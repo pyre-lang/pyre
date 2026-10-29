@@ -1052,7 +1052,7 @@ fn bool_assigned_to_return(llbc: &Llbc, init_id: u64) -> Option<bool> {
 /// Read the `&'static str` value of an oopspec marker const. The init
 /// body assigns `Local(0) = Const(ConstantExpr)` whose kind is the
 /// string literal (`[{"Str": spec}, ty]`), mirroring [`global_marker_bool`]'s bool path.
-fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
+pub(crate) fn global_marker_str(llbc: &Llbc, gd: &GlobalDecl) -> Option<String> {
     if let Some(value) = gd.rest.get("value")
         && let Some(spec) = decode_str_const(llbc, value)
     {

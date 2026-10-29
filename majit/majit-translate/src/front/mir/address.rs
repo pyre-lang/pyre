@@ -1,17 +1,30 @@
 //! Address-taking of locals: raw scalar spills, `&mut` GC-ref cells, and address escape.
 
 use super::*;
+use majit_charon_reader::ullbc::{FunDecl, TypeDeclKind};
 
 /// Spill allocation for one borrowed primitive passed to a raw
 /// scalar pointer. `Tuple<i64>` is one signed field: size 8, align 8,
 /// raw gckind (`StructLayout::from_type_strings`).
 pub(in crate::front::mir) const RAW_SCALAR_SPILL_OWNER: &str = "Tuple<i64>";
 pub(in crate::front::mir) const RAW_SCALAR_SPILL_BYTES: usize = 8;
+/// Char-varsize cell for a function-local primitive whose address is
+/// taken as a raw scalar pointer. `jtransform.py` `_rewrite_raw_malloc`
+/// emits `OS_RAW_MALLOC_VARSIZE_CHAR`; `virtualize.py`
+/// `make_virtual_raw_memory` deletes it in traces. The same TYPE as
+/// `ll_slice_len_slot_new`.
+pub(in crate::front::mir) const RAW_SCALAR_CELL_OWNER: &str = "Array(Char)";
 
 pub(in crate::front::mir) struct RawScalarBorrowSpill {
     pub(in crate::front::mir) fun_id: u64,
     pub(in crate::front::mir) index: usize,
     pub(in crate::front::mir) copy_out: bool,
+    /// Rust `&T` / `&mut T` whose residual ABI is a pointer. An
+    /// inspectable callee that does not stash the address still uses
+    /// this flag; the cell's lifetime is the source's storage scope
+    /// (`scoped_alloc`), not the `&T` spelling. A raw `*const T` is
+    /// not this.
+    pub(in crate::front::mir) call_scoped: bool,
     pub(in crate::front::mir) item_ty: ValueType,
     pub(in crate::front::mir) itemsize: usize,
     pub(in crate::front::mir) is_item_signed: bool,
@@ -20,6 +33,9 @@ pub(in crate::front::mir) struct RawScalarBorrowSpill {
 pub(in crate::front::mir) struct RawScalarReload {
     pub(in crate::front::mir) ptr: Variable,
     pub(in crate::front::mir) copy_out: bool,
+    /// Per-call `Tuple<i64>` spill. A function-scoped Char-varsize cell
+    /// is freed at `StorageDead` / function exit instead.
+    pub(in crate::front::mir) free: bool,
     /// Borrowed place, after peeling `&mut *p` reborrows. `None` when
     /// the borrow temporary has more than one referent. Aliases of one
     /// place share `ptr`.
@@ -49,6 +65,733 @@ pub(in crate::front::mir) enum SpillAddressSource {
     /// A parameter, a call result, arithmetic, or a projection whose
     /// stored operand is not one place.
     Unknown,
+}
+
+/// `raw_malloc_varsize_char(itemsize)` as `OpKind::RawMalloc` with TYPE
+/// `CArray(Char)`, the shape `_rewrite_raw_malloc` rewrites to
+/// `OS_RAW_MALLOC_VARSIZE_CHAR`.
+pub(in crate::front::mir) fn emit_raw_cell_malloc(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    itemsize: usize,
+) -> Variable {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::CArray;
+    let length = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(length.clone()),
+        kind: OpKind::ConstUInt(itemsize as u64),
+    });
+    let ptr = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(ptr.clone()),
+        kind: OpKind::raw_malloc_with_flags(
+            RAW_SCALAR_CELL_OWNER,
+            Some(LowLevelType::Array(Box::new(CArray(LowLevelType::Char)))),
+            false,
+            true,
+            false,
+            Vec::new(),
+            Some(length),
+        ),
+    });
+    ptr
+}
+
+pub(in crate::front::mir) fn emit_raw_cell_store(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    ptr: Variable,
+    value: Variable,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) {
+    let offset = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(offset.clone()),
+        kind: OpKind::ConstInt(0),
+    });
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawStore {
+            base: ptr,
+            offset,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        },
+    });
+}
+
+pub(in crate::front::mir) fn emit_raw_cell_load(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    ptr: Variable,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) -> Variable {
+    let offset = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(offset.clone()),
+        kind: OpKind::ConstInt(0),
+    });
+    let loaded = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(loaded.clone()),
+        kind: OpKind::RawLoad {
+            base: ptr,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        },
+    });
+    loaded
+}
+
+pub(in crate::front::mir) fn emit_raw_cell_free(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    ptr: Variable,
+) {
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawFree { ptr },
+    });
+}
+
+/// Function-local primitive scalars whose address is passed as a raw
+/// scalar pointer. One Char-varsize cell each, for the local's storage
+/// scope (`scoped_alloc`).
+pub(in crate::front::mir) struct CellScalarPlan {
+    pub(in crate::front::mir) locals: bit_set::BitSet,
+    pub(in crate::front::mir) descr: Vec<Option<(ValueType, usize, bool)>>,
+    pub(in crate::front::mir) has_storage_live: bit_set::BitSet,
+}
+
+/// Residual `&T` of a parameter or field: one Char-varsize cell for the
+/// enclosing function (`ScopedAlloc` of caller storage). Slot is filled
+/// when the extra local is numbered.
+pub(in crate::front::mir) struct FunctionScopeCellPlan {
+    pub(in crate::front::mir) place: Place,
+    pub(in crate::front::mir) itemsize: usize,
+}
+
+/// Numbered extra slot for a [`FunctionScopeCellPlan`].
+pub(in crate::front::mir) struct FunctionScopeCell {
+    pub(in crate::front::mir) slot: usize,
+    pub(in crate::front::mir) place: Place,
+}
+
+/// FunDecl paths that carry an `oopspec:jit.*` marker const.
+/// jtransform rewrites those calls to a box query (`jit.isconstant`)
+/// instead of the rustc `&T` pointer ABI. `ordereddict.lookup` still
+/// residual-executes the trampoline and is not in this set.
+pub(in crate::front::mir) fn oopspec_fn_paths(llbc: &Llbc) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for gd in llbc.iter_global_decls() {
+        let path = strip_crate_prefix(&gd.item_meta.name_path());
+        let Some((module, leaf)) = path.rsplit_once("::") else {
+            continue;
+        };
+        let Some(fn_leaf) = leaf.strip_prefix("oopspec_") else {
+            continue;
+        };
+        let Some(spec) = crate::front::llbc_hints::global_marker_str(llbc, gd) else {
+            continue;
+        };
+        if !spec.starts_with("jit.") {
+            continue;
+        }
+        out.insert(format!("{module}::{fn_leaf}"));
+        // Body-local marker: `<fn_path>::oopspec_<leaf>` — `module` is
+        // already the function path.
+        out.insert(module.to_string());
+    }
+    out
+}
+
+fn fun_decl_has_oopspec(fd: &FunDecl, oopspec_fns: &std::collections::HashSet<String>) -> bool {
+    oopspec_fns.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
+}
+
+fn call_substituted_inputs(
+    fd: &FunDecl,
+    generics: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<Vec<TyRef>> {
+    let (types, consts) = crate::front::clause_spec::concrete_type_args(generics, llbc)?;
+    Some(
+        crate::front::clause_spec::substituted_signature(&fd.signature, llbc, &types, &consts)
+            .inputs,
+    )
+}
+
+/// Declared `&T` / `&mut T` of a residual copy word, or `&TypeVar` that
+/// a residual generic still spells. A raw pointer is the other path.
+fn declared_residual_scalar_ref(declared: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_raw_pointer(declared, llbc) {
+        return false;
+    }
+    if tyref_is_ref_of_residual_scalar_word(declared, llbc) {
+        return true;
+    }
+    tyref_peel_one_ref_node(declared, llbc)
+        .is_some_and(|pointee| tyref_is_type_var(&TyRef::Other(pointee.clone()), llbc))
+}
+
+/// One-word Copy value the residual ABI can store in a `Tuple<i64>`
+/// cell: a Charon primitive, or a `repr(transparent)` handle of one
+/// word. A Charon `&` / `*const` is an address and is not this.
+fn tyref_is_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    residual_scalar_word_descr(ty, llbc).is_some()
+}
+
+fn tyref_is_ref_of_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    tyref_peel_one_ref_node(ty, llbc)
+        .is_some_and(|pointee| tyref_is_residual_scalar_word(&TyRef::Other(pointee.clone()), llbc))
+}
+
+fn residual_scalar_word_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+    if tyref_is_raw_pointer(ty, llbc) || output_type_is_ref(ty, llbc) {
+        return None;
+    }
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    if json_ty_is_copy_scalar(node, llbc) {
+        return json_ty_raw_store_descr(node, llbc)
+            .filter(|(_, size, _)| *size > 0 && *size <= RAW_SCALAR_SPILL_BYTES);
+    }
+    let obj = node.as_object()?;
+    if !obj.contains_key("Adt") {
+        return None;
+    }
+    if let Some((index, _)) = tyref_transparent_nonzst_field(ty, llbc) {
+        let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+        if let TypeDeclKind::Struct(fields) = &decl.kind
+            && let Some(field) = fields.get(index)
+        {
+            if let Some(descr) = residual_scalar_word_descr(&field.ty, llbc) {
+                return Some(descr);
+            }
+            let field_node = tyref_node(&field.ty, llbc)?;
+            if json_ty_is_thin_pointer_element(field_node, llbc)
+                || json_ty_byte_size(field_node, llbc)
+                    == Some(crate::layout::target_word_size() as i64)
+            {
+                return Some((ValueType::Int, crate::layout::target_word_size(), false));
+            }
+        }
+    }
+    None
+}
+
+fn residual_arg_store_descr(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, usize, bool)> {
+    json_ty_raw_store_descr(tyref_node(ty, llbc)?, llbc)
+        .or_else(|| residual_scalar_word_descr(ty, llbc))
+}
+
+fn residual_scalar_ref_callee(
+    fd: &FunDecl,
+    dont_look_inside: &std::collections::HashSet<String>,
+    oopspec_fns: &std::collections::HashSet<String>,
+) -> bool {
+    fun_decl_is_residual(fd, dont_look_inside)
+        && !fun_decl_has_oopspec(fd, oopspec_fns)
+        && !is_inlined_mem_exchange_path(&fd.item_meta.name_path())
+}
+
+pub(in crate::front::mir) fn collect_cell_scalar_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+    arg_count: usize,
+    forward: &[bool],
+    dont_look_inside: &std::collections::HashSet<String>,
+    oopspec_fns: &std::collections::HashSet<String>,
+) -> CellScalarPlan {
+    let n_locals = body.locals.locals.len();
+    let mut locals = bit_set::BitSet::with_capacity(n_locals);
+    let mut descr = vec![None; n_locals];
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        let subst_inputs = call_substituted_inputs(fd, &reg.generics, llbc);
+        let inputs = subst_inputs
+            .as_deref()
+            .unwrap_or(fd.signature.inputs.as_slice());
+        let residual_ref_callee = residual_scalar_ref_callee(fd, dont_look_inside, oopspec_fns);
+        for (index, declared) in inputs.iter().enumerate() {
+            let residual_ref = residual_ref_callee && declared_residual_scalar_ref(declared, llbc);
+            if raw_scalar_address_value_type(declared, llbc).is_none() && !residual_ref {
+                continue;
+            }
+            let Some(arg) = call.args.get(index) else {
+                continue;
+            };
+            let Some(passed) = operand_tyref(arg) else {
+                continue;
+            };
+            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, llbc);
+            let passed_value = tyref_is_residual_scalar_word(passed, llbc);
+            if residual_ref {
+                if !passed_ref && !passed_value {
+                    continue;
+                }
+            } else if !passed_ref && !tyref_is_raw_ptr_of_primitive(passed, llbc) {
+                continue;
+            }
+            let param_node = if residual_ref {
+                tyref_peel_one_ref_node(declared, llbc)
+            } else {
+                tyref_peel_one_raw_ptr_node(declared, llbc)
+            };
+            let Some(param_node) = param_node else {
+                continue;
+            };
+            let arg_node = if passed_ref {
+                tyref_peel_one_ref_node(passed, llbc)
+            } else if residual_ref && passed_value {
+                tyref_node(passed, llbc).and_then(|node| strip_ty_indirections(node, llbc))
+            } else {
+                tyref_peel_one_raw_ptr_node(passed, llbc)
+            };
+            let Some(arg_node) = arg_node else {
+                continue;
+            };
+            let param_pointee = TyRef::Other(param_node.clone());
+            let arg_pointee = TyRef::Other(arg_node.clone());
+            let arg_store = residual_arg_store_descr(&arg_pointee, llbc);
+            let Some((_, itemsize, _)) =
+                residual_arg_store_descr(&param_pointee, llbc).or_else(|| arg_store.clone())
+            else {
+                continue;
+            };
+            let Some((_, arg_size, _)) = arg_store else {
+                continue;
+            };
+            if itemsize == 0 || itemsize > RAW_SCALAR_SPILL_BYTES || arg_size != itemsize {
+                continue;
+            }
+            let Some(place) =
+                body_resolved_borrow_place(body, forward, operand_local(Some(arg)), llbc)
+            else {
+                continue;
+            };
+            let PlaceKind::Local(id) = place.kind else {
+                continue;
+            };
+            let id = id as usize;
+            if id <= arg_count {
+                continue;
+            }
+            let Some(decl) = body.locals.locals.get(id) else {
+                continue;
+            };
+            if !tyref_is_primitive_scalar(&decl.ty, llbc) {
+                continue;
+            }
+            let Some(cell_descr) =
+                tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
+            else {
+                continue;
+            };
+            locals.insert(id);
+            descr[id] = Some(cell_descr);
+        }
+    }
+    let mut has_storage_live = bit_set::BitSet::with_capacity(n_locals);
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::StorageLive(local)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let local = *local as usize;
+            if locals.contains(local) {
+                has_storage_live.insert(local);
+            }
+        }
+    }
+    CellScalarPlan {
+        locals,
+        descr,
+        has_storage_live,
+    }
+}
+
+/// Residual `&T` of a parameter or field: one Char-varsize cell for the
+/// enclosing function, freed on every modeled exit (`scoped_alloc` of
+/// caller storage). A function-local primitive already in `cell_locals`
+/// keeps that local's storage scope.
+pub(in crate::front::mir) fn collect_function_scope_spill_cells(
+    llbc: &Llbc,
+    body: &Unstructured,
+    arg_count: usize,
+    forward: &[bool],
+    dont_look_inside: &std::collections::HashSet<String>,
+    oopspec_fns: &std::collections::HashSet<String>,
+    cell_locals: &bit_set::BitSet,
+) -> Vec<FunctionScopeCellPlan> {
+    let mut out = Vec::new();
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        let subst_inputs = call_substituted_inputs(fd, &reg.generics, llbc);
+        let inputs = subst_inputs
+            .as_deref()
+            .unwrap_or(fd.signature.inputs.as_slice());
+        let residual_ref_callee = residual_scalar_ref_callee(fd, dont_look_inside, oopspec_fns);
+        for (index, declared) in inputs.iter().enumerate() {
+            let residual_ref = residual_ref_callee && declared_residual_scalar_ref(declared, llbc);
+            if raw_scalar_address_value_type(declared, llbc).is_none() && !residual_ref {
+                continue;
+            }
+            let Some(arg) = call.args.get(index) else {
+                continue;
+            };
+            let Some(passed) = operand_tyref(arg) else {
+                continue;
+            };
+            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, llbc);
+            let passed_value = tyref_is_residual_scalar_word(passed, llbc);
+            if residual_ref {
+                if !passed_ref && !passed_value {
+                    continue;
+                }
+            } else if !passed_ref {
+                let residual_raw_value = residual_ref_callee && passed_value;
+                if !residual_raw_value {
+                    continue;
+                }
+            }
+            let residual_value = residual_ref_callee && passed_value && !passed_ref;
+            if !residual_ref && !residual_value {
+                continue;
+            }
+            let param_node = if residual_ref {
+                tyref_peel_one_ref_node(declared, llbc)
+            } else {
+                tyref_peel_one_raw_ptr_node(declared, llbc)
+            };
+            let Some(param_node) = param_node else {
+                continue;
+            };
+            let arg_node = if passed_ref {
+                tyref_peel_one_ref_node(passed, llbc)
+            } else if residual_value {
+                tyref_node(passed, llbc).and_then(|node| strip_ty_indirections(node, llbc))
+            } else {
+                tyref_peel_one_raw_ptr_node(passed, llbc)
+            };
+            let Some(arg_node) = arg_node else {
+                continue;
+            };
+            let param_pointee = TyRef::Other(param_node.clone());
+            let arg_pointee = TyRef::Other(arg_node.clone());
+            let arg_store = residual_arg_store_descr(&arg_pointee, llbc);
+            let Some((_, itemsize, _)) =
+                residual_arg_store_descr(&param_pointee, llbc).or_else(|| arg_store.clone())
+            else {
+                continue;
+            };
+            let Some((_, arg_size, _)) = arg_store else {
+                continue;
+            };
+            if itemsize == 0 || itemsize > RAW_SCALAR_SPILL_BYTES || arg_size != itemsize {
+                continue;
+            }
+            let Some(place) =
+                body_spill_source_place(body, forward, operand_local(Some(arg)), arg_count, llbc)
+            else {
+                continue;
+            };
+            if place_is_planned_cell(&place, cell_locals) {
+                continue;
+            }
+            if out
+                .iter()
+                .any(|cell: &FunctionScopeCellPlan| places_alias(&cell.place, &place))
+            {
+                continue;
+            }
+            out.push(FunctionScopeCellPlan { place, itemsize });
+        }
+    }
+    out
+}
+
+fn place_is_planned_cell(place: &Place, cell_locals: &bit_set::BitSet) -> bool {
+    match &place.kind {
+        PlaceKind::Local(id) => cell_locals.contains(*id as usize),
+        PlaceKind::Projection(inner, _) => place_is_planned_cell(inner, cell_locals),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+    }
+}
+
+/// Blocks that keep a cell pointer live. A local with no `StorageLive`
+/// is live on every forward-reached block. Otherwise the scope is the
+/// DFS from each `StorageLive` that stops at `StorageDead` (that block
+/// is in scope; its successors are not).
+pub(in crate::front::mir) fn cell_scope_extra_live(
+    llbc: &Llbc,
+    body: &Unstructured,
+    plan: &CellScalarPlan,
+    forward: &[bool],
+) -> Vec<Vec<usize>> {
+    let n_blocks = body.body.len();
+    let mut extra = vec![Vec::new(); n_blocks];
+    for local in &plan.locals {
+        if plan.has_storage_live.contains(local) {
+            for bb in cell_storage_scope_blocks(llbc, body, local, n_blocks).iter() {
+                extra[bb].push(local);
+            }
+        } else {
+            for (bb, reached) in forward.iter().enumerate() {
+                if *reached {
+                    extra[bb].push(local);
+                }
+            }
+        }
+    }
+    extra
+}
+
+fn cell_storage_scope_blocks(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+    n_blocks: usize,
+) -> bit_set::BitSet {
+    let mut lives = Vec::new();
+    let mut deads = bit_set::BitSet::with_capacity(n_blocks);
+    for (bb, block) in body.body.iter().enumerate() {
+        for stmt in &block.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::StorageLive(id)) if *id as usize == local => lives.push(bb),
+                Ok(StmtKind::StorageDead(id)) if *id as usize == local => {
+                    deads.insert(bb);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut scope = bit_set::BitSet::with_capacity(n_blocks);
+    let mut stack = lives;
+    while let Some(bb) = stack.pop() {
+        if !scope.insert(bb) {
+            continue;
+        }
+        if deads.contains(bb) {
+            continue;
+        }
+        for succ in successor_blocks(llbc, body, bb, true) {
+            stack.push(succ);
+        }
+    }
+    scope
+}
+
+fn body_resolved_borrow_place(
+    body: &Unstructured,
+    forward: &[bool],
+    arg_local: Option<usize>,
+    llbc: &Llbc,
+) -> Option<Place> {
+    let local = arg_local?;
+    let place = if let Some(place) = body_argument_borrow_place(body, forward, local) {
+        place
+    } else {
+        body_pointer_place_of_local(body, forward, local, 0, llbc)?
+    };
+    Some(body_concrete_borrow_place(body, forward, place))
+}
+
+/// Place a residual `&T` names. A parameter with no `Ref` assign is the
+/// parameter local itself (caller storage, no `StorageLive`).
+fn body_spill_source_place(
+    body: &Unstructured,
+    forward: &[bool],
+    arg_local: Option<usize>,
+    arg_count: usize,
+    llbc: &Llbc,
+) -> Option<Place> {
+    if let Some(place) = body_resolved_borrow_place(body, forward, arg_local, llbc) {
+        return Some(place);
+    }
+    let local = arg_local?;
+    if local == 0 || local > arg_count {
+        return None;
+    }
+    let decl = body.locals.locals.get(local)?;
+    Some(Place {
+        kind: PlaceKind::Local(local as u64),
+        ty: clone_tyref(&decl.ty),
+    })
+}
+
+/// `&raw mut *_r` where `_r = &mut x` is `x`, the same peel
+/// [`Lowering::concrete_borrow_place`] does from `atomic_ref_place`.
+fn body_concrete_borrow_place(body: &Unstructured, forward: &[bool], mut place: Place) -> Place {
+    for _ in 0..8 {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            break;
+        };
+        let ProjectionElem::Atom(name) = elem else {
+            break;
+        };
+        if name != "Deref" {
+            break;
+        }
+        let PlaceKind::Local(local) = inner.kind else {
+            break;
+        };
+        let Some(next) = body_argument_borrow_place(body, forward, local as usize) else {
+            break;
+        };
+        place = next;
+    }
+    place
+}
+
+fn body_argument_borrow_place(
+    body: &Unstructured,
+    forward: &[bool],
+    local: usize,
+) -> Option<Place> {
+    let mut found = None;
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            if index as usize != local {
+                continue;
+            }
+            let Some(place) = borrowed_place_referent(rvalue) else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some(place);
+        }
+    }
+    found
+}
+
+fn body_pointer_place_of_local(
+    body: &Unstructured,
+    forward: &[bool],
+    local: usize,
+    depth: u8,
+    llbc: &Llbc,
+) -> Option<Place> {
+    if depth > 8 {
+        return None;
+    }
+    let mut found = None;
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            if index as usize != local {
+                continue;
+            }
+            let place =
+                body_rvalue_pointer_place(body, forward, rvalue, depth, Some(&dest.ty), llbc)?;
+            if found.is_some() {
+                return None;
+            }
+            found = Some(place);
+        }
+    }
+    found
+}
+
+fn body_rvalue_pointer_place(
+    body: &Unstructured,
+    forward: &[bool],
+    rvalue: &Rvalue,
+    depth: u8,
+    dest_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> Option<Place> {
+    match rvalue {
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => Some(place.clone()),
+        Rvalue::Use(op, _) => body_operand_pointer_place(body, forward, op, depth, llbc),
+        Rvalue::Cast(kind, op, target_ty)
+            if cast_preserves_spill_address(kind, Some(target_ty), llbc) =>
+        {
+            body_operand_pointer_place(body, forward, op, depth, llbc)
+        }
+        Rvalue::UnaryOp(op, operand)
+            if unary_op_is_cast(op) && cast_preserves_spill_address(op, dest_ty, llbc) =>
+        {
+            body_operand_pointer_place(body, forward, operand, depth, llbc)
+        }
+        _ => None,
+    }
+}
+
+fn body_operand_pointer_place(
+    body: &Unstructured,
+    forward: &[bool],
+    op: &Operand,
+    depth: u8,
+    llbc: &Llbc,
+) -> Option<Place> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => {
+            let PlaceKind::Local(id) = place.kind else {
+                return None;
+            };
+            body_pointer_place_of_local(body, forward, id as usize, depth + 1, llbc)
+        }
+        Operand::Const(_) => None,
+    }
 }
 
 impl<'a> Lowering<'a> {
@@ -132,6 +875,244 @@ impl<'a> Lowering<'a> {
                 ))
             })?
             .one()
+    }
+
+    pub(in crate::front::mir) fn is_cell_local(&self, local: usize) -> bool {
+        self.cell_locals.contains(local)
+    }
+
+    pub(in crate::front::mir) fn cell_descr(
+        &self,
+        local: usize,
+    ) -> Option<&(ValueType, usize, bool)> {
+        self.cell_descr.get(local).and_then(Option::as_ref)
+    }
+
+    pub(in crate::front::mir) fn place_is_cell_local(&self, place: &Place) -> bool {
+        matches!(place.kind, PlaceKind::Local(id) if self.is_cell_local(id as usize))
+    }
+
+    /// `x`, or `&raw mut *_r` / `&mut *_r` whose recorded referent is `x`.
+    pub(in crate::front::mir) fn cell_local_of_address_place(
+        &self,
+        place: &Place,
+    ) -> Option<usize> {
+        let peeled = self.concrete_borrow_place(place.clone());
+        match peeled.kind {
+            PlaceKind::Local(id) if self.is_cell_local(id as usize) => Some(id as usize),
+            _ => None,
+        }
+    }
+
+    pub(in crate::front::mir) fn variable_is_cell_ptr(&self, var: &Variable) -> bool {
+        self.cell_locals.iter().any(|local| {
+            self.local_var
+                .get(local)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|value| value.one().ok())
+                .is_some_and(|ptr| ptr == *var)
+        })
+    }
+
+    fn operand_names_cell_address(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self.place_names_cell_address(place),
+            Operand::Const(_) => false,
+        }
+    }
+
+    fn place_names_cell_address(&self, place: &Place) -> bool {
+        match &place.kind {
+            PlaceKind::Local(i) => {
+                let i = *i as usize;
+                if self.is_cell_local(i) {
+                    return false;
+                }
+                if let Some(recorded) = self.atomic_ref_place.get(&i)
+                    && self.place_is_cell_local(recorded)
+                {
+                    return true;
+                }
+                self.local_var
+                    .get(i)
+                    .and_then(|slot| slot.as_ref())
+                    .and_then(|value| value.one().ok())
+                    .is_some_and(|var| self.variable_is_cell_ptr(&var))
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::front::mir) fn rvalue_names_cell_address(&self, rvalue: &Rvalue) -> bool {
+        if let Some(place) = borrowed_place_referent(rvalue) {
+            return self.cell_local_of_address_place(&place).is_some();
+        }
+        match rvalue {
+            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => self.operand_names_cell_address(op),
+            Rvalue::UnaryOp(op, operand)
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+            {
+                self.operand_names_cell_address(operand)
+            }
+            _ => false,
+        }
+    }
+
+    /// The cell pointer stored into a heap field, a global, or the
+    /// return slot would outlive `StorageDead` / `raw_free`.
+    pub(in crate::front::mir) fn cell_address_escapes_scope(
+        &self,
+        dest: &Place,
+        rvalue: &Rvalue,
+    ) -> bool {
+        if !self.rvalue_names_cell_address(rvalue) {
+            return false;
+        }
+        match &dest.kind {
+            PlaceKind::Local(0) => true,
+            PlaceKind::Local(_) => false,
+            PlaceKind::Global { .. } | PlaceKind::Projection(..) | PlaceKind::Unknown => true,
+        }
+    }
+
+    pub(in crate::front::mir) fn emit_cell_malloc_bind(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<(), LowerError> {
+        let Some((_, itemsize, _)) = self.cell_descr(local).cloned() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: cell local {local} has no scalar descr"
+            )));
+        };
+        let bb = self.emit_bb(mir_bb);
+        let ptr = emit_raw_cell_malloc(&mut self.graph, bb, itemsize);
+        self.local_var[local] = Some(LocalValue::One(ptr));
+        Ok(())
+    }
+
+    pub(in crate::front::mir) fn emit_cell_store(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+        value: Variable,
+    ) -> Result<(), LowerError> {
+        let Some((item_ty, itemsize, is_item_signed)) = self.cell_descr(local).cloned() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: cell local {local} has no scalar descr"
+            )));
+        };
+        let ptr = self.defined_local(mir_bb, local)?;
+        let bb = self.emit_bb(mir_bb);
+        emit_raw_cell_store(
+            &mut self.graph,
+            bb,
+            ptr,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        );
+        Ok(())
+    }
+
+    pub(in crate::front::mir) fn emit_cell_load(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<Variable, LowerError> {
+        let Some((item_ty, itemsize, is_item_signed)) = self.cell_descr(local).cloned() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: cell local {local} has no scalar descr"
+            )));
+        };
+        let ptr = self.defined_local(mir_bb, local)?;
+        let bb = self.emit_bb(mir_bb);
+        Ok(emit_raw_cell_load(
+            &mut self.graph,
+            bb,
+            ptr,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        ))
+    }
+
+    pub(in crate::front::mir) fn emit_cell_free(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<(), LowerError> {
+        let Some(ptr) = self
+            .local_var
+            .get(local)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())
+        else {
+            return Ok(());
+        };
+        let bb = self.emit_bb(mir_bb);
+        emit_raw_cell_free(&mut self.graph, bb, ptr);
+        self.local_var[local] = None;
+        Ok(())
+    }
+
+    pub(in crate::front::mir) fn free_bound_cells(
+        &mut self,
+        mir_bb: usize,
+    ) -> Result<(), LowerError> {
+        let locals: Vec<usize> = self.cell_locals.iter().collect();
+        for local in locals {
+            self.emit_cell_free(mir_bb, local)?;
+        }
+        let slots: Vec<usize> = self
+            .function_scope_cells
+            .iter()
+            .map(|cell| cell.slot)
+            .collect();
+        for slot in slots {
+            self.emit_cell_free(mir_bb, slot)?;
+        }
+        Ok(())
+    }
+
+    /// Residual `&T` of a parameter or field: the extra Char-varsize cell
+    /// that lives until function exit.
+    fn function_scope_cell_for(&self, group: &RawScalarAddressGroup) -> Option<&FunctionScopeCell> {
+        let place = group.place.as_ref()?;
+        self.function_scope_cells
+            .iter()
+            .find(|cell| places_alias(&cell.place, place))
+    }
+
+    fn group_spill_outlives_call(&self, group: &RawScalarAddressGroup) -> bool {
+        self.group_place_is_cell(group) || self.function_scope_cell_for(group).is_some()
+    }
+
+    /// Place a residual `&T` names. A parameter with no `Ref` assign is
+    /// the parameter local (`scoped_alloc` of caller storage).
+    fn spill_source_place(&self, arg_local: Option<usize>) -> Option<Place> {
+        if let Some(place) = self.resolved_borrow_place(arg_local) {
+            return Some(place);
+        }
+        let local = arg_local?;
+        if local == 0 || local > self.arg_count {
+            return None;
+        }
+        let decl = self.body.locals.locals.get(local)?;
+        Some(Place {
+            kind: PlaceKind::Local(local as u64),
+            ty: clone_tyref(&decl.ty),
+        })
+    }
+
+    fn group_place_is_cell(&self, group: &RawScalarAddressGroup) -> bool {
+        if let Some(place) = group.place.as_ref()
+            && self.cell_local_of_address_place(place).is_some()
+        {
+            return true;
+        }
+        self.variable_is_cell_ptr(&group.word)
     }
 
     /// A GC reference behind `&mut` lives in a one-field GC cell for the
@@ -530,8 +1511,13 @@ impl<'a> Lowering<'a> {
     /// field, a call result, `*p` of a pointer parameter) is left
     /// alone; [`attach_aliasing_raw_arguments`] still passes the
     /// spill address when that pointer names a place spilled by
-    /// another argument. An `&mut i64` parameter is the word on both
-    /// sides and is left alone. A byte pointer stays `Ref`.
+    /// another argument. An `&mut i64` parameter of a look-inside
+    /// callee is the word on both sides and is left alone. A residual
+    /// callee's `&T` of a copy word is a pointer in the residual
+    /// ABI (`ResidualSlot` for `&T`), so the aliased word is stored
+    /// in the same cell and the address is passed. A callee with an
+    /// `oopspec:jit.*` hint is skipped: jtransform rewrites that call
+    /// to a box query. A byte pointer stays `Ref`.
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
@@ -547,29 +1533,58 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return Vec::new();
         };
+        let subst_inputs = call_substituted_inputs(fd, &reg.generics, self.llbc);
+        let inputs = subst_inputs
+            .as_deref()
+            .unwrap_or(fd.signature.inputs.as_slice());
+        let residual_ref_callee =
+            residual_scalar_ref_callee(fd, self.dont_look_inside, &self.oopspec_fns);
         let mut spills = Vec::new();
-        for (index, declared) in fd.signature.inputs.iter().enumerate() {
-            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+        for (index, declared) in inputs.iter().enumerate() {
+            let residual_ref =
+                residual_ref_callee && declared_residual_scalar_ref(declared, self.llbc);
+            if raw_scalar_address_value_type(declared, self.llbc).is_none() && !residual_ref {
                 continue;
             }
             let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            let passed_ref = tyref_is_ref_of_primitive(passed, self.llbc);
-            if !passed_ref {
-                if !tyref_is_raw_ptr_of_primitive(passed, self.llbc)
-                    || !self.raw_ptr_arg_is_bare_primitive_local(
-                        arg_locals.get(index).copied().flatten(),
-                    )
+            let passed_ref = tyref_is_ref_of_residual_scalar_word(passed, self.llbc);
+            let passed_value = tyref_is_residual_scalar_word(passed, self.llbc);
+            // Residual `&T` / `*const T`: the aliased word (a `&i64`
+            // parameter banked as Int, a specialized `i64` local, or a
+            // one-word Copy ADT) is stored in a cell and the address
+            // is passed. A look-inside `&T` is the word on both sides
+            // and is left alone.
+            if residual_ref {
+                if !passed_ref && !passed_value {
+                    continue;
+                }
+            } else if !passed_ref {
+                let residual_raw_value = residual_ref_callee && passed_value;
+                if !residual_raw_value
+                    && (!tyref_is_raw_ptr_of_primitive(passed, self.llbc)
+                        || !self.raw_ptr_arg_is_bare_primitive_local(
+                            arg_locals.get(index).copied().flatten(),
+                        ))
                 {
                     continue;
                 }
             }
-            let Some(param_node) = tyref_peel_one_raw_ptr_node(declared, self.llbc) else {
+            let residual_value = residual_ref_callee && passed_value && !passed_ref;
+            let param_node = if residual_ref {
+                tyref_peel_one_ref_node(declared, self.llbc)
+            } else {
+                tyref_peel_one_raw_ptr_node(declared, self.llbc)
+            };
+            let Some(param_node) = param_node else {
                 continue;
             };
             let arg_node = if passed_ref {
                 tyref_peel_one_ref_node(passed, self.llbc)
+            } else if residual_value {
+                tyref_node(passed, self.llbc)
+                    .and_then(|node| strip_ty_indirections(node, self.llbc))
             } else {
                 tyref_peel_one_raw_ptr_node(passed, self.llbc)
             };
@@ -578,11 +1593,17 @@ impl<'a> Lowering<'a> {
             };
             let param_pointee = TyRef::Other(param_node.clone());
             let arg_pointee = TyRef::Other(arg_node.clone());
-            let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&param_pointee)
+            let arg_descr = self
+                .raw_word_descr(&arg_pointee)
+                .or_else(|| residual_scalar_word_descr(&arg_pointee, self.llbc));
+            let Some((item_ty, itemsize, is_item_signed)) = self
+                .raw_word_descr(&param_pointee)
+                .or_else(|| residual_scalar_word_descr(&param_pointee, self.llbc))
+                .or_else(|| arg_descr.clone())
             else {
                 continue;
             };
-            let Some((arg_ty, arg_size, _)) = self.raw_word_descr(&arg_pointee) else {
+            let Some((arg_ty, arg_size, _)) = arg_descr else {
                 continue;
             };
             // `Tuple<i64>` is the spill allocation: one signed field,
@@ -598,16 +1619,25 @@ impl<'a> Lowering<'a> {
             {
                 continue;
             }
-            let copy_out = raw_ptr_kind_is_mut(declared, self.llbc)
-                && if passed_ref {
-                    ref_kind_is_mut(passed, self.llbc)
-                } else {
-                    raw_ptr_kind_is_mut(passed, self.llbc)
-                };
+            let copy_out = if residual_ref {
+                !passed_value
+                    && ref_kind_is_mut(declared, self.llbc)
+                    && ref_kind_is_mut(passed, self.llbc)
+            } else if residual_value {
+                false
+            } else {
+                raw_ptr_kind_is_mut(declared, self.llbc)
+                    && if passed_ref {
+                        ref_kind_is_mut(passed, self.llbc)
+                    } else {
+                        raw_ptr_kind_is_mut(passed, self.llbc)
+                    }
+            };
             spills.push(RawScalarBorrowSpill {
                 fun_id: *id,
                 index,
                 copy_out,
+                call_scoped: residual_ref || residual_value,
                 item_ty,
                 itemsize,
                 is_item_signed,
@@ -620,8 +1650,6 @@ impl<'a> Lowering<'a> {
     /// `Option<P>` whose payload is that kind. Nullable `llmemory.GCREF`
     /// is kind `'r'` (`history.py` `getkind`) and cannot hold a
     /// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` address.
-    /// The kind-`'r'` exemption for a fresh-cell spill applies only to a
-    /// callee whose body cannot be inspected.
     fn tyref_is_nullable_gcref(&self, ty: &TyRef) -> bool {
         if tyref_is_gc_reference(ty, self.llbc) {
             return true;
@@ -684,8 +1712,12 @@ impl<'a> Lowering<'a> {
                 if arg != &resolved_args[spill.index] {
                     continue;
                 }
-                let place =
-                    self.resolved_borrow_place(arg_locals.get(spill.index).copied().flatten());
+                let arg_local = arg_locals.get(spill.index).copied().flatten();
+                let place = if spill.call_scoped {
+                    self.spill_source_place(arg_local)
+                } else {
+                    self.resolved_borrow_place(arg_local)
+                };
                 if let Some(group) = groups.iter_mut().find(|group| {
                     raw_scalar_groups_share(
                         group,
@@ -719,23 +1751,34 @@ impl<'a> Lowering<'a> {
                 fun_id: spill.fun_id,
                 index: spill.index,
                 copy_out: spill.copy_out,
+                call_scoped: spill.call_scoped,
                 item_ty: spill.item_ty.clone(),
                 itemsize: spill.itemsize,
                 is_item_signed: spill.is_item_signed,
             })
             .collect::<Vec<_>>();
         if !groups.is_empty() {
-            let alias_indices = self.attach_aliasing_raw_arguments(
-                fun_id,
-                &mut groups,
-                arg_locals,
-                arg_operands,
-                mir_bb,
-            )?;
+            // Residual `&T` materialises a call-scoped cell from the
+            // aliased word. Sibling arguments (`&mut Formatter`, a GC
+            // object) cannot name that cell: it does not exist until
+            // this call. The raw-pointer alias walk treats any other
+            // reference as a possible packing of the address.
+            let alias_indices = if tracked.iter().all(|spill| spill.call_scoped) {
+                Vec::new()
+            } else {
+                self.attach_aliasing_raw_arguments(
+                    fun_id,
+                    &mut groups,
+                    arg_locals,
+                    arg_operands,
+                    mir_bb,
+                )?
+            };
             let template = tracked.first().map(|spill| RawScalarBorrowSpill {
                 fun_id: spill.fun_id,
                 index: spill.index,
                 copy_out: false,
+                call_scoped: spill.call_scoped,
                 item_ty: spill.item_ty.clone(),
                 itemsize: spill.itemsize,
                 is_item_signed: spill.is_item_signed,
@@ -746,6 +1789,7 @@ impl<'a> Lowering<'a> {
                         fun_id: template.fun_id,
                         index,
                         copy_out: false,
+                        call_scoped: template.call_scoped,
                         item_ty: template.item_ty.clone(),
                         itemsize: template.itemsize,
                         is_item_signed: template.is_item_signed,
@@ -758,29 +1802,29 @@ impl<'a> Lowering<'a> {
             }
         }
         if !groups.is_empty() {
-            // `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` is a
-            // fresh raw cell. `history.py` `getkind` kind `'r'` cannot
-            // hold that address, so an uninspectable callee
-            // (`AddressEscape::opaque` / `opaque_child`) that returns
-            // `lltype.GCREF` / `Ptr(GcStruct)` / a niche `Option<P>` of
-            // that kind is not this escape. Kind `'r'` is not a result
-            // type that can hold the address, even as `*mut T`. A store
-            // this walk classified still is, and a result type that can
-            // hold the address still is. Kind `'r'` does not excuse
-            // either.
-            let fresh_cell = groups
+            // A function-local primitive cell and a function-scope
+            // extra slot outlive the call (`scoped_alloc`). An
+            // uninspectable callee is not itself a refusal then. A
+            // result type that can hold the address, a store this walk
+            // classified, or a return of the address still is.
+            let scope_group = groups
                 .iter()
-                .all(|group| self.spill_group_is_fresh_cell(group, arg_locals));
-            let gc_return = self.tyref_is_nullable_gcref(dest_ty)
-                || self
-                    .llbc
-                    .fn_by_id(fun_id)
-                    .is_some_and(|fd| self.tyref_is_nullable_gcref(&fd.signature.output));
-            let skip_opaque = fresh_cell && gc_return;
+                .all(|group| self.group_spill_outlives_call(group));
             let verdict = callee_returns_spill_address(self.llbc, fun_id, &tracked);
-            if self.raw_scalar_spill_result_escapes(dest_ty)
+            // Residual `&T` still uses the narrow dest-type walk
+            // (`identity(&x)`). A raw `*const T` uses the full walk.
+            // Uninspectable is a refusal only when no cell outlives
+            // the call: an opaque helper may stash a residual `&T`.
+            let call_scoped = tracked.iter().all(|spill| spill.call_scoped);
+            let result_escapes = if call_scoped {
+                self.call_scoped_spill_result_escapes(dest_ty)
+            } else {
+                self.raw_scalar_spill_result_escapes(dest_ty)
+            };
+            if result_escapes
                 || verdict.leaked
-                || (!skip_opaque && (verdict.uninspectable || verdict.returned))
+                || verdict.returned
+                || (!scope_group && verdict.uninspectable)
             {
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: raw scalar spill address would escape through the call result"
@@ -791,6 +1835,47 @@ impl<'a> Lowering<'a> {
         let mut reloads = Vec::new();
         let mut replacements = Vec::new();
         for group in groups {
+            if self.group_place_is_cell(&group) {
+                let ptr = group.word.clone();
+                for index in group.indices {
+                    replacements.push((index, ptr.clone()));
+                }
+                continue;
+            }
+            if let Some(slot) = self.function_scope_cell_for(&group).map(|cell| cell.slot) {
+                let Some(ptr) = self
+                    .local_var
+                    .get(slot)
+                    .and_then(|bound| bound.as_ref())
+                    .and_then(|value| value.one().ok())
+                else {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: function-scope raw cell is unbound"
+                    )));
+                };
+                emit_raw_cell_store(
+                    &mut self.graph,
+                    bb_id,
+                    ptr.clone(),
+                    group.word,
+                    group.item_ty.clone(),
+                    group.itemsize,
+                    group.is_item_signed,
+                );
+                for index in group.indices {
+                    replacements.push((index, ptr.clone()));
+                }
+                reloads.push(RawScalarReload {
+                    ptr,
+                    copy_out: group.copy_out,
+                    free: false,
+                    place: group.place,
+                    item_ty: group.item_ty,
+                    itemsize: group.itemsize,
+                    is_item_signed: group.is_item_signed,
+                });
+                continue;
+            }
             let ptr = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -822,6 +1907,7 @@ impl<'a> Lowering<'a> {
             reloads.push(RawScalarReload {
                 ptr,
                 copy_out: group.copy_out,
+                free: true,
                 place: group.place,
                 item_ty: group.item_ty,
                 itemsize: group.itemsize,
@@ -906,6 +1992,36 @@ impl<'a> Lowering<'a> {
     /// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` address, even
     /// when the layout is `*mut T`. A primitive `*mut u64` is not that
     /// kind.
+    /// Residual `&T` can only publish the cell as the call result when
+    /// that result is a pointer to a copy scalar. Any other reference
+    /// (`&str`, a GC object) is a different word. An unclassified
+    /// payload is not that pointer: the callee cannot name the cell
+    /// without a scalar-pointer return type.
+    fn call_scoped_spill_result_escapes(&self, ty: &TyRef) -> bool {
+        let mut pending = vec![clone_tyref(ty)];
+        let mut seen = Vec::new();
+        while let Some(ty) = pending.pop() {
+            let key = spill_ty_identity(&ty);
+            if seen.iter().any(|seen| seen == &key) {
+                continue;
+            }
+            seen.push(key);
+            if self.tyref_is_nullable_gcref(&ty) {
+                continue;
+            }
+            if raw_scalar_address_value_type(&ty, self.llbc).is_some()
+                || tyref_is_ref_of_primitive(&ty, self.llbc)
+            {
+                return true;
+            }
+            match spill_address_payloads(&ty, self.llbc, self.static_addrs.error_carrier) {
+                SpillPayloads::Unclassified => {}
+                SpillPayloads::Types(types) => pending.extend(types),
+            }
+        }
+        false
+    }
+
     pub(in crate::front::mir) fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -955,15 +2071,13 @@ impl<'a> Lowering<'a> {
     /// stays unlowered. A pointer to such an aggregate is the same
     /// check on the pointee.
     ///
-    /// A spill of a function-local whose address is taken only as this
-    /// call's argument is `rffi.scoped_alloc` /
-    /// `lltype.malloc(flavor='raw')`: the cell's address exists only in
-    /// the pointer argument it was passed as. A sibling address-sized
-    /// integer or raw pointer with [`SpillAddressSource::Unknown`], a
-    /// constant, or a by-value copy of the local cannot name that cell
-    /// and is passed as itself. A parameter is caller storage, and an
-    /// address taken elsewhere keeps the conservative
-    /// [`SpillAddressSource::Unknown`] error.
+    /// A spill of a function-local primitive is `rffi.scoped_alloc` /
+    /// `lltype.malloc(flavor='raw')`: one cell for the storage scope.
+    /// A sibling address-sized integer or raw pointer with
+    /// [`SpillAddressSource::Unknown`], a constant, or a by-value copy
+    /// of the local cannot name that cell and is passed as itself. A
+    /// parameter is caller storage. An extra in-scope address of the
+    /// same local is still that cell.
     pub(in crate::front::mir) fn attach_aliasing_raw_arguments(
         &self,
         fun_id: u64,
@@ -975,9 +2089,9 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(fun_id) else {
             return Ok(Vec::new());
         };
-        let fresh_cell = groups
-            .iter()
-            .all(|group| self.spill_group_is_fresh_cell(group, arg_locals));
+        let fresh_cell = groups.iter().all(|group| {
+            self.group_place_is_cell(group) || self.spill_group_is_fresh_cell(group, arg_locals)
+        });
         let mut attached = Vec::new();
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             if groups.iter().any(|group| group.indices.contains(&index)) {
@@ -1080,14 +2194,13 @@ impl<'a> Lowering<'a> {
     }
 
     /// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` is a function-local
-    /// cell whose address exists only in the pointer argument it was passed
-    /// as. A parameter is caller storage. A field or unresolved place is
-    /// not a fresh cell. Kind `'r'` exempts only an uninspectable callee
-    /// of such a cell, not a store this walk classified.
+    /// cell. A parameter is caller storage. A field or unresolved place is
+    /// not a fresh cell. An extra in-scope address of the same local is
+    /// still that cell.
     fn spill_group_is_fresh_cell(
         &self,
         group: &RawScalarAddressGroup,
-        arg_locals: &[Option<usize>],
+        _arg_locals: &[Option<usize>],
     ) -> bool {
         let Some(place) = group.place.as_ref() else {
             return false;
@@ -1096,161 +2209,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let id = id as usize;
-        if id <= self.arg_count {
-            return false;
-        }
-        !self.local_address_taken_outside_call(id, arg_locals)
-    }
-
-    /// Address of `local` taken by a `Rvalue::Ref` / `RawPtr` whose dest is
-    /// not this call's argument, and not a temporary that produces one
-    /// ([`argument_borrow_place`] / [`pointer_place_of_local`]).
-    fn local_address_taken_outside_call(&self, local: usize, arg_locals: &[Option<usize>]) -> bool {
-        let owned = self.call_argument_address_locals(arg_locals);
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
-            if !self.forward_reached[bb_idx] {
-                continue;
-            }
-            for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
-                    continue;
-                };
-                let Some(referent) = borrowed_place_referent(&rvalue) else {
-                    continue;
-                };
-                if !self.place_refers_to_local(&referent, local) {
-                    continue;
-                }
-                match dest.kind {
-                    PlaceKind::Local(id) if owned.contains(&(id as usize)) => {}
-                    _ => return true,
-                }
-            }
-        }
-        for other in 0..self.body.locals.locals.len() {
-            if other == local || owned.contains(&other) {
-                continue;
-            }
-            if let Some(place) = self.atomic_ref_place.get(&other)
-                && self.place_refers_to_local(place, local)
-            {
-                return true;
-            }
-            if self
-                .pointer_place_of_local(other, 0)
-                .is_some_and(|place| self.place_refers_to_local(&place, local))
-                || self
-                    .argument_borrow_place(other)
-                    .is_some_and(|place| self.place_refers_to_local(&place, local))
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Locals that are this call's arguments, plus every local
-    /// [`pointer_place_of_local`] / [`argument_borrow_place`] follows to
-    /// name those arguments (`&mut x` then `x as *mut T`).
-    fn call_argument_address_locals(&self, arg_locals: &[Option<usize>]) -> Vec<usize> {
-        let mut owned: Vec<usize> = arg_locals.iter().copied().flatten().collect();
-        let mut i = 0;
-        while i < owned.len() {
-            let local = owned[i];
-            i += 1;
-            self.push_pointer_source_locals(local, &mut owned);
-        }
-        owned
-    }
-
-    fn push_pointer_source_locals(&self, local: usize, owned: &mut Vec<usize>) {
-        if let Some(place) = self.atomic_ref_place.get(&local) {
-            self.push_place_locals(place, owned);
-        }
-        if let Some(place) = self.argument_borrow_place(local) {
-            self.push_place_locals(&place, owned);
-        }
-        if let Some(place) = self.pointer_place_of_local(local, 0) {
-            self.push_place_locals(&place, owned);
-        }
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
-            if !self.forward_reached[bb_idx] {
-                continue;
-            }
-            for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
-                    continue;
-                };
-                let PlaceKind::Local(id) = dest.kind else {
-                    continue;
-                };
-                if id as usize != local {
-                    continue;
-                }
-                self.push_rvalue_source_locals(&rvalue, owned);
-            }
-        }
-    }
-
-    fn push_place_locals(&self, place: &Place, owned: &mut Vec<usize>) {
-        if let Some(id) = place_root_local(place)
-            && !owned.contains(&id)
-        {
-            owned.push(id);
-        }
-    }
-
-    fn push_rvalue_source_locals(&self, rvalue: &Rvalue, owned: &mut Vec<usize>) {
-        match rvalue {
-            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
-                self.push_place_locals(place, owned);
-            }
-            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => self.push_operand_locals(op, owned),
-            Rvalue::UnaryOp(op, operand) if unary_op_is_cast(op) => {
-                self.push_operand_locals(operand, owned);
-            }
-            _ => {}
-        }
-    }
-
-    fn push_operand_locals(&self, op: &Operand, owned: &mut Vec<usize>) {
-        match op {
-            Operand::Copy(place) | Operand::Move(place) => self.push_place_locals(place, owned),
-            Operand::Const(_) => {}
-        }
-    }
-
-    /// `place` names `local` after peeling `&mut *p` and one
-    /// [`pointer_place_of_local`] / [`argument_borrow_place`] step.
-    fn place_refers_to_local(&self, place: &Place, local: usize) -> bool {
-        let peeled = self.concrete_borrow_place(clone_place(place));
-        if place_root_local(&peeled) == Some(local) {
-            return true;
-        }
-        match &peeled.kind {
-            PlaceKind::Local(id) => {
-                let inner = *id as usize;
-                if inner == local {
-                    return true;
-                }
-                self.pointer_place_of_local(inner, 0)
-                    .or_else(|| self.argument_borrow_place(inner))
-                    .is_some_and(|named| place_root_local(&named) == Some(local))
-            }
-            PlaceKind::Projection(inner, elem) if projection_is_deref(elem) => {
-                if place_root_local(inner) == Some(local) {
-                    return true;
-                }
-                match inner.kind {
-                    PlaceKind::Local(id) => self
-                        .pointer_place_of_local(id as usize, 0)
-                        .or_else(|| self.argument_borrow_place(id as usize))
-                        .is_some_and(|named| place_root_local(&named) == Some(local)),
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+        id > self.arg_count && self.local_decl_is_primitive(id)
     }
 
     /// `pair = (q,)` with `q` naming the spilled place. The aggregate
@@ -1929,6 +2888,9 @@ impl<'a> Lowering<'a> {
                         )));
                     }
                 }
+            }
+            if !reload.free {
+                continue;
             }
             let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {

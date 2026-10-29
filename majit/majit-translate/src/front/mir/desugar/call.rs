@@ -8883,13 +8883,16 @@ impl<'a> Lowering<'a> {
             &resolved_call_args,
             &call.dest.ty,
         )?;
-        self.local_var[dest_local] = Some(match slice_next {
-            Some(LocalValue::SliceIter { items, .. }) => LocalValue::SliceIter {
-                items,
-                index: result_var.clone(),
-            },
-            _ => LocalValue::One(result_var.clone()),
-        });
+        let dest_is_cell = self.is_cell_local(dest_local);
+        if !dest_is_cell {
+            self.local_var[dest_local] = Some(match slice_next {
+                Some(LocalValue::SliceIter { items, .. }) => LocalValue::SliceIter {
+                    items,
+                    index: result_var.clone(),
+                },
+                _ => LocalValue::One(result_var.clone()),
+            });
+        }
         // A fat `&dyn` / `Box<dyn>` result is two words. Record it so
         // `front::dyn_fat` can splice the callee before the vtable word
         // is dropped on the one-word return.
@@ -8992,7 +8995,10 @@ impl<'a> Lowering<'a> {
         for owner in converted_window_owners {
             self.emit_keepalive(mir_bb, owner);
         }
-        if let Some(slot) = window_ret_slot {
+        if dest_is_cell {
+            self.emit_cell_store(mir_bb, dest_local, result_var.clone())?;
+        }
+        if !dest_is_cell && let Some(slot) = window_ret_slot {
             let len = self.emit_path_call(
                 mir_bb,
                 majit_ir::rvec::SLICE_LEN_SLOT_TAKE,
@@ -9031,7 +9037,7 @@ impl<'a> Lowering<'a> {
         // target class (`recast_result_root`). Identity at jitcode
         // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
         // the roots already match, so the Call dest is the value.
-        if let Some(root) = recast_result_root {
+        if !dest_is_cell && let Some(root) = recast_result_root {
             let narrowed = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);

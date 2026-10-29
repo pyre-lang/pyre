@@ -880,7 +880,7 @@ fn raise_merged_err_ctor(
     })?;
     let block_id = BlockId(block);
     for close in closes {
-        graph.push_op_var(block_id, close, true);
+        push_bracket_close(graph, block_id, close);
     }
     // The merged-continue payload's class is not known at this site.
     // A marked instance converts unless its own ops already name the class.
@@ -2278,7 +2278,7 @@ fn lower_result_exc_returns_inner(
             //
             // Before the raise: the order the guard's destructor runs in.
             for close in root_scope_closes {
-                graph.push_op_var(block_id, close, true);
+                push_bracket_close(graph, block_id, close);
             }
             if let Some(class_name) = raised_class.as_deref() {
                 raised = carry_raised_exception_class(graph, block_id, raised, class_name);
@@ -5224,7 +5224,7 @@ fn raise_returned_from_residual(
     // the raised carrier (`codewriter::error_carrier_edges`). Closes on
     // the tail run at the raise, the same way an `Err` shell does.
     for close in closes {
-        graph.push_op_var(block_id, close, true);
+        push_bracket_close(graph, block_id, close);
     }
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, carrier);
     Ok(())
@@ -5452,8 +5452,11 @@ fn rewire_one_option_ok_or_else_try_site(
         ));
     }
 
-    // One recorded result: a merged `ok_or_else` continue has to fail in
-    // planning, before this splice mutates, and the matcher reads the list.
+    // One recorded result. A merged continue whose other predecessors
+    // already carry `T` still diamonds (`continue_siblings_already_payload`);
+    // `rewire_merged_target` refuses `ok_or_else` and would leave ControlFlow
+    // in that Int phi. Other merged shapes still fail in planning, before
+    // this splice mutates.
     let recorded = [(site.result_var.clone(), None, site.payload_ty.clone())];
     let result_shape = rewire_one_call_site(
         graph,
@@ -5513,6 +5516,12 @@ fn rewire_one_option_ok_or_else_try_site(
         .find(|link| link.exitcase.is_none())
         .cloned()
         .expect("the Result diamond rewrite always installs one normal exit");
+    let exc = graph.blocks[a]
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_some())
+        .cloned()
+        .expect("the Result diamond rewrite always installs one exception exit");
 
     let mut carried = Vec::new();
     for arg in &normal.args {
@@ -5527,8 +5536,19 @@ fn rewire_one_option_ok_or_else_try_site(
     if !some_sources.contains(&opt) {
         some_sources.push(opt.clone().into_variable());
     }
+    let env_var = env.clone().into_variable();
+    let mut none_sources = vec![env_var.clone()];
+    if exc.target != graph.exceptblock && exc.args.len() >= 2 {
+        for arg in &exc.args[..exc.args.len() - 2] {
+            if let LinkArg::Value(v) = arg
+                && !none_sources.contains(v)
+            {
+                none_sources.push(v.clone());
+            }
+        }
+    }
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
-    let (none_bb, none_inputs) = graph.create_block_with_arg_vars(1);
+    let (none_bb, none_inputs) = graph.create_block_with_arg_vars(none_sources.len());
 
     let opt_in_some = map_source(&some_sources, &some_inputs, &opt)
         .expect("some_sources explicitly includes the Option value");
@@ -5572,7 +5592,8 @@ fn rewire_one_option_ok_or_else_try_site(
     .expect("some_sources contains every non-result value from the normal link");
     close_goto_mixed(graph, some_bb, normal.target, some_args);
 
-    let env_in_none = none_inputs[0].clone();
+    let env_in_none = map_source(&none_sources, &none_inputs, &env_var)
+        .expect("none_sources includes the ok_or_else closure");
     let error = emit_call_once(
         graph,
         none_bb,
@@ -5582,7 +5603,26 @@ fn rewire_one_option_ok_or_else_try_site(
         site.error_ty.clone(),
         "",
     );
-    crate::front::exc_from_raise::set_raise_from_instance(graph, none_bb, error);
+    if exc.target == graph.exceptblock {
+        crate::front::exc_from_raise::set_raise_from_instance(graph, none_bb, error);
+    } else {
+        // Keep the diamond's raise-edge closes (cell `RawFree` /
+        // `ScopedAlloc.__exit__`, root brackets) in front of the raise.
+        let mut raise_args: Vec<LinkArg> = Vec::new();
+        for arg in &exc.args[..exc.args.len() - 2] {
+            match arg {
+                LinkArg::Value(v) => {
+                    let mapped = map_source(&none_sources, &none_inputs, v)
+                        .expect("close var is in none_sources");
+                    raise_args.push(LinkArg::Value(mapped));
+                }
+                LinkArg::Const(c) => raise_args.push(LinkArg::Const(c.clone())),
+            }
+        }
+        raise_args.push(LinkArg::Value(error.clone()));
+        raise_args.push(LinkArg::Value(error));
+        close_goto_mixed(graph, none_bb, exc.target, raise_args);
+    }
 
     graph.blocks[a].operations.truncate(call_idx);
     let disc = graph.alloc_value_var();
@@ -5635,14 +5675,7 @@ fn rewire_one_option_ok_or_else_try_site(
                 },
             });
     }
-    graph.set_branch(
-        a_id,
-        disc,
-        some_bb,
-        some_sources,
-        none_bb,
-        vec![env.into_variable()],
-    );
+    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, none_sources);
     Ok(())
 }
 
@@ -8159,6 +8192,9 @@ fn rewire_one_call_site(
         if let Some(merge) = merged_forward_target(graph, a, r) {
             return rewire_merged_target(graph, merge, &calls, &name);
         }
+        // Close-chain acceptance before remint: a later decline must
+        // not leave `remint_call_as_payload`'s old identity on the goto.
+        accept_bracket_closes(&tail_closes, &name)?;
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
         let exc_link = raise_link_through_closes(graph, tail_closes, &name)?;
@@ -8392,7 +8428,22 @@ fn rewire_one_call_site(
     let continue_target = match &continue_link {
         Some(link) => {
             let continue_target = link.target;
-            if predecessor_exits(graph, continue_target.0).len() != 1 {
+            // `rewire_merged_target` / `plan_question_diamond` refuse an
+            // `ok_or_else` producer, so a shared continue would otherwise
+            // leave the residual `?`. When every other predecessor already
+            // carries `T` in the payload slots (inner-loop `rep: i64`
+            // joining the `?` continue), this edge can join that phi
+            // directly — collapsing `__pos_0` is a no-op when the header
+            // uses the slot as the payload (`ssa.py` one value per path).
+            if predecessor_exits(graph, continue_target.0).len() != 1
+                && !continue_siblings_already_payload(
+                    graph,
+                    continue_target,
+                    c,
+                    &payload_positions,
+                    &calls,
+                )
+            {
                 return rewire_merged_target(graph, continue_target, &calls, &name);
             }
             continue_target
@@ -8407,6 +8458,12 @@ fn rewire_one_call_site(
         let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
         assert_question_plumbing_pure(graph, c, &recognized, "discriminant", &name)?;
     }
+    // Close-chain acceptance and `__pos_0` collapse can still decline.
+    // Remint only after those checks: `op.result = Some(r.copy())` would
+    // otherwise leave the old identity on the goto (`FreshMallocs`).
+    // Cell `RawFree` (`ScopedAlloc.__exit__`) is a close here, same as
+    // a shadow-stack Call.
+    accept_bracket_closes(&break_closes_a, &name)?;
     for pos in payload_positions {
         let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
     }
@@ -8415,6 +8472,7 @@ fn rewire_one_call_site(
     // payload at every phi (`exceptiontransform` / `jtransform` keep
     // the normal-edge value off the shell).
     let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+    let exc_link = raise_link_through_closes(graph, break_closes_a, &name)?;
     for arg in &mut normal_args {
         if let LinkArg::Value(v) = arg
             && *v == *r
@@ -8428,7 +8486,6 @@ fn rewire_one_call_site(
     // (`flowspace/model.py` `Link.last_exception` pair; `flatten.rs`
     // turns the `[last_exception, last_exc_value]` propagation shape
     // into the rethrow tail).
-    let exc_link = raise_link_through_closes(graph, break_closes_a, &name)?;
     {
         let block_a = &mut graph.blocks[a];
         block_a.exitswitch = Some(ExitSwitch::LastException);
@@ -8541,6 +8598,72 @@ fn materialize_call_arg_constant(graph: &mut FunctionGraph, bb: BlockId, c: &Con
     var
 }
 
+/// Close-chain acceptance for [`raise_link_through_closes`]: every close
+/// is a Call or `RawFree`. Callers run this before remint so a decline
+/// leaves the call result in place.
+fn accept_bracket_closes(closes: &[OpKind], name: &str) -> Result<(), String> {
+    for close in closes {
+        close_value_vars(close, name)?;
+    }
+    Ok(())
+}
+
+/// Variables a raise-edge close still names. RootScope closes are Calls;
+/// a call-scoped raw cell is `RawFree` (`ScopedAlloc.__exit__`).
+fn close_value_vars(close: &OpKind, name: &str) -> Result<Vec<Variable>, String> {
+    match close {
+        OpKind::Call { args, .. } => Ok(args
+            .iter()
+            .filter_map(|arg| arg.as_variable().cloned())
+            .collect()),
+        OpKind::RawFree { ptr } => Ok(vec![ptr.clone()]),
+        other => Err(format!(
+            "{name}: a bracket close is not a call or RawFree ({other:?})"
+        )),
+    }
+}
+
+fn remap_close_onto_raise(
+    graph: &mut FunctionGraph,
+    close: OpKind,
+    close_vars: &[Variable],
+    r_inputs: &[Variable],
+    r_id: BlockId,
+    name: &str,
+) -> Result<OpKind, String> {
+    let map_var = |v: &Variable| {
+        let pos = close_vars
+            .iter()
+            .position(|x| x == v)
+            .expect("collected above");
+        r_inputs[pos].clone()
+    };
+    match close {
+        OpKind::RawFree { ptr } => Ok(OpKind::RawFree { ptr: map_var(&ptr) }),
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+        } => {
+            let args: Vec<Variable> = args
+                .into_iter()
+                .map(|arg| match arg {
+                    LinkArg::Value(v) => map_var(&v),
+                    LinkArg::Const(c) => materialize_call_arg_constant(graph, r_id, &c),
+                })
+                .collect();
+            Ok(OpKind::Call {
+                target,
+                args: crate::model::call_args(args),
+                result_ty,
+            })
+        }
+        other => Err(format!(
+            "{name}: a bracket close is not a call or RawFree ({other:?})"
+        )),
+    }
+}
+
 /// The exception link of a call whose raise must first run `closes`, the
 /// bracket closes (in the call block's namespace) its normal return runs.
 /// Without closes the link goes straight to `exceptblock`; with them it goes
@@ -8550,6 +8673,7 @@ fn raise_link_through_closes(
     closes: Vec<OpKind>,
     name: &str,
 ) -> Result<Link, String> {
+    accept_bracket_closes(&closes, name)?;
     let va = graph.alloc_value_var();
     let vb = graph.alloc_value_var();
     // `exception_exitcase()` marks the link catch-all
@@ -8564,17 +8688,9 @@ fn raise_link_through_closes(
     } else {
         let mut close_vars: Vec<Variable> = Vec::new();
         for close in &closes {
-            let OpKind::Call { args, .. } = close else {
-                return Err(format!("{name}: a bracket close is not a call"));
-            };
-            // Link.args carry Variables. A recast close keeps the
-            // class root as `LinkArg::Const` (`cast_instance_call`);
-            // rematerialise it on the raise block (`emit_constant`).
-            for arg in args {
-                if let Some(var) = arg.as_variable()
-                    && !close_vars.contains(var)
-                {
-                    close_vars.push(var.clone());
+            for var in close_value_vars(close, name)? {
+                if !close_vars.contains(&var) {
+                    close_vars.push(var);
                 }
             }
         }
@@ -8586,36 +8702,9 @@ fn raise_link_through_closes(
             copy_concretetype(src, input);
         }
         for close in closes {
-            let OpKind::Call {
-                target,
-                args,
-                result_ty,
-            } = close
-            else {
-                unreachable!("checked above");
-            };
-            let args: Vec<Variable> = args
-                .iter()
-                .map(|arg| match arg {
-                    LinkArg::Value(v) => {
-                        let pos = close_vars
-                            .iter()
-                            .position(|x| x == v)
-                            .expect("collected above");
-                        r_inputs[pos].clone()
-                    }
-                    LinkArg::Const(c) => materialize_call_arg_constant(graph, r_id, c),
-                })
-                .collect();
-            graph.push_op_var(
-                r_id,
-                OpKind::Call {
-                    target,
-                    args: crate::model::call_args(args),
-                    result_ty,
-                },
-                true,
-            );
+            let remapped =
+                remap_close_onto_raise(graph, close, &close_vars, &r_inputs, r_id, name)?;
+            push_bracket_close(graph, r_id, remapped);
         }
         // `r_inputs[n + 1]` is the caught value, a block input. It may be
         // the carrier. This planner does not know a minted class, so the
@@ -12178,12 +12267,31 @@ pub(crate) fn build_shell(
     shell
 }
 
+/// RootScope closes are Calls (they produce a result). A call-scoped
+/// raw-cell `RawFree` is the same lifetime close and has no result.
+fn close_has_result(kind: &OpKind) -> bool {
+    matches!(kind, OpKind::Call { .. })
+}
+
+fn push_bracket_close(graph: &mut FunctionGraph, block: BlockId, close: OpKind) {
+    let has_result = close_has_result(&close);
+    graph.push_op_var(block, close, has_result);
+}
+
 fn remap_root_scope_close_through_links(
     graph: &FunctionGraph,
     close: &OpKind,
     hops: &[(usize, &Link)],
     name: &str,
 ) -> Result<OpKind, String> {
+    if let OpKind::RawFree { ptr } = close {
+        let remapped =
+            remap_close_arg_through_links(graph, &LinkArg::Value(ptr.clone()), hops, name)?;
+        let Some(ptr) = remapped.as_variable() else {
+            return Err(format!("{name}: RawFree ptr is not a value"));
+        };
+        return Ok(OpKind::RawFree { ptr: ptr.clone() });
+    }
     let OpKind::Call {
         target,
         args,
@@ -12194,44 +12302,53 @@ fn remap_root_scope_close_through_links(
     };
     let mut remapped = Vec::with_capacity(args.len());
     for arg in args {
-        let mut current = arg.clone();
-        if let Some(&(target_block, _)) = hops.first() {
-            current = peel_recast_to_source(graph, target_block, current);
-        }
-        for &(target_block, link) in hops {
-            if link.target.0 != target_block {
-                return Err(format!("{name}: forwarding link targets the wrong block"));
-            }
-            let Some(pos) = graph.blocks[target_block]
-                .inputargs
-                .iter()
-                .position(|v| *v == current)
-            else {
-                // Not this block's input and not produced here: the close
-                // names a variable that already reaches the producer.
-                let local = graph.blocks[target_block]
-                    .operations
-                    .iter()
-                    .any(|op| op.result.as_ref() == current.as_variable());
-                if local {
-                    return Err(format!(
-                        "{name}: close argument is not forwarded in block {target_block}"
-                    ));
-                }
-                break;
-            };
-            current = match link.args.get(pos) {
-                Some(LinkArg::Value(v)) => v.clone().into(),
-                _ => return Err(format!("{name}: close argument is not a value")),
-            };
-        }
-        remapped.push(current);
+        remapped.push(remap_close_arg_through_links(graph, arg, hops, name)?);
     }
     Ok(OpKind::Call {
         target: target.clone(),
         args: remapped,
         result_ty: result_ty.clone(),
     })
+}
+
+fn remap_close_arg_through_links(
+    graph: &FunctionGraph,
+    arg: &LinkArg,
+    hops: &[(usize, &Link)],
+    name: &str,
+) -> Result<LinkArg, String> {
+    let mut current = arg.clone();
+    if let Some(&(target_block, _)) = hops.first() {
+        current = peel_recast_to_source(graph, target_block, current);
+    }
+    for &(target_block, link) in hops {
+        if link.target.0 != target_block {
+            return Err(format!("{name}: forwarding link targets the wrong block"));
+        }
+        let Some(pos) = graph.blocks[target_block]
+            .inputargs
+            .iter()
+            .position(|v| *v == current)
+        else {
+            // Not this block's input and not produced here: the close
+            // names a variable that already reaches the producer.
+            let local = graph.blocks[target_block]
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == current.as_variable());
+            if local {
+                return Err(format!(
+                    "{name}: close argument is not forwarded in block {target_block}"
+                ));
+            }
+            break;
+        };
+        current = match link.args.get(pos) {
+            Some(LinkArg::Value(v)) => v.clone().into(),
+            _ => return Err(format!("{name}: close argument is not a value")),
+        };
+    }
+    Ok(current)
 }
 
 /// Probe: does `var` flow from `block`'s exit through pure positional
@@ -12279,7 +12396,8 @@ fn forwards_to_returnblock_inner(
             // the Ok path keeps the forwarding block, the Err path re-emits
             // it at the raise with the RootScope closes.
             let is_keepalive_or_nop = |op: &SpaceOperation| {
-                op_is_keepalive_until_here(&op.kind) || matches!(op.kind, OpKind::ConstNone)
+                op_is_keepalive_until_here(&op.kind)
+                    || matches!(op.kind, OpKind::ConstNone | OpKind::RawFree { .. })
             };
             let carries_work = if past_bracket_closes {
                 !b.operations.iter().all(|op| {
@@ -14672,6 +14790,48 @@ fn sibling_link_passes_pending(
                 )
         })
     })
+}
+
+/// True when every predecessor of `continue_target` other than
+/// `continue_source` already carries a payload (`SlotAction::Ready`) in
+/// each ControlFlow slot. The residual `?` can then join that phi with
+/// `T` instead of going through [`rewire_merged_target`], which refuses
+/// an `ok_or_else` producer (`plan_question_diamond`).
+fn continue_siblings_already_payload(
+    graph: &FunctionGraph,
+    continue_target: crate::model::BlockId,
+    continue_source: usize,
+    payload_positions: &[usize],
+    results: &[ResultExcCall],
+) -> bool {
+    if payload_positions.is_empty() {
+        return false;
+    }
+    let incoming = predecessor_exits(graph, continue_target.0);
+    if incoming.iter().all(|(src, _)| *src == continue_source) {
+        return false;
+    }
+    for (source, exit_index) in incoming {
+        if source == continue_source {
+            continue;
+        }
+        let link = &graph.blocks[source].exits[exit_index];
+        for &pos in payload_positions {
+            let Some(arg) = link.args.get(pos) else {
+                return false;
+            };
+            match arg {
+                LinkArg::Const(_) => {}
+                LinkArg::Value(value) => {
+                    match classify_slot_value(graph, source, value, results, 0) {
+                        Ok(SlotAction::Ready) => {}
+                        _ => return false,
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Rewrite every link into `target` so a shell slot carries `T`.
@@ -19049,6 +19209,55 @@ mod option_ok_or_else_try_tests {
         reachable
     }
 
+    fn assert_link_args_are_op_result_or_inputarg(graph: &FunctionGraph) {
+        use std::collections::HashSet;
+        let mut defined = HashSet::new();
+        for block in &graph.blocks {
+            defined.extend(block.inputargs.iter().cloned());
+            for op in &block.operations {
+                if let Some(var) = &op.result {
+                    defined.insert(var.clone());
+                }
+            }
+        }
+        for block in &graph.blocks {
+            for (ei, link) in block.exits.iter().enumerate() {
+                for (ai, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(var) = arg else {
+                        continue;
+                    };
+                    assert!(
+                        defined.contains(var),
+                        "block {} exit[{ei}] args[{ai}] -> {} is not an op result or inputarg",
+                        block.id.0,
+                        link.target.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// Continue of `ok_or_else()?` joins a loop header whose other
+    /// predecessor already carries `T`. The header has no `__pos_0`:
+    /// the slot is the payload (`_orig_parse_format` inner-loop `rep`).
+    fn ok_or_else_try_loop_header_already_payload() -> (FunctionGraph, OptionOkOrElseTrySite) {
+        let (mut graph, site) = ok_or_else_try_diamond();
+        let a = graph.startblock.0;
+        let b = graph.blocks[a].exits[0].target.0;
+        let c = graph.blocks[b].exits[0].target.0;
+        let cont = graph.blocks[c].exits[0].target;
+        graph.blocks[cont.0].operations.clear();
+        let payload_in = graph.blocks[cont.0].inputargs[0].clone();
+        let extra_in = graph.blocks[cont.0].inputargs[1].clone();
+        let (sib, sib_ins) = graph.create_block_with_arg_vars(2);
+        let sib_int = graph
+            .push_op_var(sib, OpKind::ConstInt(1), true)
+            .expect("sibling Int");
+        graph.set_goto(sib, cont, vec![sib_int, sib_ins[1].clone()]);
+        graph.set_goto(cont, sib, vec![payload_in, extra_in]);
+        (graph, site)
+    }
+
     fn leftover_from_residual_or_break(graph: &FunctionGraph) -> Vec<String> {
         let reachable = reachable_blocks(graph);
         let mut hits = Vec::new();
@@ -19127,6 +19336,188 @@ mod option_ok_or_else_try_tests {
             !leftover_ok_or_else,
             "FunctionPath ok_or_else `?` left the residual call"
         );
+    }
+
+    /// `_orig_parse_format`: the `?` continue shares a loop header with
+    /// an Int `rep`. `rewire_merged_target` refuses `ok_or_else`, so the
+    /// private diamond must join that phi with `T` (`ssa.py`).
+    #[test]
+    fn ok_or_else_try_merged_loop_header_joins_int_phi() {
+        let (mut graph, site) = ok_or_else_try_loop_header_already_payload();
+        let a = graph.startblock.0;
+        let b = graph.blocks[a].exits[0].target.0;
+        let c = graph.blocks[b].exits[0].target.0;
+        let cont = graph.blocks[c].exits[0].target;
+        rewire_one_option_ok_or_else_try_site(&mut graph, &site, false)
+            .expect("merged-continue ok_or_else `?` diamonds when siblings already carry T");
+        assert_link_args_defined(&graph);
+        assert_link_args_are_op_result_or_inputarg(&graph);
+        let leftover = leftover_from_residual_or_break(&graph);
+        assert!(
+            leftover.is_empty(),
+            "merged-continue ok_or_else `?` left from_residual / ControlFlow Break: {leftover:?}"
+        );
+        let leftover_ok_or_else = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if call_target_is_ok_or_else(target)
+                )
+            })
+        });
+        assert!(
+            !leftover_ok_or_else,
+            "merged-continue ok_or_else `?` left the residual call"
+        );
+        let reachable = reachable_blocks(&graph);
+        for (si, src) in graph.blocks.iter().enumerate() {
+            if !reachable[si] {
+                continue;
+            }
+            for link in &src.exits {
+                if link.target != cont {
+                    continue;
+                }
+                for arg in &link.args {
+                    let LinkArg::Value(var) = arg else {
+                        continue;
+                    };
+                    assert!(
+                        !is_branch_result(&graph, var),
+                        "reachable continue into the loop header still carries ControlFlow"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cell `RawFree` on the `?` break-arm tail is a lifetime close
+    /// (`ScopedAlloc.__exit__`). The raise edge must re-emit it; declining
+    /// would remint the call and leave the residual `?` for the combinator.
+    fn ok_or_else_try_raw_free_on_break() -> (FunctionGraph, OptionOkOrElseTrySite) {
+        let (mut graph, site) = ok_or_else_try_diamond();
+        let a = graph.startblock.0;
+        let b = graph.blocks[a].exits[0].target.0;
+        let c = graph.blocks[b].exits[0].target.0;
+        let brk = graph.blocks[c].exits[1].target;
+        let extra_c = graph.blocks[c].inputargs[1].clone();
+        let cell_brk = graph.alloc_value_var();
+        graph.blocks[brk.0].inputargs.push(cell_brk.clone());
+        graph.blocks[c].exits[1].args.push(LinkArg::Value(extra_c));
+        let residual = match &graph.blocks[brk.0].exits[0].args[0] {
+            LinkArg::Value(v) => v.clone(),
+            LinkArg::Const(_) => panic!("break arm returns a value"),
+        };
+        let (free_hop, free_ins) = graph.create_block_with_arg_vars(2);
+        graph.blocks[free_hop.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::RawFree {
+                ptr: free_ins[1].clone(),
+            },
+        });
+        graph.set_return(free_hop, Some(free_ins[0].clone()));
+        graph.set_goto(brk, free_hop, vec![residual, cell_brk]);
+        (graph, site)
+    }
+
+    #[test]
+    fn ok_or_else_try_replays_raw_free_on_the_raise_edge() {
+        let (mut graph, site) = ok_or_else_try_raw_free_on_break();
+        rewire_one_option_ok_or_else_try_site(&mut graph, &site, false)
+            .expect("ok_or_else `?` with cell RawFree on the break arm rewires");
+        assert_link_args_defined(&graph);
+        assert_link_args_are_op_result_or_inputarg(&graph);
+        let leftover = leftover_from_residual_or_break(&graph);
+        assert!(
+            leftover.is_empty(),
+            "RawFree break-arm ok_or_else `?` left from_residual / ControlFlow Break: {leftover:?}"
+        );
+        let reachable = reachable_blocks(&graph);
+        let raw_free_on_raise = graph.blocks.iter().enumerate().any(|(bi, block)| {
+            reachable[bi]
+                && block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::RawFree { .. }))
+                && block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+        });
+        assert!(
+            raw_free_on_raise,
+            "the raise edge must re-emit the cell RawFree"
+        );
+    }
+
+    /// A `?` break-arm hop that is not a Call or `RawFree` close declines
+    /// the try-site. Remint must not have run: the call still defines
+    /// `site.result_var`, and every `Link.args` Variable still has a def.
+    fn ok_or_else_try_unrecognized_close_on_break() -> (FunctionGraph, OptionOkOrElseTrySite) {
+        let (mut graph, site) = ok_or_else_try_diamond();
+        let a = graph.startblock.0;
+        let b = graph.blocks[a].exits[0].target.0;
+        let c = graph.blocks[b].exits[0].target.0;
+        let brk = graph.blocks[c].exits[1].target;
+        let extra_c = graph.blocks[c].inputargs[1].clone();
+        let cell_brk = graph.alloc_value_var();
+        graph.blocks[brk.0].inputargs.push(cell_brk.clone());
+        graph.blocks[c].exits[1].args.push(LinkArg::Value(extra_c));
+        let residual = match &graph.blocks[brk.0].exits[0].args[0] {
+            LinkArg::Value(v) => v.clone(),
+            LinkArg::Const(_) => panic!("break arm returns a value"),
+        };
+        let (hop, hop_ins) = graph.create_block_with_arg_vars(2);
+        graph.blocks[hop.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: hop_ins[1].clone(),
+                field: FieldDescriptor::new("__pos_0", Some("test::Slot".into())),
+                value: LinkArg::Value(hop_ins[1].clone()),
+                ty: ValueType::Int,
+            },
+        });
+        graph.set_return(hop, Some(hop_ins[0].clone()));
+        graph.set_goto(brk, hop, vec![residual, cell_brk]);
+        (graph, site)
+    }
+
+    #[test]
+    fn declined_ok_or_else_try_site_does_not_remint() {
+        let (mut graph, site) = ok_or_else_try_unrecognized_close_on_break();
+        let a = graph.startblock.0;
+        let call_result_before = graph.blocks[a]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, .. } if call_target_is_ok_or_else(target) => {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("ok_or_else");
+        assert_eq!(call_result_before, site.result_var);
+        let err = rewire_one_option_ok_or_else_try_site(&mut graph, &site, false);
+        assert!(
+            err.is_err(),
+            "unrecognized break-arm close must decline the try-site"
+        );
+        let call_result_after = graph.blocks[a]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, .. } if call_target_is_ok_or_else(target) => {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .expect("ok_or_else still present");
+        assert_eq!(
+            call_result_after, call_result_before,
+            "declined try-site must not remint the call result"
+        );
+        assert_link_args_defined(&graph);
+        assert_link_args_are_op_result_or_inputarg(&graph);
     }
 }
 

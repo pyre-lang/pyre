@@ -9,10 +9,17 @@
 //!
 //! A byte pointer stays `Ref`: pyre erases a GC reference to `*mut u8`.
 //!
-//! A call that passes `&` / `&mut` of a primitive into a raw
-//! scalar-pointer parameter materializes an address first
-//! (`RawMalloc` / `RawStore` / `RawFree`). `history.py` `getkind` banks
-//! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
+//! A call that passes `&` / `&mut` of a function-local primitive into a
+//! raw scalar-pointer parameter uses one Char-varsize cell for that
+//! local's storage scope (`scoped_alloc` / `OS_RAW_MALLOC_VARSIZE_CHAR`).
+//! Reads are `raw_load`, writes `raw_store`, and the address is the cell
+//! pointer. A residual `&T` of a parameter or field uses one extra
+//! Char-varsize cell for the enclosing function (`ScopedAlloc` of caller
+//! storage), freed on every modeled exit. A raw `*const T` of a
+//! parameter or projection still materializes a per-call `Tuple<i64>`
+//! address (`RawMalloc` / `RawStore` / `RawFree`).
+//! `history.py` `getkind` banks that parameter as `int`, and `Rvalue::Ref`
+//! of a non-cell aliases the pointee word.
 //! Two borrows of one place share that address. A raw pointer of that
 //! place uses the same address. A raw pointer with no referent is not
 //! lowered. A raw pointer taken while its local is still clean reloads
@@ -1223,6 +1230,272 @@ fn shared_borrow_of_i64_into_const_pointer_is_not_copied_out() {
     assert_address_spill(&graph, false, false);
 }
 
+/// Inlined wrapper `fwd(key: &i64)` forwards that parameter to a
+/// residual `leaf(key: &i64)`. The residual ABI publishes `&i64` as a
+/// pointer, so the operand (the Int word) is stored in a function-scope
+/// Char-varsize cell (`scoped_alloc`) and the cell address is passed.
+#[test]
+fn inlined_wrapper_forwards_i64_ref_to_residual_as_raw_cell() {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let key_ty = borrow_ty(&word, "Shared");
+    let wrapper_locals = vec![
+        local(0, None, &word),
+        local(1, Some("key"), &key_ty),
+        local(2, None, &word),
+    ];
+    let wrapper = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "fwd"]),
+        "signature": {"is_unsafe": false, "inputs": [key_ty.clone()], "output": word.clone()},
+        "body": {"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": wrapper_locals}, "body": [
+            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Copy": place(1, &key_ty)}], "dest": place(2, &word)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}
+    });
+    let leaf = json!({
+        "def_id": 1,
+        "item_meta": meta(&["probe", "leaf"]),
+        "signature": {"is_unsafe": false, "inputs": [key_ty], "output": word},
+        "body": Value::Null
+    });
+    let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
+        "crate_name": "probe", "type_decls": [], "fun_decls": [wrapper, leaf],
+        "global_decls": [], "trait_decls": [], "trait_impls": []
+    }});
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("wrapper fixture parses");
+    let graph = lower_function(&llbc, "fwd").unwrap_or_else(|err| panic!("lower fwd: {err}"));
+    let key = input_var(&graph, "key");
+    match ops(&graph).find_map(|op| match &op.kind {
+        OpKind::Input { name, ty, .. } if name == "key" => Some(ty),
+        _ => None,
+    }) {
+        Some(ValueType::Int) => {}
+        other => panic!("wrapper `&i64` param is the Int word, got {other:?}"),
+    }
+    assert_function_scope_char_cell(&graph, &key, "leaf", 8);
+}
+
+/// Specialized `&i64` is the Int word. The residual still takes `&i64`.
+#[test]
+fn inlined_wrapper_forwards_i64_value_to_residual_ref_as_raw_cell() {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let key_ty = borrow_ty(&word, "Shared");
+    let wrapper_locals = vec![
+        local(0, None, &word),
+        local(1, Some("key"), &word),
+        local(2, None, &word),
+    ];
+    let wrapper = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "fwd_val"]),
+        "signature": {"is_unsafe": false, "inputs": [word.clone()], "output": word.clone()},
+        "body": {"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": wrapper_locals}, "body": [
+            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Copy": place(1, &word)}], "dest": place(2, &word)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}
+    });
+    let leaf = json!({
+        "def_id": 1,
+        "item_meta": meta(&["probe", "leaf"]),
+        "signature": {"is_unsafe": false, "inputs": [key_ty], "output": word},
+        "body": Value::Null
+    });
+    let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
+        "crate_name": "probe", "type_decls": [], "fun_decls": [wrapper, leaf],
+        "global_decls": [], "trait_decls": [], "trait_impls": []
+    }});
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("wrapper fixture parses");
+    let graph =
+        lower_function(&llbc, "fwd_val").unwrap_or_else(|err| panic!("lower fwd_val: {err}"));
+    let key = input_var(&graph, "key");
+    match ops(&graph).find_map(|op| match &op.kind {
+        OpKind::Input { name, ty, .. } if name == "key" => Some(ty),
+        _ => None,
+    }) {
+        Some(ValueType::Int) => {}
+        other => panic!("wrapper i64 param is the Int word, got {other:?}"),
+    }
+    assert_function_scope_char_cell(&graph, &key, "leaf", 8);
+}
+
+/// Sibling `&Ctx` is not the cell. The raw-pointer alias walk would treat
+/// any other reference as a packing of the spill address.
+#[test]
+fn inlined_wrapper_forwards_i64_ref_beside_another_ref_as_raw_cell() {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let key_ty = borrow_ty(&word, "Shared");
+    let ctx_ty = adt_ty(0, vec![]);
+    let ctx_ref = borrow_ty(&ctx_ty, "Shared");
+    let wrapper_locals = vec![
+        local(0, None, &word),
+        local(1, Some("key"), &key_ty),
+        local(2, Some("ctx"), &ctx_ref),
+        local(3, None, &word),
+    ];
+    let wrapper = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "fwd"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [key_ty.clone(), ctx_ref.clone()],
+            "output": word.clone()
+        },
+        "body": {"Unstructured": {"span": span, "locals": {"arg_count": 2, "locals": wrapper_locals}, "body": [
+            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [
+                        {"Copy": place(1, &key_ty)},
+                        {"Copy": place(2, &ctx_ref)}
+                    ], "dest": place(3, &word)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": place(3, &word)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}
+    });
+    let leaf = json!({
+        "def_id": 1,
+        "item_meta": meta(&["probe", "leaf"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [key_ty, ctx_ref.clone()],
+            "output": word
+        },
+        "body": Value::Null
+    });
+    let ctx_decl = named_decl(
+        0,
+        &["probe", "Ctx"],
+        json!({"Struct": [field_decl("0", &word)]}),
+    );
+    let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
+        "crate_name": "probe", "type_decls": [ctx_decl], "fun_decls": [wrapper, leaf],
+        "global_decls": [], "trait_decls": [], "trait_impls": []
+    }});
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("wrapper fixture parses");
+    let graph = lower_function(&llbc, "fwd").unwrap_or_else(|err| panic!("lower fwd: {err}"));
+    let key = input_var(&graph, "key");
+    let ctx = input_var(&graph, "ctx");
+    assert_function_scope_char_cell(&graph, &key, "leaf", 8);
+    let mut leaf_call = None;
+    for op in ops(&graph) {
+        let OpKind::Call { target, .. } = &op.kind else {
+            continue;
+        };
+        if call_leaf(target) == Some("leaf") {
+            assert!(leaf_call.is_none(), "two leaf calls\n{}", op_lines(&graph));
+            leaf_call = Some(&op.kind);
+        }
+    }
+    let call = leaf_call.unwrap_or_else(|| panic!("missing leaf\n{}", op_lines(&graph)));
+    assert_eq!(
+        call_arg(call, 1),
+        ctx,
+        "sibling `&Ctx` stays the object word\n{}",
+        op_lines(&graph)
+    );
+}
+
+/// Residual `&i64` of a struct field: no local storage scope, so the
+/// Char-varsize cell lives until function exit (`scoped_alloc` of caller
+/// storage). An opaque callee may stash the address.
+#[test]
+fn opaque_residual_ref_of_struct_field_uses_function_scope_cell() {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let empty_g = generics.clone();
+    let pair_ty = json!({"Adt": {"id": 0, "generics": empty_g}});
+    let borrowed = borrow_ty(&word, "Shared");
+    let field = json!({
+        "kind": {"Projection": [place(1, &pair_ty), {"Field": [null, 0]}]},
+        "ty": word
+    });
+    let borrow = place(2, &borrowed);
+    let pair_decl = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "Pair"]),
+        "kind": {"Struct": [{"name": "word", "ty": word, "attr_info": null}]}
+    });
+    let caller = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "write_hash"]),
+        "signature": {"is_unsafe": false, "inputs": [pair_ty.clone()], "output": ret.clone()},
+        "body": {"Unstructured": {"span": span, "locals": {"arg_count": 1, "locals": [
+            local(0, None, &ret),
+            local(1, Some("pair"), &pair_ty),
+            local(2, None, &borrowed),
+            local(3, None, &ret)
+        ]}, "body": [
+            {"statements": [
+                {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                    "place": field, "kind": "Shared", "ptr_metadata": null
+                }}]}}
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Move": borrow}], "dest": place(3, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(3, &ret)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}
+    });
+    let leaf = json!({
+        "def_id": 1,
+        "item_meta": meta(&["probe", "leaf"]),
+        "signature": {"is_unsafe": false, "inputs": [borrowed], "output": ret},
+        "body": Value::Null
+    });
+    let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
+        "crate_name": "probe", "type_decls": [pair_decl], "fun_decls": [caller, leaf],
+        "global_decls": [], "trait_decls": [], "trait_impls": []
+    }});
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("field fixture parses");
+    let graph =
+        lower_function(&llbc, "write_hash").unwrap_or_else(|err| panic!("lower write_hash: {err}"));
+    let pair = input_var(&graph, "pair");
+    let reads = raw_ops(&graph, |kind| matches!(kind, OpKind::FieldRead { .. }));
+    assert_eq!(reads.len(), 1, "one field read\n{}", op_lines(&graph));
+    let read_var = reads[0].result.as_ref().expect("FieldRead result");
+    match &reads[0].kind {
+        OpKind::FieldRead {
+            base,
+            field,
+            ty: ValueType::Int,
+            ..
+        } if base == pair
+            && field.name == "word"
+            && field.owner_root.as_deref() == Some("Pair") => {}
+        other => panic!("the cell stores pair.word, got {other:?}"),
+    }
+    assert_function_scope_char_cell(&graph, read_var, "leaf", 8);
+}
+
 #[test]
 fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
     let i64_ty = i64_ty();
@@ -1476,18 +1749,165 @@ fn lower_two_borrows(alias: BorrowAlias) -> FunctionGraph {
 }
 
 fn malloc_ptrs(graph: &FunctionGraph) -> Vec<majit_translate::flowspace::model::Variable> {
-    raw_ops(graph, |kind| matches!(kind, OpKind::RawMalloc { .. }))
-        .into_iter()
-        .map(|op| {
-            match &op.kind {
-                OpKind::RawMalloc {
-                    owner, zero: false, ..
-                } if owner == "Tuple<i64>" => {}
-                other => panic!("spill owner is Tuple<i64>, got {other:?}"),
-            }
-            op.result.clone().expect("RawMalloc result")
+    raw_ops(graph, |kind| {
+        matches!(
+            kind,
+            OpKind::RawMalloc {
+                owner,
+                zero: false,
+                ..
+            } if owner == "Tuple<i64>"
+        )
+    })
+    .into_iter()
+    .map(|op| op.result.clone().expect("RawMalloc result"))
+    .collect()
+}
+
+fn cell_malloc_ptrs(graph: &FunctionGraph) -> Vec<majit_translate::flowspace::model::Variable> {
+    raw_ops(graph, |kind| {
+        matches!(
+            kind,
+            OpKind::RawMalloc {
+                owner,
+                length: Some(_),
+                zero: false,
+                ..
+            } if owner == "Array(Char)"
+        )
+    })
+    .into_iter()
+    .map(|op| op.result.clone().expect("RawMalloc result"))
+    .collect()
+}
+
+/// Residual `&T` of a parameter or field: one Char-varsize cell malloc'd
+/// on entry, stored before the residual call, not freed until function
+/// exit (`scoped_alloc`).
+fn assert_function_scope_char_cell(
+    graph: &FunctionGraph,
+    stored: &majit_translate::flowspace::model::Variable,
+    callee: &str,
+    itemsize: u64,
+) {
+    let ptrs = cell_malloc_ptrs(graph);
+    assert_eq!(ptrs.len(), 1, "one Char-varsize cell\n{}", op_lines(graph));
+    let ptr = &ptrs[0];
+    assert_eq!(malloc_length(graph, ptr), itemsize);
+    let malloc_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(ptr))
         })
-        .collect()
+        .expect("cell malloc block");
+    assert_eq!(
+        malloc_block.id,
+        graph.startblock,
+        "the cell is allocated on function entry\n{}",
+        op_lines(graph)
+    );
+    let stores = raw_ops(graph, |kind| matches!(kind, OpKind::RawStore { .. }));
+    assert!(
+        stores.iter().any(|op| match &op.kind {
+            OpKind::RawStore {
+                base,
+                value,
+                itemsize: store_size,
+                is_item_signed: true,
+                ..
+            } if base == ptr && value == stored && *store_size as u64 == itemsize => true,
+            _ => false,
+        }),
+        "the aliased word is stored into the cell\n{}",
+        op_lines(graph)
+    );
+    let mut leaf_call = None;
+    for op in ops(graph) {
+        let OpKind::Call { target, .. } = &op.kind else {
+            continue;
+        };
+        if call_leaf(target) == Some(callee) {
+            assert!(
+                leaf_call.is_none(),
+                "two {callee} calls\n{}",
+                op_lines(graph)
+            );
+            leaf_call = Some(&op.kind);
+        }
+    }
+    let call = leaf_call.unwrap_or_else(|| panic!("missing {callee}\n{}", op_lines(graph)));
+    match root_op(graph, call_arg(call, 0)) {
+        Some(OpKind::RawMalloc { owner, .. }) if owner == "Array(Char)" => {}
+        other => panic!(
+            "residual `&T` receives the cell address, got {other:?}\n{}",
+            op_lines(graph)
+        ),
+    }
+    let call_block = call_block_of(graph, call);
+    let call_at = call_block
+        .operations
+        .iter()
+        .position(|op| std::ptr::eq(&op.kind, call))
+        .expect("call");
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the cell is not freed right after the call\n{}",
+        op_lines(graph)
+    );
+    let frees = raw_ops(graph, |kind| matches!(kind, OpKind::RawFree { .. }));
+    assert!(
+        !frees.is_empty(),
+        "the cell is freed at function exit\n{}",
+        op_lines(graph)
+    );
+    for free in &frees {
+        match &free.kind {
+            OpKind::RawFree { ptr: freed } => match root_op(graph, freed) {
+                Some(OpKind::RawMalloc { owner, .. }) if owner == "Array(Char)" => {}
+                other => panic!(
+                    "RawFree must release the cell, got {other:?}\n{}",
+                    op_lines(graph)
+                ),
+            },
+            other => panic!("expected RawFree, got {other:?}"),
+        }
+    }
+}
+
+fn malloc_length(graph: &FunctionGraph, ptr: &majit_translate::flowspace::model::Variable) -> u64 {
+    let Some(OpKind::RawMalloc {
+        length: Some(len), ..
+    }) = defining_op(graph, ptr)
+    else {
+        panic!("cell malloc has no length\n{}", op_lines(graph));
+    };
+    match defining_op(graph, len) {
+        Some(OpKind::ConstUInt(n)) => *n,
+        Some(OpKind::ConstInt(n)) => u64::try_from(*n).expect("length fits u64"),
+        other => panic!(
+            "cell length is a constant, got {other:?}\n{}",
+            op_lines(graph)
+        ),
+    }
+}
+
+fn call_block_of<'a>(graph: &'a FunctionGraph, call: &OpKind) -> &'a majit_translate::model::Block {
+    graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| std::ptr::eq(&op.kind, call))
+        })
+        .expect("call block")
 }
 
 fn assert_const_spills(
@@ -1605,17 +2025,28 @@ fn borrows_of_two_locals_keep_distinct_spill_addresses() {
 #[test]
 fn copied_local_keeps_a_distinct_spill_address() {
     let graph = lower_two_borrows(BorrowAlias::CopiedPlace);
-    let ptrs = malloc_ptrs(&graph);
+    let param_ptrs = malloc_ptrs(&graph);
+    let cell_ptrs = cell_malloc_ptrs(&graph);
     assert_eq!(
-        ptrs.len(),
-        2,
-        "a copy is a different place even when the word aliases\n{}",
+        param_ptrs.len(),
+        1,
+        "the parameter stays a per-call Tuple spill\n{}",
         op_lines(&graph)
     );
-    assert_ne!(&ptrs[0], &ptrs[1]);
+    assert_eq!(
+        cell_ptrs.len(),
+        1,
+        "the copy is a scoped Char-varsize cell\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(&param_ptrs[0], &cell_ptrs[0]);
     let call = sink_call(&graph);
-    assert_eq!(call_arg(call, 0), &ptrs[0]);
-    assert_eq!(call_arg(call, 1), &ptrs[1]);
+    let args = [call_arg(call, 0), call_arg(call, 1)];
+    assert!(
+        args.contains(&&param_ptrs[0]) && args.contains(&&cell_ptrs[0]),
+        "the two places keep distinct addresses\n{}",
+        op_lines(&graph)
+    );
     let word = input_var(&graph, "word");
     for store in raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. })) {
         match &store.kind {
@@ -1623,7 +2054,6 @@ fn copied_local_keeps_a_distinct_spill_address() {
             other => panic!("both stores write the aliased word, got {other:?}"),
         }
     }
-    assert_const_spills(&graph, &ptrs);
 }
 
 #[derive(Clone, Copy)]
@@ -9029,22 +9459,34 @@ fn fresh_cell_usize_beside_bool_spill_into_gcref_lowers() {
 }
 
 #[test]
-fn fresh_cell_address_taken_elsewhere_stays_unlowered() {
-    let err = lower_fresh_cell_gcref(true)
-        .expect_err("a usize beside a spill whose address is taken elsewhere must stay unlowered");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unspilled raw argument") || msg.contains("spill address would escape"),
-        "{msg}"
-    );
+fn fresh_cell_address_taken_elsewhere_lowers() {
+    let graph = lower_fresh_cell_gcref(true).unwrap_or_else(|err| {
+        panic!("an extra in-scope address of the same cell must lower: {err}")
+    });
+    assert_fresh_cell_bool_spill_lowers(&graph);
 }
 
 fn assert_fresh_cell_bool_spill_lowers(graph: &FunctionGraph) {
-    let ptrs = malloc_ptrs(graph);
+    let ptrs = cell_malloc_ptrs(graph);
     assert_eq!(
         ptrs.len(),
         1,
-        "one spill for the flag cell\n{}",
+        "one Char-varsize cell for the flag\n{}",
+        op_lines(graph)
+    );
+    assert_eq!(
+        malloc_length(graph, &ptrs[0]),
+        1,
+        "bool cell is one byte\n{}",
+        op_lines(graph)
+    );
+    assert!(
+        raw_ops(graph, |kind| matches!(
+            kind,
+            OpKind::RawMalloc { owner, .. } if owner == "Tuple<i64>"
+        ))
+        .is_empty(),
+        "the flag is not a per-call Tuple spill\n{}",
         op_lines(graph)
     );
     let call = sink_call(graph);
@@ -9063,28 +9505,46 @@ fn assert_fresh_cell_bool_spill_lowers(graph: &FunctionGraph) {
     assert_eq!(
         call_arg(call, 2),
         &ptrs[0],
-        "the out-parameter receives the spill address\n{}",
+        "the out-parameter receives the cell pointer\n{}",
         op_lines(graph)
     );
-    let loads = raw_ops(graph, |kind| matches!(kind, OpKind::RawLoad { .. }));
-    assert_eq!(
-        loads.len(),
-        1,
-        "mutable out-parameter copies the word back\n{}",
+    let stores = raw_ops(graph, |kind| matches!(kind, OpKind::RawStore { .. }));
+    assert!(
+        stores.iter().any(|op| match &op.kind {
+            OpKind::RawStore {
+                base,
+                itemsize: 1,
+                is_item_signed: false,
+                ..
+            } if base == &ptrs[0] => true,
+            _ => false,
+        }),
+        "writes of the flag are raw_store into the cell\n{}",
         op_lines(graph)
     );
-    match &loads[0].kind {
-        OpKind::RawLoad {
-            base,
-            itemsize: 1,
-            is_item_signed: false,
-            ..
-        } if base == &ptrs[0] => {}
-        other => panic!("copy-out loads the bool cell, got {other:?}"),
-    }
+    let call_block = call_block_of(graph, call);
+    let call_at = call_block
+        .operations
+        .iter()
+        .position(|op| std::ptr::eq(&op.kind, call))
+        .expect("call");
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the cell is not freed right after the call\n{}",
+        op_lines(graph)
+    );
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawLoad { .. })),
+        "the cell has no copy-out RawLoad after the call\n{}",
+        op_lines(graph)
+    );
     assert!(
         ops(graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+        "the cell is freed at scope exit\n{}",
         op_lines(graph)
     );
 }
@@ -9212,6 +9672,380 @@ fn fresh_cell_gcref_function_pointer_hook_lowers() {
         panic!("a fresh-cell GcRef sink that forwards through a function pointer must lower: {err}")
     });
     assert_fresh_cell_bool_spill_lowers(&graph);
+}
+
+fn lower_scoped_bool_cell(
+    extra_caller_input: Option<&Value>,
+    body: Value,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, _, _, local) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let flag_ty = bool_ty();
+    let borrowed = borrow_ty(&flag_ty, "Mut");
+    let raw_flag = raw_ptr(&flag_ty, "Mut");
+    let ret = i64_ty();
+    let mut caller_inputs = vec![tid_ty.clone(), size_ty.clone()];
+    if let Some(ty) = extra_caller_input {
+        caller_inputs.push(ty.clone());
+    }
+    let arg_count = caller_inputs.len() as u64;
+    let mut locals = vec![
+        local(0, None, &ret),
+        local(1, Some("tid"), &tid_ty),
+        local(2, Some("size"), &size_ty),
+    ];
+    if let Some(ty) = extra_caller_input {
+        locals.push(local(3, Some("again"), ty));
+    }
+    let flag_local = if extra_caller_input.is_some() {
+        4u64
+    } else {
+        3
+    };
+    locals.push(local(flag_local, Some("flag"), &flag_ty));
+    locals.push(local(flag_local + 1, None, &borrowed));
+    locals.push(local(flag_local + 2, None, &ret));
+    let caller = probe_fun(
+        0,
+        &["probe", "place_flag"],
+        caller_inputs,
+        &ret,
+        json!({"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": arg_count, "locals": locals},
+            "body": body
+        }}),
+    );
+    let sink = probe_fun(
+        1,
+        &["probe", "sink_pair"],
+        vec![tid_ty, size_ty, raw_flag],
+        &ret,
+        json!("Opaque"),
+    );
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "place_flag")
+}
+
+#[test]
+fn scoped_bool_cell_storage_live_frees_on_early_return() {
+    let (span, generics, _, _) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let flag_ty = bool_ty();
+    let borrowed = borrow_ty(&flag_ty, "Mut");
+    let ret = i64_ty();
+    let graph = lower_scoped_bool_cell(
+        None,
+        json!([
+            {"statements": [
+                bare_stmt(json!({"StorageLive": 3})),
+                assign_to(place(3, &flag_ty), bool_true_use())
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {
+                "Switch": {"discr": {"Copy": place(3, &flag_ty)}, "targets": {"If": [1, 2]}}
+            }}},
+            {"statements": [assign_to(place(0, &ret), json!({"Use": [i64_const_operand("0"), "Yes"]}))],
+                "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [ref_assign_mut(4, &borrowed, place(3, &flag_ty))],
+                "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                    "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                        "args": [
+                            {"Copy": place(1, &tid_ty)},
+                            {"Copy": place(2, &size_ty)},
+                            {"Move": place(4, &borrowed)}
+                        ], "dest": place(5, &ret)},
+                    "target": 3, "on_unwind": 4
+                }}}},
+            {"statements": [
+                bare_stmt(json!({"StorageDead": 3})),
+                assign_to(place(0, &ret), copy_use(place(5, &ret)))
+            ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]),
+    )
+    .unwrap_or_else(|err| {
+        panic!("a StorageLive bool cell passed to an opaque callee must lower: {err}")
+    });
+    let ptrs = cell_malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one Char-varsize cell at StorageLive\n{}",
+        op_lines(&graph)
+    );
+    assert_eq!(malloc_length(&graph, &ptrs[0]), 1);
+    let call = sink_call(&graph);
+    match root_op(&graph, call_arg(call, 2)) {
+        Some(OpKind::RawMalloc { owner, .. }) if owner == "Array(Char)" => {}
+        other => panic!(
+            "the out-parameter receives the cell pointer, got {other:?}\n{}",
+            op_lines(&graph)
+        ),
+    }
+    let stores = raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. }));
+    assert!(
+        stores.iter().any(|op| match &op.kind {
+            OpKind::RawStore {
+                base, itemsize: 1, ..
+            } if base == &ptrs[0] => true,
+            _ => false,
+        }),
+        "writes of the flag are raw_store\n{}",
+        op_lines(&graph)
+    );
+    let loads = raw_ops(&graph, |kind| matches!(kind, OpKind::RawLoad { .. }));
+    assert!(
+        loads.iter().any(|op| match &op.kind {
+            OpKind::RawLoad {
+                base, itemsize: 1, ..
+            } if base == &ptrs[0] => true,
+            _ => false,
+        }),
+        "reads of the flag are raw_load\n{}",
+        op_lines(&graph)
+    );
+    let call_block = call_block_of(&graph, call);
+    let call_at = call_block
+        .operations
+        .iter()
+        .position(|op| std::ptr::eq(&op.kind, call))
+        .expect("call");
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the cell is not freed right after the call\n{}",
+        op_lines(&graph)
+    );
+    let frees = raw_ops(&graph, |kind| matches!(kind, OpKind::RawFree { .. }));
+    assert_eq!(
+        frees.len(),
+        2,
+        "free at StorageDead and at the early return\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn scoped_bool_cell_storage_live_in_a_loop_mallocs_per_iteration() {
+    let (span, generics, _, _) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let flag_ty = bool_ty();
+    let borrowed = borrow_ty(&flag_ty, "Mut");
+    let again = bool_ty();
+    let ret = i64_ty();
+    let graph = lower_scoped_bool_cell(
+        Some(&again),
+        json!([
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}},
+            {"statements": [
+                bare_stmt(json!({"StorageLive": 4})),
+                assign_to(place(4, &flag_ty), bool_true_use()),
+                ref_assign_mut(5, &borrowed, place(4, &flag_ty))
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [
+                        {"Copy": place(1, &tid_ty)},
+                        {"Copy": place(2, &size_ty)},
+                        {"Move": place(5, &borrowed)}
+                    ], "dest": place(6, &ret)},
+                "target": 2, "on_unwind": 4
+            }}}},
+            {"statements": [bare_stmt(json!({"StorageDead": 4}))],
+                "kind": "Regular", "terminator": {"span": span, "kind": {
+                    "Switch": {"discr": {"Copy": place(3, &again)}, "targets": {"If": [1, 3]}}
+                }}},
+            {"statements": [assign_to(place(0, &ret), copy_use(place(6, &ret)))],
+                "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]),
+    )
+    .unwrap_or_else(|err| {
+        panic!("a loop StorageLive bool cell passed to an opaque callee must lower: {err}")
+    });
+    let ptrs = cell_malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one Char-varsize malloc in the loop body\n{}",
+        op_lines(&graph)
+    );
+    assert_eq!(malloc_length(&graph, &ptrs[0]), 1);
+    let malloc_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(&ptrs[0]) && matches!(op.kind, OpKind::RawMalloc { .. })
+            })
+        })
+        .expect("malloc block");
+    assert_ne!(
+        malloc_block.id,
+        graph.startblock,
+        "the loop cell is not hoisted to function entry\n{}",
+        op_lines(&graph)
+    );
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 2), &ptrs[0]);
+    let call_block = call_block_of(&graph, call);
+    let call_at = call_block
+        .operations
+        .iter()
+        .position(|op| std::ptr::eq(&op.kind, call))
+        .expect("call");
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "StorageDead, not the call, frees the cell\n{}",
+        op_lines(&graph)
+    );
+    let free_blocks: Vec<_> = graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::RawFree { .. }))
+        })
+        .collect();
+    assert_eq!(
+        free_blocks.len(),
+        1,
+        "one RawFree at the loop StorageDead\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(
+        free_blocks[0].id,
+        graph.startblock,
+        "the loop free is not at function entry\n{}",
+        op_lines(&graph)
+    );
+}
+
+/// Product MIR of `&mut flag` coerced to `*mut bool`:
+/// `_r = &mut flag; _p = &raw mut *_r; call(..., _p)`.
+fn lower_fresh_cell_raw_reborrow() -> Result<FunctionGraph, majit_translate::front::mir::LowerError>
+{
+    let (span, generics, _, local) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let flag_ty = bool_ty();
+    let borrowed = borrow_ty(&flag_ty, "Mut");
+    let raw_flag = raw_ptr(&flag_ty, "Mut");
+    let ret = gcref_ty();
+    let caller = probe_fun(
+        0,
+        &["probe", "place_flag"],
+        vec![tid_ty.clone(), size_ty.clone()],
+        &ret,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 2, "locals": [
+            local(0, None, &ret),
+            local(1, Some("tid"), &tid_ty),
+            local(2, Some("size"), &size_ty),
+            local(3, Some("flag"), &flag_ty),
+            local(4, None, &borrowed),
+            local(5, None, &raw_flag),
+            local(6, None, &ret)
+        ]}, "body": [
+            {"statements": [
+                assign_to(place(3, &flag_ty), bool_true_use()),
+                ref_assign_mut(4, &borrowed, place(3, &flag_ty)),
+                raw_mut_assign(5, &raw_flag, deref_place(place(4, &borrowed), &flag_ty))
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [
+                        {"Copy": place(1, &tid_ty)},
+                        {"Copy": place(2, &size_ty)},
+                        {"Move": place(5, &raw_flag)}
+                    ], "dest": place(6, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(6, &ret)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink = probe_fun(
+        1,
+        &["probe", "sink_pair"],
+        vec![tid_ty, size_ty, raw_flag],
+        &ret,
+        json!("Opaque"),
+    );
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [gcref_decl()],
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "place_flag")
+}
+
+#[test]
+fn scoped_bool_cell_raw_reborrow_of_mut_ref_lowers() {
+    let graph = lower_fresh_cell_raw_reborrow().unwrap_or_else(|err| {
+        panic!("a raw reborrow of `&mut flag` into `*mut bool` must lower: {err}")
+    });
+    assert_fresh_cell_bool_spill_lowers(&graph);
+}
+
+#[test]
+fn scoped_bool_cell_address_returned_beyond_scope_stays_unlowered() {
+    let (span, generics, _, _) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let flag_ty = bool_ty();
+    let borrowed = borrow_ty(&flag_ty, "Mut");
+    let ret = i64_ty();
+    let err = lower_scoped_bool_cell(
+        None,
+        json!([
+            {"statements": [
+                assign_to(place(3, &flag_ty), bool_true_use()),
+                ref_assign_mut(4, &borrowed, place(3, &flag_ty))
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [
+                        {"Copy": place(1, &tid_ty)},
+                        {"Copy": place(2, &size_ty)},
+                        {"Move": place(4, &borrowed)}
+                    ], "dest": place(5, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [assign_to(place(0, &ret), copy_use(place(4, &borrowed)))],
+                "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]),
+    )
+    .expect_err("returning the cell address past StorageDead must stay unlowered");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
 }
 
 #[test]

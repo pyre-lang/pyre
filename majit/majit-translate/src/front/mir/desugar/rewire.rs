@@ -723,6 +723,79 @@ pub(in crate::front::mir) fn locate_combinator_call(
     Ok((a, ci, flow_result, args))
 }
 
+/// Ops `ci..=remove_upto` are the combinator call and, when it is
+/// second-to-last, its trailing `cast_instance` (`locate_combinator_call`).
+fn combinator_remove_upto(ops_len: usize, ci: usize) -> usize {
+    if ci + 2 == ops_len { ci + 1 } else { ci }
+}
+
+/// Variables `FreshMallocs` will still accept after `ci..=remove_upto`
+/// is deleted: every block inputarg and every remaining op result.
+/// Extra-live can name a def from another block on this goto; those
+/// stay.
+fn combinator_surviving_vars(
+    graph: &FunctionGraph,
+    block_idx: usize,
+    ci: usize,
+    remove_upto: usize,
+) -> std::collections::HashSet<Variable> {
+    let mut defined = std::collections::HashSet::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        defined.extend(block.inputargs.iter().cloned());
+        for (oi, op) in block.operations.iter().enumerate() {
+            if bi == block_idx && (ci..=remove_upto).contains(&oi) {
+                continue;
+            }
+            if let Some(v) = &op.result {
+                defined.insert(v.clone());
+            }
+        }
+    }
+    defined
+}
+
+/// The combinator call and its trailing `cast_instance` are the same
+/// value (`locate_combinator_call` `flow_result`). Map those results
+/// onto `flow_result` so `carried` drops them. Any other exit arg
+/// without a def is a front defect: decline, never rewrite it.
+fn prepare_combinator_saved_exit(
+    graph: &FunctionGraph,
+    a: usize,
+    ci: usize,
+    flow_result: &Variable,
+    name: &str,
+    method: &str,
+) -> Result<(Link, usize), String> {
+    let remove_upto = combinator_remove_upto(graph.blocks[a].operations.len(), ci);
+    let mut removed = std::collections::HashSet::new();
+    for op in &graph.blocks[a].operations[ci..=remove_upto] {
+        if let Some(v) = &op.result {
+            removed.insert(v.clone());
+        }
+    }
+    let mut saved_exit = graph.blocks[a].exits[0].clone();
+    for arg in &mut saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && removed.contains(v)
+        {
+            *v = flow_result.clone();
+        }
+    }
+    let defined = combinator_surviving_vars(graph, a, ci, remove_upto);
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != *flow_result
+            && !defined.contains(v)
+        {
+            return Err(format!(
+                "{name}: {method} exit carries undefined {}",
+                v.name()
+            ));
+        }
+    }
+    Ok((saved_exit, remove_upto))
+}
+
 pub(in crate::front::mir) fn rewire_result_is_ok_err(
     graph: &mut FunctionGraph,
     site: &DiscCombinatorSite,
@@ -805,7 +878,8 @@ pub(in crate::front::mir) fn rewire_disc_combinator_diamond(
     {
         return Err(format!("{name}: {method} exit is not a plain goto"));
     }
-    let saved_exit = exit.clone();
+    let (saved_exit, remove_upto) =
+        prepare_combinator_saved_exit(graph, a, ci, &flow_result, &name, method)?;
     let b_target = saved_exit.target;
     let mut carried: Vec<Variable> = Vec::new();
     for arg in &saved_exit.args {
@@ -903,8 +977,6 @@ pub(in crate::front::mir) fn rewire_disc_combinator_diamond(
     close_goto_mixed(graph, else_bb, b_target, else_args);
 
     let a_id = graph.blocks[a].id;
-    let ops_len = graph.blocks[a].operations.len();
-    let remove_upto = if ci + 2 == ops_len { ci + 1 } else { ci };
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }
@@ -950,7 +1022,8 @@ pub(in crate::front::mir) fn rewire_option_filter_diamond(
     {
         return Err(format!("{name}: filter exit is not a plain goto"));
     }
-    let saved_exit = exit.clone();
+    let (saved_exit, remove_upto) =
+        prepare_combinator_saved_exit(graph, a, ci, &flow_result, name, "filter")?;
     let b_target = saved_exit.target;
     let mut carried: Vec<Variable> = Vec::new();
     for arg in &saved_exit.args {
@@ -1069,8 +1142,6 @@ pub(in crate::front::mir) fn rewire_option_filter_diamond(
     );
 
     let a_id = graph.blocks[a].id;
-    let ops_len = graph.blocks[a].operations.len();
-    let remove_upto = if ci + 2 == ops_len { ci + 1 } else { ci };
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }

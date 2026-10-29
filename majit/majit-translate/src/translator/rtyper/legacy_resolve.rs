@@ -932,6 +932,12 @@ fn infer_concrete_from_op(
         // A length, not an element — no `Unknown`-to-`GcRef` fallback applies.
         // `arraylen_gc/rd>i` is the same length word as `arraylen_vable`.
         OpKind::ArrayLen { .. } | OpKind::VableArrayLen { .. } => ConcreteType::Signed,
+        // `lltype.malloc(T, flavor='raw')` returns a Signed address
+        // (`history.py` `getkind` of a raw pointer is `'int'`).
+        OpKind::RawMalloc { .. } => ConcreteType::Signed,
+        OpKind::RawLoad { item_ty, .. } | OpKind::GcLoadIndexed { item_ty, .. } => {
+            valuetype_to_concrete_for_legacy(item_ty, raw_alloc_flavor_structs)
+        }
         // `OpKind::Abort` for unsupported syntax — macros, unsupported
         // literals, fallback expressions.  Fall back to GcRef so these values
         // still get a regalloc coloring and the assembler's
