@@ -64,9 +64,9 @@ assert hh == 950649862511, hh
 # runs out of length before the iteration's body completes.  The trace limit
 # puts that abort inside `sum`'s loop, whose FOR_ITER carries an EXTENDED_ARG:
 # the frame is parked on the prefix, one unit before the FOR_ITER.  The
-# abort has to resume forward from the walk's own frame state (the latched
-# image) rather than replay from the walk entry; missing that, the resume
-# reads the next element and the sum comes out short (19898 for 19900).
+# delivery has to recognise that header, and a refused delivery has to put the
+# iterator cursor back; either way missing, the resume reads the next element
+# and the sum comes out short (19898 for 19900).
 try:
     import pypyjit
 
