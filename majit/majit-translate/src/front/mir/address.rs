@@ -7,6 +7,12 @@ use super::*;
 /// raw gckind (`StructLayout::from_type_strings`).
 pub(in crate::front::mir) const RAW_SCALAR_SPILL_OWNER: &str = "Tuple<i64>";
 pub(in crate::front::mir) const RAW_SCALAR_SPILL_BYTES: usize = 8;
+/// Char-varsize cell for a function-local primitive whose address is
+/// taken as a raw scalar pointer. `jtransform.py` `_rewrite_raw_malloc`
+/// emits `OS_RAW_MALLOC_VARSIZE_CHAR`; `virtualize.py`
+/// `make_virtual_raw_memory` deletes it in traces. The same TYPE as
+/// `ll_slice_len_slot_new`.
+pub(in crate::front::mir) const RAW_SCALAR_CELL_OWNER: &str = "Array(Char)";
 
 pub(in crate::front::mir) struct RawScalarBorrowSpill {
     pub(in crate::front::mir) fun_id: u64,
@@ -49,6 +55,436 @@ pub(in crate::front::mir) enum SpillAddressSource {
     /// A parameter, a call result, arithmetic, or a projection whose
     /// stored operand is not one place.
     Unknown,
+}
+
+/// `raw_malloc_varsize_char(itemsize)` as `OpKind::RawMalloc` with TYPE
+/// `CArray(Char)`, the shape `_rewrite_raw_malloc` rewrites to
+/// `OS_RAW_MALLOC_VARSIZE_CHAR`.
+pub(in crate::front::mir) fn emit_raw_cell_malloc(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    itemsize: usize,
+) -> Variable {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::CArray;
+    let length = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(length.clone()),
+        kind: OpKind::ConstUInt(itemsize as u64),
+    });
+    let ptr = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(ptr.clone()),
+        kind: OpKind::raw_malloc_with_flags(
+            RAW_SCALAR_CELL_OWNER,
+            Some(LowLevelType::Array(Box::new(CArray(LowLevelType::Char)))),
+            false,
+            true,
+            false,
+            Vec::new(),
+            Some(length),
+        ),
+    });
+    ptr
+}
+
+pub(in crate::front::mir) fn emit_raw_cell_store(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    ptr: Variable,
+    value: Variable,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) {
+    let offset = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(offset.clone()),
+        kind: OpKind::ConstInt(0),
+    });
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawStore {
+            base: ptr,
+            offset,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        },
+    });
+}
+
+pub(in crate::front::mir) fn emit_raw_cell_load(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    ptr: Variable,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) -> Variable {
+    let offset = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(offset.clone()),
+        kind: OpKind::ConstInt(0),
+    });
+    let loaded = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(loaded.clone()),
+        kind: OpKind::RawLoad {
+            base: ptr,
+            offset,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        },
+    });
+    loaded
+}
+
+pub(in crate::front::mir) fn emit_raw_cell_free(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    ptr: Variable,
+) {
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: None,
+        kind: OpKind::RawFree { ptr },
+    });
+}
+
+/// Function-local primitive scalars whose address is passed as a raw
+/// scalar pointer. One Char-varsize cell each, for the local's storage
+/// scope (`scoped_alloc`).
+pub(in crate::front::mir) struct CellScalarPlan {
+    pub(in crate::front::mir) locals: bit_set::BitSet,
+    pub(in crate::front::mir) descr: Vec<Option<(ValueType, usize, bool)>>,
+    pub(in crate::front::mir) has_storage_live: bit_set::BitSet,
+}
+
+pub(in crate::front::mir) fn collect_cell_scalar_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+    arg_count: usize,
+    forward: &[bool],
+) -> CellScalarPlan {
+    let n_locals = body.locals.locals.len();
+    let mut locals = bit_set::BitSet::with_capacity(n_locals);
+    let mut descr = vec![None; n_locals];
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            continue;
+        };
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            if raw_scalar_address_value_type(declared, llbc).is_none() {
+                continue;
+            }
+            let Some(arg) = call.args.get(index) else {
+                continue;
+            };
+            let Some(passed) = operand_tyref(arg) else {
+                continue;
+            };
+            let passed_ref = tyref_is_ref_of_primitive(passed, llbc);
+            if !passed_ref && !tyref_is_raw_ptr_of_primitive(passed, llbc) {
+                continue;
+            }
+            let Some(param_node) = tyref_peel_one_raw_ptr_node(declared, llbc) else {
+                continue;
+            };
+            let arg_node = if passed_ref {
+                tyref_peel_one_ref_node(passed, llbc)
+            } else {
+                tyref_peel_one_raw_ptr_node(passed, llbc)
+            };
+            let Some(arg_node) = arg_node else {
+                continue;
+            };
+            let param_pointee = TyRef::Other(param_node.clone());
+            let arg_pointee = TyRef::Other(arg_node.clone());
+            let Some((_, itemsize, _)) = json_ty_raw_store_descr(
+                tyref_node(&param_pointee, llbc).unwrap_or(&param_node),
+                llbc,
+            ) else {
+                continue;
+            };
+            let Some((_, arg_size, _)) =
+                json_ty_raw_store_descr(tyref_node(&arg_pointee, llbc).unwrap_or(&arg_node), llbc)
+            else {
+                continue;
+            };
+            if itemsize == 0 || itemsize > RAW_SCALAR_SPILL_BYTES || arg_size != itemsize {
+                continue;
+            }
+            let Some(place) =
+                body_resolved_borrow_place(body, forward, operand_local(Some(arg)), llbc)
+            else {
+                continue;
+            };
+            let PlaceKind::Local(id) = place.kind else {
+                continue;
+            };
+            let id = id as usize;
+            if id <= arg_count {
+                continue;
+            }
+            let Some(decl) = body.locals.locals.get(id) else {
+                continue;
+            };
+            if !tyref_is_primitive_scalar(&decl.ty, llbc) {
+                continue;
+            }
+            let Some(cell_descr) =
+                tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
+            else {
+                continue;
+            };
+            locals.insert(id);
+            descr[id] = Some(cell_descr);
+        }
+    }
+    let mut has_storage_live = bit_set::BitSet::with_capacity(n_locals);
+    for block in &body.body {
+        for stmt in &block.statements {
+            let Ok(StmtKind::StorageLive(local)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let local = *local as usize;
+            if locals.contains(local) {
+                has_storage_live.insert(local);
+            }
+        }
+    }
+    CellScalarPlan {
+        locals,
+        descr,
+        has_storage_live,
+    }
+}
+
+/// Blocks that keep a cell pointer live. A local with no `StorageLive`
+/// is live on every forward-reached block. Otherwise the scope is the
+/// DFS from each `StorageLive` that stops at `StorageDead` (that block
+/// is in scope; its successors are not).
+pub(in crate::front::mir) fn cell_scope_extra_live(
+    llbc: &Llbc,
+    body: &Unstructured,
+    plan: &CellScalarPlan,
+    forward: &[bool],
+) -> Vec<Vec<usize>> {
+    let n_blocks = body.body.len();
+    let mut extra = vec![Vec::new(); n_blocks];
+    for local in &plan.locals {
+        if plan.has_storage_live.contains(local) {
+            for bb in cell_storage_scope_blocks(llbc, body, local, n_blocks).iter() {
+                extra[bb].push(local);
+            }
+        } else {
+            for (bb, reached) in forward.iter().enumerate() {
+                if *reached {
+                    extra[bb].push(local);
+                }
+            }
+        }
+    }
+    extra
+}
+
+fn cell_storage_scope_blocks(
+    llbc: &Llbc,
+    body: &Unstructured,
+    local: usize,
+    n_blocks: usize,
+) -> bit_set::BitSet {
+    let mut lives = Vec::new();
+    let mut deads = bit_set::BitSet::with_capacity(n_blocks);
+    for (bb, block) in body.body.iter().enumerate() {
+        for stmt in &block.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::StorageLive(id)) if *id as usize == local => lives.push(bb),
+                Ok(StmtKind::StorageDead(id)) if *id as usize == local => {
+                    deads.insert(bb);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut scope = bit_set::BitSet::with_capacity(n_blocks);
+    let mut stack = lives;
+    while let Some(bb) = stack.pop() {
+        if !scope.insert(bb) {
+            continue;
+        }
+        if deads.contains(bb) {
+            continue;
+        }
+        for succ in successor_blocks(llbc, body, bb, true) {
+            stack.push(succ);
+        }
+    }
+    scope
+}
+
+fn body_resolved_borrow_place(
+    body: &Unstructured,
+    forward: &[bool],
+    arg_local: Option<usize>,
+    llbc: &Llbc,
+) -> Option<Place> {
+    let local = arg_local?;
+    let place = if let Some(place) = body_argument_borrow_place(body, forward, local) {
+        place
+    } else {
+        body_pointer_place_of_local(body, forward, local, 0, llbc)?
+    };
+    Some(body_concrete_borrow_place(body, forward, place))
+}
+
+/// `&raw mut *_r` where `_r = &mut x` is `x`, the same peel
+/// [`Lowering::concrete_borrow_place`] does from `atomic_ref_place`.
+fn body_concrete_borrow_place(body: &Unstructured, forward: &[bool], mut place: Place) -> Place {
+    for _ in 0..8 {
+        let PlaceKind::Projection(inner, elem) = &place.kind else {
+            break;
+        };
+        let ProjectionElem::Atom(name) = elem else {
+            break;
+        };
+        if name != "Deref" {
+            break;
+        }
+        let PlaceKind::Local(local) = inner.kind else {
+            break;
+        };
+        let Some(next) = body_argument_borrow_place(body, forward, local as usize) else {
+            break;
+        };
+        place = next;
+    }
+    place
+}
+
+fn body_argument_borrow_place(
+    body: &Unstructured,
+    forward: &[bool],
+    local: usize,
+) -> Option<Place> {
+    let mut found = None;
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            if index as usize != local {
+                continue;
+            }
+            let Some(place) = borrowed_place_referent(rvalue) else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some(place);
+        }
+    }
+    found
+}
+
+fn body_pointer_place_of_local(
+    body: &Unstructured,
+    forward: &[bool],
+    local: usize,
+    depth: u8,
+    llbc: &Llbc,
+) -> Option<Place> {
+    if depth > 8 {
+        return None;
+    }
+    let mut found = None;
+    for (bb_idx, block) in body.body.iter().enumerate() {
+        if !forward.get(bb_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(index) = dest.kind else {
+                continue;
+            };
+            if index as usize != local {
+                continue;
+            }
+            let place =
+                body_rvalue_pointer_place(body, forward, rvalue, depth, Some(&dest.ty), llbc)?;
+            if found.is_some() {
+                return None;
+            }
+            found = Some(place);
+        }
+    }
+    found
+}
+
+fn body_rvalue_pointer_place(
+    body: &Unstructured,
+    forward: &[bool],
+    rvalue: &Rvalue,
+    depth: u8,
+    dest_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> Option<Place> {
+    match rvalue {
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => Some(place.clone()),
+        Rvalue::Use(op, _) => body_operand_pointer_place(body, forward, op, depth, llbc),
+        Rvalue::Cast(kind, op, target_ty)
+            if cast_preserves_spill_address(kind, Some(target_ty), llbc) =>
+        {
+            body_operand_pointer_place(body, forward, op, depth, llbc)
+        }
+        Rvalue::UnaryOp(op, operand)
+            if unary_op_is_cast(op) && cast_preserves_spill_address(op, dest_ty, llbc) =>
+        {
+            body_operand_pointer_place(body, forward, operand, depth, llbc)
+        }
+        _ => None,
+    }
+}
+
+fn body_operand_pointer_place(
+    body: &Unstructured,
+    forward: &[bool],
+    op: &Operand,
+    depth: u8,
+    llbc: &Llbc,
+) -> Option<Place> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => {
+            let PlaceKind::Local(id) = place.kind else {
+                return None;
+            };
+            body_pointer_place_of_local(body, forward, id as usize, depth + 1, llbc)
+        }
+        Operand::Const(_) => None,
+    }
 }
 
 impl<'a> Lowering<'a> {
@@ -132,6 +568,206 @@ impl<'a> Lowering<'a> {
                 ))
             })?
             .one()
+    }
+
+    pub(in crate::front::mir) fn is_cell_local(&self, local: usize) -> bool {
+        self.cell_locals.contains(local)
+    }
+
+    pub(in crate::front::mir) fn cell_descr(
+        &self,
+        local: usize,
+    ) -> Option<&(ValueType, usize, bool)> {
+        self.cell_descr.get(local).and_then(Option::as_ref)
+    }
+
+    pub(in crate::front::mir) fn place_is_cell_local(&self, place: &Place) -> bool {
+        matches!(place.kind, PlaceKind::Local(id) if self.is_cell_local(id as usize))
+    }
+
+    /// `x`, or `&raw mut *_r` / `&mut *_r` whose recorded referent is `x`.
+    pub(in crate::front::mir) fn cell_local_of_address_place(
+        &self,
+        place: &Place,
+    ) -> Option<usize> {
+        let peeled = self.concrete_borrow_place(place.clone());
+        match peeled.kind {
+            PlaceKind::Local(id) if self.is_cell_local(id as usize) => Some(id as usize),
+            _ => None,
+        }
+    }
+
+    pub(in crate::front::mir) fn variable_is_cell_ptr(&self, var: &Variable) -> bool {
+        self.cell_locals.iter().any(|local| {
+            self.local_var
+                .get(local)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|value| value.one().ok())
+                .is_some_and(|ptr| ptr == *var)
+        })
+    }
+
+    fn operand_names_cell_address(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self.place_names_cell_address(place),
+            Operand::Const(_) => false,
+        }
+    }
+
+    fn place_names_cell_address(&self, place: &Place) -> bool {
+        match &place.kind {
+            PlaceKind::Local(i) => {
+                let i = *i as usize;
+                if self.is_cell_local(i) {
+                    return false;
+                }
+                if let Some(recorded) = self.atomic_ref_place.get(&i)
+                    && self.place_is_cell_local(recorded)
+                {
+                    return true;
+                }
+                self.local_var
+                    .get(i)
+                    .and_then(|slot| slot.as_ref())
+                    .and_then(|value| value.one().ok())
+                    .is_some_and(|var| self.variable_is_cell_ptr(&var))
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::front::mir) fn rvalue_names_cell_address(&self, rvalue: &Rvalue) -> bool {
+        if let Some(place) = borrowed_place_referent(rvalue) {
+            return self.cell_local_of_address_place(&place).is_some();
+        }
+        match rvalue {
+            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => self.operand_names_cell_address(op),
+            Rvalue::UnaryOp(op, operand)
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+            {
+                self.operand_names_cell_address(operand)
+            }
+            _ => false,
+        }
+    }
+
+    /// The cell pointer stored into a heap field, a global, or the
+    /// return slot would outlive `StorageDead` / `raw_free`.
+    pub(in crate::front::mir) fn cell_address_escapes_scope(
+        &self,
+        dest: &Place,
+        rvalue: &Rvalue,
+    ) -> bool {
+        if !self.rvalue_names_cell_address(rvalue) {
+            return false;
+        }
+        match &dest.kind {
+            PlaceKind::Local(0) => true,
+            PlaceKind::Local(_) => false,
+            PlaceKind::Global { .. } | PlaceKind::Projection(..) | PlaceKind::Unknown => true,
+        }
+    }
+
+    pub(in crate::front::mir) fn emit_cell_malloc_bind(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<(), LowerError> {
+        let Some((_, itemsize, _)) = self.cell_descr(local).cloned() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: cell local {local} has no scalar descr"
+            )));
+        };
+        let bb = self.emit_bb(mir_bb);
+        let ptr = emit_raw_cell_malloc(&mut self.graph, bb, itemsize);
+        self.local_var[local] = Some(LocalValue::One(ptr));
+        Ok(())
+    }
+
+    pub(in crate::front::mir) fn emit_cell_store(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+        value: Variable,
+    ) -> Result<(), LowerError> {
+        let Some((item_ty, itemsize, is_item_signed)) = self.cell_descr(local).cloned() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: cell local {local} has no scalar descr"
+            )));
+        };
+        let ptr = self.defined_local(mir_bb, local)?;
+        let bb = self.emit_bb(mir_bb);
+        emit_raw_cell_store(
+            &mut self.graph,
+            bb,
+            ptr,
+            value,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        );
+        Ok(())
+    }
+
+    pub(in crate::front::mir) fn emit_cell_load(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<Variable, LowerError> {
+        let Some((item_ty, itemsize, is_item_signed)) = self.cell_descr(local).cloned() else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: cell local {local} has no scalar descr"
+            )));
+        };
+        let ptr = self.defined_local(mir_bb, local)?;
+        let bb = self.emit_bb(mir_bb);
+        Ok(emit_raw_cell_load(
+            &mut self.graph,
+            bb,
+            ptr,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        ))
+    }
+
+    pub(in crate::front::mir) fn emit_cell_free(
+        &mut self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<(), LowerError> {
+        let Some(ptr) = self
+            .local_var
+            .get(local)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())
+        else {
+            return Ok(());
+        };
+        let bb = self.emit_bb(mir_bb);
+        emit_raw_cell_free(&mut self.graph, bb, ptr);
+        self.local_var[local] = None;
+        Ok(())
+    }
+
+    pub(in crate::front::mir) fn free_bound_cells(
+        &mut self,
+        mir_bb: usize,
+    ) -> Result<(), LowerError> {
+        let locals: Vec<usize> = self.cell_locals.iter().collect();
+        for local in locals {
+            self.emit_cell_free(mir_bb, local)?;
+        }
+        Ok(())
+    }
+
+    fn group_place_is_cell(&self, group: &RawScalarAddressGroup) -> bool {
+        if let Some(place) = group.place.as_ref()
+            && self.cell_local_of_address_place(place).is_some()
+        {
+            return true;
+        }
+        self.variable_is_cell_ptr(&group.word)
     }
 
     /// A GC reference behind `&mut` lives in a one-field GC cell for the
@@ -620,8 +1256,6 @@ impl<'a> Lowering<'a> {
     /// `Option<P>` whose payload is that kind. Nullable `llmemory.GCREF`
     /// is kind `'r'` (`history.py` `getkind`) and cannot hold a
     /// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` address.
-    /// The kind-`'r'` exemption for a fresh-cell spill applies only to a
-    /// callee whose body cannot be inspected.
     fn tyref_is_nullable_gcref(&self, ty: &TyRef) -> bool {
         if tyref_is_gc_reference(ty, self.llbc) {
             return true;
@@ -758,29 +1392,16 @@ impl<'a> Lowering<'a> {
             }
         }
         if !groups.is_empty() {
-            // `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` is a
-            // fresh raw cell. `history.py` `getkind` kind `'r'` cannot
-            // hold that address, so an uninspectable callee
-            // (`AddressEscape::opaque` / `opaque_child`) that returns
-            // `lltype.GCREF` / `Ptr(GcStruct)` / a niche `Option<P>` of
-            // that kind is not this escape. Kind `'r'` is not a result
-            // type that can hold the address, even as `*mut T`. A store
-            // this walk classified still is, and a result type that can
-            // hold the address still is. Kind `'r'` does not excuse
-            // either.
-            let fresh_cell = groups
-                .iter()
-                .all(|group| self.spill_group_is_fresh_cell(group, arg_locals));
-            let gc_return = self.tyref_is_nullable_gcref(dest_ty)
-                || self
-                    .llbc
-                    .fn_by_id(fun_id)
-                    .is_some_and(|fd| self.tyref_is_nullable_gcref(&fd.signature.output));
-            let skip_opaque = fresh_cell && gc_return;
+            // A function-local primitive cell outlives the call
+            // (`scoped_alloc`). An uninspectable callee is not itself a
+            // refusal. A result type that can hold the address, a store
+            // this walk classified, or a return of the address still is.
+            let cell_group = groups.iter().all(|group| self.group_place_is_cell(group));
             let verdict = callee_returns_spill_address(self.llbc, fun_id, &tracked);
             if self.raw_scalar_spill_result_escapes(dest_ty)
                 || verdict.leaked
-                || (!skip_opaque && (verdict.uninspectable || verdict.returned))
+                || verdict.returned
+                || (!cell_group && verdict.uninspectable)
             {
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: raw scalar spill address would escape through the call result"
@@ -791,6 +1412,13 @@ impl<'a> Lowering<'a> {
         let mut reloads = Vec::new();
         let mut replacements = Vec::new();
         for group in groups {
+            if self.group_place_is_cell(&group) {
+                let ptr = group.word.clone();
+                for index in group.indices {
+                    replacements.push((index, ptr.clone()));
+                }
+                continue;
+            }
             let ptr = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -955,15 +1583,13 @@ impl<'a> Lowering<'a> {
     /// stays unlowered. A pointer to such an aggregate is the same
     /// check on the pointee.
     ///
-    /// A spill of a function-local whose address is taken only as this
-    /// call's argument is `rffi.scoped_alloc` /
-    /// `lltype.malloc(flavor='raw')`: the cell's address exists only in
-    /// the pointer argument it was passed as. A sibling address-sized
-    /// integer or raw pointer with [`SpillAddressSource::Unknown`], a
-    /// constant, or a by-value copy of the local cannot name that cell
-    /// and is passed as itself. A parameter is caller storage, and an
-    /// address taken elsewhere keeps the conservative
-    /// [`SpillAddressSource::Unknown`] error.
+    /// A spill of a function-local primitive is `rffi.scoped_alloc` /
+    /// `lltype.malloc(flavor='raw')`: one cell for the storage scope.
+    /// A sibling address-sized integer or raw pointer with
+    /// [`SpillAddressSource::Unknown`], a constant, or a by-value copy
+    /// of the local cannot name that cell and is passed as itself. A
+    /// parameter is caller storage. An extra in-scope address of the
+    /// same local is still that cell.
     pub(in crate::front::mir) fn attach_aliasing_raw_arguments(
         &self,
         fun_id: u64,
@@ -975,9 +1601,9 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(fun_id) else {
             return Ok(Vec::new());
         };
-        let fresh_cell = groups
-            .iter()
-            .all(|group| self.spill_group_is_fresh_cell(group, arg_locals));
+        let fresh_cell = groups.iter().all(|group| {
+            self.group_place_is_cell(group) || self.spill_group_is_fresh_cell(group, arg_locals)
+        });
         let mut attached = Vec::new();
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             if groups.iter().any(|group| group.indices.contains(&index)) {
@@ -1080,14 +1706,13 @@ impl<'a> Lowering<'a> {
     }
 
     /// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')` is a function-local
-    /// cell whose address exists only in the pointer argument it was passed
-    /// as. A parameter is caller storage. A field or unresolved place is
-    /// not a fresh cell. Kind `'r'` exempts only an uninspectable callee
-    /// of such a cell, not a store this walk classified.
+    /// cell. A parameter is caller storage. A field or unresolved place is
+    /// not a fresh cell. An extra in-scope address of the same local is
+    /// still that cell.
     fn spill_group_is_fresh_cell(
         &self,
         group: &RawScalarAddressGroup,
-        arg_locals: &[Option<usize>],
+        _arg_locals: &[Option<usize>],
     ) -> bool {
         let Some(place) = group.place.as_ref() else {
             return false;
@@ -1096,161 +1721,7 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let id = id as usize;
-        if id <= self.arg_count {
-            return false;
-        }
-        !self.local_address_taken_outside_call(id, arg_locals)
-    }
-
-    /// Address of `local` taken by a `Rvalue::Ref` / `RawPtr` whose dest is
-    /// not this call's argument, and not a temporary that produces one
-    /// ([`argument_borrow_place`] / [`pointer_place_of_local`]).
-    fn local_address_taken_outside_call(&self, local: usize, arg_locals: &[Option<usize>]) -> bool {
-        let owned = self.call_argument_address_locals(arg_locals);
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
-            if !self.forward_reached[bb_idx] {
-                continue;
-            }
-            for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
-                    continue;
-                };
-                let Some(referent) = borrowed_place_referent(&rvalue) else {
-                    continue;
-                };
-                if !self.place_refers_to_local(&referent, local) {
-                    continue;
-                }
-                match dest.kind {
-                    PlaceKind::Local(id) if owned.contains(&(id as usize)) => {}
-                    _ => return true,
-                }
-            }
-        }
-        for other in 0..self.body.locals.locals.len() {
-            if other == local || owned.contains(&other) {
-                continue;
-            }
-            if let Some(place) = self.atomic_ref_place.get(&other)
-                && self.place_refers_to_local(place, local)
-            {
-                return true;
-            }
-            if self
-                .pointer_place_of_local(other, 0)
-                .is_some_and(|place| self.place_refers_to_local(&place, local))
-                || self
-                    .argument_borrow_place(other)
-                    .is_some_and(|place| self.place_refers_to_local(&place, local))
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Locals that are this call's arguments, plus every local
-    /// [`pointer_place_of_local`] / [`argument_borrow_place`] follows to
-    /// name those arguments (`&mut x` then `x as *mut T`).
-    fn call_argument_address_locals(&self, arg_locals: &[Option<usize>]) -> Vec<usize> {
-        let mut owned: Vec<usize> = arg_locals.iter().copied().flatten().collect();
-        let mut i = 0;
-        while i < owned.len() {
-            let local = owned[i];
-            i += 1;
-            self.push_pointer_source_locals(local, &mut owned);
-        }
-        owned
-    }
-
-    fn push_pointer_source_locals(&self, local: usize, owned: &mut Vec<usize>) {
-        if let Some(place) = self.atomic_ref_place.get(&local) {
-            self.push_place_locals(place, owned);
-        }
-        if let Some(place) = self.argument_borrow_place(local) {
-            self.push_place_locals(&place, owned);
-        }
-        if let Some(place) = self.pointer_place_of_local(local, 0) {
-            self.push_place_locals(&place, owned);
-        }
-        for (bb_idx, block) in self.body.body.iter().enumerate() {
-            if !self.forward_reached[bb_idx] {
-                continue;
-            }
-            for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
-                    continue;
-                };
-                let PlaceKind::Local(id) = dest.kind else {
-                    continue;
-                };
-                if id as usize != local {
-                    continue;
-                }
-                self.push_rvalue_source_locals(&rvalue, owned);
-            }
-        }
-    }
-
-    fn push_place_locals(&self, place: &Place, owned: &mut Vec<usize>) {
-        if let Some(id) = place_root_local(place)
-            && !owned.contains(&id)
-        {
-            owned.push(id);
-        }
-    }
-
-    fn push_rvalue_source_locals(&self, rvalue: &Rvalue, owned: &mut Vec<usize>) {
-        match rvalue {
-            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
-                self.push_place_locals(place, owned);
-            }
-            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => self.push_operand_locals(op, owned),
-            Rvalue::UnaryOp(op, operand) if unary_op_is_cast(op) => {
-                self.push_operand_locals(operand, owned);
-            }
-            _ => {}
-        }
-    }
-
-    fn push_operand_locals(&self, op: &Operand, owned: &mut Vec<usize>) {
-        match op {
-            Operand::Copy(place) | Operand::Move(place) => self.push_place_locals(place, owned),
-            Operand::Const(_) => {}
-        }
-    }
-
-    /// `place` names `local` after peeling `&mut *p` and one
-    /// [`pointer_place_of_local`] / [`argument_borrow_place`] step.
-    fn place_refers_to_local(&self, place: &Place, local: usize) -> bool {
-        let peeled = self.concrete_borrow_place(clone_place(place));
-        if place_root_local(&peeled) == Some(local) {
-            return true;
-        }
-        match &peeled.kind {
-            PlaceKind::Local(id) => {
-                let inner = *id as usize;
-                if inner == local {
-                    return true;
-                }
-                self.pointer_place_of_local(inner, 0)
-                    .or_else(|| self.argument_borrow_place(inner))
-                    .is_some_and(|named| place_root_local(&named) == Some(local))
-            }
-            PlaceKind::Projection(inner, elem) if projection_is_deref(elem) => {
-                if place_root_local(inner) == Some(local) {
-                    return true;
-                }
-                match inner.kind {
-                    PlaceKind::Local(id) => self
-                        .pointer_place_of_local(id as usize, 0)
-                        .or_else(|| self.argument_borrow_place(id as usize))
-                        .is_some_and(|named| place_root_local(&named) == Some(local)),
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+        id > self.arg_count && self.local_decl_is_primitive(id)
     }
 
     /// `pair = (q,)` with `q` naming the spilled place. The aggregate

@@ -35,9 +35,11 @@
 //!   - `Assign(Local, Rvalue)` — primary lowering site.
 //!   - `Assign(Projection(.., Field|Deref|Index), ...)` — emits a
 //!     side-effectful `FieldWrite` / `ArrayWrite` / `__deref_write`.
-//!   - `StorageLive` / `PlaceMention` — skipped. `StorageDead` of a
-//!     window local emits `objectmodel.keepalive_until_here`
-//!     (`rtype_keepalive_until_here`).
+//!   - `StorageLive` / `StorageDead` — honoured for address-taken
+//!     primitive scalar locals that live in a scoped Char-varsize cell
+//!     (`scoped_alloc`). `StorageDead` of a window local emits
+//!     `objectmodel.keepalive_until_here` (`rtype_keepalive_until_here`).
+//!     Other locals still skip them. `PlaceMention` — skipped.
 //!   - `Assert` — stripped (overflow asserts collapse into success
 //!     edge; see the `TermKind::Assert` lowering note below).
 //!
@@ -53,17 +55,19 @@
 //!     (`neg`, `invert`, `cast_int_to_float`, …) per `binop_label` /
 //!     `unary_op_label`.
 //!   - `Ref` / `RawPtr` — same-Variable alias (JIT does not model
-//!     lifetimes). A call that passes that alias into a raw
-//!     scalar-pointer parameter materializes an address first
-//!     (`RawMalloc` / `RawStore`): `history.py` `getkind` of a raw
-//!     `Ptr` is the address, not the pointee word. Aliases of one
-//!     place share that address. A mutable parameter writes the word
-//!     back into the place, including a field or element projection.
-//!     The spill is freed at the call. A result that carries a pointer
-//!     or a reference is not lowered: the result itself, a payload, a
-//!     field, or an opaque body whose layout is not zero-sized. A generic
-//!     argument counts when a field stores it. That address would outlive
-//!     the free.
+//!     lifetimes), except an address-taken primitive local whose
+//!     address is passed as a raw scalar pointer: that local lives in
+//!     one Char-varsize cell for its storage scope (`scoped_alloc` /
+//!     `OS_RAW_MALLOC_VARSIZE_CHAR`). Reads are `raw_load`, writes
+//!     `raw_store`, and the address is the cell pointer. A parameter
+//!     or a projection still materializes a per-call `Tuple<i64>`
+//!     spill. The cell is freed at `StorageDead` and at each modeled
+//!     scope exit. A result that carries a pointer or a reference is
+//!     not lowered: the result itself, a payload, a field, or an
+//!     opaque body whose layout is not zero-sized. A generic argument
+//!     counts when a field stores it. That address would outlive the
+//!     free. An uninspectable callee is not itself a refusal: the cell
+//!     outlives the call.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -6794,7 +6798,7 @@ fn terminator_is_panic_abort(llbc: &Llbc, body: &Unstructured, bb: u64) -> bool 
 /// A normal successor may be a cleanup block:
 /// `kept_block_normal_successor_is_cleanup` is why `strip_cleanup_blocks`
 /// left those bodies unchanged.
-fn successor_blocks(
+pub(in crate::front::mir) fn successor_blocks(
     llbc: &Llbc,
     body: &Unstructured,
     mir_bb: usize,

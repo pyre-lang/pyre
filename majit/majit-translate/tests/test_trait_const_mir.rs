@@ -114,6 +114,37 @@ fn nursery_spec_folds_gc_type_size() {
         };
         assert!(n > 0, "{} folded a non-positive size {n}", function.name);
         sizes.push((function.name.clone(), n));
+        let has_char_cell = function
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::RawMalloc {
+                        owner,
+                        length: Some(_),
+                        ..
+                    } if owner == "Array(Char)"
+                )
+            });
+        assert!(
+            has_char_cell,
+            "{} has no Char-varsize cell for the address-taken bool",
+            function.name
+        );
+        let has_tuple_spill = function
+            .graph()
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind, OpKind::RawMalloc { owner, .. } if owner == "Tuple<i64>"));
+        assert!(
+            !has_tuple_spill,
+            "{} still uses a per-call Tuple spill for the bool",
+            function.name
+        );
     }
     assert!(
         sizes.len() >= 2,

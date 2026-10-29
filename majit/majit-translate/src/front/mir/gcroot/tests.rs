@@ -628,7 +628,9 @@ fn root_scope_drop_is_classified_and_live() {
     let body: Unstructured =
         serde_json::from_value(body_json).expect("fixture Unstructured parses");
 
-    let erased = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &BitSet::new());
+    let no_cells = BitSet::new();
+    let erased =
+        super::compute_mir_liveness(&fixture_llbc(), &body, &[], &BitSet::new(), &no_cells);
     assert!(
         !erased[1].contains(1),
         "an erased drop reads nothing, so the guard is not live-in at bb1"
@@ -636,7 +638,7 @@ fn root_scope_drop_is_classified_and_live() {
 
     let mut as_call = BitSet::new();
     as_call.insert(1);
-    let lowered = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &as_call);
+    let lowered = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &as_call, &no_cells);
     assert!(
         lowered[1].contains(1),
         "a drop lowered as its glue call reads the guard, so it is live-in at bb1"

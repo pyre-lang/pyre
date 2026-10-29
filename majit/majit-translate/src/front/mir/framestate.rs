@@ -423,6 +423,7 @@ pub(in crate::front::mir) fn compute_mir_liveness(
     body: &Unstructured,
     extra_live: &[Vec<usize>],
     glue_call_drops: &bit_set::BitSet,
+    cell_locals: &bit_set::BitSet,
 ) -> Vec<bit_set::BitSet> {
     use bit_set::BitSet;
 
@@ -456,7 +457,13 @@ pub(in crate::front::mir) fn compute_mir_liveness(
             match kind {
                 StmtKind::Assign(place, rvalue) => {
                     mark_rvalue_uses(rvalue, &mut uses[bb_idx], &defs[bb_idx], n_locals);
-                    mark_place_write(place, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
+                    mark_cell_or_place_write(
+                        place,
+                        &mut uses[bb_idx],
+                        &mut defs[bb_idx],
+                        n_locals,
+                        cell_locals,
+                    );
                 }
                 StmtKind::PlaceMention(place) => {
                     mark_place_use(place, &mut uses[bb_idx], &defs[bb_idx], n_locals)
@@ -464,10 +471,19 @@ pub(in crate::front::mir) fn compute_mir_liveness(
                 StmtKind::Assert(assert) => {
                     mark_operand_use(&assert.cond, &mut uses[bb_idx], &defs[bb_idx], n_locals)
                 }
-                StmtKind::StorageLive(_)
-                | StmtKind::StorageDead(_)
-                | StmtKind::Borrowck(_)
-                | StmtKind::Unknown => {}
+                StmtKind::StorageLive(local) => {
+                    let local = *local as usize;
+                    if cell_locals.contains(local) {
+                        mark_local_def(local, &mut defs[bb_idx], n_locals);
+                    }
+                }
+                StmtKind::StorageDead(local) => {
+                    let local = *local as usize;
+                    if cell_locals.contains(local) {
+                        mark_local_use(local, &mut uses[bb_idx], &defs[bb_idx], n_locals);
+                    }
+                }
+                StmtKind::Borrowck(_) | StmtKind::Unknown => {}
             }
         }
         let Ok(term) = bb.term_ref(llbc) else {
@@ -495,7 +511,13 @@ pub(in crate::front::mir) fn compute_mir_liveness(
             }
             TermKind::Call { call, target, .. } => {
                 mark_call_uses(call, &mut uses[bb_idx], &defs[bb_idx], n_locals);
-                mark_place_write(&call.dest, &mut uses[bb_idx], &mut defs[bb_idx], n_locals);
+                mark_cell_or_place_write(
+                    &call.dest,
+                    &mut uses[bb_idx],
+                    &mut defs[bb_idx],
+                    n_locals,
+                    cell_locals,
+                );
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks);
             }
             TermKind::Assert { assert, target, .. } => {
@@ -651,6 +673,23 @@ pub(in crate::front::mir) fn mark_place_use(
         }
         PlaceKind::Global { .. } | PlaceKind::Unknown => {}
     }
+}
+
+fn mark_cell_or_place_write(
+    place: &Place,
+    uses: &mut bit_set::BitSet,
+    defs: &mut bit_set::BitSet,
+    n_locals: usize,
+    cell_locals: &bit_set::BitSet,
+) {
+    if let PlaceKind::Local(i) = place.kind {
+        let i = i as usize;
+        if cell_locals.contains(i) {
+            mark_local_use(i, uses, defs, n_locals);
+            return;
+        }
+    }
+    mark_place_write(place, uses, defs, n_locals);
 }
 
 pub(in crate::front::mir) fn mark_place_write(

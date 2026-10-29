@@ -7598,6 +7598,92 @@ mod tests {
     }
 
     #[test]
+    fn test_scoped_char_varsize_cell_virtualizes_in_a_loop() {
+        // A Char-varsize cell allocated and freed inside the loop body
+        // (`scoped_alloc` / `OS_RAW_MALLOC_VARSIZE_CHAR`) is
+        // `make_virtual_raw_memory` / `do_RAW_FREE` of a virtual buffer.
+        // The residual malloc/free pair disappears.
+        let malloc_descr = majit_ir::descr::make_call_descr(
+            vec![Type::Int, Type::Int],
+            Type::Int,
+            majit_ir::EffectInfo::new(
+                majit_ir::ExtraEffect::CanRaise,
+                OopSpecIndex::RawMallocVarsizeChar,
+            ),
+        );
+        let free_descr = majit_ir::descr::make_call_descr(
+            vec![Type::Int, Type::Int],
+            Type::Void,
+            majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CannotRaise, OopSpecIndex::RawFree),
+        );
+        let ad = raw_arraydescr();
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::CallI,
+                &[
+                    Operand::const_from_value(Value::Int(0x2000)),
+                    Operand::const_from_value(Value::Int(8)),
+                ],
+                malloc_descr,
+            ),
+            Op::with_descr(
+                OpCode::RawStore,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 0),
+                    Operand::const_from_value(Value::Int(0)),
+                    Operand::const_from_value(Value::Int(1)),
+                ],
+                ad.clone(),
+            ),
+            Op::with_descr(
+                OpCode::RawLoadI,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 0),
+                    Operand::const_from_value(Value::Int(0)),
+                ],
+                ad,
+            ),
+            Op::with_descr(
+                OpCode::CallN,
+                &[
+                    Operand::const_from_value(Value::Int(0x2000)),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 0),
+                ],
+                free_descr,
+            ),
+            Op::new(
+                OpCode::IntAdd,
+                &[
+                    crate::history::test_support::rooted_inputarg_operand(Type::Int, 0),
+                    crate::history::test_support::rooted_resop_operand(Type::Int, 2),
+                ],
+            ),
+            Op::new(
+                OpCode::Jump,
+                &[crate::history::test_support::rooted_resop_operand(
+                    Type::Int,
+                    4,
+                )],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_default_pipeline_typed(&ops, &[0], &[]);
+        let opcodes: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+        assert!(
+            !opcodes.contains(&OpCode::CallI) && !opcodes.contains(&OpCode::CallN),
+            "scoped Char-varsize cell must virtualize; leftover malloc/free {opcodes:?}"
+        );
+        assert!(
+            !opcodes.contains(&OpCode::RawStore) && !opcodes.contains(&OpCode::RawLoadI),
+            "virtual raw buffer store/load must fold; leftover {opcodes:?}"
+        );
+        assert!(
+            opcodes.contains(&OpCode::Jump),
+            "the loop jump remains; {opcodes:?}"
+        );
+    }
+
+    #[test]
     fn test_call_forced_virtual_immutable_getfield() {
         // RPython test_optimizeopt.py:test_forced_virtual_pure_getfield
         //
