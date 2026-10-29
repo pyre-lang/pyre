@@ -10801,6 +10801,10 @@ fn build_function(
         sink.end();
         sink.local_tee(bridge_slot_local);
         sink.if_(BlockType::Empty);
+        // An attached guard enters its bridge with jf_descr clear, the state
+        // patch_jump_for_descr gives (the recovery stub never runs), so the
+        // bridge's GUARD_NOT_FORCED reads only a force by its own call.
+        emit_store_header_word(&mut sink, majit_backend::jitframe::JF_DESCR_OFS as u64, 0);
         sink.local_get(0); // frame_ptr argument to the bridge
         sink.local_get(bridge_slot_local); // table slot
         sink.return_call_indirect(0, 0); // tail call, table 0, type 0: (i32) -> i32
