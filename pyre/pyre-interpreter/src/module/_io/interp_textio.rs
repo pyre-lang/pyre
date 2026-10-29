@@ -493,11 +493,11 @@ impl W_TextIOWrapper {
     /// unspecified argument that resolves to it.  A sandbox build has no host
     /// locale to ask and reads utf-8, the answer a `_Py_FORCE_UTF8_LOCALE`
     /// build gives without asking one.
-    fn resolve_locale_encoding(encoding: String) -> String {
+    fn resolve_locale_encoding(encoding: String) -> Result<String, crate::PyError> {
         if encoding == "locale" {
             crate::module::_locale::interp_locale::locale_encoding()
         } else {
-            encoding
+            Ok(encoding)
         }
     }
 
@@ -1495,7 +1495,7 @@ impl W_TextIOWrapper {
         let errors = pyre_object::with_roots!(buffer, newline => Self::checked_text0(errors, "strict", "errors"))?;
         pyre_object::with_roots!(buffer, newline => Self::io_check_errors(&errors))?;
         let newline_value = Self::unwrap_newline(newline)?;
-        let encoding = Self::resolve_locale_encoding(encoding_text);
+        let encoding = Self::resolve_locale_encoding(encoding_text)?;
         let codec =
             pyre_object::with_roots!(buffer, newline => Self::lookup_text_codec(&encoding))?;
 
@@ -2202,7 +2202,7 @@ impl W_TextIOWrapper {
             None
         } else {
             let value = pyre_object::with_roots!(errors, line_buffering, newline, write_through => Self::checked_text(encoding, "", "encoding"))?;
-            Some(Self::resolve_locale_encoding(value))
+            Some(Self::resolve_locale_encoding(value)?)
         };
         let new_errors = if unsafe { pyre_object::is_none(errors) } {
             None

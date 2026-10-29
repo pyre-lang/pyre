@@ -471,6 +471,31 @@ mod tests {
     }
 
     #[test]
+    fn alloc_buffer_large_count_uses_raw_storage() {
+        let allocated_size = 8;
+        let needed_size = 5;
+        let raw = super::buffer::raw_malloc_or_memory_error(allocated_size)
+            .unwrap()
+            .cast::<CHAR>();
+        unsafe {
+            c_memset(cast::<VOIDP>(raw), 0x58, allocated_size);
+            for (i, byte) in b"hello".iter().enumerate() {
+                *raw.add(i) = *byte;
+            }
+            let s = str_from_buffer(raw, majit_ir::GcRef::NULL, 3, allocated_size, needed_size)
+                .unwrap();
+            assert_eq!(
+                crate::lltypesystem::rstr::str_as_bytes(
+                    s.0 as *const crate::lltypesystem::rstr::STR
+                ),
+                b"hello"
+            );
+            keep_buffer_alive_until_here(raw, majit_ir::GcRef::NULL, 3);
+            crate::lltypesystem::rstr::free_immortal_str(s, needed_size);
+        }
+    }
+
+    #[test]
     fn cast_truncates_and_sign_extends() {
         assert_eq!(cast::<u8>(0x1_ABCDi32), 0xCDu8);
         assert_eq!(cast::<i8>(-1i32), -1i8);

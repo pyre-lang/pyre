@@ -103,10 +103,10 @@ fn langinfo_constants() -> &'static [(&'static str, i64)] {
 /// `_io.TextIOWrapper` reads it as well, for the `encoding="locale"` its
 /// unspecified argument resolves to.
 #[cfg(all(windows, not(feature = "sandbox")))]
-pub(crate) fn locale_encoding() -> String {
+pub(crate) fn locale_encoding() -> Result<String, crate::PyError> {
     // The active ANSI code page, spelled `cp<n>` whatever it is: code page
     // 65001 answers `cp65001`, not `utf-8`.
-    format!("cp{}", active_acp())
+    Ok(format!("cp{}", active_acp()))
 }
 
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -128,7 +128,7 @@ fn active_acp() -> u32 {
     not(feature = "sandbox"),
     not(any(target_os = "android", target_os = "redox"))
 ))]
-pub(crate) fn locale_encoding() -> String {
+pub(crate) fn locale_encoding() -> Result<String, crate::PyError> {
     match majit_rlib::rlocale::nl_langinfo_codeset() {
         // [3.15-spec] `interp_locale.py _getencoding` returns the CODESET
         // as it is, an empty one included, and answers 'ascii' only when
@@ -136,18 +136,12 @@ pub(crate) fn locale_encoding() -> String {
         // (read at v3.15.0) answers "utf-8" for a NULL or empty CODESET,
         // which macOS returns when the `LC_CTYPE` locale is not supported.
         // `_getencoding` carries no JIT hint.
-        Ok(Some(bytes)) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
-        Ok(_) => "utf-8".to_string(),
-        Err(e) => {
-            #[cfg(all(unix, feature = "sandbox"))]
-            {
-                majit_rlib::rsandbox::reraise(e);
-            }
-            #[cfg(not(all(unix, feature = "sandbox")))]
-            {
-                std::panic::panic_any(e);
-            }
-        }
+        Ok(Some(bytes)) if !bytes.is_empty() => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Ok(_) => Ok("utf-8".to_string()),
+        Err(e) => Err(crate::error::get_converted_unexpected_exception(
+            pyre_object::PY_NULL,
+            &e,
+        )),
     }
 }
 
@@ -161,12 +155,12 @@ pub(crate) fn locale_encoding() -> String {
         not(any(target_os = "android", target_os = "redox"))
     )
 )))]
-pub(crate) fn locale_encoding() -> String {
+pub(crate) fn locale_encoding() -> Result<String, crate::PyError> {
     // [3.15-spec] No host locale to ask.  `_getencoding` answers 'ascii'
     // without `HAVE_LANGINFO`; `_Py_GetLocaleEncoding` (v3.15.0) answers
     // "utf-8" under `_Py_FORCE_UTF8_LOCALE`, the Android build, which has no
     // CODESET either.
-    "utf-8".to_string()
+    Ok("utf-8".to_string())
 }
 
 fn collation_arg(obj: pyre_object::PyObjectRef) -> Result<CollationArg, crate::PyError> {
@@ -847,7 +841,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         "getencoding",
         crate::make_builtin_function_with_arity(
             "getencoding",
-            |_| Ok(pyre_object::w_str_new_managed(&locale_encoding())),
+            |_| Ok(pyre_object::w_str_new_managed(&locale_encoding()?)),
             0,
         )
     );

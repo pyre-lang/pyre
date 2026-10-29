@@ -638,6 +638,10 @@ pub struct GcMemoryStats {
     pub peak_rawmalloced_memory: usize,
     pub nursery_size: usize,
     pub total_gc_time_ms: usize,
+    /// `rgc.NONLARGE_MAX`: `incminimark.py` `nonlarge_max`, the largest
+    /// request the nursery serves. 0 with no active collector, as the
+    /// untranslated `_alloc_buffer_nonlarge_max` answers.
+    pub nonlarge_max: usize,
 }
 
 pub trait GcAllocator: Send {

@@ -190,13 +190,14 @@ fn is_set_nonempty(name: &str) -> bool {
 /// Only when the process environment is the authority: an embedding that
 /// supplied its own table is describing an environment this process does not
 /// have, and `setlocale("")` would answer from the wrong one.
-fn set_locale_from_env() {
+fn set_locale_from_env() -> Result<(), PreConfigError> {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
-    if LAUNCH_ENV.lock().is_none() {
-        if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
-            std::panic::panic_any(e);
-        }
+    if LAUNCH_ENV.lock().is_none()
+        && majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")).is_err()
+    {
+        return Err(PreConfigError::no_memory("_PyPreConfig_Write"));
     }
+    Ok(())
 }
 
 /// A configuration failure that ends the process before the interpreter
@@ -223,6 +224,16 @@ impl PreConfigError {
             func: "config_init_lazy_imports",
             detail,
             state: "preinitialized",
+        }
+    }
+
+    /// `_PyStatus_NO_MEMORY`: the banner's detail is `_PyStatus_NO_MEMORY_ERRMSG`.
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+    fn no_memory(func: &'static str) -> Self {
+        PreConfigError {
+            func,
+            detail: "memory allocation failed",
+            state: "preinitializing",
         }
     }
 
@@ -435,7 +446,7 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         );
     }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
-    set_locale_from_env();
+    set_locale_from_env()?;
     flags.optimize = resolve_counter(&flags, flags.optimize, "PYTHONOPTIMIZE");
     flags.verbose = resolve_counter(&flags, flags.verbose, "PYTHONVERBOSE");
     flags.debug = resolve_counter(&flags, flags.debug, "PYTHONDEBUG");

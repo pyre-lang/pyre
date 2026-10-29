@@ -1,7 +1,7 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
     json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
     tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
@@ -5432,6 +5432,22 @@ fn adt_field_read_raw_owner_byte_ptr_is_int() {
         ),
         ValueType::Int,
         "a raw owner's *mut i8 is the address word"
+    );
+}
+
+#[test]
+fn raw_field_address_value_type_matches_field_read() {
+    let llbc = llbc_with_ordinary_and_closure_env();
+    let raw_u8 = raw_mut_u8();
+    assert_eq!(
+        raw_field_address_value_type(&raw_u8, &raw_u8, Some(false), &llbc),
+        Some(ValueType::Int),
+        "a raw owner's *mut u8 is the address word"
+    );
+    assert_eq!(
+        raw_field_address_value_type(&raw_u8, &raw_u8, Some(true), &llbc),
+        None,
+        "a GC owner's *mut u8 is not the raw-address bank"
     );
 }
 

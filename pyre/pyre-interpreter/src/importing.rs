@@ -127,16 +127,6 @@ pub mod host {
                     use std::os::unix::ffi::OsStringExt;
                     std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(e.into_bytes()))
                 }),
-                Err(e) => {
-                    #[cfg(all(unix, feature = "sandbox"))]
-                    {
-                        majit_rlib::rsandbox::reraise(e);
-                    }
-                    #[cfg(not(all(unix, feature = "sandbox")))]
-                    {
-                        std::panic::panic_any(e);
-                    }
-                }
             }
         }
 
@@ -2886,6 +2876,24 @@ fn restore_double_root(_original: &Path, normalized: PathBuf) -> PathBuf {
     normalized
 }
 
+/// The directory a relative startup path resolves against: `rposix.getcwd`,
+/// or "." when it fails with an OS error. `MemoryError` escapes, as
+/// `rpath._posix_rabspath` catches only `OSError`.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn startup_cwd() -> PathBuf {
+    match host_os::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => {
+            panic!("MemoryError while reading the current directory")
+        }
+        Err(_) => PathBuf::from("."),
+    }
+}
+
 /// Return the executable spelling used to invoke pyre, made absolute without
 /// resolving symlinks.  `std::env::current_exe()` resolves the process image on
 /// several hosts and would turn `venv/bin/pyre -> base/bin/pyre` back into the
@@ -2906,7 +2914,7 @@ fn find_invoked_executable() -> PathBuf {
         if candidate.extension().is_none() {
             candidate.set_extension("exe");
         }
-        let cwd = host_os::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let cwd = startup_cwd();
         if candidate.components().count() > 1 || candidate.is_absolute() {
             let absolute = absolute_from(candidate, &cwd);
             if exists_and_is_executable(&absolute) {
@@ -3019,7 +3027,7 @@ fn append_macos_stdlib_paths(paths: &mut Vec<PathBuf>, stdlib: &Path) {
     not(target_arch = "wasm32")
 ))]
 fn resolve_final_symlinks(path: &Path) -> PathBuf {
-    let cwd = host_os::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = startup_cwd();
     let mut resolved = absolute_from(path.to_path_buf(), &cwd);
     loop {
         let Ok(is_link) = host_is_symlink(&resolved) else {

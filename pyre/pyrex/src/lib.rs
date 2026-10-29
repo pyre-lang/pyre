@@ -556,14 +556,18 @@ fn sys_path_cwd() -> std::path::PathBuf {
             {
                 match majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd()) {
                     Ok(Ok(Ok(bytes))) => Ok(bytes),
-                    _ => Err(()),
+                    Ok(Ok(Err(_))) => Err(()),
+                    Ok(Err(_)) => panic!("MemoryError while reading the current directory"),
+                    Err(_) => Err(()),
                 }
             }
             #[cfg(not(feature = "sandbox"))]
             {
+                // `rposix.getcwd` lets `MemoryError` escape; only an OS error falls back.
                 match majit_rlib::rposix::getcwd() {
                     Ok(Ok(bytes)) => Ok(bytes),
-                    _ => Err(()),
+                    Ok(Err(_)) => Err(()),
+                    Err(_) => panic!("MemoryError while reading the current directory"),
                 }
             }
         };

@@ -11324,6 +11324,7 @@ impl GcAllocator for MiniMarkGC {
             peak_rawmalloced_memory: self.oldgen.peak_rawmalloced_bytes(),
             nursery_size,
             total_gc_time_ms: (self.total_gc_time * 1000.0) as usize,
+            nonlarge_max: self.config.large_object_threshold.saturating_sub(1),
         }
     }
 

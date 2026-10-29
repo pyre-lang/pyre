@@ -22,6 +22,9 @@ const CASE_INSIDE: isize = 0;
 const CASE_PINNED: isize = 1;
 /// `alloc_buffer` case: raw `malloc` of `count` bytes; [`keep_buffer_alive_until_here`] frees it.
 const CASE_RAW: isize = 2;
+/// `alloc_buffer` case: raw `malloc` with a null GC buffer, for a count above
+/// `_alloc_buffer_nonlarge_max`; [`keep_buffer_alive_until_here`] frees it.
+const CASE_LARGE: isize = 3;
 
 /// RPython `MemoryError` raised by `mallocfn` / `lltype.malloc`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,21 +243,35 @@ fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
     Ok(unsafe { Vec::from_raw_parts(ptr, count, count) })
 }
 
+/// `rffi._alloc_buffer_nonlarge_max`: `rgc.get_stats(rgc.NONLARGE_MAX)`, 0
+/// when no collector is active.
+fn _alloc_buffer_nonlarge_max() -> usize {
+    majit_gc::active_gc_memory_stats().nonlarge_max
+}
+
 /// `rffi.alloc_buffer` (`jit.dont_look_inside`).
 ///
 /// Returns `(raw_buffer, gc_buffer, case_num)`:
 /// * `0` — the pointer is inside an unpinned, non-moving GC `STR`
 /// * `1` — the GC `STR` was pinned (`rgc.pin`)
 /// * `2` — raw `malloc` of `count` bytes; [`keep_buffer_alive_until_here`] frees it
+/// * `3` — raw `malloc` with a null GC buffer, for a count above
+///   `_alloc_buffer_nonlarge_max`; [`keep_buffer_alive_until_here`] frees it
 ///
 /// `mallocfn` is `rstr.mallocstr`. `rgc.must_split_gc_address_space` is False.
-/// `_alloc_buffer_nonlarge_max` (case 3) is unported: no in-tree user.
 ///
 /// The caller must root `gc_buffer` before the next collecting call: `rgc.pin`
 /// is not a root, and a young non-moving / nursery STR that is unreachable is
 /// freed by the next minor collection.
 #[majit_macros::dont_look_inside]
 pub fn alloc_buffer(count: usize) -> Result<(CCHARP, majit_ir::GcRef, isize), MemoryError> {
+    let nonlarge_max = _alloc_buffer_nonlarge_max();
+    if nonlarge_max > 0 && count > nonlarge_max {
+        // The GC would serve `count` from its large-object path, which never
+        // moves, so skip the full-size STR and use raw storage.
+        let raw_buf = raw_malloc_or_memory_error(count)?.cast::<super::CHAR>();
+        return Ok((raw_buf, majit_ir::GcRef::NULL, CASE_LARGE));
+    }
     let new_buf = crate::lltypesystem::rstr::mallocstr(count)?;
     let mut pinned: isize = 0;
     let mut fallback = false;
@@ -278,6 +295,7 @@ pub fn alloc_buffer(count: usize) -> Result<(CCHARP, majit_ir::GcRef, isize), Me
 /// [`alloc_buffer`] to a high-level string of `needed_size` bytes: the GC
 /// `STR` itself (`hlstr(gc_buf)`).
 ///
+/// Case 3 never allocated a `gc_buf`; `rstr.mallocstr(needed_size)` and case 2.
 /// A size mismatch tries `llop.shrink_array` (`gc_shrink_array`) first. That
 /// write is the length word only, so a successful shrink stores the trailing
 /// NUL at `chars[needed_size]` here. On `false`, `rstr.mallocstr(needed_size)`
@@ -301,7 +319,11 @@ pub unsafe fn str_from_buffer(
     needed_size: usize,
 ) -> Result<majit_ir::GcRef, MemoryError> {
     assert!(allocated_size >= needed_size);
-    if allocated_size != needed_size {
+    if case_num == CASE_LARGE {
+        // alloc_buffer never allocated a gc_buf at all; nothing to shrink.
+        gc_buf = crate::lltypesystem::rstr::mallocstr(needed_size)?;
+        case_num = CASE_RAW;
+    } else if allocated_size != needed_size {
         if majit_gc::gc_shrink_array(gc_buf.0, needed_size) {
             unsafe {
                 (gc_buf.0 as *mut u8)
@@ -327,9 +349,8 @@ pub unsafe fn str_from_buffer(
 
 /// `rffi.keep_buffer_alive_until_here` (`jit.dont_look_inside`).
 ///
-/// `keepalive_until_here(gc_buf)`; case 1 → `rgc.unpin(gc_buf)`; case 2 →
-/// `lltype.free(raw_buf, flavor='raw')`. Case 3 (`_alloc_buffer_nonlarge_max`)
-/// is unported.
+/// `keepalive_until_here(gc_buf)`; case 1 → `rgc.unpin(gc_buf)`; case 2 or 3 →
+/// `lltype.free(raw_buf, flavor='raw')`.
 ///
 /// # Safety
 /// `(raw_buf, gc_buf, case_num)` came from [`alloc_buffer`] and has not been
@@ -344,7 +365,7 @@ pub unsafe fn keep_buffer_alive_until_here(
     if case_num == CASE_PINNED {
         majit_gc::unpin(gc_buf);
     }
-    if case_num == CASE_RAW {
+    if case_num == CASE_RAW || case_num == CASE_LARGE {
         unsafe { raw_free(raw_buf.cast()) };
     }
 }
@@ -824,7 +845,7 @@ unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
 /// NULL from [`raw_malloc`] is [`MemoryError`]. Does not call
 /// `majit_gc::raise_memory_error` (`raw_malloc_memory_error` is the
 /// `extern "C"` `ll_raw_malloc_*` path).
-fn raw_malloc_or_memory_error(size: usize) -> Result<*mut u8, MemoryError> {
+pub(super) fn raw_malloc_or_memory_error(size: usize) -> Result<*mut u8, MemoryError> {
     let p = unsafe { raw_malloc(size) };
     if p.is_null() { Err(MemoryError) } else { Ok(p) }
 }

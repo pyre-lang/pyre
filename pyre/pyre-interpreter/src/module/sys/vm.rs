@@ -2094,11 +2094,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // occupy that kept the sanitizer from claiming a `posix_spawn`
     // `POSIX_SPAWN_CLOSE` slot, so `create_stdio` still sees EBADF.
     majit_rlib::rposix::restore_closed_standard_fds();
-    let stdout = make_std_stream("<stdout>", 1);
+    let stdout = make_std_stream("<stdout>", 1)?;
     let stdout_slot = roots.pin_roots(&[stdout]);
-    let stderr = make_std_stream("<stderr>", 2);
+    let stderr = make_std_stream("<stderr>", 2)?;
     let stderr_slot = roots.pin_roots(&[stderr]);
-    let stdin = make_std_stream("<stdin>", 0);
+    let stdin = make_std_stream("<stdin>", 0)?;
     let stdin_slot = roots.pin_roots(&[stdin]);
     module_ns_store(roots.get(ns_slot), "stdout", roots.get(stdout_slot));
     module_ns_store(roots.get(ns_slot), "stderr", roots.get(stderr_slot));
@@ -4580,15 +4580,15 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 /// the whole platform in. The locale test could not stand in for it: the MSVC
 /// runtime's `setlocale(LC_CTYPE, "")` reads the user's ANSI locale and
 /// ignores `LC_ALL`, so it never sees C there.
-fn locale_asks_for_surrogateescape() -> bool {
+fn locale_asks_for_surrogateescape() -> Result<bool, crate::PyError> {
     #[cfg(windows)]
     {
-        true
+        Ok(true)
     }
     #[cfg(not(windows))]
     {
         if crate::importing::utf8_mode_flag() != 0 {
-            return true;
+            return Ok(true);
         }
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         {
@@ -4596,32 +4596,40 @@ fn locale_asks_for_surrogateescape() -> bool {
             // reading it back, so what is tested is the locale the C library
             // took rather than the variables that asked for it.
             if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
-                std::panic::panic_any(e);
+                return Err(crate::error::get_converted_unexpected_exception(
+                    pyre_object::PY_NULL,
+                    &e,
+                ));
             }
             let effective = match majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None) {
                 Ok(Ok(bytes)) => Some(bytes),
                 Ok(Err(_)) => None,
-                Err(e) => std::panic::panic_any(e),
+                Err(e) => {
+                    return Err(crate::error::get_converted_unexpected_exception(
+                        pyre_object::PY_NULL,
+                        &e,
+                    ));
+                }
             };
             // `app_main.py initstdio`'s `is_c_locale` tuple names C, POSIX,
             // C.UTF-8, C.utf8 and UTF-8, the same set `initconfig.c
             // config_get_stdio_errors` reaches through `_Py_IsLocaleCoercionTarget`
             // (`pylifecycle.c _TARGET_LOCALES`), so both upstreams agree and
             // this is plain parity, not a spec split.
-            matches!(
+            Ok(matches!(
                 effective.as_deref(),
                 None | Some(b"C")
                     | Some(b"POSIX")
                     | Some(b"C.UTF-8")
                     | Some(b"C.utf8")
                     | Some(b"UTF-8")
-            )
+            ))
         }
         // No locale database at all -- wasm32, and the sandbox, whose
         // `_locale.setlocale` answers `C` for every category.
         #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
         {
-            true
+            Ok(true)
         }
     }
 }
@@ -4643,42 +4651,41 @@ fn locale_asks_for_surrogateescape() -> bool {
 ///
 /// Resolved once: `initstdio` runs once, and a later `locale.setlocale` must
 /// not change the answer a stream is already open with.
-fn stdio_encoding_and_errors() -> (String, String) {
+fn stdio_encoding_and_errors() -> Result<(String, String), crate::PyError> {
     static RESOLVED: OnceLock<(String, String)> = OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            let raw = crate::importing::stdio_encoding();
-            let (encoding, errors, user_set_encoding) = match raw.as_deref() {
-                Some(value) if value.contains(':') => {
-                    let (encoding, errors) = value.split_once(':').expect("value holds a ':'");
-                    let user_set_encoding = !encoding.is_empty();
-                    let errors = if !errors.is_empty() {
-                        Some(errors)
-                    } else if user_set_encoding {
-                        Some("strict")
-                    } else {
-                        None
-                    };
-                    let encoding = if encoding.is_empty() {
-                        default_stdio_encoding()
-                    } else {
-                        encoding.to_string()
-                    };
-                    (encoding, errors, user_set_encoding)
-                }
-                Some(value) if !value.is_empty() => (value.to_string(), None, true),
-                _ => (default_stdio_encoding(), None, false),
+    if let Some(resolved) = RESOLVED.get() {
+        return Ok(resolved.clone());
+    }
+    let raw = crate::importing::stdio_encoding();
+    let (encoding, errors, user_set_encoding) = match raw.as_deref() {
+        Some(value) if value.contains(':') => {
+            let (encoding, errors) = value.split_once(':').expect("value holds a ':'");
+            let user_set_encoding = !encoding.is_empty();
+            let errors = if !errors.is_empty() {
+                Some(errors)
+            } else if user_set_encoding {
+                Some("strict")
+            } else {
+                None
             };
-            let errors = match errors {
-                Some(errors) => errors.to_string(),
-                None if !user_set_encoding && locale_asks_for_surrogateescape() => {
-                    "surrogateescape".to_string()
-                }
-                None => "strict".to_string(),
+            let encoding = if encoding.is_empty() {
+                default_stdio_encoding()?
+            } else {
+                encoding.to_string()
             };
-            (encoding, errors)
-        })
-        .clone()
+            (encoding, errors, user_set_encoding)
+        }
+        Some(value) if !value.is_empty() => (value.to_string(), None, true),
+        _ => (default_stdio_encoding()?, None, false),
+    };
+    let errors = match errors {
+        Some(errors) => errors.to_string(),
+        None if !user_set_encoding && locale_asks_for_surrogateescape()? => {
+            "surrogateescape".to_string()
+        }
+        None => "strict".to_string(),
+    };
+    Ok(RESOLVED.get_or_init(move || (encoding, errors)).clone())
 }
 
 /// `config_get_locale_encoding` — the encoding a standard stream opens with
@@ -4693,9 +4700,9 @@ fn stdio_encoding_and_errors() -> (String, String) {
 /// POSIX answer is the `nl_langinfo` codeset, and reading it here would make a
 /// C-locale host open its streams as `ascii` — the encoding CPython avoids
 /// through the PEP 538 locale coercion pyre does not implement yet.
-fn default_stdio_encoding() -> String {
+fn default_stdio_encoding() -> Result<String, crate::PyError> {
     if crate::importing::utf8_mode_flag() != 0 {
-        return "utf-8".to_string();
+        return Ok("utf-8".to_string());
     }
     #[cfg(windows)]
     {
@@ -4703,7 +4710,7 @@ fn default_stdio_encoding() -> String {
     }
     #[cfg(not(windows))]
     {
-        "utf-8".to_string()
+        Ok("utf-8".to_string())
     }
 }
 
@@ -4731,13 +4738,16 @@ fn raw_is_windows_console(_raw: PyObjectRef) -> bool {
     false
 }
 
-fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (String, String) {
-    let defaults = stdio_encoding_and_errors();
+fn live_stdio_encoding_errors(
+    stream_name: &str,
+    default_errors: &str,
+) -> Result<(String, String), crate::PyError> {
+    let defaults = stdio_encoding_and_errors()?;
     let Some(sys) = crate::importing::get_interpreter_sys_module() else {
-        return (defaults.0, default_errors.to_string());
+        return Ok((defaults.0, default_errors.to_string()));
     };
     let Ok(stream) = crate::baseobjspace::getattr_str(sys, stream_name) else {
-        return (defaults.0, default_errors.to_string());
+        return Ok((defaults.0, default_errors.to_string()));
     };
     let text_attr = |name: &str, default: &str| {
         crate::baseobjspace::getattr_str(stream, name)
@@ -4750,10 +4760,10 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
             })
             .unwrap_or_else(|| default.to_string())
     };
-    (
+    Ok((
         text_attr("encoding", &defaults.0),
         text_attr("errors", default_errors),
-    )
+    ))
 }
 
 /// `pylifecycle.c init_sys_streams` builds the standard streams after the
@@ -4829,7 +4839,7 @@ fn flush_std_descriptors() -> crate::PyResult {
     Ok(w_none())
 }
 
-fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
+fn make_std_stream(name: &'static str, fd: i32) -> Result<PyObjectRef, crate::PyError> {
     let writable = fd != 0;
     let to_stderr = fd == 2;
     let unbuffered = writable && crate::importing::unbuffered_flag();
@@ -4848,13 +4858,13 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         if unsafe { majit_rlib::_rsocket_rffi::fcntl(fd, libc::F_GETFD, 0) } == -1 {
-            return w_none();
+            return Ok(w_none());
         }
     }
     #[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
     {
         if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-            return w_none();
+            return Ok(w_none());
         }
     }
     // [3.14-spec] `app_main.py` never reads PYTHONLEGACYWINDOWSSTDIO, so
@@ -4897,7 +4907,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         let raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
         let _ = crate::baseobjspace::setattr_str(raw, "name", w_name);
     }
-    let (encoding, configured_errors) = stdio_encoding_and_errors();
+    let (encoding, configured_errors) = stdio_encoding_and_errors()?;
     // `create_stdio` reads the raw layer back after `_io.open` has chosen it:
     // a console stream is utf-8 encoded whatever the configuration named.
     let encoding = if raw_is_windows_console(pyre_object::gc_roots::shadow_stack_get(raw_slot)) {
@@ -5039,7 +5049,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         crate::make_builtin_function("write", |args| {
             stdio_check_closed("__stderr__", CLOSED_TEXT_LAYER)?;
             if let Some(mut s_obj) = pick_str(args) {
-                let (encoding, _) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stderr", "backslashreplace"));
+                let (encoding, _) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stderr", "backslashreplace"))?;
                 let bytes = pyre_object::with_roots!(s_obj => encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace"))?;
                 // An embedder that installed a hook takes the bytes here;
                 // otherwise fall through to the descriptor.
@@ -5075,7 +5085,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         crate::make_builtin_function("write", |args| {
             stdio_check_closed("__stdout__", CLOSED_TEXT_LAYER)?;
             if let Some(mut s_obj) = pick_str(args) {
-                let (encoding, errors) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stdout", "strict"));
+                let (encoding, errors) = pyre_object::with_roots!(s_obj => live_stdio_encoding_errors("stdout", "strict"))?;
                 let bytes = pyre_object::with_roots!(s_obj => encode_stdio_text(s_obj, "stdout", &encoding, &errors))?;
                 // Same seam `print` rides, so an embedder that captures stdout
                 // sees `sys.stdout.write` too and the two stay in order.
@@ -5202,7 +5212,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         "readable",
         pyre_object::gc_roots::shadow_stack_get(readable_slot),
     );
-    pyre_object::gc_roots::shadow_stack_get(stream_slot)
+    Ok(pyre_object::gc_roots::shadow_stack_get(stream_slot))
 }
 
 #[cfg(test)]

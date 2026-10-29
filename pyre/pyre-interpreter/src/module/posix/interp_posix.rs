@@ -3953,15 +3953,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let roots = pyre_object::gc_roots::push_roots();
                     w_data = roots.pin_root(w_data);
                     let llobj = unsafe { crate::builtins::file_write_as_str(w_data) }?;
-                    let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
-                    let llobj = crate::builtins::py_write_max_str(llobj)?;
-                    let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                    let llobj_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(llobj.0 as PyObjectRef);
                     // `rposix.write` sits inside the `eintr_retry=True` loop,
                     // so an interrupted write runs the pending signal handlers
                     // and is re-issued rather than surfacing as
                     // `InterruptedError`.
+                    // A retry runs signal handlers, which can collect: re-read the root.
                     loop {
-                        match majit_rlib::rposix::write(fd, llobj) {
+                        match majit_rlib::rposix::write(
+                            fd,
+                            majit_ir::GcRef(
+                                pyre_object::gc_roots::shadow_stack_get(llobj_slot) as usize
+                            ),
+                        ) {
                             Ok(Ok(ret)) => break ret,
                             Ok(Err(errno)) => crate::builtins::eintr_retry_with(
                                 std::io::Error::from_raw_os_error(errno),

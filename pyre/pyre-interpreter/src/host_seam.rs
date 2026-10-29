@@ -201,14 +201,15 @@ pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, majit_rlib::rffi::MemoryEr
 // Best-effort — a failed relay is dropped, matching a closed real stream.
 
 /// `ll_os.ll_os_write` for a Rust `&[u8]` that is not already a STR: pack
-/// into a `BytesBlock` (`alloc_bytes_block`, old-gen or immortal) and call
+/// into a `BytesBlock` (`try_alloc_bytes_block`; a refused reservation is MemoryError) and call
 /// `rposix.write`.
 #[cfg(feature = "sandbox")]
 pub(crate) fn write_sandbox_fd(
     fd: i32,
     bytes: &[u8],
 ) -> Result<Result<i64, i32>, majit_rlib::rffi::MemoryError> {
-    let block = pyre_object::bytesobject::alloc_bytes_block(bytes);
+    let block = pyre_object::bytesobject::try_alloc_bytes_block(bytes)
+        .ok_or(majit_rlib::rffi::MemoryError)?;
     majit_rlib::rposix::write(fd, majit_ir::GcRef(block as usize))
 }
 

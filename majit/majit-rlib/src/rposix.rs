@@ -447,6 +447,12 @@ pub fn write(
         crate::lltypesystem::rstr::str_as_bytes(llobj.0 as *const crate::lltypesystem::rstr::STR)
             .len()
     };
+    // [3.15-spec] count clamped to INT_MAX on Apple ↔ rposix.py write passes len(data) —
+    // observable: os.write/FileIO.write of more than INT_MAX bytes on macOS returns INT_MAX
+    // instead of raising OSError(EINVAL); evidence: v3.15.0 pycore_fileutils.h _PY_WRITE_MAX,
+    // fileutils.c _Py_write_impl.
+    #[cfg(target_vendor = "apple")]
+    let count = count.min(i32::MAX as usize);
     let buf = crate::rffi::scoped_nonmovingbuffer::new(llobj)?;
     Ok(handle_posix_error(
         unsafe { c_write(fd, buf.buf.cast(), count) } as i64,

@@ -5824,7 +5824,7 @@ pub fn get_converted_unexpected_exception(
     let traceback = {
         #[cfg(unix)]
         {
-            majit_rlib::rsandbox::take_recorded_traceback()
+            majit_rlib::rsandbox::take_recorded_traceback(name)
                 .unwrap_or_else(std::backtrace::Backtrace::force_capture)
         }
         #[cfg(not(unix))]
@@ -6407,27 +6407,27 @@ pub fn debug_print(text: &str, file: Option<&mut dyn Write>, _newline: bool) {
 /// `os.strerror` bytes, decoded with `str_decode_locale_surrogateescape`.
 /// `Err` is the `ValueError` `rposix.strerror` raises when the host returns
 /// null.
-pub fn strerror(errno: i32) -> Result<Wtf8Buf, ()> {
-    let bytes = strerror_bytes(errno)?;
-    let (utf8, _lgt) = crate::module::_codecs::locale::str_decode_locale_surrogateescape(&bytes)?;
-    Ok(utf8)
+/// The outer `Err` is the `MemoryError` that escapes `rposix.strerror`.
+pub fn strerror(errno: i32) -> Result<Result<Wtf8Buf, ()>, crate::PyError> {
+    let bytes = match strerror_bytes(errno)? {
+        Ok(b) => b,
+        Err(()) => return Ok(Err(())),
+    };
+    Ok(
+        crate::module::_codecs::locale::str_decode_locale_surrogateescape(&bytes)
+            .map(|(utf8, _lgt)| utf8),
+    )
 }
 
-fn strerror_bytes(errno: i32) -> Result<Vec<u8>, ()> {
+fn strerror_bytes(errno: i32) -> Result<Result<Vec<u8>, ()>, crate::PyError> {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         match majit_rlib::rposix::strerror(errno) {
-            Ok(inner) => inner,
-            Err(e) => {
-                #[cfg(all(unix, feature = "sandbox"))]
-                {
-                    majit_rlib::rsandbox::reraise(e);
-                }
-                #[cfg(not(all(unix, feature = "sandbox")))]
-                {
-                    std::panic::panic_any(e);
-                }
-            }
+            Ok(inner) => Ok(inner),
+            Err(e) => Err(crate::error::get_converted_unexpected_exception(
+                pyre_object::PY_NULL,
+                &e,
+            )),
         }
     }
     #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
@@ -6436,16 +6436,18 @@ fn strerror_bytes(errno: i32) -> Result<Vec<u8>, ()> {
         {
             let p = unsafe { libc::strerror(errno) };
             if p.is_null() {
-                Err(())
+                Ok(Err(()))
             } else {
-                Ok(unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec())
+                Ok(Ok(unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_bytes()
+                    .to_vec()))
             }
         }
         #[cfg(target_arch = "wasm32")]
         {
-            crate::builtins::wasm_errno::strerror(errno)
+            Ok(crate::builtins::wasm_errno::strerror(errno)
                 .map(|s| s.as_bytes().to_vec())
-                .ok_or(())
+                .ok_or(()))
         }
     }
 }
@@ -6466,8 +6468,9 @@ pub fn exception_from_errno(
 ) -> OperationError {
     let _ = _space;
     let msg = match strerror(errno) {
-        Ok(msg) => msg,
-        Err(()) => Wtf8Buf::from_string(format!("error {errno}")),
+        Ok(Ok(msg)) => msg,
+        Ok(Err(())) => Wtf8Buf::from_string(format!("error {errno}")),
+        Err(err) => return err,
     };
     if w_type.is_null() {
         // No class to call: `OSError(errno, strerror)` is what the family's

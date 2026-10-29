@@ -1066,17 +1066,31 @@ impl<'a> Lowering<'a> {
                             // `PyObject ∪ PyErrorObject`.
                             value =
                                 self.recast_error_carrier_field_store(bb_id, &field_base_ty, value);
+                            let owner_declared_gc = container_declared_gc(
+                                &field_base_ty,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                self.immutable_fields,
+                            );
                             let ty =
                                 crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                     &owner_root,
                                     &field_name,
-                                    tyref_to_value_type_with(
+                                    raw_field_address_value_type(
                                         dest_ty,
+                                        dest_ty,
+                                        owner_declared_gc,
                                         self.llbc,
-                                        self.tombstoned_leaves,
-                                        self.gc_struct_ids,
-                                        &self.raw_alloc_flavor_structs,
-                                    ),
+                                    )
+                                    .unwrap_or_else(|| {
+                                        tyref_to_value_type_with(
+                                            dest_ty,
+                                            self.llbc,
+                                            self.tombstoned_leaves,
+                                            self.gc_struct_ids,
+                                            &self.raw_alloc_flavor_structs,
+                                        )
+                                    }),
                                 );
                             if let Some(dest) = interior_dest
                                 && self.interior_field_alias.contains_key(&dest)
@@ -1086,12 +1100,7 @@ impl<'a> Lowering<'a> {
                                     Some(owner_root.clone()),
                                 )
                                 .with_owner_id(owner_id)
-                                .with_owner_declared_gc(container_declared_gc(
-                                    &field_base_ty,
-                                    self.llbc,
-                                    self.gc_struct_ids,
-                                    self.immutable_fields,
-                                ))
+                                .with_owner_declared_gc(owner_declared_gc)
                                 .with_base_is_deref(true)
                                 .with_host_index(host_index);
                                 self.emit_interior_field_write(
@@ -1107,12 +1116,7 @@ impl<'a> Lowering<'a> {
                             (
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
-                                    .with_owner_declared_gc(container_declared_gc(
-                                        &field_base_ty,
-                                        self.llbc,
-                                        self.gc_struct_ids,
-                                        self.immutable_fields,
-                                    ))
+                                    .with_owner_declared_gc(owner_declared_gc)
                                     .with_base_is_deref(base_is_deref)
                                     .with_host_index(host_index),
                                 ty,
@@ -3725,17 +3729,36 @@ impl<'a> Lowering<'a> {
     /// The [`ValueType`] of a `Copy` / `Move` operand, read from the
     /// operand place's post-projection type.  Used by the `Cast`
     /// lowering to decide whether the cast crosses a register bank.
-    /// Returns `None` for `Const` operands (a constant carries no place
-    /// type here; a const-source cast aliases its operand).
+    /// A raw owner's address field takes the bank
+    /// [`adt_field_read_value_type`] gave the read.  Returns `None` for
+    /// `Const` operands (a constant carries no place type here; a
+    /// const-source cast aliases its operand).
     pub(in crate::front::mir) fn operand_value_kind(&self, op: &Operand) -> Option<ValueType> {
         match op {
-            Operand::Copy(place) | Operand::Move(place) => Some(tyref_to_value_type_with(
-                &place.ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            )),
+            Operand::Copy(place) | Operand::Move(place) => {
+                if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
+                    && v.as_object().and_then(|m| m.get("Field")).is_some()
+                {
+                    let owner_gc = container_declared_gc(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        self.immutable_fields,
+                    );
+                    if let Some(raw) =
+                        raw_field_address_value_type(&place.ty, &place.ty, owner_gc, self.llbc)
+                    {
+                        return Some(raw);
+                    }
+                }
+                Some(tyref_to_value_type_with(
+                    &place.ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                ))
+            }
             Operand::Const(_) => None,
         }
     }

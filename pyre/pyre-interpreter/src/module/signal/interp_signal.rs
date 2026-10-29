@@ -686,11 +686,15 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
     let Some(w_type) = crate::builtins::lookup_exc_class("OSError") else {
         return;
     };
-    let msg = match crate::error::strerror(errno_val) {
-        Ok(msg) => msg,
-        Err(()) => rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}")),
+    let mut err = match crate::error::strerror(errno_val) {
+        Ok(r) => crate::PyError::os_error_errno_strerror(
+            errno_val,
+            r.unwrap_or_else(|()| {
+                rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}"))
+            }),
+        ),
+        Err(err) => err,
     };
-    let mut err = crate::PyError::os_error_errno_strerror(errno_val, msg);
     let w_exc = err.to_exc_object();
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1149,16 +1153,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
                     #[cfg(unix)]
-                    let text = majit_rlib::rsignal::strsignal(signum).map_err(|e| {
-                        crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
-                    })?;
+                    let text: Option<PyObjectRef> =
+                        match majit_rlib::rsignal::strsignal(signum).map_err(|e| {
+                            crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            )
+                        })? {
+                            None => None,
+                            Some(bytes) => {
+                                let (decoded, _) =
+                                    crate::typedef::decode_utf8_with_errors_incremental(
+                                        &bytes, "strict", true, false,
+                                    )?;
+                                Some(pyre_object::w_str_from_wtf8_managed(decoded))
+                            }
+                        };
                     #[cfg(windows)]
-                    let text = rustpython_host_env::signal::strsignal(signum);
+                    let text: Option<PyObjectRef> = rustpython_host_env::signal::strsignal(signum)
+                        .map(|s| pyre_object::w_str_new_managed(&s));
                     #[cfg(not(any(unix, windows)))]
-                    let text = wasm_signals::strsignal(signum).map(str::to_owned);
-                    Ok(text
-                        .map(|s| pyre_object::w_str_new_managed(&s))
-                        .unwrap_or(pyre_object::w_none()))
+                    let text: Option<PyObjectRef> = wasm_signals::strsignal(signum)
+                        .map(pyre_object::w_str_new_managed);
+                    Ok(text.unwrap_or(pyre_object::w_none()))
                 }
                 #[cfg(not(feature = "host_env"))]
                 {

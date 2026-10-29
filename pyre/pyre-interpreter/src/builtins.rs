@@ -25597,27 +25597,6 @@ pub(crate) unsafe fn file_write_as_str(
     }
 }
 
-// [3.15-spec] count clamped to INT_MAX on Apple ↔ rposix.py write passes len(data) —
-// observable: os.write/FileIO.write of more than INT_MAX bytes on macOS returns INT_MAX instead of
-// raising OSError(EINVAL); evidence: v3.15.0 pycore_fileutils.h _PY_WRITE_MAX, fileutils.c
-// _Py_write_impl.
-#[cfg(unix)]
-pub(crate) fn py_write_max_str(llobj: majit_ir::GcRef) -> Result<majit_ir::GcRef, crate::PyError> {
-    if cfg!(target_vendor = "apple") {
-        let data = unsafe {
-            pyre_object::bytesobject::bytes_block_chars(
-                llobj.0 as *const pyre_object::bytesobject::BytesBlock,
-            )
-        };
-        if data.len() > i32::MAX as usize {
-            let block = pyre_object::bytesobject::try_alloc_bytes_block(&data[..i32::MAX as usize])
-                .ok_or_else(reservation_failed)?;
-            return Ok(majit_ir::GcRef(block as usize));
-        }
-    }
-    Ok(llobj)
-}
-
 /// `_io/interp_fileio.py:write_w` — `space.getarg_w('s*', w_data).as_str()`.
 /// The `s*` converter accepts readable buffer exporters, not only bytes.
 pub(crate) unsafe fn file_write_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
@@ -25733,11 +25712,16 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                         file_write_as_str(roots.get(base + 1))?
                     }
                 };
-                let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
-                let llobj = py_write_max_str(llobj)?;
-                let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                let llobj_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = roots.pin_root(llobj.0 as PyObjectRef);
+                // A retry runs signal handlers, which can collect: re-read the root.
                 loop {
-                    match majit_rlib::rposix::write(fd, llobj) {
+                    match majit_rlib::rposix::write(
+                        fd,
+                        majit_ir::GcRef(
+                            pyre_object::gc_roots::shadow_stack_get(llobj_slot) as usize
+                        ),
+                    ) {
                         Ok(Ok(n)) => break n,
                         Ok(Err(errno)) if errno == libc::EAGAIN => return Ok(w_none()),
                         Ok(Err(errno)) => eintr_retry(std::io::Error::from_raw_os_error(errno))?,

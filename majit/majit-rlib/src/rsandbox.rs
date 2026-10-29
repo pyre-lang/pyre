@@ -88,22 +88,29 @@ impl SandboxError {
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
 /// Process-global last-raised sandbox traceback (`debug_traceback.h`
-/// `pypy_debug_tracebacks` / `PYPY_DEBUG_RECORD_TRACEBACK`).
-static RECORDED_TRACEBACK: Mutex<Option<std::backtrace::Backtrace>> = Mutex::new(None);
+/// `pypy_debug_tracebacks` / `PYPY_DEBUG_RECORD_TRACEBACK`). The entry carries
+/// the exctype, as `pypy_debug_tracebacks` entries do.
+static RECORDED_TRACEBACK: Mutex<Option<(&'static str, std::backtrace::Backtrace)>> =
+    Mutex::new(None);
 
-fn record_debug_traceback() {
+fn record_debug_traceback(exctype: &'static str) {
     if let Ok(mut slot) = RECORDED_TRACEBACK.lock() {
-        *slot = Some(std::backtrace::Backtrace::force_capture());
+        *slot = Some((exctype, std::backtrace::Backtrace::force_capture()));
     }
 }
 
 /// `debug_traceback.h` `pypy_debug_traceback_print` / `debug_print_traceback`:
 /// take the traceback recorded at the raise so a later error never reprints it.
-pub fn take_recorded_traceback() -> Option<std::backtrace::Backtrace> {
-    RECORDED_TRACEBACK
+/// Decoding matches on exctype, as `pypy_debug_traceback_print` does.
+pub fn take_recorded_traceback(exctype: &str) -> Option<std::backtrace::Backtrace> {
+    let recorded = RECORDED_TRACEBACK
         .lock()
         .ok()
-        .and_then(|mut slot| slot.take())
+        .and_then(|mut slot| slot.take());
+    match recorded {
+        Some((stored, bt)) if stored == exctype => Some(bt),
+        _ => None,
+    }
 }
 
 /// Catch an `OSError` escaping a non-`Result` trampoline, matching an interp
@@ -117,7 +124,11 @@ pub fn catch_os_error<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
         Ok(value) => Ok(value),
         Err(payload) => match payload.downcast::<SandboxError>() {
             Ok(err) => match *err {
-                SandboxError::Os(errno) => Err(errno),
+                SandboxError::Os(errno) => {
+                    // PYPY_DEBUG_CATCH_EXCEPTION: the raise was caught.
+                    let _ = take_recorded_traceback("OSError");
+                    Err(errno)
+                }
                 other => std::panic::resume_unwind(Box::new(other)),
             },
             Err(payload) => std::panic::resume_unwind(payload),
@@ -145,8 +156,9 @@ impl From<crate::rffi::MemoryError> for SandboxError {
 /// `debug_traceback.h` `PYPY_DEBUG_RECORD_TRACEBACK` then `panic_any`, matching
 /// `rsandbox.py` `reraise_error`.
 pub fn reraise(err: impl Into<SandboxError>) -> ! {
-    record_debug_traceback();
-    std::panic::panic_any(err.into())
+    let err = err.into();
+    record_debug_traceback(err.rpython_exception_class_name());
+    std::panic::panic_any(err)
 }
 
 /// Map an exception code (the first int of a reply) to a [`SandboxError`].

@@ -2810,6 +2810,35 @@ pub(in crate::front::mir) fn tyref_deref_value_type_with(
     )
 }
 
+/// The `'int'` bank of a raw owner's address field: `history.py`
+/// `getkind` of a raw `Ptr` is `'int'`. Shared by the field read, the
+/// field write and a cast of the read value, so all three agree.
+pub(in crate::front::mir) fn raw_field_address_value_type(
+    place_ty: &TyRef,
+    field_ty: &TyRef,
+    owner_declared_gc: Option<bool>,
+    llbc: &Llbc,
+) -> Option<ValueType> {
+    // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
+    // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
+    // adapter spells the same `*mut i64` and must stay the GC header
+    // (`typed_array_base_call_stays_ref`).
+    if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc)
+        .or_else(|| raw_scalar_address_value_type(field_ty, llbc))
+    {
+        return Some(raw);
+    }
+    // Same raw-owner gate as [`fat_part_value_type`] / `field_spelling_lltype`.
+    // `tyref_scalar_pointee_value_type` leaves a raw `*mut u8`/`*mut i8` as
+    // the erased GCREF spelling; only a raw owner banks that word as `'int'`.
+    if owner_declared_gc == Some(false)
+        && (tyref_is_raw_byte_ptr(place_ty, llbc) || tyref_is_raw_byte_ptr(field_ty, llbc))
+    {
+        return Some(ValueType::Int);
+    }
+    None
+}
+
 /// Register-bank kind of an ADT field read.
 ///
 /// Prefers the place's post-projection type (generic substitution is
@@ -2839,22 +2868,8 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
-    // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
-    // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
-    // adapter spells the same `*mut i64` and must stay the GC header
-    // (`typed_array_base_call_stays_ref`).
-    if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc)
-        .or_else(|| raw_scalar_address_value_type(field_ty, llbc))
-    {
+    if let Some(raw) = raw_field_address_value_type(place_ty, field_ty, owner_declared_gc, llbc) {
         return raw;
-    }
-    // Same raw-owner gate as [`fat_part_value_type`] / `field_spelling_lltype`.
-    // `tyref_scalar_pointee_value_type` leaves a raw `*mut u8`/`*mut i8` as
-    // the erased GCREF spelling; only a raw owner banks that word as `'int'`.
-    if owner_declared_gc == Some(false)
-        && (tyref_is_raw_byte_ptr(place_ty, llbc) || tyref_is_raw_byte_ptr(field_ty, llbc))
-    {
-        return ValueType::Int;
     }
     let declared = if container_is_enum {
         tyref_enum_payload_value_type(

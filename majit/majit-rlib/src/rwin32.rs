@@ -531,13 +531,14 @@ fn llimpl_FormatError(code: i64) -> Result<Vec<u8>, crate::rffi::MemoryError> {
         buflen -= 1;
     }
 
+    // rwin32.py llimpl_FormatError: LocalFree runs in finally.
     let result = if buflen <= 0 {
-        format!("Windows Error {code}").into_bytes()
+        Ok(format!("Windows Error {code}").into_bytes())
     } else {
-        unsafe { rffi::charpsize2str(s_buf, buflen as usize)? }
+        unsafe { rffi::charpsize2str(s_buf, buflen as usize) }
     };
     unsafe { LocalFree(buf.cast()) };
-    Ok(result)
+    result
 }
 
 /// `rwin32.llimpl_FormatErrorW` — return a utf8-encoded msg and its length.
