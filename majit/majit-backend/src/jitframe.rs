@@ -688,6 +688,12 @@ impl JitframeDescrFacts {
         }
     }
 
+    /// `GcAllocator::jitframe_type_id` of this descr.
+    #[inline]
+    pub fn type_id(self) -> u32 {
+        self.type_id
+    }
+
     /// Frame the compiled run returned, ready for `jf_descr` and slot 0.
     ///
     /// `jitframe.py` `jitframe_resolve` walks `jf_forward`. A moving nursery
@@ -806,7 +812,7 @@ pub fn malloc_gc_jitframe(facts: JitframeDescrFacts, size_bytes: usize) -> (*mut
 
 /// Inlined `malloc_fast` (`framework.py`) over the descr's nursery cells.
 #[inline]
-fn try_bump_nursery_jitframe(
+pub fn try_bump_nursery_jitframe(
     facts: JitframeDescrFacts,
     size_bytes: usize,
 ) -> Option<*mut JitFrame> {
@@ -837,7 +843,7 @@ fn try_bump_nursery_jitframe(
 /// hook. A per-thread box (CelGc) answers from this thread's heap; a
 /// process-global MiniMark answers from `gc_sync`.
 #[inline]
-fn malloc_gc_jitframe_via_descr(type_id: u32, size_bytes: usize) -> (*mut JitFrame, bool) {
+pub fn malloc_gc_jitframe_via_descr(type_id: u32, size_bytes: usize) -> (*mut JitFrame, bool) {
     let mut needs_wb = true;
     let gcref =
         unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size_bytes, &mut needs_wb) };

@@ -20016,7 +20016,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Pyre's inlined Python frames share the portal jitcode, so each section
     /// is a portal frame and `portal_call_depth` counts them. The pc is still
     /// per section: leaving every frame at 0 resumes the callee at the
-    /// caller's entry. Register fill is [`Self::consume_portal_resume_boxes`].
+    /// caller's entry. Register fill is [`Self::consume_portal_resume_section`].
     pub fn rebuild_portal_framestack_from_resume(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
@@ -20177,6 +20177,33 @@ impl<M: Clone> MetaInterp<M> {
         self.call_ids.clear();
         self.current_call_id = 0;
         let jitcodes = std::sync::Arc::clone(&self.staticdata);
+        let staticdata = std::sync::Arc::clone(&self.staticdata);
+        let resume_owned = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.bridge_resume_data().cloned());
+        // Empty `resume_liveness` is `metainterp.staticdata` (`resume.py`).
+        // A non-empty buffer is a caller-supplied table (unit tests whose
+        // jitcode was not encoded against this staticdata).
+        let published = if resume_liveness.is_empty() {
+            Some(staticdata.liveness_info.snapshot_arc())
+        } else {
+            None
+        };
+        let op_live = if published.is_some() {
+            staticdata.op_live as u8
+        } else {
+            resume_op_live
+        };
+        let liveness: &[u8] = match published.as_deref() {
+            Some(bytes) => bytes,
+            None => resume_liveness,
+        };
+        let rd_consts = resume_owned
+            .as_ref()
+            .and_then(|resume| resume.storage.as_ref())
+            .and_then(|storage| storage.rd_consts())
+            .unwrap_or(&[]);
         for (section_i, section) in frames.iter().enumerate() {
             // resume.py `rebuild_from_resumedata`:
             // `jitcode = metainterp.staticdata.jitcodes[jitcode_pos]`.
@@ -20211,23 +20238,39 @@ impl<M: Clone> MetaInterp<M> {
             let Ok(pc) = usize::try_from(section.pc) else {
                 return false;
             };
+            // resume.py `ResumeDataBoxReader` keeps `metainterp` (and so
+            // the history) reachable the whole time; `newframe` may
+            // borrow `self.tracing` for `setup`.
             let frame_index = self.newframe(jitcode, None);
             if let Some(frame) = self.framestack.frames.get_mut(frame_index) {
                 // resume.py `MIFrame.setup_resume_at_op`.
                 frame.setup_resume_at_op(pc);
             }
+            let ok = Self::consume_portal_resume_section(
+                &mut self.framestack,
+                &staticdata,
+                self.tracing.as_mut(),
+                resume_owned.as_ref(),
+                section,
+                section_i,
+                fail_values,
+                fail_types,
+                materialized,
+                op_live,
+                liveness,
+                rd_consts,
+                reader,
+            );
+            if !ok {
+                return false;
+            }
+            // resume.py `rebuild_from_resumedata` calls
+            // `f.handle_rvmprof_enter_on_resume()` after that section's
+            // `consume_boxes`, before the next `read_jitcode_pos_pc`.
+            self.framestack.frames[frame_index]
+                .handle_rvmprof_enter_on_resume(staticdata.op_live, staticdata.op_rvmprof_code);
         }
-        // resume.py `rebuild_from_resumedata`: `newframe` +
-        // `setup_resume_at_op` + `consume_boxes`.
-        self.consume_portal_resume_boxes(
-            frames,
-            fail_values,
-            fail_types,
-            materialized,
-            resume_liveness,
-            resume_op_live,
-            reader,
-        )
+        true
     }
 
     /// `pyjitpl.py MIFrame.make_result_of_lastop` recovers the result
@@ -20290,51 +20333,20 @@ impl<M: Clone> MetaInterp<M> {
     /// `getvirtual_ptr` before that capture runs.
     ///
     /// `resume.py` `ResumeDataBoxReader.consume_boxes` always consumes.
-    /// Pair live indices with `section.values` in bank order (int, ref,
-    /// float) up to the available values; leftover live slots stay unset.
     #[allow(clippy::too_many_arguments)]
-    fn consume_portal_resume_boxes(
-        &mut self,
-        frames: &[majit_ir::resumedata::RebuiltFrame],
-        fail_values: &[i64],
-        fail_types: &[majit_ir::Type],
-        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
-        resume_liveness: &[u8],
-        resume_op_live: u8,
-        reader: &mut crate::BridgeVirtualCache<'_>,
-    ) -> bool {
-        // `getvirtual_ptr` records into the active trace. Take it out so
-        // the frame borrow below does not alias `self.tracing`.
-        let mut tracing = self.tracing.take();
-        let resume_owned = tracing
-            .as_ref()
-            .and_then(|ctx| ctx.bridge_resume_data().cloned());
-        let ok = self.consume_portal_resume_registers(
-            frames,
-            fail_values,
-            fail_types,
-            materialized,
-            resume_liveness,
-            resume_op_live,
-            tracing.as_mut(),
-            resume_owned.as_ref(),
-            reader,
-        );
-        self.tracing = tracing;
-        ok
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn consume_portal_resume_registers(
-        &mut self,
-        frames: &[majit_ir::resumedata::RebuiltFrame],
-        fail_values: &[i64],
-        fail_types: &[majit_ir::Type],
-        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
-        resume_liveness: &[u8],
-        resume_op_live: u8,
+    fn consume_portal_resume_section(
+        framestack: &mut crate::pyjitpl::MIFrameStack,
+        staticdata: &std::sync::Arc<crate::MetaInterpStaticData>,
         mut tracing: Option<&mut crate::TraceCtx>,
         resume_data: Option<&crate::jit_state::ResumeDataResult>,
+        section: &majit_ir::resumedata::RebuiltFrame,
+        section_i: usize,
+        fail_values: &[i64],
+        fail_types: &[majit_ir::Type],
+        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
+        op_live: u8,
+        liveness: &[u8],
+        rd_consts: &[majit_ir::Const],
         reader: &mut crate::BridgeVirtualCache<'_>,
     ) -> bool {
         // `registers_*` holds the box. The `*_values` mirror is
@@ -20352,184 +20364,166 @@ impl<M: Clone> MetaInterp<M> {
                 _ => root,
             }
         }
-        // `rebuild_from_resumedata` reads `metainterp.staticdata` directly.
-        // One `Arc` clone releases the borrow.
-        let staticdata = std::sync::Arc::clone(&self.staticdata);
-        // Empty `resume_liveness` is `metainterp.staticdata` (`resume.py`).
-        // A non-empty buffer is a caller-supplied table (unit tests whose
-        // jitcode was not encoded against this staticdata).
-        let published = if resume_liveness.is_empty() {
-            Some(staticdata.liveness_info.snapshot_arc())
-        } else {
-            None
-        };
-        let op_live = if published.is_some() {
-            staticdata.op_live as u8
-        } else {
-            resume_op_live
-        };
-        let liveness: &[u8] = match published.as_deref() {
-            Some(bytes) => bytes,
-            None => resume_liveness,
-        };
+        let _ = fail_types;
         let registered = staticdata.jitcodes.as_slice();
-        let rd_consts = resume_data
-            .and_then(|resume| resume.storage.as_ref())
-            .and_then(|storage| storage.rd_consts())
-            .unwrap_or(&[]);
-        let n = self.framestack.frames.len().min(frames.len());
-        for i in 0..n {
-            let section = &frames[i];
-            // Same unrepresentable coordinate as `rebuild_from_resumedata`
-            // above (`NO_JITCODE_PC`). Upstream `read_jitcode_pos_pc` has no
-            // negative pc. Decline; this is the unrepresentable-pc abort
-            // `consume_boxes` still has.
-            let Ok(pc) = usize::try_from(section.pc) else {
-                return false;
+        // Same unrepresentable coordinate as `rebuild_from_resumedata`
+        // above (`NO_JITCODE_PC`). Upstream `read_jitcode_pos_pc` has no
+        // negative pc. Decline; this is the unrepresentable-pc abort
+        // `consume_boxes` still has.
+        let Ok(pc) = usize::try_from(section.pc) else {
+            return false;
+        };
+        // `jitcode_index as usize` wraps a negative index into a huge
+        // slot and would pair this section against the wrong jitcode.
+        let jitcode = materialized
+            .get(section_i)
+            .and_then(|slot| slot.clone())
+            .or_else(|| {
+                usize::try_from(section.jitcode_index)
+                    .ok()
+                    .and_then(|pos| registered.get(pos).cloned())
+            })
+            .unwrap_or_else(|| framestack.frames[section_i].jitcode.clone());
+        let indices =
+            crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, liveness);
+        let mut order = Vec::with_capacity(indices.total_len());
+        for index in indices.int {
+            order.push((majit_ir::Type::Int, index as usize));
+        }
+        for index in indices.ref_ {
+            order.push((majit_ir::Type::Ref, index as usize));
+        }
+        for index in indices.float {
+            order.push((majit_ir::Type::Float, index as usize));
+        }
+        assert_eq!(
+            order.len(),
+            section.values.len(),
+            "resume.py enumerate_vars: live register count must equal the encoded values"
+        );
+        // resume.py `_callback_i/_r/_f` → `decode_box` / `getvirtual_ptr`
+        // then `write_an_int` / `write_a_ref` / `write_a_float`, in
+        // `enumerate_vars` order. A TAGBOX after a virtual is decoded
+        // after that allocate(); `cpu.get_ref_value(deadframe, num)` is
+        // a traced slot. Do not snapshot bits into `pending` before
+        // `materialize_bridge_virtual`.
+        for (slot, value) in order.iter().zip(section.values.iter()) {
+            let (bank, index) = *slot;
+            let (opref, bits) = match value {
+                majit_ir::resumedata::RebuiltValue::Virtual(vidx) => {
+                    let ctx = tracing.as_deref_mut().expect(
+                        "rebuild_from_resumedata: ResumeDataBoxReader.getvirtual_ptr needs the live history",
+                    );
+                    let resume_data =
+                        resume_data.expect("resume.py getvirtual_ptr: rd_virtuals is not None");
+                    let rd_virtuals = resume_data
+                        .storage
+                        .as_ref()
+                        .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
+                    let mut opref = crate::materialize_bridge_virtual(
+                        ctx,
+                        *vidx,
+                        rd_virtuals,
+                        resume_data,
+                        reader,
+                    );
+                    if opref.is_none() {
+                        opref = ctx
+                            .bridge_virtual_op(*vidx)
+                            .filter(|op| !op.is_none())
+                            .unwrap_or(opref);
+                    }
+                    assert!(
+                        !opref.is_none(),
+                        "resume.py getvirtual_ptr: allocate returned no box"
+                    );
+                    let bits = virtual_box_bits(ctx, opref, reader.concrete_root_of(opref));
+                    (opref, bits)
+                }
+                majit_ir::resumedata::RebuiltValue::Box(n, majit_ir::Type::Ref) => {
+                    // Re-read after any earlier allocate in this section.
+                    // `fail_ref_root` is the rooted copy (`get_ref_value`);
+                    // fall back to the caller slice (DeadFrameRefRoots
+                    // on the product path; recording-only has empty roots).
+                    let bits = reader.fail_ref_root(*n).unwrap_or_else(|| {
+                        *fail_values.get(*n).unwrap_or_else(|| {
+                            panic!(
+                                "resume.py decode_box: liveboxes[{n}] is past the deadframe (len {})",
+                                fail_values.len()
+                            )
+                        })
+                    });
+                    (
+                        majit_ir::OpRef::input_arg_typed(*n as u32, majit_ir::Type::Ref),
+                        Some(bits),
+                    )
+                }
+                _ => {
+                    // `resume.py` `decode_box` always returns a box. A live
+                    // slot is `ResumeDataLoopMemo._number_boxes` (TAGBOX /
+                    // TAGCONST / TAGINT); `UNINITIALIZED` is `_gettagged` for
+                    // a missing virtual field. `getvirtual_ptr` already took
+                    // TAGVIRTUAL above.
+                    let (opref, bits) =
+                        crate::resume::resume_register_box(value, fail_values, rd_consts);
+                    (opref, Some(bits))
+                }
             };
-            // `jitcode_index as usize` wraps a negative index into a huge
-            // slot and would pair this section against the wrong jitcode.
-            let jitcode = materialized
-                .get(i)
-                .and_then(|slot| slot.clone())
-                .or_else(|| {
-                    usize::try_from(section.jitcode_index)
-                        .ok()
-                        .and_then(|pos| registered.get(pos).cloned())
-                })
-                .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
-            let indices =
-                crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, liveness);
-            // `resume.py` `ResumeDataBoxReader.consume_boxes` always
-            // consumes. Pair in bank order up to the available values.
-            let mut order = Vec::with_capacity(indices.total_len());
-            for index in indices.int {
-                order.push((majit_ir::Type::Int, index as usize));
-            }
-            for index in indices.ref_ {
-                order.push((majit_ir::Type::Ref, index as usize));
-            }
-            for index in indices.float {
-                order.push((majit_ir::Type::Float, index as usize));
-            }
-            // resume.py `_callback_i/_r/_f` → `decode_box` / `getvirtual_ptr`
-            // then `write_an_int` / `write_a_ref` / `write_a_float`, in
-            // `enumerate_vars` order. A TAGBOX after a virtual is decoded
-            // after that allocate(); `cpu.get_ref_value(deadframe, num)` is
-            // a traced slot. Do not snapshot bits into `pending` before
-            // `materialize_bridge_virtual`.
-            for (slot, value) in order.iter().zip(section.values.iter()) {
-                let (bank, index) = *slot;
-                let (opref, bits) = match value {
-                    majit_ir::resumedata::RebuiltValue::Virtual(vidx) => {
-                        let ctx = tracing.as_deref_mut().expect(
-                            "rebuild_from_resumedata: ResumeDataBoxReader.getvirtual_ptr needs the live history",
-                        );
-                        let resume_data =
-                            resume_data.expect("resume.py getvirtual_ptr: rd_virtuals is not None");
-                        let rd_virtuals = resume_data
-                            .storage
-                            .as_ref()
-                            .map(|storage| storage.rd_virtuals().unwrap_or(&[]));
-                        let mut opref = crate::materialize_bridge_virtual(
-                            ctx,
-                            *vidx,
-                            rd_virtuals,
-                            resume_data,
-                            reader,
-                        );
-                        if opref.is_none() {
-                            opref = ctx
-                                .bridge_virtual_op(*vidx)
-                                .filter(|op| !op.is_none())
-                                .unwrap_or(opref);
-                        }
+            let decoded_kind = match value {
+                majit_ir::resumedata::RebuiltValue::Box(_, k) => *k,
+                majit_ir::resumedata::RebuiltValue::Const(c) => c.get_type(),
+                majit_ir::resumedata::RebuiltValue::ConstRef(_) => majit_ir::Type::Ref,
+                majit_ir::resumedata::RebuiltValue::Virtual(_) => majit_ir::Type::Ref,
+                majit_ir::resumedata::RebuiltValue::Unassigned => {
+                    unreachable!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+                }
+            };
+            debug_assert_eq!(
+                decoded_kind, bank,
+                "resume.py decode_box: assert box.type == kind"
+            );
+            {
+                let frame = &mut framestack.frames[section_i];
+                match bank {
+                    majit_ir::Type::Int => {
                         assert!(
-                            !opref.is_none(),
-                            "resume.py getvirtual_ptr: allocate returned no box"
+                            index < frame.int_regs.len(),
+                            "resume.py write_an_int: register index {index} is past the frame"
                         );
-                        let bits = virtual_box_bits(ctx, opref, reader.concrete_root_of(opref));
-                        (opref, bits)
+                        frame.int_regs[index] = Some(opref);
                     }
-                    majit_ir::resumedata::RebuiltValue::Box(n, majit_ir::Type::Ref) => {
-                        // Re-read after any earlier allocate in this section.
-                        // `fail_ref_root` is the rooted copy (`get_ref_value`);
-                        // fall back to the caller slice (DeadFrameRefRoots
-                        // on the product path; recording-only has empty roots).
-                        let bits = reader.fail_ref_root(*n).unwrap_or_else(|| {
-                            *fail_values.get(*n).unwrap_or_else(|| {
-                                panic!(
-                                    "resume.py decode_box: liveboxes[{n}] is past the deadframe (len {})",
-                                    fail_values.len()
-                                )
-                            })
-                        });
-                        (
-                            majit_ir::OpRef::input_arg_typed(*n as u32, majit_ir::Type::Ref),
-                            Some(bits),
-                        )
+                    majit_ir::Type::Ref => {
+                        assert!(
+                            index < frame.ref_regs.len(),
+                            "resume.py write_a_ref: register index {index} is past the frame"
+                        );
+                        frame.ref_regs[index] = Some(opref);
                     }
-                    _ => {
-                        // `resume.py` `decode_box` always returns a box. A live
-                        // slot is `ResumeDataLoopMemo._number_boxes` (TAGBOX /
-                        // TAGCONST / TAGINT); `UNINITIALIZED` is `_gettagged` for
-                        // a missing virtual field. `getvirtual_ptr` already took
-                        // TAGVIRTUAL above.
-                        let (opref, bits) =
-                            crate::resume::resume_register_box(value, fail_values, rd_consts);
-                        (opref, Some(bits))
+                    majit_ir::Type::Float => {
+                        assert!(
+                            index < frame.float_regs.len(),
+                            "resume.py write_a_float: register index {index} is past the frame"
+                        );
+                        frame.float_regs[index] = Some(opref);
                     }
-                };
-                {
-                    let frame = &mut self.framestack.frames[i];
-                    match bank {
-                        majit_ir::Type::Int => {
-                            assert!(
-                                index < frame.int_regs.len(),
-                                "resume.py write_an_int: register index {index} is past the frame"
-                            );
-                            frame.int_regs[index] = Some(opref);
-                        }
-                        majit_ir::Type::Ref => {
-                            assert!(
-                                index < frame.ref_regs.len(),
-                                "resume.py write_a_ref: register index {index} is past the frame"
-                            );
-                            frame.ref_regs[index] = Some(opref);
-                        }
-                        majit_ir::Type::Float => {
-                            assert!(
-                                index < frame.float_regs.len(),
-                                "resume.py write_a_float: register index {index} is past the frame"
-                            );
-                            frame.float_regs[index] = Some(opref);
-                        }
-                        majit_ir::Type::Void => unreachable!(
-                            "jitcode.py enumerate_vars walks the int, ref, and float banks only"
-                        ),
-                    }
-                }
-                if let Some(bits) = bits
-                    && let Some(ctx) = tracing.as_mut()
-                {
-                    let stamped = match bank {
-                        majit_ir::Type::Int => majit_ir::Value::Int(bits),
-                        majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
-                        majit_ir::Type::Float => {
-                            majit_ir::Value::Float(f64::from_bits(bits as u64))
-                        }
-                        majit_ir::Type::Void => unreachable!(
-                            "jitcode.py enumerate_vars walks the int, ref, and float banks only"
-                        ),
-                    };
-                    let _ = ctx.try_set_opref_concrete(opref, stamped);
+                    majit_ir::Type::Void => unreachable!(
+                        "jitcode.py enumerate_vars walks the int, ref, and float banks only"
+                    ),
                 }
             }
-            // resume.py `rebuild_from_resumedata` calls
-            // `f.handle_rvmprof_enter_on_resume()` after that section's
-            // `consume_boxes`, before the next `read_jitcode_pos_pc`.
-            self.framestack.frames[i]
-                .handle_rvmprof_enter_on_resume(staticdata.op_live, staticdata.op_rvmprof_code);
+            if let Some(bits) = bits
+                && let Some(ctx) = tracing.as_mut()
+            {
+                let stamped = match bank {
+                    majit_ir::Type::Int => majit_ir::Value::Int(bits),
+                    majit_ir::Type::Ref => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
+                    majit_ir::Type::Float => majit_ir::Value::Float(f64::from_bits(bits as u64)),
+                    majit_ir::Type::Void => unreachable!(
+                        "jitcode.py enumerate_vars walks the int, ref, and float banks only"
+                    ),
+                };
+                let _ = ctx.try_set_opref_concrete(opref, stamped);
+            }
         }
         true
     }
@@ -25361,7 +25355,7 @@ mod portal_resume_rebuild_tests {
 
         struct MovingAllocator {
             next: std::cell::Cell<i64>,
-            inputarg: std::cell::RefCell<Option<majit_ir::InputArgRc>>,
+            meta: *mut MetaInterp<()>,
         }
 
         impl crate::resume::BlackholeAllocator for MovingAllocator {
@@ -25371,13 +25365,14 @@ mod portal_resume_rebuild_tests {
                         root.0 = TO_SPACE as usize;
                     }
                 });
-                // `walk_active_trace_refs` forwards InputArg `.value`.
-                if let Some(ia) = self.inputarg.borrow().as_ref()
-                    && let Some(majit_ir::Value::Ref(mut r)) = ia.get_value()
-                    && r.0 == FROM_SPACE as usize
-                {
-                    r.0 = TO_SPACE as usize;
-                    ia.set_value(majit_ir::Value::Ref(r));
+                if !self.meta.is_null() {
+                    unsafe {
+                        (*self.meta).walk_active_trace_refs(|root| {
+                            if root.0 == FROM_SPACE as usize {
+                                root.0 = TO_SPACE as usize;
+                            }
+                        });
+                    }
                 }
                 let ptr = self.next.get();
                 self.next.set(ptr + 0x10);
@@ -25402,7 +25397,6 @@ mod portal_resume_rebuild_tests {
         install(&mut meta, jitcode.clone());
 
         let mut tracing = crate::TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
-        let inputarg = tracing.recorder.inputargs()[0].clone();
         let storage = crate::resume::new_resume_storage(
             majit_ir::NumberingRef::from_bytes(&[]),
             vec![],
@@ -25428,7 +25422,7 @@ mod portal_resume_rebuild_tests {
 
         let alloc = MovingAllocator {
             next: std::cell::Cell::new(FIRST_ALLOC),
-            inputarg: std::cell::RefCell::new(Some(inputarg)),
+            meta: &mut meta as *mut MetaInterp<()>,
         };
         let mut fail_values = [FROM_SPACE];
         let fail_types = [majit_ir::Type::Ref];

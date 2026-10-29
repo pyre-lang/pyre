@@ -868,7 +868,9 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::warmstate::{BaseJitCell, FunctionEntryStep, HotResult, JcFlags, WarmEnterState};
+use crate::warmstate::{
+    BaseJitCell, DoorCell, FunctionEntryStep, HotResult, JcFlags, WarmEnterState,
+};
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -2204,6 +2206,18 @@ pub enum BackEdgeWarmth {
     Interpret,
     Trace,
     Full,
+}
+
+enum DoorLookup {
+    /// Handled on the door (tick, tracing start, or nothing to do).
+    Handled(Option<usize>),
+    /// `EnterJitAssembler(procedure_token, ...)`.
+    Enter {
+        cell_key: u64,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
+    },
+    /// Continue into `back_edge_internal`, which resolves the cell itself.
+    Occupied,
 }
 
 impl<S: JitState> JitDriver<S> {
@@ -5854,22 +5868,14 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        if let Some(handled) =
-            self.try_empty_chain_tick(target_pc as u64, None, target_pc, state, env)
-        {
-            return handled.map(continue_at_pc);
-        }
+        let (key, carried) =
+            match self.try_empty_chain_tick(target_pc as u64, None, target_pc, state, env) {
+                DoorLookup::Handled(handled) => return handled.map(continue_at_pc),
+                DoorLookup::Enter { cell_key, token } => (cell_key, Some(token)),
+                DoorLookup::Occupied => (target_pc as u64, None),
+            };
         self.back_edge_internal(
-            target_pc as u64,
-            None,
-            false,
-            None,
-            target_pc,
-            state,
-            env,
-            None,
-            None,
-            pre_run,
+            key, None, false, carried, target_pc, state, env, None, None, pre_run,
         )
     }
 
@@ -5881,11 +5887,14 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        if let Some(handled) = self.try_empty_chain_tick(green_key, None, target_pc, state, env) {
-            return handled.map(continue_at_pc);
-        }
+        let (key, carried) = match self.try_empty_chain_tick(green_key, None, target_pc, state, env)
+        {
+            DoorLookup::Handled(handled) => return handled.map(continue_at_pc),
+            DoorLookup::Enter { cell_key, token } => (cell_key, Some(token)),
+            DoorLookup::Occupied => (green_key, None),
+        };
         self.back_edge_internal(
-            green_key, None, false, None, target_pc, state, env, None, None, pre_run,
+            key, None, false, carried, target_pc, state, env, None, None, pre_run,
         )
     }
 
@@ -5937,22 +5946,14 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> Option<PortalResume> {
-        if let Some(handled) =
-            self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env)
-        {
-            return handled.map(continue_at_pc);
-        }
+        let (key, carried) =
+            match self.try_empty_chain_tick(green_key_hash, greenargs, target_pc, state, env) {
+                DoorLookup::Handled(handled) => return handled.map(continue_at_pc),
+                DoorLookup::Enter { cell_key, token } => (cell_key, Some(token)),
+                DoorLookup::Occupied => (green_key_hash, None),
+            };
         self.back_edge_internal(
-            green_key_hash,
-            greenargs,
-            false,
-            None,
-            target_pc,
-            state,
-            env,
-            None,
-            None,
-            pre_run,
+            key, greenargs, false, carried, target_pc, state, env, None, None, pre_run,
         )
     }
 
@@ -6843,8 +6844,9 @@ impl<S: JitState> JitDriver<S> {
     /// chained bucket, or a `JC_DONT_TRACE_HERE` cell this hash owns
     /// continues into `back_edge_internal`.
     ///
-    /// `Some(resume)` means this IS that cold case — including `Some(None)`
-    /// when the tick did not overflow.
+    /// `Handled(resume)` means this IS that cold case — including
+    /// `Handled(None)` when the tick did not overflow. `Enter` carries the
+    /// token as `maybe_compile_and_run` carries `procedure_token`.
     #[inline(always)]
     fn try_empty_chain_tick(
         &mut self,
@@ -6853,55 +6855,32 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-    ) -> Option<Option<usize>> {
+    ) -> DoorLookup {
         if self.meta.is_tracing() {
-            return Some(None);
+            return DoorLookup::Handled(None);
         }
         // Cross-loop-cut decline and single-pass label handoff must stay
         // ahead of the counter (`back_edge_internal` cites why). Empty
         // tables are O(1) and allocation-free: check emptiness first so a
         // never-compiled loop does not hash into them.
         if !self.meta.cut_compiled_keys.is_empty() {
-            return None;
+            return DoorLookup::Occupied;
         }
-        // A chained bucket needs comparekey and stays on `back_edge_internal`.
-        // A lone cell is the tick arm only when this hash owns it.
         let jd_no = self.index().unwrap_or(0);
-        if let Some(cell) = self
-            .meta
-            .warm_state_ref_for_driver(jd_no)
-            .and_then(|warm| warm.lookup_chain(green_key_hash))
-        {
-            if cell.next.borrow().is_some() {
-                return None;
+        let door = match self.meta.warm_state_ref_for_driver(jd_no) {
+            Some(warm) => warm.door_cell(green_key_hash, greenargs),
+            None => DoorCell::Empty,
+        };
+        match door {
+            DoorCell::Tracing => return DoorLookup::Handled(None),
+            DoorCell::Occupied => return DoorLookup::Occupied,
+            DoorCell::Enter { cell_key, token } => {
+                return DoorLookup::Enter { cell_key, token };
             }
-            // `lookup_chain` returns the table-slot head. `_get_index` keeps
-            // only the high bits of the low 32, so that head can belong to a
-            // different green key. Its compiled / tracing / dead-token /
-            // abort-ceiling / `JC_DONT_TRACE_HERE` state is not ours: the
-            // not-found arm of `maybe_compile_and_run` ticks this hash.
-            if cell.cell_bucket.get() == green_key_hash {
-                if cell.is_compiled() {
-                    return None;
-                }
-                if cell.is_tracing() {
-                    return Some(None);
-                }
-                // Dead-token and other tokenless cells take `cleanup_chain`
-                // on the occupied door (`maybe_compile_and_run`).
-                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
-                    return None;
-                }
-                if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
-                    // `should_start_dont_trace_here_trace`: never traced
-                    // starts immediately, `JC_TRACING_OCCURRED` ticks. Both
-                    // stay on the occupied door.
-                    return None;
-                }
-            }
+            DoorCell::Empty => {}
         }
         if !state.can_trace() {
-            return Some(None);
+            return DoorLookup::Handled(None);
         }
         if self
             .meta
@@ -6909,9 +6888,9 @@ impl<S: JitState> JitDriver<S> {
             .tick_empty_chain(green_key_hash)
             && self.commit_start_tracing(green_key_hash, greenargs, target_pc, state, env)
         {
-            return Some(Some(target_pc));
+            return DoorLookup::Handled(Some(target_pc));
         }
-        Some(None)
+        DoorLookup::Handled(None)
     }
 
     /// RPython warmstate.py:482-501 / compile.py:711 parity.
@@ -8591,11 +8570,11 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
-        if let Some(handled) =
-            self.try_empty_chain_tick(green_key, greenargs, target_pc, state, env)
-        {
-            let _ = handled;
-            return None;
+        match self.try_empty_chain_tick(green_key, greenargs, target_pc, state, env) {
+            DoorLookup::Handled(_) => return None,
+            // No carried-token entry on this path: fall through as the
+            // previous `None` (occupied / compiled) arm did.
+            DoorLookup::Enter { .. } | DoorLookup::Occupied => {}
         }
         let single_pass_dispatch_key: Option<u32> = None;
         if !state.can_trace() {

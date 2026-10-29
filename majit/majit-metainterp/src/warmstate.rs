@@ -213,8 +213,9 @@ impl BaseJitCell {
     /// (`jitdriver_sd._green_args_spec`), used only to pick
     /// `equal_whatever`'s TYPE. There is no types comparison: every
     /// caller has already checked `cell.jitdriver_sd`
-    /// (`isinstance(cell, JitCell)`). Each `gN` is the same per-index
-    /// read as [`Self::current_greens`].
+    /// (`isinstance(cell, JitCell)`). With `types` constant at the
+    /// inlined door, the loop and `equal_whatever` fold per slot
+    /// (`unrolling_iterable(green_args_name_spec)`, `@specialize.arg(0)`).
     #[inline(always)]
     pub fn comparekey(&self, greenargs: &[i64], types: &[GreenType]) -> bool {
         debug_assert_eq!(types.len(), greenargs.len());
@@ -222,7 +223,13 @@ impl BaseJitCell {
             return false;
         }
         for i in 0..types.len() {
-            let item1 = self.retained_greens.current_value(i, self.greens[i]);
+            // Ref greens live in the frontend root slot, the others are the
+            // cell field `getattr(self, attrname)` (`JitCell.comparekey`).
+            let item1 = if types[i] == GreenType::Ref {
+                self.retained_greens.current_value(i, self.greens[i])
+            } else {
+                self.greens[i]
+            };
             if !majit_ir::equal_whatever(types[i], item1, greenargs[i]) {
                 return false;
             }
@@ -888,6 +895,23 @@ pub(crate) fn root_confirm_ref_values<'a>(values: &'a mut [Value]) -> ConfirmRef
         _walk: Some(walk),
         _values: std::marker::PhantomData,
     }
+}
+
+/// What `maybe_compile_and_run`'s chain walk found for this hash on the
+/// door, before any counter work.
+pub(crate) enum DoorCell {
+    /// No cell for this hash: the not-found arm (`jitcounter.tick`).
+    Empty,
+    /// The cell is being traced: `if cell.flags & JC_TRACING: return`.
+    Tracing,
+    /// The cell holds an enterable token. `cell_key` is the resolved key.
+    Enter {
+        cell_key: u64,
+        token: Arc<JitCellToken>,
+    },
+    /// Anything else (chained bucket, comparekey miss, dead token,
+    /// `JC_DONT_TRACE_HERE`, compiled-but-not-enterable): the occupied door.
+    Occupied,
 }
 
 impl WarmEnterState {
@@ -2898,6 +2922,62 @@ impl WarmEnterState {
             return None;
         }
         cell.get_procedure_token()
+    }
+
+    /// The table-slot load `maybe_compile_and_run` keeps
+    /// (`cell = jitcounter.lookup_chain(hash)`), without an `Rc` clone.
+    #[inline(always)]
+    pub(crate) fn door_cell(
+        &self,
+        hash: u64,
+        greenargs: Option<(&[i64], &[GreenType])>,
+    ) -> DoorCell {
+        let Some(cell) = self.counter.lookup_chain(hash) else {
+            return DoorCell::Empty;
+        };
+        // A chained bucket needs comparekey and stays on `back_edge_internal`.
+        // A lone cell is the tick arm only when this hash owns it.
+        if cell.next.borrow().is_some() {
+            return DoorCell::Occupied;
+        }
+        // `lookup_chain` returns the table-slot head. `_get_index` keeps
+        // only the high bits of the low 32, so that head can belong to a
+        // different green key. Its compiled / tracing / dead-token /
+        // abort-ceiling / `JC_DONT_TRACE_HERE` state is not ours: the
+        // not-found arm of `maybe_compile_and_run` ticks this hash.
+        if cell.cell_bucket.get() != hash {
+            return DoorCell::Empty;
+        }
+        if cell.is_compiled() {
+            if let Some((values, types)) = greenargs
+                && !cell.comparekey(values, types)
+            {
+                return DoorCell::Occupied;
+            }
+            if cell.jitdriver_sd != self.jitdriver_sd {
+                return DoorCell::Occupied;
+            }
+            let cell_key = cell.cell_key.get().unwrap_or(hash);
+            return match Self::cell_entry_procedure_token(&cell) {
+                Some(token) => DoorCell::Enter { cell_key, token },
+                None => DoorCell::Occupied,
+            };
+        }
+        if cell.is_tracing() {
+            return DoorCell::Tracing;
+        }
+        // Dead-token and other tokenless cells take `cleanup_chain`
+        // on the occupied door (`maybe_compile_and_run`).
+        if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+            return DoorCell::Occupied;
+        }
+        if cell.flags.get().contains(JcFlags::JC_DONT_TRACE_HERE) {
+            // `should_start_dont_trace_here_trace`: never traced
+            // starts immediately, `JC_TRACING_OCCURRED` ticks. Both
+            // stay on the occupied door.
+            return DoorCell::Occupied;
+        }
+        DoorCell::Empty
     }
 
     /// [`Self::resolve_cell_key`]'s answer together with the cell it names,
@@ -5831,6 +5911,51 @@ mod tests {
             minted_ws.resolve_cell_key(minted, || arriving.clone()),
             minted,
             "get_jitcell miss carries the arriving hash"
+        );
+    }
+
+    /// The door keeps the chain-head token `maybe_compile_and_run` would
+    /// carry, and a comparekey miss at that hash is Occupied.
+    #[test]
+    fn door_cell_carries_the_resolved_token() {
+        let mut ws = WarmEnterState::new(100);
+        let key_hit = GreenKey::new(vec![1, 0]);
+        let key_miss = GreenKey::new(vec![2, 13080698639]);
+        let hash = key_hit.get_uhash();
+        assert_eq!(
+            hash,
+            key_miss.get_uhash(),
+            "fixture is a full-hash collision"
+        );
+        ws.ensure_cell_for_key(&key_hit);
+        attach_alive_for_key(
+            &mut ws,
+            &key_hit,
+            JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED),
+        );
+        assert!(
+            ws.lookup_chain(hash)
+                .expect("installed")
+                .next
+                .borrow()
+                .is_none(),
+            "test needs a unique occupant"
+        );
+        let hit = (key_hit.values.as_slice(), key_hit.types.as_slice());
+        let miss = (key_miss.values.as_slice(), key_miss.types.as_slice());
+        let (resolved_key, resolved_token) = ws.resolved_cell_procedure_token(hash, Some(hit));
+        let resolved_token = resolved_token.expect("occupant holds an executable token");
+        let DoorCell::Enter { cell_key, token } = ws.door_cell(hash, Some(hit)) else {
+            panic!("door_cell must carry the compiled occupant's token");
+        };
+        assert_eq!(cell_key, resolved_key);
+        assert!(
+            Arc::ptr_eq(&token, &resolved_token),
+            "door_cell carries the same token resolved_cell_procedure_token found"
+        );
+        assert!(
+            matches!(ws.door_cell(hash, Some(miss)), DoorCell::Occupied),
+            "comparekey miss with the same hash is Occupied"
         );
     }
 

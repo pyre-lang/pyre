@@ -1631,7 +1631,9 @@ pub fn rebuilt_value_to_opref(
         RebuiltValue::Virtual(vidx) => {
             materialize_bridge_virtual(ctx, *vidx, rd_virtuals, resume_data, cache)
         }
-        RebuiltValue::Unassigned => OpRef::NONE,
+        RebuiltValue::Unassigned => {
+            panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
+        }
     }
 }
 

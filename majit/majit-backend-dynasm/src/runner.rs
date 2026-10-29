@@ -9,8 +9,9 @@ use std::sync::atomic::Ordering;
 use majit_backend::deadframe::{ExitDescr, JitFrameDeadFrame};
 use majit_backend::jitframe::{
     HostHeapGc, JitframeDescrFacts, check_jitframe_descr, jitframe_facts_at_cpu_init,
-    jitframe_is_gc_object, jitframe_write_barrier, malloc_entry_jitframe, malloc_host_jitframe,
-    malloc_jitframe, malloc_jitframe_no_collect, publish_standalone_jitframe_facts,
+    jitframe_is_gc_object, jitframe_write_barrier, malloc_entry_jitframe,
+    malloc_gc_jitframe_via_descr, malloc_host_jitframe, malloc_jitframe,
+    malloc_jitframe_no_collect, publish_standalone_jitframe_facts, try_bump_nursery_jitframe,
 };
 use majit_backend::libc_deadframe::LibcJitFrameDeadFrame;
 use majit_backend::llmodel::{
@@ -414,11 +415,17 @@ fn malloc_jitframe_like_entry(size_bytes: usize) -> *mut JitFrame {
 
 /// `malloc_jitframe` (`execute_token`) for a compiled entry.
 ///
-/// REF arguments are pushed before the allocation (`push_roots`). Rust's
-/// stack is not traced; the frame is filled from the slots `walk_stack_root`
-/// updates, and the guard's `Drop` is `pop_roots`. Returns whether the frame
-/// is a collector object, which decides the deadframe that later owns it.
-fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bool, EntryArgRoots) {
+/// `facts` is this CPU's `gc_ll_descr` (`AbstractLLCPU.gc_ll_descr`). A GC
+/// descr takes the inlined `malloc_fast` (`framework.py`) bump over the
+/// descr's nursery cells; `ShadowStackFrameworkGCTransformer.push_roots`
+/// brackets only the collecting fallback when the nursery is full. Returns
+/// whether the frame is a collector object (the deadframe that later owns
+/// it) and whether the argument stores need `llop.gc_writebarrier`.
+fn alloc_entry_jitframe(
+    facts: JitframeDescrFacts,
+    size_bytes: usize,
+    args: &[Value],
+) -> (*mut JitFrame, bool, bool, EntryArgRoots) {
     // `make_execute_token` allocates through `gc_ll_descr`. With no collector
     // installed that descr is `HostHeapGc` and the vtable query is a call
     // that always answers "host block".
@@ -426,8 +433,19 @@ fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bo
         return (
             malloc_jitframe_like_entry(size_bytes),
             false,
+            false,
             EntryArgRoots::inactive(),
         );
+    }
+    if facts.is_gc_object {
+        if let Some(f) = try_bump_nursery_jitframe(facts, size_bytes) {
+            return (f, true, false, EntryArgRoots::inactive());
+        }
+        // Nursery full: `ShadowStackFrameworkGCTransformer.push_roots`
+        // around the collecting call only.
+        let roots = EntryArgRoots::push_refs(args);
+        let (f, needs_wb) = malloc_gc_jitframe_via_descr(facts.type_id(), size_bytes);
+        return (f, true, needs_wb, roots);
     }
     with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
@@ -437,7 +455,12 @@ fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bo
         } else {
             EntryArgRoots::inactive()
         };
-        (malloc_entry_jitframe(gc, size_bytes), gc_object, roots)
+        (
+            malloc_entry_jitframe(gc, size_bytes),
+            gc_object,
+            gc_object,
+            roots,
+        )
     })
 }
 
@@ -2794,13 +2817,15 @@ impl DynasmBackend {
         // (`llmodel.py execute_token` bump) instead of a TLS free list.
         // `EntryWords::Raw` is only used on that path: a collector converts
         // the words back to `Value`s and takes `EntryWords::Typed`.
-        let (jf_ptr, gc_object, arg_roots) = match args {
+        let (jf_ptr, gc_object, needs_wb, arg_roots) = match args {
             EntryWords::Typed(values) if majit_gc::collector_installed() => {
-                let (ptr, gc_object, roots) = alloc_entry_jitframe(frame_bytes, values);
-                (ptr, gc_object, Some(roots))
+                let (ptr, gc_object, needs_wb, roots) =
+                    alloc_entry_jitframe(self.jitframe_facts, frame_bytes, values);
+                (ptr, gc_object, needs_wb, Some(roots))
             }
             _ => (
                 take_or_alloc_parked_entry_frame(token, frame_bytes),
+                false,
                 false,
                 None,
             ),
@@ -2844,9 +2869,10 @@ impl DynasmBackend {
         // llmodel.py execute_token: `llop.gc_writebarrier(lltype.Void, ll_frame)`
         // after the inputs are stored. A frame the allocation placed outside
         // the nursery reaches the next minor collection only through the
-        // remembered set.
-        if gc_object {
-            with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf_ptr));
+        // remembered set. A nursery frame is young
+        // (`init_gc_object` leaves `GCFLAG_TRACK_YOUNG_PTRS` clear).
+        if needs_wb {
+            majit_gc::gc_write_barrier(GcRef(jf_ptr as usize));
         }
 
         // Each flag is folded into `diag`. A steady run takes the one
@@ -3951,16 +3977,17 @@ impl Backend for DynasmBackend {
             Self::input_slot(args.len()),
             args.len()
         );
-        let (jf_ptr, gc_object, _arg_roots) =
-            alloc_entry_jitframe(JitFrame::alloc_size(num_slots), &[]);
+        let (jf_ptr, gc_object, needs_wb, _arg_roots) =
+            alloc_entry_jitframe(self.jitframe_facts, JitFrame::alloc_size(num_slots), &[]);
         unsafe { JitFrame::init(jf_ptr, fi_ptr, num_slots) };
 
         for (i, &val) in args.iter().enumerate() {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };
         }
         // llmodel.py `execute_token`: `llop.gc_writebarrier(ll_frame)`.
-        if gc_object {
-            with_gc_ll_descr(|gc| jitframe_write_barrier(gc, jf_ptr));
+        // A nursery frame is young.
+        if needs_wb {
+            majit_gc::gc_write_barrier(GcRef(jf_ptr as usize));
         }
 
         let func: unsafe extern "C" fn(*mut JitFrame, *const i64) -> *mut JitFrame =
