@@ -1,5 +1,5 @@
 # CPython-suite gap: the loss is a jit walk-abort path, invisible to an interpreter-level suite.
-# parity-tests reason: pins a consumed FOR_ITER item against an abort inside a nested inline callee, and against a root-trace too-long abort whose delivery is refused.
+# parity-tests reason: pins a consumed FOR_ITER item against an abort inside a nested inline callee, and against a root-trace too-long abort at an EXTENDED_ARG-prefixed FOR_ITER.
 
 """A FOR_ITER item consumed before an aborted sub-walk still reaches the body.
 
@@ -62,11 +62,11 @@ assert hh == 950649862511, hh
 
 # A list FOR_ITER whose consume the walk descended, in a root loop trace that
 # runs out of length before the iteration's body completes.  The trace limit
-# puts that abort inside `sum`'s loop; its FOR_ITER carries an EXTENDED_ARG,
-# so the frame is parked one opcode before the FOR_ITER and the delivery is
-# refused.  The refusal has to put the iterator cursor back: without the
-# snapshot it resumes on the next element and the sum comes out short
-# (19898 for 19900).
+# puts that abort inside `sum`'s loop, whose FOR_ITER carries an EXTENDED_ARG:
+# the frame is parked on the prefix, one unit before the FOR_ITER.  The
+# delivery has to recognise that header, and a refused delivery has to put the
+# iterator cursor back; either way missing, the resume reads the next element
+# and the sum comes out short (19898 for 19900).
 try:
     import pypyjit
 
