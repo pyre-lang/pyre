@@ -5064,6 +5064,34 @@ fn may_force_call_value(
     }
 }
 
+/// Whether `finditem_str(w_dict, name)` answers from the dict's own storage:
+/// an exact `dict` (a module dict included) whose strategy holds only str or
+/// bytes keys, or none.  Such a probe calls no key `__hash__` / `__eq__` and no
+/// `__getitem__` / `__missing__` override.  An object-strategy dict can compare
+/// a stored user key with `__eq__`, and a subclass can override the probe, so
+/// both stay out.
+fn str_probe_runs_no_user_code(w_dict: pyre_object::PyObjectRef) -> bool {
+    use pyre_object::dictmultiobject::{DictStrategy, StrategyKind};
+    if w_dict.is_null() || !unsafe { pyre_object::is_dict(w_dict) } {
+        return false;
+    }
+    let exact = pyre_interpreter::typedef::r#type(w_dict).is_some_and(|w_type| {
+        std::ptr::eq(
+            w_type.as_ptr(),
+            pyre_interpreter::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+        )
+    });
+    exact
+        && matches!(
+            unsafe { pyre_object::dictmultiobject::w_dict_get_strategy(w_dict) }.strategy_kind(),
+            StrategyKind::Empty
+                | StrategyKind::EmptyKwargs
+                | StrategyKind::Unicode
+                | StrategyKind::Bytes
+                | StrategyKind::Module
+        )
+}
+
 /// `executor.execute_varargs` for one residual, then the caller's
 /// `record_after_execute` hook.
 ///
@@ -5897,6 +5925,29 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         && args
             .first()
             .is_some_and(|&iter| fbw_bridge_iter_journalable(iter as pyre_object::PyObjectRef));
+    // `_load_global` (`pyopcode.py`): `finditem_str` on the frame's
+    // `get_w_globals()`, then on a miss the dict of `get_builtin()`, then a
+    // fresh `NameError`.  Read both dicts the way `bh_load_global_fn` does.
+    // When each answers a str probe from its own storage, the residual runs no
+    // user code and writes nothing, so a replay reads the same value again.
+    let observed_replay_safe_load_global =
+        helper == majit_ir::RuntimeHelperKind::LoadGlobal && args.len() == 4 && {
+            let frame = args[2] as usize as *const pyre_interpreter::PyFrame;
+            let w_code = args[1] as usize as pyre_object::PyObjectRef;
+            let w_globals = if frame.is_null() {
+                unsafe { pyre_interpreter::w_code_get_w_globals(w_code) }
+            } else {
+                unsafe { (*frame).get_w_globals() }
+            };
+            let builtins_ok = frame.is_null() || {
+                let w_builtin = unsafe { (*frame).get_builtin() };
+                w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } || {
+                    let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+                    w_dict.is_null() || str_probe_runs_no_user_code(w_dict)
+                }
+            };
+            str_probe_runs_no_user_code(w_globals) && builtins_ok
+        };
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
         || is_rewindable_root_bracket
@@ -5906,6 +5957,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         || observed_exact_str_iter
         || observed_exact_str_ord
         || observed_replay_safe_isinstance
+        || observed_replay_safe_load_global
         || replay_safe_fresh_allocation
         || replay_safe_tuple_from_list
         || observed_exact_int_index
