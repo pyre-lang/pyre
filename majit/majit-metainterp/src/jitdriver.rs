@@ -13802,7 +13802,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -13886,7 +13885,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -13931,7 +13929,6 @@ mod tests {
             meta,
             root_trace_id,
             traces: crate::FxIndexMap::default(),
-            previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
         };

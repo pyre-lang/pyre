@@ -2237,58 +2237,6 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) loop_header_pc: Option<usize>,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
     pub(crate) traces: crate::FxIndexMap<u64, CompiledTrace>,
-    /// RPython parity: previous compiled entries for this green_key.
-    /// In RPython, JitCellToken keeps all target_tokens' code alive.
-    /// In majit, each retrace produces a new Cranelift function;
-    /// previous functions are kept here so external target_token JUMPs
-    /// can redirect to them via runtime trampoline.  Stored
-    /// as `Weak<JitCellToken>` so this metadata index does not extend token
-    /// lifetime beyond `MemoryManager.alive_loops` (memmgr.py).
-    /// `previous_tokens_upgraded` is the readers' entry point — it upgrades
-    /// and filters out dead references.  The remaining warmstate-side strong
-    /// owner is documented on `BaseJitCell::loop_token`.
-    ///
-    /// # `compile_bridge` use & weak-drop safety
-    ///
-    /// Cranelift's `compile_bridge` (`compiler.rs`) iterates
-    /// `previous_tokens` to attach the freshly-compiled bridge to
-    /// matching `(trace_id, fail_index_per_trace)` fail_descrs in
-    /// retired predecessor tokens whose machine code may still be
-    /// reachable — cranelift cannot patch code in place, so every
-    /// predecessor that still has running code AND carries the same
-    /// source guard needs its descr's bridge slot installed too.
-    ///
-    /// "Still reachable" is what determines whether a Weak that fails
-    /// to upgrade is a safety problem.  A predecessor `T_prev` is
-    /// reachable only if something holds an `Arc<JitCellToken>` to it:
-    ///
-    /// 1. `MemoryManager.alive_loops` (the canonical strong owner).
-    /// 2. `JitCellToken.keepalive_tokens` on a *jumper* loop
-    ///    (`history.py:449 _keepalive_jitcell_tokens` parity) — pyre
-    ///    pushes Arcs into this set via `record_jump_to` when a
-    ///    cross-loop jump is emitted, mirroring RPython.
-    /// 3. `warmstate::BaseJitCell::loop_token` for the current
-    ///    install_token at the cell's green_key.
-    /// 4. The active call stack while `execute_token_*` runs.
-    ///
-    /// If none of the above hold `T_prev`, `T_prev`'s `Arc` drops, its
-    /// `compiled_loop_token` Arc drops, and the asmmemmgr blocks are
-    /// released — the machine code is gone.  In that case
-    /// `filter_map(Weak::upgrade)` correctly skips `T_prev`: there is
-    /// no live machine code for the bridge slot to be installed onto.
-    ///
-    /// The case CodeRabbit PR #68 review flagged
-    /// (`pullrequestreview-4318361750`) is the gap between "alive_loops
-    /// evicted `T_prev`" and "`T_prev`'s code freed": with `Arc` strong
-    /// ownership previously held by `compiled_loops`, that gap was
-    /// effectively zero because `compiled_loops` extended the lifetime
-    /// past alive_loops eviction.  With the `Weak` index the gap is real but
-    /// bounded — pyre's single-thread JIT means `T_prev`'s code can be
-    /// "reachable" only while a frame is on the stack (case 4), and
-    /// that frame's caller holds the Arc via the executor's
-    /// `&Arc<JitCellToken>` parameter.  No two `compile_bridge` calls
-    /// interleave with `try_to_free_some_loops` on the same thread.
-    pub(crate) previous_tokens: Vec<std::sync::Weak<JitCellToken>>,
     /// Box identity plan Phase E: high-water OpRef at which a bridge
     /// compilation starts allocating fresh boxes.
     ///
@@ -4339,9 +4287,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Salvage the evicted entry's per-trace metadata into the new
-    /// CompiledEntry being built for the same `green_key`, and return the
-    /// list of `Arc<JitCellToken>` to seed the new entry's
-    /// `previous_tokens` for cross-token JUMP/redirect keepalive.
+    /// CompiledEntry being built for the same `green_key`.
     ///
     /// Mirrors `pyjitpl.py` recompile semantics where successor compiled
     /// loops absorb predecessor's per-fail metadata so old guards (which
@@ -4357,17 +4303,12 @@ impl<M: Clone> MetaInterp<M> {
         _owning_key: u64,
         entry: CompiledEntry<M>,
         merged_traces: &mut crate::FxIndexMap<u64, CompiledTrace>,
-    ) -> Vec<std::sync::Weak<JitCellToken>> {
-        // `entry.token` is already `Weak<JitCellToken>`; push it directly.
-        let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
-        previous_tokens.push(entry.token);
-        previous_tokens.extend(entry.previous_tokens);
+    ) {
         for (tid, ct) in entry.traces {
             if !merged_traces.contains_key(&tid) {
                 merged_traces.insert(tid, ct);
             }
         }
-        previous_tokens
     }
 
     fn trace_for_exit(compiled: &CompiledEntry<M>, trace_id: u64) -> Option<(u64, &CompiledTrace)> {
@@ -10153,9 +10094,6 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                // RPython parity: keep previous compiled tokens alive so
-                // external target_token JUMPs can redirect to them.
-                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 // Carried forward because this replaces the entry at the same
                 // green key: the loop still closes at the header it closed at
                 // before, so dropping the pc here would strand every bridge
@@ -10167,7 +10105,7 @@ impl<M: Clone> MetaInterp<M> {
                     // disjoint from any future bridge.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
-                    previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
+                    self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -10189,7 +10127,6 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
-                        previous_tokens,
                         // Box identity: record Phase 2's final
                         // OpRef high-water so later bridges can allocate in a
                         // disjoint namespace. RPython gets disjointness for
@@ -11691,14 +11628,13 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 // Carried forward for the same reason as the compile_loop site.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
-                    previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
+                    self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -11727,7 +11663,6 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
-                        previous_tokens,
                         // Box identity: Phase 2's final OpRef high-water, as at
                         // the main compile site.
                         next_global_opref,
@@ -11832,8 +11767,9 @@ impl<M: Clone> MetaInterp<M> {
         // for `record_loop_or_bridge` alike. This function binds the artifact
         // to `source_jct` the same way (`set_original_jitcell_token`,
         // `record_loop_or_bridge`) but files everything else under the
-        // caller-supplied `green_key`: `set_next_header_pc`, the
-        // `previous_tokens` read, `caller_recovery_layout`,
+        // caller-supplied `green_key`: `set_next_header_pc`,
+        // `descr_owning_jct` / `rd_loop_token.loop_token_wref()`,
+        // `caller_recovery_layout`,
         // `build_guard_metadata`'s key, and the `compiled.traces` insert. Those
         // five only name the right loop while the two identities agree.
         //
@@ -12784,7 +12720,6 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 {
-                    let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                     // Carried forward for the same reason as the compile_loop site.
                     let mut carried_loop_header_pc = None;
                     if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
@@ -12793,8 +12728,7 @@ impl<M: Clone> MetaInterp<M> {
                         // disjoint from any future bridge.
                         next_global_opref = next_global_opref.max(carried.next_global_opref);
                         carried_loop_header_pc = carried.loop_header_pc;
-                        previous_tokens =
-                            self.retire_compiled_entry(green_key, old_entry, &mut traces);
+                        self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
                     // The retired entry's count does not follow it here. The
                     // token this compile installs came out of
@@ -12832,7 +12766,6 @@ impl<M: Clone> MetaInterp<M> {
                             root_trace_id: trace_id,
                             loop_header_pc: carried_loop_header_pc,
                             traces,
-                            previous_tokens,
                             next_global_opref,
                         },
                     );
@@ -13292,14 +13225,13 @@ impl<M: Clone> MetaInterp<M> {
                         terminal_exit_layouts,
                     },
                 );
-                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 // Carried forward for the same reason as the compile_loop site.
                 let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
-                    previous_tokens = self.retire_compiled_entry(green_key, old_entry, &mut traces);
+                    self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 self.insert_compiled_loop_on_driver(
@@ -13311,7 +13243,6 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
-                        previous_tokens,
                         next_global_opref,
                     },
                 );
@@ -14789,13 +14720,12 @@ impl<M: Clone> MetaInterp<M> {
     /// The eviction dispatch matches by **token-object identity**
     /// (`Arc::ptr_eq`) — mirroring `memmgr.py`'s `del
     /// self.alive_loops[looptoken]` which keys on the looptoken
-    /// itself.  This protects the recompile case: when fn B was
-    /// recompiled, `compiled_loops[gk].token` is the new token while
-    /// the old token is in `previous_tokens`; if alive_loops evicts
-    /// the old token, only the `previous_tokens` slot is dropped —
-    /// the current entry stays.  Conversely, when the current token
-    /// itself ages out, the whole `compiled_loops` entry is dropped
-    /// (RPython's `LoopToken.__del__` analog).
+    /// itself.  Eviction of a predecessor is `alive_loops` drop +
+    /// `JitCellToken::drop` → `free_loop_and_bridges`; the
+    /// `compiled_loops` row stays until the current token is evicted.
+    /// When the current token itself ages out, the whole
+    /// `compiled_loops` entry is dropped (RPython's
+    /// `LoopToken.__del__` analog).
     /// `memmgr.py` `release_all_loops` via `jit_hooks.stats_memmgr_release_all`
     /// on the one `warmrunnerdesc.memory_manager`, which every
     /// `jitdriver_sd.warmstate` shares.
@@ -14832,28 +14762,12 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or(false)
             {
                 // Current eviction is the `LoopToken.__del__` analog
-                // (memmgr.py:73): the whole green_key's loop disappears,
-                // including every previous-token predecessor on the
-                // entry (the merged `traces` map and the
-                // previous_tokens Vec drop together).
+                // (`memmgr.py`): the whole green_key's loop disappears.
                 self.compiled_loops.swap_remove(&(jd_no, gk));
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-mem-collect",
                         &format!("evicted current loop key={gk}"),
-                    );
-                }
-            } else {
-                let before = entry.previous_tokens.len();
-                entry.previous_tokens.retain(|weak| {
-                    weak.upgrade()
-                        .map(|t| !std::sync::Arc::ptr_eq(&t, &token))
-                        .unwrap_or(false)
-                });
-                if crate::debug::have_debug_prints() && entry.previous_tokens.len() < before {
-                    crate::debug::log_one(
-                        "jit-mem-collect",
-                        &format!("evicted previous token at key={gk}"),
                     );
                 }
             }
@@ -16546,7 +16460,6 @@ impl<M: Clone> MetaInterp<M> {
                 // the jitcell and keeps the old token alive; it never takes the
                 // loop's own TargetTokens away, and the fresh token's
                 // `target_tokens` stays empty.
-                let mut previous_tokens: Vec<std::sync::Weak<JitCellToken>> = Vec::new();
                 // Carried forward: the replacement entry inherits the retired
                 // loop's close target, and a key with no header pc is
                 // unreachable to a closing bridge.
@@ -16556,8 +16469,7 @@ impl<M: Clone> MetaInterp<M> {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
                     carried_loop_header_pc = carried.loop_header_pc;
-                    previous_tokens =
-                        self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
+                    self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
                 // The retrace budget does not carry over. `token`
                 // came out of `make_jitcell_token`, so its count is the
@@ -16575,7 +16487,6 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
                         traces,
-                        previous_tokens,
                         next_global_opref,
                     },
                 );
@@ -17400,8 +17311,8 @@ impl<M: Clone> MetaInterp<M> {
                 // The walker stamps every internal `ResumeDescr.rd_loop_token
                 //  = clt(source_jct)` (compile.py:186), so the new
                 // bridge-internal guards inherit the *source* JCT identity
-                // (could be a previous_tokens entry on cross-loop or
-                // post-recompile failures), not the current running loop's
+                // (could be a keepalive / replaced token still named by
+                // `rd_loop_token.loop_token_wref()`), not the current running loop's
                 // latest token.
                 self.last_quasi_immutable_deps =
                     std::mem::take(&mut optimizer.quasi_immutable_deps);
@@ -25550,7 +25461,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -27938,7 +27848,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -28000,7 +27909,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -28055,7 +27963,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -28120,7 +28027,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -28236,7 +28142,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -30630,7 +30535,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -30715,7 +30619,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -32304,7 +32207,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces,
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -32371,7 +32273,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -32419,7 +32320,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -32469,7 +32369,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -32576,7 +32475,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces,
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -33008,7 +32906,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -33158,7 +33055,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -33430,7 +33326,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -34364,7 +34259,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 0,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -34954,7 +34848,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 101,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -35082,7 +34975,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: Some(0),
                 next_global_opref: 0,
             },
@@ -35151,7 +35043,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 102,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -36951,7 +36842,6 @@ mod bridge_cell_token_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: green_key,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -37003,7 +36893,6 @@ mod loop_side_table_tests {
             meta: std::sync::Arc::new(()),
             root_trace_id,
             traces: crate::FxIndexMap::default(),
-            previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
         }

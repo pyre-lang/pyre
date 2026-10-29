@@ -1460,7 +1460,7 @@ pub struct JitCellToken {
     /// (`history.py _keepalive_jitcell_tokens = {}` keyed on the
     /// token object itself, with `:457 record_jump_to` writing
     /// `self._keepalive_jitcell_tokens[target] = None`).  Pyre keeps the
-    /// same shape: an `Arc<JitCellToken>` set keyed on token number.
+    /// same shape: an `Arc<JitCellToken>` Vec keyed on object identity.
     ///
     /// Wrapped in `Mutex` so `record_jump_to` can push through
     /// `&JitCellToken` once the token has been shared via
