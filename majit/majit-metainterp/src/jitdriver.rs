@@ -3958,8 +3958,7 @@ impl<S: JitState> JitDriver<S> {
         Some((original_green_key, trace_meta))
     }
 
-    /// pyjitpl.py:1641-1663, the loop arm of
-    /// `_create_segmented_trace_and_blackhole`:
+    /// pyjitpl.py `_create_segmented_trace_and_blackhole` loop arm:
     ///
     /// ```python
     /// target_token = compile.compile_simple_loop(
@@ -3973,43 +3972,24 @@ impl<S: JitState> JitDriver<S> {
     /// the bridge else-arm (pyjitpl.py) beside it without the two
     /// compiles pushing the shared handoff and blackhole tail apart.
     fn compile_segmented_loop(&mut self, meta: S::Meta) {
-        let Some(green_key) = self.meta.compile_simple_loop(meta) else {
+        let Some((green_key, install_token)) = self.meta.compile_simple_loop(meta) else {
             return;
         };
-        // pyjitpl.py:2760 reads the greenkey from current_merge_points;
-        // without staging the key here, the segmented-loop abort hook
-        // reports key 0.
+        // pyjitpl.py `_create_segmented_trace_and_blackhole` reads the greenkey
+        // from current_merge_points; without staging the key here, the
+        // segmented-loop abort hook reports key 0.
         self.meta.pending_abort_green_key = Some(green_key);
-        // pyjitpl.py:1662-1663 line-by-line: pass the compiled
-        // `target_token` returned by `compile_simple_loop` to
-        // `attach_procedure_to_interp`, NOT a fresh synthetic uncompiled
-        // JitCellToken.  pyre's `compile_simple_loop` returns the
-        // resolved cell key; the actual `Arc<JitCellToken>` is the `token`
-        // field of the freshly-installed `CompiledEntry` in
-        // `self.compiled_loops`. `compile_simple_loop` inserted the entry
-        // under the compiling driver (`self.jitdriver_sd`); read it back
-        // from the same one.
+        // pyjitpl.py `_create_segmented_trace_and_blackhole` passes
+        // `target_token.targeting_jitcell_token` from `compile.compile_simple_loop`
+        // to `warmstate.attach_procedure_to_interp`. pyre's `compile_simple_loop`
+        // returns that minted `JitCellToken` (its `target_tokens` hold the new
+        // TargetToken). `compile.py send_loop_to_backend` still records the
+        // same token on `last_compiled_artifact_token` for other readers.
         let jd_no = self.meta.active_jitdriver_sd.unwrap_or(0);
-        let install_token = self
-            .meta
-            .compiled_entry_on_driver(jd_no, green_key)
-            .expect(
-                "compile_simple_loop returned Some(green_key) ⇒ \
-                 compiled_loops has the new CompiledEntry",
-            )
-            .live_token();
-        // `warmstate.py attach_procedure_to_interp` redirect+record_jump_to chain routed
-        // through MetaInterp's caller-side helper.  Skip the redirect when
-        // MemoryManager has already evicted the freshly-installed token
-        // (rare; eviction is independent of this insertion path).
-        if let Some(install_token) = install_token {
-            self.meta.attach_procedure_with_redirect_on_driver(
-                jd_no,
-                green_key,
-                None,
-                install_token,
-            );
-        }
+        // `warmstate.py attach_procedure_to_interp` redirect+record_jump_to chain
+        // routed through MetaInterp's caller-side helper.
+        self.meta
+            .attach_procedure_with_redirect_on_driver(jd_no, green_key, None, install_token);
     }
 
     /// RPython rlib.jit.current_trace_length().
@@ -13730,7 +13710,6 @@ mod tests {
         driver.insert_compiled_loop(
             key.get_uhash(),
             crate::pyjitpl::CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -13815,7 +13794,6 @@ mod tests {
         driver.insert_compiled_loop(
             key.get_uhash(),
             crate::pyjitpl::CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -13883,7 +13861,6 @@ mod tests {
         let meta0 = Arc::new(());
         let meta1 = Arc::new(());
         let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
-            token: std::sync::Weak::new(),
             meta,
             root_trace_id,
             traces: crate::FxIndexMap::default(),
