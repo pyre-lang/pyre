@@ -815,7 +815,7 @@
 print(fib(100))</textarea>
               <div class="playground-controls">
                 <button class="button primary" id="run-button" disabled>Run</button>
-                <button class="button secondary" id="compare-toggle" type="button" aria-pressed="false">Show Pyodide</button>
+                <button class="button secondary" id="compare-toggle" type="button" aria-pressed="false">Compare with Pyodide</button>
               </div>
             </div>
 
@@ -1031,7 +1031,7 @@ print(fib(100))</textarea>
       pyodideWrap.hidden = !on;
       playgroundGrid.classList.toggle("comparing", on);
       compareToggle.setAttribute("aria-pressed", String(on));
-      compareToggle.textContent = on ? "Hide Pyodide" : "Show Pyodide";
+      compareToggle.textContent = on ? "Hide comparison" : "Compare with Pyodide";
       pyreLabel.textContent = on ? "pyre" : "Output";
       if (on) {
         loadPyodideOnce().catch(() => {});
