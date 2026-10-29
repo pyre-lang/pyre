@@ -1335,6 +1335,7 @@ impl CrateLoweringState {
         func_hints: std::collections::HashMap<String, Vec<String>>,
         skipped: LoweringSkips,
         gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+        program_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
         module_filter: Option<&std::collections::HashSet<String>>,
         function_filter: Option<&std::collections::HashSet<String>>,
     ) -> Self {
@@ -1342,10 +1343,12 @@ impl CrateLoweringState {
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
-        let raw_alloc_flavor_structs =
+        let mut raw_alloc_flavor_structs =
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
+        // Flavor is a program-wide class property; a dependency's raw classes count here too.
+        raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -2231,6 +2234,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         std::collections::HashMap::new(),
         skips.clone(),
         &gc_struct_ids,
+        &std::collections::HashSet::new(),
         module_filter,
         function_filter,
     );
@@ -4926,6 +4930,14 @@ pub struct LowerContext<'a> {
 impl<'a> LowerContext<'a> {
     /// Derive the program's lowering metadata once for this context.
     pub fn new(llbc: &'a Llbc) -> Self {
+        Self::new_with_dependency_raw_flavors(llbc, &std::collections::HashSet::new())
+    }
+
+    /// `new` plus the flavor-raw classes of the crates `llbc` links against (`lib.rs` passes the program-wide set to whole-crate lowering).
+    pub fn new_with_dependency_raw_flavors(
+        llbc: &'a Llbc,
+        dependency_raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    ) -> Self {
         shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // Single-function lowering does not run
         // [`link_transparent_scalar_types`]. Publish the same external
@@ -4935,10 +4947,12 @@ impl<'a> LowerContext<'a> {
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
-        let raw_alloc_flavor_structs =
+        let mut raw_alloc_flavor_structs =
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
+        // Flavor is a program-wide class property; a dependency's raw classes count here too.
+        raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
         let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
             &gc_struct_ids,

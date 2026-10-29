@@ -653,6 +653,7 @@ fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
     let interp = load_llbc(INTERPRETER_LLBC);
     let interp_ctx = lower_context_for(interp);
     let terms = mapdict_fns(&interp, "_get_mapdict_map");
+    let mut checked_interp_graph = false;
     for fd in terms {
         let graph = lower_fun_decl(&interp_ctx, fd)
             .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
@@ -668,8 +669,13 @@ fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
         });
         if has_word_mapnode {
             assert_mapnode_casts_are_word_operands(&graph);
+            checked_interp_graph = true;
         }
     }
+    assert!(
+        checked_interp_graph,
+        "_get_mapdict_map must keep a word-operand MapNode cast in at least one graph"
+    );
 }
 
 fn i64_ty() -> Value {

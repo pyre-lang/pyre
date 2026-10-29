@@ -158,6 +158,7 @@ impl GraphBodyProvider {
         module_paths: &[&str],
         cross_tombstoned_leaves: &HashSet<String>,
         gc_struct_ids: &HashSet<majit_ir::descr::StructId>,
+        raw_alloc_flavor_structs: &HashSet<String>,
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
@@ -167,6 +168,7 @@ impl GraphBodyProvider {
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
             gc_struct_ids,
+            raw_alloc_flavor_structs,
             None,
             None,
         );
@@ -204,6 +206,7 @@ impl GraphBodyProvider {
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
             &gc_struct_ids,
+            &HashSet::new(),
             None,
             Some(&function_filter),
         );
@@ -608,7 +611,13 @@ mod tests {
             FuncObjDeclarations::default(),
             Default::default(),
         );
-        let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids);
+        let program = provider.lower_prelinked_crate(
+            llbc,
+            &[],
+            &HashSet::new(),
+            &gc_struct_ids,
+            &HashSet::new(),
+        );
         let mut compared = 0;
         for f in &program.functions {
             let Some(fd) = f
@@ -656,7 +665,7 @@ mod tests {
             FuncObjDeclarations::default(),
             Default::default(),
         )
-        .lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids);
+        .lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids, &HashSet::new());
         let target = unhinted
             .functions
             .iter()
@@ -673,7 +682,7 @@ mod tests {
             FuncObjDeclarations::default(),
             Default::default(),
         )
-        .lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids);
+        .lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids, &HashSet::new());
         let f = program
             .functions
             .iter()

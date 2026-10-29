@@ -8121,51 +8121,63 @@ mod tests {
         use crate::flowspace::model::{Hlvalue, Variable};
         use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
 
-        let hop = dummy_hop();
-        hop.rtyper
-            .initialize_exceptiondata()
-            .expect("initialize_exceptiondata");
-        let s_int = SomeValue::Integer(SomeInteger::new(false, false));
-        let r_int = hop.rtyper.getrepr(&s_int).expect("IntegerRepr");
-        let v = Variable::named("addr");
-        v.set_concretetype(Some(r_int.lowleveltype().clone()));
-        hop.args_v.borrow_mut().push(Hlvalue::Variable(v));
-        hop.args_s.borrow_mut().push(s_int);
-        hop.args_r.borrow_mut().push(Some(r_int));
+        for unsigned in [false, true] {
+            let hop = dummy_hop();
+            hop.rtyper
+                .initialize_exceptiondata()
+                .expect("initialize_exceptiondata");
+            let s_int = SomeValue::Integer(SomeInteger::new(false, unsigned));
+            let r_int = hop.rtyper.getrepr(&s_int).expect("IntegerRepr");
+            let v = Variable::named("addr");
+            v.set_concretetype(Some(r_int.lowleveltype().clone()));
+            hop.args_v.borrow_mut().push(Hlvalue::Variable(v));
+            hop.args_s.borrow_mut().push(s_int);
+            hop.args_r.borrow_mut().push(Some(r_int));
 
-        let classdef = ClassDef::new_standalone("pkg.RawC", None);
-        classdef
-            .borrow()
-            .classdesc
-            .borrow()
-            .pyobj
-            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
-        let s_result = SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            false,
-            std::collections::BTreeMap::new(),
-        ));
-        let r_result = hop.rtyper.getrepr(&s_result).expect("getrepr");
-        Repr::setup(r_result.as_ref()).expect("setup flavor-raw InstanceRepr");
-        *hop.r_result.borrow_mut() = Some(r_result);
+            let classdef = ClassDef::new_standalone("pkg.RawC", None);
+            classdef
+                .borrow()
+                .classdesc
+                .borrow()
+                .pyobj
+                .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+            let s_result = SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            ));
+            let r_result = hop.rtyper.getrepr(&s_result).expect("getrepr");
+            Repr::setup(r_result.as_ref()).expect("setup flavor-raw InstanceRepr");
+            *hop.r_result.borrow_mut() = Some(r_result);
 
-        let _out = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
-            .expect("Integer → Raw")
-            .expect("cast_int_to_ptr result");
-        let ops = hop.llops.borrow();
-        assert!(
-            ops.ops.iter().any(|op| op.opname == "cast_int_to_ptr"),
-            "Integer → Raw InstanceRepr emits cast_int_to_ptr, ops={:?}",
-            ops.ops
-                .iter()
-                .map(|op| op.opname.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            ops._called_exception_is_here_or_cannot_occur,
-            "rtype_cast_instance_intrinsic calls exception_cannot_occur"
-        );
-        drop(ops);
+            let _out = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
+                .expect("Integer → Raw")
+                .expect("cast_int_to_ptr result");
+            let ops = hop.llops.borrow();
+            let opnames: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+            assert!(
+                ops.ops.iter().any(|op| op.opname == "cast_int_to_ptr"),
+                "Integer → Raw InstanceRepr emits cast_int_to_ptr, ops={:?}",
+                opnames
+            );
+            if unsigned {
+                let uint_to_int = ops
+                    .ops
+                    .iter()
+                    .position(|op| op.opname == "cast_uint_to_int");
+                let int_to_ptr = ops.ops.iter().position(|op| op.opname == "cast_int_to_ptr");
+                assert!(
+                    matches!((uint_to_int, int_to_ptr), (Some(u), Some(i)) if u < i),
+                    "Unsigned Integer → Raw emits cast_uint_to_int before cast_int_to_ptr, ops={:?}",
+                    opnames
+                );
+            }
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "rtype_cast_instance_intrinsic calls exception_cannot_occur"
+            );
+            drop(ops);
+        }
 
         let hop = dummy_hop();
         hop.rtyper

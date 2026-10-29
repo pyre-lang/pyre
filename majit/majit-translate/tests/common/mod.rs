@@ -6,6 +6,7 @@
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
 use majit_translate::flowspace::bytecode::ConstantData;
+use majit_translate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs;
 use majit_translate::front::mir::{LowerContext, LowerError, lower_fun_decl_with_static_addrs};
 use majit_translate::model::FunctionGraph;
 use rustpython_compiler::{Mode, compile as rp_compile};
@@ -94,7 +95,18 @@ pub fn lower_context_for(llbc: &'static Llbc) -> &'static LowerContext<'static> 
         if let Some(loaded) = llbc_slot(path).get()
             && std::ptr::eq(llbc, loaded)
         {
-            return context_slot(path).get_or_init(|| LowerContext::new(llbc));
+            return context_slot(path).get_or_init(|| {
+                if path == INTERPRETER_LLBC || path == MODULE_LLBC {
+                    LowerContext::new_with_dependency_raw_flavors(
+                        llbc,
+                        &harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(load_llbc(
+                            OBJECT_LLBC,
+                        ))),
+                    )
+                } else {
+                    LowerContext::new(llbc)
+                }
+            });
         }
     }
     panic!("lower_context_for: llbc is not a production artefact from load_llbc")

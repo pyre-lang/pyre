@@ -10222,6 +10222,7 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         std::collections::HashMap::new(),
         Default::default(),
         &gc,
+        &std::collections::HashSet::new(),
         None,
         None,
     );

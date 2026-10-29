@@ -403,6 +403,7 @@ fn build_semantic_program_via_active_frontend(
                     module_paths,
                     &cross_tombstoned_leaves,
                     &gc_struct_ids,
+                    &raw_alloc_flavor_structs,
                 );
                 prof.mark(&format!("    lower {p}"));
                 front::mir::absorb_semantic_program(
