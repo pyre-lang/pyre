@@ -257,18 +257,6 @@ fn test_bridge_end_to_end() {
     // Compile main loop
     let mut backend = CraneliftBackend::new();
 
-    // Pin the loop trace id to match the test's TestFailDescr defaults
-    // (`trace_id() == 0`).  In production, metainterp's
-    // `record_loop_or_bridge` (compile.py line-by-line counterpart)
-    // stamps the metainterp ResumeGuardDescr's trace_id to match the
-    // backend allocation; this integration test bypasses metainterp, so
-    // we instead pin the backend's `next_trace_id` to align both sides
-    // explicitly.  Without this, `find_fail_descr_in_fail_descrs`
-    // compares the backend descr's `trace_id` field (allocated by
-    // `compile_loop`, default 1) against the bridge fail descr's
-    // `trace_id()` trait method (which forwards through the test's
-    // TestFailDescr meta_descr, default 0).
-    backend.set_next_trace_id(0);
     let token = JitCellToken::new(10);
     backend
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
@@ -284,11 +272,8 @@ fn test_bridge_end_to_end() {
     //   iter5: i=1,sum=14 -> sum2=15, i2=0, fail
     // Guard saves input args (i=1, sum=14)
     let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
-    let (source_trace_id, source_fail_index_per_trace) = {
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0);
-        (descr.trace_id(), descr.fail_index_per_trace())
-    };
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), 1); // i
     assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
 
@@ -304,22 +289,11 @@ fn test_bridge_end_to_end() {
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
 
-    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity.
-    // Bridge compilation looks up the parent guard by
-    // `FailDescr::{trace_id, fail_index_per_trace}` from the descr passed
-    // by the metainterp (`pyjitpl.rs`).
-    let bridge_fail_descr =
-        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-    {
-        let fd = bridge_fail_descr.as_fail_descr().unwrap();
-        fd.set_trace_id(source_trace_id);
-        fd.set_fail_index_per_trace(source_fail_index_per_trace);
-    }
-    let bridge_fail_descr_ref = bridge_fail_descr.as_fail_descr().unwrap();
-
+    // `assemble_bridge(faildescr)` / `do_compile_bridge`: attach to the
+    // live guard descr `get_latest_descr` returned.
     let bridge_info = backend
         .compile_bridge(
-            bridge_fail_descr_ref,
+            descr,
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
@@ -2214,24 +2188,16 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let bridge_trace = bridge_rec.get_trace();
     set_guard_failargs(&bridge_trace, bridge_guard, &[_bi, bsum]);
 
-    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
-    // (per-trace fail_index = 0, trace_id = 910). Bridge compilation
-    // looks up the parent guard by `FailDescr::{trace_id,
-    // fail_index_per_trace}` from the descr passed by the metainterp.
-    let bridge_fail_descr =
-        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-    {
-        let fd = bridge_fail_descr.as_fail_descr().unwrap();
-        fd.set_trace_id(910);
-        fd.set_fail_index_per_trace(0);
-    }
-    let bridge_fail_descr_ref = bridge_fail_descr.as_fail_descr().unwrap();
+    // `assemble_bridge(faildescr)` / `do_compile_bridge`: attach to the
+    // live guard descr `get_latest_descr` returned.
+    let loop_frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+    let descr = backend.get_latest_descr(&loop_frame);
 
     backend.set_next_trace_id(911);
     backend.set_next_header_pc(2000);
     let _bridge_info = backend
         .compile_bridge(
-            bridge_fail_descr_ref,
+            descr,
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
