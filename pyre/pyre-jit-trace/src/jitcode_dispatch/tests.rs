@@ -4567,6 +4567,49 @@ fn hint_force_virtualizable_is_a_noop_without_virtualizable_info() {
 }
 
 #[test]
+fn establish_nullity_of_box_guards_observations_and_declines_missing_values() {
+    // pyjitpl.py MIFrame._establish_nullity: observing a pointer records
+    // its guard once, then heapcache.nullity_now_known answers later reads.
+    for pointer in [None, Some(0), Some(pyre_object::w_none() as usize)] {
+        let mut tc = fresh_trace_ctx();
+        let operand = dummy_ptr_eq_box(&mut tc);
+        if let Some(pointer) = pointer {
+            tc.set_opref_concrete(operand, Value::Ref(majit_ir::GcRef(pointer)));
+        }
+        let before = tc.num_ops();
+        with_hint_walk_context(
+            &mut tc,
+            &mut [operand],
+            &mut [ConcreteValue::Null],
+            &mut [],
+            &mut [],
+            &mut [],
+            &[],
+            |wc| {
+                let expected = pointer.map(|p| p != 0);
+                assert_eq!(establish_nullity_of_box(wc, 0, operand).unwrap(), expected);
+                if let Some(nonnull) = expected {
+                    let guard = if nonnull {
+                        OpCode::GuardNonnull
+                    } else {
+                        OpCode::GuardIsnull
+                    };
+                    assert_eq!(wc.trace_ctx.ops().last().unwrap().opcode, guard);
+                    assert!(wc.trace_ctx.heap_cache().is_nullity_known(operand));
+                }
+                let after = wc.trace_ctx.num_ops();
+                assert_eq!(establish_nullity_of_box(wc, 0, operand).unwrap(), expected);
+                assert_eq!(wc.trace_ctx.num_ops(), after);
+                if expected.is_none() {
+                    assert_eq!(after, before);
+                    assert!(!wc.trace_ctx.heap_cache().is_nullity_known(operand));
+                }
+            },
+        );
+    }
+}
+
+#[test]
 fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")

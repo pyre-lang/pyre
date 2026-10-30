@@ -5011,8 +5011,7 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
             crate::descr::frame_debug_data_w_globals_descr(),
         );
     }
-    // Const 0, a heapcache-known null, or a box the caller could not
-    // establish: published `pycode.w_globals`.
+    // The caller established null debugdata: published `pycode.w_globals`.
     let code_descr = crate::descr::pyframe_code_descr();
     let pycode = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], code_descr.clone());
     // `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
@@ -12938,6 +12937,29 @@ mod tests {
     /// Process-global `HOST_HOOKS` is one slot; save and restore it so this
     /// test cannot overwrite a sibling.
     static QMUT_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    #[test]
+    fn frame_debugdata_observation_requires_nullity_knowledge() {
+        // pyjitpl.py MIFrame._establish_nullity guards box.nonnull() before
+        // PyFrame.get_w_globals can select either namespace.
+        for pointer in [0, pyre_object::w_none() as usize] {
+            let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+            let debugdata = OpRef::input_arg_ref(0);
+            ctx.set_opref_concrete(debugdata, Value::Ref(majit_ir::GcRef(pointer)));
+            assert!(!frame_debugdata_box_is_known_null(&ctx, debugdata));
+            assert!(!frame_debugdata_box_is_known_non_null(&ctx, debugdata));
+
+            ctx.heap_cache_mut().nullity_now_known(debugdata);
+            assert_eq!(
+                frame_debugdata_box_is_known_null(&ctx, debugdata),
+                pointer == 0
+            );
+            assert_eq!(
+                frame_debugdata_box_is_known_non_null(&ctx, debugdata),
+                pointer != 0
+            );
+        }
+    }
 
     struct QmutHookGuard {
         saved: majit_metainterp::HostHooks,
