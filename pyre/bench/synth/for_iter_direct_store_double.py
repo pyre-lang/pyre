@@ -4,6 +4,13 @@
 # PyPy (whose oracle reports trace-too-long and segmenting aborts here).
 # main CI 10-24..10-26 (6 runs, all native legs): 0.2x-0.5x; ceiling = max x 1.35.
 # pyre-check: spec-folds=store_attr_direct
+import atexit
+
+# Resolve the app-level shutdown hooks before the tiny trace limit. Otherwise
+# shutdown imports trace importlib's find_spec/parent/has_location, and the
+# wasm parent trace reaches the limit even though mutate_all is unchanged.
+atexit._ncallbacks()
+
 try:
     import pypyjit
 except ImportError:

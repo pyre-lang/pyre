@@ -2,7 +2,10 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=017b7cc2c6de5755 platform=linux
+# corpus=393dff071a3a2cd9 platform=linux
+# clinic_arg_type_name and its bad_arg/fileio_writebuf::type_error callers
+# reach opaque core::str::floor_char_boundary since the clinic name truncation
+# change. These remain lowering debt, rather than newly supported helpers.
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
 direct-skip (never reaches unported_category)	pyre_interpreter::eval::<Impl>::dict_update__AccessDirect_None
 direct-skip (never reaches unported_category)	pyre_interpreter::module::thread::handle_class::__majit_wrap_ident
@@ -256,7 +259,6 @@ two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_get_annotate
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_get_annotations
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_set_annotate
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::type_set_annotations
-two-phase-annotate-skipped	pyre_interpreter::baseobjspace::unpack_iter_descr_next
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::unpackiterable
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::unpackiterable_portal
 two-phase-annotate-skipped	pyre_interpreter::baseobjspace::view_as_kwargs
@@ -292,6 +294,7 @@ two-phase-annotate-skipped	pyre_interpreter::builtins::exception_group_match
 two-phase-annotate-skipped	pyre_interpreter::builtins::exception_str_method
 two-phase-annotate-skipped	pyre_interpreter::builtins::file_write_buffer_bytes
 two-phase-annotate-skipped	pyre_interpreter::builtins::fileio_writebuf
+two-phase-annotate-skipped	pyre_interpreter::builtins::fileio_writebuf::type_error
 two-phase-annotate-skipped	pyre_interpreter::builtins::getindex_w
 two-phase-annotate-skipped	pyre_interpreter::builtins::memoryview_backing_buffer
 two-phase-annotate-skipped	pyre_interpreter::builtins::memoryview_call_python_release_unraisable
@@ -539,6 +542,7 @@ two-phase-annotate-skipped	pyre_interpreter::module::__pypy__::interp_buffer::bu
 two-phase-annotate-skipped	pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::<Impl>::__new__
 two-phase-annotate-skipped	pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::__majit_wrap___buffer__
 two-phase-annotate-skipped	pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::__majit_wrap___new__
+two-phase-annotate-skipped	pyre_interpreter::module::_codecs::bad_arg
 two-phase-annotate-skipped	pyre_interpreter::module::_codecs::call_codec
 two-phase-annotate-skipped	pyre_interpreter::module::_codecs::decode_text_codec
 two-phase-annotate-skipped	pyre_interpreter::module::_codecs::encode_text_codec
@@ -988,25 +992,14 @@ two-phase-annotate-skipped	pyre_interpreter::module::_warnings::update_registry
 two-phase-annotate-skipped	pyre_interpreter::module::_warnings::warnings_attr
 two-phase-annotate-skipped	pyre_interpreter::module::posix::interp_posix::urandom
 two-phase-annotate-skipped	pyre_interpreter::module::struct::<Impl>::__sizeof__
-two-phase-annotate-skipped	pyre_interpreter::module::struct::<Impl>::iter_unpack
 two-phase-annotate-skipped	pyre_interpreter::module::struct::<Impl>::unpack
-two-phase-annotate-skipped	pyre_interpreter::module::struct::<Impl>::unpack_from
 two-phase-annotate-skipped	pyre_interpreter::module::struct::__majit_wrap___sizeof__
-two-phase-annotate-skipped	pyre_interpreter::module::struct::__majit_wrap_iter_unpack
 two-phase-annotate-skipped	pyre_interpreter::module::struct::__majit_wrap_unpack
-two-phase-annotate-skipped	pyre_interpreter::module::struct::__majit_wrap_unpack_from
-two-phase-annotate-skipped	pyre_interpreter::module::struct::_orig_do_unpack
 two-phase-annotate-skipped	pyre_interpreter::module::struct::_orig_parse_format
 two-phase-annotate-skipped	pyre_interpreter::module::struct::_orig_parse_format::<Impl>::call_once
-two-phase-annotate-skipped	pyre_interpreter::module::struct::do_unpack
-two-phase-annotate-skipped	pyre_interpreter::module::struct::do_unpack_from
 two-phase-annotate-skipped	pyre_interpreter::module::struct::parse_format
 two-phase-annotate-skipped	pyre_interpreter::module::struct::unpack_iter::<Impl>::__length_hint__
-two-phase-annotate-skipped	pyre_interpreter::module::struct::unpack_iter::<Impl>::__next__
 two-phase-annotate-skipped	pyre_interpreter::module::struct::unpack_iter::__majit_wrap___length_hint__
-two-phase-annotate-skipped	pyre_interpreter::module::struct::unpack_iter::__majit_wrap___next__
-two-phase-annotate-skipped	pyre_interpreter::module::struct::unpack_iter::make_unpack_iter
-two-phase-annotate-skipped	pyre_interpreter::module::struct::unpack_units
 two-phase-annotate-skipped	pyre_interpreter::module::sys::vm::monitoring_free_tool_id
 two-phase-annotate-skipped	pyre_interpreter::module::sys::vm::monitoring_set_tool_name
 two-phase-annotate-skipped	pyre_interpreter::module::sys::vm::monitoring_tool_name
@@ -1345,6 +1338,7 @@ two-phase-annotate-skipped	pyre_interpreter::sliceobject::eval_slice_index
 two-phase-annotate-skipped	pyre_interpreter::sliceobject::slice_unpack
 two-phase-annotate-skipped	pyre_interpreter::type_methods::_orig_extend_from_tuple
 two-phase-annotate-skipped	pyre_interpreter::type_methods::call_format_dispatch_w
+two-phase-annotate-skipped	pyre_interpreter::type_methods::clinic_arg_type_name
 two-phase-annotate-skipped	pyre_interpreter::type_methods::decode_raw_unicode_escape
 two-phase-annotate-skipped	pyre_interpreter::type_methods::decode_raw_unicode_escape_stateful
 two-phase-annotate-skipped	pyre_interpreter::type_methods::decode_utf16_32
@@ -1443,7 +1437,6 @@ two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed::<Impl>::
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave::<Impl>::call_once
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_return_trace
-two-phase-annotate-skipped	pyre_jit::eval::portal_body_result
 two-phase-annotate-skipped	pyre_jit::eval::portal_diag_bump
 two-phase-annotate-skipped	pyre_jit::eval::portal_metatrace_skip
 two-phase-annotate-skipped	pyre_jit::eval::portal_runner_dispatch
@@ -1573,10 +1566,8 @@ two-phase-annotate-skipped	pyre_module::module::_lzma::compressor_methods::__maj
 two-phase-annotate-skipped	pyre_module::module::_lzma::compressor_methods::__majit_wrap_flush
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::<Impl>::__new__
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::<Impl>::decompress
-two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::<Impl>::unused_data
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::__majit_wrap___new__
 two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::__majit_wrap_decompress
-two-phase-annotate-skipped	pyre_module::module::_lzma::decompressor_methods::__majit_wrap_unused_data
 two-phase-annotate-skipped	pyre_module::module::_lzma::optional_filter_chain
 two-phase-annotate-skipped	pyre_module::module::_lzma::uint32_w
 two-phase-annotate-skipped	pyre_module::module::_pickle::compat_map
@@ -1777,10 +1768,8 @@ two-phase-annotate-skipped	pyre_module::module::bz2::compressor_methods::__majit
 two-phase-annotate-skipped	pyre_module::module::bz2::compressor_methods::__majit_wrap_flush
 two-phase-annotate-skipped	pyre_module::module::bz2::decompressor_methods::<Impl>::__new__
 two-phase-annotate-skipped	pyre_module::module::bz2::decompressor_methods::<Impl>::decompress
-two-phase-annotate-skipped	pyre_module::module::bz2::decompressor_methods::<Impl>::unused_data
 two-phase-annotate-skipped	pyre_module::module::bz2::decompressor_methods::__majit_wrap___new__
 two-phase-annotate-skipped	pyre_module::module::bz2::decompressor_methods::__majit_wrap_decompress
-two-phase-annotate-skipped	pyre_module::module::bz2::decompressor_methods::__majit_wrap_unused_data
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::__majit_wrap_fcntl_flock
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::__majit_wrap_fcntl_ioctl
 two-phase-annotate-skipped	pyre_module::module::fcntl::interp_fcntl::fill_guarded
@@ -2164,14 +2153,9 @@ two-phase-never-a-subject	ll_max__uint
 two-phase-never-a-subject	ll_min__int
 two-phase-never-a-subject	ll_min__uint
 two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
-two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_uint
-two-phase-rtype-skipped	majit_rlib::rffi::buffer::raw_malloc_or_memory_error
 two-phase-rtype-skipped	pyre_interpreter::module::thread::rlock_class::<Impl>::_release_save
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
 two-phase-rtype-skipped	pyre_interpreter::type_methods::padded_byte_len
-two-phase-rtype-skipped	pyre_jit::eval::exit_frame_handler_needs_unwritten_stack__AccessDirect_None
 two-phase-rtype-skipped	pyre_module::module::mmap::interp_mmap::mmap_get_attr_i64::<Impl>::call_once
 two-phase-rtype-skipped	pyre_object::kwargsdict::<Impl>::copy
-two-phase-rtype-skipped	pyre_object::lowlevel_string::alloc_lowlevel_string
-two-phase-rtype-skipped	pyre_object::unicodeobject::alloc_raw_utf8_payload
 two-phase-rtype-skipped	pyre_object::unicodeobject::alloc_utf8_payload

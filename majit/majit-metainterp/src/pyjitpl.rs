@@ -6394,7 +6394,7 @@ impl<M: Clone> MetaInterp<M> {
     /// retry — gets `metainterp_sd.cpu` plus the host resolvers
     /// `ConstPtrInfo.getstrlen1` / vstring read off that cpu.
     /// `default_pipeline()` leaves those slots empty.
-    fn pin_optimizer_host_state(&self, opt: &mut Optimizer) {
+    fn pin_optimizer_host_state(&mut self, opt: &mut Optimizer) {
         opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
         opt.cpu = self.cpu.clone();
         let jd = self.active_jitdriver_sd.unwrap_or(0);
@@ -6411,15 +6411,16 @@ impl<M: Clone> MetaInterp<M> {
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
-        // `&self` cannot hand out `&mut` of this field. The slot is the
-        // address `publish_live_op_*` writes through while this compile runs.
-        opt.set_compile_live_op_roots_slot(Some(
-            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
-                as usize,
-        ));
+        // optimizer.py Optimizer.__init__ owns resumedata_memo; resume.py
+        // ResumeDataVirtualAdder.finish keeps memo.consts live while allocating
+        // rd_numb, before assigning the pool to the guard. Publish every
+        // optimizer here, including simple finishes and unroll-cancel retries.
+        self.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&opt.resumedata_memo));
+        opt.set_compile_live_op_roots_slot(Some((&raw mut self.compile_live_op_roots) as usize));
     }
 
-    fn make_optimizer(&self) -> Optimizer {
+    fn make_optimizer(&mut self) -> Optimizer {
         // compile.py `CompileData.optimize_trace` → `build_opt_chain(enable_opts)`.
         let jd = self.active_jitdriver_sd.unwrap_or(0);
         let enable_opts = self
@@ -16666,12 +16667,6 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        // optimizer.py gives every `Optimizer` its own `ResumeDataLoopMemo`;
-        // `store_final_boxes_in_guard` fills its `rd_consts` with live GCREFs.
-        // Publish it for the rest of this compile, as
-        // `UnrollOptimizer::register_resume_memo` does for loops.
-        self.compile_resume_memos
-            .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
@@ -17489,12 +17484,6 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
-        // optimizer.py gives every `Optimizer` its own `ResumeDataLoopMemo`;
-        // `store_final_boxes_in_guard` fills its `rd_consts` with live GCREFs.
-        // Publish it for the rest of this compile, as
-        // `UnrollOptimizer::register_resume_memo` does for loops.
-        self.compile_resume_memos
-            .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.
@@ -32321,6 +32310,37 @@ mod tests {
             majit_ir::make_array_descr(0, 8, Type::Int),
         );
         info
+    }
+
+    #[test]
+    fn simple_optimizer_resume_memo_forwards_before_guard_publication() {
+        // resume.py ResumeDataVirtualAdder.finish allocates rd_numb before
+        // handing memo.consts to the guard; the optimizer owns it meanwhile.
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup_descrs_for_jitdrivers();
+        drop(meta.warm_state_for_driver(0));
+        let optimizer = meta.make_optimizer();
+        let dead = GcRef(0x96E6_5100);
+        let live = GcRef(0x96E6_6100);
+        optimizer
+            .resumedata_memo
+            .borrow_mut()
+            .getconst_ref(dead.0 as i64)
+            .unwrap();
+
+        // No guard descr or compiled trace roots the pool yet.
+        meta.walk_rd_consts_refs(|slot| {
+            if *slot == dead {
+                *slot = live;
+            }
+        });
+        assert_eq!(
+            optimizer.resumedata_memo.borrow().consts(),
+            &[Const::Ref(live)]
+        );
+        drop(optimizer);
+        meta.walk_rd_consts_refs(|_| panic!("a dropped optimizer must not retain roots"));
+        assert!(meta.compile_resume_memos.is_empty());
     }
 
     /// A pointer copied before `NUMBERING` allocation still names the

@@ -3,6 +3,13 @@
 # three independently observable containers before the limit lands; replaying
 # from the caller's CALL applies an iteration twice, while collapsing the
 # callee onto the caller loses its locals/operand stack.
+import atexit
+
+# Keep lazy shutdown imports outside this fixture's tiny trace limit. The
+# subject's entry/leaf and raising_entry/module traces then determine the
+# blackhole handoff counts, rather than importlib's initialization frames.
+atexit._ncallbacks()
+
 try:
     import pypyjit
 except ImportError:
