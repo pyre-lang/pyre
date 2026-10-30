@@ -10620,6 +10620,32 @@ fn find_fail_descr_in_fail_descrs(
     None
 }
 
+/// Locate `fail_descr` in `fail_descrs` or a nested attached bridge's
+/// `fail_descrs` by `dyn FailDescr` data-pointer equality
+/// (`history.py` `AbstractFailDescr` object identity /
+/// `cpu.get_latest_descr`). Recurses the same tree as
+/// `find_fail_descr_in_fail_descrs`.
+fn find_fail_descr_by_identity(
+    fail_descrs: &[DescrRef],
+    fail_descr: &dyn FailDescr,
+) -> Option<DescrRef> {
+    let wanted = fail_descr as *const dyn FailDescr as *const ();
+    for descr in fail_descrs {
+        if as_fd(descr) as *const dyn FailDescr as *const () == wanted {
+            return Some(descr.clone());
+        }
+    }
+    for descr in fail_descrs {
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
+        if let Some(bridge) = bridge_guard.as_ref()
+            && let Some(found) = find_fail_descr_by_identity(&bridge.fail_descrs, fail_descr)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Resolve a JIT-baked `jf_descr` pointer back to its owning
 /// `DescrRef` (`history.py AbstractDescr.show`).
 ///
@@ -23114,39 +23140,33 @@ impl majit_backend::Backend for CraneliftBackend {
             .ok_or_else(|| {
                 BackendError::CompilationFailed("original token has no compiled loop".to_string())
             })?;
-        // compile.py:569 / compile.py:593 line-by-line: the caller hands
-        // `send_bridge_to_backend` the actual `faildescr` object;
-        // `fail_descr.trace_id()` is the bridge origin's allocated id
-        // (`alloc_trace_id` starts at 1, no sentinel) and identifies the
-        // owning trace.  `descr_owning_jct(fail_descr)`
-        // (`majit-backend/src/lib.rs`) resolves the descr's owning JCT
-        // directly via
-        // `rd_loop_token_clt`.  The metainterp caller now passes that
-        // owning JCT as `original_token`, so the matching backend descr
-        // is always reachable inside `original_compiled.fail_descrs`.
+        // `compile.py send_bridge_to_backend` / `do_compile_bridge` and
+        // `x86/assembler.py assemble_bridge(faildescr)` attach to the
+        // caller `faildescr` object. Presence: that object must live in
+        // `original_token.compiled.fail_descrs` or a nested attached
+        // bridge's `fail_descrs` (same tree the stamp walk covers).
+        // `fail_descr.trace_id()` is still the origin's allocated id
+        // (`alloc_trace_id` starts at 1) for `CompiledTraceInfo.source_guard`.
         let source_trace_id = fail_descr.trace_id();
-        let source_descr = find_fail_descr_in_fail_descrs(
-            &original_compiled.fail_descrs,
-            source_trace_id,
-            fail_descr.fail_index_per_trace(),
-        );
-        if source_descr.is_none() {
-            // RPython compile.py: send_bridge_to_backend always has a
-            // valid faildescr. If source_descr is not found, the bridge
-            // cannot be attached — return error for all fail_indices.
-            return Err(BackendError::CompilationFailed(format!(
-                "source fail descr not found for trace {} fail {}",
-                source_trace_id,
-                fail_descr.fail_index_per_trace()
-            )));
+        if find_fail_descr_by_identity(&original_compiled.fail_descrs, fail_descr).is_none() {
+            // `send_bridge_to_backend` always has a valid faildescr.
+            return Err(BackendError::CompilationFailed(
+                "source fail descr not found by identity".to_string(),
+            ));
         }
-        // caller_recovery_layout is now passed in by the
-        // metainterp (StoredExitLayout.recovery_layout for the source
-        // guard).  The previous `source_descr.recovery_layout_ref()`
-        // read forced the metainterp to push the layout into the
-        // descr-side cache; threading the layout through the
-        // compile_bridge parameter eliminates that cache dependency.
-        let _ = source_descr; // kept for the trace_id / fail_index_per_trace lookup above
+        debug_assert!(
+            find_fail_descr_in_fail_descrs(
+                &original_compiled.fail_descrs,
+                source_trace_id,
+                fail_descr.fail_index_per_trace(),
+            )
+            .is_none_or(|stamp| {
+                as_fd(&stamp) as *const dyn FailDescr as *const ()
+                    == fail_descr as *const dyn FailDescr as *const ()
+            })
+        );
+        // caller_recovery_layout is passed in by the metainterp
+        // (`StoredExitLayout.recovery_layout` for the source guard).
         let caller_layout = caller_recovery_layout.map(|layout| {
             let mut popped = layout.clone();
             popped.frames.pop();
@@ -23247,51 +23267,45 @@ impl majit_backend::Backend for CraneliftBackend {
                 layout.trace_info = Some(bridge_trace_info.clone());
             }
         }
-        {
-            if let Some(ref sd) = source_descr
-                && let Some(bridge) = fail_descr_bridge_ref(as_fd(sd))
-            {
-                unregister_bridge_call_assembler_expectations(&bridge);
-            }
+        if let Some(bridge) = fail_descr_bridge_ref(fail_descr) {
+            unregister_bridge_call_assembler_expectations(&bridge);
         }
-        if let Some(ref sd) = source_descr {
-            let bridge_num_inputs = inputargs.len().max(compiled.input_types.len());
-            // history.py TargetToken parity: a bridge that ends with
-            // an external JUMP re-enters its target via
-            // `target_descr._ll_loop_code` (stored on the fail_descr at
-            // collect_guards time). BridgeData.loop_reentry caches this for
-            // the `execute_bridge` entry marshaling path; derive it from
-            // the compiled fail_descrs' is_external_jump flag rather than
-            // re-scanning ops + mutating descrs after the fact.
-            let loop_reentry = compiled
-                .fail_descrs
-                .iter()
-                .any(|d| as_fd(d).is_external_jump());
-            fail_descr_attach_bridge(
-                as_fd(sd),
-                BridgeData {
-                    trace_id: compiled.trace_id,
-                    input_types: compiled.input_types.clone(),
-                    header_pc: compiled.header_pc,
-                    source_guard: (source_trace_id, fail_descr.fail_index_per_trace()),
-                    caller_prefix_layout: compiled.caller_prefix_layout.clone(),
-                    code_ptr: compiled.code_ptr,
-                    body_ptr: compiled.body_ptr,
-                    fail_descrs: compiled.fail_descrs,
-                    fail_descr_cells: compiled.fail_descr_cells,
-                    terminal_exit_layouts: compiled.terminal_exit_layouts,
-                    loop_reentry,
-                    num_inputs: bridge_num_inputs,
-                    num_ref_roots: compiled.num_ref_roots,
-                    max_output_slots: compiled.max_output_slots,
-                    frame_depth: compiled.frame_depth,
+        let bridge_num_inputs = inputargs.len().max(compiled.input_types.len());
+        // history.py TargetToken parity: a bridge that ends with
+        // an external JUMP re-enters its target via
+        // `target_descr._ll_loop_code` (stored on the fail_descr at
+        // collect_guards time). BridgeData.loop_reentry caches this for
+        // the `execute_bridge` entry marshaling path; derive it from
+        // the compiled fail_descrs' is_external_jump flag rather than
+        // re-scanning ops + mutating descrs after the fact.
+        let loop_reentry = compiled
+            .fail_descrs
+            .iter()
+            .any(|d| as_fd(d).is_external_jump());
+        fail_descr_attach_bridge(
+            fail_descr,
+            BridgeData {
+                trace_id: compiled.trace_id,
+                input_types: compiled.input_types.clone(),
+                header_pc: compiled.header_pc,
+                source_guard: (source_trace_id, fail_descr.fail_index_per_trace()),
+                caller_prefix_layout: compiled.caller_prefix_layout.clone(),
+                code_ptr: compiled.code_ptr,
+                body_ptr: compiled.body_ptr,
+                fail_descrs: compiled.fail_descrs,
+                fail_descr_cells: compiled.fail_descr_cells,
+                terminal_exit_layouts: compiled.terminal_exit_layouts,
+                loop_reentry,
+                num_inputs: bridge_num_inputs,
+                num_ref_roots: compiled.num_ref_roots,
+                max_output_slots: compiled.max_output_slots,
+                frame_depth: compiled.frame_depth,
 
-                    invalidated_arc: Some(invalidated_arc),
-                    gc_table: compiled.gc_table.clone(),
-                    merge_source,
-                },
-            );
-        }
+                invalidated_arc: Some(invalidated_arc),
+                gc_table: compiled.gc_table.clone(),
+                merge_source,
+            },
+        );
 
         // `assemble_bridge` ends at `patch_jump_for_descr(faildescr,
         // rawstart + startpos)`. That is the whole attach: a new code
@@ -24835,6 +24849,33 @@ mod tests {
             .expect("ResumeGuardDescr always implements FailDescr")
             .set_trace_id(trace_id);
         descr
+    }
+
+    /// First non-finish descr in `CompiledLoop.fail_descrs` — the loop
+    /// guard `assemble_bridge(faildescr)` attaches to.
+    fn test_loop_guard_descr(token: &JitCellToken) -> DescrRef {
+        token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
+            .expect("test token has a compiled loop")
+            .fail_descrs
+            .iter()
+            .find(|d| !as_fd(d).is_finish())
+            .cloned()
+            .expect("compiled loop has a non-finish fail descr")
+    }
+
+    /// First non-finish descr in the bridge already attached to `source`.
+    fn test_attached_bridge_guard_descr(source: &dyn FailDescr) -> DescrRef {
+        fail_descr_bridge_ref(source)
+            .expect("source fail descr has an attached bridge")
+            .fail_descrs
+            .iter()
+            .find(|d| !as_fd(d).is_finish())
+            .cloned()
+            .expect("attached bridge has a non-finish fail descr")
     }
 
     /// `x86/assembler.py assemble_loop`: `adr_jump_offset` is stamped only
@@ -30456,8 +30497,8 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let fail_descr_arc = mk_test_resume_guard_descr(90, vec![Type::Int]);
-        let fail_descr = fail_descr_arc.as_fail_descr().unwrap();
+        let fail_descr_arc = test_loop_guard_descr(&token);
+        let fail_descr = as_fd(&fail_descr_arc);
 
         backend.set_next_trace_id(91);
         backend.set_next_header_pc(2000);
@@ -30577,8 +30618,8 @@ mod tests {
         // layout flows through `compile_bridge`'s explicit
         // `caller_recovery_layout` parameter (QQ-7 contract).
 
-        let bridge_fail_descr_arc = mk_test_resume_guard_descr(190, vec![Type::Int]);
-        let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
+        let bridge_fail_descr_arc = test_loop_guard_descr(&token);
+        let bridge_fail_descr = as_fd(&bridge_fail_descr_arc);
         let bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -30710,8 +30751,8 @@ mod tests {
         // through `compile_bridge`'s explicit `caller_recovery_layout`
         // parameter below.
 
-        let bridge_fail_descr_arc = mk_test_resume_guard_descr(290, vec![Type::Int]);
-        let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
+        let bridge_fail_descr_arc = test_loop_guard_descr(&token);
+        let bridge_fail_descr = as_fd(&bridge_fail_descr_arc);
         let bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -30796,8 +30837,9 @@ mod tests {
         // source layout flows through the nested `compile_bridge`'s
         // explicit `caller_recovery_layout` parameter below.
 
-        let nested_bridge_fail_descr_arc = mk_test_resume_guard_descr(291, vec![Type::Int]);
-        let nested_bridge_fail_descr = nested_bridge_fail_descr_arc.as_fail_descr().unwrap();
+        let nested_bridge_fail_descr_arc =
+            test_attached_bridge_guard_descr(as_fd(&bridge_fail_descr_arc));
+        let nested_bridge_fail_descr = as_fd(&nested_bridge_fail_descr_arc);
         backend.set_next_trace_id(292);
         backend.set_next_header_pc(3000);
         backend
