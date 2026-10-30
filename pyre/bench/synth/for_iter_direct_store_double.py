@@ -62,3 +62,9 @@ def mutate_all(items):
 
 total = mutate_all(errs)
 print(sum(map(lambda e: e.errno, errs)), total)
+
+# Keep the tiny trace limit inside this workload. Otherwise shutdown
+# importlib/atexit helpers become extra segmentation tests whose frame
+# boundaries depend on the target layout (interp_jit.set_param).
+if pypyjit is not None:
+    pypyjit.set_param("default")
