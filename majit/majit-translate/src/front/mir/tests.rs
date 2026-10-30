@@ -13699,6 +13699,396 @@ fn option_u8_window_discriminant_is_pointer_null_test() {
     }
 }
 
+fn option_ref_niche_fixture_types() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let pointee = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let payload = serde_json::json!({"Ref": ["Erased", pointee, "Shared"]});
+    let option_ty = option_adt_node(0, payload);
+    let pointee_struct = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "FrameDebugData"], false),
+        "kind": {"Struct": [
+            {"name": "w_locals", "ty": {"Scalar": {"Integer": {"Signed": "I64"}}}, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    (disc_ty, option_ty, pointee_struct)
+}
+
+/// `Rvalue::Discriminant` of a niche-optimized `Option<&T>` (sized
+/// pointee) is `bool(p)` (`rptr.py` / `rnone.py` `CanBeNull.rtype_bool`
+/// → `ptr_nonzero`). The Discriminant *value* is Some=1, so a SwitchInt
+/// tag-1 arm is `if_true` and `optimize_goto_if_not` fuses the hop to
+/// `goto_if_not_ptr_nonzero`.
+#[test]
+fn option_ref_niche_discriminant_is_ptr_nonzero() {
+    use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+    use crate::model::{ExitCase, ExitSwitch, OpKind};
+
+    let (disc_ty, option_ty, pointee_struct) = option_ref_niche_fixture_types();
+    let opt_place = window_place(serde_json::json!({"Local": 1}), &option_ty);
+    let disc_place = window_place(serde_json::json!({"Local": 2}), &disc_ty);
+    let ret_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &ret_ty);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "option_ref_disc"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_ty.clone()],
+            "output": ret_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &ret_ty),
+                window_local(1, &option_ty),
+                window_local(2, &disc_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                ret_place.clone(),
+                                {"Use": [{"Const": [
+                                    {"Integer": {"Signed": ["I64", "99"]}},
+                                    ret_ty.clone()
+                                ]}, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                disc_place.clone(),
+                                {"Discriminant": opt_place.clone()}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": disc_place.clone()},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                            ],
+                            2
+                        ]}
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "1"]}},
+                                ret_ty.clone()
+                            ]}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "0"]}},
+                                ret_ty.clone()
+                            ]}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![option_enum(0), pointee_struct], vec![caller]);
+    let graph = super::lower_function(&llbc, "option_ref_disc")
+        .unwrap_or_else(|err| panic!("lower Discriminant: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::ConstNone))
+            .count(),
+        0,
+        "pointer-niche Discriminant must not emit ConstNone; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"))
+            .count(),
+        0,
+        "pointer-niche Discriminant must not emit is_ / ne; graph={}",
+        graph.dump()
+    );
+    let input_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    let bool_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::UnaryOp {
+                op: name, operand, ..
+            } if name == "bool" && input_ids.contains(&operand.id()) => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !bool_ids.is_empty(),
+        "pointer-niche Discriminant must emit bool(p); graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            .count(),
+        0,
+        "pointer-niche Discriminant must not read __discriminant; graph={}",
+        graph.dump()
+    );
+
+    // SwitchInt tag 1 = Some returns 1; tag 0 = None returns 0.
+    // Discriminant is `bool(p)` (true = Some), so Bool(true) is the Some arm.
+    let mut saw_some_true = false;
+    for block in &graph.blocks {
+        let Some(ExitSwitch::Value(sw)) = &block.exitswitch else {
+            continue;
+        };
+        let switches_on_bool = block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(sw)
+                && match &op.kind {
+                    OpKind::UnaryOp {
+                        op: name, operand, ..
+                    } => {
+                        name == "bool"
+                            && (bool_ids.contains(&operand.id())
+                                || bool_ids.contains(&sw.id())
+                                || input_ids.contains(&operand.id()))
+                    }
+                    _ => false,
+                }
+        });
+        if !switches_on_bool {
+            continue;
+        }
+        for link in &block.exits {
+            match &link.exitcase {
+                Some(ExitCase::Bool(true)) => {
+                    let target = &graph.blocks[link.target.0];
+                    let returns_one = target
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(1)));
+                    assert!(
+                        returns_one,
+                        "bool(p) true must take the Some arm (1); graph={}",
+                        graph.dump()
+                    );
+                    saw_some_true = true;
+                }
+                Some(ExitCase::Bool(false)) => {
+                    let target = &graph.blocks[link.target.0];
+                    let returns_zero = target
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(0)));
+                    assert!(
+                        returns_zero,
+                        "bool(p) false must take the None arm (0); graph={}",
+                        graph.dump()
+                    );
+                }
+                other => {
+                    panic!("pointer-niche switch must close with ExitCase::Bool, got {other:?}")
+                }
+            }
+        }
+    }
+    assert!(
+        saw_some_true,
+        "expected a niche bool(p) switch block; graph={}",
+        graph.dump()
+    );
+
+    let config = GraphTransformConfig::default();
+    let transformed = Transformer::new(&config).transform(&graph);
+    let fused_ptr_nonzero = transformed.graph.blocks.iter().any(|block| {
+        matches!(
+            &block.exitswitch,
+            Some(ExitSwitch::Fused { opname, .. }) if opname == "ptr_nonzero"
+        )
+    });
+    assert!(
+        fused_ptr_nonzero,
+        "jtransform must fuse bool(p) to goto_if_not_ptr_nonzero; graph={}",
+        transformed.graph.dump()
+    );
+}
+
+/// A pointer-niche Discriminant used by `Eq(d, 1)` (not a SwitchInt) keeps
+/// Some=1: the compared value is `bool(p)`, so `d == 1` is the Some arm.
+#[test]
+fn option_ref_niche_discriminant_eq_one_is_some() {
+    use crate::model::OpKind;
+
+    let (disc_ty, option_ty, pointee_struct) = option_ref_niche_fixture_types();
+    let opt_place = window_place(serde_json::json!({"Local": 1}), &option_ty);
+    let disc_place = window_place(serde_json::json!({"Local": 2}), &disc_ty);
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &bool_ty);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "option_ref_disc_eq"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_ty.clone()],
+            "output": bool_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &bool_ty),
+                window_local(1, &option_ty),
+                window_local(2, &disc_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                disc_place.clone(),
+                                {"Discriminant": opt_place.clone()}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                ret_place.clone(),
+                                {"BinaryOp": [
+                                    "Eq",
+                                    {"Copy": disc_place.clone()},
+                                    {"Const": [
+                                        {"Integer": {"Signed": ["Isize", "1"]}},
+                                        disc_ty.clone()
+                                    ]}
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![option_enum(0), pointee_struct], vec![caller]);
+    let graph = super::lower_function(&llbc, "option_ref_disc_eq")
+        .unwrap_or_else(|err| panic!("lower Discriminant Eq: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let input_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    let bool_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::UnaryOp {
+                op: name, operand, ..
+            } if name == "bool" && input_ids.contains(&operand.id()) => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !bool_ids.is_empty(),
+        "Eq(d, 1) Discriminant must emit bool(p); graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"))
+            .count(),
+        0,
+        "Eq(d, 1) must not emit inverted is_(p, None); graph={}",
+        graph.dump()
+    );
+    let one_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstInt(1) | OpKind::ConstUInt(1) => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !one_ids.is_empty(),
+        "Eq(d, 1) must materialise constant 1; graph={}",
+        graph.dump()
+    );
+    let eq_on_bool_and_one = ops.iter().any(|op| match &op.kind {
+        OpKind::BinOp {
+            op: name, lhs, rhs, ..
+        } if name == "eq" => {
+            (bool_ids.contains(&lhs.id()) && one_ids.contains(&rhs.id()))
+                || (bool_ids.contains(&rhs.id()) && one_ids.contains(&lhs.id()))
+        }
+        _ => false,
+    });
+    assert!(
+        eq_on_bool_and_one,
+        "Eq(d, 1) must compare bool(p) with 1 (Some=1); graph={}",
+        graph.dump()
+    );
+}
+
 /// `match opt { Some(w) => w, None => default }` over `Option<&[u8]>`
 /// (and Charon's `Option<[u8]>` spelling): the `Some` payload is the
 /// Option's window, not a tagged `Option<[u8]>::Some` instance.
@@ -15084,10 +15474,10 @@ fn niche_option_match_switch_closes_with_bool_exitcase() {
     let graph = super::lower_function(&llbc, "object_functionstr_type_name")
         .expect("lower object_functionstr_type_name");
 
-    // The niche match's Some-discriminant is `not (base is None)`. It is
-    // routed through the `If` path (`set_branch`), which may wrap the final
-    // bool in an idempotent `bool` UnaryOp. Locate switches on that final
-    // `eq(is_none, false)` value (or its wrapper).
+    // The niche match's discriminant is `p is None` (`is_(p, ConstNone)`).
+    // Routed through the `If` path (`set_branch`), which may wrap the final
+    // bool in an idempotent `bool` UnaryOp. Locate switches on that `is_`
+    // value (or its wrapper).
     let is_result_ids: std::collections::HashSet<u64> = graph
         .blocks
         .iter()
@@ -15097,34 +15487,18 @@ fn niche_option_match_switch_closes_with_bool_exitcase() {
             _ => None,
         })
         .collect();
-    let some_result_ids: std::collections::HashSet<u64> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter_map(|op| match &op.kind {
-            OpKind::BinOp { op: name, lhs, .. }
-                if name == "eq" && is_result_ids.contains(&lhs.id()) =>
-            {
-                op.result.as_ref().map(|v| v.id())
-            }
-            _ => None,
-        })
-        .collect();
     let mut checked = 0usize;
     for b in &graph.blocks {
         let Some(ExitSwitch::Value(sw)) = &b.exitswitch else {
             continue;
         };
-        // The exitswitch is a `bool(ne)` wrap (set_branch) or the raw `ne`.
         let switches_on_nulltest = b.operations.iter().any(|op| {
             op.result.as_ref() == Some(sw)
                 && match &op.kind {
-                    OpKind::BinOp { op: name, lhs, .. } => {
-                        name == "eq" && is_result_ids.contains(&lhs.id())
-                    }
+                    OpKind::BinOp { op: name, .. } => name == "is_",
                     OpKind::UnaryOp {
                         op: name, operand, ..
-                    } => name == "bool" && some_result_ids.contains(&operand.id()),
+                    } => name == "bool" && is_result_ids.contains(&operand.id()),
                     _ => false,
                 }
         });

@@ -270,14 +270,12 @@ pub struct IdentityDictStrategy;
 /// singleton — matches PyPy's `space.fromcache(IdentityDictStrategy)`.
 pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
 
-/// The [`crate::dictmultiobject::DictStrategyRef`] holder a dict's `dstrategy`
-/// slot points at.
-pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
-    crate::dictmultiobject::DictStrategyRef {
-        kind: crate::dictmultiobject::StrategyKind::Identity,
-        imp: &IDENTITY_DICT_STRATEGY,
-        owner: std::ptr::null_mut(),
-    };
+crate::define_prebuilt_dict_strategy_ref!(
+    IDENTITY_DICT_STRATEGY_REF,
+    identity_dict_strategy_ref,
+    crate::dictmultiobject::StrategyKind::Identity,
+    &IDENTITY_DICT_STRATEGY
+);
 
 impl IdentityDictStrategy {
     /// `identitydict.py IdentityDictStrategy.is_correct_type` —
@@ -445,7 +443,7 @@ impl DictStrategy for IdentityDictStrategy {
         let storage = identity_storage(w_dict);
         let new_storage = storage.clone_to_young_box(identity_dict_storage_gc_type_id());
         crate::dictmultiobject::w_dict_new_with(
-            &IDENTITY_DICT_STRATEGY_REF,
+            identity_dict_strategy_ref(),
             new_storage as crate::gc_hook::GCREF,
         )
     }

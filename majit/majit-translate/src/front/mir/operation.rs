@@ -3103,9 +3103,11 @@ impl<'a> Lowering<'a> {
                 // data word. The discriminant is that null test, not a
                 // `__discriminant` field of a tagged aggregate. The data
                 // word is CCHARP (`Ptr(Array Char)`); `p is None` is
-                // `rnone.py` `rtype_is_None` → `ptr_iszero`, the same
-                // `is_(opt, null)` then `eq(_, False)` sequence the
-                // niche-pointer Discriminant arm emits (`push_niche_is_some`).
+                // `rnone.py` `rtype_is_None` → `ptr_iszero`. Keep
+                // `is_(data, None)` then `eq(_, False)` so the switch stays
+                // Some=1 (`push_niche_is_some`). The pointer-niche
+                // Discriminant arm below emits `bool(p)`
+                // (`CanBeNull.rtype_bool` / `ptr_nonzero`), also Some=1.
                 // `Constant(None)` is Void (`pairtype(Repr, VoidRepr)`);
                 // integer 0 is not a pointer null (`lltype.nullptr`).
                 if tyref_is_u8_window(&place.ty, self.llbc)
@@ -3259,62 +3261,25 @@ impl<'a> Lowering<'a> {
                     return Ok((None, decoded));
                 }
                 // A one-word niche `Option` is represented by its payload
-                // pointer: `None`
-                // = null, `Some(p)` = the non-null pointer.  Its
-                // discriminant is the pointer-null test `base != null`
-                // (`None` = 0, `Some` = 1), not a `__discriminant` field off
-                // a two-word aggregate base (there is none).  Emit the null
-                // pointer, then compare — a `ne` on two `Ref` operands
-                // lowers to `ptr_ne` (`jtransform`), and its `Int` result
-                // feeds the match switch exactly as a `__discriminant` read
-                // would.  The null is a `null_mut()` call, not a
-                // `ConstRefNull`: `null_mut()` rtypes to `convert_const(None)`
-                // on the result repr (`rbuiltin::rtype_ptr_null`), so it
-                // adapts to the `base` pointer's own `InstanceRepr` and the
-                // `ptr_ne` sees two same-repr operands.  A `ConstRefNull` is a
-                // fixed GCREF `_ptr`, which cannot rtype against an
-                // `InstanceRepr(PyObject)` base at the `ne`.  Modelling the
-                // maybe-null pointer this way is the orthodox representation
-                // (RPython has no `Option`; a maybe-null `Ptr` tests
-                // `ptr_nonzero`).
+                // pointer: `None` = null, `Some(p)` = the non-null pointer.
+                // Rust's Discriminant of `Option` is Some=1; emit `bool(p)`,
+                // the hop `rptr.py` / `rnone.py` `CanBeNull.rtype_bool` turns
+                // into `ptr_nonzero`. jtransform rewrites `bool` on a ref to
+                // `ptr_nonzero` and `optimize_goto_if_not` fuses that into
+                // `goto_if_not_ptr_nonzero`, so the walker records
+                // `guard_nonnull` / `guard_isnull` and the heapcache answers
+                // a second check. `is_(p, None)` is true for None and would
+                // invert every non-switch use (`Eq(d, 1)`, a stored or
+                // returned discriminant). Not a `__discriminant` field off a
+                // two-word aggregate.
                 if self.tyref_is_niche_option_ptr(&place.ty) {
-                    let option_ty = clone_tyref(&place.ty);
                     let base = self.resolve_place(mir_bb, place)?;
-                    let nullc = self.push_niche_null_ptr(mir_bb, &option_ty);
-                    // Preserve PyPy's identity test: first compute
-                    // `base is None`, then negate that bool for the Rust
-                    // discriminant (`Some` = 1). `ne` would dispatch to value
-                    // inequality on StringRepr/ListRepr, which is not a null
-                    // test (and FixedSizeListRepr deliberately has no such
-                    // operation). The final bool must close a `SwitchInt`
-                    // with `ExitCase::Bool`, so record its result id.
-                    let is_none = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let false_var = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.emit_bb(mir_bb);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(is_none.clone()),
-                        kind: OpKind::BinOp {
-                            op: "is_".to_string(),
-                            lhs: base,
-                            rhs: nullc,
-                            result_ty: ValueType::Int,
-                        },
-                    });
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(false_var.clone()),
-                        kind: OpKind::ConstBool(false),
-                    });
                     self.niche_disc_vars.insert(res.id());
                     return Ok((
-                        Some(OpKind::BinOp {
-                            op: "eq".to_string(),
-                            lhs: is_none,
-                            rhs: false_var,
-                            result_ty: ValueType::Int,
+                        Some(OpKind::UnaryOp {
+                            op: "bool".to_string(),
+                            operand: base,
+                            result_ty: ValueType::Bool,
                         }),
                         res,
                     ));

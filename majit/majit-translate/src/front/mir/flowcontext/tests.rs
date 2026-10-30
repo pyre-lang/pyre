@@ -6013,33 +6013,66 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
     let context = super::LowerContext::new(&llbc);
     let graph =
         super::lower_fun_decl(&context, fd).expect("lower w_module_dict_setitem_str_internal");
-    let mut bindings = Vec::new();
-    for op in graph_ops(&graph) {
-        let OpKind::Call { target, .. } = &op.kind else {
-            continue;
-        };
-        match target {
-            CallTarget::Method {
-                name,
-                resolved_path,
-                fun_decl_id,
-                ..
-            } if name == "setitem_str" => bindings.push((
-                *fun_decl_id,
-                resolved_path
-                    .as_ref()
-                    .map(|p| p.segments.clone())
-                    .unwrap_or_default(),
-            )),
-            CallTarget::FunctionPath {
-                segments,
-                fun_decl_id,
-                ..
-            } if segments.last().map(String::as_str) == Some("setitem_str") => {
-                bindings.push((*fun_decl_id, segments.clone()))
+    let collect_setitem_str = |graph: &crate::model::FunctionGraph| {
+        let mut bindings = Vec::new();
+        for op in graph_ops(graph) {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                CallTarget::Method {
+                    name,
+                    resolved_path,
+                    fun_decl_id,
+                    ..
+                } if name == "setitem_str" => bindings.push((
+                    *fun_decl_id,
+                    resolved_path
+                        .as_ref()
+                        .map(|p| p.segments.clone())
+                        .unwrap_or_default(),
+                )),
+                CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id,
+                    ..
+                } if segments.last().map(String::as_str) == Some("setitem_str") => {
+                    bindings.push((*fun_decl_id, segments.clone()))
+                }
+                _ => {}
             }
-            _ => {}
         }
+        bindings
+    };
+    let mut bindings = collect_setitem_str(&graph);
+    // The module arm is a same-crate helper so the object-strategy arm
+    // stays the only collecting path. Follow that helper when rustc
+    // leaves it as a call.
+    if bindings.is_empty() {
+        let helper_id = graph_ops(&graph).iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id,
+                        ..
+                    },
+                ..
+            } if segments.last().map(String::as_str)
+                == Some("w_module_dict_setitem_str_module_strategy") =>
+            {
+                *fun_decl_id
+            }
+            _ => None,
+        });
+        let helper_id = helper_id
+            .expect("module-dict store must call setitem_str or the module-strategy helper");
+        let helper = llbc
+            .fn_by_id(helper_id)
+            .expect("w_module_dict_setitem_str_module_strategy FunDecl");
+        let helper_graph = super::lower_fun_decl(&context, helper)
+            .expect("lower w_module_dict_setitem_str_module_strategy");
+        bindings = collect_setitem_str(&helper_graph);
     }
     assert!(
         !bindings.is_empty(),

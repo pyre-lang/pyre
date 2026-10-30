@@ -3750,9 +3750,11 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .filter_map(|&idx| {
             if has_self && idx == 0 {
-                // rlib/jit.py — promote self by identity (guard_value on pointer)
+                // rlib/jit.py — promote self by identity (`r_guard_value` on a
+                // GC instance pointer). `as usize` records `cast_ptr_to_int`
+                // on every call (`celldict.py getdictvalue_no_unwrapping`).
                 Some(quote! {
-                    let _ = majit_ir::jit::promote(self as *const _ as usize);
+                    let _ = majit_ir::jit::promote(self as *const _);
                 })
             } else {
                 let named_idx = if has_self { idx - 1 } else { idx };

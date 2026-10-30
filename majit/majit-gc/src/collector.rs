@@ -11532,10 +11532,13 @@ impl GcAllocator for MiniMarkGC {
     /// RPython reads the typeid from the GC header word
     /// (`llop.extract_ushort(llgroup.HALFWORD, hdr.tid)`). MiniMarkGC's
     /// managed objects use the same layout — `GcHeader::SIZE` bytes
-    /// before the payload, type id in the lower `TYPE_ID_BITS`. pyre's
-    /// host-allocated "foreign" objects do not carry a `GcHeader`; for
-    /// those we recover the type id by reading the classptr (offset 0)
-    /// and looking it up in `vtable_to_type_id`, which is what
+    /// before the payload, type id in the lower `TYPE_ID_BITS`.
+    /// `init_gc_object_immortal` prebuilts (`alloc_with_gc_header_immortal`)
+    /// carry that header but sit outside nursery/oldgen; they are born
+    /// in the immortal arena so membership is a range test over every
+    /// published segment. Remaining
+    /// host "foreign" objects have no header: recover the type id from
+    /// the classptr (offset 0) via `vtable_to_type_id`, which
     /// `register_vtable_for_type` populated.
     fn get_actual_typeid(&self, gcref: GcRef) -> Option<u32> {
         if gcref.is_null() {
@@ -11547,7 +11550,9 @@ impl GcAllocator for MiniMarkGC {
         if self.is_tagged_immediate(gcref.0) {
             return None;
         }
-        if self.is_managed_heap_object(gcref.0) {
+        if self.is_managed_heap_object(gcref.0)
+            || crate::header::is_immortal_header_payload(gcref.0)
+        {
             let header_addr = gcref.0.wrapping_sub(crate::header::GcHeader::SIZE);
             let header: crate::header::GcHeader = unsafe { *(header_addr as *const _) };
             return Some(header.type_id());

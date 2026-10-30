@@ -181,9 +181,9 @@ mod minted_descr {
 
     #[test]
     fn a_quasi_declared_field_mints_a_quasi_descr() {
-        // `is_always_pure` is `is_immutable && !is_quasi_immutable`, so this
-        // pair is what keeps a quasi-immutable read behind its guard instead
-        // of folding it outright.
+        // Rank flags stay `(false, true)`: `ImmutableRanking.is_immutable`
+        // / `__nonzero__` is false for `IR_QUASIIMMUTABLE`. `is_always_pure`
+        // is `_immutable_field(name) != False` and is derived from the pair.
         assert_eq!(immutability_of("marked", "marked?"), (false, true));
     }
 }

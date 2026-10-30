@@ -5555,10 +5555,10 @@ unsafe fn fbw_bind_star_kwargs(
     let dstrategy = unsafe { (*(kwargs as *const pyre_object::W_DictObject)).dstrategy };
     if !std::ptr::eq(
         dstrategy,
-        &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+        pyre_object::dictmultiobject::unicode_dict_strategy_ref(),
     ) && !std::ptr::eq(
         dstrategy,
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
     ) {
         return None;
     }
@@ -5590,7 +5590,7 @@ unsafe fn fbw_bind_star_kwargs(
     let _ = roots.pin_root(kwargs);
     let lookup = if std::ptr::eq(
         dstrategy,
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
     ) {
         pyre_object::kwargsdict::w_dict_lookup_or_null_kwargs_strategy
     } else {
@@ -9935,7 +9935,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[len_op, expected])?;
         let lookup = if std::ptr::eq(
             kw.strategy,
-            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
         ) {
             crate::helpers::jit_dict_exact_kwargs_lookup_or_null as *const ()
         } else {
