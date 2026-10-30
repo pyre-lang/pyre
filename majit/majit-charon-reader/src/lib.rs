@@ -256,13 +256,13 @@ fn build_trait_assoc_index(rows: &[serde_json::Value]) -> TraitAssocIndex {
 /// `front::option_try`) reach only the ids their lowered functions
 /// mention.  Parsing on demand keeps the untouched majority at raw size.
 #[derive(Debug)]
-struct DedupBody {
+pub(crate) struct DedupBody {
     raw: Box<serde_json::value::RawValue>,
     parsed: std::sync::OnceLock<serde_json::Value>,
 }
 
 impl DedupBody {
-    fn get(&self) -> Option<&serde_json::Value> {
+    pub(crate) fn get(&self) -> Option<&serde_json::Value> {
         // A body that fails to re-parse cannot be projected by any
         // consumer, and every one of them already treats a missing id as
         // "not resolvable" — so a parse failure degrades to the same
@@ -322,7 +322,7 @@ impl Llbc {
         span_bodies.sort_by_key(|p| p.0);
         span_bodies.dedup_by_key(|p| p.0);
         let mut file: LlbcFile = serde_json::from_slice(bytes).map_err(SchemaError::Parse)?;
-        ullbc::attach_promoted_inits(&mut file);
+        ullbc::attach_promoted_inits(&mut file, &dedup_const);
         Ok(Self {
             file,
             dedup_adt,

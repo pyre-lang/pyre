@@ -119,7 +119,7 @@ fn loads_fixture_corpus() {
     // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
     // contributes no body.
     //
-    // Measured on Charon 0.1.298 (nightly-2026.10.25) with
+    // Measured on Charon 0.1.301 (nightly-2026.10.29) with
     // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
     // longer its own local item, and this artefact holds 105.
     assert_eq!(local_count, 105, "105 local fns expected");

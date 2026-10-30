@@ -63,7 +63,7 @@ pub struct FunDecl {
     /// every read, the shape 0.1.273 emitted inline. `None` when this
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
     #[serde(skip)]
-    promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
+    promoted_inits: Option<Arc<Vec<Option<PromotedRead>>>>,
     /// Whether [`FunDecl::unstructured`] splices promoted-constant reads: the artefact
     /// table has an inlinable initializer and the body names a `Global`. Decided on first
     /// query.
@@ -107,7 +107,9 @@ impl FunDecl {
     /// Charon 0.1.298 emits promoted constants as their own global items.
     /// When this declaration was loaded with the artefact table, each read
     /// of an inlinable promoted constant is replaced by the initializer's
-    /// statements, the shape 0.1.273 emitted at the use site.
+    /// statements, the shape 0.1.273 emitted at the use site. A `&str`
+    /// literal global is rewritten as an inline `const` operand, the shape
+    /// 0.1.298 emitted.
     pub fn unstructured(&self) -> Option<Unstructured> {
         #[derive(Deserialize)]
         struct Proj {
@@ -125,9 +127,28 @@ impl FunDecl {
                 && memchr::memmem::find(body.get().as_bytes(), b"\"Global\"").is_some()
         });
         if splices && let Some(table) = &self.promoted_inits {
-            splice_promoted_reads(&mut u, table);
+            splice_promoted_reads(&mut u, table, false);
         }
         Some(u)
+    }
+
+    /// Rewrite each shared borrow of a string-literal global in `body` to an inline `const`,
+    /// as [`FunDecl::unstructured`] does. For a body parsed from [`FunDecl::body`] by another
+    /// path; promoted-constant initializers are not spliced.
+    pub fn rewrite_str_literal_reads(&self, body: &mut Unstructured) {
+        let Some(table) = &self.promoted_inits else {
+            return;
+        };
+        if !table
+            .iter()
+            .any(|entry| matches!(entry, Some(PromotedRead::StrLiteral { .. })))
+        {
+            return;
+        }
+        if !body.body.iter().any(block_raw_has_global) {
+            return;
+        }
+        splice_promoted_reads(body, table, true);
     }
 
     /// The `locals` table of the `Unstructured` body, without building its
@@ -249,15 +270,48 @@ fn raw_object_first_key_is(raw: &str, key: &str) -> bool {
 
 /// Static or const item referenced via [`PlaceKind::Global`].
 ///
-/// Body / type / initialiser remain opaque (`Value`); the only field
-/// the lowering driver consumes is [`ItemMeta::name_path`] for
-/// constructing a stable `CallTarget::FunctionPath`-style identifier.
+/// `rest` holds only `global_kind`, `ty` and `value`, the keys the
+/// translator reads.
 #[derive(Debug, Deserialize)]
+#[serde(from = "GlobalDeclFields")]
 pub struct GlobalDecl {
     pub def_id: u64,
     pub item_meta: ItemMeta,
-    #[serde(flatten)]
     pub rest: std::collections::BTreeMap<String, Value>,
+}
+
+/// The `GlobalDecl` fields the translator reads; serde skips the others
+/// (`generics`, `size`, `align`, `ptr_metadata`, `src`).
+#[derive(Deserialize)]
+struct GlobalDeclFields {
+    def_id: u64,
+    item_meta: ItemMeta,
+    #[serde(default)]
+    global_kind: Option<Value>,
+    #[serde(default)]
+    ty: Option<Value>,
+    #[serde(default)]
+    value: Option<Value>,
+}
+
+impl From<GlobalDeclFields> for GlobalDecl {
+    fn from(fields: GlobalDeclFields) -> Self {
+        let mut rest = std::collections::BTreeMap::new();
+        if let Some(global_kind) = fields.global_kind {
+            rest.insert("global_kind".to_string(), global_kind);
+        }
+        if let Some(ty) = fields.ty {
+            rest.insert("ty".to_string(), ty);
+        }
+        if let Some(value) = fields.value {
+            rest.insert("value".to_string(), value);
+        }
+        GlobalDecl {
+            def_id: fields.def_id,
+            item_meta: fields.item_meta,
+            rest,
+        }
+    }
 }
 
 impl GlobalDecl {
@@ -1532,7 +1586,8 @@ pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
 /// Charon 0.1.298 emits each promoted constant as its own `AnonConst`
 /// item whose last name segment is `PromotedConst`. The reader splices
 /// this initializer at every read so the body matches the inline shape
-/// 0.1.273 emitted.
+/// 0.1.273 emitted. A `&str` literal has no initializer body and is
+/// [`PromotedRead::StrLiteral`] instead of this splice.
 #[derive(Debug)]
 struct PromotedInit {
     /// Init locals with index ≥ 1, in table order.
@@ -1543,10 +1598,36 @@ struct PromotedInit {
     ret_rvalue: Value,
 }
 
+/// What a read of a promoted constant global is replaced with.
+#[derive(Debug)]
+enum PromotedRead {
+    /// Splice the initializer's statements (promoted constants with an initializer body).
+    Init(PromotedInit),
+    /// A string literal: Charon 0.1.301 emits each `&str` literal as a shared borrow of a
+    /// `str`-typed `AnonConst` global. Holds the global's `value` const id and its `Str` kind.
+    /// A temporary used once is forwarded into its use, which restores the inline operand
+    /// 0.1.298 emitted. The string-literal `GlobalDecl` is dropped after its literal is recorded,
+    /// so [`crate::Llbc::global_by_id`] returns `None` for it, as for an id
+    /// Charon 0.1.298 never emitted.
+    StrLiteral { const_id: u64, kind: Value },
+}
+
 /// Build the per-artefact promoted-initializer table and store a clone on
 /// every [`FunDecl`]. Declarations deserialized any other way keep `None`.
-pub(crate) fn attach_promoted_inits(file: &mut crate::schema::LlbcFile) {
-    let table = Arc::new(collect_promoted_inits(file));
+/// The string-literal `GlobalDecl` is dropped after its literal is recorded, so
+/// [`crate::Llbc::global_by_id`] returns `None` for it, as for an id
+/// Charon 0.1.298 never emitted.
+pub(crate) fn attach_promoted_inits(
+    file: &mut crate::schema::LlbcFile,
+    dedup_const: &[(u64, crate::DedupBody)],
+) {
+    let table = collect_promoted_inits(file, dedup_const);
+    for (i, entry) in table.iter().enumerate() {
+        if matches!(entry, Some(PromotedRead::StrLiteral { .. })) {
+            file.translated.global_decls[i] = None;
+        }
+    }
+    let table = Arc::new(table);
     for fd in file.translated.fun_decls.iter_mut().flatten() {
         fd.promoted_inits = Some(Arc::clone(&table));
         // `collect_promoted_inits` parsed the initializer bodies before any
@@ -1555,11 +1636,14 @@ pub(crate) fn attach_promoted_inits(file: &mut crate::schema::LlbcFile) {
     }
 }
 
-fn collect_promoted_inits(file: &crate::schema::LlbcFile) -> Vec<Option<PromotedInit>> {
+fn collect_promoted_inits(
+    file: &crate::schema::LlbcFile,
+    dedup_const: &[(u64, crate::DedupBody)],
+) -> Vec<Option<PromotedRead>> {
     let n = file.translated.global_decls.len();
-    let mut table: Vec<Option<PromotedInit>> = (0..n).map(|_| None).collect();
+    let mut table: Vec<Option<PromotedRead>> = (0..n).map(|_| None).collect();
     for gd in file.translated.global_decls.iter().flatten() {
-        let Some(init) = promoted_init_from_global(file, gd) else {
+        let Some(init) = promoted_init_from_global(file, gd, dedup_const) else {
             continue;
         };
         let idx = gd.def_id as usize;
@@ -1573,7 +1657,8 @@ fn collect_promoted_inits(file: &crate::schema::LlbcFile) -> Vec<Option<Promoted
 fn promoted_init_from_global(
     file: &crate::schema::LlbcFile,
     gd: &GlobalDecl,
-) -> Option<PromotedInit> {
+    dedup_const: &[(u64, crate::DedupBody)],
+) -> Option<PromotedRead> {
     if gd.rest.get("global_kind").and_then(Value::as_str) != Some("AnonConst") {
         return None;
     }
@@ -1585,13 +1670,33 @@ fn promoted_init_from_global(
     {
         return None;
     }
-    let init_id = global_init_fun_id(gd)?;
-    let init_fd = file
-        .translated
-        .fun_decls
-        .get(init_id as usize)
-        .and_then(Option::as_ref)?;
-    promoted_init_from_body(&init_fd.unstructured()?)
+    if let Some(init_id) = global_init_fun_id(gd) {
+        let init_fd = file
+            .translated
+            .fun_decls
+            .get(init_id as usize)
+            .and_then(Option::as_ref)?;
+        return Some(PromotedRead::Init(promoted_init_from_body(
+            &init_fd.unstructured()?,
+        )?));
+    }
+    let value = gd.rest.get("value")?;
+    let str_lit = |const_id: u64, body: &Value| -> Option<PromotedRead> {
+        let kind = body.as_array()?.first()?;
+        kind.get("Str").and_then(Value::as_str)?;
+        Some(PromotedRead::StrLiteral {
+            const_id,
+            kind: kind.clone(),
+        })
+    };
+    if let Some(pair) = value.get("Value").and_then(Value::as_array) {
+        return str_lit(pair.first()?.as_u64()?, pair.get(1)?);
+    }
+    if let Some(id) = value.get("Deduplicated").and_then(Value::as_u64) {
+        let i = dedup_const.binary_search_by_key(&id, |p| p.0).ok()?;
+        return str_lit(id, dedup_const[i].1.get()?);
+    }
+    None
 }
 
 fn is_promoted_const_segment(seg: &NameSeg) -> bool {
@@ -1675,10 +1780,14 @@ fn promoted_init_from_body(u: &Unstructured) -> Option<PromotedInit> {
 }
 
 struct SpliceCtx<'a> {
-    table: &'a [Option<PromotedInit>],
+    table: &'a [Option<PromotedRead>],
     locals: &'a mut Locals,
     span: &'a SpanRef,
     inserts: &'a mut Vec<Statement>,
+    str_only: bool,
+    /// `(local n, {"Const": ...})` for each `_n = &Global(<str>)` rewrite
+    /// whose destination is an unprojected `Local(n)`.
+    str_rewrites: &'a mut Vec<(u64, Value)>,
 }
 
 /// `true` when a block's raw statement or terminator kind spells a
@@ -1687,29 +1796,39 @@ struct SpliceCtx<'a> {
 fn block_raw_has_global(bb: &BasicBlock) -> bool {
     bb.statements
         .iter()
-        .any(|st| st.kind.get().contains("\"Global\""))
-        || bb.terminator.kind.get().contains("\"Global\"")
+        .any(|st| memchr::memmem::find(st.kind.get().as_bytes(), b"\"Global\"").is_some())
+        || memchr::memmem::find(bb.terminator.kind.get().as_bytes(), b"\"Global\"").is_some()
 }
 
 /// Replace each inlinable promoted `Global` read with the initializer
-/// statements and a local holding the init's `_0`.
+/// statements and a local holding the init's `_0`. A shared borrow of a
+/// string-literal global becomes a `Use(Const)` of that string. A temporary
+/// used once is forwarded into its use, which restores the inline operand
+/// 0.1.298 emitted.
 ///
 /// Blocks with no `Global` in their raw kinds are left untouched.
+/// Statements and terminators without a `Global` are not parsed.
 /// [`Terminator::kind_value`] caches the parsed tree on the terminator, so
 /// walking every cleanup block of a body that merely mentions some other
 /// `Global` would retain one tree per block.
-fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]) {
+fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedRead>], str_only: bool) {
     let mut locals = Locals {
         arg_count: body.locals.arg_count,
         locals: std::mem::take(&mut body.locals.locals),
     };
     let body_span = body.span.clone();
+    let mut str_rewrites = Vec::new();
     for bb in &mut body.body {
         if !block_raw_has_global(bb) {
             continue;
         }
         let mut i = 0;
         while i < bb.statements.len() {
+            if memchr::memmem::find(bb.statements[i].kind.get().as_bytes(), b"\"Global\"").is_none()
+            {
+                i += 1;
+                continue;
+            }
             let span = bb.statements[i].span.clone();
             let mut kind = bb.statements[i].kind_value().clone();
             let mut inserts = Vec::new();
@@ -1718,6 +1837,8 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]
                 locals: &mut locals,
                 span: &span,
                 inserts: &mut inserts,
+                str_only,
+                str_rewrites: &mut str_rewrites,
             };
             if rewrite_value(&mut kind, &mut ctx) {
                 bb.statements[i].set_kind(kind);
@@ -1726,6 +1847,9 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]
                 i += n;
             }
             i += 1;
+        }
+        if memchr::memmem::find(bb.terminator.kind.get().as_bytes(), b"\"Global\"").is_none() {
+            continue;
         }
         let span = bb
             .terminator
@@ -1739,6 +1863,8 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]
             locals: &mut locals,
             span: &span,
             inserts: &mut inserts,
+            str_only,
+            str_rewrites: &mut str_rewrites,
         };
         if rewrite_value(&mut kind, &mut ctx) {
             bb.set_terminator_kind(kind);
@@ -1746,24 +1872,326 @@ fn splice_promoted_reads(body: &mut Unstructured, table: &[Option<PromotedInit>]
         }
     }
     body.locals.locals = locals.locals;
+    if !str_rewrites.is_empty() {
+        forward_str_literal_temps(body, &str_rewrites);
+    }
 }
 
 fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    let mut changed = rewrite_str_literal_assign(v, ctx);
     if v.get("kind").is_some() && v.get("ty").is_some() {
-        return rewrite_place(v, ctx);
+        return changed | rewrite_place(v, ctx);
     }
     match v {
         Value::Array(arr) => {
-            let mut changed = false;
             for item in arr {
                 changed |= rewrite_value(item, ctx);
             }
             changed
         }
         Value::Object(map) => {
-            let mut changed = false;
             for item in map.values_mut() {
                 changed |= rewrite_value(item, ctx);
+            }
+            changed
+        }
+        _ => changed,
+    }
+}
+
+/// Rewrite `_n = &Global(str-literal)` to `_n = const "..."`.
+fn rewrite_str_literal_assign(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    let Some(arr) = v.get_mut("Assign").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if arr.len() != 2 {
+        return false;
+    }
+    let dest_ty = arr[0].get("ty").cloned().unwrap_or(Value::Null);
+    let Some(rf) = arr[1].get("Ref") else {
+        return false;
+    };
+    if rf.get("kind").and_then(Value::as_str) != Some("Shared") {
+        return false;
+    }
+    let Some(id) = rf
+        .get("place")
+        .and_then(|p| p.get("kind"))
+        .and_then(|k| k.get("Global"))
+        .and_then(|g| g.get("id"))
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let (const_id, kind) = match ctx.table.get(id as usize).and_then(Option::as_ref) {
+        Some(PromotedRead::StrLiteral { const_id, kind }) => (*const_id, kind.clone()),
+        _ => return false,
+    };
+    let const_operand = serde_json::json!({
+        "Const": {"Value": [const_id, [kind, dest_ty]]}
+    });
+    if let Some(n) = arr[0]
+        .get("kind")
+        .and_then(|k| k.get("Local"))
+        .and_then(Value::as_u64)
+    {
+        ctx.str_rewrites.push((n, const_operand.clone()));
+    }
+    arr[1] = serde_json::json!({
+        "Use": [const_operand, "Yes"]
+    });
+    true
+}
+
+/// Compact JSON spelling of a place local: `{"Local":N}`.
+const LOCAL_KEY: &[u8] = b"\"Local\":";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KindLoc {
+    block: usize,
+    /// `None` is the block terminator.
+    stmt: Option<usize>,
+}
+
+struct StrTempCand<'a> {
+    n: u64,
+    const_operand: &'a Value,
+    count: usize,
+    loc0: Option<KindLoc>,
+    loc1: Option<KindLoc>,
+}
+
+struct StrTempRemoval {
+    block: usize,
+    def_stmt: usize,
+    live: String,
+    dead: String,
+}
+
+/// Forward a once-used string-literal temporary into its `Move`/`Copy` use.
+///
+/// One raw-text count pass records every compact `{"Local":N}` in statement
+/// and terminator kinds. A candidate `n` is forwarded only when that count is
+/// exactly two, one mention is `_n = Use(Const)`, and the other is a
+/// `Move`/`Copy` of `_n`. Only those two kinds are parsed. The defining
+/// assign and the matching `StorageLive`/`StorageDead` statements are then
+/// dropped; locals are not renumbered.
+fn forward_str_literal_temps(body: &mut Unstructured, rewrites: &[(u64, Value)]) {
+    let mut items: Vec<(u64, &Value)> = rewrites
+        .iter()
+        .filter(|(n, _)| *n > body.locals.arg_count)
+        .map(|(n, op)| (*n, op))
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    items.sort_by_key(|(n, _)| *n);
+
+    let mut candidates: Vec<StrTempCand<'_>> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let n = items[i].0;
+        let mut j = i + 1;
+        while j < items.len() && items[j].0 == n {
+            j += 1;
+        }
+        if j == i + 1 {
+            candidates.push(StrTempCand {
+                n,
+                const_operand: items[i].1,
+                count: 0,
+                loc0: None,
+                loc1: None,
+            });
+        }
+        i = j;
+    }
+    if candidates.is_empty() {
+        return;
+    }
+
+    for (bi, bb) in body.body.iter().enumerate() {
+        for (si, st) in bb.statements.iter().enumerate() {
+            record_raw_local_mentions(
+                st.kind.get(),
+                &mut candidates,
+                KindLoc {
+                    block: bi,
+                    stmt: Some(si),
+                },
+            );
+        }
+        record_raw_local_mentions(
+            bb.terminator.kind.get(),
+            &mut candidates,
+            KindLoc {
+                block: bi,
+                stmt: None,
+            },
+        );
+    }
+
+    let mut removals: Vec<StrTempRemoval> = Vec::new();
+    for cand in &candidates {
+        if cand.count != 2 {
+            continue;
+        }
+        let (Some(loc0), Some(loc1)) = (cand.loc0, cand.loc1) else {
+            continue;
+        };
+        let def = if loc0.stmt.is_some() && is_str_temp_defining_assign(kind_at(body, loc0), cand.n)
+        {
+            loc0
+        } else if loc1.stmt.is_some() && is_str_temp_defining_assign(kind_at(body, loc1), cand.n) {
+            loc1
+        } else {
+            continue;
+        };
+        let use_loc = if def == loc0 { loc1 } else { loc0 };
+        if !replace_str_temp_use_at(body, use_loc, cand.n, cand.const_operand) {
+            continue;
+        }
+        let Some(def_stmt) = def.stmt else {
+            continue;
+        };
+        removals.push(StrTempRemoval {
+            block: def.block,
+            def_stmt,
+            live: format!(r#"{{"StorageLive":{}}}"#, cand.n),
+            dead: format!(r#"{{"StorageDead":{}}}"#, cand.n),
+        });
+    }
+
+    for (bi, bb) in body.body.iter_mut().enumerate() {
+        let mut i = 0;
+        bb.statements.retain(|st| {
+            let raw = st.kind.get();
+            let remove = removals
+                .iter()
+                .any(|r| (r.block == bi && r.def_stmt == i) || raw == r.live || raw == r.dead);
+            i += 1;
+            !remove
+        });
+    }
+}
+
+fn record_raw_local_mentions(kind: &str, candidates: &mut [StrTempCand<'_>], loc: KindLoc) {
+    let bytes = kind.as_bytes();
+    for pos in memchr::memmem::find_iter(bytes, LOCAL_KEY) {
+        let Some(n) = local_id_at(bytes, pos + LOCAL_KEY.len()) else {
+            continue;
+        };
+        let Ok(idx) = candidates.binary_search_by_key(&n, |c| c.n) else {
+            continue;
+        };
+        let cand = &mut candidates[idx];
+        if cand.count == 0 {
+            cand.loc0 = Some(loc);
+        } else if cand.count == 1 {
+            cand.loc1 = Some(loc);
+        }
+        cand.count += 1;
+    }
+}
+
+fn local_id_at(bytes: &[u8], mut i: usize) -> Option<u64> {
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    let mut n: u64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        n = n.checked_mul(10)?.checked_add(u64::from(bytes[i] - b'0'))?;
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'}' {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fn kind_at(body: &Unstructured, loc: KindLoc) -> &Value {
+    match loc.stmt {
+        Some(i) => body.body[loc.block].statements[i].kind_value(),
+        None => body.body[loc.block].terminator.kind_value(),
+    }
+}
+
+fn is_str_temp_defining_assign(kind: &Value, n: u64) -> bool {
+    let Some(arr) = kind.get("Assign").and_then(Value::as_array) else {
+        return false;
+    };
+    if arr.len() != 2 || !place_is_unprojected_local(&arr[0], n) {
+        return false;
+    }
+    arr[1]
+        .get("Use")
+        .and_then(Value::as_array)
+        .and_then(|use_arr| use_arr.first())
+        .and_then(|op| op.get("Const"))
+        .is_some()
+}
+
+fn replace_str_temp_use_at(
+    body: &mut Unstructured,
+    loc: KindLoc,
+    n: u64,
+    const_operand: &Value,
+) -> bool {
+    match loc.stmt {
+        Some(i) => {
+            let stmt = &mut body.body[loc.block].statements[i];
+            let mut kind = stmt.kind_value().clone();
+            if !replace_move_or_copy_operand(&mut kind, n, const_operand) {
+                return false;
+            }
+            stmt.set_kind(kind);
+            true
+        }
+        None => {
+            let bb = &mut body.body[loc.block];
+            let mut kind = bb.terminator.kind_value().clone();
+            if !replace_move_or_copy_operand(&mut kind, n, const_operand) {
+                return false;
+            }
+            bb.set_terminator_kind(kind);
+            true
+        }
+    }
+}
+
+fn place_is_unprojected_local(place: &Value, n: u64) -> bool {
+    let Some(Value::Object(kind)) = place.get("kind") else {
+        return false;
+    };
+    kind.len() == 1 && kind.get("Local").and_then(Value::as_u64) == Some(n)
+}
+
+/// Replace `{"Move"|"Copy": Local(n)}` with `const_operand`. True if one was found.
+fn replace_move_or_copy_operand(v: &mut Value, n: u64, const_operand: &Value) -> bool {
+    let is_use = match v {
+        Value::Object(map) if map.len() == 1 => map
+            .get("Move")
+            .or_else(|| map.get("Copy"))
+            .is_some_and(|place| place_is_unprojected_local(place, n)),
+        _ => false,
+    };
+    if is_use {
+        *v = const_operand.clone();
+        return true;
+    }
+    match v {
+        Value::Array(arr) => {
+            let mut changed = false;
+            for item in arr {
+                changed |= replace_move_or_copy_operand(item, n, const_operand);
+            }
+            changed
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for item in map.values_mut() {
+                changed |= replace_move_or_copy_operand(item, n, const_operand);
             }
             changed
         }
@@ -1772,13 +2200,17 @@ fn rewrite_value(v: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
 }
 
 fn rewrite_place(place: &mut Value, ctx: &mut SpliceCtx<'_>) -> bool {
+    if ctx.str_only {
+        return false;
+    }
     let global_id = place
         .get("kind")
         .and_then(|k| k.get("Global"))
         .and_then(|g| g.get("id"))
         .and_then(Value::as_u64);
     if let Some(id) = global_id {
-        let Some(init) = ctx.table.get(id as usize).and_then(Option::as_ref) else {
+        let Some(PromotedRead::Init(init)) = ctx.table.get(id as usize).and_then(Option::as_ref)
+        else {
             return false;
         };
         let ty = place.get("ty").cloned().unwrap_or(Value::Null);
@@ -3300,6 +3732,280 @@ mod tests {
                 .all(|st| !st.kind.get().contains("\"Global\"")),
             "promoted Global read should have been rewritten"
         );
+    }
+
+    fn str_literal_span() -> Value {
+        serde_json::json!({"Deduplicated": 0})
+    }
+
+    fn str_literal_storage(live: bool, n: u64) -> Value {
+        let span = str_literal_span();
+        let kind = if live {
+            serde_json::json!({"StorageLive": n})
+        } else {
+            serde_json::json!({"StorageDead": n})
+        };
+        serde_json::json!({"span": span, "kind": kind})
+    }
+
+    fn str_literal_assign_global_ref(local: u64) -> Value {
+        let span = str_literal_span();
+        serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [
+                {"kind": {"Local": local}, "ty": {"Deduplicated": 1269}},
+                {"Ref": {
+                    "place": {
+                        "kind": {"Global": {"generics": null, "id": 0}},
+                        "ty": {"Deduplicated": 30}
+                    },
+                    "kind": "Shared",
+                    "ptr_metadata": {"Const": {"Deduplicated": 768}}
+                }}
+            ]}
+        })
+    }
+
+    fn str_literal_assign_agg(agg_operands: Value) -> Value {
+        let span = str_literal_span();
+        serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [
+                {"kind": {"Local": 0}, "ty": {"Deduplicated": 1269}},
+                {"Aggregate": ["Array", agg_operands]}
+            ]}
+        })
+    }
+
+    fn str_literal_llbc(n_locals: u64, statements: Vec<Value>) -> crate::Llbc {
+        let span = str_literal_span();
+        let meta = |name: serde_json::Value| {
+            serde_json::json!({
+                "name": name,
+                "span": span,
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            })
+        };
+        let local = |index: u64| {
+            serde_json::json!({
+                "index": index,
+                "name": null,
+                "span": span,
+                "ty": {"Deduplicated": 1269}
+            })
+        };
+        let locals: Vec<Value> = (0..n_locals).map(local).collect();
+        let subject = serde_json::json!({
+            "span": span,
+            "locals": {"arg_count": 0, "locals": locals},
+            "body": [{
+                "statements": statements,
+                "terminator": {"span": span, "kind": "Return"},
+                "kind": "Regular"
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "pad": [{"Value": [7, [{"Str": "abc"}, {"Deduplicated": 30}]]}],
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(serde_json::json!([{"Ident": ["subject", 0]}])),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": {"Deduplicated": 1269}
+                    },
+                    "body": {"Unstructured": subject}
+                }],
+                "global_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(serde_json::json!([{"Builtin": ["PromotedConst", 0]}])),
+                    "global_kind": "AnonConst",
+                    "value": {"Deduplicated": 7}
+                }]
+            }
+        });
+        crate::Llbc::from_slice(file.to_string().as_bytes()).expect("fixture")
+    }
+
+    fn str_literal_global_borrow_llbc(agg_operands: Value) -> crate::Llbc {
+        str_literal_llbc(
+            2,
+            vec![
+                str_literal_storage(true, 1),
+                str_literal_assign_global_ref(1),
+                str_literal_assign_agg(agg_operands),
+                str_literal_storage(false, 1),
+            ],
+        )
+    }
+
+    fn str_literal_global_borrow_fixture() -> crate::Llbc {
+        str_literal_global_borrow_llbc(serde_json::json!([{
+            "Move": {"kind": {"Local": 1}, "ty": {"Deduplicated": 1269}}
+        }]))
+    }
+
+    fn str_literal_copied_twice_fixture() -> crate::Llbc {
+        let place = serde_json::json!({"kind": {"Local": 1}, "ty": {"Deduplicated": 1269}});
+        str_literal_global_borrow_llbc(serde_json::json!([
+            {"Copy": place.clone()},
+            {"Copy": place}
+        ]))
+    }
+
+    fn str_literal_two_once_used_temps_fixture() -> crate::Llbc {
+        let place =
+            |n: u64| serde_json::json!({"kind": {"Local": n}, "ty": {"Deduplicated": 1269}});
+        str_literal_llbc(
+            3,
+            vec![
+                str_literal_storage(true, 1),
+                str_literal_assign_global_ref(1),
+                str_literal_storage(true, 2),
+                str_literal_assign_global_ref(2),
+                str_literal_assign_agg(serde_json::json!([
+                    {"Move": place(1)},
+                    {"Move": place(2)}
+                ])),
+                str_literal_storage(false, 1),
+                str_literal_storage(false, 2),
+            ],
+        )
+    }
+
+    fn assert_str_literal_const_assign(llbc: &crate::Llbc, body: &Unstructured) {
+        assert!(llbc.global_by_id(0).is_none());
+        assert_eq!(body.body[0].statements.len(), 1);
+        match body.body[0].statements[0].stmt_kind().expect("typed") {
+            StmtKind::Assign(place, Rvalue::Aggregate(_, operands)) => {
+                assert!(matches!(place.kind, PlaceKind::Local(0)));
+                assert_eq!(operands.len(), 1);
+                match &operands[0] {
+                    Operand::Const(c) => {
+                        assert_eq!(
+                            llbc.const_expr_literal(c),
+                            Some(serde_json::json!({"Str": "abc"}))
+                        );
+                    }
+                    other => panic!("expected Operand::Const, got {other:?}"),
+                }
+            }
+            other => panic!("expected Assign(Local(0), Aggregate(_, [Const])), got {other:?}"),
+        }
+    }
+
+    /// Charon 0.1.301 emits a `&str` literal as a shared borrow of an
+    /// `AnonConst` `PromotedConst` global whose `value` is a deduplicated
+    /// `Str` constant. The reader presents that as an inline `const`.
+    #[test]
+    fn str_literal_global_borrow_reads_as_const() {
+        let llbc = str_literal_global_borrow_fixture();
+        assert!(llbc.global_by_id(0).is_none());
+        let body = llbc
+            .fn_by_id(0)
+            .unwrap()
+            .unstructured()
+            .expect("subject body");
+        assert_str_literal_const_assign(&llbc, &body);
+    }
+
+    #[test]
+    fn rewrite_str_literal_reads_on_a_separately_parsed_body() {
+        let llbc = str_literal_global_borrow_fixture();
+        let fd = llbc.fn_by_id(0).unwrap();
+        let raw = serde_json::from_str::<serde_json::Value>(fd.body.as_ref().unwrap().get())
+            .expect("raw body");
+        let mut u = serde_json::from_value::<Unstructured>(raw["Unstructured"].clone())
+            .expect("unstructured");
+        match u.body[0].statements[1].stmt_kind().expect("typed") {
+            StmtKind::Assign(_, Rvalue::Ref { .. }) => {}
+            other => panic!("expected Assign(_, Ref {{ .. }}), got {other:?}"),
+        }
+        fd.rewrite_str_literal_reads(&mut u);
+        assert_str_literal_const_assign(&llbc, &u);
+    }
+
+    #[test]
+    fn str_literal_copied_twice_is_not_forwarded() {
+        let llbc = str_literal_copied_twice_fixture();
+        let body = llbc
+            .fn_by_id(0)
+            .unwrap()
+            .unstructured()
+            .expect("subject body");
+        let mut saw_def = false;
+        let mut saw_agg = false;
+        for stmt in &body.body[0].statements {
+            match stmt.stmt_kind().expect("typed") {
+                StmtKind::StorageLive(1) | StmtKind::StorageDead(1) => {}
+                StmtKind::Assign(place, Rvalue::Use(Operand::Const(expr), _)) => {
+                    assert!(matches!(place.kind, PlaceKind::Local(1)));
+                    assert_eq!(
+                        llbc.const_expr_literal(&expr),
+                        Some(serde_json::json!({"Str": "abc"}))
+                    );
+                    saw_def = true;
+                }
+                StmtKind::Assign(place, Rvalue::Aggregate(_, operands)) => {
+                    assert!(matches!(place.kind, PlaceKind::Local(0)));
+                    assert_eq!(operands.len(), 2);
+                    for op in &operands {
+                        match op {
+                            Operand::Copy(p) => {
+                                assert!(matches!(p.kind, PlaceKind::Local(1)));
+                            }
+                            other => panic!("expected Copy(_1), got {other:?}"),
+                        }
+                    }
+                    saw_agg = true;
+                }
+                other => panic!("unexpected statement {other:?}"),
+            }
+        }
+        assert!(saw_def, "defining _1 = Use(Const(..)) should remain");
+        assert!(saw_agg, "aggregate of Copy(_1) should remain");
+    }
+
+    #[test]
+    fn str_literal_two_once_used_temps_same_block_are_forwarded() {
+        let llbc = str_literal_two_once_used_temps_fixture();
+        let body = llbc
+            .fn_by_id(0)
+            .unwrap()
+            .unstructured()
+            .expect("subject body");
+        assert_eq!(body.body[0].statements.len(), 1);
+        match body.body[0].statements[0].stmt_kind().expect("typed") {
+            StmtKind::Assign(place, Rvalue::Aggregate(_, operands)) => {
+                assert!(matches!(place.kind, PlaceKind::Local(0)));
+                assert_eq!(operands.len(), 2);
+                for op in &operands {
+                    match op {
+                        Operand::Const(c) => {
+                            assert_eq!(
+                                llbc.const_expr_literal(c),
+                                Some(serde_json::json!({"Str": "abc"}))
+                            );
+                        }
+                        other => panic!("expected Operand::Const, got {other:?}"),
+                    }
+                }
+            }
+            other => {
+                panic!("expected Assign(Local(0), Aggregate(_, [Const, Const])), got {other:?}")
+            }
+        }
     }
 
     #[test]

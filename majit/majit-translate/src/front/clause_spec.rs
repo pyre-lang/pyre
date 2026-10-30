@@ -295,9 +295,9 @@ pub(crate) fn substituted_unstructured(
     // i64 instantiation of RDict::lookup_for_store still becomes a graph.
     // getkind banks the substituted &i64 key as int (lltype.Ptr with
     // _gckind == 'raw').
-    serde_json::from_value::<Proj>(value)
-        .ok()
-        .map(|proj| proj.unstructured)
+    let mut u = serde_json::from_value::<Proj>(value).ok()?.unstructured;
+    fd.rewrite_str_literal_reads(&mut u);
+    Some(u)
 }
 
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
