@@ -841,22 +841,16 @@ impl W_Pickler {
         let _ = pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
-        let proxy = PicklerMemoProxy::allocate_stable(PicklerMemoProxy {
+        let proxy = PicklerMemoProxy::allocate(PicklerMemoProxy {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
             w_pickler: pyre_object::PY_NULL,
         });
-        // `allocate` may have relocated the pickler; wire the (young) proxy to
-        // its post-collection address.
+        // Ordinary young proxy; the pickler stays rooted because allocate does not collect.
         if let Some(px) = PicklerMemoProxy::from_obj(proxy) {
             px.w_pickler = pyre_object::gc_roots::shadow_stack_get(slot);
-            // `find_initializing_stores` would elide the barrier for a store
-            // into a just-malloc'd young object, but `allocate_stable` fires
-            // the managed barrier during construction and so consumes the
-            // proxy's fresh TRACK_YOUNG_PTRS; the exemption's premise no
-            // longer holds here.
             pickler_write_barrier(proxy);
         }
         proxy

@@ -779,10 +779,10 @@ pub(crate) extern "C" fn force_quasi_immutable(field_addr: i64) {
     }
     // Safety: the only caller is `do_force_quasi_immutable`, which derives the
     // address from a live struct pointer plus the mutate field descr's offset;
-    // that field is a `QuasiImmutField` embedded in the owner.
+    // that field is the mutate word, with the lock word immediately after.
     unsafe {
         pyre_object::quasiimmut::sweep_quasi_immut_field(
-            field_addr as *const pyre_object::quasiimmut::QuasiImmutField,
+            field_addr as *const std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
         )
     };
 }
@@ -827,9 +827,13 @@ fn get_current_qmut_instance(field_addr: i64) -> Arc<dyn majit_ir::QuasiImmutHan
     }
     // Safety: the only caller is `majit_metainterp::quasiimmut::get_current_qmut_instance`,
     // which derives the address from a live struct pointer plus the mutate
-    // field descr's offset; that field is a `QuasiImmutField` embedded in
-    // the owner.
-    let field = unsafe { &*(field_addr as *const pyre_object::quasiimmut::QuasiImmutField) };
+    // field descr's offset; that field is the mutate word, with the lock
+    // word immediately after.
+    let field = unsafe {
+        pyre_object::quasiimmut::QuasiImmutField::from_mutate_word(
+            field_addr as *const std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
+        )
+    };
     Arc::new(HostQuasiImmut(field.get_current_qmut_instance()))
 }
 

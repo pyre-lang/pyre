@@ -14141,6 +14141,9 @@ fn field_pos_in(cc: &CallControl, owner: &str, field_name: &str) -> usize {
     // that consumers resolve it through `FieldDescr::is_w_class()` rather than
     // by index (`pyre-jit-trace/src/descr.rs new_w_class_field_descr`); answer
     // with the same number so both sides agree on the slot nobody reads.
+    // `ob_header.ob_type` is that word under a containment path
+    // (`is_header_word` last-component rule; upstream `all_fielddescrs`
+    // skips `typeptr` by bare name at every recursion level).
     if crate::codewriter::heaptracker::is_header_word(owner, field_name) {
         return 0;
     }
@@ -15736,6 +15739,7 @@ fn effect_transduce_op(
                     base,
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 result,
             );
@@ -15753,6 +15757,7 @@ fn effect_transduce_op(
                     item_ty: effect_value_type_of(&result),
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 result,
@@ -15776,6 +15781,7 @@ fn effect_transduce_op(
                     item_ty,
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 false,
             );
@@ -25936,6 +25942,50 @@ mod tests {
         );
     }
 
+    /// Two nesting levels: `nested_struct_leaf("Outer", "mid.inner.c")` is
+    /// `offset(mid) + offset(inner) + offset(c)`.
+    #[test]
+    fn fielddescrof_resolves_two_level_nested_struct_leaf() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Inner".to_string(),
+            vec![("c".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "Mid".to_string(),
+            vec![
+                ("b".to_string(), "i64".to_string()),
+                ("inner".to_string(), "Inner".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "Outer".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("mid".to_string(), "Mid".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(
+            ["Inner".to_string(), "Mid".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let (descr, member) = cc
+            .fielddescrof_keyed(0, "Outer", None, "mid.inner.c")
+            .expect("two-level nested leaf resolves");
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.offset(), 16, "a (8) + mid.b (8) + inner.c (0)");
+        assert_eq!(fd.field_size(), 8);
+        match member {
+            majit_ir::effectinfo::DescrSetMember::Field { field_name, .. } => {
+                assert_eq!(field_name, "mid.inner.c");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The embedded object header contributes no slot, the way recursing
     /// into RPython's `OBJECT` contributes none: its one field is `typeptr`
     /// and `heaptracker.py:64-66` skips it by name.
@@ -25977,6 +26027,11 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_module", 0), 4);
         assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
         assert_eq!(field_pos_in(&cc, "Method", "w_class"), 3);
+        // Containment-path spelling of the skipped vtable word, and of the
+        // counted `w_class` leaf (`is_header_word` last-component rule).
+        assert_eq!(field_pos_in(&cc, "Method", "ob.ob_type"), 0);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "ob.w_class", 0), 0);
+        assert_eq!(field_pos_in(&cc, "Method", "ob.w_class"), 0);
     }
 
     /// A `()`-payload enum variant is what makes a mint site's own field

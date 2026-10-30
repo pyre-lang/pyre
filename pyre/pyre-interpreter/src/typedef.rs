@@ -21485,7 +21485,8 @@ fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
             },
             w_function: PY_NULL,
             w_dict: PY_NULL,
-            mutate_w_function: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_w_function: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_w_function_lock: pyre_object::quasiimmut::null_mutate_lock(),
         },
         roots.get(cls_slot),
     );
@@ -22121,7 +22122,8 @@ fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
             },
             w_function: PY_NULL,
             w_dict: PY_NULL,
-            mutate_w_function: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_w_function: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_w_function_lock: pyre_object::quasiimmut::null_mutate_lock(),
         },
         roots.get(cls_slot),
     );

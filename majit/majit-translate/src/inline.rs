@@ -773,6 +773,7 @@ pub(crate) fn remap_op_kind(
             item_ty,
             array_type_id,
             nolength,
+            gckind,
             pure,
         } => OpKind::ArrayRead {
             base: remap_var(base),
@@ -780,6 +781,7 @@ pub(crate) fn remap_op_kind(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            gckind: *gckind,
             // Preserve the source foldable/immutable flag through the
             // inline clone — never hardcode it (rlist.py:724
             // ll_getitem_foldable_nonneg).
@@ -789,10 +791,12 @@ pub(crate) fn remap_op_kind(
             base,
             array_type_id,
             nolength,
+            gckind,
         } => OpKind::ArrayLen {
             base: remap_var(base),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            gckind: *gckind,
         },
         OpKind::ArrayWrite {
             base,
@@ -801,6 +805,7 @@ pub(crate) fn remap_op_kind(
             item_ty,
             array_type_id,
             nolength,
+            gckind,
         } => OpKind::ArrayWrite {
             base: remap_var(base),
             index: remap_var(index),
@@ -808,6 +813,7 @@ pub(crate) fn remap_op_kind(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            gckind: *gckind,
         },
         OpKind::InteriorFieldRead {
             base,
@@ -1993,6 +1999,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,

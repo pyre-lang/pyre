@@ -897,7 +897,7 @@ pub(crate) mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "h".to_string(),
-                    ty: ValueType::Unknown,
+                    ty: ValueType::Ref(None),
                     class_root: None,
                 },
                 true,

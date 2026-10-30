@@ -6765,6 +6765,37 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// `ARRAY._gckind` for `Transformer.rewrite_op_getarrayitem`.
+    ///
+    /// Upstream reads `ARRAY = op.args[0].concretetype.TO` and interpolates
+    /// `ARRAY._gckind` into the opcode name. A `Ptr` whose `TO` is an array
+    /// (`PtrTarget::Array` / `PtrTarget::FixedSizeArray`) contributes
+    /// `Ptr::_gckind`. An unresolved operand keeps the gckind the operation
+    /// was built with.
+    fn array_gckind_from_base(
+        &self,
+        base: &crate::flowspace::model::Variable,
+        supplied: crate::model::ArrayGcKind,
+    ) -> crate::model::ArrayGcKind {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+        if let Some(LowLevelType::Ptr(ptr)) = base.concretetype() {
+            if matches!(&ptr.TO, PtrTarget::Array(_) | PtrTarget::FixedSizeArray(_)) {
+                return match ptr._gckind() {
+                    GcKind::Gc => crate::model::ArrayGcKind::Gc,
+                    GcKind::Raw => crate::model::ArrayGcKind::Raw,
+                    _ => supplied,
+                };
+            }
+        }
+        match FunctionGraph::concretetype_of(base) {
+            crate::codewriter::type_state::ConcreteType::Signed => crate::model::ArrayGcKind::Raw,
+            crate::codewriter::type_state::ConcreteType::GcRef => crate::model::ArrayGcKind::Gc,
+            crate::codewriter::type_state::ConcreteType::Unknown
+            | crate::codewriter::type_state::ConcreteType::Void
+            | crate::codewriter::type_state::ConcreteType::Float => supplied,
+        }
+    }
+
     /// RPython `Transformer._is_rclass_instance`
     /// (`jtransform.py`): `lltype._castdepth(v.concretetype.TO, rclass.OBJECT) >= 0`.
     fn is_rclass_instance(&self, var: &crate::flowspace::model::Variable) -> bool {
@@ -8297,6 +8328,7 @@ impl<'a> Transformer<'a> {
                     base: base.clone(),
                     array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
             }]);
         }
@@ -8658,6 +8690,7 @@ impl<'a> Transformer<'a> {
                             item_ty: ValueType::Int,
                             array_type_id: array_type_id.clone(),
                             nolength: *nolength,
+                            gckind: crate::model::ArrayGcKind::Raw,
                             pure: false,
                         },
                     }]));
@@ -8672,6 +8705,7 @@ impl<'a> Transformer<'a> {
                             item_ty: ValueType::Int,
                             array_type_id: array_type_id.clone(),
                             nolength: *nolength,
+                            gckind: crate::model::ArrayGcKind::Raw,
                             pure: false,
                         },
                     },
@@ -8715,6 +8749,7 @@ impl<'a> Transformer<'a> {
                             item_ty: ValueType::Int,
                             array_type_id: array_type_id.clone(),
                             nolength: *nolength,
+                            gckind: crate::model::ArrayGcKind::Raw,
                         },
                     },
                 ]))
@@ -8788,13 +8823,14 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        let (array_type_id, nolength, source_pure) = match &op.kind {
+        let (array_type_id, nolength, source_gckind, source_pure) = match &op.kind {
             OpKind::ArrayRead {
                 array_type_id,
                 nolength,
+                gckind,
                 pure,
                 ..
-            } => (array_type_id.clone(), *nolength, *pure),
+            } => (array_type_id.clone(), *nolength, *gckind, *pure),
             _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
         };
         // `rewrite_op_getarrayitem`: `immut = ARRAY._immutable_field(None)`
@@ -8825,8 +8861,16 @@ impl<'a> Transformer<'a> {
                     .as_deref()
                     .is_some_and(|cc| cc.immutable_array_types.contains(aid))
             });
-        let pure = source_pure || immutable;
-        if &typed_item_ty != item_ty || pure != source_pure {
+        // `rewrite_op_getarrayitem`: `ARRAY._gckind` chooses the opcode
+        // family. A raw array strips `_pure` (`pure = ''`). `ARRAY` is
+        // `op.args[0].concretetype.TO`.
+        let gckind = self.array_gckind_from_base(base, source_gckind);
+        let pure = if gckind.is_gc() {
+            source_pure || immutable
+        } else {
+            false
+        };
+        if &typed_item_ty != item_ty || pure != source_pure || gckind != source_gckind {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ArrayRead {
@@ -8835,6 +8879,7 @@ impl<'a> Transformer<'a> {
                     item_ty: typed_item_ty,
                     array_type_id,
                     nolength,
+                    gckind,
                     pure,
                 },
             }]);
@@ -8867,6 +8912,30 @@ impl<'a> Transformer<'a> {
         let Some((vable_base, arr_idx, itemsize, is_signed)) =
             self.vable_array_vars.get(base).cloned()
         else {
+            // `rewrite_op_getarraysize` asserts `_gckind == 'gc'` then
+            // emits `arraylen_gc`. Stamp that from the operand, the same
+            // way `rewrite_op_getarrayitem` stamps the item opcode.
+            let (array_type_id, nolength, source_gckind) = match &op.kind {
+                OpKind::ArrayLen {
+                    array_type_id,
+                    nolength,
+                    gckind,
+                    ..
+                } => (array_type_id.clone(), *nolength, *gckind),
+                _ => unreachable!("rewrite_op_getarraysize called on non-ArrayLen op"),
+            };
+            let gckind = self.array_gckind_from_base(base, source_gckind);
+            if gckind != source_gckind {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ArrayLen {
+                        base: base.clone(),
+                        array_type_id,
+                        nolength,
+                        gckind,
+                    },
+                }]);
+            }
             return RewriteResult::Keep;
         };
         self.notes.push(GraphTransformNote {
@@ -8945,7 +9014,20 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
-        if &typed_item_ty != item_ty {
+        let (array_type_id, nolength, source_gckind) = match &op.kind {
+            OpKind::ArrayWrite {
+                array_type_id,
+                nolength,
+                gckind,
+                ..
+            } => (array_type_id.clone(), *nolength, *gckind),
+            _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
+        };
+        // `rewrite_op_setarrayitem` interpolates `ARRAY._gckind` into
+        // `setarrayitem_{gckind}_*`. `ARRAY` is the operand's
+        // `concretetype.TO`.
+        let gckind = self.array_gckind_from_base(base, source_gckind);
+        if &typed_item_ty != item_ty || gckind != source_gckind {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ArrayWrite {
@@ -8953,14 +9035,9 @@ impl<'a> Transformer<'a> {
                     index: index.clone(),
                     value: value.clone(),
                     item_ty: typed_item_ty,
-                    array_type_id: match &op.kind {
-                        OpKind::ArrayWrite { array_type_id, .. } => array_type_id.clone(),
-                        _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
-                    },
-                    nolength: match &op.kind {
-                        OpKind::ArrayWrite { nolength, .. } => *nolength,
-                        _ => unreachable!("rewrite_op_setarrayitem called on non-ArrayWrite op"),
-                    },
+                    array_type_id,
+                    nolength,
+                    gckind,
                 },
             }]);
         }
@@ -11442,6 +11519,7 @@ impl<'a> Transformer<'a> {
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
                             },
                         },
@@ -11484,6 +11562,7 @@ impl<'a> Transformer<'a> {
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 pure: true,
                             },
                         },
@@ -11519,6 +11598,7 @@ impl<'a> Transformer<'a> {
                                 item_ty: ValueType::Int,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -11560,6 +11640,7 @@ impl<'a> Transformer<'a> {
                                 base: block,
                                 array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -11652,6 +11733,7 @@ impl<'a> Transformer<'a> {
                                 item_ty: ValueType::Float,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
                             },
                         },
@@ -11687,6 +11769,7 @@ impl<'a> Transformer<'a> {
                                 item_ty: ValueType::Float,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -11720,6 +11803,7 @@ impl<'a> Transformer<'a> {
                                 base: block,
                                 array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -11813,6 +11897,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -12021,6 +12106,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
                             },
                         },
@@ -12074,6 +12160,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
                             },
                         },
@@ -12109,6 +12196,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -12164,6 +12252,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -12195,6 +12284,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
                             },
                         },
@@ -12229,6 +12319,7 @@ impl<'a> Transformer<'a> {
                                     crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
                                 ),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                             },
                         },
                     ],
@@ -12351,6 +12442,7 @@ impl<'a> Transformer<'a> {
                         item_ty: item_ty.clone(),
                         array_type_id: array_type_id.clone(),
                         nolength: true,
+                        gckind: crate::model::ArrayGcKind::Raw,
                         pure: false,
                     },
                 });
@@ -12395,6 +12487,7 @@ impl<'a> Transformer<'a> {
                         item_ty,
                         array_type_id,
                         nolength: true,
+                        gckind: crate::model::ArrayGcKind::Raw,
                     },
                 });
                 "list.setitem → raw_load_i(l, ptr) + setarrayitem_raw"
@@ -14924,6 +15017,7 @@ fn rewrite_fixed_newlist(
         return RewriteResult::Keep;
     };
     let nolength = crate::front::typestr::nolength_from_array_type_id(Some(array_type_id.as_str()));
+    let gckind = crate::front::typestr::gckind_from_array_type_id(Some(array_type_id.as_str()));
     let n = items.len() as i64;
     let length =
         graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
@@ -14974,6 +15068,7 @@ fn rewrite_fixed_newlist(
                 item_ty: item_ty.clone(),
                 array_type_id: Some(array_type_id.clone()),
                 nolength,
+                gckind,
             },
         });
     }
@@ -15018,6 +15113,7 @@ fn rewrite_shaped_array_field(
             item_ty,
             array_type_id: Some(array_type_id),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         }
     } else {
         OpKind::ArrayRead {
@@ -15026,6 +15122,7 @@ fn rewrite_shaped_array_field(
             item_ty,
             array_type_id: Some(array_type_id),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
             pure: false,
         }
     };
@@ -15227,6 +15324,7 @@ fn do_renaming(
             item_ty,
             array_type_id,
             nolength,
+            gckind,
         } => OpKind::ArrayWrite {
             base,
             index,
@@ -15234,6 +15332,7 @@ fn do_renaming(
             item_ty,
             array_type_id,
             nolength,
+            gckind,
         },
         OpKind::VableFieldWrite {
             base,
@@ -15667,6 +15766,7 @@ fn remap_op(
             item_ty,
             array_type_id,
             nolength,
+            gckind,
             pure,
         } => OpKind::ArrayRead {
             base: remap_value(base, aliases),
@@ -15674,6 +15774,7 @@ fn remap_op(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            gckind: *gckind,
             // Preserve the source foldable/immutable flag through the
             // alias remap — never hardcode it (rlist.py:724
             // ll_getitem_foldable_nonneg).
@@ -15683,10 +15784,12 @@ fn remap_op(
             base,
             array_type_id,
             nolength,
+            gckind,
         } => OpKind::ArrayLen {
             base: remap_value(base, aliases),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            gckind: *gckind,
         },
         OpKind::ArrayWrite {
             base,
@@ -15695,6 +15798,7 @@ fn remap_op(
             item_ty,
             array_type_id,
             nolength,
+            gckind,
         } => OpKind::ArrayWrite {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
@@ -15702,6 +15806,7 @@ fn remap_op(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
             nolength: *nolength,
+            gckind: *gckind,
         },
         OpKind::InteriorFieldRead {
             base,
@@ -18806,6 +18911,7 @@ mod tests {
                     item_ty: ValueType::Ref(None),
                     array_type_id: Some("enum_slice".into()),
                     nolength: true,
+                    gckind: crate::model::ArrayGcKind::Raw,
                     pure: false,
                 },
                 true,
@@ -18823,6 +18929,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("enum_slice".into()),
                 nolength: true,
+                gckind: crate::model::ArrayGcKind::Raw,
             },
             false,
         );
@@ -22186,6 +22293,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -22272,6 +22380,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -22447,6 +22556,7 @@ mod tests {
                 base: array_var,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             true,
         );
@@ -23130,6 +23240,7 @@ mod tests {
                 item_ty: ValueType::Unknown,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
         );
@@ -23193,6 +23304,7 @@ mod tests {
                     item_ty: ValueType::Unknown,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -23211,6 +23323,82 @@ mod tests {
             OpKind::ArrayRead { item_ty, .. } => assert_eq!(*item_ty, ValueType::Int),
             other => panic!("expected ArrayRead, got {other:?}"),
         }
+    }
+
+    fn arrayread_gckind_after_rewrite(
+        stamp_base: impl FnOnce(&crate::flowspace::model::Variable),
+        built: crate::model::ArrayGcKind,
+    ) -> crate::model::ArrayGcKind {
+        let mut graph = FunctionGraph::new("array_gckind");
+        let base = graph.alloc_value_var();
+        stamp_base(&base);
+        let index = graph.alloc_value_var();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: ValueType::Int,
+                    array_type_id: None,
+                    nolength: false,
+                    gckind: built,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var));
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config).transform(&graph);
+        result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ArrayRead { gckind, .. } => Some(*gckind),
+                _ => None,
+            })
+            .expect("expected ArrayRead")
+    }
+
+    /// An unresolved array base keeps the gckind the `ArrayRead` was built
+    /// with. `Transformer.rewrite_op_getarrayitem` reads `ARRAY._gckind`
+    /// off `op.args[0].concretetype.TO`; a missing cell is not Gc.
+    #[test]
+    fn arrayread_unknown_base_keeps_raw_gckind() {
+        let gckind = arrayread_gckind_after_rewrite(|_| {}, crate::model::ArrayGcKind::Raw);
+        assert_eq!(gckind, crate::model::ArrayGcKind::Raw);
+    }
+
+    /// A `Ptr` to a gc array contributes `ARRAY._gckind` even when the
+    /// `ArrayRead` was built Raw.
+    #[test]
+    fn arrayread_gc_array_ptr_overrides_raw_gckind() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        let gckind = arrayread_gckind_after_rewrite(
+            |base| {
+                base.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+                }))));
+            },
+            crate::model::ArrayGcKind::Raw,
+        );
+        assert_eq!(gckind, crate::model::ArrayGcKind::Gc);
+    }
+
+    /// Coarse `Signed` on the base is a raw array pointer (`getkind` of
+    /// `Ptr(ARRAY)` with `_gckind == 'raw'`).
+    #[test]
+    fn arrayread_signed_base_yields_raw_gckind() {
+        let gckind = arrayread_gckind_after_rewrite(
+            |base| FunctionGraph::set_concretetype_of_inline(base, ConcreteType::Signed),
+            crate::model::ArrayGcKind::Gc,
+        );
+        assert_eq!(gckind, crate::model::ArrayGcKind::Raw);
     }
 
     /// A method call whose override says `Residual` lowers to the const
@@ -27209,6 +27397,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -27280,6 +27469,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -27347,6 +27537,7 @@ mod tests {
                 item_ty: ValueType::Ref(None),
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
             true,
@@ -27417,6 +27608,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: None,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: true,
                 },
                 true,
@@ -30010,6 +30202,7 @@ mod tests {
             item_ty: ValueType::Ref(None),
             array_type_id: None,
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         }
     }
 
@@ -30423,6 +30616,7 @@ mod tests {
                     value: LinkArg::Value(item),
                     array_type_id: Some(id),
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     ..
                 } if base == &list && id == &expected => Some(item.clone()),
                 _ => None,
@@ -30664,6 +30858,7 @@ mod tests {
                             OpKind::ArrayWrite {
                                 array_type_id: Some(id),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 ..
                             } if id == "[i64]"
                         )
@@ -30808,6 +31003,7 @@ mod tests {
                             OpKind::ArrayWrite {
                                 array_type_id: Some(got),
                                 nolength: false,
+                                gckind: crate::model::ArrayGcKind::Gc,
                                 ..
                             } if got == id
                         )
@@ -30846,6 +31042,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: Some("[i64]".to_string()),
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -30891,6 +31088,7 @@ mod tests {
                     item_ty: ValueType::Int,
                     array_type_id: Some("[i64]".to_string()),
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -30967,6 +31165,7 @@ mod tests {
                     item_ty: ValueType::Float,
                     array_type_id: Some("[f64]".to_string()),
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 true,
@@ -31417,6 +31616,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: Some("[i64;4]".into()),
                 nolength: true,
+                gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
             },
             true,
@@ -35013,7 +35213,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "handler".to_string(),
-                    ty: ValueType::Unknown,
+                    ty: ValueType::Ref(None),
                     class_root: None,
                 },
                 true,
@@ -35107,7 +35307,7 @@ mod tests {
                 graph.startblock,
                 OpKind::Input {
                     name: "handler".to_string(),
-                    ty: ValueType::Unknown,
+                    ty: ValueType::Ref(None),
                     class_root: None,
                 },
                 true,
@@ -35861,6 +36061,7 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
                 pure,
             } = &body[1].kind
             else {
@@ -35876,6 +36077,7 @@ mod tests {
                 Some(rust_vec_item_array_type_id(item_ll).as_str())
             );
             assert!(*nolength && !*pure);
+            assert_eq!(*gckind, crate::model::ArrayGcKind::Raw);
             match kind {
                 VecItemKind::Float => assert_eq!(*item_ty, ValueType::Float),
                 _ => assert_eq!(*item_ty, ValueType::Int),
@@ -37364,6 +37566,7 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
                 pure,
             } => {
                 assert_eq!(base, &block);
@@ -37371,6 +37574,7 @@ mod tests {
                 assert!(matches!(item_ty, ValueType::Int));
                 assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
+                assert!(gckind.is_gc());
                 // `list.int_getitem` is the mutable (non-foldable) read.
                 assert!(!pure);
             }
@@ -37434,6 +37638,7 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
                 pure,
             } => {
                 assert_eq!(base, &block);
@@ -37441,6 +37646,7 @@ mod tests {
                 assert!(matches!(item_ty, ValueType::Int));
                 assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
+                assert!(gckind.is_gc());
                 // The foldable element load — `getarrayitem_gc_i_pure`.
                 assert!(pure);
             }
@@ -37492,6 +37698,7 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
@@ -37499,6 +37706,7 @@ mod tests {
                 assert!(matches!(item_ty, ValueType::Int));
                 assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
+                assert!(gckind.is_gc());
             }
             other => panic!("expected ArrayWrite, got {other:?}"),
         }
@@ -37684,6 +37892,7 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
@@ -37694,6 +37903,7 @@ mod tests {
                     Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
                 );
                 assert!(!nolength);
+                assert!(gckind.is_gc());
             }
             other => panic!("expected ArrayWrite, got {other:?}"),
         }
@@ -37742,6 +37952,7 @@ mod tests {
                 base,
                 array_type_id,
                 nolength,
+                gckind,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(
@@ -37749,6 +37960,7 @@ mod tests {
                     Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
                 );
                 assert!(!*nolength, "the block carries its length header");
+                assert!(gckind.is_gc());
             }
             other => panic!("expected ArrayLen, got {other:?}"),
         }
@@ -37882,6 +38094,7 @@ mod tests {
                 item_ty,
                 array_type_id,
                 nolength,
+                gckind,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
@@ -37889,6 +38102,7 @@ mod tests {
                 assert!(matches!(item_ty, ValueType::Float));
                 assert_eq!(array_type_id, &Some(LIST_FLOAT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
+                assert!(gckind.is_gc());
             }
             other => panic!("expected ArrayWrite, got {other:?}"),
         }

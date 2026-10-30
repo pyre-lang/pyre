@@ -837,6 +837,9 @@ impl<'a> Lowering<'a> {
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             alias.array_type_id.as_deref(),
                         ),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            alias.array_type_id.as_deref(),
+                        ),
                     }
                 } else if let Some(owner) = self.string_array_remove_owner() {
                     // Tail of RPython `ll_delitem_nonneg`: after
@@ -895,6 +898,9 @@ impl<'a> Lowering<'a> {
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                             STRING_GCREF_GCARRAY_TYPE_ID,
                         )),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )),
                     }
                 } else if let Some(local) = inner_local
                     && !self.index_elem_alias.contains_key(&local)
@@ -933,6 +939,9 @@ impl<'a> Lowering<'a> {
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                            array_type_id.as_str(),
+                        )),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
                             array_type_id.as_str(),
                         )),
                     }
@@ -1025,7 +1034,37 @@ impl<'a> Lowering<'a> {
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
                             ))
                         })?;
-                        self.emit_inlined_struct_leaf_copy(mir_bb, &base, &src, nested);
+                        let at_offset_zero = self
+                            .struct_field_offset_from_payload(&field_base_ty, field_payload)
+                            == Some(0);
+                        let container_field = match self
+                            .resolve_adt_field(&field_base_ty, field_payload)
+                        {
+                            Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
+                                FieldDescriptor::new(field_name, Some(owner_root))
+                                    .with_owner_id(owner_id)
+                                    .with_owner_declared_gc(container_declared_gc(
+                                        &field_base_ty,
+                                        self.llbc,
+                                        self.gc_struct_ids,
+                                        self.immutable_fields,
+                                    ))
+                                    .with_base_is_deref(base_is_deref)
+                                    .with_host_index(host_index)
+                            }
+                            None => {
+                                FieldDescriptor::new(field_label_from_payload(field_payload), None)
+                                    .with_base_is_deref(base_is_deref)
+                            }
+                        };
+                        self.emit_inlined_struct_leaf_copy(
+                            mir_bb,
+                            &base,
+                            &src,
+                            nested,
+                            &container_field,
+                            at_offset_zero,
+                        );
                         return Ok(());
                     }
                     // Resolve the field through its TypeDecl exactly
@@ -1184,6 +1223,9 @@ impl<'a> Lowering<'a> {
                         index: idx_var,
                         value: value.clone(),
                         item_ty,
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            projection_array_type_id.as_deref(),
+                        ),
                         array_type_id: projection_array_type_id,
                         nolength: projection_array_nolength,
                     }
@@ -5948,6 +5990,9 @@ impl<'a> Lowering<'a> {
                                     &self.raw_alloc_flavor_structs,
                                 )
                             },
+                            gckind: crate::front::typestr::gckind_from_array_type_id(
+                                array_type_id.as_deref(),
+                            ),
                             array_type_id,
                             nolength,
                             pure: false,
@@ -6263,6 +6308,9 @@ impl<'a> Lowering<'a> {
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
+                            gckind: crate::front::typestr::gckind_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
                             pure: false,
                         },
                     });
@@ -6295,6 +6343,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
                         },
                     });

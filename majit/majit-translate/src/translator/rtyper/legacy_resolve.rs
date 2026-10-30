@@ -46,6 +46,15 @@ use crate::translator::rtyper::rmodel::inputconst;
 /// read kinds via `FunctionGraph::concretetype_of(&v)`
 /// (`getkind(v.concretetype)`).
 pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<String>) {
+    resolve_types_inner(graph, raw_alloc_flavor_structs).unwrap_or_else(|e| panic!("{e}"));
+}
+
+fn resolve_types_inner(
+    graph: &FunctionGraph,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> Result<(), crate::translator::rtyper::error::TyperError> {
+    crate::translator::rtyper::legacy_annotator::refuse_merged_frozen_pbc_reprs(graph)?;
+
     // RPython `rtyper.setup_block_entry` writes `Signed` for `etype`
     // and `GcRef` for `evalue` on every graph's exceptblock unconditionally
     // at rtyper time (`rpython/rtyper/rtyper.py:setup_block_entry`
@@ -82,8 +91,7 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
         }
         let ann = var.annotation.borrow();
         if let Some(rc_some) = ann.as_ref() {
-            let vtype = somevalue_to_valuetype(rc_some);
-            let concrete = valuetype_to_concrete_for_legacy(&vtype, raw_alloc_flavor_structs);
+            let concrete = concrete_from_annotation(rc_some, raw_alloc_flavor_structs)?;
             commit_concretetype(&var, concrete);
         }
     }
@@ -93,13 +101,13 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
         // Resolve inputargs (Phi nodes) from `Variable.annotation`
         for var in &block.inputargs {
             if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
-                let vtype = var
-                    .annotation
-                    .borrow()
-                    .as_ref()
-                    .map(|rc| somevalue_to_valuetype(rc))
-                    .unwrap_or(crate::model::ValueType::Unknown);
-                let concrete = valuetype_to_concrete_for_legacy(&vtype, raw_alloc_flavor_structs);
+                let concrete = match var.annotation.borrow().as_ref() {
+                    Some(rc) => concrete_from_annotation(rc, raw_alloc_flavor_structs)?,
+                    None => valuetype_to_concrete_for_legacy(
+                        &crate::model::ValueType::Unknown,
+                        raw_alloc_flavor_structs,
+                    ),
+                };
                 if concrete != ConcreteType::Unknown {
                     commit_concretetype(var, concrete);
                 }
@@ -140,19 +148,17 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
 
     // Backward-constraint: an op whose RPython decorator declares
     // integer operands (`@arguments("i", ...)` in `blackhole.py`) cannot
-    // run on `Ref`-classified operands — upstream `rtyper.py:specialize`
+    // run on `Ref`-classified operands — upstream `rtyper.py specialize`
     // determines operand kind from the op's `concretetype`, not from a
     // fallback.  Pyre's front-end leaves many `OpKind::Input` values
     // with `ty: Unknown` (path references not yet bound by the annotator);
-    // without this pass they end up defaulted to `GcRef` by the backfill
-    // below and produce pyre-only `int_*/{ri,ir,rr,r}` keys. Upgrade
-    // Unknown operands of pure integer ops to `Signed`, matching
-    // RPython's mandatory kind assignment (`rint.py IntegerRepr`
-    // `hop.inputargs(self, self)`).  Void is Impossible/None
-    // (`IntegerRepr.convert_const` refuses None) and stays Void.
-    // `ptr_eq` / `ptr_ne` remain Ref-Ref (rewritten in `jtransform`
-    // per `rpython/jit/codewriter/jtransform.py _rewrite_cmp_ptrs`)
-    // and are skipped.
+    // without this pass they stay Unknown and `setconcretetype` fails
+    // (`rtyper.py bindingrepr`). Upgrade Unknown operands of pure
+    // integer ops to `Signed`, matching RPython's mandatory kind
+    // assignment (`rint.py IntegerRepr` `hop.inputargs(self, self)`).
+    // Void is Impossible/None (`IntegerRepr.convert_const` refuses None)
+    // and stays Void. `ptr_eq` / `ptr_ne` remain Ref-Ref (rewritten in
+    // `jtransform` per `jtransform.py _rewrite_cmp_ptrs`) and are skipped.
     fn is_int_unop(op: &str) -> bool {
         matches!(op, "neg" | "invert" | "not")
     }
@@ -322,50 +328,83 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
         }
     }
 
-    // Backfill any `Variable` that's referenced by the graph but was
-    // never typed (e.g. Link args pointing at values with no producer
-    // op, synthetic values whose declaring site didn't seed a
-    // concretetype).  RPython's rtyper cannot leave any `Variable`
-    // untyped — `lltype.Signed / Ptr / Float` is mandatory — so the
-    // assembler is entitled to assume every register has a class.
-    // Default untyped values to `GcRef` (the same safe default
-    // jtransform's `get_value_kind` picks) so `build_value_kinds` +
-    // `perform_register_allocation` always produce a coloring for
-    // every reachable value.
+    // `RPythonTyper.setconcretetype` writes
+    // `v.concretetype = bindingrepr(v).lowleveltype` (`rtyper.py`).
+    // There is no default: `bindingrepr` calls `annotator.binding`,
+    // which is a KeyError when the Variable has no annotation. A
+    // leftover Unknown is that typer bug — do not invent `GcRef`.
     #[expect(
         clippy::mutable_key_type,
         reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
     )]
     let mut seen: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     for block in &graph.blocks {
-        for var in &block.inputargs {
-            seen.insert(var.clone());
-        }
-        for op in &block.operations {
-            for var in crate::inline::op_variable_refs(&op.kind) {
-                seen.insert(var);
-            }
-            if let Some(r) = op.result.as_ref() {
-                seen.insert(r.clone());
-            }
-        }
-        for link in &block.exits {
-            for arg in &link.args {
-                if let Some(var) = arg.as_variable() {
-                    seen.insert(var.clone());
-                }
-            }
-            for arg in link.last_exception.iter().chain(link.last_exc_value.iter()) {
-                if let Some(var) = arg.as_variable() {
-                    seen.insert(var.clone());
-                }
-            }
+        collect_block_variables(block, &mut seen);
+    }
+    // A graph whose body never reaches `returnblock` still owns
+    // `getreturnvar()`. `SomeImpossibleValue.rtyper_makerepr` is
+    // `impossible_repr` (`rtyper.py` / `annmodel.py`) — Void, not a
+    // heap object. Seed that before leftover Unknown is a TyperError.
+    // Only a live predecessor counts (`FunctionGraph.iterblocks` walks
+    // from `startblock`; `RPythonTyper.specialize_more_blocks` walks
+    // `annotator.annotated`). A disconnected untyped link into
+    // returnblock does not keep the return var live.
+    let live_flags = live_block_flags(graph);
+    let returnblock_has_pred = graph.blocks.iter().enumerate().any(|(idx, block)| {
+        live_flags[idx]
+            && block.id != graph.returnblock
+            && block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.returnblock)
+    });
+    if !returnblock_has_pred
+        && let Some(ret) = graph
+            .blocks
+            .get(graph.returnblock.0)
+            .and_then(|block| block.inputargs.first())
+        && FunctionGraph::concretetype_of(ret) == ConcreteType::Unknown
+    {
+        FunctionGraph::set_concretetype_of_inline(ret, ConcreteType::Void);
+    }
+
+    // `RPythonTyper.specialize` only walks `annotator.annotated` after
+    // `annotator.simplify`. Skip-arm does not delete disconnected
+    // blocks; their Variables have no binding. They are
+    // `SomeImpossibleValue` → `impossible_repr` (Void). Live blocks are
+    // `FunctionGraph.iterblocks` from startblock plus
+    // `secondary_entry_roots`. Do not invent GcRef.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Variable equality and hashing use immutable identity IDs while annotations are excluded; this exactly models RPython object-identity dictionary keys without a divergent side table"
+    )]
+    let mut live_vars: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    for (idx, block) in graph.blocks.iter().enumerate() {
+        if live_flags[idx] {
+            collect_block_variables(block, &mut live_vars);
         }
     }
     for var in &seen {
-        if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown {
-            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
+        if FunctionGraph::concretetype_of(var) == ConcreteType::Unknown && !live_vars.contains(var)
+        {
+            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::Void);
         }
+    }
+
+    let leftover: Vec<&Variable> = live_vars
+        .iter()
+        .filter(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Unknown)
+        .collect();
+    if let Some(var) = leftover.first() {
+        let names: Vec<String> = leftover.iter().map(|v| v.name()).take(12).collect();
+        panic!(
+            "setconcretetype: no binding for {} in graph {:?} ({} leftover \
+             Unknown Variable(s): {}; rtyper.py setconcretetype / bindingrepr)",
+            var.name(),
+            graph.name,
+            leftover.len(),
+            names.join(", "),
+        );
     }
 
     // RPython parity: every `FunctionGraph::set_concretetype_of_inline(&var, ct)`
@@ -375,6 +414,82 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
     // `FunctionGraph::concretetype_of(&v)` (i.e.
     // `getkind(v.concretetype)`) directly without a separate
     // `apply_to_graph` publish step.
+    Ok(())
+}
+
+/// Reachability from `startblock` (`FunctionGraph.iterblocks`) plus
+/// `secondary_entry_roots`. Those extra roots stand in for
+/// `simplify.transform_dead_op_vars_in_blocks`'s every-graph-start root
+/// when one `FunctionGraph` carries a second start (the `generated::*` /
+/// `eval_loop_jit` body block). An unreached returnblock or exceptblock
+/// is not live; its Unknown variables take `impossible_repr` (Void).
+fn live_block_flags(graph: &FunctionGraph) -> Vec<bool> {
+    let mut live = vec![false; graph.blocks.len()];
+    let mut worklist: Vec<crate::model::BlockId> = vec![graph.startblock];
+    worklist.extend(crate::model::secondary_entry_roots(graph));
+    while let Some(block_id) = worklist.pop() {
+        if std::mem::replace(&mut live[block_id.0], true) {
+            continue;
+        }
+        for link in &graph.blocks[block_id.0].exits {
+            worklist.push(link.target);
+        }
+    }
+    live
+}
+
+fn collect_block_variables(block: &crate::model::Block, into: &mut HashSet<Variable>) {
+    for var in &block.inputargs {
+        into.insert(var.clone());
+    }
+    for op in &block.operations {
+        for var in crate::inline::op_variable_refs(&op.kind) {
+            into.insert(var);
+        }
+        if let Some(result) = op.result.as_ref() {
+            into.insert(result.clone());
+        }
+    }
+    for link in &block.exits {
+        for arg in &link.args {
+            if let Some(var) = arg.as_variable() {
+                into.insert(var.clone());
+            }
+        }
+        for arg in link.last_exception.iter().chain(link.last_exc_value.iter()) {
+            if let Some(var) = arg.as_variable() {
+                into.insert(var.clone());
+            }
+        }
+    }
+}
+
+fn concrete_from_annotation(
+    s: &crate::annotator::model::SomeValue,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> Result<ConcreteType, crate::translator::rtyper::error::TyperError> {
+    use crate::annotator::description::DescEntry;
+    use crate::annotator::model::SomeValue;
+    if let SomeValue::PBC(pbc) = s {
+        let all_frozen = pbc
+            .descriptions
+            .values()
+            .all(|d| matches!(d, DescEntry::Frozen(_)));
+        if all_frozen {
+            if pbc.descriptions.len() > 1 || pbc.can_be_none {
+                return Err(
+                    crate::translator::rtyper::legacy_annotator::multiple_frozen_pbc_unsupported(),
+                );
+            }
+            // `getFrozenPBCRepr` → `SingleFrozenPBCRepr.lowleveltype = Void`.
+            return Ok(ConcreteType::Void);
+        }
+    }
+    let vtype = somevalue_to_valuetype(s);
+    Ok(valuetype_to_concrete_for_legacy(
+        &vtype,
+        raw_alloc_flavor_structs,
+    ))
 }
 
 fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
@@ -402,8 +517,15 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_)
-        | ConstValue::Opaque(_)
-        | ConstValue::Repr(_) => ConcreteType::GcRef,
+        | ConstValue::Opaque(_) => ConcreteType::GcRef,
+        // Bare-constant repr selection after annotation: one FrozenDesc
+        // (`getFrozenPBCRepr` → `SingleFrozenPBCRepr`).
+        // `SingleFrozenPBCRepr.lowleveltype` is `Void`; `history.getkind(Void)`
+        // is `"void"`. `refuse_merged_frozen_pbc_reprs` refuses a dest
+        // whose `follow_link` / `mergeinputargs` union is not a single
+        // FrozenDesc (`getFrozenPBCRepr`), or — when the dest is
+        // unannotated — distinct Repr identities or a mixed non-Repr arg.
+        ConstValue::Repr(_) => ConcreteType::Void,
     }
 }
 
@@ -442,6 +564,12 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
             FunctionGraph::set_concretetype_of_inline(dst, incoming);
             continue;
         }
+        // `insert_link_conversions` (`rtyper.py`) converts each Constant
+        // into the dest repr. A bare Repr constant is `SingleFrozenPBCRepr`
+        // (`getFrozenPBCRepr`). `refuse_merged_frozen_pbc_reprs` already
+        // refused a dest whose `follow_link` / `mergeinputargs` union is
+        // not a single FrozenDesc, or — when the dest is unannotated —
+        // distinct Repr identities or a mixed non-Repr arg.
         let _ = maybe_seed_concrete_type(dst, link_arg_concrete_type(src));
     }
 }
@@ -678,8 +806,8 @@ fn infer_concrete_from_op(
         // MIR local's declared type, which is `ValueType::Unknown`
         // whenever that type cannot be resolved.  Leave Unknown so the
         // integer-op backward-constraint pass (`resolve_types`) can
-        // upgrade operands of pure integer ops to `Signed` before the
-        // final GcRef backfill.
+        // upgrade operands of pure integer ops to `Signed` before
+        // leftover Unknown fails `setconcretetype`.
         OpKind::Input { ty, .. } => valuetype_to_concrete_for_legacy(ty, raw_alloc_flavor_structs),
         // Field / array reads whose declared `ty` is pyre-only Unknown
         // default to `ConcreteType::GcRef` so the value reaches
@@ -805,7 +933,17 @@ mod tests {
     fn resolves_ref_field() {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
-        let base_var = graph.alloc_value_var();
+        let base_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
         let v_var = graph
             .push_op_var(
                 entry,
@@ -1041,6 +1179,167 @@ mod tests {
         resolve_types(&graph, &HashSet::new());
     }
 
+    fn repr_const(
+        handle: &std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr>,
+    ) -> ConstValue {
+        ConstValue::Repr(crate::flowspace::model::ReprConst::new(
+            std::sync::Arc::clone(handle),
+        ))
+    }
+
+    fn branch_start_to_preds(
+        graph: &mut FunctionGraph,
+        pred1: crate::model::BlockId,
+        pred2: crate::model::BlockId,
+    ) {
+        let cond = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "switch".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_branch(graph.startblock, cond, pred1, vec![], pred2, vec![]);
+    }
+
+    fn two_pred_const_phi(
+        left: ConstValue,
+        right: ConstValue,
+    ) -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("repr_phi");
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto_mixed(
+            pred1,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(left))],
+        );
+        graph.set_goto_mixed(
+            pred2,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(
+                right,
+            ))],
+        );
+        graph.set_return(join, Some(phi.clone()));
+        (graph, phi)
+    }
+
+    #[test]
+    fn same_repr_const_phi_is_void() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, phi) = two_pred_const_phi(repr_const(&handle), repr_const(&handle));
+        annotate::annotate(&graph);
+        resolve_types_inner(&graph, &HashSet::new()).expect("same ReprConst is Void");
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Void);
+    }
+
+    #[test]
+    fn distinct_repr_const_phi_is_typer_error() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle_a: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let handle_b: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, _phi) = two_pred_const_phi(repr_const(&handle_a), repr_const(&handle_b));
+        let err =
+            resolve_types_inner(&graph, &HashSet::new()).expect_err("distinct ReprConst merge");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleFrozenPBCRepr"),
+            "error should name MultipleFrozenPBCRepr, got {msg}"
+        );
+        assert!(
+            msg.contains("getFrozenPBCRepr"),
+            "error should cite getFrozenPBCRepr, got {msg}"
+        );
+    }
+
+    #[test]
+    fn repr_const_mixed_with_non_repr_is_typer_error() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, _phi) = two_pred_const_phi(repr_const(&handle), ConstValue::Int(1));
+        let err =
+            resolve_types_inner(&graph, &HashSet::new()).expect_err("Repr mixed with non-Repr");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleFrozenPBCRepr"),
+            "error should name MultipleFrozenPBCRepr, got {msg}"
+        );
+        assert!(
+            msg.contains("getFrozenPBCRepr"),
+            "error should cite getFrozenPBCRepr, got {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_types_accepts_repr_const_and_same_singleton_variable() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let c = repr_const(&handle);
+        let bk = Rc::new(Bookkeeper::new());
+        let s_pbc = bk
+            .immutablevalue(&c)
+            .expect("immutablevalue of Repr is SomePBC");
+
+        let mut graph = FunctionGraph::new("repr_const_and_var");
+        let pred1 = graph.create_block();
+        let pred2 = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+
+        let src_var = graph.alloc_value_var();
+        *src_var.annotation.borrow_mut() = Some(Rc::new(s_pbc));
+
+        branch_start_to_preds(&mut graph, pred1, pred2);
+        graph.set_goto_mixed(
+            pred1,
+            join,
+            vec![LinkArg::Const(crate::flowspace::model::Constant::new(c))],
+        );
+        graph.set_goto(pred2, join, vec![src_var]);
+        graph.set_return(join, Some(phi.clone()));
+
+        annotate::annotate_with_bookkeeper(&graph, Some(&bk));
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Void);
+    }
+
+    #[test]
+    fn resolve_types_refuses_distinct_repr_consts_unannotated() {
+        use crate::translator::rtyper::rmodel::VoidRepr;
+
+        let handle_a: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let handle_b: std::sync::Arc<dyn crate::translator::rtyper::rmodel::Repr> =
+            std::sync::Arc::new(VoidRepr::new());
+        let (graph, _phi) = two_pred_const_phi(repr_const(&handle_a), repr_const(&handle_b));
+        let err = resolve_types_inner(&graph, &HashSet::new())
+            .expect_err("distinct ReprConst unannotated");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("MultipleFrozenPBCRepr"),
+            "error should name MultipleFrozenPBCRepr, got {msg}"
+        );
+    }
+
     #[test]
     fn same_as_preserves_ref_classification() {
         let mut graph = FunctionGraph::new("same_as_ref");
@@ -1161,7 +1460,178 @@ mod tests {
     }
 
     #[test]
-    fn unknown_input_without_integer_constraint_backfills_as_gcref() {
+    fn unreached_returnblock_is_void_despite_disconnected_predecessor() {
+        // startblock raises and never reaches returnblock.
+        // A disconnected block (no predecessor, no `OpKind::Input`
+        // inputargs) still exits to returnblock with an untyped
+        // Variable. `RPythonTyper.specialize_more_blocks` walks
+        // `annotator.annotated`; `FunctionGraph.iterblocks` walks
+        // from `startblock` — neither sees the disconnected block.
+        // The return var is `SomeImpossibleValue` → `impossible_repr`
+        // (`rtyper.py` / `annmodel.py`): Void.
+        let mut graph = FunctionGraph::new("dead_return_pred");
+        let entry = graph.startblock;
+        graph.set_raise(entry, "");
+        let dead = graph.create_block();
+        let ghost = graph.alloc_value_var();
+        graph.set_return(dead, Some(ghost));
+        let return_var = graph.blocks[graph.returnblock.0].inputargs[0].clone();
+
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(
+            FunctionGraph::concretetype_of(&return_var),
+            ConcreteType::Void
+        );
+    }
+
+    #[test]
+    fn unreached_disconnected_phi_is_impossible_void() {
+        // `annotator.simplify` / `clear_unreachable_blocks` drop a
+        // no-predecessor phi that is not an Input-shaped secondary
+        // entry. Skip-arm keeps the block; `SomeImpossibleValue` →
+        // `impossible_repr` types it Void.
+        let mut graph = FunctionGraph::new("dead_phi");
+        let entry = graph.startblock;
+        let live = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        graph.set_return(entry, Some(live.clone()));
+        let (_dead, args) = graph.create_block_with_arg_vars(1);
+        let ghost = args[0].clone();
+
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&live), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&ghost), ConcreteType::Void);
+    }
+
+    #[test]
+    fn unreachable_return_predecessor_does_not_panic() {
+        // startblock loops and never reaches returnblock.
+        // A disconnected block (no predecessor, no `OpKind::Input`
+        // inputargs) still exits to returnblock with an untyped
+        // Variable. `FunctionGraph.iterblocks` walks from
+        // `startblock`; `RPythonTyper.specialize_more_blocks` walks
+        // `annotator.annotated` — neither sees the disconnected block
+        // or the unreached return. The return var is
+        // `SomeImpossibleValue` → `impossible_repr` (`rtyper.py` /
+        // `annmodel.py`): Void.
+        let mut graph = FunctionGraph::new("loop_dead_return_pred");
+        let entry = graph.startblock;
+        graph.set_goto(entry, entry, vec![]);
+        let dead = graph.create_block();
+        let ghost = graph.alloc_value_var();
+        graph.set_return(dead, Some(ghost));
+        let return_var = graph.blocks[graph.returnblock.0].inputargs[0].clone();
+
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        let live = live_block_flags(&graph);
+        assert!(live[entry.0]);
+        assert!(!live[dead.0]);
+        assert!(!live[graph.returnblock.0]);
+        assert!(!live[graph.exceptblock.0]);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&return_var),
+            ConcreteType::Void
+        );
+    }
+
+    #[test]
+    fn secondary_entry_block_stays_live() {
+        // `simplify.transform_dead_op_vars_in_blocks` treats every
+        // graph start as a root. A no-predecessor block whose
+        // inputargs are all defined by matching `OpKind::Input` ops
+        // is pyre's stand-in (`secondary_entry_roots`) when one
+        // `FunctionGraph` carries a second start (`generated::*` /
+        // `eval_loop_jit`).
+        let mut graph = FunctionGraph::new("secondary_entry");
+        let entry = graph.startblock;
+        let live_ret = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        graph.set_return(entry, Some(live_ret));
+        let orphan = graph.create_block();
+        let param = graph
+            .push_op_var(
+                orphan,
+                OpKind::Input {
+                    name: "captured".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(orphan, param.clone());
+
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert!(
+            live_block_flags(&graph)[orphan.0],
+            "Input-shaped secondary entry must stay live"
+        );
+        assert_eq!(FunctionGraph::concretetype_of(&param), ConcreteType::Signed);
+    }
+
+    #[test]
+    fn input_op_without_secondary_entry_shape_is_not_live() {
+        // `secondary_entry_roots` is not "contains `OpKind::Input`".
+        // A disconnected block with an Input op stays dead when it
+        // has a predecessor, or when an inputarg is not defined by
+        // a matching Input.
+
+        let mut with_pred = FunctionGraph::new("input_with_pred");
+        with_pred.set_raise(with_pred.startblock, "");
+        let pred = with_pred.create_block();
+        let target = with_pred.create_block();
+        let param = with_pred
+            .push_op_var(
+                target,
+                OpKind::Input {
+                    name: "x".to_string(),
+                    ty: ValueType::Unknown,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        with_pred.push_inputarg_var(target, param.clone());
+        let ghost = with_pred.alloc_value_var();
+        with_pred.set_goto(pred, target, vec![ghost]);
+
+        annotate::annotate(&with_pred);
+        resolve_types(&with_pred, &HashSet::new());
+        let live = live_block_flags(&with_pred);
+        assert!(!live[pred.0]);
+        assert!(!live[target.0]);
+        assert_eq!(FunctionGraph::concretetype_of(&param), ConcreteType::Void);
+
+        let mut unmatched = FunctionGraph::new("inputarg_not_from_input");
+        unmatched.set_raise(unmatched.startblock, "");
+        let (orphan, args) = unmatched.create_block_with_arg_vars(1);
+        let phi = args[0].clone();
+        let extra = unmatched
+            .push_op_var(
+                orphan,
+                OpKind::Input {
+                    name: "extra".to_string(),
+                    ty: ValueType::Unknown,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+
+        annotate::annotate(&unmatched);
+        resolve_types(&unmatched, &HashSet::new());
+        let live = live_block_flags(&unmatched);
+        assert!(!live[orphan.0]);
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Void);
+        assert_eq!(FunctionGraph::concretetype_of(&extra), ConcreteType::Void);
+    }
+
+    #[test]
+    #[should_panic(expected = "setconcretetype: no binding")]
+    fn unknown_input_without_integer_constraint_is_typer_error() {
+        // `rtyper.py setconcretetype` / `bindingrepr` has no GcRef default.
         let mut graph = FunctionGraph::new("unknown_backfill");
         let entry = graph.startblock;
         let value_var = graph
@@ -1175,14 +1645,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(value_var.clone()));
+        graph.set_return(entry, Some(value_var));
 
         annotate::annotate(&graph);
         resolve_types(&graph, &HashSet::new());
-        assert_eq!(
-            FunctionGraph::concretetype_of(&value_var),
-            ConcreteType::GcRef
-        );
     }
 
     #[test]

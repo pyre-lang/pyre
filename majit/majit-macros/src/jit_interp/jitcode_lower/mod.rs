@@ -244,10 +244,10 @@ pub struct LowererConfig {
     pub(super) ref_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
     /// `array_fields = { Struct::field => ElementType }`, keyed
     /// `"StructLastSegment::field"` → (struct_path, field_ident,
-    /// element_path). The field holds an array BASE POINTER, so
-    /// `base.field[i]` is a `getfield_gc_r` followed by
-    /// `get/setarrayitem_gc_i` — never `arraylen_gc`, since the buffer
-    /// carries no header length.
+    /// element_path). The field holds an array BASE POINTER. Headerless
+    /// is `getfield_gc_i` then `get/setarrayitem_raw_*`; `ElementType in
+    /// Header` is `getfield_gc_r` then `get/setarrayitem_gc_*`. Never
+    /// `arraylen_gc` on the headerless buffer, which has no length word.
     pub(super) array_fields: HashMap<String, (syn::Path, Ident, syn::Path)>,
     /// `ElementType in Header` entries, same key as `array_fields`.
     /// The value is the header struct; element 0 is its `items` field,

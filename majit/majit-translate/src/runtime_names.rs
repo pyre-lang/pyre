@@ -160,6 +160,11 @@ pub(crate) mod modules {
     /// identifier anywhere under `majit/`, so the leaf lives only in the
     /// value.
     pub(crate) const OBJECT_MODEL: &str = "pyre_object.pyobject";
+    /// `pyobject.rs` `get_instantiate`. Matched by this CallPath (and the
+    /// corpus twin), not by a `pyobject|object_model` path suffix.
+    pub(crate) const GET_INSTANTIATE: &str = "pyre_object.pyobject.get_instantiate";
+    /// Translator-fixture spelling of [`GET_INSTANTIATE`].
+    pub(crate) const GET_INSTANTIATE_CORPUS: &str = "runtime_object.object_model.get_instantiate";
     pub(crate) const OBJECT_LLTYPE: &str = "pyre_object.lltype";
     pub(crate) const MALLOC: &str = "pyre_object.lltype.malloc";
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";

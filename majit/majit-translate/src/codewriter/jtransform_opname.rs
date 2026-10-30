@@ -329,6 +329,7 @@ fn transduce_op(
                         base,
                         array_type_id: array_type_id_of(&array),
                         nolength: array_nolength(&array),
+                        gckind: crate::model::ArrayGcKind::Gc,
                     },
                     result,
                 );
@@ -1356,6 +1357,7 @@ fn emit_getarrayitem(
                 item_ty: value_type_of(&result),
                 array_type_id: array_type_id_of(&array),
                 nolength: array_nolength(&array),
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: array._immutable_field(),
             },
             result,
@@ -1383,6 +1385,7 @@ fn emit_getarrayitem(
                 item_ty,
                 array_type_id: array_type_id_of(&array),
                 nolength: array_nolength(&array),
+                gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
             },
             result,
@@ -1426,6 +1429,7 @@ fn emit_setarrayitem(
                 item_ty: hlvalue_value_type(&op.args[2]),
                 nolength: array_nolength(&array),
                 array_type_id: array_type_id_of(&array),
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
         );
@@ -1452,6 +1456,7 @@ fn emit_setarrayitem(
                 item_ty,
                 array_type_id: array_type_id_of(&array),
                 nolength: array_nolength(&array),
+                gckind: crate::model::ArrayGcKind::Raw,
             },
             false,
         );

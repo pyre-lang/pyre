@@ -418,7 +418,8 @@ pub struct W_TypeObject {
     /// Shares [`crate::quasiimmut::QuasiImmutField`] with
     /// `ModuleDictStrategy.version?`, the way upstream's one `QuasiImmut`
     /// class serves every quasi-immutable field.
-    pub mutate_version_tag: crate::quasiimmut::QuasiImmutField,
+    pub mutate_version_tag: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_version_tag_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// Hidden `mutate_w_name` field (`quasiimmut.py get_mutate_field_name` of
     /// pyre `w_name`; upstream field `name` would produce `mutate_name`).
     /// `descr_set__name__` stores a new string without `mutated()`, so
@@ -427,7 +428,8 @@ pub struct W_TypeObject {
     ///
     /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
     /// no GC pointers, reclaimed by `type_object_destructor`.
-    pub mutate_w_name: crate::quasiimmut::QuasiImmutField,
+    pub mutate_w_name: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_w_name_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// Hidden `mutate_flag_cpython_immutabletype` field `rclass.py
     /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
     /// `"flag_cpython_immutabletype?"`.
@@ -439,14 +441,19 @@ pub struct W_TypeObject {
     ///
     /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
     /// no GC pointers, reclaimed by `type_object_destructor`.
-    pub mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField,
+    pub mutate_flag_cpython_immutabletype:
+        std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_flag_cpython_immutabletype_lock:
+        std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// Hidden `mutate_flag_patma_collection` field `rclass.py
     /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
     /// `"flag_patma_collection?"`.  Written by `_abc` registration.
     ///
     /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
     /// no GC pointers, reclaimed by `type_object_destructor`.
-    pub mutate_flag_patma_collection: crate::quasiimmut::QuasiImmutField,
+    pub mutate_flag_patma_collection: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_flag_patma_collection_lock:
+        std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type join
     /// the collector's traversal. A build that keeps the global interpreter
     /// lock gives them a two-word `PyGC_Head` for it, which is what
@@ -469,6 +476,50 @@ pub struct W_TypeObject {
     /// `typeobject.py W_TypeObject` `_lifeline_` (`getweakref` / `setweakref`
     /// / `delweakref` written by hand on this class).
     pub lifeline: PyObjectRef,
+}
+
+crate::quasi_immut_words!(W_TypeObject, mutate_version_tag, mutate_version_tag_lock);
+crate::quasi_immut_words!(W_TypeObject, mutate_w_name, mutate_w_name_lock);
+crate::quasi_immut_words!(
+    W_TypeObject,
+    mutate_flag_cpython_immutabletype,
+    mutate_flag_cpython_immutabletype_lock
+);
+crate::quasi_immut_words!(
+    W_TypeObject,
+    mutate_flag_patma_collection,
+    mutate_flag_patma_collection_lock
+);
+
+impl W_TypeObject {
+    #[inline]
+    pub fn mutate_version_tag(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_version_tag,
+            &self.mutate_version_tag_lock,
+        )
+    }
+
+    #[inline]
+    pub fn mutate_w_name(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_w_name, &self.mutate_w_name_lock)
+    }
+
+    #[inline]
+    pub fn mutate_flag_cpython_immutabletype(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_flag_cpython_immutabletype,
+            &self.mutate_flag_cpython_immutabletype_lock,
+        )
+    }
+
+    #[inline]
+    pub fn mutate_flag_patma_collection(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_flag_patma_collection,
+            &self.mutate_flag_patma_collection_lock,
+        )
+    }
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py).
@@ -673,10 +724,14 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         flag_dispatch_own_getattribute: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
-        mutate_version_tag: crate::quasiimmut::QuasiImmutField::new(),
-        mutate_w_name: crate::quasiimmut::QuasiImmutField::new(),
-        mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField::new(),
-        mutate_flag_patma_collection: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_version_tag: crate::quasiimmut::null_mutate_word(),
+        mutate_version_tag_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_w_name: crate::quasiimmut::null_mutate_word(),
+        mutate_w_name_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_flag_cpython_immutabletype: crate::quasiimmut::null_mutate_word(),
+        mutate_flag_cpython_immutabletype_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_flag_patma_collection: crate::quasiimmut::null_mutate_word(),
+        mutate_flag_patma_collection_lock: crate::quasiimmut::null_mutate_lock(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     };
@@ -820,10 +875,14 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         flag_dispatch_own_getattribute: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
-        mutate_version_tag: crate::quasiimmut::QuasiImmutField::new(),
-        mutate_w_name: crate::quasiimmut::QuasiImmutField::new(),
-        mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField::new(),
-        mutate_flag_patma_collection: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_version_tag: crate::quasiimmut::null_mutate_word(),
+        mutate_version_tag_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_w_name: crate::quasiimmut::null_mutate_word(),
+        mutate_w_name_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_flag_cpython_immutabletype: crate::quasiimmut::null_mutate_word(),
+        mutate_flag_cpython_immutabletype_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_flag_patma_collection: crate::quasiimmut::null_mutate_word(),
+        mutate_flag_patma_collection_lock: crate::quasiimmut::null_mutate_lock(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     }) as PyObjectRef
@@ -952,10 +1011,11 @@ pub unsafe fn w_type_set_flag_patma_collection(w_type: PyObjectRef, flag: u8) {
         return;
     }
     let t = w_type as *const W_TypeObject;
-    (*t).mutate_flag_patma_collection.invalidate_then_store(|| {
-        (*t).flag_patma_collection
-            .store(flag, std::sync::atomic::Ordering::Release);
-    });
+    (*t).mutate_flag_patma_collection()
+        .invalidate_then_store(|| {
+            (*t).flag_patma_collection
+                .store(flag, std::sync::atomic::Ordering::Release);
+        });
 }
 
 /// `Py_TPFLAGS_DISALLOW_INSTANTIATION` reader — `True` when `w_type`'s
@@ -1282,7 +1342,7 @@ pub unsafe fn w_type_current_qmut_instance(
     }
     Some(
         (*(obj as *const W_TypeObject))
-            .mutate_version_tag
+            .mutate_version_tag()
             .get_current_qmut_instance(),
     )
 }
@@ -1315,11 +1375,11 @@ pub unsafe fn w_type_notify_mutate_version_tag(obj: PyObjectRef) {
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    let field = &(*(obj as *const W_TypeObject)).mutate_version_tag;
-    if !field.is_installed() {
+    let t = &*(obj as *const W_TypeObject);
+    if !t.mutate_version_tag().is_installed() {
         return;
     }
-    crate::quasiimmut::sweep_quasi_immut_field(field);
+    crate::quasiimmut::sweep_quasi_immut_field(&t.mutate_version_tag);
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for this type's `name?`.
@@ -1339,7 +1399,7 @@ pub unsafe fn w_type_current_w_name_qmut(
     }
     Some(
         (*(obj as *const W_TypeObject))
-            .mutate_w_name
+            .mutate_w_name()
             .get_current_qmut_instance(),
     )
 }
@@ -1350,7 +1410,11 @@ pub unsafe fn w_type_current_w_name_qmut(
 /// # Safety
 /// `obj` must be null or point at a valid `W_TypeObject`.
 pub unsafe fn w_type_w_name_qmut_installed(obj: PyObjectRef) -> bool {
-    !obj.is_null() && is_type(obj) && (*(obj as *const W_TypeObject)).mutate_w_name.is_installed()
+    !obj.is_null()
+        && is_type(obj)
+        && (*(obj as *const W_TypeObject))
+            .mutate_w_name()
+            .is_installed()
 }
 
 /// Force this type's `name?` qmut directly. This is the tracer's own
@@ -1363,7 +1427,7 @@ pub unsafe fn w_type_force_w_name_qmut(obj: PyObjectRef) {
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    (*(obj as *const W_TypeObject)).mutate_w_name.invalidate();
+    (*(obj as *const W_TypeObject)).mutate_w_name().invalidate();
 }
 
 /// typeobject.py:183-185 `uses_object_getattribute` reader.  Returns the
@@ -1550,7 +1614,7 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     // `invalidate_then_store` owns every store; the GIL made that pair
     // indivisible in `quasiimmut.py make_invalidation_function.invalidation`.
     let t = obj as *mut W_TypeObject;
-    (*t).mutate_w_name.invalidate_then_store(|| {
+    (*t).mutate_w_name().invalidate_then_store(|| {
         // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
         // `w_type_get_name` returns `&str` and is read from the interpreter, the
         // JIT GC trace, cpyext, and extension modules, so this slot is not switched
@@ -1955,7 +2019,7 @@ pub unsafe fn w_type_set_cpython_type_flags(
     // `PyType_Freeze` share this writer; the sweep and the store share the
     // watcher lock so a recorder cannot publish a watcher for the old
     // value in between.
-    (*t).mutate_flag_cpython_immutabletype
+    (*t).mutate_flag_cpython_immutabletype()
         .invalidate_then_store(|| {
             (*t).flag_cpython_immutabletype
                 .store(immutabletype, std::sync::atomic::Ordering::Release);
@@ -1989,7 +2053,7 @@ pub unsafe fn w_type_is_cpython_static_builtin(obj: PyObjectRef) -> bool {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_cpython_immutabletype(obj: PyObjectRef, value: bool) {
     let t = obj as *const W_TypeObject;
-    (*t).mutate_flag_cpython_immutabletype
+    (*t).mutate_flag_cpython_immutabletype()
         .invalidate_then_store(|| {
             (*t).flag_cpython_immutabletype
                 .store(value, std::sync::atomic::Ordering::Release);
@@ -2879,7 +2943,7 @@ mod tests {
         let obj = w_type_new("Quasi", PY_NULL, std::ptr::null_mut());
         let w_type = unsafe { &*(obj as *const W_TypeObject) };
         assert!(
-            !w_type.mutate_version_tag.is_installed(),
+            !w_type.mutate_version_tag().is_installed(),
             "no instance until the first registration",
         );
 
@@ -2888,12 +2952,12 @@ mod tests {
         unsafe { w_type_current_qmut_instance(obj) }
             .expect("a type resolves an instance")
             .register_loop_token(&token);
-        assert!(w_type.mutate_version_tag.is_installed());
+        assert!(w_type.mutate_version_tag().is_installed());
 
         unsafe { w_type_set_version_tag(obj, new_version_tag()) };
         assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
         assert!(
-            !w_type.mutate_version_tag.is_installed(),
+            !w_type.mutate_version_tag().is_installed(),
             "the field is nulled before the sweep",
         );
 
@@ -2911,7 +2975,7 @@ mod tests {
         let obj = w_type_new("QuasiName", PY_NULL, std::ptr::null_mut());
         let w_type = unsafe { &*(obj as *const W_TypeObject) };
         assert!(
-            !w_type.mutate_w_name.is_installed(),
+            !w_type.mutate_w_name().is_installed(),
             "no instance until the first registration",
         );
 
@@ -2920,13 +2984,13 @@ mod tests {
         unsafe { w_type_current_w_name_qmut(obj) }
             .expect("a type resolves a name? instance")
             .register_loop_token(&token);
-        assert!(w_type.mutate_w_name.is_installed());
+        assert!(w_type.mutate_w_name().is_installed());
 
         let w_name = crate::w_str_new("D");
         unsafe { w_type_set_name(obj, w_name) };
         assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
         assert!(
-            !w_type.mutate_w_name.is_installed(),
+            !w_type.mutate_w_name().is_installed(),
             "the field is nulled before the sweep",
         );
 
@@ -2945,22 +3009,22 @@ mod tests {
         let obj = w_type_new("QuasiImm", PY_NULL, std::ptr::null_mut());
         let w_type = unsafe { &*(obj as *const W_TypeObject) };
         assert!(
-            !w_type.mutate_flag_cpython_immutabletype.is_installed(),
+            !w_type.mutate_flag_cpython_immutabletype().is_installed(),
             "no instance until the first registration",
         );
 
         let flag = Arc::new(AtomicBool::new(false));
         let token = crate::quasiimmut::test_loop_token(&flag);
         w_type
-            .mutate_flag_cpython_immutabletype
+            .mutate_flag_cpython_immutabletype()
             .get_current_qmut_instance()
             .register_loop_token(&token);
-        assert!(w_type.mutate_flag_cpython_immutabletype.is_installed());
+        assert!(w_type.mutate_flag_cpython_immutabletype().is_installed());
 
         unsafe { w_type_set_cpython_immutabletype(obj, true) };
         assert!(flag.load(Ordering::Acquire), "the loop must be revoked");
         assert!(
-            !w_type.mutate_flag_cpython_immutabletype.is_installed(),
+            !w_type.mutate_flag_cpython_immutabletype().is_installed(),
             "the field is nulled before the sweep",
         );
 

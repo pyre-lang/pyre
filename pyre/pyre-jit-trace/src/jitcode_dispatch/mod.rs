@@ -12859,7 +12859,7 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
 /// `CachedAttributeHolder`, never the enum start. `MapNode` is `repr(C)`
 /// (tag then payload); descr offsets are `offset_of!` on those structs so
 /// `quasiimmut.py get_current_qmut_instance` (`struct_ptr + mutate offset`)
-/// lands on the `QuasiImmutField`.
+/// lands on the mutate word.
 ///
 /// `walker_flush_guard_not_invalidated` drains a pending flag, so consecutive
 /// markers at one fold site emit exactly one `GUARD_NOT_INVALIDATED`.

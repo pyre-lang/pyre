@@ -72,14 +72,27 @@ fn wrap_as_builtin_function(func: PyObjectRef) -> PyObjectRef {
         payload.ob.ob_type = &crate::BUILTIN_FUNCTION_TYPE as *const _;
         payload.ob.w_class = pyre_object::pyobject::get_instantiate(&crate::BUILTIN_FUNCTION_TYPE);
         payload.can_change_code = false;
-        // `ptr::read` copied the source's watchers; overwrite without dropping
-        // them so the source keeps its own `mutate_<name>` instances.
-        for slot in crate::QuasiImmutSlot::ALL {
-            std::ptr::write(
-                payload.mutate_field_mut(slot),
-                pyre_object::quasiimmut::QuasiImmutField::new(),
-            );
-        }
+        // `ptr::read` copied the source's watchers; overwrite the words
+        // without reclaiming so the source keeps its own `mutate_<name>`
+        // instances. AtomicPtr assignment does not free the published Arc.
+        payload.mutate_code = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_code_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_w_func_globals_obj = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_w_func_globals_obj_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_closure = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_closure_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_defs_w = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_defs_w_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_name = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_name_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_w_qualname = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_w_qualname_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_w_objclass = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_w_objclass_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_w_text_signature = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_w_text_signature_lock = pyre_object::quasiimmut::null_mutate_lock();
+        payload.mutate_w_kw_defs = pyre_object::quasiimmut::null_mutate_word();
+        payload.mutate_w_kw_defs_lock = pyre_object::quasiimmut::null_mutate_lock();
         // BuiltinFunction.typedef has no instance dict (`hasdict=false`);
         // a copied Function dict would leak `__code__` / `__defaults__`
         // / `__globals__` as hasattr-true instance attributes.

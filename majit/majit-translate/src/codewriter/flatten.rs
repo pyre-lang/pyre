@@ -1642,7 +1642,8 @@ pub(crate) fn constant_kind(c: &Constant) -> char {
 ///
 /// Pyre's [`ConstValue`] carries the effective lltype by variant: `Int`
 /// is `lltype.Signed`, `Float` is `lltype.Float`, `HostObject`/`None`/`Str`
-/// are gcref-bearing (kind `'r'`), `SpecTag` is a Signed wrapper.
+/// are gcref-bearing (kind `'r'`), `Repr` is `SingleFrozenPBCRepr` /
+/// `Void` (`'v'`), `SpecTag` is a Signed wrapper.
 pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
     match cv {
         ConstValue::Int(_)
@@ -1661,7 +1662,6 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::UniStr(_)
         | ConstValue::HostObject(_)
         | ConstValue::Opaque(_)
-        | ConstValue::Repr(_)
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
         | ConstValue::Dict(_)
@@ -1672,6 +1672,11 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::Function(_)
         | ConstValue::Atom(_)
         | ConstValue::Placeholder => 'r',
+        // Bare-constant repr selection after annotation: one FrozenDesc
+        // (`getFrozenPBCRepr` → `SingleFrozenPBCRepr`).
+        // `SingleFrozenPBCRepr.lowleveltype` is `Void`; `history.getkind(Void)`
+        // is `"void"`.
+        ConstValue::Repr(_) => 'v',
     }
 }
 
@@ -3302,5 +3307,12 @@ mod tests {
         // No concretetype → fall back to value variant.
         let bare = Constant::new(ConstValue::Int(7));
         assert_eq!(constant_kind(&bare), 'i');
+        // Bare `ConstValue::Repr` is `SingleFrozenPBCRepr` (`rpbc.py`);
+        // `history.getkind(Void)` is `"void"`.
+        let bare_repr = Constant::new(ConstValue::Repr(crate::flowspace::model::ReprConst::new(
+            crate::translator::rtyper::rint::signed_repr(),
+        )));
+        assert_eq!(constant_kind(&bare_repr), 'v');
+        assert_eq!(constvalue_kind(&bare_repr.value), 'v');
     }
 }

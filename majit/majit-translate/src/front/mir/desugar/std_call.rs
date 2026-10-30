@@ -1366,9 +1366,7 @@ impl<'a> Lowering<'a> {
         }
         let type_id = type_decl_ref_adt_id(self.field_base_adt(base_ty)?)?;
         let td = self.llbc.type_by_id(type_id)?;
-        let target = std::env::var("TARGET").unwrap_or_default();
-        td.layout_for_target(self.llbc, &target)?
-            .struct_field_offset(field_idx)
+        type_decl_struct_field_offset(td, self.llbc, field_idx)
     }
 
     /// Whole-enum move: switch on `__discriminant`, then copy that
@@ -1701,14 +1699,19 @@ impl<'a> Lowering<'a> {
     /// Copy `src` into `dest` one inner leaf at a time.
     ///
     /// `src` is the inlined struct value; `dest` is the outer object.
-    /// Leaves use the inner struct's own descriptors, matching a nested
-    /// `FieldRead` of `frame.header.leaf` whose base is the outer object.
+    /// Reads use the inner struct's relative leaf descriptors. An offset-0
+    /// hop keeps that inner descr on the write (`heaptracker.all_fielddescrs`
+    /// / `Transformer.zero_contents`: the outer object is an inner object at
+    /// that address). A nonzero hop writes `{field}.{leaf}` on the container
+    /// (`nest_inline_leaf`); `nested_struct_leaf` sums enclosing offsets.
     pub(in crate::front::mir) fn emit_inlined_struct_leaf_copy(
         &mut self,
         mir_bb: usize,
         dest: &Variable,
         src: &Variable,
         nested: &TypeDecl,
+        container_field: &FieldDescriptor,
+        at_offset_zero: bool,
     ) {
         let leaves = collect_by_value_struct_leaves(
             nested,
@@ -1719,14 +1722,14 @@ impl<'a> Lowering<'a> {
             &self.raw_alloc_flavor_structs,
         );
         let bb_id = self.emit_bb(mir_bb);
-        for (leaf, leaf_ty) in leaves {
+        for leaf in leaves {
             let read = self.graph.alloc_value_var();
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(read.clone()),
                 kind: OpKind::FieldRead {
                     base: src.clone(),
-                    field: leaf.clone(),
-                    ty: leaf_ty.clone(),
+                    field: leaf.field.clone(),
+                    ty: leaf.ty.clone(),
                     pure: false,
                 },
             });
@@ -1734,9 +1737,9 @@ impl<'a> Lowering<'a> {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: dest.clone(),
-                    field: leaf,
+                    field: container_leaf_descriptor(container_field, at_offset_zero, &leaf),
                     value: LinkArg::Value(read),
-                    ty: leaf_ty,
+                    ty: leaf.ty,
                 },
             });
         }
@@ -2879,6 +2882,7 @@ impl<'a> Lowering<'a> {
                             base: list.clone(),
                             array_type_id: Some("[u8]".to_string()),
                             nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
                         },
                     });
                     len

@@ -669,6 +669,7 @@ fn build_nonnull(names: &AllocAndSetNames, identity: &FixedArrayRepeat) -> Funct
             item_ty: identity.item_ty.clone(),
             array_type_id: Some(identity.array_type_id.clone()),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         },
         false,
     );
