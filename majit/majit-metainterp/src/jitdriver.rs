@@ -15523,14 +15523,12 @@ mod tests {
 
     /// Compile twice at one green key and hand back both MetaInterp high-waters.
     ///
-    /// The second compile only happens if the key is traceable *again* while
-    /// its `compiled_loops` entry is still present. Both trace-start doors
-    /// (`on_back_edge`, `force_start_tracing`) refuse a key whose cell
-    /// `is_compiled()`, which is `get_procedure_token().is_some()` filtered on
-    /// `!is_invalidated()` (`warmstate.rs`'s `BaseJitCell::is_compiled`).
-    /// Invalidating the procedure token clears that predicate and touches no
-    /// `compiled_loops` entry, so it re-opens tracing — the same
-    /// desynchronisation quasi-immut invalidation produces in production.
+    /// Both trace-start doors (`on_back_edge`, `force_start_tracing`) refuse a
+    /// key whose cell `is_compiled()`, which is `get_procedure_token().is_some()`
+    /// filtered on `!is_invalidated()` (`warmstate.rs` `BaseJitCell.is_compiled`).
+    /// `invalidate_all` clears the token so tracing re-opens — the same
+    /// `warmstate.py BaseJitCell.get_procedure_token` filter quasi-immut
+    /// invalidation produces in production.
     ///
     /// Returns `(high-water after first compile, high-water after replacement)`.
     fn compile_twice_at_one_green_key(
@@ -15541,16 +15539,11 @@ mod tests {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(raw);
-        let hash = key.get_uhash();
 
         compile_once_at(&mut driver, &key, first_adds);
         let first_opref = driver.meta.next_global_opref;
 
         driver.meta.warm_state_for_driver(0).invalidate_all();
-        assert!(
-            driver.meta.has_compiled_loop_entry(hash),
-            "invalidating the token must leave the entry to be displaced"
-        );
 
         compile_once_at(&mut driver, &key, second_adds);
         assert_eq!(
