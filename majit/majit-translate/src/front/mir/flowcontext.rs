@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// `objectmodel.keepalive_until_here`.
+pub(crate) const KEEPALIVE_UNTIL_HERE_PATH: &str =
+    "rpython::rlib::objectmodel::keepalive_until_here";
+
 /// The `(base, index)` operands of a devirtualized workspace index call,
 /// recorded for the paired `*p = v` write.  Each operand keeps the
 /// resolving-block Variable plus its source MIR local (`None` for a
@@ -3571,10 +3575,35 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn emit_keepalive(&mut self, mir_bb: usize, owner: Variable) {
         let _ = self.emit_path_call(
             mir_bb,
-            "rpython::rlib::objectmodel::keepalive_until_here",
+            KEEPALIVE_UNTIL_HERE_PATH,
             vec![owner],
             ValueType::Void,
         );
+    }
+
+    /// True when `owner` is `emit_gc_null`'s `ConstRefNull`, or a
+    /// `FrameState.copy` of one (`input_copied_from`).
+    fn owner_is_gc_null(&self, owner: &Variable) -> bool {
+        let mut id = owner.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let produced = self.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(op.kind, OpKind::ConstRefNull)
+                        && op.result.as_ref().is_some_and(|r| r.id() == id)
+                })
+            });
+            if produced {
+                return true;
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return false;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return false,
+            }
+        }
     }
 
     /// `StorageDead` of a window local: keepalive the GC owner, then drop it.
@@ -3586,7 +3615,10 @@ impl<'a> Lowering<'a> {
         let Some(owner) = self.window_owner_of_local(local) else {
             return;
         };
-        self.emit_keepalive(mir_bb, owner);
+        // A defined null is an empty GC root (`liveness.py` keeps Registers).
+        if !self.owner_is_gc_null(&owner) {
+            self.emit_keepalive(mir_bb, owner);
+        }
         if let Some(LocalValue::Pair(_, _, slot)) =
             self.local_var.get_mut(local).and_then(Option::as_mut)
         {

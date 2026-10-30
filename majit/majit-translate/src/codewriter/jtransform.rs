@@ -16415,7 +16415,8 @@ fn call_is_keepalive_until_here(target: &CallTarget) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => segments
             .iter()
-            .any(|s| s == "keepalive_until_here" || s.ends_with("keepalive_until_here")),
+            .map(String::as_str)
+            .eq(crate::front::mir::KEEPALIVE_UNTIL_HERE_PATH.split("::")),
         _ => false,
     }
 }
@@ -17759,6 +17760,23 @@ mod tests {
             kind: OpKind::live(),
         };
         assert_eq!(keep_operation_unchanged(&transformer, &op), op);
+    }
+
+    #[test]
+    fn call_is_keepalive_until_here_matches_exact_path_only() {
+        let exact =
+            CallTarget::function_path(crate::front::mir::KEEPALIVE_UNTIL_HERE_PATH.split("::"));
+        assert!(call_is_keepalive_until_here(&exact));
+        assert!(!call_is_keepalive_until_here(&CallTarget::function_path([
+            "custom_keepalive_until_here"
+        ])));
+        assert!(!call_is_keepalive_until_here(&CallTarget::function_path([
+            "foo",
+            "keepalive_until_here"
+        ])));
+        assert!(!call_is_keepalive_until_here(&CallTarget::function_path([
+            "keepalive_until_here"
+        ])));
     }
 
     /// `jtransform.py` `('keepalive', '-live-')`: the operand is forced live.

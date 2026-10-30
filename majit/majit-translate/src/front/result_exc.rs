@@ -5749,6 +5749,8 @@ fn rewire_question_site(
         a
     };
     let mut chain = vec![(pred_of_branch, site.branch_block)];
+    let mut plumbing = vec![site.branch_block];
+    let mut recognized_per: Vec<(usize, Vec<usize>, &'static str)> = Vec::new();
     let (shell_var, disc_var, continue_link, break_link) = if site.fused {
         let (disc_idx, disc_var) =
             recognize_fused_question(graph, site.branch_block, site.branch_op_idx).ok_or_else(
@@ -5759,13 +5761,11 @@ fn rewire_question_site(
                     )
                 },
             )?;
-        assert_question_plumbing_pure(
-            graph,
+        recognized_per.push((
             site.branch_block,
-            &[site.branch_op_idx, disc_idx],
+            vec![site.branch_op_idx, disc_idx],
             "branch",
-            &name,
-        )?;
+        ));
         let (continue_link, break_link) =
             split_diamond_exits(&graph.blocks[site.branch_block].exits, &name)?;
         let (cf_forwarded, _) = peel_recast_chain_from(graph, site.branch_block, &cf);
@@ -5776,13 +5776,7 @@ fn rewire_question_site(
             break_link,
         )
     } else {
-        assert_question_plumbing_pure(
-            graph,
-            site.branch_block,
-            &[site.branch_op_idx],
-            "branch",
-            &name,
-        )?;
+        recognized_per.push((site.branch_block, vec![site.branch_op_idx], "branch"));
         let (cf_forwarded, _recast_b) = peel_recast_chain_from(graph, site.branch_block, &cf);
         let question =
             locate_control_flow_question(graph, site.branch_block, &cf_forwarded, &name)?;
@@ -5796,8 +5790,12 @@ fn rewire_question_site(
                     ),
                 );
             }
-            let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
-            assert_question_plumbing_pure(graph, disc_block, &recognized, "discriminant", &name)?;
+            plumbing.push(disc_block);
+            recognized_per.push((
+                disc_block,
+                question.disc_idx.into_iter().collect(),
+                "discriminant",
+            ));
         }
         chain = diamond_forward_chain(pred_of_branch, &question.path);
         (
@@ -5869,6 +5867,12 @@ fn rewire_question_site(
             )
         }
     };
+    let keepalive_chain = chain_from_call_through_hops(a, &site.hops, &chain);
+    let keepalives =
+        collect_keepalive_until_here_from_bypassed(graph, &plumbing, &keepalive_chain, &name)?;
+    for (block, recognized, role) in &recognized_per {
+        assert_question_plumbing_pure(graph, *block, recognized, role, &name)?;
+    }
 
     let snaps: Vec<HopSnap> = site
         .hops
@@ -5931,6 +5935,7 @@ fn rewire_question_site(
         );
     }
     separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
+    insert_keepalive_block_on_normal_link(graph, a, keepalives);
     crate::model::clear_unreachable_blocks(graph);
     Ok(SiteOutcome::Diamond)
 }
@@ -6202,7 +6207,6 @@ fn rewire_one_call_site(
     // Block B is bypassed by the rewrite (A exits straight to the
     // continue target); only the `branch` destructuring may carry an
     // effect, so any other side-effecting op here is unsupported.
-    assert_question_plumbing_pure(graph, b, &[branch_op_idx], "branch", &name)?;
     let cf = graph.blocks[b].operations[branch_op_idx]
         .result
         .clone()
@@ -6225,10 +6229,11 @@ fn rewire_one_call_site(
             catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
             return Ok(SiteOutcome::Rewrapped);
         }
-        // Block C is bypassed too; only the discriminant read may carry an
-        // effect.  Reject any extra side-effecting op the switch would drop.
-        let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
-        assert_question_plumbing_pure(graph, c, &recognized, "discriminant", &name)?;
+    }
+    let chain = diamond_forward_chain(a, &question.path);
+    let mut plumbing = vec![b];
+    if c != b {
+        plumbing.push(c);
     }
     let continue_link = question.continue_link.clone();
     let break_link = question.break_link.clone();
@@ -6240,7 +6245,6 @@ fn rewire_one_call_site(
     // remapped into A's namespace; the exception edge re-emits them.
     let break_closes_a = break_arm_closes(graph, a, b, c, &question.path, &break_link, &name)?;
 
-    let chain = diamond_forward_chain(a, &question.path);
     let (mut normal_args, payload_positions) = match &continue_link {
         Some(link) => {
             let (args, positions, _passed_disc) =
@@ -6269,13 +6273,21 @@ fn rewire_one_call_site(
             if predecessor_exits(graph, continue_target.0).len() != 1 {
                 return rewire_merged_target(graph, continue_target, results, &name);
             }
-            for pos in payload_positions {
-                let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
-            }
             continue_target
         }
         None => unreachable_continue_target(graph),
     };
+    let keepalives = collect_keepalive_until_here_from_bypassed(graph, &plumbing, &chain, &name)?;
+    assert_question_plumbing_pure(graph, b, &[branch_op_idx], "branch", &name)?;
+    if c != b {
+        // Block C is bypassed too; only the discriminant read may carry an
+        // effect.  Reject any extra side-effecting op the switch would drop.
+        let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
+        assert_question_plumbing_pure(graph, c, &recognized, "discriminant", &name)?;
+    }
+    for pos in payload_positions {
+        let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
+    }
     // Bind the unwrapped payload to a fresh Variable.  `r` is the
     // Result shell; threading it as `T` unions `Result::Ok` with the
     // payload at every phi (`exceptiontransform` / `jtransform` keep
@@ -6307,6 +6319,7 @@ fn rewire_one_call_site(
     // The link now carries `T`; the phi has to be a fresh variable of
     // that kind, not the ControlFlow shell.
     separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
+    insert_keepalive_block_on_normal_link(graph, a, keepalives);
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
     Ok(SiteOutcome::Diamond)
@@ -8251,6 +8264,7 @@ fn try_fuse_drain_match(
             ));
         }
     }
+    let keepalives = collect_keepalive_until_here_from_bypassed(graph, &[b], &a_to_b_chain, &name)?;
     assert_question_plumbing_pure(graph, b, &[disc_idx], "discriminant", &name)?;
 
     // (3) Discriminant 0/1 is Ok/Err. Payload uses may be empty (`Ok(_)`)
@@ -8992,6 +9006,7 @@ fn try_fuse_drain_match(
     for pos in payload_positions {
         let _ = collapse_pos0_read(graph, ok_link.target, pos, &name)?;
     }
+    insert_keepalive_block_on_normal_link(graph, a, keepalives);
 
     Ok(())
 }
@@ -9897,52 +9912,212 @@ pub(crate) fn split_diamond_exits(exits: &[Link], name: &str) -> Result<(Link, L
 /// replaces.  Anything else is a custom handler and must fail loud.
 /// `objectmodel.keepalive_until_here` / `rtype_keepalive_until_here`.
 fn op_is_keepalive_until_here(kind: &OpKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         OpKind::Call {
             target: CallTarget::FunctionPath { segments, .. },
             ..
-        } if segments.iter().any(|s| s == "keepalive_until_here")
-    )
+        } => segments
+            .iter()
+            .map(String::as_str)
+            .eq(crate::front::mir::KEEPALIVE_UNTIL_HERE_PATH.split("::")),
+        _ => false,
+    }
 }
 
-/// Move `keepalive_until_here` off a `?` plumbing block onto its unique
-/// predecessor. The rewrite disconnects the plumbing block, and the
-/// keepalive must survive after the last use of the raw `char *`
-/// (`objectmodel.keepalive_until_here`). Indices stay put: each moved
-/// op is replaced by a removable `ConstNone`.
-fn hoist_keepalive_until_here_to_pred(graph: &mut FunctionGraph, block: usize) {
-    let preds = predecessor_exits(graph, block);
-    if preds.len() != 1 {
-        return;
-    }
-    let pred = preds[0].0;
-    if pred == block {
-        return;
-    }
-    let mut moved = Vec::new();
-    for op in &mut graph.blocks[block].operations {
-        if op_is_keepalive_until_here(&op.kind) {
-            moved.push(std::mem::replace(
-                op,
-                SpaceOperation {
-                    result: None,
-                    kind: OpKind::ConstNone,
-                },
-            ));
+#[cfg(test)]
+mod keepalive_until_here_path_tests {
+    use super::*;
+    use crate::front::mir::KEEPALIVE_UNTIL_HERE_PATH;
+
+    fn call_kind(segments: &[&str]) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path(segments.iter().copied()),
+            args: Vec::new(),
+            result_ty: ValueType::Void,
         }
     }
-    graph.blocks[pred].operations.append(&mut moved);
+
+    #[test]
+    fn op_is_keepalive_until_here_matches_exact_path_only() {
+        let exact: Vec<&str> = KEEPALIVE_UNTIL_HERE_PATH.split("::").collect();
+        assert!(op_is_keepalive_until_here(&call_kind(&exact)));
+        assert!(!op_is_keepalive_until_here(&call_kind(&[
+            "custom_keepalive_until_here"
+        ])));
+        assert!(!op_is_keepalive_until_here(&call_kind(&[
+            "foo",
+            "keepalive_until_here"
+        ])));
+        assert!(!op_is_keepalive_until_here(&call_kind(&[
+            "keepalive_until_here"
+        ])));
+    }
+}
+
+/// `(pred, succ)` hops from the call through restore hops then plumbing.
+fn chain_from_call_through_hops(
+    a: usize,
+    restore_hops: &[QuestionHop],
+    plumbing_chain: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut chain = Vec::with_capacity(restore_hops.len() + plumbing_chain.len());
+    if let Some(first) = restore_hops.first() {
+        chain.push((a, first.block));
+        for pair in restore_hops.windows(2) {
+            chain.push((pair[0].block, pair[1].block));
+        }
+    }
+    chain.extend(plumbing_chain.iter().copied());
+    chain
+}
+
+/// Incoming links from `block` back to the call, as
+/// `remap_root_scope_close_through_links` wants them: `(target, link)`.
+fn reverse_hops_into(
+    graph: &FunctionGraph,
+    chain: &[(usize, usize)],
+    block: usize,
+    name: &str,
+) -> Result<Vec<(usize, Link)>, String> {
+    let Some(end) = chain.iter().rposition(|&(_, succ)| succ == block) else {
+        return Err(format!(
+            "{name}: keepalive plumbing block {block} is not on the forwarding chain"
+        ));
+    };
+    let mut hops = Vec::with_capacity(end + 1);
+    for &(pred, succ) in chain[..=end].iter().rev() {
+        let [link] = graph.blocks[pred].exits.as_slice() else {
+            return Err(format!(
+                "{name}: forwarding block {pred} has multiple exits"
+            ));
+        };
+        hops.push((succ, link.clone()));
+    }
+    Ok(hops)
+}
+
+/// Gather `keepalive_until_here` from every bypassed `?` plumbing block
+/// (`rbuiltin.py` `rtype_keepalive_until_here`) and rename each operand
+/// into the call block through A→B (and B→C)
+/// (`simplify.py` `join_blocks` zip of `link.args` with
+/// `link.target.inputargs`). Each moved op becomes `ConstNone` so
+/// recognized indices stay valid. An operand produced inside a plumbing
+/// block is a decline (`model.py` `checkgraph` `usevar`).
+fn collect_keepalive_until_here_from_bypassed(
+    graph: &mut FunctionGraph,
+    plumbing: &[usize],
+    chain: &[(usize, usize)],
+    name: &str,
+) -> Result<Vec<OpKind>, String> {
+    let mut collected = Vec::new();
+    let mut seen = Vec::new();
+    for &block in plumbing {
+        if seen.contains(&block) {
+            continue;
+        }
+        seen.push(block);
+        let owned = reverse_hops_into(graph, chain, block, name)?;
+        let hops: Vec<(usize, &Link)> = owned.iter().map(|(b, link)| (*b, link)).collect();
+        let mut moved = Vec::new();
+        for op in &graph.blocks[block].operations {
+            if !op_is_keepalive_until_here(&op.kind) {
+                continue;
+            }
+            moved.push(remap_root_scope_close_through_links(
+                graph,
+                &op.kind,
+                &hops,
+                "keepalive",
+            )?);
+        }
+        for op in &mut graph.blocks[block].operations {
+            if op_is_keepalive_until_here(&op.kind) {
+                *op = SpaceOperation {
+                    result: None,
+                    kind: OpKind::ConstNone,
+                };
+            }
+        }
+        collected.extend(moved);
+    }
+    Ok(collected)
+}
+
+/// Re-emit remapped `keepalive_until_here` ops on a fresh block sitting
+/// on `a`'s normal LastException link (`unsimplify.py` `insert_empty_block`,
+/// same shape as `split_link_project`). Never append to `a` itself:
+/// that would become `raising_op` (`model.py` `checkgraph`).
+fn insert_keepalive_block_on_normal_link(
+    graph: &mut FunctionGraph,
+    a: usize,
+    keepalives: Vec<OpKind>,
+) {
+    if keepalives.is_empty() {
+        return;
+    }
+    let link = graph.blocks[a].exits[0].clone();
+    let mut pass = Vec::new();
+    for arg in &link.args {
+        let LinkArg::Value(value) = arg else {
+            continue;
+        };
+        if !pass.iter().any(|have| have == value) {
+            pass.push(value.clone());
+        }
+    }
+    for kind in &keepalives {
+        let OpKind::Call { args, .. } = kind else {
+            continue;
+        };
+        for arg in args {
+            let Some(value) = arg.as_variable() else {
+                continue;
+            };
+            if !pass.iter().any(|have| have == value) {
+                pass.push(value.clone());
+            }
+        }
+    }
+    let (new_id, new_inputs) = graph.create_block_with_arg_vars(pass.len());
+    for (input, src) in new_inputs.iter().zip(pass.iter()) {
+        copy_concretetype(src, input);
+    }
+    graph.blocks[a].exits[0] = Link::new_mixed(
+        pass.iter().cloned().map(LinkArg::Value).collect(),
+        new_id,
+        link.exitcase.clone(),
+    )
+    .with_prevblock(BlockId(a));
+    let remap = |var: &Variable| {
+        pass.iter()
+            .position(|have| have == var)
+            .map(|i| new_inputs[i].clone())
+            .unwrap_or_else(|| var.clone())
+    };
+    for kind in keepalives {
+        graph.blocks[new_id.0].operations.push(SpaceOperation {
+            result: None,
+            kind: crate::inline::remap_op_kind(&kind, &remap),
+        });
+    }
+    let exit_args: Vec<LinkArg> = link
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(c) => LinkArg::Const(c.clone()),
+            LinkArg::Value(value) => LinkArg::Value(remap(value)),
+        })
+        .collect();
+    graph.set_goto_mixed(new_id, link.target, exit_args);
 }
 
 fn assert_question_plumbing_pure(
-    graph: &mut FunctionGraph,
+    graph: &FunctionGraph,
     block: usize,
     recognized: &[usize],
     role: &str,
     name: &str,
 ) -> Result<(), String> {
-    hoist_keepalive_until_here_to_pred(graph, block);
     assert_block_pure_besides(graph, block, recognized, role, name)
 }
 
@@ -19391,6 +19566,207 @@ mod merged_continue_tests {
                         .any(|link| link.target == graph.exceptblock)
             }),
             "replayed close reaches exceptblock"
+        );
+    }
+
+    fn keepalive_until_here(arg: Variable) -> OpKind {
+        OpKind::Call {
+            target: CallTarget::function_path(
+                crate::front::mir::KEEPALIVE_UNTIL_HERE_PATH.split("::"),
+            ),
+            args: crate::model::call_args(vec![arg]),
+            result_ty: ValueType::Void,
+        }
+    }
+
+    fn question_keepalive_diamond() -> (FunctionGraph, Variable, usize, usize, usize, Variable) {
+        let mut graph = FunctionGraph::new("question_keepalive");
+        let (cont, cont_args) = graph.create_block_with_arg_vars(2);
+        let payload = graph
+            .push_op_var(
+                cont,
+                OpKind::FieldRead {
+                    base: cont_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Continue".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("continue payload");
+        graph.set_return(cont, Some(payload));
+
+        let (brk, brk_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(brk, Some(residual));
+
+        let r = add_question(&mut graph, cont, brk);
+        let a = producer_block_index(&graph, &r).expect("call");
+        let extra = graph.blocks[a].inputargs[0].clone();
+        let b = graph.blocks[a].exits[0].target.0;
+        let c = graph.blocks[b].exits[0].target.0;
+        let live = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0].inputargs = vec![live.clone()];
+        graph.set_goto(graph.startblock, BlockId(a), vec![live]);
+        (graph, r, a, b, c, extra)
+    }
+
+    fn reachable_flags(graph: &FunctionGraph) -> Vec<bool> {
+        let mut seen = vec![false; graph.blocks.len()];
+        let mut stack = vec![graph.startblock.0];
+        while let Some(i) = stack.pop() {
+            if seen[i] {
+                continue;
+            }
+            seen[i] = true;
+            for link in &graph.blocks[i].exits {
+                stack.push(link.target.0);
+            }
+        }
+        seen
+    }
+
+    fn assert_keepalive_survives_on_a_normal_successor(
+        graph: &FunctionGraph,
+        a: usize,
+        fed_from_a: &Variable,
+    ) {
+        assert_model_links(graph);
+        let reach = reachable_flags(graph);
+        let mut holders = Vec::new();
+        for (i, block) in graph.blocks.iter().enumerate() {
+            if !reach[i] {
+                continue;
+            }
+            for op in &block.operations {
+                if super::op_is_keepalive_until_here(&op.kind) {
+                    holders.push(i);
+                }
+            }
+        }
+        holders.sort_unstable();
+        holders.dedup();
+        assert_eq!(
+            holders.len(),
+            1,
+            "exactly one reachable block holds a keepalive, got {holders:?}"
+        );
+        let ka = holders[0];
+        assert_ne!(ka, a, "keepalive must not become A's raising_op");
+        let normal = &graph.blocks[a].exits[0];
+        assert_eq!(
+            normal.target.0, ka,
+            "keepalive block is A's normal successor"
+        );
+        let ka_block = &graph.blocks[ka];
+        let keepalives: Vec<&SpaceOperation> = ka_block
+            .operations
+            .iter()
+            .filter(|op| super::op_is_keepalive_until_here(&op.kind))
+            .collect();
+        assert_eq!(keepalives.len(), 1, "survivor holds one keepalive");
+        let OpKind::Call { args, .. } = &keepalives[0].kind else {
+            panic!("keepalive is a Call");
+        };
+        let operand = args[0].as_variable().expect("keepalive operand");
+        let pos = ka_block
+            .inputargs
+            .iter()
+            .position(|v| v == operand)
+            .expect("operand is an inputarg of the survivor");
+        assert_eq!(
+            normal.args.get(pos).and_then(LinkArg::as_variable),
+            Some(fed_from_a),
+            "A feeds the survivor the value it passed to B"
+        );
+    }
+
+    #[test]
+    fn question_keepalive_in_discriminant_block_survives_renamed() {
+        let (mut graph, r, a, _b, c, extra) = question_keepalive_diamond();
+        graph.push_op_var(
+            BlockId(c),
+            keepalive_until_here(graph.blocks[c].inputargs[1].clone()),
+            false,
+        );
+        rewire_result_exc_call_sites(
+            &mut graph,
+            &[(r, None, ValueType::Int)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("discriminant keepalive rewires");
+        assert_keepalive_survives_on_a_normal_successor(&graph, a, &extra);
+    }
+
+    #[test]
+    fn question_keepalive_in_branch_block_survives_renamed() {
+        let (mut graph, r, a, b, _c, extra) = question_keepalive_diamond();
+        graph.push_op_var(
+            BlockId(b),
+            keepalive_until_here(graph.blocks[b].inputargs[1].clone()),
+            false,
+        );
+        rewire_result_exc_call_sites(
+            &mut graph,
+            &[(r, None, ValueType::Int)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("branch keepalive rewires");
+        assert_keepalive_survives_on_a_normal_successor(&graph, a, &extra);
+    }
+
+    #[test]
+    fn question_keepalive_of_plumbing_local_declines() {
+        let (mut graph, r, _a, b, _c, _extra) = question_keepalive_diamond();
+        let local = graph
+            .push_op_var(BlockId(b), OpKind::ConstInt(0), true)
+            .expect("plumbing local");
+        graph.push_op_var(BlockId(b), keepalive_until_here(local), false);
+        let err = match rewire_result_exc_call_sites(
+            &mut graph,
+            &[(r, None, ValueType::Int)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("keepalive of a plumbing-local must decline"),
+        };
+        assert!(
+            err.contains("keepalive") && err.contains("not forwarded"),
+            "{err}"
         );
     }
 }

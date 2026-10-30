@@ -124,18 +124,27 @@ impl<'a> Lowering<'a> {
             .map_err(|_| uninit())
     }
 
+    /// Bind a pair window's `(ptr, len)` and GC owner. `owner == None` is a
+    /// defined GC null (`emit_gc_null` / `ConstRefNull`): `framestate.py`
+    /// `union` kills the other path's value when a local is undefined; a
+    /// defined null keeps a phi.
     pub(in crate::front::mir) fn bind_pair_local(
         &mut self,
+        mir_bb: usize,
         local: usize,
         ptr: Variable,
         len: Variable,
         owner: Option<Variable>,
     ) {
+        let owner = match owner {
+            Some(owner) => owner,
+            None => self.emit_gc_null(mir_bb),
+        };
         let len_slot = self.len_shadow[local].expect("pair slice local has a length slot");
-        self.local_var[local] = Some(LocalValue::Pair(ptr, len.clone(), owner.clone()));
+        self.local_var[local] = Some(LocalValue::Pair(ptr, len.clone(), Some(owner.clone())));
         self.local_var[len_slot] = Some(LocalValue::One(len));
         if let Some(owner_slot) = self.owner_shadow.get(local).copied().flatten() {
-            self.local_var[owner_slot] = owner.map(LocalValue::One);
+            self.local_var[owner_slot] = Some(LocalValue::One(owner));
         }
         self.positional_aggregate_locals.remove(&local);
         self.string_byte_view_locals.retain(|&l| l != local);
@@ -259,7 +268,7 @@ impl<'a> Lowering<'a> {
         if window_dest {
             let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header);
             let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-            self.bind_pair_local(dest_local, ptr, len, Some(owner));
+            self.bind_pair_local(mir_bb, dest_local, ptr, len, Some(owner));
         } else {
             self.bind_str_view_local(dest_local, header);
         }
@@ -359,7 +368,7 @@ impl<'a> Lowering<'a> {
         let owner = self.owner_for_window_source(&var);
         let (ptr, len) = self.owner_to_window(mir_bb, var, src_ty)?;
         let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-        self.bind_pair_local(dest, ptr, len, owner);
+        self.bind_pair_local(mir_bb, dest, ptr, len, owner);
         Ok(())
     }
 
@@ -1272,23 +1281,7 @@ impl<'a> Lowering<'a> {
                 )));
             }
         }
-        let mut forwarded: Vec<Variable> = Vec::new();
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for slot in &self.local_var {
-            let Some(value) = slot else {
-                continue;
-            };
-            for word in value.words() {
-                if self.graph.variable_defined_in_block(head, &word) && seen.insert(word.id()) {
-                    forwarded.push(word);
-                }
-            }
-        }
-        for word in carry {
-            if seen.insert(word.id()) {
-                forwarded.push(word.clone());
-            }
-        }
+        let forwarded = self.forwarded_head_words(head, carry);
         let copies: Vec<Variable> = forwarded.iter().map(Variable::copy).collect();
         let tail = self.graph.create_block();
         for copy in &copies {
@@ -1335,6 +1328,94 @@ impl<'a> Lowering<'a> {
                     .expect("carried word was forwarded")
             })
             .collect())
+    }
+
+    /// Words defined in `head` that a mid-statement fork must forward,
+    /// plus `carry`. Same collection [`Self::fork_in_bounds`] uses.
+    fn forwarded_head_words(&self, head: BlockId, carry: &[Variable]) -> Vec<Variable> {
+        let mut forwarded: Vec<Variable> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for slot in &self.local_var {
+            let Some(value) = slot else {
+                continue;
+            };
+            for word in value.words() {
+                if self.graph.variable_defined_in_block(head, &word) && seen.insert(word.id()) {
+                    forwarded.push(word);
+                }
+            }
+        }
+        for word in carry {
+            if seen.insert(word.id()) {
+                forwarded.push(word.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// Select a GC pointer with the same runtime `cond` as `emit_uint_select`.
+    /// A GC ref cannot go through that arithmetic select; RPython's
+    /// `x if cond else y` is `set_branch` plus a join phi
+    /// (`rbuiltin.rtype_keepalive_until_here`,
+    /// `rffi.get_raw_address_of_string`). Locals defined in the head, and
+    /// every `carry` word, are forwarded like [`Self::fork_in_bounds`].
+    /// Incoming edges still target [`Self::block_id`].
+    pub(in crate::front::mir) fn select_gc_join(
+        &mut self,
+        mir_bb: usize,
+        cond: Variable,
+        then_gc: Variable,
+        else_gc: Variable,
+        carry: &[Variable],
+    ) -> Result<(Variable, Vec<Variable>), LowerError> {
+        let head = self.emit_bb(mir_bb);
+        for word in carry
+            .iter()
+            .chain(std::iter::once(&then_gc))
+            .chain(std::iter::once(&else_gc))
+        {
+            if !self.graph.variable_defined_in_block(head, word) {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: GC select carries a word defined outside the block"
+                )));
+            }
+        }
+        let forwarded = self.forwarded_head_words(head, carry);
+        let copies: Vec<Variable> = forwarded.iter().map(Variable::copy).collect();
+        let owner_phi = then_gc.copy();
+        let join = self.graph.create_block();
+        for copy in &copies {
+            self.graph.push_inputarg_var(join, copy.clone());
+        }
+        self.graph.push_inputarg_var(join, owner_phi.clone());
+        let remap: std::collections::HashMap<u64, Variable> = forwarded
+            .iter()
+            .zip(copies.iter())
+            .map(|(orig, copy)| (orig.id(), copy.clone()))
+            .collect();
+        for value in self.local_var.iter_mut().flatten() {
+            value.remap_words(&remap);
+        }
+        self.remap_forwarded_provenance(&remap);
+        let mut true_args = forwarded.clone();
+        true_args.push(then_gc);
+        let mut false_args = forwarded;
+        false_args.push(else_gc);
+        self.graph
+            .set_branch(head, cond, join, true_args, join, false_args);
+        self.emit_block.set(mir_bb, join);
+        Ok((
+            owner_phi,
+            carry
+                .iter()
+                .map(|word| {
+                    remap
+                        .get(&word.id())
+                        .cloned()
+                        .expect("carried word was forwarded")
+                })
+                .collect(),
+        ))
     }
 
     /// `index < len`, then the in-bounds copies of `ptr` and `index`.
@@ -1584,7 +1665,7 @@ impl<'a> Lowering<'a> {
             };
             let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header);
             let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-            self.bind_pair_local(dest, ptr, len, Some(owner));
+            self.bind_pair_local(mir_bb, dest, ptr, len, Some(owner));
             return Ok(());
         }
         // A reference to a pair slice aliases the pair it borrows.
@@ -1663,7 +1744,7 @@ impl<'a> Lowering<'a> {
                 },
                 _ => None,
             });
-        self.bind_pair_local(dest, ptr, len, owner);
+        self.bind_pair_local(mir_bb, dest, ptr, len, owner);
         Ok(())
     }
 
@@ -2361,7 +2442,7 @@ impl<'a> Lowering<'a> {
                 let owner = self
                     .owner_for_window_source(&ptr)
                     .or_else(|| args.first().and_then(|v| self.owner_for_window_source(v)));
-                self.bind_pair_local(dest_local, ptr, len, owner);
+                self.bind_pair_local(mir_bb, dest_local, ptr, len, owner);
             }
         } else if self.len_shadow[dest_local].is_some() {
             // `<[T; N]>::index(&a, range)` over a raw-buffer array.
@@ -2591,7 +2672,7 @@ impl<'a> Lowering<'a> {
                 }
             };
             let owner = self.owner_for_window_source(&ptr).or(src_owner);
-            self.bind_pair_local(dest_local, ptr, len, owner);
+            self.bind_pair_local(mir_bb, dest_local, ptr, len, owner);
         } else {
             let Some((0, len)) = pair_lens.first().cloned() else {
                 return Err(LowerError::Schema(format!(
@@ -2985,6 +3066,9 @@ impl<'a> Lowering<'a> {
 
     /// `unwrap_or` on an `Option<&[T]>` pair: both words of the option when
     /// its item pointer is non-null, otherwise both words of the default.
+    /// Pointer and length are selected arithmetically; the GC owner is
+    /// selected with the same runtime `is_some` via [`Self::select_gc_join`]
+    /// (`rffi.get_raw_address_of_string` / `rbuiltin.rtype_keepalive_until_here`).
     pub(in crate::front::mir) fn try_lower_pair_unwrap_or(
         &mut self,
         mir_bb: usize,
@@ -2999,45 +3083,80 @@ impl<'a> Lowering<'a> {
         {
             return Ok(false);
         }
-        let Some(dest_kind) = self.pair_slice_kind(&call.dest.ty) else {
+        let dest_is_u8 = tyref_is_u8_window(&call.dest.ty, self.llbc)
+            || self
+                .body
+                .locals
+                .locals
+                .get(dest_local)
+                .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc));
+        let dest_kind = self.pair_slice_kind(&call.dest.ty);
+        if dest_kind.is_none() && !dest_is_u8 {
             return Ok(false);
-        };
+        }
         let opt_ty = operand_tyref(&call.args[0]).map(clone_tyref);
-        let Some(opt_kind) = opt_ty
-            .as_ref()
-            .and_then(|ty| self.option_pair_slice_kind(ty))
-        else {
-            return Ok(false);
+        if dest_is_u8 {
+            if !opt_ty
+                .as_ref()
+                .is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
+            {
+                return Ok(false);
+            }
+        } else {
+            let Some(opt_kind) = opt_ty
+                .as_ref()
+                .and_then(|ty| self.option_pair_slice_kind(ty))
+            else {
+                return Ok(false);
+            };
+            if Some(opt_kind) != dest_kind {
+                return Ok(false);
+            }
+        }
+        let pair_msg = format!("bb{mir_bb}: pair slice passed to or returned from {name}");
+        let (opt_ptr, opt_len) = if dest_is_u8 {
+            self.window_operand(mir_bb, &call.args[0])?
+                .ok_or_else(|| LowerError::Unsupported(pair_msg.clone()))?
+        } else {
+            self.option_pair_operand(mir_bb, &call.args[0])?
+                .ok_or_else(|| LowerError::Unsupported(pair_msg.clone()))?
         };
-        if opt_kind != dest_kind {
-            return Ok(false);
-        }
-        let (opt_ptr, opt_len) = self
-            .option_pair_operand(mir_bb, &call.args[0])?
-            .ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "bb{mir_bb}: pair slice passed to or returned from {name}"
-                ))
-            })?;
-        let (def_ptr, def_len, def_kind) =
-            self.pair_operand(mir_bb, &call.args[1])?.ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "bb{mir_bb}: pair slice passed to or returned from {name}"
-                ))
-            })?;
-        if def_kind != dest_kind {
-            return Err(LowerError::Unsupported(format!(
-                "bb{mir_bb}: pair slice passed to or returned from {name}"
-            )));
-        }
+        let (def_ptr, def_len) = if dest_is_u8 {
+            self.window_operand(mir_bb, &call.args[1])?
+                .ok_or_else(|| LowerError::Unsupported(pair_msg.clone()))?
+        } else {
+            let (ptr, len, def_kind) = self
+                .pair_operand(mir_bb, &call.args[1])?
+                .ok_or_else(|| LowerError::Unsupported(pair_msg.clone()))?;
+            if Some(def_kind) != dest_kind {
+                return Err(LowerError::Unsupported(pair_msg));
+            }
+            (ptr, len)
+        };
         let zero = self.emit_const_uint(mir_bb, 0);
         let is_some = self.emit_uint_binop(mir_bb, "ne", opt_ptr.clone(), zero);
-        let owner = self
+        let mut ptr =
+            self.emit_uint_select(mir_bb, is_some.clone(), opt_ptr.clone(), def_ptr.clone());
+        let mut len = self.emit_uint_select(mir_bb, is_some.clone(), opt_len, def_len);
+        let opt_owner = self
             .owner_for_window_source(&opt_ptr)
-            .or_else(|| self.owner_for_window_source(&def_ptr));
-        let ptr = self.emit_uint_select(mir_bb, is_some.clone(), opt_ptr, def_ptr);
-        let len = self.emit_uint_select(mir_bb, is_some, opt_len, def_len);
-        self.bind_pair_local(dest_local, ptr, len, owner);
+            .unwrap_or_else(|| self.emit_gc_null(mir_bb));
+        let def_owner = self
+            .owner_for_window_source(&def_ptr)
+            .unwrap_or_else(|| self.emit_gc_null(mir_bb));
+        let head = self.emit_bb(mir_bb);
+        let opt_owner = self.bind_array_view_len_in_block(head, opt_owner);
+        let def_owner = self.bind_array_view_len_in_block(head, def_owner);
+        let owner = if opt_owner == def_owner {
+            opt_owner
+        } else {
+            let (owner, carried) =
+                self.select_gc_join(mir_bb, is_some, opt_owner, def_owner, &[ptr, len])?;
+            ptr = carried[0].clone();
+            len = carried[1].clone();
+            owner
+        };
+        self.bind_pair_local(mir_bb, dest_local, ptr, len, Some(owner));
         let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;

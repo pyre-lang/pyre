@@ -8583,7 +8583,7 @@ impl<'a> Lowering<'a> {
                 if self.len_shadow.get(dest_local).copied().flatten().is_some()
                     && tyref_is_u8_window(&call.dest.ty, self.llbc)
                 {
-                    self.bind_pair_local(dest_local, ptr, len, owner);
+                    self.bind_pair_local(mir_bb, dest_local, ptr, len, owner);
                 } else {
                     self.local_var[dest_local] = Some(LocalValue::One(ptr));
                 }
@@ -8628,7 +8628,7 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
             if self.len_shadow.get(dest_local).copied().flatten().is_some() {
-                self.bind_pair_local(dest_local, ptr, len, None);
+                self.bind_pair_local(mir_bb, dest_local, ptr, len, None);
             } else {
                 self.local_var[dest_local] = Some(LocalValue::One(ptr));
             }

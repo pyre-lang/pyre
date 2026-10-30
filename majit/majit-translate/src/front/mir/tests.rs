@@ -3583,9 +3583,10 @@ fn window_keepalive_operand(
             target: CallTarget::FunctionPath { segments, .. },
             args,
             ..
-        } if segments.iter().any(|s| {
-            s == "keepalive" || s == "keepalive_until_here" || s.ends_with("keepalive_until_here")
-        }) =>
+        } if segments
+            .iter()
+            .map(String::as_str)
+            .eq(super::KEEPALIVE_UNTIL_HERE_PATH.split("::")) =>
         {
             args.iter().find_map(crate::model::LinkArg::as_variable)
         }
@@ -3716,6 +3717,131 @@ fn str_window_owner_threads_across_goto_to_storagedead() {
     assert!(
         keepalive_here,
         "keepalive of the threaded owner is after window_param; graph={}",
+        graph.dump()
+    );
+}
+
+/// A STR window and an ownerless opaque window join: `bind_pair_local`
+/// gives the ownerless arm a defined GC null, so `framestate.py` `union`
+/// keeps a phi. `StorageDead` keepalives that join inputarg.
+#[test]
+fn window_owner_survives_merge_with_ownerless_window() {
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+    let shared = window_shared_slice();
+    let unit = serde_json::json!({"Tuple": []});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let as_bytes = window_opaque_fun(
+        1,
+        &["core", "str", "<Impl>", "as_bytes"],
+        vec![utf8_ref.clone()],
+        shared.clone(),
+    );
+    let g = window_opaque_fun(2, &["fixture", "g"], vec![], shared.clone());
+    let unwind = serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": "UnwindResume"}
+    });
+    let dead = serde_json::json!({
+        "span": window_span(),
+        "kind": {"StorageDead": 3}
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "window_owner_merge"], true),
+        "signature": {"is_unsafe": true, "inputs": [utf8_ref, bool_ty], "output": unit},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &unit),
+                window_local(1, &utf8_ref),
+                window_local(2, &bool_ty),
+                window_local(3, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &unit),
+                            {"Aggregate": ["Tuple", []]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
+                        "targets": {"If": [2, 3]}
+                    }}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [],
+                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [dead],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller, as_bytes, g]);
+    let graph = super::lower_function(&llbc, "window_owner_merge")
+        .expect("lower STR/ownerless window merge");
+    let mut join_keepalive = None;
+    for block in &graph.blocks {
+        let pred_n = graph
+            .blocks
+            .iter()
+            .flat_map(|pred| pred.exits.iter())
+            .filter(|link| link.target == block.id)
+            .count();
+        if pred_n < 2 {
+            continue;
+        }
+        for op in &block.operations {
+            if let Some(owner) = window_keepalive_operand(&op.kind)
+                && block.inputargs.iter().any(|v| v.id() == owner.id())
+            {
+                join_keepalive = Some(owner.id());
+            }
+        }
+    }
+    assert!(
+        join_keepalive.is_some(),
+        "StorageDead keepalive operand must be the joined owner phi; graph={}",
         graph.dump()
     );
 }
@@ -13616,6 +13742,309 @@ fn option_u8_window_some_payload_is_the_window() {
             graph.dump()
         );
     }
+}
+
+/// `opt.unwrap_or(default)` of two STR windows. `as_bytes` alone is a W1
+/// STR view; a mixed opaque window def keeps the length shadow so each
+/// dest is `{ptr, len, owner}`. The unwrap_or dest is mixed the same way
+/// so copy-propagated `str_view` does not drop its length slot.
+/// `StorageDead` keepalives the owner the runtime `is_some` selected
+/// (`rffi.get_raw_address_of_string` / `rbuiltin.rtype_keepalive_until_here`).
+#[test]
+fn unwrap_or_window_keeps_selected_owner_alive() {
+    use crate::model::{ExitCase, LinkArg};
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+    let shared = window_shared_slice();
+    let option_ty = option_adt_node(1, shared.clone());
+    let unit = serde_json::json!({"Tuple": []});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let as_bytes = window_opaque_fun(
+        1,
+        &["core", "str", "<Impl>", "as_bytes"],
+        vec![utf8_ref.clone()],
+        shared.clone(),
+    );
+    let g = window_opaque_fun(2, &["fixture", "g"], vec![], shared.clone());
+    let unwrap_or = window_opaque_fun(
+        3,
+        &["core", "option", "<Impl>", "unwrap_or"],
+        vec![option_ty.clone(), shared.clone()],
+        shared.clone(),
+    );
+    let callee = window_opaque_fun(
+        4,
+        &["fixture", "window_param"],
+        vec![shared.clone()],
+        unit.clone(),
+    );
+    let (unwind, _) = window_unwind_and_return_blocks();
+    let wa = window_place(serde_json::json!({"Local": 4}), &shared);
+    let wb = window_place(serde_json::json!({"Local": 5}), &shared);
+    let w = window_place(serde_json::json!({"Local": 6}), &shared);
+    let flag = window_place(serde_json::json!({"Local": 3}), &bool_ty);
+    let a = window_place(serde_json::json!({"Local": 1}), &utf8_ref);
+    let b = window_place(serde_json::json!({"Local": 2}), &utf8_ref);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "unwrap_or_window_owner"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [utf8_ref.clone(), utf8_ref.clone(), bool_ty.clone()],
+            "output": unit
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 3, "locals": [
+                window_local(0, &unit),
+                window_local(1, &utf8_ref),
+                window_local(2, &utf8_ref),
+                window_local(3, &bool_ty),
+                window_local(4, &shared),
+                window_local(5, &shared),
+                window_local(6, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": flag.clone()},
+                        "targets": {"If": [2, 3]}
+                    }}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": a.clone()}],
+                        "dest": wa.clone()
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [],
+                        "dest": wa.clone()
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": flag.clone()},
+                        "targets": {"If": [5, 6]}
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": b.clone()}],
+                        "dest": wb.clone()
+                    }, "target": 7, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [],
+                        "dest": wb.clone()
+                    }, "target": 7, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": flag.clone()},
+                        "targets": {"If": [8, 9]}
+                    }}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 3},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Move": wa.clone()},
+                            {"Copy": wb.clone()}
+                        ],
+                        "dest": w.clone()
+                    }, "target": 10, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": a.clone()}],
+                        "dest": w.clone()
+                    }, "target": 10, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 4},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": w.clone()}],
+                        "dest": window_place(serde_json::json!({"Local": 0}), &unit)
+                    }, "target": 11, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"StorageDead": 6}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(
+        vec![utf8, option_enum(1)],
+        vec![caller, as_bytes, g, unwrap_or, callee],
+    );
+    let graph = super::lower_function(&llbc, "unwrap_or_window_owner")
+        .expect("lower Option<&[u8]>::unwrap_or of two STR windows");
+    let start = graph.block(graph.startblock);
+    assert!(
+        start.inputargs.len() >= 2,
+        "two STR parameters; graph={}",
+        graph.dump()
+    );
+    let family_a = grow_link_family(&graph, start.inputargs[0].id());
+    let family_b = grow_link_family(&graph, start.inputargs[1].id());
+    let mut selected_join = None;
+    for block in &graph.blocks {
+        let Some(true_link) = block
+            .exits
+            .iter()
+            .find(|link| link.exitcase == Some(ExitCase::Bool(true)))
+        else {
+            continue;
+        };
+        let Some(false_link) = block
+            .exits
+            .iter()
+            .find(|link| link.exitcase == Some(ExitCase::Bool(false)))
+        else {
+            continue;
+        };
+        if true_link.target != false_link.target {
+            continue;
+        }
+        let join = graph.block(true_link.target);
+        for (i, phi) in join.inputargs.iter().enumerate() {
+            let Some(true_arg) = true_link.args.get(i).and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            let Some(false_arg) = false_link.args.get(i).and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            if family_a.contains(&true_arg.id()) && family_b.contains(&false_arg.id()) {
+                selected_join = Some(phi.id());
+                break;
+            }
+        }
+        if selected_join.is_some() {
+            break;
+        }
+    }
+    let selected = selected_join.unwrap_or_else(|| {
+        panic!(
+            "is_some join must take A on true and B on false, not A unconditionally; graph={}",
+            graph.dump()
+        )
+    });
+    let selected_family = grow_link_family(&graph, selected);
+    let mut storagedead_keepalive = false;
+    for block in &graph.blocks {
+        let returns = block
+            .exits
+            .iter()
+            .any(|link| link.target == graph.returnblock)
+            || block.id == graph.returnblock;
+        if !returns {
+            continue;
+        }
+        for op in &block.operations {
+            if window_keepalive_operand(&op.kind).is_some_and(|v| selected_family.contains(&v.id()))
+            {
+                storagedead_keepalive = true;
+            }
+        }
+    }
+    assert!(
+        storagedead_keepalive,
+        "StorageDead keepalive operand must be the selected-owner join inputarg; graph={}",
+        graph.dump()
+    );
+}
+
+fn grow_link_family(
+    graph: &crate::model::FunctionGraph,
+    seed: u64,
+) -> std::collections::HashSet<u64> {
+    let mut family = std::collections::HashSet::from([seed]);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    let Some(arg) = arg.as_variable() else {
+                        continue;
+                    };
+                    if family.contains(&arg.id()) && family.insert(input.id()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    family
 }
 
 /// Real-LLBC anchor for the `FixedObjectArray` Index intercept.  The

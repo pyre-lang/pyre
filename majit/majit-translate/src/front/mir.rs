@@ -5308,6 +5308,7 @@ mod views;
 use self::address::*;
 use self::consteval::*;
 use self::desugar::*;
+pub(crate) use self::flowcontext::KEEPALIVE_UNTIL_HERE_PATH;
 use self::flowcontext::*;
 use self::framestate::*;
 use self::gcroot::*;
