@@ -130,6 +130,8 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::option::_::map_or",
     "--include",
+    "core::option::_::expect",
+    "--include",
     "core::option::_::map",
     "--include",
     "core::option::_::and_then",

@@ -2703,12 +2703,20 @@ pub(in crate::front::mir) fn is_core_ptr_null_fun_path(path: &str) -> bool {
     )
 }
 
-/// `core::panicking::*` / `std::panicking::*` — a Rust abort, lowered
-/// as `RaiseImplicit(AssertionError)` the way `TermKind::Abort` is.
+/// A Rust abort, lowered as `RaiseImplicit(AssertionError)` the way
+/// `TermKind::Abort` is. Declared `Never` / `!` output is that path
+/// (`ll_assert`; `rtyper/debug.py`). A panicking-module callee without
+/// that spelling still matches.
 pub(in crate::front::mir) fn regular_call_is_panicking_abort(
     reg: &RegularCall,
     llbc: &Llbc,
 ) -> bool {
+    if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+        && let Some(fd) = llbc.fn_by_id(*id)
+        && tyref_is_never(&fd.signature.output, llbc)
+    {
+        return true;
+    }
     let Some(path) = regular_call_name_path(reg, llbc) else {
         return false;
     };
@@ -3138,17 +3146,6 @@ pub(in crate::front::mir) fn regular_call_fun_decl_id(kind: &CallKind) -> Option
         // fun-decl id. Callers that need the method use
         // `trait_payload_path_and_method`.
         CallKind::Trait(_) => None,
-        _ => None,
-    }
-}
-
-/// Source operand of a `__cast_instance_intrinsic` recast. The recast is
-/// identity (`cast_pointer`); the dest type's ClassDef is on the Call
-/// result / FunDecl output, not on the recast name.
-pub(in crate::front::mir) fn recast_operand(kind: &OpKind) -> Option<&Variable> {
-    crate::model::cast_instance_root(kind)?;
-    match kind {
-        OpKind::Call { args, .. } => args.first().and_then(|arg| arg.as_variable()),
         _ => None,
     }
 }

@@ -13622,18 +13622,22 @@ fn intern_tagged_option_from_map_call_with_open_closure_arg() {
     );
 }
 
-/// Interned `Option<char>::Some` and `Option<String>::Some` keep distinct
-/// `__pos_0` payload types (declared payload type, not a neighbour).
+/// Interned `Option<char>::Some` and `Option<Value>::Some` keep distinct
+/// `__pos_0` payload types. The Value intern ROW is the TypeDecl identity
+/// (`value::Value` = `strip_crate_prefix` of `majit_ir::value::Value`),
+/// not the leaf (`Value`). CAST intern suffix stays the leaf (`<Value>`).
+/// `Option<String>` is a string-family niche (`tyref_is_string_adt`) so
+/// intern harvest skips it (`ref_enum_instantiation_of_adt`).
 #[test]
-fn interned_option_char_and_string_some_payloads_are_distinct() {
+fn interned_option_char_and_value_some_payloads_are_distinct() {
     let char_ty = serde_json::json!({"Scalar": "Char"});
-    let string_ty = adt_node(1);
+    let value_ty = adt_node(1);
     let i64_ty = interior_i64();
-    let string_decl = interior_struct(
+    let value_decl = interior_struct(
         1,
-        &["alloc", "string", "String"],
+        &["majit_ir", "value", "Value"],
         &[(
-            "vec",
+            "kind",
             serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
         )],
         8,
@@ -13642,10 +13646,10 @@ fn interned_option_char_and_string_some_payloads_are_distinct() {
     );
     let llbc = llbc_with_types(
         "fixture",
-        vec![option_enum(0), string_decl],
+        vec![option_enum(0), value_decl],
         vec![
             intern_map_caller(0, "call_map_char", 2, vec![char_ty, i64_ty.clone()]),
-            intern_map_caller(1, "call_map_string", 2, vec![string_ty, i64_ty]),
+            intern_map_caller(1, "call_map_value", 2, vec![value_ty, i64_ty]),
             generic_option_map_decl(2, 0),
         ],
     );
@@ -13664,11 +13668,11 @@ fn interned_option_char_and_string_some_payloads_are_distinct() {
     assert_eq!(
         field_row_ty(
             &program.struct_fields,
-            "core::option::Option<String>::Some",
+            "core::option::Option<Value>::Some",
             "__pos_0"
         ),
-        Some("String"),
-        "keys={:?}",
+        Some("value::Value"),
+        "intern ROW is the TypeDecl identity, CAST suffix stays <Value>; keys={:?}",
         program.struct_fields.fields.keys().collect::<Vec<_>>()
     );
 }

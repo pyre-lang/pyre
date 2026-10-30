@@ -562,11 +562,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `front::option_unwrap` post-pass synthesizes (see
     /// [`crate::front::option_unwrap::UnwrapSite`]).
     pub(in crate::front::mir) unwrap_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
-    /// `Option::expect(opt, msg)` call sites recorded for the discriminant
-    /// guard the `front::option_expect` post-pass synthesizes — the two-arg
-    /// sibling of `unwrap` (the panic message is dropped; see
-    /// [`crate::front::option_expect::ExpectSite`]).
-    pub(in crate::front::mir) expect_sites: Vec<crate::front::option_expect::ExpectSite>,
     /// Option/Result combinators whose body is a discriminant switch (plus an
     /// optional closure `call_once`).  Captured here so the post-pass can
     /// replace the opaque core residual with the if/else the flow graph
@@ -1571,7 +1566,6 @@ impl<'a> Lowering<'a> {
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
             unwrap_sites: Vec::new(),
-            expect_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),

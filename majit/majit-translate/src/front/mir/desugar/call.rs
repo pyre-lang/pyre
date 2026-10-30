@@ -38,10 +38,10 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
-        // `core::panicking::*` / `std::panicking::*` (`assert_failed`,
-        // `panic`, `panic_fmt`, …) is a Rust abort. Upstream that is
-        // `ll_assert` / `fatalerror`: the same implicit AssertionError
-        // raise `TermKind::Abort` already closes a block with. Do not
+        // A declared-Never callee (`assert_failed`, `panic_fmt`, a
+        // `-> !` helper) is a Rust abort. Upstream that is `ll_assert`
+        // / `fatalerror`: the same implicit AssertionError raise
+        // `TermKind::Abort` already closes a block with. Do not
         // register a stub body for the panicking helper.
         if let CallFunc::Regular(reg) = &call.func
             && regular_call_is_panicking_abort(reg, self.llbc)
@@ -8287,18 +8287,10 @@ impl<'a> Lowering<'a> {
                 self.unwrap_sites.push(site);
             }
         }
-        // Capture `Option::expect(opt, msg)` and carrier
-        // `Result::expect(res, msg)` sites. Option keeps the discriminant
-        // guard `front::option_expect` synthesizes — the two-arg sibling of
-        // `unwrap`. Its body is Opaque (foreign `core`) and its receiver is
-        // the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver `args[0]`, panic message `args[1]`).
-        // The exception-carrier Result is a `CarrierCombinatorSite`
-        // (`interp_deque.py` `W_Deque.trimleft` / `popleft`; `core`
-        // `Result::expect`; the `msg` operand is dropped).
-        // `recognize_expect_site` confirms the receiver is an `Option`.
-        // A resolution miss leaves the residual call — an unregistered
-        // callee the rtyper census Skips.
+        // Carrier `Result::expect(res, msg)` (`interp_deque.py`
+        // `W_Deque.trimleft` / `popleft`; the `msg` operand is dropped).
+        // Option's two-arg sibling is a regular call of the extracted
+        // core body.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -8313,12 +8305,6 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if let Some(site) = self.recognize_expect_site(
-                first_arg_ty.as_ref(),
-                &result_var,
-                args[0].as_variable(),
-            ) {
-                self.expect_sites.push(site);
             }
         }
         // Carrier map_err: dest is Result of the exception carrier. The

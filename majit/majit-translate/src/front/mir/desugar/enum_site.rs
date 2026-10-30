@@ -667,10 +667,10 @@ impl<'a> Lowering<'a> {
     /// Resolve a recognized carrier `Result<T, PyError>` combinator
     /// (`unwrap_or` / `expect` / `unwrap`) into a
     /// [`crate::front::result_exc::CarrierCombinatorSite`].  `None` when the
-    /// receiver is not the exception-carrier Result — `expect` / `unwrap`
-    /// then go to [`Self::recognize_unwrap_site`] /
-    /// [`Self::recognize_expect_site`], and `unwrap_or` stays a residual
-    /// call whose core body is translated.
+    /// receiver is not the exception-carrier Result — `unwrap` then goes
+    /// to [`Self::recognize_unwrap_site`], Option expect is the extracted
+    /// core body, and `unwrap_or` stays a residual call whose core body
+    /// is translated.
     pub(in crate::front::mir) fn recognize_carrier_combinator_site(
         &self,
         recv_ty: Option<&TyRef>,
@@ -750,48 +750,6 @@ impl<'a> Lowering<'a> {
             payload_owner,
             payload_ty,
             payload_on_disc_true,
-            niche,
-            int_null: self.option_niche_int_null(recv_ty),
-            scalar_niche,
-            niche_null_cast: self.option_niche_null_cast(recv_ty),
-        })
-    }
-
-    /// Resolve a recognized `Option::expect(opt, msg)` call into an
-    /// [`crate::front::option_expect::ExpectSite`] — the two-arg sibling of
-    /// [`Self::recognize_unwrap_site`].  Guards on `Option` (not `Result`:
-    /// `Result::expect` shares the name but its `Ok`/`Err` tags do not match
-    /// `Some`=1/`None`=0).  The owners route through
-    /// [`Self::resolve_option_consumer_owners`] so the synthesized
-    /// `__discriminant` / `__pos_0` reads key the same classdef the value's
-    /// producer wrote.  `None` (leaving the residual call) when the receiver is
-    /// not a resolvable `Option`.
-    pub(in crate::front::mir) fn recognize_expect_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        result_var: &Variable,
-        opt_var: Option<&Variable>,
-    ) -> Option<crate::front::option_expect::ExpectSite> {
-        let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
-            return None;
-        }
-        let (mut option_owner, mut some_owner, payload_ty) =
-            self.resolve_option_consumer_owners(recv_ty)?;
-        let mut niche = self.tyref_is_niche_option_ptr(recv_ty);
-        self.recover_option_instantiation(
-            recv_ty,
-            opt_var,
-            &mut option_owner,
-            &mut some_owner,
-            &mut niche,
-        );
-        let scalar_niche = !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
-        Some(crate::front::option_expect::ExpectSite {
-            result_var: result_var.clone(),
-            option_owner,
-            some_owner,
-            payload_ty,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
@@ -1001,165 +959,6 @@ impl<'a> Lowering<'a> {
             field,
             layout_owner,
         })
-    }
-
-    /// Dest type of the producer of `var`: the callee `FunDecl` output
-    /// (the same substitution `lower_call` uses when the dest place is a
-    /// bare `Option` type_id). Recasts and forwarded successor inputargs
-    /// are identity; chase them to that output.
-    pub(in crate::front::mir) fn recover_option_dest_ty(&self, var: &Variable) -> Option<TyRef> {
-        self.recover_option_dest_ty_depth(var, 0)
-    }
-
-    pub(in crate::front::mir) fn recover_option_dest_ty_depth(
-        &self,
-        var: &Variable,
-        depth: usize,
-    ) -> Option<TyRef> {
-        if depth > 8 {
-            return None;
-        }
-        for block in &self.graph.blocks {
-            for op in &block.operations {
-                if op.result.as_ref() != Some(var) {
-                    continue;
-                }
-                if let Some(src) = recast_operand(&op.kind) {
-                    return self.recover_option_dest_ty_depth(src, depth + 1);
-                }
-                if let OpKind::Call { target, .. } = &op.kind
-                    && let Some(id) = target.fun_decl_id()
-                    && let Some(fd) = self.llbc.fn_by_id(id)
-                {
-                    return Some(clone_tyref(&fd.signature.output));
-                }
-                return None;
-            }
-        }
-        // `lower_call` closes the producer block, so `opt?` reads the dest
-        // as a successor inputarg. Chase the forwarded predecessor arg to
-        // the FunDecl output the producer recast onto.
-        for (bi, block) in self.graph.blocks.iter().enumerate() {
-            let Some(pos) = block.inputargs.iter().position(|v| v == var) else {
-                continue;
-            };
-            for pred in &self.graph.blocks {
-                for link in &pred.exits {
-                    if link.target.0 != bi {
-                        continue;
-                    }
-                    let Some(LinkArg::Value(src)) = link.args.get(pos) else {
-                        continue;
-                    };
-                    if let Some(ty) = self.recover_option_dest_ty_depth(src, depth + 1) {
-                        return Some(ty);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// When `recv_ty` is a bare `Option` type_id, recover the dest type
-    /// the producer interned (`FunDecl` output, or a `checked_*` site
-    /// already keyed off that dest type) so `__pos_0` keys that ClassDef
-    /// (`bookkeeper.py` `getuniqueclassdef(cls)`). Variant owners come
-    /// from [`Self::tagged_pair_payload_owner`] (`v.name`).
-    pub(in crate::front::mir) fn recover_option_instantiation(
-        &self,
-        recv_ty: &TyRef,
-        opt_var: Option<&Variable>,
-        option_owner: &mut String,
-        some_owner: &mut String,
-        niche: &mut bool,
-    ) {
-        if *niche || !tyref_enum_instantiation_suffix(recv_ty, self.llbc).is_empty() {
-            return;
-        }
-        let Some(opt_var) = opt_var else {
-            return;
-        };
-        if let Some((owner, some)) = self.checked_arith_uint_owners(opt_var) {
-            *option_owner = owner;
-            *some_owner = some;
-            return;
-        }
-        let Some(dest) = self.recover_option_dest_ty(opt_var) else {
-            return;
-        };
-        if crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
-            let payload = crate::front::result_exc::tyref_option_payload(&dest, self.llbc);
-            if payload
-                .as_ref()
-                .is_some_and(|ty| tyref_is_type_parameter(ty, self.llbc))
-            {
-                return;
-            }
-            if tyref_enum_instantiation_suffix(&dest, self.llbc).is_empty()
-                && !self.tyref_is_niche_option_ptr(&dest)
-            {
-                return;
-            }
-            if let Some((owner, some, _)) = self.resolve_option_consumer_owners(&dest) {
-                *option_owner = owner;
-                *some_owner = some;
-                *niche = self.tyref_is_niche_option_ptr(&dest);
-            }
-        } else {
-            *niche = true;
-        }
-    }
-
-    pub(in crate::front::mir) fn checked_arith_uint_owners(
-        &self,
-        var: &Variable,
-    ) -> Option<(String, String)> {
-        self.checked_arith_uint_owners_depth(var, 0)
-    }
-
-    pub(in crate::front::mir) fn checked_arith_uint_owners_depth(
-        &self,
-        var: &Variable,
-        depth: usize,
-    ) -> Option<(String, String)> {
-        if depth > 8 {
-            return None;
-        }
-        if let Some(site) = self
-            .checked_arith_uint_sites
-            .iter()
-            .find(|site| site.opt == *var)
-        {
-            return Some((site.option_owner.clone(), site.some_owner.clone()));
-        }
-        for block in &self.graph.blocks {
-            for op in &block.operations {
-                if op.result.as_ref() != Some(var) {
-                    continue;
-                }
-                let src = recast_operand(&op.kind)?;
-                return self.checked_arith_uint_owners_depth(src, depth + 1);
-            }
-        }
-        for (bi, block) in self.graph.blocks.iter().enumerate() {
-            let Some(pos) = block.inputargs.iter().position(|v| v == var) else {
-                continue;
-            };
-            for pred in &self.graph.blocks {
-                for link in &pred.exits {
-                    if link.target.0 != bi {
-                        continue;
-                    }
-                    let Some(LinkArg::Value(src)) = link.args.get(pos) else {
-                        continue;
-                    };
-                    if let Some(owners) = self.checked_arith_uint_owners_depth(src, depth + 1) {
-                        return Some(owners);
-                    }
-                }
-            }
-        }
-        None
     }
 
     /// Dest type of a bare `Option` place with the payload as its type

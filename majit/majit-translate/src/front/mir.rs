@@ -717,7 +717,11 @@ fn ref_enum_instantiation_of_adt(
         m.insert("Adt".into(), serde_json::Value::Object(adt.clone()));
         serde_json::Value::Object(m)
     };
-    if owner_root_guard::tyref_is_option_of_guard(&TyRef::Other(node), llbc) {
+    // A pointer-niche Option is the null word (`tyref_is_niche_option`,
+    // including Option of a thin Arc/Rc/Box and OwnerRootGuard). Intern of
+    // a tagged variant class would mint `__pos_0` on a ClassDef the
+    // FieldRead identity fold never reads; CAST then getattr a missing attr.
+    if lltype::tyref_is_niche_option(&TyRef::Other(node), llbc) {
         return None;
     }
     // Payload rows, not the `<…>` class suffix. The suffix stays the
@@ -774,6 +778,14 @@ fn collect_ref_enum_instantiations(
     let mut queue: Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)> = Vec::new();
     let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
     let filtered = module_filter.is_some() || function_filter.is_some();
+    // TypeDecl field types (`Vec<Option<T>>` on a struct) are not in any
+    // Unstructured body. Walk them when the harvest is whole-program so a
+    // payload that only lives in a field still intern's its variant rows.
+    if !filtered {
+        for td in llbc.iter_type_decls() {
+            intern_enums_from_type_decl(llbc, gc_struct_ids, td, &mut found);
+        }
+    }
     for fd in llbc.iter_local_fns() {
         if filtered {
             if fd.is_global_initializer().is_some() {
@@ -786,6 +798,7 @@ fn collect_ref_enum_instantiations(
                 continue;
             }
         }
+        intern_enums_from_signature(llbc, gc_struct_ids, fd, &mut found);
         let Some(u) = fd.unstructured() else {
             continue;
         };
@@ -829,13 +842,17 @@ fn intern_enum_from_ty(
     ty: &TyRef,
     found: &mut std::collections::HashSet<RefEnumInst>,
 ) {
-    // Pointer-niche `Option<OwnerRootGuard>` is the nullable GCREF word
-    // (`owner_root_guard.rs`). Intern of a tagged Option class with
-    // `__discriminant` / `Some.__pos_0` would paint that word as the
-    // guard ClassDef (`adt_node_class_root_identity` already excludes
-    // modeled_niche from intern class paint; variant rows would still
-    // mint a class that does not exist at runtime).
-    if owner_root_guard::tyref_is_option_of_guard(ty, llbc) {
+    intern_enum_from_ty_at(llbc, gc_struct_ids, ty, found, 0);
+}
+
+fn intern_enum_from_ty_at(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    ty: &TyRef,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+    depth: usize,
+) {
+    if depth > 12 {
         return;
     }
     let Some(adt) = tyref_adt_map(ty, llbc) else {
@@ -843,6 +860,66 @@ fn intern_enum_from_ty(
     };
     if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids) {
         found.insert(pair);
+    }
+    // Nested payloads (`Vec<Option<T>>`, `HashMap<K, Option<T>>`) are
+    // not the head ADT. Walk the type arguments so a tagged Option that
+    // only appears inside another constructor still intern's.
+    let Some(types) = type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+    else {
+        return;
+    };
+    for t in types {
+        intern_enum_from_ty_at(
+            llbc,
+            gc_struct_ids,
+            &TyRef::Other(t.clone()),
+            found,
+            depth + 1,
+        );
+    }
+}
+
+fn intern_enums_from_signature(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    fd: &FunDecl,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+) {
+    for ty in fd
+        .signature
+        .inputs
+        .iter()
+        .chain(std::iter::once(&fd.signature.output))
+    {
+        intern_enum_from_ty(llbc, gc_struct_ids, ty, found);
+    }
+}
+
+fn intern_enums_from_type_decl(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    td: &TypeDecl,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+) {
+    match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            for f in fields {
+                intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found);
+            }
+        }
+        TypeDeclKind::Enum(variants) => {
+            for v in variants {
+                for f in &v.fields {
+                    intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found);
+                }
+            }
+        }
+        TypeDeclKind::Alias(body) => {
+            intern_enum_from_ty(llbc, gc_struct_ids, &TyRef::Other(body.clone()), found);
+        }
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
     }
 }
 
@@ -1130,12 +1207,16 @@ fn register_ref_enum_instantiation_rows(
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = field_decl_name(i, f);
-                let concrete = substitute_field_type(
-                    &f.ty,
-                    &inst.args,
+                let concrete = intern_payload_registry_spelling(
                     llbc,
-                    gc_struct_ids,
-                    &std::collections::HashSet::<String>::new(),
+                    &substitute_field_type(
+                        &f.ty,
+                        &inst.args,
+                        llbc,
+                        gc_struct_ids,
+                        &std::collections::HashSet::<String>::new(),
+                    ),
+                    struct_fields,
                 );
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
@@ -1235,17 +1316,15 @@ fn register_ref_enum_instantiation_rows(
             }
         }
         for arg in &inst.args {
-            intern_opaque_payload_spelling(llbc, arg, struct_fields);
+            intern_opaque_payload_spelling(
+                llbc,
+                &intern_payload_registry_spelling(llbc, arg, struct_fields),
+                struct_fields,
+            );
         }
     }
 }
 
-/// Publish an empty struct row for a `TypeDeclKind::Opaque` payload the
-/// interned variant names. `derive_program_metadata` skips Opaque decls,
-/// so `project_struct_field_type` of that leaf was Impossible and
-/// Blocked getattr of `Some.__pos_0` (`rclass.py` `s_getattr`). An empty
-/// registry entry is the same registered-struct arm a Struct TypeDecl
-/// already takes; the payload stays one GC word (`InstanceRepr`).
 /// Empty registry row for a whole-arg unresolved associated-type
 /// projection. `intern_opaque_payload_spelling` looks up an Opaque
 /// TypeDecl and skips `??`; this spelling has none. One GC word
@@ -1264,6 +1343,64 @@ fn intern_projection_payload_spelling(
         .or_insert_with(Vec::new);
 }
 
+/// Intern payload field types render as a TypeDecl leaf
+/// (`charon_adt_to_ast_string`). The intern pass runs per LLBC, before
+/// the cross-crate `harden_duplicate_leaf_metadata` that withdraws a
+/// duplicate last-segment. A leaf still present in this crate's
+/// `struct_fields` can vanish from the merged registry; `project_struct_field_type`
+/// of that spelling is then Impossible and getattr of the interned
+/// variant's `__pos_0` blocks. Map a TypeDecl leaf onto the unique
+/// declaration whose crate-stripped path or full `name_path` is already
+/// registered, even while the leaf alias still exists. Two TypeDecls
+/// sharing the leaf keep the original spelling (fail-closed). The intern
+/// `<…>` class suffix is unchanged: CAST owner_root still uses the leaf
+/// render.
+fn intern_payload_registry_spelling(
+    llbc: &Llbc,
+    spelling: &str,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+) -> String {
+    let spelling = spelling.trim();
+    if spelling.is_empty()
+        || spelling.contains('<')
+        || spelling.contains("::")
+        || spelling.starts_with('*')
+        || spelling.starts_with('&')
+        || spelling.starts_with('[')
+        || spelling.starts_with('(')
+    {
+        return spelling.to_string();
+    }
+    let mut resolved: Option<String> = None;
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+        if spelling != leaf {
+            continue;
+        }
+        let canon = strip_crate_prefix(&name);
+        let key = if !canon.is_empty() && struct_fields.fields.contains_key(&canon) {
+            canon
+        } else if struct_fields.fields.contains_key(&name) {
+            name
+        } else {
+            continue;
+        };
+        match resolved.as_ref() {
+            Some(prev) if prev != &key => return spelling.to_string(),
+            Some(_) => {}
+            None => resolved = Some(key),
+        }
+    }
+    resolved.unwrap_or_else(|| spelling.to_string())
+}
+
+/// Publish an empty struct row for a `TypeDeclKind::Opaque` payload the
+/// interned variant names. `derive_program_metadata` skips Opaque decls,
+/// so `project_struct_field_type` of that leaf was Impossible and
+/// Blocked getattr of `Some.__pos_0` (`rclass.py` `s_getattr`). An empty
+/// registry entry is the same registered-struct arm a Struct TypeDecl
+/// already takes; the payload stays one GC word (`InstanceRepr`).
 fn intern_opaque_payload_spelling(
     llbc: &Llbc,
     spelling: &str,
@@ -6509,16 +6646,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         } else {
             crate::front::option_unwrap::rewire_unwrap_call_sites(&mut lo.graph, &lo.unwrap_sites)
         };
-        // The `Option::expect` guard rewrite (`front::option_expect`) splits the
-        // residual `expect` call block into a `__discriminant` guard the same
-        // way `unwrap` does — its `Some` arm extracts `__pos_0`, its `None` arm
-        // raises the implicit `AssertionError` and drops the panic message; same
-        // fail-safe contract, gate the reachability sweep on an actual rewrite.
-        let expect_rewritten = if lo.expect_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_expect::rewire_expect_call_sites(&mut lo.graph, &lo.expect_sites)
-        };
+        // Option expect is a regular call of the extracted core body
+        // (`match self { Some(v) => v, None => <diverging Never call> }`).
+        // The Never callee is `RaiseImplicit` (`TermKind::Abort`);
+        // `remove_assertion_errors` then prunes that arm.
         let result_expect_rewritten = crate::front::option_unwrap::rewire_result_expect_sites(
             &mut lo.graph,
             &lo.result_expect_sites,
@@ -6596,7 +6727,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || saturating_add_rewritten > 0
             || saturating_sub_rewritten > 0
             || unwrap_rewritten > 0
-            || expect_rewritten > 0
             || result_expect_rewritten > 0
             || !lo.disc_combinator_sites.is_empty()
         {

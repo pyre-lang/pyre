@@ -6957,6 +6957,49 @@ fn option_of_shared_ref_to_generic_struct_is_niche() {
     );
 }
 
+/// Thin `Arc<T>` / `Rc<T>` is a one-word owning pointer, so Option of
+/// either is the null niche. Fat `Arc<[T]>` keeps the tag.
+#[test]
+fn option_of_thin_arc_or_rc_is_niche() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            option_enum(0),
+            type_decl_struct(1, &["alloc", "sync", "Arc"], vec![]),
+            type_decl_struct(2, &["alloc", "rc", "Rc"], vec![]),
+            type_decl_struct(3, &["jit", "JitCode"], vec![]),
+        ],
+        vec![],
+    );
+    let tomb = super::no_tombstoned_leaves();
+    let jitcode = named_adt(3, vec![]);
+    let option_arc = option_adt_node(0, named_adt(1, vec![jitcode.clone()]));
+    let option_rc = option_adt_node(0, named_adt(2, vec![jitcode]));
+    let ty_arc = TyRef::Other(option_arc.clone());
+    let ty_rc = TyRef::Other(option_rc.clone());
+    assert!(
+        super::tyref_is_niche_option(&ty_arc, &llbc),
+        "Option of a thin Arc is the nullable pointer niche"
+    );
+    assert!(
+        super::tyref_is_niche_option(&ty_rc, &llbc),
+        "Option of a thin Rc is the nullable pointer niche"
+    );
+    assert_eq!(
+        super::adt_node_class_root_with(&option_arc, &llbc, &tomb),
+        None,
+        "niche Option of Arc must not intern a tagged class"
+    );
+    let fat_inner = serde_json::json!({
+        "Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]
+    });
+    let option_fat = TyRef::Other(option_adt_node(0, named_adt(1, vec![fat_inner])));
+    assert!(
+        !super::tyref_is_niche_option(&option_fat, &llbc),
+        "Option of a fat Arc slice keeps the tag"
+    );
+}
+
 /// A DST newtype whose last field is a Slice is two words. The
 /// shared-ref arm must not treat a missing layout size as thin.
 #[test]

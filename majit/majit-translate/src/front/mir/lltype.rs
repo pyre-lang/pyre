@@ -2009,28 +2009,7 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
     if let Some(pointee) = one_word_pointer_pointee(node, llbc) {
         return Some(pointee);
     }
-    let node = type_node_peel_aliases(node, llbc)?;
-    let def_id = adt_node_def_id(node)?;
-    let td = llbc.type_by_id(def_id)?;
-    let leaf = match td.item_meta.template_name().next_back()? {
-        NameSeg::Ident { ident: (s, _) } => s.as_str(),
-        _ => return None,
-    };
-    match leaf {
-        "Arc" | "Rc" => {
-            let path = td.item_meta.name_path();
-            if !(path.contains("::sync::") || path.contains("::rc::")) {
-                return None;
-            }
-            let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
-                .get("types")?
-                .as_array()?
-                .first()?;
-            let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
-            json_ty_is_statically_sized(inner, llbc).then_some(inner)
-        }
-        _ => None,
-    }
+    type_node_thin_arc_or_rc_pointee(node, llbc)
 }
 
 /// Declared gckind of the struct or enum `ty` names, after one pointer peel.
@@ -3215,6 +3194,32 @@ pub(in crate::front::mir) fn tyref_is_enum_free(ty: &TyRef, llbc: &Llbc) -> bool
         .and_then(adt_node_def_id)
         .and_then(|def_id| llbc.type_by_id(def_id))
         .is_some_and(|td| matches!(td.kind, TypeDeclKind::Enum(_)))
+}
+
+/// Declared `Never` / `!` FunDecl output. A callee with that spelling is
+/// a Rust abort (`ll_assert`; `rtyper/debug.py`) and lowers as
+/// `RaiseImplicit` the way `TermKind::Abort` does. Charon hash-conses
+/// the primitive as a type-name string through Deduplicated / Value
+/// (`charon_type_value_to_ast_string`).
+pub(in crate::front::mir) fn tyref_is_never(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| type_node_is_never(node, llbc))
+}
+
+fn type_node_is_never(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    if let Some(s) = node.as_str() {
+        return matches!(s, "Never" | "!");
+    }
+    if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc
+            .dedup_body(id)
+            .is_some_and(|body| type_node_is_never(body, llbc));
+    }
+    if let Some(arr) = node.get("Value").and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return type_node_is_never(&arr[1], llbc);
+    }
+    false
 }
 
 /// Whether `ty` resolves to a type Charon's resolved layout reports as
@@ -7433,6 +7438,13 @@ pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> b
     if type_node_is_thin_box(payload, llbc) {
         return true;
     }
+    // A thin `Arc<T>` / `Rc<T>` is a non-null owning pointer (the word
+    // addresses the refcount header), so Option of one is the same null
+    // niche as Option of a thin Box. Fat `Arc<[T]>` / `Arc<dyn Trait>`
+    // stay out ([`json_ty_is_statically_sized`]).
+    if type_node_is_thin_arc_or_rc(payload, llbc) {
+        return true;
+    }
     // A function pointer is one word, and `Option<fn(..)>` represents
     // `None` as the null pointer.  The payload therefore aliases the
     // base pointer directly and carries no metadata word.
@@ -8184,6 +8196,46 @@ pub(in crate::front::mir) fn type_node_box_pointee<'l>(
             .first();
     }
     None
+}
+
+/// Thin `Arc<T>` / `Rc<T>`: one word pointing at the refcount header
+/// (`ArcInner` / `RcBox`). Fat `Arc<[T]>` / `Arc<dyn Trait>` stay out.
+fn type_node_thin_arc_or_rc_pointee<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let node = type_node_peel_aliases(node, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let leaf = match td.item_meta.template_name().next_back()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        _ => return None,
+    };
+    match leaf {
+        "Arc" | "Rc" => {
+            let path = td.item_meta.name_path();
+            if !(path.contains("::sync::") || path.contains("::rc::")) {
+                return None;
+            }
+            let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
+                .get("types")?
+                .as_array()?
+                .first()?;
+            let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+            json_ty_is_statically_sized(inner, llbc).then_some(inner)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a Charon type node is a thin `Arc<T>` / `Rc<T>`. Kept next to
+/// [`type_node_is_thin_box`] so the Option niche walk and the int-bank
+/// peel share one predicate.
+pub(in crate::front::mir) fn type_node_is_thin_arc_or_rc(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    type_node_thin_arc_or_rc_pointee(node, llbc).is_some()
 }
 
 /// Whether a Charon type node is an owning `Box<T>` whose pointee has a
