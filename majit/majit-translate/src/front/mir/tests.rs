@@ -13514,6 +13514,69 @@ fn intern_option_from_map_call_llbc(
     )
 }
 
+fn generic_result_unwrap_decl(def_id: u64, result_id: u64) -> serde_json::Value {
+    let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let e = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(&["core", "result", "Result", "unwrap"], false),
+        "generics": {
+            "types": [
+                {"index": 0, "name": "T"},
+                {"index": 1, "name": "E"}
+            ],
+            "trait_clauses": [],
+            "const_generics": []
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [result_adt_node(result_id, t, e)],
+            "output": {"TypeVar": {"Bound": [0, 0]}}
+        },
+        "body": "Missing"
+    })
+}
+
+fn intern_result_from_unwrap_call_llbc(
+    type_args: Vec<serde_json::Value>,
+    extra_types: Vec<serde_json::Value>,
+) -> Llbc {
+    let mut types = vec![result_enum(0)];
+    types.extend(extra_types);
+    llbc_with_types(
+        "fixture",
+        types,
+        vec![
+            intern_map_caller(0, "call_unwrap", 1, type_args),
+            generic_result_unwrap_decl(1, 0),
+        ],
+    )
+}
+
+fn fieldless_enum_decl(def_id: u64, path: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, true),
+        "kind": {"Enum": [
+            {"name": "Memory", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U32", "0"]}}},
+            {"name": "Overflow", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U32", "1"]}}}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 4,
+                "align": 4,
+                "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U32"}}},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": []}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    })
+}
+
 fn field_row_ty<'a>(
     fields: &'a crate::front::semantic::StructFieldRegistry,
     owner: &str,
@@ -13744,6 +13807,213 @@ fn interned_option_opaque_some_pos0_is_named_instance() {
         panic!("Some.__pos_0 of Opaque intern spelling is named Instance, got {attr:?}")
     };
     assert_eq!(payload.classdef.is_some(), true);
+}
+
+/// Intern of `Result<Arguments, PyError>` spells `Ok.__pos_0` as the
+/// TypeDecl identity (`argument::Arguments`), not the shared leaf
+/// (`Arguments`). Three TypeDecls share that leaf; harden withdraws it.
+/// CAST intern suffix stays `<Arguments,PyError>`.
+#[test]
+fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
+    let interp_args = interior_struct(
+        1,
+        &["pyre_interpreter", "argument", "Arguments"],
+        &[(
+            "argc",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let fmt_args = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["core", "fmt", "Arguments"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[], false)
+    });
+    let ruff_args = interior_struct(
+        3,
+        &["ruff_python_ast", "nodes", "Arguments"],
+        &[(
+            "args",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let pyerror = interior_struct(
+        4,
+        &["pyre_interpreter", "error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = intern_result_from_unwrap_call_llbc(
+        vec![adt_node(1), adt_node(4)],
+        vec![interp_args, fmt_args, ruff_args, pyerror],
+    );
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<Arguments, PyError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<Arguments,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("argument::Arguments"),
+        "intern ROW is the TypeDecl identity, CAST suffix stays <Arguments>; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "result::Result<Arguments,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("argument::Arguments"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Result<RBigInt, RBigIntError>` spells `Err.__pos_0` as the
+/// fieldless enum's signed discriminant integer (`i32` for a U32 fixture
+/// layout). Fieldless enums have no ClassDef (`derive_program_metadata`
+/// skips the base). CAST intern suffix stays `<RBigInt,RBigIntError>`.
+/// `Ok.__pos_0` is the Opaque TypeDecl identity.
+#[test]
+fn interned_result_err_fieldless_enum_payload_is_discriminant_int() {
+    let bigint = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["majit_rlib", "rbigint", "RBigInt"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[], false)
+    });
+    let err = fieldless_enum_decl(2, &["majit_rlib", "rbigint", "RBigIntError"]);
+    let llbc =
+        intern_result_from_unwrap_call_llbc(vec![adt_node(1), adt_node(2)], vec![bigint, err]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<RBigInt, RBigIntError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<RBigInt,RBigIntError>::Err",
+            "__pos_0"
+        ),
+        Some("i32"),
+        "fieldless Err intern ROW is the signed discriminant integer; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<RBigInt,RBigIntError>::Ok",
+            "__pos_0"
+        ),
+        Some("rbigint::RBigInt"),
+        "Ok intern ROW is the Opaque TypeDecl identity; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Result<(RBigInt, RBigInt), RBigIntError>` spells the same
+/// fieldless `Err.__pos_0` integer. CAST intern suffix stays
+/// `<(RBigInt,RBigInt),RBigIntError>`.
+#[test]
+fn interned_result_tuple_ok_fieldless_err_payload_is_discriminant_int() {
+    let bigint = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["majit_rlib", "rbigint", "RBigInt"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[], false)
+    });
+    let err = fieldless_enum_decl(2, &["majit_rlib", "rbigint", "RBigIntError"]);
+    let pair = serde_json::json!({
+        "Adt": {
+            "id": 99,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [adt_node(1), adt_node(1)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let llbc = intern_result_from_unwrap_call_llbc(vec![pair, adt_node(2)], vec![bigint, err]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<(RBigInt, RBigInt), RBigIntError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<(RBigInt,RBigInt),RBigIntError>::Err",
+            "__pos_0"
+        ),
+        Some("i32"),
+        "tuple-Ok Result still intern's fieldless Err as signed integer; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Result<G<u8>, PyError>` keeps the CAST leaf render
+/// (`G<u8>`) as `Ok.__pos_0`. Identity-with-args (`g::G<u8>`) would be a
+/// different `struct_fields` key than CAST's `<G<u8>>` suffix.
+#[test]
+fn interned_result_ok_generic_payload_keeps_leaf_render() {
+    let g_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["majit_ir", "g", "G"], true),
+        "generics": {
+            "types": [{"index": 0, "name": "T"}],
+            "trait_clauses": [],
+            "const_generics": []
+        },
+        "kind": {"Struct": [
+            {"name": "item", "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}
+        ]},
+        "layout": interior_layout(8, &[0], false)
+    });
+    let pyerror = interior_struct(
+        2,
+        &["pyre_interpreter", "error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let g_u8 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let llbc = intern_result_from_unwrap_call_llbc(vec![g_u8, adt_node(2)], vec![g_decl, pyerror]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<G<u8>, PyError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<G<u8>,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("G<u8>"),
+        "generic intern ROW stays the CAST leaf render; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
 }
 
 /// Interned `Option<char>` BASE carries `__discriminant` so rtype
@@ -15958,23 +16228,28 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
         residuals.is_empty(),
         "signed-to-usize conversion must not leave an opaque core call: {residuals:?}"
     );
-    let unwrap_residuals = graph
+    let unwrap_calls = graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "unwrap"
-            )
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "unwrap",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("unwrap")
+                    && segments.iter().any(|s| s == "result")
+            }
+            _ => false,
         })
         .count();
     assert_eq!(
-        unwrap_residuals, 0,
-        "checked conversion Result::unwrap must become a discriminant guard"
+        unwrap_calls, 1,
+        "checked conversion Result::unwrap stays one regular call of the core body"
     );
     for name in [
         "pyre_object::listobject::range_state_value",
@@ -16083,12 +16358,12 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
 
 /// `complex_val` returns the RPython spelling of an optional pair.  The
 /// arithmetic helpers call `unwrap` only after their numeric dispatch has
-/// established the value is present, so the opaque Rust combinator must be
-/// translated to the ordinary payload guard instead of becoming a method
-/// lookup on an Option shell.
+/// established the value is present. The extracted core body is a regular
+/// call; its None arm is implicit AssertionError pruned by
+/// `remove_assertion_errors`.
 #[test]
 #[ignore]
-fn complex_arithmetic_unwraps_lower_to_payload_guards() {
+fn complex_arithmetic_unwraps_keep_regular_core_calls() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
@@ -16103,23 +16378,29 @@ fn complex_arithmetic_unwraps_lower_to_payload_guards() {
     ] {
         let graph = super::lower_function(&llbc, name)
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
-        let residuals: Vec<_> = graph
+        let unwrap_calls = graph
             .blocks
             .iter()
-            .enumerate()
-            .flat_map(|(block, bb)| {
-                bb.operations.iter().filter_map(move |op| match &op.kind {
-                    OpKind::Call {
-                        target: CallTarget::Method { name, .. },
-                        ..
-                    } if name == "unwrap" => Some((block, op.clone(), bb.exits.clone())),
-                    _ => None,
-                })
+            .flat_map(|bb| &bb.operations)
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "unwrap",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some("unwrap")
+                        && segments.iter().any(|s| s == "option")
+                }
+                _ => false,
             })
-            .collect();
-        assert!(
-            residuals.is_empty(),
-            "{name}: Option::unwrap must become a payload guard: {residuals:#?}"
+            .count();
+        let expected = if name.ends_with("complex_neg") { 1 } else { 2 };
+        assert_eq!(
+            unwrap_calls, expected,
+            "{name}: Option::unwrap stays a regular call of the core body, got {unwrap_calls}"
         );
     }
 }

@@ -1378,6 +1378,17 @@ fn intern_payload_registry_spelling(
         if spelling != leaf {
             continue;
         }
+        // A fieldless enum is its discriminant integer, not a ClassDef.
+        // Unique-leaf remap to the declared tag width so getattr of
+        // `Result::Err.__pos_0` is Integer (`tyref_to_value_type`).
+        if let Some(int_ty) = fieldless_enum_payload_int_ty(td, llbc) {
+            match resolved.as_ref() {
+                Some(prev) if prev != &int_ty => return spelling.to_string(),
+                Some(_) => {}
+                None => resolved = Some(int_ty),
+            }
+            continue;
+        }
         let canon = strip_crate_prefix(&name);
         let key = if !canon.is_empty() && struct_fields.fields.contains_key(&canon) {
             canon
@@ -6636,24 +6647,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.saturating_sub_sites,
             )
         };
-        // The `Option::unwrap` guard rewrite (`front::option_unwrap`) splits the
-        // residual `unwrap` call block into a `__discriminant` guard whose
-        // `Some` arm extracts `__pos_0` and whose `None` arm raises the implicit
-        // `AssertionError`; fail-safe, gate the
-        // reachability sweep on an actual rewrite.
-        let unwrap_rewritten = if lo.unwrap_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_unwrap::rewire_unwrap_call_sites(&mut lo.graph, &lo.unwrap_sites)
-        };
-        // Option expect is a regular call of the extracted core body
-        // (`match self { Some(v) => v, None => <diverging Never call> }`).
+        // Option/Result unwrap and plain Result expect are regular calls of
+        // the extracted core bodies
+        // (`match self { Some(v)/Ok(v) => v, None/Err => <diverging Never call> }`).
         // The Never callee is `RaiseImplicit` (`TermKind::Abort`);
-        // `remove_assertion_errors` then prunes that arm.
-        let result_expect_rewritten = crate::front::option_unwrap::rewire_result_expect_sites(
-            &mut lo.graph,
-            &lo.result_expect_sites,
-        );
+        // `remove_assertion_errors` then prunes that arm. Carrier
+        // `Result<T, PyError>` unwrap/expect stay on `result_exc`.
         let option_ok_or_else_disc = disc_combinator_sites
             .iter()
             .any(|site| site.kind == DiscCombinator::OptionOkOrElse);
@@ -6726,8 +6725,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || slice_is_ascii_rewritten > 0
             || saturating_add_rewritten > 0
             || saturating_sub_rewritten > 0
-            || unwrap_rewritten > 0
-            || result_expect_rewritten > 0
             || !lo.disc_combinator_sites.is_empty()
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);

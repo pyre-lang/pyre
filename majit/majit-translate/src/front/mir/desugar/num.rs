@@ -1327,8 +1327,10 @@ impl<'a> Lowering<'a> {
     /// struct, so the call becomes the pair residual plus two pure item reads
     /// packed back into the source-level `(RBigInt, RBigInt)`.  The Rust
     /// `Result` around it is always `Ok` here -- the residual raises instead
-    /// -- so the destination binds to the tuple the way
-    /// [`Self::try_lower_usize_try_from`] binds an always-`Ok` payload.
+    /// -- and the destination is that declared Result, so the lowering
+    /// materializes the tagged-pair instance
+    /// ([`Self::emit_tagged_pair_aggregate`]) rather than binding the
+    /// tuple payload as the local.
     pub(in crate::front::mir) fn try_lower_rbigint_divmod_pair(
         &mut self,
         mir_bb: usize,
@@ -1446,26 +1448,18 @@ impl<'a> Lowering<'a> {
                 .collect(),
         };
         let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items)?;
-        if self.multi_assigned_locals.contains(&dest_local) {
-            let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
-            let payload_owner =
-                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
-            self.emit_tagged_pair_aggregate(
-                mir_bb,
-                &owner,
-                &payload_owner,
-                disc,
-                payload,
-                dest_local,
-                target,
-            )?;
-            return Ok(true);
-        }
-        self.const_discriminant_locals.insert(dest_local, 0);
-        self.local_var[dest_local] = Some(LocalValue::One(payload));
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
+        let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            payload,
+            dest_local,
+            target,
+        )?;
         Ok(true)
     }
 
@@ -1588,47 +1582,30 @@ impl<'a> Lowering<'a> {
             )?;
             return Ok(true);
         }
-        if self.multi_assigned_locals.contains(&dest_local) {
-            // A re-bindable local may later carry a runtime `Result`,
-            // so the constant tag can't be recorded and consumers
-            // can't be folded — materialize the aggregate so field
-            // reads on the local stay type-consistent.
-            let bb_id = self.emit_bb(mir_bb);
-            let disc = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(disc.clone()),
-                kind: OpKind::ConstInt(0),
-            });
-            // Always-`Ok`: the payload belongs to the `Ok` variant (tag 0).
-            let payload_owner =
-                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
-            self.emit_tagged_pair_aggregate(
-                mir_bb,
-                &owner,
-                &payload_owner,
-                disc,
-                arg,
-                dest_local,
-                target,
-            )?;
-            return Ok(true);
-        }
-        // Identity widening: bind the destination local directly to
-        // the operand — no `Result` object is materialized at all,
-        // exactly as upstream `widen` leaves no op in the graph.
-        // The discriminant switch always sits in a successor block
-        // (a MIR call terminates its own block), so record the
-        // constant tag per-local: `Rvalue::Discriminant` folds to
-        // `ConstInt(0)` and `expect`/`unwrap` aliases the payload
-        // (`expect_on_const_ok`) without touching the variable.
-        self.const_discriminant_locals.insert(dest_local, 0);
-        self.local_var[dest_local] = Some(LocalValue::One(arg));
+        // Dest is a declared Result. Materialize the tagged-pair
+        // instance so field reads (`__discriminant` / variant payload)
+        // stay type-consistent with that enum, including when a later
+        // combinator looks inside the core body. Always-`Ok`: the
+        // payload belongs to the `Ok` variant (tag 0).
         let bb_id = self.emit_bb(mir_bb);
-        let target_bb = self.block_id[target];
-        let link_args = self.edge_args(mir_bb, target)?;
-        self.graph.set_goto(bb_id, target_bb, link_args);
+        let disc = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg,
+            dest_local,
+            target,
+        )?;
         Ok(true)
     }
 
@@ -2092,20 +2069,13 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Resolve `Result::expect` / `Result::unwrap` on a receiver local
-    /// recorded always-`Ok` (`const_discriminant_locals`, tag 0) to
-    /// the receiver variable itself.  Such locals are bound directly
-    /// to the `Ok` payload by [`Lowering::try_lower_usize_try_from`]
-    /// (no `Result` object is materialized), so the unwrap is an
-    /// alias, not an op.  The match these methods perform lives
-    /// inside the Opaque core body, so without the intercept the call
-    /// keeps its panic-message `&str` argument and the graph walls on
-    /// the `__str_const` lowering even though the `Err` arm is
-    /// statically dead.  Upstream has no such call: `ovfcheck`-free
-    /// widening is a plain identity (`rarithmetic.py widen`),
-    /// so the operand *is* the whole operation.  Returns `None` for
-    /// any other callee or a receiver without the always-`Ok` record,
-    /// keeping the generic `Call` form.
+    /// Resolve a Result combinator on a receiver local recorded
+    /// always-`Ok` (`const_discriminant_locals`, tag 0) to the receiver
+    /// variable itself.  A tagged-pair Result dest no longer records
+    /// that tag; this intercept remains for any leftover identity-bound
+    /// payload local.  Returns `None` for any other callee or a
+    /// receiver without the always-`Ok` record, keeping the generic
+    /// `Call` form.
     pub(in crate::front::mir) fn expect_on_const_ok(
         &self,
         segments: &[String],

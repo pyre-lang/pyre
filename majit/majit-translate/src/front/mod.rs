@@ -86,7 +86,6 @@ pub(crate) mod join_chars;
 pub mod llbc_hints;
 pub mod mir;
 pub(crate) mod option_ctor;
-pub(crate) mod option_unwrap;
 pub(crate) mod option_variant;
 pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;

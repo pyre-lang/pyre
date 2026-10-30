@@ -79,7 +79,7 @@
 //!   (`getdict(obj).unwrap_or(default)` = `try/except OperationError`);
 //!   `expect` / `unwrap` raise the implicit `AssertionError` (`core`
 //!   `Result::expect`; `simplify.py` `remove_assertion_errors`) — the
-//!   panic on `Err` that `option_unwrap` already uses.
+//!   same implicit raise every other `-> !` panic path already uses.
 //!   `interp_deque.py` `W_Deque.trimleft` / `popleft` is
 //!   `pop_left(self_obj).expect("trimleft on non-empty deque")`.
 //!   No `Result` shell and no residual combinator survive.
@@ -2578,7 +2578,7 @@ pub(crate) enum CarrierCatchKind {
     /// `Result::expect` / `Result::unwrap`: catch raises the implicit
     /// `AssertionError` (`core` `Result::expect`; `simplify.py`
     /// `remove_assertion_errors`). The panic is the "shouldn't occur at
-    /// run-time" arm `option_unwrap` already uses. `interp_deque.py`
+    /// run-time" arm every other `-> !` path already uses. `interp_deque.py`
     /// `W_Deque.trimleft` / `popleft` is the interpreter spelling
     /// (`pop_left(self_obj).expect(...)` when `len > maxlen`).
     RaiseImplicit,
@@ -4972,6 +4972,36 @@ fn plan_through_hops(
     })
 }
 
+/// Re-emit the `__cast_instance_intrinsic` narrowing the residual call carried
+/// into an arm's `raw` payload value.  `None` (no cast on the original result)
+/// is a pass-through: the raw value flows on unchanged.  The cast is
+/// jitcode-identity (`cast_pointer` → `same_as`), so duplicating it per arm is
+/// sound.
+fn emit_cast_instance_narrow(
+    graph: &mut FunctionGraph,
+    bb: crate::model::BlockId,
+    cast: &Option<(String, ValueType)>,
+    raw: Variable,
+) -> Variable {
+    let Some((root, result_ty)) = cast else {
+        return raw;
+    };
+    let narrowed = graph.alloc_value_var();
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(narrowed.clone()),
+        kind: crate::model::cast_instance_call_result(root.clone(), raw, result_ty.clone()),
+    });
+    narrowed
+}
+
+/// Implicit `AssertionError` raise for a non-payload arm (`None` / `Err`).
+///
+/// [`FunctionGraph::set_raise_implicit`]; pruned by `simplify.py`
+/// `remove_assertion_errors`. Used by carrier `Result::expect` / `unwrap`.
+fn raise_implicit_non_payload(graph: &mut FunctionGraph, block: crate::model::BlockId) {
+    graph.set_raise_implicit(block, "AssertionError");
+}
+
 fn resolve_incoming(incoming: &[PlannedIncoming], payload: &Variable) -> Vec<LinkArg> {
     incoming
         .iter()
@@ -4984,7 +5014,7 @@ fn resolve_incoming(incoming: &[PlannedIncoming], payload: &Variable) -> Vec<Lin
 }
 
 /// Fresh arm that narrows `replacement` then reconstructs the join
-/// (`option_unwrap::emit_narrow`; `Link.__init__` one arg per inputarg).
+/// (`emit_cast_instance_narrow`; `Link.__init__` one arg per inputarg).
 fn emit_join_cast_arm(
     graph: &mut FunctionGraph,
     inspect: &UnwrapOrInspect,
@@ -4999,7 +5029,7 @@ fn emit_join_cast_arm(
             .expect("cast arm narrows an input the plan recorded"),
         NarrowFrom::Const(c) => materialize_call_arg_constant(graph, bb, c),
     };
-    let narrowed = crate::front::option_unwrap::emit_narrow(graph, bb, &inspect.cast, raw);
+    let narrowed = emit_cast_instance_narrow(graph, bb, &inspect.cast, raw);
     let outgoing: Vec<LinkArg> = cast
         .outgoing
         .iter()
@@ -5094,18 +5124,14 @@ fn apply_direct_join(
         DirectCatch::RaiseImplicit { normal } => {
             // `core` `Result::expect`: Ok is the reminted `T`; Err panics.
             // The catch is a fresh implicit-`AssertionError` raise
-            // (`simplify.py` `remove_assertion_errors`; `option_unwrap`
-            // `raise_implicit_non_payload`). `interp_deque.py`
+            // (`simplify.py` `remove_assertion_errors`). `interp_deque.py`
             // `W_Deque.trimleft` / `popleft`.
             if origin.a != inspect.u {
-                crate::front::option_unwrap::raise_implicit_non_payload(
-                    graph,
-                    crate::model::BlockId(inspect.u),
-                );
+                raise_implicit_non_payload(graph, crate::model::BlockId(inspect.u));
             }
             let (normal_target, normal_args) = apply_planned_arm(graph, &inspect, normal, &payload);
             let (raise_bb, _) = graph.create_block_with_arg_vars(0);
-            crate::front::option_unwrap::raise_implicit_non_payload(graph, raise_bb);
+            raise_implicit_non_payload(graph, raise_bb);
             install_last_exception(
                 graph,
                 origin.a,

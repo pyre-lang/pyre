@@ -7422,12 +7422,12 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
         }
-        // `Result::expect`. The callee is that result-module item:
+        // Carrier `Result::expect` via FunDecl / FunctionPath spelling.
         // `core::result::<Impl>::expect` on the `Method` spelling, and
         // `result::Result::expect` when a raw `&Result` takes the static
         // `FunctionPath` (`impl_method_owner` declines the method hint).
-        // `as_ref` is a regular call to the extracted core body
-        // (`match *self { Ok(ref x) => Ok(x), Err(ref x) => Err(x) }`).
+        // A non-carrier Result expect is a regular call of the extracted
+        // core body. `as_ref` is already that shape.
         let result_expect_callee = callee_name_path.as_deref().is_some_and(|path| {
             let segs: Vec<&str> = path.split("::").collect();
             *segs.last().unwrap_or(&"") == "expect"
@@ -7446,12 +7446,6 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if first_arg_ty
-                .as_ref()
-                .is_some_and(|ty| crate::front::result_exc::tyref_is_result(ty, self.llbc))
-                && let Some(site) = self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.result_expect_sites.push(site);
             }
         }
         // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
@@ -8256,17 +8250,10 @@ impl<'a> Lowering<'a> {
                 self.carrier_combinator_sites.push(site);
             }
         }
-        // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
-        // sites for the discriminant guard `front::option_unwrap` synthesizes.
-        // Like `unwrap_or`, `unwrap`'s body is Opaque (foreign `core`) and its
-        // receiver is the enum ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver in `args[0]`, the sole argument).
-        // The exception-carrier Result is a `CarrierCombinatorSite` —
-        // `front::result_exc` fuses `unwrap` onto `LastException` with an
-        // implicit-`AssertionError` catch (`core` `Result::unwrap`;
-        // `simplify.py` `remove_assertion_errors`). Plain-error Result and
-        // Option keep the discriminant guard. A resolution miss leaves the
-        // residual call — an unregistered callee the rtyper census Skips.
+        // Capture carrier `Result<T, PyError>::unwrap(res)` for
+        // `front::result_exc` LastException fusion. Plain Option / Result
+        // unwrap are regular calls of the extracted core bodies. A
+        // non-carrier miss leaves that call.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -8281,16 +8268,12 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.unwrap_sites.push(site);
             }
         }
         // Carrier `Result::expect(res, msg)` (`interp_deque.py`
         // `W_Deque.trimleft` / `popleft`; the `msg` operand is dropped).
-        // Option's two-arg sibling is a regular call of the extracted
-        // core body.
+        // Option / plain Result expect are regular calls of the extracted
+        // core bodies.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,

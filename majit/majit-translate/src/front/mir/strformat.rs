@@ -2868,7 +2868,7 @@ pub(in crate::front::mir) fn rewrite_debug_enum_fmt_site(
     }
     // Default arm: a closed enum's tag is always one of the above, so this
     // path "shouldn't occur" — raise the implicit `AssertionError`
-    // `remove_assertion_errors` prunes (matching `option_unwrap`'s None arm).
+    // `remove_assertion_errors` prunes.
     let (default_arm, _) = graph.create_block_with_arg_vars(0);
     graph.set_raise_implicit(
         default_arm,

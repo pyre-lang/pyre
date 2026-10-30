@@ -2659,10 +2659,11 @@ fn gcref_address_cast_store_keeps_gcref_pointer() {
     );
 }
 
-/// Count regular calls of the extracted Option expect body. Result
-/// expect stays on the carrier / Result rewrite and is excluded by the
-/// `option` segment (or by Method-only sites whose receiver was Option).
-fn core_option_impl_expect_call_count(graph: &crate::model::FunctionGraph) -> usize {
+/// Count regular calls of an extracted `core::{option,result}::<Impl>` body.
+/// Carrier `Result<T, PyError>` unwrap/expect is rewritten by `result_exc`
+/// and does not survive as a call. Method sites with no owner fall through
+/// only for `option` (the cv9 Method-only spelling).
+fn core_impl_call_count(graph: &crate::model::FunctionGraph, leaf: &str, owner_seg: &str) -> usize {
     use crate::model::{CallTarget, OpKind};
     graph
         .blocks
@@ -2670,19 +2671,90 @@ fn core_option_impl_expect_call_count(graph: &crate::model::FunctionGraph) -> us
         .flat_map(|block| block.operations.iter())
         .filter(|op| match &op.kind {
             OpKind::Call {
-                target: CallTarget::Method { name, .. },
+                target:
+                    CallTarget::Method {
+                        name,
+                        resolved_path,
+                        receiver_root,
+                        ..
+                    },
                 ..
-            } => name == "expect",
+            } => {
+                if name != leaf {
+                    return false;
+                }
+                if let Some(path) = resolved_path {
+                    return path.segments.iter().any(|s| s == owner_seg);
+                }
+                if let Some(root) = receiver_root {
+                    let leaf_root = majit_ir::descr::class_root_leaf(root);
+                    return match owner_seg {
+                        "option" => leaf_root == "Option" || leaf_root.starts_with("Option<"),
+                        "result" => leaf_root == "Result" || leaf_root.starts_with("Result<"),
+                        _ => false,
+                    };
+                }
+                owner_seg == "option"
+            }
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
             } => {
-                segments.last().map(String::as_str) == Some("expect")
-                    && segments.iter().any(|s| s == "option")
+                segments.last().map(String::as_str) == Some(leaf)
+                    && segments.iter().any(|s| s == owner_seg)
             }
             _ => false,
         })
         .count()
+}
+
+fn core_option_impl_expect_call_count(graph: &crate::model::FunctionGraph) -> usize {
+    core_impl_call_count(graph, "expect", "option")
+}
+
+fn assert_extracted_core_body_lowers(llbc: &Llbc, suffix: &str) {
+    let ctx = super::LowerContext::new(llbc);
+    let mut lowered_core_bodies = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let name_path = fd.item_meta.name_path();
+        if !name_path.ends_with(suffix) {
+            continue;
+        }
+        let graph =
+            super::lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+        let leftover_divergent = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(call_leaf_is_diverging_panic);
+        assert!(
+            !leftover_divergent,
+            "{name_path}: failing arm must not residualize the Never abort callee; ops={:?}",
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .map(|op| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !graph_has_live_assertion_branch(&graph),
+            "{name_path}: failing arm is implicit AssertionError removed by remove_assertion_errors"
+        );
+        assert!(
+            leftover_fmt_message_paths(&graph).is_empty(),
+            "{name_path}: abort-message chain must melt; leftover={:?}",
+            leftover_fmt_message_paths(&graph)
+        );
+        lowered_core_bodies += 1;
+    }
+    assert_eq!(
+        lowered_core_bodies, 1,
+        "extracted {suffix} FunDecl bodies must lower, got {lowered_core_bodies}"
+    );
 }
 
 fn call_leaf_is_diverging_panic(op: &crate::model::SpaceOperation) -> bool {
@@ -8084,6 +8156,114 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
         lowered_core_bodies, 1,
         "extracted expect FunDecl bodies must lower, got {lowered_core_bodies}"
     );
+}
+
+/// `complex_add` calls `complex_val(a).unwrap()` / `complex_val(b).unwrap()`.
+/// Each stays one regular call of the extracted core body
+/// `match self { Some(v) => v, None => <diverging Never call> }`.
+/// That body lowers; its None arm is `RaiseImplicit` and
+/// `remove_assertion_errors` prunes it.
+#[test]
+fn complex_add_keeps_regular_call_to_core_unwrap() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let caller = super::lower_function(&llbc, "complex_add").expect("lower complex_add");
+    assert_eq!(
+        core_impl_call_count(&caller, "unwrap", "option"),
+        2,
+        "caller keeps two regular calls to the core Option unwrap body, got {}",
+        core_impl_call_count(&caller, "unwrap", "option")
+    );
+    let leftover_divergent = caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(call_leaf_is_diverging_panic);
+    assert!(
+        !leftover_divergent,
+        "complex_add must not residualize the Never abort callee"
+    );
+    assert!(
+        !graph_has_live_assertion_branch(&caller),
+        "complex_add must not keep a live AssertionError raise after simplify"
+    );
+    assert_extracted_core_body_lowers(&llbc, "::option::<Impl>::unwrap");
+}
+
+/// `unicode_translate_error_str` has two plain Result expects:
+/// `start_slot.as_ref().expect(...)` and `usize::try_from(start).expect(...)`.
+/// Each stays a regular call of the extracted core body
+/// `match self { Ok(t) => t, Err(_) => <diverging Never call> }`.
+/// Carrier Result expect stays on `result_exc` and is not this site.
+#[test]
+fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let caller = super::lower_function(&llbc, "unicode_translate_error_str")
+        .expect("lower unicode_translate_error_str");
+    assert_eq!(
+        core_impl_call_count(&caller, "expect", "result"),
+        2,
+        "caller keeps two regular calls to the core Result expect body, got {}",
+        core_impl_call_count(&caller, "expect", "result")
+    );
+    let leftover_divergent = caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(call_leaf_is_diverging_panic);
+    assert!(
+        !leftover_divergent,
+        "unicode_translate_error_str must not residualize the Never abort callee"
+    );
+    assert!(
+        !graph_has_live_assertion_branch(&caller),
+        "unicode_translate_error_str must not keep a live AssertionError raise after simplify"
+    );
+    assert_extracted_core_body_lowers(&llbc, "::result::<Impl>::expect");
+}
+
+/// `range_list_length` is `usize::try_from(...).unwrap()`. The caller
+/// keeps one regular call of the extracted core body
+/// `match self { Ok(t) => t, Err(_) => <diverging Never call> }`.
+#[test]
+fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load object LLBC");
+    let caller =
+        super::lower_function(&llbc, "range_list_length").expect("lower range_list_length");
+    assert_eq!(
+        core_impl_call_count(&caller, "unwrap", "result"),
+        1,
+        "caller keeps one regular call to the core Result unwrap body, got {}",
+        core_impl_call_count(&caller, "unwrap", "result")
+    );
+    let leftover_divergent = caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(call_leaf_is_diverging_panic);
+    assert!(
+        !leftover_divergent,
+        "range_list_length must not residualize the Never abort callee"
+    );
+    assert!(
+        !graph_has_live_assertion_branch(&caller),
+        "range_list_length must not keep a live AssertionError raise after simplify"
+    );
+    assert_extracted_core_body_lowers(&llbc, "::result::<Impl>::unwrap");
 }
 
 /// A plain Result dest stays a regular call of the extracted core body

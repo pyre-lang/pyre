@@ -667,10 +667,9 @@ impl<'a> Lowering<'a> {
     /// Resolve a recognized carrier `Result<T, PyError>` combinator
     /// (`unwrap_or` / `expect` / `unwrap`) into a
     /// [`crate::front::result_exc::CarrierCombinatorSite`].  `None` when the
-    /// receiver is not the exception-carrier Result — `unwrap` then goes
-    /// to [`Self::recognize_unwrap_site`], Option expect is the extracted
-    /// core body, and `unwrap_or` stays a residual call whose core body
-    /// is translated.
+    /// receiver is not the exception-carrier Result — plain Option / Result
+    /// unwrap and expect are regular calls of the extracted core bodies,
+    /// and `unwrap_or` stays a residual call whose core body is translated.
     pub(in crate::front::mir) fn recognize_carrier_combinator_site(
         &self,
         recv_ty: Option<&TyRef>,
@@ -696,64 +695,6 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             payload_ty,
             catch,
-        })
-    }
-
-    /// Resolve a recognized `Option::unwrap(opt)` / plain-error
-    /// `Result::unwrap(res)` call into an
-    /// [`crate::front::option_unwrap::UnwrapSite`] — the enum root, payload
-    /// variant owner, payload type, and discriminant polarity the guard
-    /// post-pass needs. `Result<T, PyError>` remains the exception transform's
-    /// domain and is deliberately excluded. `None` leaves the residual call.
-    pub(in crate::front::mir) fn recognize_unwrap_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        result_var: &Variable,
-    ) -> Option<crate::front::option_unwrap::UnwrapSite> {
-        let recv_ty = recv_ty?;
-        let is_option = crate::front::result_exc::tyref_is_option(recv_ty, self.llbc);
-        let (enum_owner, payload_owner, payload_on_disc_true, niche) = if is_option {
-            let (option_owner, some_owner, _) = self.resolve_option_consumer_owners(recv_ty)?;
-            (
-                option_owner,
-                some_owner,
-                true,
-                self.tyref_is_niche_option_ptr(recv_ty),
-            )
-        } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
-            && !crate::front::result_exc::tyref_is_result_of_carrier(
-                recv_ty,
-                self.llbc,
-                self.static_addrs.error_carrier,
-            )
-        {
-            let def_id = self.tyref_adt_def_id(recv_ty)?;
-            let td = self.llbc.type_by_id(def_id)?;
-            // Match the per-instantiation owner minted by checked conversion
-            // producers (`Result<usize, TryFromIntError>`, etc.). A bare
-            // Result root would split the producer and consumer classdefs.
-            let enum_owner = format!(
-                "{}{}",
-                td.item_meta.name_path(),
-                tyref_enum_instantiation_suffix(recv_ty, self.llbc)
-            );
-            let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, 0)?;
-            (enum_owner, payload_owner, false, false)
-        } else {
-            return None;
-        };
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        let scalar_niche = is_option && !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
-        Some(crate::front::option_unwrap::UnwrapSite {
-            result_var: result_var.clone(),
-            enum_owner,
-            payload_owner,
-            payload_ty,
-            payload_on_disc_true,
-            niche,
-            int_null: self.option_niche_int_null(recv_ty),
-            scalar_niche,
-            niche_null_cast: self.option_niche_null_cast(recv_ty),
         })
     }
 

@@ -16,7 +16,9 @@ use majit_translate::{
     },
     flowspace::argument::Signature,
     front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names,
-    model::{ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, VecFieldPart},
+    model::{
+        ArrayGcKind, CallTarget, ConcreteType, ExitSwitch, LinkArg, OpKind, ValueType, VecFieldPart,
+    },
     translator::rtyper::{legacy_annotator, legacy_resolve},
 };
 
@@ -911,8 +913,10 @@ fn raising_op_result_does_not_flow_into_exception_link() {
 /// `formats[i].chars().next().unwrap()`. A Rust `char` is `UniChar`
 /// (`builtin_unichr` / `IntegerRepr.rtype_unichr`); an int code point from
 /// `Utf8StringIterator.next` (`rutf8.py`) is not. Call-site arguments
-/// must be the `as char` unichr op, a char constant, or a `FieldRead` of
-/// `__pos_0` (the unwrap payload is the `__pos_0` read, already a UniChar),
+/// must be the `as char` unichr op, a char constant, a `FieldRead` of
+/// `__pos_0`, a regular call of the extracted Option unwrap body (the
+/// helper's Int result is already a UniChar; the None arm is implicit
+/// AssertionError pruned by `remove_assertion_errors`),
 /// or mergeinputargs unions Integer with UnicodeCodePoint.
 #[test]
 fn oefmt_expected_fmt_arg_args_come_from_unichr_or_char_const() {
@@ -981,6 +985,35 @@ fn is_char_producing_op(kind: &OpKind) -> bool {
             target: CallTarget::FunctionPath { segments, .. },
             ..
         } if segments.len() == 1 && segments[0] == "__majit_unichr" => true,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } if *result_ty == ValueType::Int
+            && segments.iter().any(|s| s == "option")
+            && segments
+                .last()
+                .is_some_and(|s| s == "unwrap" || s.starts_with("unwrap__spec_")) =>
+        {
+            true
+        }
+        OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    resolved_path,
+                    ..
+                },
+            result_ty,
+            ..
+        } if *result_ty == ValueType::Int
+            && (name == "unwrap" || name.starts_with("unwrap__spec_"))
+            && resolved_path
+                .as_ref()
+                .is_none_or(|p| p.segments.iter().any(|s| s == "option")) =>
+        {
+            true
+        }
         OpKind::ConstInt(_) => true,
         OpKind::FieldRead { field, .. } if field.name == "__pos_0" => true,
         _ => false,

@@ -452,7 +452,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// mapper and raises. A plain Result dest is the extracted helper.
     pub(in crate::front::mir) result_map_err_sites:
         Vec<crate::front::result_map_err::ResultMapErrSite>,
-    pub(in crate::front::mir) result_expect_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -558,10 +557,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `range_iter` candidate; both passes are consumer-gated.
     pub(in crate::front::mir) slice_index_range_sites:
         Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
-    /// `front::option_unwrap` post-pass synthesizes (see
-    /// [`crate::front::option_unwrap::UnwrapSite`]).
-    pub(in crate::front::mir) unwrap_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// Option/Result combinators whose body is a discriminant switch (plus an
     /// optional closure `call_once`).  Captured here so the post-pass can
     /// replace the opaque core residual with the if/else the flow graph
@@ -1543,7 +1538,6 @@ impl<'a> Lowering<'a> {
             option_ok_or_else_try_sites: Vec::new(),
             carrier_combinator_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
-            result_expect_sites: Vec::new(),
             next_call_results: Vec::new(),
             map_collect_sites: Vec::new(),
             checked_arith_call_results: Vec::new(),
@@ -1565,7 +1559,6 @@ impl<'a> Lowering<'a> {
             slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
-            unwrap_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),

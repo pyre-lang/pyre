@@ -10745,12 +10745,124 @@ pub(in crate::front::mir) fn render_adt_type_args(
         .unwrap_or_default()
 }
 
+/// Discriminant integer spelling of a fieldless (C-like) enum TypeDecl.
+/// The intern payload row is this integer: fieldless enums have no
+/// ClassDef (`derive_program_metadata` skips the base). The annotator
+/// colors every fieldless enum `Int` (`tyref_to_value_type`); intern ROW
+/// is the signed width of the recorded tag so getattr of `__pos_0` is
+/// that same signed bank, not `r_uint`.
+pub(in crate::front::mir) fn fieldless_enum_payload_int_ty(
+    td: &TypeDecl,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !type_decl_is_fieldless_enum(td, llbc) {
+        return None;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let layout = td.layout_for_target(llbc, &target)?;
+    layout
+        .discriminant_int_type()
+        .map(intern_fieldless_enum_int_ty)
+        .or_else(|| match layout.size? {
+            1 => Some("i8".to_string()),
+            2 => Some("i16".to_string()),
+            4 => Some("i32".to_string()),
+            8 => Some("i64".to_string()),
+            _ => None,
+        })
+}
+
+fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
+    match int_ty {
+        "u8" => "i8",
+        "u16" => "i16",
+        "u32" => "i32",
+        "u64" => "i64",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Intern payload-row spelling of one ADT type argument.
+///
+/// The `<…>` CAST suffix stays the leaf render ([`render_adt_type_args`]).
+/// The intern ROW is the declared TypeDecl representation so getattr of
+/// a substituted `__pos_0` hits a registry key that survives
+/// `harden_duplicate_leaf_metadata`: a fieldless enum is its discriminant
+/// integer, a transparent handle is `*mut` of its `Deref::Target`, a
+/// monomorphic named ADT is `strip_crate_prefix` of the TypeDecl path,
+/// and a generic instantiation keeps the CAST leaf render.
+fn intern_type_arg_payload_spelling(
+    t: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+    if rendered == "Global" || rendered == "RandomState" {
+        return None;
+    }
+    let ty = TyRef::Other(t.clone());
+    if let Some(td) = tyref_fieldless_enum_pointee(&ty, llbc)
+        && let Some(int_ty) = fieldless_enum_payload_int_ty(td, llbc)
+    {
+        return Some(int_ty);
+    }
+    if let Some(spelling) = transparent_handle_field_spelling(
+        &ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return Some(spelling);
+    }
+    if let Some(identity) = intern_adt_type_decl_identity(&ty, llbc, depth) {
+        return Some(identity);
+    }
+    Some(rendered)
+}
+
+/// Crate-stripped TypeDecl identity of a monomorphic named ADT.
+///
+/// Generic instantiations (`Option<T>`, `Vec<u8>`) keep the CAST leaf
+/// render: intern ROW identity-with-args (`option::Option<*mut PyObject>`,
+/// `vec::Vec<u8>`) is a different `struct_fields` key than the `<…>`
+/// suffix CAST uses, and getattr of `__pos_0` then misses. Builtin
+/// Tuple/Box stay on [`charon_adt_to_ast_string`].
+fn intern_adt_type_decl_identity(ty: &TyRef, llbc: &Llbc, depth: usize) -> Option<String> {
+    let adt = tyref_adt_map(ty, llbc)?;
+    if adt.get("builtin").is_some_and(|b| !b.is_null()) {
+        return None;
+    }
+    let def_id = type_decl_ref_adt_id(adt)?;
+    let td = llbc.type_by_id(def_id)?;
+    let name = td.item_meta.name_path();
+    if name.is_empty() {
+        return None;
+    }
+    let type_args = render_adt_type_args(adt, llbc, depth);
+    if !type_args.is_empty() {
+        return None;
+    }
+    let canon = strip_crate_prefix(&name);
+    if canon.is_empty() {
+        Some(name)
+    } else {
+        Some(canon)
+    }
+}
+
 /// Payload-row spellings of an ADT head's type arguments.
 ///
 /// Same order and `Global` / `RandomState` filter as
 /// [`render_adt_type_args`] (that one still spells the `<…>` class
 /// suffix). A transparent GC handle is [`transparent_handle_field_spelling`]
-/// so a substituted `Err` payload projects to the cast's class.
+/// so a substituted `Err` payload projects to the cast's class. A named
+/// ADT payload is the TypeDecl identity, not the leaf, so a duplicate
+/// last-segment (`Arguments`) still intern's the declaration the type
+/// argument names.
 pub(in crate::front::mir) fn render_adt_payload_type_args(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
@@ -10765,20 +10877,12 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
-                    if rendered == "Global" || rendered == "RandomState" {
-                        return None;
-                    }
-                    let ty = TyRef::Other(t.clone());
-                    Some(
-                        transparent_handle_field_spelling(
-                            &ty,
-                            llbc,
-                            no_tombstoned_leaves(),
-                            gc_struct_ids,
-                            raw_alloc_flavor_structs,
-                        )
-                        .unwrap_or(rendered),
+                    intern_type_arg_payload_spelling(
+                        t,
+                        llbc,
+                        depth,
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
                     )
                 })
                 .collect()
