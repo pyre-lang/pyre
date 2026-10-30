@@ -3871,10 +3871,10 @@ impl<S: JitState> JitDriver<S> {
 
     /// pyjitpl.py compile_loop + raise_if_successful bookkeeping,
     /// shared by the `CloseLoop` and `CloseLoopWithArgs` arms.  Captures the
-    /// `(green_key, header_pc)` BEFORE `compile_loop` drains the trace ctx (so a
-    /// later bridge into this loop can resolve its parent loop's header pc — its
-    /// JUMP close target), compiles, and on success records the loop-header pc
-    /// and stashes the just-compiled key for the single-pass direct-entry hook.
+    /// start cell BEFORE `compile_loop` drains the trace ctx, compiles, and on
+    /// success stashes the just-compiled key for the single-pass direct-entry
+    /// hook. The loop's merge-point pc is the cell's greens
+    /// (`warmstate.py` `BaseJitCell`), not a field written here.
     fn compile_and_record_loop(
         &mut self,
         jump_args: &[OpRef],
@@ -3927,13 +3927,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         if matches!(outcome, crate::CompileOutcome::Compiled { .. }) {
-            if let (Some(gk), Some(hp)) = (loop_green_key, loop_header_pc) {
-                self.meta.record_loop_header_pc(gk, hp);
-            }
             if let Some(k) = self.meta.last_compiled_key() {
-                if let Some(hp) = loop_header_pc {
-                    self.meta.record_loop_header_pc(k, hp);
-                }
                 // Stash the just-compiled loop's key so the merge-point hook
                 // can arm the CRN/lazy back-edge label entry with the
                 // walk-final state instead of replaying the walked peeled
@@ -11467,8 +11461,12 @@ impl<S: JitState> JitDriver<S> {
         let bridge_driver_descriptor = self.driver_descriptor_for(state, &trace_meta);
         // The parent loop (the guard's owning loop, keyed by `green_key`) lives
         // at this header pc; the bridge closes by JUMPing into it there, not at
-        // its own `resume_pc`. Resolve before the `ctx` mutable borrow below.
-        let parent_header_pc = self.meta.loop_header_pc_for_driver(
+        // its own `resume_pc`. The cell's greens name that pc
+        // (`warmstate.py` `BaseJitCell`, first Int of `_green_args_spec` —
+        // the same `mp_green_pc` / `green_int[0]` the merge-point walker
+        // already uses). Resolve from the owning JCT's driver, not leftover
+        // `active_jitdriver_sd`. Resolve before the `ctx` mutable borrow below.
+        let parent_header_pc = self.meta.merge_point_pc_for_driver_cell(
             jct.outermost_jitdriver_index
                 .unwrap_or(self.index().unwrap_or(0)),
             green_key,
@@ -13791,7 +13789,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -13875,7 +13872,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -14023,7 +14019,6 @@ mod tests {
             meta,
             root_trace_id,
             traces: crate::FxIndexMap::default(),
-            loop_header_pc: None,
             next_global_opref: 0,
         };
         driver.meta.insert_compiled_loop_on_driver(
@@ -15551,14 +15546,12 @@ mod tests {
     /// re-opens tracing and leaves the entry to be displaced — the same
     /// desynchronisation quasi-immut invalidation produces in production.
     ///
-    /// Returns `(first.next_global_opref, replacement.next_global_opref,
-    /// replacement.loop_header_pc)`.
+    /// Returns `(first.next_global_opref, replacement.next_global_opref)`.
     fn compile_twice_at_one_green_key(
         raw: i64,
-        header_pc: usize,
         first_adds: usize,
         second_adds: usize,
-    ) -> (u32, u32, Option<usize>) {
+    ) -> (u32, u32) {
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let key = gk(raw);
@@ -15570,9 +15563,6 @@ mod tests {
             .compiled_entry(hash)
             .expect("compiled entry")
             .next_global_opref;
-        // `compile_loop` can only ever carry `loop_header_pc` forward, never
-        // mint one, so stamp the first entry the way a closing bridge does.
-        driver.meta.record_loop_header_pc(hash, header_pc);
 
         driver.meta.warm_state_for_driver(0).invalidate_all();
         assert!(
@@ -15587,11 +15577,7 @@ mod tests {
             "the second compile did not happen"
         );
         let replacement = &driver.meta.compiled_entry(hash).expect("compiled entry");
-        (
-            first_opref,
-            replacement.next_global_opref,
-            replacement.loop_header_pc,
-        )
+        (first_opref, replacement.next_global_opref)
     }
 
     /// `compile_loop`'s replace branch must raise the fresh high-water to the
@@ -15612,7 +15598,7 @@ mod tests {
             .expect("compiled entry")
             .next_global_opref;
 
-        let (first, replacement, _) = compile_twice_at_one_green_key(77, 4242, 8, 1);
+        let (first, replacement) = compile_twice_at_one_green_key(77, 8, 1);
         assert!(
             short_alone < first,
             "fixture is not discriminating: a short trace alone reaches \
@@ -15623,20 +15609,6 @@ mod tests {
             replacement, first,
             "the replacement entry must inherit the displaced entry's OpRef \
              high-water"
-        );
-    }
-
-    /// `compile_loop`'s replace branch must carry the displaced entry's
-    /// `loop_header_pc`, or every bridge aiming its closing JUMP at that
-    /// header is stranded.
-    #[test]
-    fn a_replacing_compile_carries_the_displaced_entrys_loop_header_pc() {
-        let (_, _, loop_header_pc) = compile_twice_at_one_green_key(78, 4242, 8, 1);
-        assert_eq!(
-            loop_header_pc,
-            Some(4242),
-            "the replacement entry must inherit the displaced entry's close \
-             target"
         );
     }
 
@@ -16211,6 +16183,118 @@ mod tests {
             "live loop_token_wref starts a bridge without compiled_loops"
         );
         assert!(driver.meta.is_tracing());
+    }
+
+    #[test]
+    fn a_bridge_target_header_pc_is_the_owning_cells_merge_point_pc() {
+        // The parent loop's merge-point pc is the first Int green on that
+        // cell (`warmstate.py` `JitCell`, `mp_green_pc` / `green_int[0]`),
+        // read from the guard's owning JCT driver — not declaration-order
+        // slot 0, not leftover `active_jitdriver_sd`.
+        struct BridgeState;
+        impl JitState for BridgeState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+            fn build_meta(&self, _: usize, _: &()) {}
+            fn extract_live(&mut self, _: &()) -> Vec<i64> {
+                vec![0]
+            }
+            fn create_sym(_: &(), _: usize) {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                vec![]
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn rebuild_from_resumedata(
+                _: &mut (),
+                fail_arg_types: &[Type],
+                storage: Option<&Arc<crate::resume::ResumeStorage>>,
+            ) -> Option<crate::ResumeDataResult> {
+                assert!(fail_arg_types.is_empty());
+                Some(crate::ResumeDataResult {
+                    frames: vec![],
+                    virtualizable_boxes: vec![],
+                    virtualref_values: vec![],
+                    storage: storage.cloned(),
+                    num_failargs: 0,
+                    fail_arg_types: vec![],
+                })
+            }
+        }
+        let mut driver = JitDriver::<BridgeState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let schema = || {
+            JitDriverStaticData::new(
+                vec![("code", Type::Ref), ("pc", Type::Int)],
+                vec![("value", Type::Int)],
+            )
+        };
+        let leftover_driver = driver.register_descriptor(schema());
+        let source_driver = driver.register_descriptor(schema());
+        let descriptor = driver.meta.staticdata.jitdrivers_sd[source_driver].clone();
+        let merge_pc = 4242usize;
+        let key = majit_ir::GreenKey::with_types(
+            vec![0x1111, merge_pc as i64],
+            vec![GreenType::Ref, GreenType::Int],
+        );
+        assert!(matches!(
+            driver.meta.force_start_tracing(
+                key.get_uhash(),
+                (0, 0),
+                Some((&key.values, &key.types)),
+                Some(descriptor),
+                &[Value::Int(0)]
+            ),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().unwrap();
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(guard, &[]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let cell_key = driver
+            .meta
+            .warm_state_for_driver(source_driver)
+            .cell_key_for(&key)
+            .expect("force_start_tracing installed the source cell");
+        let failure = driver
+            .meta
+            .run_compiled_detailed_with_values_on_driver(
+                source_driver,
+                cell_key,
+                &[Value::Int(0)],
+                0,
+            )
+            .unwrap();
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
+        let descr = failure.descr_arc.clone().unwrap();
+        driver.meta.active_jitdriver_sd = Some(leftover_driver);
+        let mut state = BridgeState;
+        assert!(
+            driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false, &[]),
+            "live loop_token_wref starts a bridge"
+        );
+        let parent_pc = driver
+            .meta
+            .trace_ctx()
+            .expect("bridge tracing")
+            .bridge_target_header_pc;
+        assert_eq!(
+            parent_pc,
+            Some(merge_pc),
+            "bridge_target_header_pc is the owning cell's first Int green, \
+             not declaration-order slot 0 ({}) and not leftover driver {}",
+            key.values[0],
+            leftover_driver
+        );
     }
 
     #[test]
