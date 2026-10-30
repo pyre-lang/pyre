@@ -3860,6 +3860,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         eprintln!("[p2-ca] EMIT pc={} token={}", op.pc, token.number());
     }
 
+    // `pyframe.py execute_frame` reads activation hooks before dispatch.
+    super::record_execute_frame_tracefunc_guard(ctx, op.pc)?;
+    super::record_execute_frame_profilefunc_guard(ctx, op.pc)?;
+
     // emission
     // The token is the callee this callable resolved to. A loop-carried
     // callable (`op` in `op(value)`) is not pinned by LOAD_GLOBAL, so a later
@@ -6475,7 +6479,7 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
-/// was recorded is answered by `record_portal_tracefunc_guard`
+/// was recorded is answered by `record_execute_frame_tracefunc_guard`
 /// (`jitcode_dispatch/mod.rs`) for a trace function and by the green for a
 /// profiler.
 ///
@@ -10650,6 +10654,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             concrete_dict,
         );
     }
+
+    // Capture the caller's CALL before installing the callee's register/state
+    // guards. A guard captured under setup_call would otherwise describe the
+    // callee's locals at the caller's resume coordinate.
+    super::record_execute_frame_tracefunc_guard(ctx, op.pc)?;
+    super::record_execute_frame_profilefunc_guard(ctx, op.pc)?;
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
         allocate_callee_register_banks(&body, ctx.trace_ctx);

@@ -743,23 +743,18 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true);
                 }
             }
-            // Publish `last_instr = py_pc - 1` to the vable static shadow
-            // before snapshotting.  The walker walks JitCode and never
-            // crosses `set_orgpc`, so the `last_instr` scalar in
-            // `virtualizable_boxes` keeps whatever the trace seed or the
-            // previous `close_loop_args_at` override wrote (the loop-header
-            // pc).  The blackhole / vable-sync resume reads this scalar into
-            // `frame.last_instr`; a stale loop-header value makes a mid-body
-            // guard resume at the loop header instead of the guard's own
-            // opcode, re-running loop iterations and corrupting the result.
-            // Mirror of `MIFrame::publish_last_instr_to_vable`.
+            // `pyjitpl.py capture_resumedata` copies the current virtualizable
+            // boxes. Generated `_opimpl_setfield_vable` writes already keep
+            // last_instr current. Preserve that value: a guard in the
+            // dispatch_bytecode trace arm resumes AFTER that store, and its
+            // callback must see this opcode, not `resume_py_pc - 1`.
             // `store_token_in_vable` emits GUARD_NOT_FORCED_2 only after the
             // exit path has stored the frame's final virtualizable image.
             // Unlike an ordinary guard it does not resume by re-executing the
             // current opcode: async forcing materializes that already-final
-            // image.  Keep the `last_instr`/`valuestackdepth` values published
-            // by `fbw_publish_exit_last_instr` instead of applying the generic
-            // `resume py_pc - 1` rewrite below.  This is the direct shape of
+            // image. Keep the final scalar values published by
+            // `fbw_publish_exit_last_instr` instead of projecting the ordinary
+            // guard's operand-stack depth below.  This is the direct shape of
             // PyPy `MetaInterp.store_token_in_vable` followed by
             // `generate_guard(GUARD_NOT_FORCED_2)`.
             let mut async_force_vable_boxes = None;
@@ -770,26 +765,15 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
                     ctx.trace_ctx,
                 ));
-                let last_instr_value = py_pc as i64 - 1;
-                let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                    ctx.trace_ctx,
-                    "last_instr",
-                    last_instr_op,
-                    Value::Int(last_instr_value),
-                );
                 // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
                 // virtualizable section WHILE the residual is running. Its
                 // result belongs to the MIFrame's post-call registers, but
                 // the interpreter has not pushed it yet. Preserve the stack
                 // before the post-call depth/operand overlay below, otherwise
                 // forcing reads an unwritten result home as a GC Ref.
-                // Do publish last_instr first: the walker does not maintain
-                // that scalar at each opcode, and callers inspecting this
-                // frame must see the current call, not the last merge point.
                 let guard_opcode = ctx.trace_ctx.last_op_opcode();
                 // Publish `valuestackdepth` for THIS guard's resume
-                // coordinate the same way `last_instr` is published above.
+                // coordinate's operand-stack layout.
                 // `sym.valuestackdepth` is NOT usable: the walker never
                 // crosses `set_orgpc`, so that scalar keeps the loop-entry
                 // inputarg the trace was seeded with (a loop-invariant the

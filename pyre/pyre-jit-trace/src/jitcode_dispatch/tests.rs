@@ -21319,7 +21319,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
 /// `pyjitpl.py` `opimpl_jit_merge_point` snapshots `history.any_operation()`
 /// before `debug_merge_point` records `DEBUG_MERGE_POINT`. An empty history
 /// visiting an already-compiled green stays inert even though that record
-/// (and the portal debugdata/tracefunc/profilefunc guards) runs first.
+/// (and the portal debugdata guards) runs first.
 #[test]
 fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
     let jmp_byte = *insns_opname_to_byte()
@@ -23688,6 +23688,11 @@ fn paused_portal_mirror_uses_abort_point_not_entry_vstack() {
 /// `_opimpl_setfield_vable` writes `virtualizable_boxes`.
 #[test]
 fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
+    assert_perfn_vablefield_updates_valuestackdepth_boxes(false);
+    assert_perfn_vablefield_updates_valuestackdepth_boxes(true);
+}
+
+fn assert_perfn_vablefield_updates_valuestackdepth_boxes(own_frame: bool) {
     use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
@@ -23697,7 +23702,7 @@ fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
         .expect("valuestackdepth is a static vable field");
     let nstatic = info.num_static_extra_boxes;
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let standard = tc.const_ref(1);
+    let standard = OpRef::input_arg_ref(0);
     let mut boxes = vec![tc.const_null(); nstatic];
     let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic];
     boxes[vsd_idx] = tc.const_int(3);
@@ -23710,7 +23715,7 @@ fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
         &values,
         &[0],
     );
-    let vable = OpRef::input_arg_ref(0);
+    let vable = standard;
     tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(1)));
 
     let byte = *insns_opname_to_byte()
@@ -23725,7 +23730,11 @@ fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
+            callee_shadow: own_frame.then(|| CalleeLocalsShadow {
+                fold_frame_reg: 0,
+                frame_box: vable,
+                ..Default::default()
+            }),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
             vstack_boxes: Vec::new(),

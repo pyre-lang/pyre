@@ -1102,11 +1102,9 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Strict fresh-frame fold: a scalar setfield to the current inline level's
-    // own (unseeded) portal frame is a virtual-field write — `valuestackdepth`
-    // / `last_instr` sync on a branchless leaf that resumes at the caller
-    // boundary — so it folds to a no-op, emitting no SETFIELD_GC.  The
-    // `fresh_virtualizable` OptVirtualize elision (jtransform.py).
+    // Keep the fresh frame's concrete scalar image current. All writes still
+    // pass through `_opimpl_setfield_vable` below: the standard frame updates
+    // virtualizable_boxes, while a nonstandard frame records SETFIELD_GC.
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let value = match value_bank {
@@ -1128,13 +1126,8 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             }
             crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, value);
         }
-        let vable = read_ref_reg_raw(code, op, 0, ctx)?;
-        // Same split as `setarrayitem_vable`: only the standard virtualizable
-        // folds the write away. `_opimpl_setfield_vable` records `SETFIELD_GC`
-        // for any other box.
-        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
+        // Even a standard frame must update virtualizable_boxes below.
+        // `_opimpl_setfield_vable` elides the IR store, not the box write.
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     // Same unseeded-register guard as `getfield_vable_via_metainterp`:
@@ -1205,13 +1198,8 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
             }
             crate::state::store_live_frame_static_int(shadow.concrete_frame, field_index, imm);
         }
-        let vable = read_ref_reg_raw(code, op, 0, ctx)?;
-        // Same split as `setfield_vable_via_metainterp`: only the standard
-        // virtualizable folds the write away. `_opimpl_setfield_vable` records
-        // `SETFIELD_GC` for any other box.
-        if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
-            return Ok((DispatchOutcome::Continue, op.next_pc));
-        }
+        // The standard path still writes its box and synchronizes the field
+        // (`pyjitpl.py _opimpl_setfield_vable`); only the IR store disappears.
     }
     let obj = read_ref_reg_raw(code, op, 0, ctx)?;
     if obj.is_none() {
