@@ -660,17 +660,20 @@ thread_local! {
 /// area is published, then stored in that area's `data`. The walker uses this
 /// pointer, never TLS: a foreign collector under STW walks another mutator's
 /// areas (`shadow_stack::walk_all_extra_areas`) and must not look up the
-/// collecting thread's driver.
+/// collecting thread's driver. The owner names the MetaInterp and the attempt
+/// depth; a parked attempt resolves against its own parked recorder.
 #[derive(Clone, Copy)]
 pub struct FrontendResrefOwner {
     meta: *const (),
-    forward: fn(*const (), OpRef, &mut dyn FnMut(&mut GcRef)),
+    forward: fn(*const (), usize, OpRef, &mut dyn FnMut(&mut GcRef)),
+    depth: usize,
 }
 
-fn forward_frontend_resref_none(_: *const (), _: OpRef, _: &mut dyn FnMut(&mut GcRef)) {}
+fn forward_frontend_resref_none(_: *const (), _: usize, _: OpRef, _: &mut dyn FnMut(&mut GcRef)) {}
 
 fn forward_frontend_resref_via_meta<M: Clone>(
     meta: *const (),
+    depth: usize,
     opref: OpRef,
     visitor: &mut dyn FnMut(&mut GcRef),
 ) {
@@ -678,7 +681,8 @@ fn forward_frontend_resref_via_meta<M: Clone>(
     // area (the owning mutator's JIT_DRIVER cell). STW has quiesced that
     // mutator, so this read does not race with tracing.
     unsafe {
-        (*meta.cast::<crate::pyjitpl::MetaInterp<M>>()).forward_frontend_resref(opref, visitor)
+        (*meta.cast::<crate::pyjitpl::MetaInterp<M>>())
+            .forward_frontend_resref(depth, opref, visitor)
     }
 }
 
@@ -686,12 +690,14 @@ impl FrontendResrefOwner {
     pub const NONE: Self = Self {
         meta: std::ptr::null(),
         forward: forward_frontend_resref_none,
+        depth: 0,
     };
 
     pub fn from_metainterp<M: Clone>(meta: &crate::pyjitpl::MetaInterp<M>) -> Self {
         Self {
             meta: std::ptr::from_ref(meta).cast(),
             forward: forward_frontend_resref_via_meta::<M>,
+            depth: meta.parked_attempts.len(),
         }
     }
 
@@ -701,7 +707,7 @@ impl FrontendResrefOwner {
         if self.meta.is_null() || opref.is_constant() || opref.is_none() {
             return;
         }
-        (self.forward)(self.meta, opref, visitor);
+        (self.forward)(self.meta, self.depth, opref, visitor);
     }
 }
 

@@ -2180,9 +2180,8 @@ fn ca_complete_after_bridge_walk(
     // already executed the resumed region's effects concretely, so a
     // guard-state resume would re-apply them over the advanced heap
     // (double-execution / stale-value return). Complete the callee from its
-    // adopted state via the portal runner instead — the same
-    // portal_ptr(*args) completion the ContinueRunningNormally arm of
-    // handle_blackhole_result performs.
+    // adopted state: enter already ran in compiled code, so dispatch then
+    // `ExecutionContext.leave` — `execute_frame`'s `finally`.
     if ca_adopted_frame != 0 && ca_adopted_frame == callee_frame {
         let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
         return match crate::eval::call_assembler_portal_body_result(frame) {
@@ -4123,6 +4122,12 @@ pub fn trace_and_compile_from_bridge(
         }
     }
 
+    // compile.py `_trace_and_compile_from_bridge` constructs a new
+    // `MetaInterp(metainterp_sd, jitdriver_sd)`. The reused driver parks
+    // the outer attempt for this whole function so `start_bridge_tracing`
+    // and the `is_tracing()` checks below see only the bridge walk.
+    let _nested = crate::eval::NestedTracePark::enter();
+
     let Some((green_key, trace_id, fail_index)) = bridge_compile_preflight(descr_arc) else {
         return BridgeResolution::ResumeBlackhole;
     };
@@ -5606,28 +5611,12 @@ fn jit_ca_handle_guard_failure(
             };
         };
     }
-    // `enter_profiler_tracing` is not re-entrant (`pyjitpl.py`
-    // `handle_guard_failure` — RPython unwinds to the top-level
-    // `execute_token` before any tracing decision, so a guard never fires
-    // while another trace is open). pyre's CALL_ASSEMBLER guard callback
-    // runs synchronously from the backend trampoline, so it CAN fire
-    // mid-trace: the self-recursion fold replays its CALL_ASSEMBLER
-    // concretely while the outer trace is still recording, and a deopt in
-    // that callee reaches here with the outer trace's profiler event still
-    // open. `with_trace_ctx_and_framestack` parks the recorder in
-    // `compile_tracing`, so `is_tracing` is false for that window;
-    // `trace_attempt_in_progress` still sees the open
-    // `profiler.start_tracing`. Starting a nested bridge would panic in
-    // `start_retrace_from_guard`'s `enter_profiler_tracing`. Bail to the
-    // blackhole resume (return false) so the callee completes in the
-    // interpreter and the outer trace keeps recording; the deferred bridge
-    // compiles later when this guard fails outside a trace.
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.trace_attempt_in_progress() {
-            return None;
-        }
-    }
+    // `compile.py _trace_and_compile_from_bridge` constructs a fresh
+    // MetaInterp. pyre's CALL_ASSEMBLER guard callback runs synchronously
+    // from the backend trampoline, so an outer attempt can still occupy
+    // this reused object. Park it (`warmstate.py bound_reached`) so
+    // `start_retrace_from_guard` can open its own profiler TRACING.
+    let _nested = crate::eval::NestedTracePark::enter();
 
     // compile.py _trace_and_compile_from_bridge.  Native CA code
     // crosses the backend boundary with only the raw descr pointer; recover

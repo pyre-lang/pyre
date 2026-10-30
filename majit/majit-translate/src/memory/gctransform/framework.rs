@@ -394,6 +394,7 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "eval::portal_runner_body_result",
     "eval::portal_body_result",
     "eval::call_assembler_portal_body_result",
+    "eval::continue_entered_frame",
     "eval::portal_activation_result",
     "eval::portal_traced_activation_result",
     "eval::portal_activation_bracketed",

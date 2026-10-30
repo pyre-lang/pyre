@@ -13600,6 +13600,7 @@ impl<'a> Transformer<'a> {
         let result_ir_type = self
             .resolve_call_result(op.result.as_ref(), result_ty)
             .ir_type;
+        let requested_extraeffect = extraeffect;
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -13612,6 +13613,14 @@ impl<'a> Transformer<'a> {
                 extradescrs,
             )
         };
+        // jtransform.py `_handle_oopspec_call`: `if extraeffect is not None:
+        // assert calldescr.get_extra_info().extraeffect == extraeffect`.
+        if let Some(expected) = requested_extraeffect {
+            assert_eq!(
+                descriptor.extra_info.extraeffect, expected,
+                "jtransform.py _handle_oopspec_call: extraeffect must survive getcalldescr"
+            );
+        }
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
             detail: format!("oopspec {oopspecindex:?} → residual_call"),

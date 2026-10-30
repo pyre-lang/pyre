@@ -5745,6 +5745,54 @@ mod tests {
         );
     }
 
+    /// heap.py `emitting_operation` `force_all_lazy_sets` when
+    /// `has_random_effects`. `rffi.llexternal` stamps
+    /// `random_effects_on_gcobjs` on a GIL-releasing funcptr
+    /// (`invoke_around_handlers or has_callback`);
+    /// `RandomEffectsAnalyzer.analyze_external_call` turns that into
+    /// `EF_RANDOM_EFFECTS` on the release-gil calldescr. A lazy SETFIELD
+    /// therefore flushes before CALL_RELEASE_GIL, so GUARD_NOT_FORCED at
+    /// +1 stays adjacent (`assembler.py _store_force_index`).
+    #[test]
+    fn test_lazy_set_flushes_before_call_release_gil_not_between_it_and_guard() {
+        let field = descr(0);
+        let call_d = call_descr(91, crate::call_descr::default_effect_info());
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 101),
+                ],
+                field,
+            ),
+            Op::with_descr(
+                OpCode::CallReleaseGilI,
+                &[
+                    rooted_inputarg_operand(Type::Int, 1),
+                    rooted_inputarg_operand(Type::Int, 2),
+                    rooted_inputarg_operand(Type::Int, 3),
+                ],
+                call_d,
+            ),
+            Op::new(OpCode::GuardNotForced, &[]),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[101, 1, 2, 3]);
+        let emitted: Vec<OpCode> = result.iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            emitted,
+            vec![
+                OpCode::SetfieldGc,
+                OpCode::CallReleaseGilI,
+                OpCode::GuardNotForced,
+                OpCode::Jump,
+            ],
+            "lazy SETFIELD_GC must flush before CALL_RELEASE_GIL so the \
+             call stays adjacent to GUARD_NOT_FORCED; got {emitted:?}",
+        );
+    }
+
     /// A `SizeDescr` for a `NEW` whose result stays virtual: `OptVirtualize`
     /// indexes `VirtualInfo._fields` by `field_slot_index(descr)` and asserts
     /// the slot is inside `all_fielddescrs()`, so the bare `TestSizeDescr`

@@ -2045,6 +2045,10 @@ pub(crate) unsafe fn normalize_slice(
 /// first, then called with `args_w` alone, so `@staticmethod` /
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
+///
+/// Residual (`look_inside_graph` sees the `args_w` loop). The word-ABI
+/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
+#[majit_macros::getfunctionptr]
 pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
@@ -19010,6 +19014,19 @@ unsafe fn iter_check_is_iterator(mut w_obj: PyObjectRef, mut w_iterator: PyObjec
     }
 }
 
+/// `descroperation.py iter` after `get_and_call_function`: `space.lookup(w_iter,
+/// '__next__')` is None.  The message names both types
+/// (`X.__iter__() must return an iterator, not Y`).
+pub fn check_iter_returned_iterator(
+    w_obj: PyObjectRef,
+    w_iterator: PyObjectRef,
+) -> Result<(), PyError> {
+    if w_iterator.is_null() {
+        return Err(PyError::type_error("iter() returned non-iterator"));
+    }
+    unsafe { iter_check_is_iterator(w_obj, w_iterator) }.map(|_| ())
+}
+
 /// `objspace.py _uses_list_iter` / `_uses_tuple_iter` /
 /// `_uses_unicode_iter` — the concrete storage iterator is only correct while
 /// the receiver's `__iter__` is still the one `base` defines.  `Some(method)`
@@ -20041,8 +20058,8 @@ unsafe fn list_iter_stop(obj: PyObjectRef, index: isize) -> PyObjectRef {
 /// under the GIL (`gil.py` `GILThreadLocals.gil_ready`) and has no per-list
 /// lock. Looking inside `w_list_getitem_inner` while the stripe is held
 /// records a guard that resumes at `FOR_ITER` and never releases, so a
-/// later thread unpacking a list stararg waits forever. `w_list_getitem`
-/// keeps the same opaque pairing.
+/// later thread unpacking a list stararg waits forever. BINARY_SUBSCR
+/// reaches the inner body through look-inside `w_list_getitem` instead.
 #[majit_macros::dont_look_inside]
 unsafe fn list_iter_getitem_locked(seq: PyObjectRef, index: isize) -> Option<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();

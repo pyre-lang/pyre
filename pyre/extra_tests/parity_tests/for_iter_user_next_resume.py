@@ -408,4 +408,51 @@ def for_iter_user_next_exhaustion():
         assert sum(1 for _ in early) == 1500
         assert early._seen == 1501
 for_iter_user_next_exhaustion()
+
+# An outer function's first call inlines a loop-owning callee whose `for`
+# pulls from a user `__next__` and from a generator expression.
+# The thresholds make the outer call the first to drain the callee.
+
+
+def _sum_loop(seq, start=0):
+    total = start
+    for item in seq:
+        total = total + item
+    return total
+
+
+def _sum_through_outer(seq):
+    return _sum_loop(seq)
+
+
+class _OddCounter:
+    def __init__(self, n):
+        self.i = 0
+        self.n = n
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.i >= self.n:
+            raise StopIteration
+        value = 2 * self.i + 1
+        self.i += 1
+        return value
+
+
+try:
+    import pypyjit
+    pypyjit.set_param("threshold=1,function_threshold=1")
+except ImportError:
+    pass
+for _ in range(2):
+    assert _sum_through_outer(_OddCounter(3000)) == 9000000
+    assert _sum_through_outer(2 * i + 1 for i in range(3000)) == 9000000
+try:
+    import pypyjit
+    pypyjit.set_param("default")
+except ImportError:
+    pass
+
 print("OK")

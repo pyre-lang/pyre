@@ -4869,10 +4869,12 @@ fn parameter_entry_registers_distinct_guard_fail_arities() {
 
 #[test]
 fn attached_frame_entry_bridge_enters_with_jf_descr_clear() {
-    // The failing guard writes its descr cell into jf_descr, then the
-    // frame-entry epilogue tail-calls the attached bridge. The recovery
-    // stub never runs (`patch_jump_for_descr`), so the bridge must see
-    // jf_descr == 0. jf_gcmap stays the spilled map, proving the spill ran.
+    // The failing guard spills its fail args, then the frame-entry epilogue
+    // tail-calls the attached bridge. The recovery stub never runs
+    // (`patch_jump_for_descr`): the descr, the gcmap and jf_guard_exc are
+    // written only on the exit that returns to the host
+    // (`_build_failure_recovery`), so the bridge sees jf_descr == 0 and the
+    // jf_gcmap the frame already had.
     const CELL_ADDR: u32 = 64;
     const EXIT_TABLE: u32 = 128;
     const DESCR_CELL: u32 = 0x00AB_CDEF;
@@ -4996,8 +4998,8 @@ fn attached_frame_entry_bridge_enters_with_jf_descr_clear() {
         .expect("generated trace should execute");
     assert_eq!(
         *store.data(),
-        (0, GCMAP_PTR),
-        "attached bridge sees jf_descr clear and the spilled gcmap"
+        (0, 0),
+        "attached bridge sees jf_descr clear and jf_gcmap unwritten"
     );
 }
 
@@ -6721,6 +6723,328 @@ fn cross_geometry_jump_delivers_label_args() {
         )
         .unwrap();
     assert_eq!(i64::from_le_bytes(word), 1, "target dispatch key");
+}
+
+/// A failing guard with an attached bridge must not leave `jf_descr` set on
+/// the jitframe the bridge keeps running. `patch_jump_for_descr` never writes
+/// that word; `_build_failure_recovery` writes it only when leaving compiled
+/// code. Frame-entry dispatch used to store the descr and then
+/// `return_call_indirect` the bridge, so the loop's next `CallMayForce` +
+/// `GuardNotForced` (no force) failed on the leftover.
+#[test]
+fn attached_bridge_does_not_leave_jf_descr_for_guard_not_forced() {
+    const FRAME_PTR: i32 = 4096;
+    const EXIT_TABLE: u32 = 0x2000;
+    const CELLS_BASE: u32 = 0x2100;
+    const GNF_DESCR: u32 = 0x100;
+    const GUARD_DESCR: u32 = 0x200;
+    const FINISH_DESCR: u32 = 0x300;
+    const LOOP_SLOT: u32 = 1;
+    const BRIDGE_SLOT: u32 = 2;
+    const CALL_SLOT: i64 = 3;
+
+    let frame = codegen::FrameGeometry::fixed();
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(CALL_SLOT)],
+        OpRef::int_op(2),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let gnf = make_guard(OpCode::GuardNotForced, &[], &[OpRef::input_arg_int(0)]);
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let loop_ops = vec![call, gnf, guard, finish];
+    let mut ca = codegen::CaParams::default();
+    ca.exit_table_base = EXIT_TABLE;
+    let loop_inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.clone(),
+        ops: loop_ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: CELLS_BASE,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (loop_bytes, loop_guards, _, _) =
+        codegen::build_wasm_module(&loop_inputs).expect("loop module builds");
+    validate_wasm(&loop_bytes);
+    assert_eq!(loop_guards.len(), 3, "GuardNotForced, GuardTrue, Finish");
+
+    let bridge_ops = vec![Op::new(OpCode::Jump, &[rb(OpRef::const_int(1))])];
+    let (bridge_bytes, _) = build_framed_module(
+        &inputargs,
+        &bridge_ops,
+        &indexmap::IndexMap::new(),
+        frame,
+        codegen::CaParams::default(),
+        LOOP_SLOT,
+        0,
+        0,
+    );
+    validate_wasm(&bridge_bytes);
+
+    let engine = Engine::default();
+    let loop_module = Module::new(&engine, &loop_bytes).unwrap();
+    let bridge_module = Module::new(&engine, &bridge_bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 8, None),
+        Val::default(ValType::FuncRef),
+    )
+    .unwrap();
+    let noop = wasmi::Func::wrap(&mut store, || 0i64);
+    table
+        .set(&mut store, CALL_SLOT as u64, Val::from(noop))
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let loop_inst = linker
+        .instantiate_and_start(&mut store, &loop_module)
+        .expect("loop instantiates");
+    let loop_func = loop_inst.get_func(&store, "trace").expect("loop trace");
+    table
+        .set(&mut store, LOOP_SLOT as u64, loop_func.into())
+        .unwrap();
+    let bridge_inst = linker
+        .instantiate_and_start(&mut store, &bridge_module)
+        .expect("bridge instantiates");
+    let bridge_func = bridge_inst.get_func(&store, "trace").expect("bridge trace");
+    table
+        .set(&mut store, BRIDGE_SLOT as u64, bridge_func.into())
+        .unwrap();
+
+    let mut exit_table = Vec::new();
+    for descr in [GNF_DESCR, GUARD_DESCR, FINISH_DESCR] {
+        exit_table.extend_from_slice(&descr.to_le_bytes());
+        exit_table.extend_from_slice(&0u32.to_le_bytes());
+    }
+    memory
+        .write(&mut store, EXIT_TABLE as usize, &exit_table)
+        .unwrap();
+    let mut cells = [0u8; 12];
+    cells[4..8].copy_from_slice(&BRIDGE_SLOT.to_le_bytes());
+    memory
+        .write(&mut store, CELLS_BASE as usize, &cells)
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            FRAME_PTR as usize + frame.spill_slot_ofs(0) as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+
+    loop_inst
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, FRAME_PTR)
+        .expect("guard-to-bridge-to-loop runs");
+
+    let header = FRAME_PTR as usize - majit_backend::jitframe::FIRST_ITEM_OFFSET;
+    let mut descr_word = [0u8; 4];
+    memory
+        .read(
+            &store,
+            header + majit_backend::jitframe::JF_DESCR_OFS as usize,
+            &mut descr_word,
+        )
+        .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(descr_word),
+        FINISH_DESCR,
+        "GUARD_NOT_FORCED must not fail on the leftover guard descr after the attached bridge"
+    );
+}
+
+/// The attached-bridge path must not write `jf_descr` at all
+/// (`patch_jump_for_descr`). The sibling test still passes if the guard
+/// stored a descr and then stored 0; a sentinel that is neither 0 nor the
+/// guard's descr distinguishes "never wrote" from "wrote then cleared".
+/// The bridge is a JUMP to a host function that returns the frame pointer
+/// and does not store `jf_descr` (`genop_finish` would).
+#[test]
+fn attached_bridge_does_not_write_jf_descr() {
+    const FRAME_PTR: i32 = 4096;
+    const EXIT_TABLE: u32 = 0x2000;
+    const CELLS_BASE: u32 = 0x2100;
+    const GUARD_DESCR: u32 = 0x200;
+    const FINISH_DESCR: u32 = 0x300;
+    const BRIDGE_SLOT: u32 = 2;
+    const DUMMY_SLOT: u32 = 3;
+    const SENTINEL: u32 = 0x1111_1111;
+
+    let frame = codegen::FrameGeometry::fixed();
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
+    let loop_ops = vec![guard, finish];
+    let mut ca = codegen::CaParams::default();
+    ca.exit_table_base = EXIT_TABLE;
+    let loop_inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.clone(),
+        ops: loop_ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: CELLS_BASE,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (loop_bytes, loop_guards, _, _) =
+        codegen::build_wasm_module(&loop_inputs).expect("loop module builds");
+    validate_wasm(&loop_bytes);
+    assert_eq!(loop_guards.len(), 2, "GuardTrue, Finish");
+
+    let bridge_ops = vec![Op::new(OpCode::Jump, &[rb(OpRef::const_int(1))])];
+    let (bridge_bytes, _) = build_framed_module(
+        &inputargs,
+        &bridge_ops,
+        &indexmap::IndexMap::new(),
+        frame,
+        codegen::CaParams::default(),
+        DUMMY_SLOT,
+        0,
+        0,
+    );
+    validate_wasm(&bridge_bytes);
+
+    let engine = Engine::default();
+    let loop_module = Module::new(&engine, &loop_bytes).unwrap();
+    let bridge_module = Module::new(&engine, &bridge_bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 8, None),
+        Val::default(ValType::FuncRef),
+    )
+    .unwrap();
+    let dummy = wasmi::Func::wrap(&mut store, |frame: i32| frame);
+    table
+        .set(&mut store, DUMMY_SLOT as u64, Val::from(dummy))
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let loop_inst = linker
+        .instantiate_and_start(&mut store, &loop_module)
+        .expect("loop instantiates");
+    let bridge_inst = linker
+        .instantiate_and_start(&mut store, &bridge_module)
+        .expect("bridge instantiates");
+    let bridge_func = bridge_inst.get_func(&store, "trace").expect("bridge trace");
+    table
+        .set(&mut store, BRIDGE_SLOT as u64, bridge_func.into())
+        .unwrap();
+
+    let mut exit_table = Vec::new();
+    for descr in [GUARD_DESCR, FINISH_DESCR] {
+        exit_table.extend_from_slice(&descr.to_le_bytes());
+        exit_table.extend_from_slice(&0u32.to_le_bytes());
+    }
+    memory
+        .write(&mut store, EXIT_TABLE as usize, &exit_table)
+        .unwrap();
+    let mut cells = [0u8; 8];
+    cells[0..4].copy_from_slice(&BRIDGE_SLOT.to_le_bytes());
+    memory
+        .write(&mut store, CELLS_BASE as usize, &cells)
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            FRAME_PTR as usize + frame.spill_slot_ofs(0) as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let header = FRAME_PTR as usize - majit_backend::jitframe::FIRST_ITEM_OFFSET;
+    memory
+        .write(
+            &mut store,
+            header + majit_backend::jitframe::JF_DESCR_OFS as usize,
+            &SENTINEL.to_le_bytes(),
+        )
+        .unwrap();
+
+    loop_inst
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, FRAME_PTR)
+        .expect("guard-to-bridge-to-dummy runs");
+
+    let mut descr_word = [0u8; 4];
+    memory
+        .read(
+            &store,
+            header + majit_backend::jitframe::JF_DESCR_OFS as usize,
+            &mut descr_word,
+        )
+        .unwrap();
+    assert_eq!(
+        u32::from_le_bytes(descr_word),
+        SENTINEL,
+        "attached-bridge path must not store jf_descr (write-then-clear would leave 0)"
+    );
 }
 
 fn build_framed_module(

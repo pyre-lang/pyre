@@ -5776,8 +5776,10 @@ fn resolve_call_assembler_target(
     // A target reached via do_recursive_call(assembler_call=True) at an
     // inline-frame loop header (opimpl_jit_merge_point pyjitpl.py) is a
     // loop greenkey, not a function-entry trace: it exits via guard-deopt and
-    // exposes no FINISH descr. RPython/x86 never require a target-local finish
-    // exit — _call_assembler_check_descr (x86/assembler.py) compares the
+    // exposes no portal-return FINISH. A segmented loop's only FINISH is
+    // `exit_frame_with_exception_descr_ref` (`_create_segmented_trace_and_blackhole`).
+    // RPython/x86 never require a target-local finish exit —
+    // `_call_assembler_check_descr` (x86/assembler.py) compares the
     // returned jf_descr against the CPU-global done_with_this_frame descr, and
     // the helper path handles the deopt result. When the target DOES expose a
     // finish exit (function-entry traces), keep validating its result type.
@@ -27298,6 +27300,107 @@ mod tests {
             backend.get_value_direct(&frame, slot),
             7,
             "the compared operand is readable at the slot the stamp names"
+        );
+        let raw = backend.execute_token_ints_raw(&token, &[0]);
+        assert_eq!(
+            raw.guard_value_operand,
+            Some(7),
+            "host token run reads the same slot `make_a_counter_per_value` stamped"
+        );
+    }
+
+    thread_local! {
+        static CA_BRIDGE_OPERAND: Cell<Option<(i64, bool)>> = const { Cell::new(None) };
+    }
+
+    fn capture_ca_bridge_operand(
+        _frame: *mut majit_backend::jitframe::JitFrame,
+        _descr: usize,
+        operand: i64,
+        present: bool,
+    ) -> Option<i64> {
+        CA_BRIDGE_OPERAND.with(|c| c.set(Some((operand, present))));
+        None
+    }
+
+    /// `handle_fail_resume_guard` / `llmodel.py get_value_direct`: the
+    /// CALL_ASSEMBLER helper must hand `make_a_counter_per_value`'s operand
+    /// to the bridge callback, including when it is not a fail argument.
+    #[test]
+    fn call_assembler_guard_failure_passes_guard_value_operand_to_bridge_fn() {
+        register_call_assembler_bridge(capture_ca_bridge_operand);
+        CA_BRIDGE_OPERAND.with(|c| c.set(None));
+
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let wide = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(4))]);
+        wide.pos().set(OpRef::NONE);
+        wide.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
+        let guard = Op::new(
+            OpCode::GuardValue,
+            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+        );
+        guard.pos().set(OpRef::NONE);
+        guard.set_fail_arg_types(vec![Type::Int]);
+        guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
+            OpRc::new(wide),
+            OpRc::new(guard),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 7i64);
+        constants.insert(101, 100i64);
+        constants.insert(102, 999i64);
+        constants.insert(103, 5i64);
+        constants.insert(104, 1i64);
+        backend.set_constants(constants);
+
+        let token = Arc::new(JitCellToken::new(0xc0df));
+        token
+            .compiled_loop_token_expect()
+            .set_loop_token_wref(Arc::downgrade(&token));
+        backend
+            .compile_loop(&inputargs, &ops, token.as_ref())
+            .unwrap();
+
+        let frame = backend.execute_token(token.as_ref(), &[Value::Int(0)]);
+        let descr_arc = backend.get_latest_descr_arc(&frame);
+        let fd = descr_arc
+            .as_fail_descr()
+            .expect("guard exit carries a FailDescr");
+        assert!(
+            majit_backend::guard_value_counter_slot(fd).is_some(),
+            "the GUARD_VALUE stamped a counter slot"
+        );
+
+        let cell = majit_ir::FailDescrCell::wrap(descr_arc.clone());
+        let frame_ptr = frame
+            .as_jitframe()
+            .expect("cranelift deadframe is a jitframe")
+            .jf_gcref()
+            .0 as i64;
+        let _ = call_assembler_guard_failure_inner(
+            std::ptr::null(),
+            token.identity_key(),
+            majit_ir::FailDescrCell::thin_ptr(&cell) as i64,
+            frame_ptr,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CA_BRIDGE_OPERAND.with(|c| c.get()),
+            Some((7, true)),
+            "the compared operand must reach bridge_fn"
         );
     }
 

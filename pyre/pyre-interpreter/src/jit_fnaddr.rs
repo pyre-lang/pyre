@@ -445,7 +445,14 @@ pub mod word_publish {
         type Reg = i64;
         const IS_WORD: bool = false;
         fn from_reg(reg: i64) -> Self {
-            char::from_u32(reg as u32).unwrap_or('\0')
+            // A residual `char` word that is not a Unicode scalar can only
+            // come from a miscompiled call: `lltype.cast_primitive` uses
+            // `unichr` (`_to_primitive[UniChar]`) and `rint.rtype_unichr`
+            // checks the range via `ll_check_unichr` at the boundary.
+            match u32::try_from(reg).ok().and_then(char::from_u32) {
+                Some(c) => c,
+                None => panic!("invalid char residual argument: {reg}"),
+            }
         }
         fn into_reg(self) -> i64 {
             u32::from(self) as i64
@@ -7111,6 +7118,39 @@ mod tests {
             );
         }
         assert!(!is_abi_unsound_argument_residual(0));
+    }
+
+    /// `#[getfunctionptr]` publishes the word-ABI trampoline, not the raw
+    /// `&[PyObjectRef]` / `Result` item (`get_jitcode_calldescr` /
+    /// `getfunctionptr`).
+    #[test]
+    fn jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let get_and_call: extern "C" fn(i64, i64, i64, i64) -> i64 =
+            crate::baseobjspace::__majit_call_target_get_and_call_function;
+        let get_and_call = get_and_call as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
+            get_and_call
+        );
+        let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
+        assert_ne!(
+            get_and_call, raw_get,
+            "must not publish the raw slice/Result item"
+        );
+
+        let call_impl: extern "C" fn(i64, i64) -> i64 =
+            crate::call::__majit_call_target_call_function_impl_result;
+        let call_impl = call_impl as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::call::call_function_impl_result"],
+            call_impl
+        );
+        let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
+        assert_ne!(
+            call_impl, raw_call,
+            "must not publish the raw slice/Result item"
+        );
     }
 
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
