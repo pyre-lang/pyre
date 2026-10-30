@@ -252,7 +252,7 @@ fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
 /// `rclass.py InstanceRepr.new_instance` / `setfield`: an imported class
 /// keeps the defining owner's fields when constructing an inline header.
 #[test]
-fn imported_pyobject_header_construction_keeps_the_defining_fields() {
+fn imported_class_header_construction_keeps_the_defining_fields() {
     let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
     let fields = harvest_published_structs(&object);
     drop(object);
