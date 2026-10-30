@@ -1377,9 +1377,10 @@ pub struct JitCellToken {
     /// and bridge-link paths (`compiler.rs:2362/2468/2720/3998/4027`,
     /// `runner.rs:1281`) touch the target token without access to the
     /// trace ops, so this field caches the typed signature for them.
-    /// Front-end (tracer) code MUST NOT read this; use
-    /// `MetaInterp::front_target_inputarg_types` instead, which derives
-    /// types from the LABEL op + `TreeLoop.inputargs` per RPython.
+    /// Front-end (tracer) code MUST NOT read this. JUMP-arg types are
+    /// each box's `OpRef::ty()` (`history.py AbstractValue.type`);
+    /// `unroll.py optimize_bridge` / `jump_to_existing_trace` match the
+    /// JUMP against the target's virtual state.
     ///
     /// `OnceLock` because the backend's `compile_loop` writes it exactly
     /// once through `&JitCellToken` (the token may already have `Arc`

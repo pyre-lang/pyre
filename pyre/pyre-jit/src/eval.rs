@@ -12453,11 +12453,11 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // resume.py `ResumeDataDirectReader._prepare` dereferences
     // `storage.rd_numb_list` with no fallback: a guard reaching the
     // blackhole resume MUST carry rd_numb. `storage` is None only for
-    // terminal FINISH/JUMP exit layouts (compile.rs
-    // `infer_terminal_exit_layout`) and synthesized fallback layouts,
-    // none of which reach the guard blackhole path. If one ever did,
-    // there would be no resume data to decode — fail loudly rather than
-    // silently mis-resume.
+    // terminal FINISH/JUMP exit layouts, which carry no resume
+    // storage, and synthesized fallback layouts, none of which reach
+    // the guard blackhole path. If one ever did, there would be no
+    // resume data to decode — fail loudly rather than silently
+    // mis-resume.
     panic!(
         "resume_in_blackhole_from_exit_layout: exit_layout.storage missing \
          (trace={} fail_idx={})",

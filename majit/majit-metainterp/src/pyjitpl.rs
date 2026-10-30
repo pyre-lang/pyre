@@ -616,8 +616,6 @@ fn cross_loop_cut_label_jump_null_guard_slot(ops: &[majit_ir::OpRc]) -> Option<u
 /// per-bridge frontend record made retention grow with the bridge count
 /// and never shrink.
 pub(crate) struct CompiledTrace {
-    /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
-    pub(crate) inputargs: Vec<InputArgRc>,
     /// Optimized ops for blackhole fallback from compiled guard failures.
     pub(crate) ops: Vec<majit_ir::OpRc>,
     /// Typed constant pool paired with `ops` for blackhole fallback.
@@ -629,8 +627,6 @@ pub(crate) struct CompiledTrace {
     pub(crate) constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Static exit metadata for each guard/finish in this trace.
     pub(crate) exit_layouts: crate::FxIndexMap<u32, StoredExitLayout>,
-    /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: crate::FxIndexMap<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -646,19 +642,13 @@ pub(crate) struct StoredExitLayout {
     /// does not resolve to an op with a descr — readers treat that as
     /// an empty type vector.
     pub(crate) descr: Option<DescrRef>,
-    /// Pyre-specific: types of the values flowing through
-    /// a JUMP terminal exit, populated only when `descr` cannot supply
-    /// them.  RPython's JUMP descr is `TargetToken` (`history.py`)
-    /// which carries no `fail_arg_types` because PyPy reads JUMP arg
-    /// types directly off the boxes (`box.type`, `history.py:182/220`).
-    /// Pyre's `OpRef` is typed for the post-optimizer trace, so this
-    /// field caches the per-arg types `infer_terminal_exit_layout`
-    /// already computes; readers keep working uniformly through
-    /// `resolve_exit_types()`.  `None` for guard / FINISH layouts whose
-    /// `descr.as_fail_descr().fail_arg_types()` is the canonical source.
-    /// Convergence path: when pyre stops including JUMP in
-    /// `terminal_exit_layouts` (PyPy never does), this field disappears
-    /// with it.
+    /// Types of the values flowing through a JUMP terminal exit, populated
+    /// only when `descr` cannot supply them. RPython's JUMP descr is
+    /// `TargetToken` (`history.py`) which carries no `fail_arg_types`
+    /// because PyPy reads JUMP arg types off the boxes (`box.type`,
+    /// `history.py AbstractValue.type`). `None` for guard / FINISH
+    /// layouts whose `descr.as_fail_descr().fail_arg_types()` is the
+    /// canonical source.
     pub(crate) op_arg_types_for_jump: Option<Vec<Type>>,
 }
 
@@ -698,10 +688,8 @@ impl StoredExitLayout {
     ///
     ///   1. A JUMP terminal exit whose descr is `LoopTargetDescr`
     ///      (RPython `TargetToken`, `history.py`).  PyPy reads
-    ///      types per-arg via `box.type` (`history.py:182/220`); pyre
-    ///      caches the equivalent in `op_arg_types_for_jump` because
-    ///      `OpRef::ty()` is the per-box analog and was already
-    ///      computed at `infer_terminal_exit_layout` time.
+    ///      types per-arg via `box.type` (`history.py AbstractValue.type`);
+    ///      pyre caches the equivalent in `op_arg_types_for_jump`.
     ///
     ///   2. A backend-only layout whose `source_op_index` did not
     ///      resolve to an op with a descr — readers treat that as
@@ -721,10 +709,9 @@ impl StoredExitLayout {
             return types;
         }
         // Both descr-side and JUMP-cache fallbacks empty — production
-        // builders (`build_terminal_exit_layouts`, `build_guard_metadata`,
-        // `merge_backend_*_layouts`) always populate at least one, since
-        // backend-only entries synthesize a `ResumeGuardDescr` and JUMP
-        // entries set `op_arg_types_for_jump`.  Hitting this branch
+        // builders (`build_guard_metadata`, `merge_backend_exit_layouts`)
+        // populate descr-side types (backend-only entries synthesize a
+        // `ResumeGuardDescr`). Hitting this branch
         // means a synthetic test fixture skipped both populators or a
         // builder regressed — flag it loudly in debug builds so it
         // does not silently mask a missing fail_arg_types population.
@@ -9948,23 +9935,12 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     self.active_frame_value_count_fn(),
                 );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
                         backend_layouts.as_slice(),
-                        &compiled_ops,
-                    );
-                }
-                if let Some(backend_layouts) =
-                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
-                {
-                    compile::merge_backend_terminal_exit_layouts(
-                        &mut terminal_exit_layouts,
-                        &backend_layouts,
                         &compiled_ops,
                     );
                 }
@@ -9976,11 +9952,9 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: inputargs.clone(),
                         ops: compiled_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
-                        terminal_exit_layouts,
                     },
                 );
 
@@ -11453,23 +11427,12 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     self.active_frame_value_count_fn(),
                 );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &combined_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
                     compile::merge_backend_exit_layouts(
                         &mut exit_layouts,
                         backend_layouts.as_slice(),
-                        &combined_ops,
-                    );
-                }
-                if let Some(backend_layouts) =
-                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
-                {
-                    compile::merge_backend_terminal_exit_layouts(
-                        &mut terminal_exit_layouts,
-                        &backend_layouts,
                         &combined_ops,
                     );
                 }
@@ -11481,11 +11444,9 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: inputargs.clone(),
                         ops: combined_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
-                        terminal_exit_layouts,
                     },
                 );
 
@@ -12510,8 +12471,6 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     self.active_frame_value_count_fn(),
                 );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -12521,26 +12480,15 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                     );
                 }
-                if let Some(backend_layouts) =
-                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
-                {
-                    compile::merge_backend_terminal_exit_layouts(
-                        &mut terminal_exit_layouts,
-                        &backend_layouts,
-                        &optimized_ops,
-                    );
-                }
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
                 let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs_cloned(),
                         ops: optimized_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
-                        terminal_exit_layouts,
                     },
                 );
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
@@ -12998,8 +12946,6 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     self.active_frame_value_count_fn(),
                 );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&inputargs, &compiled_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -13009,26 +12955,15 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_ops,
                     );
                 }
-                if let Some(backend_layouts) =
-                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
-                {
-                    compile::merge_backend_terminal_exit_layouts(
-                        &mut terminal_exit_layouts,
-                        &backend_layouts,
-                        &compiled_ops,
-                    );
-                }
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
                 let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: trace.inputargs_cloned(),
                         ops: compiled_ops,
                         constants: compiled_constants_typed,
                         exit_layouts,
-                        terminal_exit_layouts,
                     },
                 );
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
@@ -14699,63 +14634,6 @@ impl<M: Clone> MetaInterp<M> {
         self.get_loop_token_on_driver(0, green_key)
     }
 
-    /// Types of a JUMP into the root loop's body LABEL.
-    ///
-    /// `warmstate.py execute_assembler` / `cpu.execute_token` enter at the
-    /// procedure start (dispatch key 0, jitdriver reds). This helper types a
-    /// compiled JUMP into the body LABEL, not that `execute_token` signature
-    /// (`JitCellToken.inputarg_types`).
-    ///
-    /// The LABEL is resolved from `root_trace.ops`: the closing `Jump`'s
-    /// descr, else the first `Label` whose descr is a non-preamble
-    /// `TargetToken` among those ops, else `root_trace.inputargs` types.
-    pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
-        self.front_target_inputarg_types_on_driver(self.active_jitdriver_sd.unwrap_or(0), green_key)
-    }
-
-    pub fn front_target_inputarg_types_on_driver(
-        &self,
-        jd_no: usize,
-        green_key: u64,
-    ) -> Option<Vec<Type>> {
-        let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
-        let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
-        let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
-        let label_types = |label_index: usize, label: &majit_ir::OpRc| -> Vec<Type> {
-            label
-                .args_slice()
-                .iter()
-                .map(|arg| {
-                    type_index
-                        .opref_type_at(arg.to_opref(), label_index)
-                        .unwrap_or(Type::Ref)
-                })
-                .collect()
-        };
-        if let Some(jump) = root_trace.ops.last().filter(|op| op.opcode == OpCode::Jump)
-            && let Some(jump_descr) = jump.getdescr()
-            && let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
-                op.opcode == OpCode::Label
-                    && op.getdescr().is_some_and(|descr| {
-                        majit_ir::descr_identity(&descr) == majit_ir::descr_identity(&jump_descr)
-                    })
-            })
-        {
-            return Some(label_types(label_index, label));
-        }
-        if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
-            op.opcode == OpCode::Label
-                && op.getdescr().is_some_and(|descr| {
-                    descr
-                        .as_loop_target_descr()
-                        .is_some_and(|target| !target.is_preamble_target())
-                })
-        }) {
-            return Some(label_types(label_index, label));
-        }
-        Some(root_trace.inputargs.iter().map(|ia| ia.tp.get()).collect())
-    }
-
     /// Get the pre-allocated token number for a trace being recorded.
     ///
     /// Returns `Some(number)` if the given green_key matches the trace
@@ -16130,8 +16008,6 @@ impl<M: Clone> MetaInterp<M> {
                     original_green_key,
                     self.active_frame_value_count_fn(),
                 );
-                let mut terminal_exit_layouts =
-                    compile::build_terminal_exit_layouts(&entry_inputargs, &optimized_ops);
                 if let Some(backend_layouts) =
                     self.backend.compiled_fail_descr_layouts(token.as_ref())
                 {
@@ -16141,26 +16017,15 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                     );
                 }
-                if let Some(backend_layouts) =
-                    self.backend.compiled_terminal_exit_layouts(token.as_ref())
-                {
-                    compile::merge_backend_terminal_exit_layouts(
-                        &mut terminal_exit_layouts,
-                        &backend_layouts,
-                        &optimized_ops,
-                    );
-                }
                 let mut next_global_opref =
                     compute_next_global_opref(&entry_inputargs, &optimized_ops);
                 let mut traces = crate::FxIndexMap::default();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: entry_inputargs.clone(),
                         ops: optimized_ops,
                         constants: compiled_constants_typed,
                         exit_layouts,
-                        terminal_exit_layouts,
                     },
                 );
 
@@ -32509,81 +32374,6 @@ mod tests {
         assert_eq!(prepared.inputargs[1].get_value(), None);
     }
 
-    #[test]
-    fn test_front_target_inputarg_types_uses_saved_front_label_contract() {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = gk(7);
-        let trace_id = 11;
-        let token = std::sync::Arc::new(JitCellToken::new(3));
-        let start_token = crate::history::TargetToken::new_loop(0);
-        let start_descr = start_token.as_jump_target_descr();
-        let inputargs = [InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
-        let label_args = [
-            OpRef::input_arg_ref(0),
-            OpRef::input_arg_ref(1),
-            OpRef::ref_op(2),
-            OpRef::int_op(3),
-        ];
-        let ops = vec![
-            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 2),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
-            mk_op_with_descr(
-                OpCode::Label,
-                &label_args,
-                OpRef::NONE.raw(),
-                start_descr.clone(),
-            ),
-            mk_op_with_descr(
-                OpCode::Jump,
-                &label_args,
-                OpRef::NONE.raw(),
-                start_descr.clone(),
-            ),
-        ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
-        constants.insert(100, majit_ir::Const::Int(1));
-        constants.insert(101, majit_ir::Const::Int(2));
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            trace_id,
-            CompiledTrace {
-                inputargs: inputargs.to_vec(),
-                ops: ops.into_iter().map(OpRc::new).collect(),
-                constants,
-                exit_layouts: crate::FxIndexMap::default(),
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
-        // `compile.py` — `send_loop_to_backend` registers the token
-        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
-        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
-        // `token` alive past this fixture's own local.
-        meta.warm_state_for_driver(0)
-            .memory_manager
-            .keep_loop_alive(&token);
-        let _ = meta
-            .warm_state_for_driver(0)
-            .ensure_cell_for_key(&green_key);
-        meta.warm_state_for_driver(0)
-            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&token));
-        token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
-        meta.insert_compiled_loop(
-            green_key.get_uhash(),
-            CompiledEntry {
-                meta: std::sync::Arc::new(()),
-                root_trace_id: trace_id,
-                traces,
-                next_global_opref: 0,
-            },
-        );
-
-        assert_eq!(
-            meta.front_target_inputarg_types(green_key.get_uhash()),
-            Some(vec![Type::Ref, Type::Ref, Type::Ref, Type::Int])
-        );
-    }
-
     /// `pyjitpl.py:3319` reads the virtualizable out of a DECLARED red
     /// position; it never searches the reds for it. A red that happens to hold
     /// the same pointer earlier in the vector — another name for the same
@@ -32692,11 +32482,9 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: vec![],
                 ops: vec![],
                 constants: majit_ir::ConstMap::default(),
                 exit_layouts,
-                terminal_exit_layouts: crate::FxIndexMap::default(),
             },
         );
 
@@ -32920,26 +32708,16 @@ mod tests {
             hash,
             meta.active_frame_value_count_fn(),
         );
-        let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(inputargs, &ops);
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {
             compile::merge_backend_exit_layouts(&mut exit_layouts, &backend_layouts, &ops);
-        }
-        if let Some(backend_layouts) = meta.backend.compiled_terminal_exit_layouts(&token) {
-            compile::merge_backend_terminal_exit_layouts(
-                &mut terminal_exit_layouts,
-                &backend_layouts,
-                &ops,
-            );
         }
         let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: inputargs.to_vec(),
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants: constants_typed,
                 exit_layouts,
-                terminal_exit_layouts,
             },
         );
 
