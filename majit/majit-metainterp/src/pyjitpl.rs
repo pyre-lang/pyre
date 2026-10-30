@@ -2038,63 +2038,19 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) meta: std::sync::Arc<M>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
-    /// Box identity plan Phase E: high-water OpRef at which a bridge
-    /// compilation starts allocating fresh boxes.
-    ///
-    /// RPython `opencoder.py TraceIterator.__init__` allocates
-    /// fresh `InputArg` Python objects every iteration, so bridge
-    /// inputargs are automatically disjoint from the parent loop's boxes
-    /// by Python `is` identity. In pyre the typed `OpRef::InputArg*(raw)`
-    /// variant tag plus `raw` together form the identity, so a bridge
-    /// that re-uses the `[0..num_inputs)` range collides with the
-    /// parent loop's OpRefs. `next_global_opref` records the first
-    /// OpRef Phase 2 did *not* allocate; `compile_bridge` /
-    /// `start_retrace_from_guard` read it to pick a disjoint
-    /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
-    /// in `compile_bridge` below).
-    pub(crate) next_global_opref: u32,
-}
-
-impl<M> CompiledEntry<M> {
-    /// The state a replacement entry must inherit from the entry it displaces.
-    /// See `CarriedFields`.
-    pub(crate) fn carried_fields(&self) -> CarriedFields {
-        CarriedFields {
-            next_global_opref: self.next_global_opref,
-        }
-    }
-}
-
-/// The fields **every** `compiled_loops` replace path must carry forward off the
-/// entry it displaces, bundled so they travel with the removal.
-///
-/// `next_global_opref` keeps a later bridge's OpRefs disjoint from an earlier
-/// one's. A replacement that drops it strands work aimed at the key.
-///
-/// This is carried at **all five** replace paths. It is deliberately the
-/// *only* member: the label list is `JitCellToken.target_tokens`
-/// (`history.py`), and a token minted by `make_jitcell_token` starts with
-/// none, so no replace path inherits the displaced loop's labels. Adding a
-/// field here that is not universal re-introduces exactly the
-/// bug this type exists to prevent. A loop's merge-point pc lives on the
-/// cell's greens (`warmstate.py` `BaseJitCell` / `JitCell`), not here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CarriedFields {
-    pub(crate) next_global_opref: u32,
 }
 
 /// Compute the smallest fresh OpRef strictly above every position
 /// referenced by `inputargs` and `ops` (op positions, op args, and
 /// guard fail_args).
 ///
-/// Box Identity Phase E.2b parity: every loop / bridge / entry-bridge
-/// stored in `compiled_loops` records its high-water mark so the next
-/// bridge's `bridge_inputarg_base` derives a disjoint
-/// `[bridge_inputarg_base..)` namespace. Without this the second
-/// bridge of the same loop, or a bridge-from-bridge chain, would
-/// re-use OpRef slots already owned by an earlier trace and lose the
-/// "fresh `InputArg` per `trace.get_iter()`" identity guarantee
-/// RPython gets for free (`opencoder.py`).
+/// Box Identity Phase E.2b parity: `MetaInterp.next_global_opref` records
+/// this high-water so the next bridge's `bridge_inputarg_base` derives a
+/// disjoint `[bridge_inputarg_base..)` namespace. Without this the second
+/// bridge of any loop, or a bridge-from-bridge chain, would re-use OpRef
+/// slots already owned by an earlier trace and lose the "fresh `InputArg`
+/// per `trace.get_iter()`" identity guarantee RPython gets for free
+/// (`opencoder.py`).
 ///
 /// Args/fail_args are scanned in addition to op.pos because a port-side
 /// undefined-OpRef fallback path historically tolerated dangling refs.
@@ -2284,6 +2240,23 @@ pub struct MetaInterp<M: Clone> {
     /// Keyed by `(jitdriver_sd.index, cell green_key)`. Cell keys are unique
     /// only inside one `WarmEnterState` (`warmstate.py JitCell`).
     pub(crate) compiled_loops: crate::FxIndexMap<(usize, u64), CompiledEntry<M>>,
+    /// Box identity plan Phase E: high-water OpRef at which a bridge
+    /// compilation starts allocating fresh boxes. Monotonically
+    /// non-decreasing; max'd at every loop / retrace / entry-bridge /
+    /// bridge compile.
+    ///
+    /// `opencoder.py TraceIterator.__init__` mints a fresh `InputArg`
+    /// Python object per iteration, so bridge inputargs never alias
+    /// another trace's boxes by `is`. Pyre `OpRef` identity is numeric
+    /// (`variant` + `raw`); a single process-wide high-water is the
+    /// closest analogue — bridges of different loops get disjoint ranges
+    /// too. `compile_bridge` / `compile_entry_bridge` read it as
+    /// `bridge_inputarg_base`.
+    ///
+    /// Not on `JitCellToken`: that is not an upstream token/CLT
+    /// attribute, and `JitCellToken.inputarg_types` is already a backend
+    /// cache the frontend must not read.
+    pub(crate) next_global_opref: u32,
     /// Aggregate write-barrier bit for the GC-traced graphs stored off-heap
     /// under `compiled_loops` (`ResumeGuardDescr.rd_consts` and
     /// `TargetToken` virtual-state/short-preamble fields).
@@ -4027,6 +4000,7 @@ impl<M: Clone> MetaInterp<M> {
             memory_manager: crate::warmstate::new_runner_memory_manager(),
             backend: Box::new(BackendImpl::new()),
             compiled_loops: crate::FxIndexMap::default(),
+            next_global_opref: 0,
             compiled_graph_minor_scan_pending: true,
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             blackhole_terminal_scratch: None,
@@ -9601,16 +9575,16 @@ impl<M: Clone> MetaInterp<M> {
                 // resume-guard descr (`stamp_guard_descr_trace_positions`).
                 compile::stamp_guard_descr_trace_positions(&compiled_ops);
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
-                let mut next_global_opref = unroll_opt
-                    .next_global_opref
-                    .max(compute_next_global_opref(&inputargs, &compiled_ops));
-
-                if let Some((_, carried)) = self.take_entry_for_replace(green_key) {
-                    // Box Identity Phase E.2b parity: preserve old entry's
-                    // high-water so previously stored bridges' OpRefs stay
-                    // disjoint from any future bridge.
-                    next_global_opref = next_global_opref.max(carried.next_global_opref);
-                }
+                // Box identity: raise the process-wide OpRef high-water so a
+                // later bridge of any loop sits above every previously
+                // numbered range. `opencoder.py TraceIterator.__init__`
+                // mints fresh `InputArg` objects per trace; pyre's numeric
+                // OpRef identity needs this explicit baseline.
+                self.next_global_opref = self.next_global_opref.max(
+                    unroll_opt
+                        .next_global_opref
+                        .max(compute_next_global_opref(&inputargs, &compiled_ops)),
+                );
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-summary",
@@ -9628,13 +9602,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        // Box identity: record Phase 2's final
-                        // OpRef high-water so later bridges can allocate in a
-                        // disjoint namespace. RPython gets disjointness for
-                        // free via fresh `InputArg` Python identities per
-                        // TraceIterator (opencoder.py); pyre flat u32
-                        // OpRefs need this explicit baseline.
-                        next_global_opref,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -9873,30 +9840,6 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         self.keep_tracing_after_close = true;
-    }
-
-    /// Removes the `compiled_loops` entry at `green_key`, returning it together
-    /// with the state a replacement must inherit from it.
-    ///
-    /// This is the single door onto a replace: **obtaining the displaced entry
-    /// without also receiving its `CarriedFields` is not expressible.** That is
-    /// the whole point — the carry-forward used to be two hand-written lines
-    /// repeated at every replace path, and dropping them is invisible to the
-    /// compiler and to the suite alike.
-    ///
-    /// This does **not** mean the replace paths are tested. It removes one
-    /// class of omission; everything else those paths do (label minting,
-    /// retirement, snapshot handling) remains uncovered, because nothing in
-    /// this crate can drive a production compile path.
-    /// The caller still raises `next_global_opref` from `CarriedFields`
-    /// itself: that is the only replace-path carry.
-    pub(crate) fn take_entry_for_replace(
-        &mut self,
-        green_key: u64,
-    ) -> Option<(CompiledEntry<M>, CarriedFields)> {
-        let old_entry = self.take_compiled_loop(green_key)?;
-        let carried = old_entry.carried_fields();
-        Some((old_entry, carried))
     }
 
     /// compile.py: has_compiled_targets — check if a green key has
@@ -11066,14 +11009,12 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 compile::stamp_guard_descr_trace_positions(&combined_ops);
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
-                let mut next_global_opref = unroll_opt
-                    .next_global_opref
-                    .max(compute_next_global_opref(&inputargs, &combined_ops));
-
-                if let Some((_, carried)) = self.take_entry_for_replace(green_key) {
-                    // Box Identity Phase E.2b parity: see compile_loop site.
-                    next_global_opref = next_global_opref.max(carried.next_global_opref);
-                }
+                // Box identity: see compile_loop site.
+                self.next_global_opref = self.next_global_opref.max(
+                    unroll_opt
+                        .next_global_opref
+                        .max(compute_next_global_opref(&inputargs, &combined_ops)),
+                );
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-summary",
@@ -11098,9 +11039,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        // Box identity: Phase 2's final OpRef high-water, as at
-                        // the main compile site.
-                        next_global_opref,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -11339,7 +11277,7 @@ impl<M: Clone> MetaInterp<M> {
                             .collect(),
                     );
                 }
-                if let Some(compiled) = self.compiled_entry_mut(green_key) {
+                if self.has_compiled_loop_entry(green_key) {
                     // `compile.py send_bridge_to_backend`: the bridge is
                     // handed to the CPU and nothing is indexed in the
                     // frontend — its guards answer later failures off
@@ -11347,9 +11285,9 @@ impl<M: Clone> MetaInterp<M> {
                     // `(fail_index, op index)` stamp the pyre readers key
                     // on is applied here.
                     compile::stamp_guard_descr_trace_positions(&combined_ops);
-                    // Box Identity Phase E.2b parity: see compile_loop site.
+                    // Box identity: see compile_loop site.
                     let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
-                    compiled.next_global_opref = compiled.next_global_opref.max(new_high_water);
+                    self.next_global_opref = self.next_global_opref.max(new_high_water);
                 }
                 self.remember_compiled_graph_write();
                 self.staticdata.log_bridge_compile(fail_index);
@@ -12083,15 +12021,12 @@ impl<M: Clone> MetaInterp<M> {
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 compile::stamp_guard_descr_trace_positions(&optimized_ops);
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
-                let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
+                // Box identity: see compile_loop site.
+                self.next_global_opref = self
+                    .next_global_opref
+                    .max(compute_next_global_opref(&inputargs, &optimized_ops));
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 {
-                    if let Some((_, carried)) = self.take_entry_for_replace(green_key) {
-                        // Box Identity Phase E.2b parity: preserve old entry's
-                        // high-water so previously stored bridges' OpRefs stay
-                        // disjoint from any future bridge.
-                        next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    }
                     // The retired entry's count does not follow it here. The
                     // token this compile installs came out of
                     // `make_jitcell_token`, and upstream's `retraced_count`
@@ -12125,7 +12060,6 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             meta: Arc::new(meta),
                             root_trace_id: trace_id,
-                            next_global_opref,
                         },
                     );
                     self.remember_compiled_graph_write();
@@ -12532,11 +12466,10 @@ impl<M: Clone> MetaInterp<M> {
                 self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
                 compile::stamp_guard_descr_trace_positions(&compiled_ops);
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
-                let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
-                if let Some((_, carried)) = self.take_entry_for_replace(green_key) {
-                    // Box Identity Phase E.2b parity: see finish_and_compile.
-                    next_global_opref = next_global_opref.max(carried.next_global_opref);
-                }
+                // Box identity: see compile_loop site.
+                self.next_global_opref = self
+                    .next_global_opref
+                    .max(compute_next_global_opref(&inputargs, &compiled_ops));
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 self.insert_compiled_loop_on_driver(
                     compiling_jd,
@@ -12544,7 +12477,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        next_global_opref,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -12615,11 +12547,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
     ) -> Option<&CompiledEntry<M>> {
         self.compiled_loops.get(&(jd_no, green_key))
-    }
-
-    pub(crate) fn compiled_entry_mut(&mut self, green_key: u64) -> Option<&mut CompiledEntry<M>> {
-        let key = self.compiled_loop_key(green_key);
-        self.compiled_loops.get_mut(&key)
     }
 
     #[cfg(test)]
@@ -15081,16 +15008,13 @@ impl<M: Clone> MetaInterp<M> {
             self.jitlog_trace_aborted();
             return false;
         };
-        let (retraced_count, loop_num_inputs, parent_next_global_opref) = (
-            tok.get_retraced_count(),
-            tok.inputarg_types().len(),
-            self.compiled_entry(green_key).unwrap().next_global_opref,
-        );
-        // Box identity: stage bridge_inputarg_base based
-        // on the parent loop's recorded next_global_opref. See
-        // Optimizer::optimize_bridge docstring for the RPython identity
-        // model this mirrors (opencoder.py TraceIterator).
-        let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        let (retraced_count, loop_num_inputs) =
+            (tok.get_retraced_count(), tok.inputarg_types().len());
+        // Box identity: stage bridge_inputarg_base from the process-wide
+        // high-water so this bridge's OpRefs sit above every previously
+        // compiled trace. See Optimizer::optimize_bridge docstring
+        // (`opencoder.py TraceIterator`).
+        let bridge_inputarg_base = self.next_global_opref.max(bridge_inputargs.len() as u32);
         // Bridge inputarg `InputArg*.value` stamp.
         //
         // bridgeopt.py `deserialize_optimizer_knowledge` receives
@@ -15431,8 +15355,10 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
                 compile::stamp_guard_descr_trace_positions(&optimized_ops);
-                let mut next_global_opref =
-                    compute_next_global_opref(&entry_inputargs, &optimized_ops);
+                // Box identity: see compile_loop site.
+                self.next_global_opref = self
+                    .next_global_opref
+                    .max(compute_next_global_opref(&entry_inputargs, &optimized_ops));
 
                 // ResumeFromInterpDescr.compile_and_attach (compile.py):
                 // the entry bridge starts with unoptimized interp args and ends in
@@ -15449,10 +15375,6 @@ impl<M: Clone> MetaInterp<M> {
                 // the jitcell and keeps the old token alive; it never takes the
                 // loop's own TargetTokens away, and the fresh token's
                 // `target_tokens` stays empty.
-                if let Some((_, carried)) = self.take_entry_for_replace(original_green_key) {
-                    // Box Identity Phase E.2b parity: see finish_and_compile.
-                    next_global_opref = next_global_opref.max(carried.next_global_opref);
-                }
                 // The retrace budget does not carry over. `token`
                 // came out of `make_jitcell_token`, so its count is the
                 // `history.py JitCellToken` default — see the fresh-token note in
@@ -15465,7 +15387,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        next_global_opref,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -15590,8 +15511,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         // The jitcell the closing JUMP enters (`bridge_cell_token_key`).
-        // `green_key` stays the origin — it selects the guard's trace, its
-        // OpRef namespace base and the loop the bridge is attached to.
+        // `green_key` stays the origin — it selects the guard's trace and
+        // the loop the bridge is attached to. The OpRef namespace base is
+        // `MetaInterp.next_global_opref`.
         //
         // Measured over `pyre/bench` (336 scripts, dynasm): 50 of 403 bridge
         // closes cross loops, but 44 of those enter a jitcell holding a single
@@ -15698,12 +15620,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut retraced_count = self
             .get_procedure_token_on_driver(compiling_jd, cell_token_key)
             .map_or(0, |tok| tok.get_retraced_count());
-        let (loop_num_inputs, parent_next_global_opref, pending_bridge_rd): (
-            usize,
-            u32,
-            Option<PendingBridgeRd>,
-        ) = {
-            let compiled = self.compiled_entry(green_key).unwrap();
+        let (loop_num_inputs, pending_bridge_rd): (usize, Option<PendingBridgeRd>) = {
             // `fail_descr.trace_id()` is the bridge origin's allocated
             // id (non-zero per `alloc_trace_id` starting at 1).  RPython
             // reaches the same value through the resumekey object's
@@ -15793,15 +15710,14 @@ impl<M: Clone> MetaInterp<M> {
                 // Parent inputarg_types belong to the failing guard's loop
                 // (`rd_loop_token` / `descr_owning_jct`).
                 source_jct.inputarg_types().len(),
-                compiled.next_global_opref,
                 pending,
             )
         };
-        // Box identity: stage bridge_inputarg_base based on
-        // the parent loop's recorded next_global_opref. See
-        // Optimizer::optimize_bridge docstring for the RPython identity
-        // model this mirrors (opencoder.py TraceIterator).
-        let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
+        // Box identity: stage bridge_inputarg_base from the process-wide
+        // high-water so this bridge's OpRefs sit above every previously
+        // compiled trace. See Optimizer::optimize_bridge docstring
+        // (`opencoder.py TraceIterator`).
+        let bridge_inputarg_base = self.next_global_opref.max(bridge_inputargs.len() as u32);
         if let Some(prd) = pending_bridge_rd.as_ref() {
             // bridgeopt.py `assert len(frontend_boxes) == len(liveboxes)`.
             // The concrete values belong on the pre-iterator bridge InputArg
@@ -15961,7 +15877,6 @@ impl<M: Clone> MetaInterp<M> {
             eprintln!("inputargs: {:?}", bridge_inputargs);
             eprint!("{}", majit_ir::format_trace(bridge_ops, &constants));
         }
-        let _compiled = self.compiled_entry_mut(green_key).unwrap();
         // `unroll.py for target_token in jitcelltoken.target_tokens` scans
         // the tokens of the loop the JUMP enters.
         let scan_target_tokens = self
@@ -16277,14 +16192,14 @@ impl<M: Clone> MetaInterp<M> {
                     std::mem::take(&mut optimizer.quasi_immutable_deps);
                 self.record_loop_or_bridge(&source_jct, &optimized_ops, bridge_trace_id);
                 // Mark the bridge as compiled
-                if let Some(compiled) = self.compiled_entry_mut(green_key) {
+                if self.has_compiled_loop_entry(green_key) {
                     // `compile.py send_bridge_to_backend`: nothing is
                     // indexed in the frontend for a bridge — see the
                     // retrace site.
                     compile::stamp_guard_descr_trace_positions(&optimized_ops);
                     let new_high_water =
                         compute_next_global_opref(bridge_inputargs, &optimized_ops);
-                    compiled.next_global_opref = compiled.next_global_opref.max(new_high_water);
+                    self.next_global_opref = self.next_global_opref.max(new_high_water);
                 }
                 self.remember_compiled_graph_write();
                 self.staticdata.log_bridge_compile(fail_index);
@@ -24364,8 +24279,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -26795,8 +26708,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -26855,8 +26766,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -26908,8 +26817,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -26971,8 +26878,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -27085,8 +26990,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -29477,8 +29380,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
         let (step, _) = meta.maybe_compile_and_run_step_on_driver(
@@ -29560,8 +29461,6 @@ mod metainterp_static_data_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -31187,8 +31086,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -31232,8 +31129,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -31279,8 +31174,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -32029,7 +31922,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
-                next_global_opref: 0,
             },
         );
     }
@@ -32932,8 +32824,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 0,
-
-                next_global_opref: 0,
             },
         );
         let key = gk(777);
@@ -33515,8 +33405,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 101,
-
-                next_global_opref: 0,
             },
         );
         assert!(
@@ -33639,8 +33527,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -33705,8 +33591,6 @@ mod tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 102,
-
-                next_global_opref: 0,
             },
         );
 
@@ -35498,8 +35382,6 @@ mod bridge_cell_token_tests {
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: green_key,
-
-                next_global_opref: 0,
             },
         );
     }
@@ -35547,8 +35429,6 @@ mod loop_side_table_tests {
         CompiledEntry {
             meta: std::sync::Arc::new(()),
             root_trace_id,
-
-            next_global_opref: 0,
         }
     }
 
@@ -35996,45 +35876,6 @@ mod loop_side_table_tests {
         assert!(!has_side_tables(&meta, 7));
         assert!(!has_side_tables(&meta, 8));
         assert!(has_side_tables(&meta, 9));
-    }
-
-    /// `take_entry_for_replace` is the one door onto a `compiled_loops`
-    /// replace, and the pair it returns is the mechanism: **the displaced entry
-    /// cannot be obtained without its carried state.** Ablation — drop
-    /// `CarriedFields.next_global_opref`, or stop copying it in
-    /// `carried_fields()` — and this goes red.
-    ///
-    /// Passing does **not** mean the five production replace paths are
-    /// covered. It pins the helper's contract, not its use. Nothing in this
-    /// crate can drive a production compile path, so a site that
-    /// simply never calls this is still invisible to the suite.
-    #[test]
-    fn take_entry_for_replace_returns_the_entry_with_the_carried_next_global_opref() {
-        let mut meta = MetaInterp::<()>::new(1);
-        let mut entry = compiled_entry(101);
-        entry.next_global_opref = 37;
-        meta.insert_compiled_loop(7, entry);
-
-        let (old_entry, carried) = meta
-            .take_entry_for_replace(7)
-            .expect("the key had an entry");
-
-        assert_eq!(old_entry.root_trace_id, 101, "the entry itself comes back");
-        assert_eq!(
-            carried,
-            CarriedFields {
-                next_global_opref: 37,
-            },
-            "the carried high-water travels with the removal"
-        );
-        assert!(
-            !meta.has_compiled_loop_entry(7),
-            "the entry is removed, exactly as the bare swap_remove did"
-        );
-        assert!(
-            meta.take_entry_for_replace(7).is_none(),
-            "a key with no entry yields nothing to carry"
-        );
     }
 }
 

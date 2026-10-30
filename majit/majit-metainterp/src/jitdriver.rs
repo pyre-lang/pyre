@@ -13836,8 +13836,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -13919,8 +13917,6 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-
-                next_global_opref: 0,
             },
         );
 
@@ -14066,8 +14062,6 @@ mod tests {
         let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
             meta,
             root_trace_id,
-
-            next_global_opref: 0,
         };
         driver.meta.insert_compiled_loop_on_driver(
             idx0,
@@ -15581,20 +15575,18 @@ mod tests {
         driver.meta.compile_loop(&[sum], ());
     }
 
-    /// Compile twice at one green key and hand back both entries' carried
-    /// state.
+    /// Compile twice at one green key and hand back both MetaInterp high-waters.
     ///
-    /// The second compile only reaches a `take_entry_for_replace` branch if
-    /// the key is traceable *again* while its `compiled_loops` entry is still
-    /// present. Both trace-start doors (`on_back_edge`, `force_start_tracing`)
-    /// refuse a key whose cell `is_compiled()`, which is
-    /// `get_procedure_token().is_some()` filtered on `!is_invalidated()`
-    /// (`warmstate.rs`'s `BaseJitCell::is_compiled`). Invalidating the procedure token
-    /// clears that predicate and touches no `compiled_loops` entry, so it
-    /// re-opens tracing and leaves the entry to be displaced — the same
+    /// The second compile only happens if the key is traceable *again* while
+    /// its `compiled_loops` entry is still present. Both trace-start doors
+    /// (`on_back_edge`, `force_start_tracing`) refuse a key whose cell
+    /// `is_compiled()`, which is `get_procedure_token().is_some()` filtered on
+    /// `!is_invalidated()` (`warmstate.rs`'s `BaseJitCell::is_compiled`).
+    /// Invalidating the procedure token clears that predicate and touches no
+    /// `compiled_loops` entry, so it re-opens tracing — the same
     /// desynchronisation quasi-immut invalidation produces in production.
     ///
-    /// Returns `(first.next_global_opref, replacement.next_global_opref)`.
+    /// Returns `(high-water after first compile, high-water after replacement)`.
     fn compile_twice_at_one_green_key(
         raw: i64,
         first_adds: usize,
@@ -15606,11 +15598,7 @@ mod tests {
         let hash = key.get_uhash();
 
         compile_once_at(&mut driver, &key, first_adds);
-        let first_opref = driver
-            .meta
-            .compiled_entry(hash)
-            .expect("compiled entry")
-            .next_global_opref;
+        let first_opref = driver.meta.next_global_opref;
 
         driver.meta.warm_state_for_driver(0).invalidate_all();
         assert!(
@@ -15624,39 +15612,97 @@ mod tests {
             2,
             "the second compile did not happen"
         );
-        let replacement = &driver.meta.compiled_entry(hash).expect("compiled entry");
-        (first_opref, replacement.next_global_opref)
+        (first_opref, driver.meta.next_global_opref)
     }
 
-    /// `compile_loop`'s replace branch must raise the fresh high-water to the
-    /// displaced entry's, so OpRefs minted for a later bridge stay disjoint
-    /// from those the retired loop's bridges already hold.
+    /// A replacing compile must raise the MetaInterp high-water, never lower
+    /// it, so OpRefs minted for a later bridge stay disjoint from those
+    /// earlier traces already hold.
     #[test]
-    fn a_replacing_compile_carries_the_displaced_entrys_next_global_opref() {
+    fn a_replacing_compile_does_not_lower_the_opref_high_water() {
         // The `max` is only observable when the replacement's own trace ends
-        // lower than the displaced entry's. Measure the short trace's
+        // lower than the first compile's. Measure the short trace's
         // standalone high-water on this tree rather than pinning a constant.
         let mut probe = JitDriver::<TypedRestoreState>::new(2);
         probe.meta.finish_setup_descrs_for_jitdrivers();
         let probe_key = gk(91);
         compile_once_at(&mut probe, &probe_key, 1);
-        let short_alone = probe
-            .meta
-            .compiled_entry(probe_key.get_uhash())
-            .expect("compiled entry")
-            .next_global_opref;
+        let short_alone = probe.meta.next_global_opref;
 
         let (first, replacement) = compile_twice_at_one_green_key(77, 8, 1);
         assert!(
             short_alone < first,
             "fixture is not discriminating: a short trace alone reaches \
-             {short_alone}, the long first compile reaches {first} — the \
-             carry cannot be distinguished from a fresh computation"
+             {short_alone}, the long first compile reaches {first} — a drop \
+             on replace would be indistinguishable from a fresh computation"
         );
+        assert!(
+            replacement >= first,
+            "the MetaInterp OpRef high-water must not decrease across a \
+             replacing compile (first={first}, replacement={replacement})"
+        );
+    }
+
+    /// A bridge's `bridge_inputarg_base` is the MetaInterp high-water (max'd
+    /// with the bridge's inputarg count). After compiling traces at different
+    /// green keys that base sits at or above every previously recorded
+    /// high-water — the analogue of `opencoder.py TraceIterator` minting
+    /// fresh `InputArg` objects per trace.
+    #[test]
+    fn a_bridge_inputarg_base_is_at_least_every_prior_trace_high_water() {
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+
+        let key_a = gk(80);
+        compile_once_at(&mut driver, &key_a, 8);
+        let high_a = driver.meta.next_global_opref;
+        assert!(high_a > 0, "a compiled trace raises the high-water");
+
+        let key_b = gk(81);
+        compile_once_at(&mut driver, &key_b, 1);
+        let high_b = driver.meta.next_global_opref;
+        assert!(
+            high_b >= high_a,
+            "compiling a second loop must not lower the process-wide high-water"
+        );
+
+        let fail_index = 0u32;
+        let descr_arc = compiled_guard_descr(&driver.meta, key_b.get_uhash(), fail_index);
+        assert!(
+            driver
+                .meta
+                .start_retrace(descr_arc, key_b.get_uhash(), fail_index, &[0])
+        );
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
+            let i0 = OpRef::input_arg_int(0);
+            let c2 = ctx.const_int(2);
+            ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+        }
+        let n_bridge_inputs = 1u32;
+        let bridge_inputarg_base = driver.meta.next_global_opref.max(n_bridge_inputs);
+        assert!(
+            bridge_inputarg_base >= high_a && bridge_inputarg_base >= high_b,
+            "bridge inputarg base {bridge_inputarg_base} must be >= every \
+             previously compiled trace's high-water (a={high_a}, b={high_b})"
+        );
+
+        let trace_id = driver
+            .meta
+            .compiled_root_trace_id(key_b.get_uhash())
+            .expect("compiled loop should have a root trace_id");
         assert_eq!(
-            replacement, first,
-            "the replacement entry must inherit the displaced entry's OpRef \
-             high-water"
+            driver.meta.close_bridge(
+                key_b.get_uhash(),
+                trace_id,
+                fail_index,
+                &[OpRef::input_arg_int(0)]
+            ),
+            crate::pyjitpl::BridgeCompileResult::Compiled,
+        );
+        assert!(
+            driver.meta.next_global_opref >= bridge_inputarg_base,
+            "compiling the bridge must not lower the high-water"
         );
     }
 
