@@ -5920,12 +5920,7 @@ impl majit_backend::Backend for WasmBackend {
             .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
             .expect("newly compiled wasm loop is missing");
-        // Native builds accept the encoded module as a test artifact. On the
-        // real wasm host, eager compilation crossed the acceptance check
-        // above; a deferred trace registers from `materialize_func_handle`.
-        if !defer_host_compile || cfg!(not(target_arch = "wasm32")) {
-            compiled.register_descrs_once();
-        }
+        compiled.register_descrs_once();
         compiled
             .resume_entry
             .slot
