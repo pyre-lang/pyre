@@ -928,11 +928,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .copied()
                     .filter(|value| !value.is_null())
                     .unwrap_or(pyre_object::PY_NULL);
-                let fd = if w_warn.is_null() {
-                    pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?
-                } else {
-                    pyre_object::with_roots!(w_fd, w_warn => crate::baseobjspace::c_int_w(w_fd))?
-                };
+                let fd = pyre_object::with_roots!(w_fd, w_warn => crate::baseobjspace::c_int_w(w_fd))?;
                 let warn_on_full_buffer = if w_warn.is_null() {
                     true
                 } else {
@@ -1350,15 +1346,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         pyre_object::PY_NULL
                     };
                     // interp_signal.py `setitimer` `@unwrap_spec(which=int, ...)`.
-                    let which = if w_interval.is_null() {
-                        pyre_object::with_roots!(
-                            w_which, w_seconds => crate::baseobjspace::gateway_int_w(w_which)
-                        )?
-                    } else {
-                        pyre_object::with_roots!(
-                            w_which, w_seconds, w_interval => crate::baseobjspace::gateway_int_w(w_which)
-                        )?
-                    } as i32;
+                    let which = pyre_object::with_roots!(
+                        w_which, w_seconds, w_interval => crate::baseobjspace::gateway_int_w(w_which)
+                    )? as i32;
                     let read_f = |o: pyre_object::PyObjectRef| -> f64 {
                         unsafe {
                             if pyre_object::is_float(o) {

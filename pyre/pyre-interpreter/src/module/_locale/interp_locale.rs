@@ -568,15 +568,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             } else {
                 pyre_object::PY_NULL
             };
-            let cat = if w_locale.is_null() {
-                pyre_object::with_roots!(
-                    w_category => crate::baseobjspace::gateway_int_w(w_category)
-                )?
-            } else {
-                pyre_object::with_roots!(
-                    w_category, w_locale => crate::baseobjspace::gateway_int_w(w_category)
-                )?
-            } as i32;
+            let cat = pyre_object::with_roots!(
+                w_category, w_locale => crate::baseobjspace::gateway_int_w(w_category)
+            )? as i32;
             let locale_str: Option<String> =
                 if !w_locale.is_null() && !unsafe { pyre_object::is_none(w_locale) } {
                     if !unsafe { pyre_object::is_str(w_locale) } {
