@@ -9019,6 +9019,11 @@ impl CallControl {
     pub fn declared_return_kind(&self, path: &CallPath) -> Option<char> {
         let graph = self.function_graphs.get(path)?;
         let s = graph.return_type.as_ref()?.trim();
+        if return_type_string_to_kind(s) == 'r'
+            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+        {
+            return Some('i');
+        }
         Some(return_type_string_to_kind(s))
     }
 
@@ -9067,6 +9072,11 @@ impl CallControl {
     pub(crate) fn declared_result_argclass(&self, path: &CallPath) -> Option<char> {
         let graph = self.function_graphs.get(path)?;
         let s = graph.return_type.as_ref()?.trim();
+        if map_type_string_to_argclass(s) == 'r'
+            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+        {
+            return Some('i');
+        }
         Some(map_type_string_to_argclass(s))
     }
 
@@ -9079,11 +9089,44 @@ impl CallControl {
     /// residual extern with no graph body).
     pub(crate) fn declared_result_type_for_target(&self, target: &CallTarget) -> Option<Type> {
         let (_, graph) = self.target_to_path_and_graph(target)?;
+        self.declared_graph_result_type(&graph)
+    }
+
+    /// Raw ADT returns have a coarse `ref` frontend token but an int-bank
+    /// `FUNC.RESULT`. Recover that declared repr for untyped call sites too.
+    pub(crate) fn declared_raw_result_for_target(&self, target: &CallTarget) -> bool {
+        let Some((_, graph)) = self.target_to_path_and_graph(target) else {
+            return false;
+        };
+        graph.return_type.as_deref() == Some("ref")
+            && self.declared_graph_result_type(&graph) == Some(Type::Int)
+    }
+
+    /// `call.py getcalldescr` reads `FUNC.RESULT`, including the pointee's
+    /// `_gckind`. A frontend `ref` token also needs its declared class root
+    /// to distinguish a raw Struct pointer from a GC reference.
+    fn declared_graph_result_type(&self, graph: &FunctionGraph) -> Option<Type> {
         let declared = graph.return_type.as_ref()?;
         let effective = crate::front::typestr::transparent_result_ok_type(declared)
             .map(|s| s.to_string())
             .unwrap_or_else(|| declared.clone());
-        Some(return_type_string_to_value_type(Some(&effective)))
+        let kind = return_type_string_to_value_type(Some(&effective));
+        // Use the same declared repr as the annotator. A headerless native
+        // layout alone does not make a nominal instance a raw-word owner.
+        if kind == Type::Ref
+            && graph.return_class_root.as_deref().is_some_and(|root| {
+                crate::annotator::bookkeeper::raw_struct_ptr_from_layout(
+                    &self.struct_fields,
+                    &self.struct_layouts,
+                    root,
+                )
+                .is_some()
+            })
+        {
+            Some(Type::Int)
+        } else {
+            Some(kind)
+        }
     }
 
     /// RPython `CallControl.getcalldescr` / `Transformer.rewrite_call`:
@@ -12019,13 +12062,7 @@ impl CallControl {
                     // panics `compare_slot_rest` (call result `Ref`, stamp
                     // missing). The stamp, when present, is checked.
                     // `Result<T, E>` is the success type `T` (`FUNC.RESULT`).
-                    if let Some(declared) = graph.return_type.as_ref() {
-                        let effective_declared =
-                            crate::front::typestr::transparent_result_ok_type(declared)
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| declared.clone());
-                        let expected_result =
-                            return_type_string_to_value_type(Some(&effective_declared));
+                    if let Some(expected_result) = self.declared_graph_result_type(&graph) {
                         if result_type != expected_result {
                             panic!(
                                 "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
@@ -12059,14 +12096,7 @@ impl CallControl {
                     // hook (`register_eval_override`, `plain_eval_fn_addr`)
                     // returns `PyResult`, which stays unstamped, and mapping
                     // that absence to `Void` disagrees with the call's `Ref`.
-                    let declared = witness_graph.return_type.as_ref();
-                    if let Some(declared) = declared {
-                        let effective_declared =
-                            crate::front::typestr::transparent_result_ok_type(declared)
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| declared.clone());
-                        let expected_result =
-                            return_type_string_to_value_type(Some(&effective_declared));
+                    if let Some(expected_result) = self.declared_graph_result_type(&witness_graph) {
                         if result_type != expected_result {
                             panic!(
                                 "indirect_call in family including {witness_path:?}: \
@@ -21792,6 +21822,84 @@ mod tests {
             None,
             &mut cache,
             None,
+        );
+    }
+
+    #[test]
+    fn getcalldescr_raw_class_result_uses_the_declared_pointee_gckind() {
+        let owner = "raw_call_result::Scope";
+        let sid = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([(
+            owner.to_string(),
+            Some(sid),
+        )]));
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![("save_point".into(), "usize".into())],
+        );
+        fields.raw_word_owners.insert(owner.to_string());
+        cc.set_struct_fields(fields);
+        cc.set_struct_layout(
+            sid,
+            StructLayout {
+                size: crate::layout::target_word_size(),
+                align: crate::layout::target_word_size(),
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(HashMap::new()),
+            },
+        );
+        let path = CallPath::from_segments(["raw_scope_new"]);
+        let target = CallTarget::function_path(["raw_scope_new"]);
+        let mut graph = simple_graph("raw_scope_new").with_return_type("ref");
+        graph.return_class_root = Some(owner.to_string());
+        graph.hints.push("dont_look_inside".into());
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.declared_result_type_for_target(&target), Some(Type::Int));
+        assert_eq!(cc.declared_return_kind(&path), Some('i'));
+        assert_eq!(cc.declared_result_argclass(&path), Some('i'));
+        let mut cache = AnalysisCache::default();
+        let descr = cc.getcalldescr(
+            &direct_call_op(target.clone()),
+            vec![],
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(descr.result_ir_type(), Type::Int);
+
+        // A caller with only the frontend's aggregate Ref token must use
+        // this same FUNC.RESULT, even without an annotated Ptr stamp.
+        let mut caller = FunctionGraph::new("raw_scope_caller");
+        let result = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::Call {
+                    target,
+                    args: vec![],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(caller.startblock, Some(result.clone()));
+        let config = crate::jtransform::GraphTransformConfig::default();
+        let transformed = crate::jtransform::Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&caller);
+        assert!(transformed.graph.blocks.iter().flat_map(|b| &b.operations).any(
+            |op| matches!(&op.kind, OpKind::CallResidual { result_kind: 'i', descriptor, .. }
+                if descriptor.result_ir_type() == Type::Int)
+        ));
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            crate::model::ConcreteType::Signed
         );
     }
 

@@ -4549,8 +4549,8 @@ impl<'a> Transformer<'a> {
 
     /// RPython `op.result.concretetype` is set by the rtyper, so jtransform
     /// reads it directly. Pyre's front-end can leave a callee return type
-    /// as `ValueType::Unknown` when the callee path is unresolved (re-export
-    /// shadowing, cross-crate paths). When that happens, the rtyper's
+    /// as `ValueType::Unknown`, or `Ref` without its raw/GC distinction.
+    /// The rtyper's
     /// backward-inference pass classifies `op.result` from its consumer-op
     /// constraints, and that classification is stamped on the result
     /// Variable's `concretetype` cell via `apply_to_graph` before this
@@ -4563,8 +4563,11 @@ impl<'a> Transformer<'a> {
         result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> Option<char> {
-        if !matches!(result_ty, ValueType::Unknown) {
+        if !matches!(result_ty, ValueType::Unknown | ValueType::Ref(_)) {
             return None;
+        }
+        if self.flavor_raw_ref_is_int_banked(result_ty) {
+            return Some('i');
         }
         let var = result?;
         match FunctionGraph::concretetype_of(var) {
@@ -4615,6 +4618,27 @@ impl<'a> Transformer<'a> {
         ResolvedCallResult { kind, ir_type }
     }
 
+    /// `jtransform.py rewrite_call` uses the same result concretetype for
+    /// the opcode and its register. Keep a typed raw Ptr intact instead of
+    /// restamping it from the frontend's coarser Ref hint.
+    fn stamp_call_result(
+        &mut self,
+        graph: &FunctionGraph,
+        result: Option<crate::flowspace::model::Variable>,
+        result_ty: &ValueType,
+    ) {
+        use crate::model::ConcreteType;
+
+        let ty = match self.resolve_call_result(result.as_ref(), result_ty).kind {
+            'i' => ConcreteType::Signed,
+            'r' => ConcreteType::GcRef,
+            'f' => ConcreteType::Float,
+            'v' => ConcreteType::Void,
+            _ => unreachable!("resolve_call_result validates the kind"),
+        };
+        self.stamp_value_kind(graph, result, ty);
+    }
+
     /// Reconcile a call's front-derived result type with the callee's
     /// post-`?` declared `RESULT` (`call.py:230` `RESULT == FUNC.RESULT`).
     ///
@@ -4626,8 +4650,8 @@ impl<'a> Transformer<'a> {
     /// the call to the declared void so the residual_call emits a `_v`
     /// opname with no result slot.  Emitting the `Ref` slot would hand GC a
     /// register holding the void call's garbage.  Only the
-    /// declared-void-vs-resolved-Ref shell case is rewritten; every other
-    /// call keeps its front-derived `result_ty`.
+    /// declared-void-vs-resolved-Ref shell case and a declared raw ADT's
+    /// coarse Ref token are rewritten; other calls keep `result_ty`.
     fn effective_call_result_ty(
         &self,
         target: &CallTarget,
@@ -4641,6 +4665,16 @@ impl<'a> Transformer<'a> {
             == Some(majit_ir::value::Type::Void);
         if declared_void && self.resolve_call_result(op_result, result_ty).kind == 'r' {
             ValueType::Void
+        } else if matches!(result_ty, ValueType::Ref(_))
+            && self
+                .callcontrol
+                .as_deref()
+                .is_some_and(|cc| cc.declared_raw_result_for_target(target))
+        {
+            // `call.py getcalldescr` uses FUNC.RESULT, not the frontend's
+            // aggregate token. This also covers a caller whose annotation
+            // did not publish the raw result's concrete Ptr.
+            ValueType::Int
         } else {
             result_ty.clone()
         }
@@ -13245,7 +13279,7 @@ impl<'a> Transformer<'a> {
         let (args_i, args_r, args_f, arg_classes) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -13315,7 +13349,7 @@ impl<'a> Transformer<'a> {
             self.make_three_lists_from_vars(green_args);
         let (reds_i, reds_r, reds_f, red_classes) = self.make_three_lists_from_vars(red_args);
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -13690,7 +13724,7 @@ impl<'a> Transformer<'a> {
             "force_ir: no float args in conditional_call"
         );
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
         let rewritten_opname = if is_value {
             "conditional_call_value"
         } else {
@@ -14317,7 +14351,7 @@ impl<'a> Transformer<'a> {
         // `result_kind` matches what every downstream consumer sees,
         // instead of falling back to `'r'` from the Unknown default.
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
@@ -14399,7 +14433,7 @@ impl<'a> Transformer<'a> {
             self.rewrite_call_three_lists(args, graph_name, "call argument (indirect)");
         let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
         let non_void_args = resolve_non_void_arg_types_from_vars(args);
         let result_ir_type = resolved_result.ir_type;
         let cc_mut = self
@@ -14548,7 +14582,7 @@ impl<'a> Transformer<'a> {
         let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         RewriteResult::Replace(vec![
             funcptr_op,
@@ -14593,7 +14627,7 @@ impl<'a> Transformer<'a> {
         let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
         let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_call_result(graph, op.result.clone(), result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
@@ -24793,6 +24827,55 @@ mod tests {
 
         assert_eq!(result_kind, 'i');
         assert_eq!(descriptor.result_ir_type(), majit_ir::Type::Int);
+    }
+
+    /// `rewrite_call` / `CallControl.getcalldescr` read RESULT from the
+    /// typed Variable. A frontend Ref hint does not make a raw Ptr GC.
+    #[test]
+    fn residual_call_ref_hint_preserves_typed_raw_pointer_result() {
+        // The bank-only prepass may publish Signed after classifying the
+        // raw pointer; both that stamp and the full Ptr are authoritative.
+        for concretetype in [
+            (*crate::translator::rtyper::lltypesystem::rffi::CCHARP).clone(),
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        ] {
+            let mut graph = FunctionGraph::new("raw_pointer_result");
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["external_raw_pointer"]),
+                        args: vec![],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .unwrap();
+            result.set_concretetype(Some(concretetype.clone()));
+            graph.set_return(graph.startblock, Some(result.clone()));
+            let mut cc = crate::call::CallControl::new();
+            let config = GraphTransformConfig::default();
+            let transformed = Transformer::new(&config)
+                .with_callcontrol(&mut cc)
+                .transform(&graph);
+            let (kind, descr) = transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find_map(|op| match &op.kind {
+                    OpKind::CallResidual {
+                        result_kind,
+                        descriptor,
+                        ..
+                    } => Some((*result_kind, descriptor)),
+                    _ => None,
+                })
+                .expect("residual call");
+            assert_eq!(kind, 'i');
+            assert_eq!(descr.result_ir_type(), majit_ir::Type::Int);
+            assert_eq!(result.concretetype(), Some(concretetype));
+        }
     }
 
     #[test]

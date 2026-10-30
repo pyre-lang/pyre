@@ -674,7 +674,7 @@ impl PbcAttrFamily {
 
 /// `SomePtr(Ptr(Struct raw))` for `class_root`, or `None` when that owner
 /// is not a Raw struct with registry rows.
-fn raw_struct_ptr_from_layout(
+pub(crate) fn raw_struct_ptr_from_layout(
     registry: &crate::front::StructFieldRegistry,
     layouts: &crate::codewriter::call::StructLayoutTable,
     class_root: &str,
