@@ -743,6 +743,58 @@ fn seed_raw_item_annotation(result: &Hlvalue, lltype: LowLevelType) {
     }
 }
 
+/// `op.args[0].value` of the rtyped `malloc` / `malloc_varsize` llop
+/// (`jtransform.py _rewrite_raw_malloc`). A typed frontend emit already
+/// carries `TYPE`; the scalar spill (`address.rs`
+/// `raw_scalar_borrow_spills`) has none, and `CallControl::struct_layout_for`
+/// sizes it from the owner string (`Tuple<i64>`).
+#[allow(non_snake_case)]
+fn raw_malloc_type_const(owner: &str, TYPE: &Option<LowLevelType>) -> LowLevelType {
+    match TYPE {
+        Some(ty) => ty.clone(),
+        None => LowLevelType::Struct(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::Struct::new(
+                owner,
+                vec![("item0".to_string(), LowLevelType::Signed)],
+            ),
+        )),
+    }
+}
+
+/// `op.args[1].value` flags dict `_rewrite_raw_malloc` pops. Flavor is
+/// always `raw` on [`OpKind::RawMalloc`]. Default `zero` / `track_allocation`
+/// / `add_memory_pressure` are omitted the way `rtype_malloc` only stores
+/// kwargs that were passed; leftovers stay so `UnsupportedMallocFlags` still
+/// fires.
+fn raw_malloc_flags_const(
+    zero: bool,
+    track_allocation: bool,
+    add_memory_pressure: bool,
+    extra_flags: &[String],
+) -> ConstValue {
+    let mut flags_map = indexmap::IndexMap::new();
+    flags_map.insert(ConstValue::byte_str("flavor"), ConstValue::byte_str("raw"));
+    if zero {
+        flags_map.insert(ConstValue::byte_str("zero"), ConstValue::Bool(true));
+    }
+    if !track_allocation {
+        flags_map.insert(
+            ConstValue::byte_str("track_allocation"),
+            ConstValue::Bool(false),
+        );
+    }
+    if add_memory_pressure {
+        flags_map.insert(
+            ConstValue::byte_str("add_memory_pressure"),
+            ConstValue::Bool(true),
+        );
+    }
+    for name in extra_flags {
+        flags_map.insert(ConstValue::byte_str(name.as_str()), ConstValue::Bool(true));
+    }
+    ConstValue::Dict(Arc::new(flags_map))
+}
+
 /// Map a pyre-frontend unary op name (`front::mir::unary_op_label`)
 /// onto the RPython flowspace operator name
 /// (`rpython/flowspace/operation.py`).
@@ -4601,6 +4653,68 @@ pub fn translate_op(
             Ok(vec![FlowspaceOp::new(
                 "gc_load_indexed",
                 vec![type_hl, base_hl, index_hl, scale_hl, base_ofs_hl],
+                result,
+            )])
+        }
+
+        // `lltype.malloc(T, flavor='raw')` / `lltype.free(p, flavor='raw')`.
+        // The frontend emits `OpKind::RawMalloc` for a typed raw struct and
+        // for the scalar `&mut i64` spill (`address.rs`
+        // `install_raw_scalar_address_call`). Upstream the high-level form
+        // is `simple_call(lltype.malloc, TYPE, flavor='raw')`; `rtype_malloc`
+        // genops the llop `malloc(TYPE, flags)` that
+        // `jtransform.py _rewrite_raw_malloc` residualizes. Emit that rtyped
+        // shape here, the way `RawLoad` emits `raw_load(TYPE, addr, ofs)`.
+        // The residual `ll_raw_malloc_fixedsize` returns a Signed address
+        // (`history.py` `getkind` of a raw pointer is `'int'`).
+        OpKind::RawMalloc {
+            owner,
+            TYPE,
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length,
+        } => {
+            let type_hl = Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+                raw_malloc_type_const(owner, TYPE),
+            ))));
+            let flags_hl = Hlvalue::Constant(Constant::new(raw_malloc_flags_const(
+                *zero,
+                *track_allocation,
+                *add_memory_pressure,
+                extra_flags,
+            )));
+            let result = resolve_result_hlvalue(op, value_map)?;
+            seed_raw_item_annotation(&result, LowLevelType::Signed);
+            if let Some(n) = length {
+                let n_hl = lookup_operand(value_map, n, op, "length")?;
+                Ok(vec![FlowspaceOp::new(
+                    "malloc_varsize",
+                    vec![type_hl, flags_hl, n_hl],
+                    result,
+                )])
+            } else {
+                Ok(vec![FlowspaceOp::new(
+                    "malloc",
+                    vec![type_hl, flags_hl],
+                    result,
+                )])
+            }
+        }
+        OpKind::RawFree { ptr } => {
+            let ptr_hl = lookup_operand(value_map, ptr, op, "ptr")?;
+            let flags_hl = Hlvalue::Constant(Constant::new(raw_malloc_flags_const(
+                false,
+                true,
+                false,
+                &[],
+            )));
+            let result = resolve_result_hlvalue(op, value_map)?;
+            seed_raw_item_annotation(&result, LowLevelType::Void);
+            Ok(vec![FlowspaceOp::new(
+                "free",
+                vec![ptr_hl, flags_hl],
                 result,
             )])
         }
@@ -8948,6 +9062,85 @@ mod tests {
         match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
             Some(SomeValue::None_(_)) => {}
             other => panic!("RawStore must seed s_None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_op_raw_malloc_lowers_to_malloc_spaceop() {
+        // Scalar spill: TYPE=None, owner `Tuple<i64>`. The rtyped shape is
+        // `malloc(TYPE, flags)` with flavor `raw`; the result is a Signed
+        // address (`ll_raw_malloc_fixedsize`).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_raw_malloc_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::raw_malloc("Tuple<i64>", false, None),
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RawMalloc arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "malloc");
+        assert_eq!(lowered.args.len(), 2);
+        match &lowered.args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::LowLevelType(ll) => match &**ll {
+                    LowLevelType::Struct(s) => assert_eq!(s._name, "Tuple<i64>"),
+                    other => panic!("scalar-spill TYPE must be Struct Tuple<i64>, got {other:?}"),
+                },
+                other => panic!("malloc TYPE must be LowLevelType, got {other:?}"),
+            },
+            other => panic!("malloc TYPE must be Constant, got {other:?}"),
+        }
+        match &lowered.args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Dict(map) => {
+                    assert_eq!(
+                        map.get(&ConstValue::byte_str("flavor")),
+                        Some(&ConstValue::byte_str("raw"))
+                    );
+                    assert!(map.get(&ConstValue::byte_str("zero")).is_none());
+                    assert!(map.get(&ConstValue::byte_str("track_allocation")).is_none());
+                }
+                other => panic!("malloc flags must be Dict, got {other:?}"),
+            },
+            other => panic!("malloc flags must be Constant, got {other:?}"),
+        }
+        let Hlvalue::Variable(result) = &lowered.result else {
+            panic!("RawMalloc result must be a Variable");
+        };
+        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+            Some(SomeValue::Integer(i)) => assert!(!i.unsigned, "raw malloc address is Signed"),
+            other => panic!("RawMalloc must seed Signed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_op_raw_free_lowers_to_free_spaceop() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_raw_free_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::RawFree {
+                ptr: vars[1].clone(),
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("RawFree arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "free");
+        assert_eq!(lowered.args.len(), 2);
+        let Hlvalue::Variable(result) = &lowered.result else {
+            panic!("RawFree result must be a Variable");
+        };
+        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+            Some(SomeValue::None_(_)) => {}
+            other => panic!("RawFree must seed s_None, got {other:?}"),
         }
     }
 

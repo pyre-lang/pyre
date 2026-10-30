@@ -2123,11 +2123,9 @@ pub(in crate::front::mir) fn lower_result_branch_to_control_flow(graph: &mut Fun
                 continue;
             };
             if name != "branch"
-                || !receiver_root.as_deref().is_some_and(|root| {
-                    majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(
-                        root,
-                    )) == "Result"
-                })
+                || !receiver_root
+                    .as_deref()
+                    .is_some_and(crate::front::result_exc::owner_is_core_result)
             {
                 continue;
             }
@@ -2275,6 +2273,22 @@ pub(in crate::front::mir) fn substitute_typevar_field(
     Some(clone_tyref(field_ty))
 }
 
+/// Classed `Result` / `Result::Err` owner of a Break payload type, or
+/// `None` when the type is not a Result intern. `Try::branch` on
+/// `Result<T, E>` returns `ControlFlow<Result<Infallible, E>, T>`;
+/// Break holds that Result, and the wrap must intern
+/// `Result<Infallible, E>::Err` rather than the unsuffixed
+/// `.branch()` receiver (`bookkeeper.py` `getuniqueclassdef`).
+pub(super) fn classed_result_enum_owner(ty: &ValueType) -> Option<&str> {
+    match ty {
+        ValueType::Ref(Some(owner)) => {
+            let enum_owner = owner.strip_suffix("::Err").unwrap_or(owner.as_str());
+            crate::front::result_exc::owner_is_core_result(enum_owner).then_some(enum_owner)
+        }
+        _ => None,
+    }
+}
+
 pub(in crate::front::mir) fn lower_result_branch_as_match(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -2378,13 +2392,19 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
                     false,
                 );
                 // Kinds differ: `Break` holds `Result<Infallible, E>`, so
-                // store `Err(e)` rather than the bare `E`.
+                // store `Err(e)` rather than the bare `E`. Intern the
+                // wrap on the Break payload's classed Result, not the
+                // unsuffixed `.branch()` receiver_root: rustc lays
+                // `Result<Infallible, E>` out as `E`, and a residual
+                // `Result::Err` then unions with `E` at
+                // `ControlFlow::Break.__pos_0`.
                 let (value, field_ty) = if tag == 1 && read_ty != write_ty {
-                    let err_field = format!("{result_owner}::Err");
+                    let wrap_owner = classed_result_enum_owner(&write_ty).unwrap_or(result_owner);
+                    let err_field = format!("{wrap_owner}::Err");
                     let wrapped = emit_sum_variant(
                         graph,
                         arm,
-                        result_owner,
+                        wrap_owner,
                         "Err",
                         1,
                         Some((err_field.as_str(), read, read_ty)),

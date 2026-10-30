@@ -981,6 +981,56 @@ pub(in crate::front::mir) fn tyref_is_ref_of_primitive(ty: &TyRef, llbc: &Llbc) 
     tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| json_ty_is_copy_scalar(pointee, llbc))
 }
 
+/// `ty` is one `*const` / `*mut` of a primitive. A reference is not a raw pointer.
+pub(in crate::front::mir) fn tyref_is_raw_ptr_of_primitive(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_peel_one_raw_ptr_node(ty, llbc)
+        .is_some_and(|pointee| json_ty_is_copy_scalar(pointee, llbc))
+}
+
+/// Kind `'r'`: `lltype.GCREF` / `Ptr(GcStruct)` (`history.py` `getkind`).
+/// `GcRef` is detected by the type decl's own name, without peeling
+/// `repr(transparent)` to `usize`. A raw pointer to a primitive or an
+/// `&T` can hold a `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')`
+/// address and is not this kind.
+pub(in crate::front::mir) fn tyref_is_gc_reference(ty: &TyRef, llbc: &Llbc) -> bool {
+    if output_type_is_ref(ty, llbc) {
+        return false;
+    }
+    if tyref_is_raw_ptr_of_primitive(ty, llbc) {
+        return false;
+    }
+    if tyref_decl_names_gcref(ty, llbc) {
+        return true;
+    }
+    if !tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    if raw_scalar_address_value_type(ty, llbc).is_some() {
+        return false;
+    }
+    matches!(
+        tyref_to_value_type(ty, llbc),
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+    )
+}
+
+pub(in crate::front::mir) fn tyref_decl_names_gcref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    let path = td.item_meta.name_path();
+    let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+    crate::annotator::bookkeeper::is_gcref_type_spelling(leaf)
+        || crate::annotator::bookkeeper::is_gcref_type_spelling(&path)
+        || leaf.eq_ignore_ascii_case("GcRef")
+}
+
 pub(in crate::front::mir) fn ref_kind_is_mut(ty: &TyRef, llbc: &Llbc) -> bool {
     pointer_kind_is_mut(ty, llbc, "Ref", 2)
 }
@@ -2610,7 +2660,9 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     // A transparent one-field struct has the same low-level value shape as
     // its field. Charon records the representation in `TypeDecl.layout`, so
     // preserve the field's register bank instead of treating the wrapper as
-    // a GC reference.
+    // a GC reference. A non-transparent by-value integer newtype
+    // (`VersionTag(u64)`) is the same word: `history.getkind` / `call.py`
+    // `getcalldescr` read that lltype off the value, not a Ref wrapper.
     if let Some(inner) = tyref_transparent_inner_value_type(
         ty,
         llbc,
@@ -3907,9 +3959,11 @@ pub(in crate::front::mir) fn tyref_payload_enum_class_root_with(
 
 /// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
 /// every aggregate onto a GC reference, which the call-signature validator
-/// must not start enforcing for ordinary struct returns.
+/// must not start enforcing for ordinary struct returns. `"()"` is Void,
+/// the declared result of a `fn(...) -> ()` (and of `Result<(), PyError>`
+/// after the `Ok` projection).
 pub(in crate::front::mir) fn scalar_result_token(token: &str) -> bool {
-    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64")
+    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64" | "()")
 }
 
 /// FUNC.RESULT token for a non-unit tuple return: `Tuple<t0,t1,…>` of
@@ -3958,12 +4012,12 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
 ///
 /// The tokens are the Rust primitive spellings the codewriter's
 /// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
-/// `u64`/`f64` → int/float), plus the `ref` sentinel for any pointer /
-/// reference / opaque-ADT return (codewriter wildcards it to
-/// `Type::Ref`, matching `valuetype_to_concrete(Ref) = GcRef`).  `None`
-/// keeps the historic declared-void behaviour for unit returns and for
-/// `Unknown` results (whose legacy concrete is also Unknown — the
-/// dead-var backfill family, not a genuine kind mismatch).
+/// `u64`/`f64` → int/float), plus `"()"` for unit (`FUNC.RESULT = Void`)
+/// and the `ref` sentinel for any pointer / reference / opaque-ADT return
+/// (codewriter wildcards it to `Type::Ref`, matching
+/// `valuetype_to_concrete(Ref) = GcRef`).  `None` is only for `Unknown`
+/// results (whose legacy concrete is also Unknown — the dead-var backfill
+/// family, not a genuine kind mismatch).
 pub(in crate::front::mir) fn dont_look_inside_return_token(
     output: &TyRef,
     llbc: &Llbc,
@@ -3996,7 +4050,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     };
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
-        return None;
+        return Some("()".to_string());
     }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.
@@ -4101,6 +4155,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
@@ -4112,14 +4167,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let type_args = adt
         .get("generics")
         .and_then(|g| g.get("types"))
         .and_then(serde_json::Value::as_array)?;
     if type_args.is_empty() {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let by_value_args = type_args.iter().all(|arg| {
         strip_ty_indirections(arg, llbc).is_some_and(|arg| {
@@ -4129,7 +4184,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     if !by_value_args {
         return None;
     }
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let suffix = adt_head_instantiation_suffix(adt, llbc, tombstoned)?;
     Some(format!("{}{suffix}", td.item_meta.name_path()))
 }
 
@@ -4808,6 +4863,7 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<&'l TypeDecl> {
     let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
     let obj = node.as_object()?;
@@ -4829,6 +4885,14 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         return None;
     }
     if field_ty_is_inline_vec(ty, llbc) || tyref_is_string_value(ty, llbc) {
+        return None;
+    }
+    // One integer word is not an inlined STRUCT. `getcalldescr` reads
+    // that lltype off the value (`call.py`); leaf-copy would GETFIELD
+    // `__pos_0` with the Int as the base (`VersionTag(u64)`).
+    if let TypeDeclKind::Struct(fields) = &td.kind
+        && integer_newtype_inner_field(td, fields, llbc, gc_struct_ids).is_some()
+    {
         return None;
     }
     Some(td)
@@ -4946,7 +5010,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
             }
             continue;
         }
-        if let Some(nested) = tyref_by_value_struct_decl(&f.ty, llbc) {
+        if let Some(nested) = tyref_by_value_struct_decl(&f.ty, llbc, gc_struct_ids) {
             leaves.extend(collect_by_value_struct_leaves(
                 nested,
                 llbc,
@@ -4997,7 +5061,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
     let field = fields
         .iter()
         .find(|f| f.name.as_deref() == Some(field_name))?;
-    let nested = tyref_by_value_struct_decl(&field.ty, llbc)?;
+    let nested = tyref_by_value_struct_decl(&field.ty, llbc, gc_struct_ids)?;
     Some(collect_by_value_struct_leaves(
         nested,
         llbc,
@@ -5176,7 +5240,7 @@ pub(in crate::front::mir) fn tyref_split_core_enum_param_root(
     {
         return None;
     }
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let suffix = adt_head_instantiation_suffix(adt, llbc, tombstoned)?;
     let identity = class_identity_spelling(&name, tombstoned);
     Some(majit_ir::descr::with_instantiation_suffix(
         &identity, &suffix,
@@ -5780,27 +5844,142 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     {
         return Some(transparent_scalar_value_type(kind));
     }
-    if !decl.is_repr_transparent() {
-        return None;
-    }
     match &decl.kind {
         TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
-            let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
-                fields.get(index)?
-            } else if let [only] = fields.as_slice() {
-                only
+            if decl.is_repr_transparent() {
+                let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
+                    fields.get(index)?
+                } else if let [only] = fields.as_slice() {
+                    only
+                } else {
+                    return None;
+                };
+                Some(tyref_to_value_type_with(
+                    &field.ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ))
+            } else if output_type_is_ref(ty, llbc) {
+                // `&Plain` / `&VersionTag` is an address. Peeling the
+                // referent into Int here makes
+                // `refuse_borrowed_transparent_scalar_residual` treat a
+                // non-transparent borrow as a scalar word.
+                None
             } else {
-                return None;
-            };
-            Some(tyref_to_value_type_with(
-                &field.ty,
-                llbc,
-                tombstoned,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            ))
+                // A by-value Copy newtype around one primitive integer is
+                // that integer. RPython's rtyper gives one lltype per
+                // value (`history.getkind`) and `getcalldescr` reads
+                // `[v.concretetype for v in op.args[1:]]` (`call.py`),
+                // so the helper Input / FUNC.ARGS / calldescr kind cannot
+                // disagree with the live word. `VersionTag(u64)` is the
+                // case: it is not `repr(transparent)`, construction and
+                // SROA alias the inner serial as Int, and a Ref paint
+                // here aborted CALL_PURE of
+                // `_getdictvalue_no_unwrapping_pure` with
+                // `GotoIfNotValueNotConcrete` on that Int.
+                integer_newtype_inner_value_type(decl, fields, llbc, gc_struct_ids)
+            }
         }
         _ => None,
+    }
+}
+
+/// Unique positional field of a non-GC tuple-struct newtype that is a
+/// one-word integer scalar (`iN` / `uN` / `isize` / `usize`, not
+/// `i128`/`u128`). Named one-field wrappers (`RangeFrom.start`, a
+/// rust-heap `String`'s header word) keep their own type.
+/// Multi-field structs, ZST markers beside a payload, GC instances,
+/// pointers, and floats stay `None` so they keep their own bank.
+fn integer_newtype_inner_field<'a>(
+    decl: &TypeDecl,
+    fields: &'a [FieldDecl],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<&'a TyRef> {
+    if gc_struct_ids.contains(&struct_id_for_type_decl(decl)) {
+        return None;
+    }
+    integer_newtype_inner_field_structural(decl, fields, llbc)
+}
+
+/// Shape of a by-value one-integer tuple struct, ignoring GC taint.
+///
+/// `history.getkind` / `descr.py get_field_descr` of that FIELD type is
+/// the inner integer. Field-0 GC closure must not follow this shape as
+/// an inlined parent (`struct_field0_type_id`).
+pub(in crate::front::mir) fn type_decl_is_by_value_integer_newtype(
+    decl: &TypeDecl,
+    llbc: &Llbc,
+) -> bool {
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return false;
+    };
+    integer_newtype_inner_field_structural(decl, fields, llbc).is_some()
+}
+
+fn integer_newtype_inner_field_structural<'a>(
+    decl: &TypeDecl,
+    fields: &'a [FieldDecl],
+    llbc: &Llbc,
+) -> Option<&'a TyRef> {
+    let path = decl.item_meta.name_path();
+    if path == STRING_BUILDER_PATH || path == "alloc::string::String" {
+        return None;
+    }
+    let carrier = llbc.exception_carrier();
+    if !carrier.is_empty() && path == carrier {
+        return None;
+    }
+    let [field] = fields else {
+        return None;
+    };
+    // Charon drops a positional `_0` to `name: None`
+    // (`ullbc.rs FieldDecl`). A named payload is a real field, not a
+    // newtype wrap of the integer (`RangeFrom.start`).
+    if field.name.is_some() {
+        return None;
+    }
+    if field_is_zst(&field.ty, llbc) {
+        return None;
+    }
+    one_word_integer_scalar_value_type(&field.ty, llbc)?;
+    Some(&field.ty)
+}
+
+fn integer_newtype_inner_value_type(
+    decl: &TypeDecl,
+    fields: &[FieldDecl],
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> Option<ValueType> {
+    one_word_integer_scalar_value_type(
+        integer_newtype_inner_field(decl, fields, llbc, gc_struct_ids)?,
+        llbc,
+    )
+}
+
+/// Field type is a Charon `Scalar` integer that occupies one JIT int
+/// word. Pointers, fieldless enums, and other shapes that
+/// [`tyref_to_value_type_with`] paints `Int` are not this: peeling
+/// those would collapse an address or a tag wrapper into the payload.
+fn one_word_integer_scalar_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let resolved = tyref_node(ty, llbc)?;
+    let value = strip_ty_indirections(resolved, llbc).unwrap_or(resolved);
+    let scalar = value.as_object()?.get("Scalar")?;
+    let int = scalar.as_object()?.get("Integer")?.as_object()?;
+    if int.get("Signed").and_then(serde_json::Value::as_str) == Some("I128")
+        || int.get("Unsigned").and_then(serde_json::Value::as_str) == Some("U128")
+    {
+        return None;
+    }
+    if int.contains_key("Unsigned") {
+        Some(ValueType::Unsigned)
+    } else if int.contains_key("Signed") {
+        Some(ValueType::Int)
+    } else {
+        None
     }
 }
 
@@ -6152,7 +6331,7 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
             let tagged_result = name.ends_with("::result::Result");
             let tagged_control_flow = name.ends_with("::control_flow::ControlFlow");
             let tagged_option = name.ends_with("::option::Option");
-            let split = adt_head_instantiation_suffix(adt, llbc).is_some();
+            let split = adt_head_instantiation_suffix(adt, llbc, tombstoned).is_some();
             // A pointer-niche Option is the null word, not an enum class.
             // Gate on the modeled niche (`tyref_is_niche_option`). A
             // transparent pointer handle over a nullable raw pointer still
@@ -6216,7 +6395,7 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
     // constructor / field-read sites must agree — they share
     // `adt_head_instantiation_suffix`.  Non-enum and primitive-payload
     // heads return `None` and keep the class identity.
-    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
+    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc, tombstoned) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
     if let Some(suffix) = struct_instantiation_suffix(&name, adt, llbc) {
@@ -8884,12 +9063,19 @@ pub(in crate::front::mir) fn tyref_checked_binop_value_type(
 }
 
 /// Default of `ty` is the unit value without running a `Default` body:
-/// `()` (`is_unit_type`) or `core::marker::PhantomData`. Any other ZST,
-/// a user type named `PhantomData` included, may have a custom
-/// `Default` (`tyref_is_zero_sized` is not this).
+/// `()` (`is_unit_type`) or a std void ZST (`PhantomData`,
+/// `BuildHasherDefault` — `type_str_leaf_is_void_zst`). A user type of
+/// the same leaf, or any other ZST, may have a custom `Default`
+/// (`tyref_is_zero_sized` is not this).
 pub(in crate::front::mir) fn tyref_default_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
-    is_unit_type(ty, llbc)
-        || adt_path_of_tyref(ty, llbc).as_deref() == Some("core::marker::PhantomData")
+    if is_unit_type(ty, llbc) {
+        return true;
+    }
+    let Some(path) = adt_path_of_tyref(ty, llbc) else {
+        return false;
+    };
+    let root = path.split("::").next().unwrap_or("");
+    matches!(root, "core" | "std") && crate::codewriter::call::type_str_leaf_is_void_zst(&path)
 }
 
 /// True when `ty` is Charon's unit type `()`.
@@ -9260,6 +9446,16 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     let Some(decl) = llbc.type_by_id(id) else {
         return tyref_to_ast_string(ty, llbc);
     };
+    // A by-value integer newtype is the inner scalar in the containing
+    // struct's descriptor (`history.getkind`). Spelling the wrapper leaf
+    // would fall to the unknown-name GC-pointer wildcard and mint a Ref
+    // field descr against the Int publish (`VersionTag(u64)`).
+    if let TypeDeclKind::Struct(fields) = &decl.kind
+        && !decl.published_struct_copy
+        && let Some(inner) = integer_newtype_inner_field(decl, fields, llbc, gc_struct_ids)
+    {
+        return tyref_to_ast_string(inner, llbc);
+    }
     if !decl.is_repr_transparent() {
         return tyref_to_ast_string(ty, llbc);
     }
@@ -10051,7 +10247,10 @@ pub(in crate::front::mir) fn charon_int_kind_to_rust(kind: &str, signed: bool) -
 /// [`charon_adt_to_ast_string`] (full type printer) and
 /// [`adt_head_instantiation_suffix`] (variant-class projection) so a
 /// rendered type and its `<…>` class suffix spell one instantiation
-/// identically.
+/// identically.  Tombstoned-leaf ADT arguments in the suffix path go
+/// through [`render_adt_suffix_type_args`] instead, so two declarations
+/// that share a leaf (`alloc::layout::Layout` beside
+/// `typeobject::Layout`) do not intern one `Result<Layout,_>::Ok`.
 pub(in crate::front::mir) fn render_adt_type_args(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
@@ -10082,6 +10281,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
     depth: usize,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
@@ -10090,7 +10290,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    let rendered = charon_type_value_to_enum_arg(t, llbc, depth + 1, tombstoned);
                     if rendered == "Global" || rendered == "RandomState" {
                         return None;
                     }
@@ -10099,7 +10299,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
                         transparent_handle_field_spelling(
                             &ty,
                             llbc,
-                            no_tombstoned_leaves(),
+                            tombstoned,
                             gc_struct_ids,
                             raw_alloc_flavor_structs,
                         )
@@ -10418,9 +10618,13 @@ pub(in crate::front::mir) fn tyref_adt_map<'l>(
 /// (an `f32`/`()`/`""` argument yields `None`).  Fail-closed: a
 /// missing `Adt` node, a non-enum type, or a deferred argument yields `""` —
 /// the bare owner, unchanged.
-pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
     tyref_adt_map(ty, llbc)
-        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc))
+        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc, tombstoned))
         .unwrap_or_default()
 }
 
@@ -10558,7 +10762,15 @@ pub(in crate::front::mir) fn type_arg_splits_per_instantiation(arg: &str) -> boo
 /// anywhere, nested arguments included. Distinct from
 /// [`type_arg_splits_per_instantiation`]: `()` and `f32` are concrete
 /// (`Bookkeeper.getuniqueclassdef`) and still do not split.
+///
+/// Charon's Never / Infallible JSON is a non-object type node and
+/// renders as `??scalar`. That is a fully substituted uninhabited
+/// type, not an open parameter: a dest_ty `Result<??scalar, E>` must
+/// still suffix a bare-head Result aggregate
+/// (`bookkeeper.py` `getuniqueclassdef`). Other `??` spellings
+/// (`??TypeVar`, `??adt#N`) stay non-concrete.
 pub(in crate::front::mir) fn type_arg_is_concrete(arg: &str) -> bool {
+    let arg = arg.replace("??scalar", "Never");
     !arg.contains("TypeVar") && !arg.contains("??")
 }
 
@@ -10612,7 +10824,10 @@ pub(in crate::front::mir) fn enum_instantiation_suffix_from_args(
 /// `enum` instantiation.  Returned `Some` only when the head names an
 /// `enum` (struct generics keep collapsing to their flat classdef) and
 /// [`enum_instantiation_suffix_from_args`] accepts the rendered
-/// type-arguments.  Every projection site (receiver type,
+/// type-arguments.  Tombstoned-leaf type arguments use
+/// [`class_identity_spelling`] so two declarations that share a leaf
+/// intern two ClassDefs (`Result<layout::Layout,_>` vs
+/// `Result<typeobject::Layout,_>`).  Every projection site (receiver type,
 /// variant constructor, variant field read, numbering pre-scan) routes
 /// through this one predicate so they all agree on which instantiations
 /// split and how they spell the suffix.
@@ -10627,13 +10842,109 @@ pub(in crate::front::mir) fn enum_instantiation_suffix_from_args(
 pub(crate) fn adt_head_instantiation_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let def_id = type_decl_ref_adt_id(adt)?;
     let td = llbc.type_by_id(def_id)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
         return None;
     }
-    enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0))
+    enum_instantiation_suffix_from_args(&render_adt_suffix_type_args(adt, llbc, 0, tombstoned))
+}
+
+/// Type-argument spellings for an enum instantiation suffix.
+///
+/// Unique-leaf ADTs keep the TypeDecl leaf (`OsError`, `i64`) so existing
+/// intern keys stay put. A leaf [`harden_duplicate_leaf_metadata`] withdrew
+/// uses [`class_identity_spelling`] instead: `alloc::layout::Layout` and
+/// `typeobject::Layout` share the leaf `Layout`, and a leaf suffix would
+/// intern one `Result<Layout, LayoutError>::Ok` whose `__pos_0` unions
+/// them (`bookkeeper.py` `getuniqueclassdef`). Nested generic arguments
+/// (`Vec<T>`) keep the field-type printer so `type_align` still sees
+/// `Vec<Rooted>` rather than a crate-qualified element.
+fn render_adt_suffix_type_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| charon_type_value_to_enum_arg(t, llbc, depth + 1, tombstoned))
+                .filter(|s| s != "Global" && s != "RandomState")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Spelling of one Result/Option type argument for the intern suffix and
+/// the substituted variant payload row. A tombstoned-leaf ADT with no
+/// type arguments (`Layout`) uses [`class_identity_spelling`]; every
+/// other shape reuses the field-type printer.
+fn charon_type_value_to_enum_arg(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    if depth > 24 {
+        return "??deep".to_string();
+    }
+    let Some(obj) = v.as_object() else {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    };
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => charon_type_value_to_enum_arg(body, llbc, depth + 1, tombstoned),
+            None => format!("??unresolved_dedup#{id}"),
+        };
+    }
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return charon_type_value_to_enum_arg(&arr[1], llbc, depth + 1, tombstoned);
+    }
+    if let Some(r) = obj.get("Ref") {
+        if let Some(arr) = r.as_array()
+            && let Some(inner) = arr.get(1)
+        {
+            return charon_type_value_to_enum_arg(inner, llbc, depth + 1, tombstoned);
+        }
+        return "??ref_shape".to_string();
+    }
+    let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) else {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    };
+    if adt.get("builtin").filter(|b| !b.is_null()).is_some() {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    }
+    let nested = render_adt_type_args(adt, llbc, depth);
+    if !nested.is_empty() {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    }
+    let name = if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        llbc.type_by_id(def_id)
+            .map(|td| td.item_meta.name_path())
+            .unwrap_or_else(|| format!("??adt#{def_id}"))
+    } else if let Some(path) = adt
+        .get("id")
+        .and_then(|i| i.get("Path"))
+        .and_then(|p| p.as_str())
+    {
+        path.to_string()
+    } else {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    };
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
+    if tombstoned.contains(leaf) {
+        super::class_identity_spelling(&name, tombstoned)
+    } else {
+        leaf.to_string()
+    }
 }
 
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).

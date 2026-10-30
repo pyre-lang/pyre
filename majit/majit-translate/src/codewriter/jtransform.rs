@@ -4194,18 +4194,21 @@ impl<'a> Transformer<'a> {
     /// register holding the void call's garbage.  Only the
     /// declared-void-vs-resolved-Ref shell case is rewritten; every other
     /// call keeps its front-derived `result_ty`.
+    ///
+    /// `declared` is `FUNC.RESULT` of the called function's lltype
+    /// (`call.py getcalldescr` for `direct_call` and `indirect_call`
+    /// alike): `declared_result_type_for_target` for a direct target, the
+    /// trait method family's signature (`declared_result_type_for_indirect`
+    /// / family witness graphs) for a vtable/indirect call.
     fn effective_call_result_ty(
         &self,
-        target: &CallTarget,
+        declared: Option<majit_ir::value::Type>,
         op_result: Option<&crate::flowspace::model::Variable>,
         result_ty: &ValueType,
     ) -> ValueType {
-        let declared_void = self
-            .callcontrol
-            .as_deref()
-            .and_then(|cc| cc.declared_result_type_for_target(target))
-            == Some(majit_ir::value::Type::Void);
-        if declared_void && self.resolve_call_result(op_result, result_ty).kind == 'r' {
+        if declared == Some(majit_ir::value::Type::Void)
+            && self.resolve_call_result(op_result, result_ty).kind == 'r'
+        {
             ValueType::Void
         } else {
             result_ty.clone()
@@ -4778,13 +4781,14 @@ impl<'a> Transformer<'a> {
                 funcptr,
                 args,
                 graphs,
-                family_key: _,
+                family_key,
                 result_ty,
             } if self.config.classify_calls => self.lower_indirect_call_op(
                 op,
                 funcptr,
                 args,
                 graphs.as_deref(),
+                family_key.as_ref(),
                 result_ty,
                 graph_name,
                 graph,
@@ -10096,8 +10100,12 @@ impl<'a> Transformer<'a> {
                     // aggregate-shaped unit shell would disagree with the
                     // callee's `void_return`.  Reconcile it just like the
                     // residual-call arm below.
+                    let declared = self
+                        .callcontrol
+                        .as_deref()
+                        .and_then(|cc| cc.declared_result_type_for_target(target));
                     let effective_result_ty =
-                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                        self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
                     let non_void_args = self
                         .callcontrol
                         .as_deref()
@@ -10186,8 +10194,12 @@ impl<'a> Transformer<'a> {
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
                     // typed the unit `()` shell (see `effective_call_result_ty`).
+                    let declared = self
+                        .callcontrol
+                        .as_deref()
+                        .and_then(|cc| cc.declared_result_type_for_target(target));
                     let effective_result_ty =
-                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                        self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
@@ -13766,10 +13778,12 @@ impl<'a> Transformer<'a> {
         funcptr: &crate::flowspace::model::Variable,
         args: &[crate::flowspace::model::Variable],
         graphs: Option<&[crate::parse::CallPath]>,
+        family_key: Option<&(String, String)>,
         result_ty: &ValueType,
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let funcptr_target = self.fn_const_target_of(graph, funcptr);
         let materialized_funcptr = self.materialize_fn_const_funcptr_value(graph, funcptr);
         let funcptr_value = materialized_funcptr
             .as_ref()
@@ -13788,9 +13802,26 @@ impl<'a> Transformer<'a> {
         let args = filtered_args.as_slice();
         let (args_i, args_r, args_f, _) =
             self.rewrite_call_three_lists(args, graph_name, "call argument (indirect)");
-        let resolved_result = self.resolve_call_result(op.result.as_ref(), result_ty);
+        // `call.py getcalldescr`: RESULT is FUNC.RESULT of the called
+        // function, for `indirect_call` as for `direct_call`. A vtable
+        // method returning `()` has Void RESULT; `front::mir` still types
+        // the unit shell Ref. Reuse the direct-call correction.
+        let declared = self.callcontrol.as_deref().and_then(|cc| {
+            funcptr_target
+                .as_ref()
+                .and_then(|target| cc.declared_result_type_for_target(target))
+                .or_else(|| {
+                    family_key.and_then(|(trait_root, method_name)| {
+                        cc.declared_result_type_for_indirect(trait_root, method_name)
+                    })
+                })
+                .or_else(|| cc.declared_result_type_for_graphs(graphs))
+        });
+        let effective_result_ty =
+            self.effective_call_result_ty(declared, op.result.as_ref(), result_ty);
+        let resolved_result = self.resolve_call_result(op.result.as_ref(), &effective_result_ty);
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), &effective_result_ty);
         let non_void_args = resolve_non_void_arg_types_from_vars(args);
         let result_ir_type = resolved_result.ir_type;
         let cc_mut = self

@@ -740,14 +740,11 @@ fn cache_set_cell(
 
 /// `caches_get` plus `cache.cell =` under the registry lock so a
 /// concurrent `delitem` cannot drop the entry and then have this
-/// store resurrect it.
+/// store resurrect it. Reads `self.caches` off the strategy
+/// (`celldict.py _setitem_str_cell_known` / `delitem`).
 #[majit_macros::dont_look_inside]
-fn caches_set_cell(
-    caches: &parking_lot::Mutex<Option<GlobalCacheRegistry>>,
-    key: &str,
-    cell: Option<PyObjectRef>,
-) {
-    let guard = caches.lock();
+fn caches_set_cell(strategy: &ModuleDictStrategy, key: &str, cell: Option<PyObjectRef>) {
+    let guard = strategy.caches.lock();
     if let Some(cache) = guard
         .as_ref()
         .and_then(|registry| registry.get(key))
@@ -1080,9 +1077,13 @@ impl ModuleDictStrategy {
         w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
-        // Promote `self` before reading `self.version`, so that the read is
-        // a no-op due to the quasi-immutable field.
-        let this = unsafe { &*majit_ir::jit::promote(self as *const Self) };
+        // `celldict.py getdictvalue_no_unwrapping`: `self = jit.promote(self)`.
+        // Promote the GC reference (`llmemory.GCREF`), not `&Self` / `as usize`:
+        // those record `cast_ptr_to_int` + `int_guard_value` on every store.
+        // `self.version` stays a FieldRead so `jtransform.py rewrite_op_getfield`
+        // emits `record_quasiimmut_field` + `getfield_*_pure`.
+        let gcref = majit_ir::jit::promote(self as *const Self as crate::gc_hook::GCREF);
+        let this = unsafe { &*(gcref as *const Self) };
         this._getdictvalue_no_unwrapping_pure(this.version, w_dict, key)
     }
 
@@ -1176,7 +1177,16 @@ impl ModuleDictStrategy {
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
         // round-trip.
-        caches_set_cell(&self.caches, key, Some(w_to_store));
+        caches_set_cell(self, key, Some(w_to_store));
+        // A missing key is a structural insert.  Value-only replacement
+        // must not bump `keys_version` (`w_dict_bump_keys_version`).
+        // Recording `storage.len()` around every `setitem_str` kept two
+        // `RDict.num_live_items` reads on the in-place cell store.
+        if cell.is_none() {
+            unsafe {
+                crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
+            }
+        }
     }
 
     /// `celldict.py length`:
@@ -1216,7 +1226,7 @@ impl ModuleDictStrategy {
         // `celldict.py:117-121`: zero out the per-key cache
         // so LOAD_GLOBAL falls through to the builtins
         // fallback (or NameError) on the next read.
-        caches_set_cell(&self.caches, key, None);
+        caches_set_cell(self, key, None);
         self.mutated();
         Some(removed)
     }
@@ -1545,7 +1555,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             }
         }
         let values_base = roots.pin_roots(&values);
-        let strategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+        let strategy = crate::dictmultiobject::unicode_dict_strategy_ref();
         let new_slot = roots.publish(&[crate::dictmultiobject::w_dict_new_with(
             strategy,
             strategy.get_empty_storage(),

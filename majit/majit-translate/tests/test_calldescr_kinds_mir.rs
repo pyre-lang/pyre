@@ -239,21 +239,14 @@ fn scalar_pointer_params_match_int_callers() {
         .expect("caller invokes the callback");
     let hash_out = args[5].as_variable().expect("hash_out value").clone();
     let produced = root_op(&caller, &hash_out);
-    let passed_int = match produced {
-        Some(OpKind::Input { ty, .. }) => int_family(ty),
-        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => true,
-        Some(
-            OpKind::Call { result_ty, .. }
-            | OpKind::UnaryOp { result_ty, .. }
-            | OpKind::BinOp { result_ty, .. },
-        ) => int_family(result_ty),
-        Some(OpKind::RawLoad { item_ty, .. }) => int_family(item_ty),
-        // `&mut keyhash` is spilled to a raw address. `_rewrite_raw_malloc`
-        // types that word Int, the same bank as `hash_out`.
-        Some(OpKind::RawMalloc { .. }) => true,
-        other => panic!("caller must pass hash_out as int, producer {other:?}"),
-    };
-    assert!(passed_int, "caller passes hash_out as int");
+    // `&raw mut *(&mut keyhash)` is spilled to a raw address.
+    // `_rewrite_raw_malloc` types that word Int, the same bank as
+    // `hash_out`. An Input would be the keyhash word (null when
+    // hash_known == 0), which the callee then stores through.
+    match produced {
+        Some(OpKind::RawMalloc { .. }) => {}
+        other => panic!("caller must pass hash_out as the spill pointer, producer {other:?}"),
+    }
 
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         std::slice::from_ref(&llbc),

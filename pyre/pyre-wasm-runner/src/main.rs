@@ -1882,12 +1882,8 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
     linker.func_wrap(
         "majit_host",
         "jit_call_host",
-        |mut caller: Caller<'_, Host>, frame_ptr: u32| {
-            if let Err(e) =
-                jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32, "host")
-            {
-                eprintln!("[jit_call_host] {e:?}");
-            }
+        |mut caller: Caller<'_, Host>, frame_ptr: u32| -> Result<()> {
+            jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32, "host")
         },
     )?;
 

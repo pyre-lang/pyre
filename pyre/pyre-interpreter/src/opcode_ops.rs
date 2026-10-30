@@ -1404,6 +1404,36 @@ pub extern "C" fn jit_baseobjspace_dict_display_setitem(
     }
 }
 
+// STORE_NAME's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+// The graph is `store_name_value_w`; its Rust `Result` is a different ABI,
+// so the two must not share an address.
+#[inline(never)]
+pub extern "C" fn jit_eval_store_name_value_w(
+    frame: &mut crate::pyframe::PyFrame,
+    w_name: PyObjectRef,
+    value: PyObjectRef,
+) -> i64 {
+    match unsafe { crate::eval::store_name_value_w(frame, w_name, value) } {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+// STORE_GLOBAL's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+// The graph is `store_global_value_w`; its Rust `Result` is a different ABI,
+// so the two must not share an address.
+#[inline(never)]
+pub extern "C" fn jit_eval_store_global_value_w(
+    frame: &mut crate::pyframe::PyFrame,
+    w_name: PyObjectRef,
+    value: PyObjectRef,
+) -> i64 {
+    match unsafe { crate::eval::store_global_value_w(frame, w_name, value) } {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
 #[inline(never)]
 pub extern "C" fn jit_newlist_from_iter_hint(last_val: PyObjectRef) -> PyObjectRef {
     match newlist_from_iter_hint(last_val) {

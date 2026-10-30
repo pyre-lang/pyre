@@ -306,7 +306,8 @@ LAYOUT_TARGET_RUSTFLAGS = '--cfg getrandom_backend="custom"'
 # represented by the effective cargo/Charon/layout flags hashed by the engine.
 # The explicit ABI keeps comments, diagnostics, tests, the forwarding shim and
 # the Charon installer from invalidating every multi-minute artefact.
-EXTRACTION_ABI = "1"
+# Layout sidecars retain SerDedup definitions from the serialized prelude.
+EXTRACTION_ABI = "2"
 
 # Workspace resolution is a compiler input. Extraction-tool implementation
 # files are deliberately absent; FINGERPRINT_SCHEMA and EXTRACTION_ABI carry

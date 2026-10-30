@@ -20,7 +20,7 @@
 /// - #[jit_module]: Module-level automatic helper discovery
 /// - virtualizable!: Standalone virtualizable field declaration
 use proc_macro::TokenStream;
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, quote_spanned};
 use syn::{
     FnArg, Ident, ItemFn, Path, ReturnType, Token, Type, parenthesized, parse::Parse,
     parse::ParseStream, parse_macro_input,
@@ -875,6 +875,35 @@ fn is_pointer_alias(ty: &Type) -> bool {
     path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef" || id == "GCREF")
 }
 
+/// `celldict.py VersionTag` is a GC instance; pyre's [`VersionTag`] is the
+/// one-word serial (`VersionTag::fresh`). Reconstruct it with the integer
+/// conversion: `VersionTag(word as u64)`.
+fn is_version_tag_type(ty: &Type) -> bool {
+    path_type_last_ident(ty).is_some_and(|id| id == "VersionTag")
+}
+
+/// Shared `&self` / `self: &Self` / `self: &T`. `&mut self` and by-value
+/// `self` stay [`HelperFnAddrSkip::MethodReceiver`].
+///
+/// `rlib/jit.py elidable_promote` treats a method as an ordinary function
+/// whose first argument is `self` (`celldict.py
+/// _getdictvalue_no_unwrapping_pure(self, version, w_dict, key)`).
+fn shared_ref_receiver_is_shared(recv: &syn::Receiver) -> bool {
+    if recv.reference.is_some() {
+        return recv.mutability.is_none();
+    }
+    matches!(
+        &*recv.ty,
+        Type::Reference(reference) if reference.mutability.is_none()
+    )
+}
+
+fn helper_has_shared_ref_receiver(func: &ItemFn) -> bool {
+    func.sig
+        .receiver()
+        .is_some_and(shared_ref_receiver_is_shared)
+}
+
 /// `Option<T>` whose `T` is one Ref-word pointer (`PyObjectRef`, `*mut X`,
 /// `*const X` with a thin pointee). `None` is the null word and `Some(p)` is
 /// `p`. Applies to both arguments and returns. `Option<i64>`, `Option<bool>`,
@@ -1035,6 +1064,9 @@ fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
     {
         return HelperCallKind::Ref;
     }
+    if is_version_tag_type(ty) {
+        return HelperCallKind::Int;
+    }
     match primitive_type_ident(ty)
         .map(|ident| ident.to_string())
         .as_deref()
@@ -1100,6 +1132,9 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
                 Some(#inner_conv)
             }
         });
+    }
+    if is_version_tag_type(ty) {
+        return Some(quote! { #ty((#arg_ident) as u64) });
     }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
@@ -1357,6 +1392,9 @@ fn wrap_result_exc_call(
 /// other fat pointer (`&mut str`, `&Path`, `&[u8]`, `&[u32]`, `&[f64]`,
 /// `*const str`, `*const [T]`, `&dyn Trait`, a slice of any other item)
 /// still skips as `FatPointerArg`.  A return of `&str` or `&Wtf8` still skips.
+/// A shared `&self` / `self: &Self` is one `Ref` word, rebuilt as
+/// `&T` (`rlib/jit.py elidable_promote` passes `self` as the first ordinary
+/// argument). `&mut self` and by-value `self` still skip as `MethodReceiver`.
 fn trampoline_skip_reason(
     func: &ItemFn,
     attr_name: &str,
@@ -1399,20 +1437,24 @@ fn trampoline_skip_reason(
     {
         return Some(HelperFnAddrSkip::Other);
     }
-    if func.sig.receiver().is_some() {
+    if let Some(recv) = func.sig.receiver()
+        && !shared_ref_receiver_is_shared(recv)
+    {
         return Some(HelperFnAddrSkip::MethodReceiver);
     }
     for arg in &func.sig.inputs {
-        let FnArg::Typed(pat_type) = arg else {
-            return Some(HelperFnAddrSkip::Other);
-        };
-        if pair_slice_param(&pat_type.ty).is_some() {
-            continue;
-        }
-        if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none()
-            && !is_word_enum_arg(&pat_type.ty, word_enums)
-        {
-            return Some(HelperFnAddrSkip::Other);
+        match arg {
+            FnArg::Receiver(_) => continue,
+            FnArg::Typed(pat_type) => {
+                if pair_slice_param(&pat_type.ty).is_some() {
+                    continue;
+                }
+                if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none()
+                    && !is_word_enum_arg(&pat_type.ty, word_enums)
+                {
+                    return Some(HelperFnAddrSkip::Other);
+                }
+            }
         }
     }
     if result_payload.is_some() {
@@ -1467,16 +1509,24 @@ fn icf_identity_tokens(name: &Ident, generics: &syn::Generics) -> proc_macro2::T
     }
 }
 
+fn trampoline_fn_ptr(ident: &Ident, in_impl: bool) -> proc_macro2::TokenStream {
+    if in_impl {
+        quote! { Self::#ident as *const () }
+    } else {
+        quote! { #ident as *const () }
+    }
+}
+
 fn emit_helper_fnaddr_registration(
     path_name: &Ident,
-    trampoline_ident: &Ident,
+    trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let static_name = format_ident!("__MAJIT_HELPER_FNADDR_{path_name}");
     let row = quote! {
         ::majit_ir::helper_fnaddr::HelperFnAddr::new(
             ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
-            #trampoline_ident as *const (),
+            #trampoline_ptr,
             #arity,
         )
     };
@@ -1493,25 +1543,25 @@ fn emit_helper_fnaddr_registration(
 
 fn emit_helper_fnaddr_registrations(
     path_names: &[&Ident],
-    trampoline_ident: &Ident,
+    trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let rows = path_names
         .iter()
-        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_ident, arity));
+        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_ptr, arity));
     quote! { #(#rows)* }
 }
 
 fn emit_helper_fnaddr_ctor(
     path_name: &Ident,
-    trampoline_ident: &Ident,
+    trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let ctor_name = format_ident!("__majit_register_helper_fnaddr_{path_name}");
     let register = quote! {
         ::majit_ir::helper_fnaddr::register(
             ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
-            #trampoline_ident as *const (),
+            #trampoline_ptr,
             #arity,
         );
     };
@@ -1526,13 +1576,186 @@ fn emit_helper_fnaddr_ctor(
 
 fn emit_helper_fnaddr_ctors(
     path_names: &[&Ident],
-    trampoline_ident: &Ident,
+    trampoline_ptr: &proc_macro2::TokenStream,
     arity: u8,
 ) -> proc_macro2::TokenStream {
     let ctors = path_names
         .iter()
-        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_ident, arity));
+        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_ptr, arity));
     quote! { #(#ctors)* }
+}
+
+/// Linker symbol for the associated `register_impl_method` function.
+///
+/// Nested items inside the trampoline cannot name `Self` (`E0401`), and
+/// associated statics are not allowed, so the constructor static reaches
+/// the associated function through this unmangled name.
+///
+/// `line!()` / `column!()` are spanned at the annotated method ident so two
+/// types in one module with the same method name emit distinct symbols, and
+/// every `export_name` / `link_name` in the same expansion agrees.
+fn impl_fnaddr_export_name(
+    trampoline_ident: &Ident,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    quote_spanned! { span =>
+        concat!(
+            "__MAJIT_IMPL_FNADDR__",
+            module_path!(),
+            "__",
+            stringify!(#trampoline_ident),
+            "_",
+            line!(),
+            "_",
+            column!(),
+        )
+    }
+}
+
+/// Linker symbol for the inherent `&self` trampoline itself.
+///
+/// Wasm32 `Self::trampoline as *const ()` is a method-coercion table slot
+/// whose wasm type is the raw Rust ABI, not the `extern "C"` trampoline.
+/// The register function reads this export through `link_name` so the
+/// stored pointer is the defining function, matching a free-function
+/// `fn as *const ()` in the same crate.
+///
+/// Unique per definition site: see [`impl_fnaddr_export_name`].
+fn impl_trampoline_export_name(
+    trampoline_ident: &Ident,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    quote_spanned! { span =>
+        concat!(
+            "__MAJIT_IMPL_TRAMPOLINE__",
+            module_path!(),
+            "__",
+            stringify!(#trampoline_ident),
+            "_",
+            line!(),
+            "_",
+            column!(),
+        )
+    }
+}
+
+/// Associated function that builds [`HelperFnAddr::new_impl_method`] rows.
+///
+/// Its body can name `Self`; constructors then call it through
+/// [`impl_fnaddr_export_name`] (nested items cannot name `Self`).
+fn emit_impl_helper_fnaddr_register_fn(
+    path_names: &[&Ident],
+    trampoline_ident: &Ident,
+    import_params: &[proc_macro2::TokenStream],
+    import_ret: &proc_macro2::TokenStream,
+    arity: u8,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let export_name = impl_fnaddr_export_name(trampoline_ident, span);
+    let trampoline_export = impl_trampoline_export_name(trampoline_ident, span);
+    let register_ident = format_ident!("__majit_register_impl_fnaddr_{trampoline_ident}");
+    let rows = path_names.iter().map(|path_name| {
+        quote! {
+            ::majit_ir::helper_fnaddr::register_impl_method(
+                ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
+                addr,
+                #arity,
+                ::core::any::type_name::<Self>(),
+            );
+        }
+    });
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case, dead_code)]
+        #[unsafe(export_name = #export_name)]
+        extern "C" fn #register_ident() {
+            let addr = {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    unsafe extern "C" {
+                        #[link_name = #trampoline_export]
+                        fn __majit_impl_trampoline_import(#(#import_params),*) #import_ret;
+                    }
+                    __majit_impl_trampoline_import as *const ()
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Self::#trampoline_ident as *const ()
+                }
+            };
+            #(#rows)*
+        }
+    }
+}
+
+/// Function-local constructor that publishes the associated register fn
+/// on native targets.
+///
+/// The static cannot name `Self`; it calls the unmangled associated
+/// function emitted by [`emit_impl_helper_fnaddr_register_fn`]. Wasm32
+/// uses [`emit_impl_helper_fnaddr_wasm_ctor`] as a sibling impl item:
+/// a nested `#[ctor]` inside the trampoline is unused and dropped, so
+/// `register_impl_method` never ran and merge left the cross-crate table
+/// slot in place.
+fn emit_impl_helper_fnaddr_ctor(
+    trampoline_ident: &Ident,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let export_name = impl_fnaddr_export_name(trampoline_ident, span);
+    quote! {
+        {
+            unsafe extern "C" {
+                #[link_name = #export_name]
+                fn __majit_impl_fnaddr_register();
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                #[used]
+                #[cfg_attr(
+                    target_vendor = "apple",
+                    unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+                )]
+                #[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
+                #[cfg_attr(
+                    not(any(target_vendor = "apple", target_os = "windows")),
+                    unsafe(link_section = ".init_array")
+                )]
+                #[allow(non_upper_case_globals, unused)]
+                static __MAJIT_IMPL_FNADDR_INIT: unsafe extern "C" fn() =
+                    __majit_impl_fnaddr_register;
+            }
+        }
+    }
+}
+
+/// Sibling impl-item constructor that publishes the associated register
+/// fn on wasm32.
+///
+/// Free-function trampolines already emit `#[ctor]` next to the function
+/// (`emit_helper_fnaddr_ctor`). Inherent `&self` trampolines live in an
+/// `impl`, so this item sits next to [`emit_impl_helper_fnaddr_register_fn`]
+/// rather than inside the trampoline body.
+fn emit_impl_helper_fnaddr_wasm_ctor(
+    trampoline_ident: &Ident,
+    span: proc_macro2::Span,
+) -> proc_macro2::TokenStream {
+    let export_name = impl_fnaddr_export_name(trampoline_ident, span);
+    let ctor_ident = format_ident!("__majit_impl_fnaddr_ctor_{trampoline_ident}");
+    quote! {
+        #[cfg(target_arch = "wasm32")]
+        #[::ctor::ctor(unsafe)]
+        #[doc(hidden)]
+        #[allow(non_snake_case, dead_code)]
+        fn #ctor_ident() {
+            unsafe extern "C" {
+                #[link_name = #export_name]
+                fn __majit_impl_fnaddr_register();
+            }
+            unsafe {
+                __majit_impl_fnaddr_register();
+            }
+        }
+    }
 }
 
 fn emit_prebuilt_class_static_registration(name: &Ident) -> proc_macro2::TokenStream {
@@ -1619,8 +1842,9 @@ pub fn prebuilt_static(_attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { #loaded as i64 }
         };
-        let registration = emit_helper_fnaddr_registration(name, &getter, 0);
-        let ctor = emit_helper_fnaddr_ctor(name, &getter, 0);
+        let getter_ptr = trampoline_fn_ptr(&getter, false);
+        let registration = emit_helper_fnaddr_registration(name, &getter_ptr, 0);
+        let ctor = emit_helper_fnaddr_ctor(name, &getter_ptr, 0);
         return quote! {
             #item
             #[doc(hidden)]
@@ -1673,6 +1897,12 @@ fn helper_return_to_i64(
             }
         });
     }
+    if is_version_tag_type(ty) {
+        return Some(quote! {{
+            let __majit_tag: #ty = #value;
+            __majit_tag.0 as i64
+        }});
+    }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
         "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "u64" | "usize" | "bool" => {
@@ -1719,16 +1949,27 @@ fn emit_helper_call_target_fn(
 
     let trace_target_name = helper_call_target_fn_name(&Path::from(func.sig.ident.clone()))?;
     let concrete_target_name = format_ident!("{}_concrete", trace_target_name);
+    let in_impl = helper_has_shared_ref_receiver(func);
     let mut wrapper_params = Vec::new();
     let mut converted_args = Vec::new();
     let mut fnaddr_params = Vec::new();
     let mut fnaddr_args = Vec::new();
     let mut has_float_arg = false;
     for (index, arg) in func.sig.inputs.iter().enumerate() {
+        let arg_ident = format_ident!("__majit_arg_{index}");
+        if let FnArg::Receiver(recv) = arg {
+            let Some(converted) = helper_arg_from_i64(&arg_ident, &recv.ty) else {
+                return Ok(None);
+            };
+            wrapper_params.push(quote! { #arg_ident: i64 });
+            converted_args.push(converted.clone());
+            fnaddr_params.push(quote! { #arg_ident: i64 });
+            fnaddr_args.push(converted);
+            continue;
+        }
         let syn::FnArg::Typed(pat_type) = arg else {
             return Ok(None);
         };
-        let arg_ident = format_ident!("__majit_arg_{index}");
         if let Some((item_ty, is_mut)) = pair_slice_param(&pat_type.ty) {
             let len_ident = format_ident!("__majit_arg_{index}_len");
             wrapper_params.push(quote! { #arg_ident: i64 });
@@ -1780,16 +2021,24 @@ fn emit_helper_call_target_fn(
     };
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
-    // `unsafe` wrapper there would be an unused-unsafe warning).
-    let mut call_expr = if func.sig.unsafety.is_some() {
-        quote! { unsafe { #helper_name(#(#converted_args),*) } }
+    // `unsafe` wrapper there would be an unused-unsafe warning). A `&self`
+    // method is called through UFCS so the trampoline can live in the impl
+    // (`Self` names the receiver type). `rlib/jit.py elidable_promote` passes
+    // `self` as the first ordinary argument.
+    let call_target = if in_impl {
+        quote! { Self::#helper_name }
     } else {
-        quote! { #helper_name(#(#converted_args),*) }
+        quote! { #helper_name }
+    };
+    let mut call_expr = if func.sig.unsafety.is_some() {
+        quote! { unsafe { #call_target(#(#converted_args),*) } }
+    } else {
+        quote! { #call_target(#(#converted_args),*) }
     };
     let mut fnaddr_call_expr = if func.sig.unsafety.is_some() {
-        quote! { unsafe { #helper_name(#(#fnaddr_args),*) } }
+        quote! { unsafe { #call_target(#(#fnaddr_args),*) } }
     } else {
-        quote! { #helper_name(#(#fnaddr_args),*) }
+        quote! { #call_target(#(#fnaddr_args),*) }
     };
     let result_payload = result_exc_payload(&func.sig.output);
     let return_kind = if let Some(ok_ty) = result_payload {
@@ -1809,8 +2058,12 @@ fn emit_helper_call_target_fn(
         fnaddr_call_expr = fnaddr_wrapped;
     }
     let arity = helper_abi_words(&func.sig.inputs);
-    let shim_registration = if register_fnaddr && !has_float_arg {
-        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_target_name, arity)
+    let trace_ptr = trampoline_fn_ptr(&trace_target_name, in_impl);
+    let method_span = func.sig.ident.span();
+    let shim_registration = if register_fnaddr && !has_float_arg && !in_impl {
+        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_ptr, arity)
+    } else if register_fnaddr && !has_float_arg && in_impl {
+        emit_impl_helper_fnaddr_ctor(&trace_target_name, method_span)
     } else {
         quote! {}
     };
@@ -1821,10 +2074,17 @@ fn emit_helper_call_target_fn(
     let empty_generics = syn::Generics::default();
     let trace_identity = icf_identity_tokens(&trace_target_name, &empty_generics);
     let concrete_identity = icf_identity_tokens(&concrete_target_name, &empty_generics);
+    let fn_export_attr = if register_fnaddr && in_impl && !has_float_arg {
+        let export = impl_trampoline_export_name(&trace_target_name, method_span);
+        quote! { #[unsafe(export_name = #export)] }
+    } else {
+        quote! {}
+    };
     let wrapper = match return_kind {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
             #[allow(non_snake_case)]
+            #fn_export_attr
             #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) {
                 #shim_registration
                 #trace_identity
@@ -1846,6 +2106,7 @@ fn emit_helper_call_target_fn(
             quote! {
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
+                #fn_export_attr
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
                     #shim_registration
                     #trace_identity
@@ -1860,6 +2121,7 @@ fn emit_helper_call_target_fn(
             let float_wrapper = quote! {
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
+                #fn_export_attr
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
                     #shim_registration
                     #trace_identity
@@ -1885,16 +2147,26 @@ fn emit_helper_call_target_fn(
         HelperCallKind::Unsupported => return Ok(None),
     };
 
+    let fnaddr_name = format_ident!("__majit_fnaddr_target_{helper_name}");
     let registered = if register_fnaddr && has_float_arg {
-        let fnaddr_name = format_ident!("__majit_fnaddr_target_{helper_name}");
-        let registration =
-            emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_name, arity);
-        let ctor = emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_name, arity);
+        let fnaddr_ptr = trampoline_fn_ptr(&fnaddr_name, in_impl);
         let fnaddr_identity = icf_identity_tokens(&fnaddr_name, &empty_generics);
+        let fnaddr_export_attr = if in_impl {
+            let export = impl_trampoline_export_name(&fnaddr_name, method_span);
+            quote! { #[unsafe(export_name = #export)] }
+        } else {
+            quote! {}
+        };
+        let registration = if in_impl {
+            emit_impl_helper_fnaddr_ctor(&fnaddr_name, method_span)
+        } else {
+            emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_ptr, arity)
+        };
         let float_abi = match return_kind {
             HelperCallKind::Void => quote! {
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
+                #fnaddr_export_attr
                 #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) {
                     #registration
                     #fnaddr_identity
@@ -1904,6 +2176,7 @@ fn emit_helper_call_target_fn(
             HelperCallKind::Float => quote! {
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
+                #fnaddr_export_attr
                 #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) -> f64 {
                     #registration
                     #fnaddr_identity
@@ -1925,6 +2198,7 @@ fn emit_helper_call_target_fn(
                 quote! {
                     #[doc(hidden)]
                     #[allow(non_snake_case)]
+                    #fnaddr_export_attr
                     #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) -> i64 {
                         #registration
                         #fnaddr_identity
@@ -1934,12 +2208,17 @@ fn emit_helper_call_target_fn(
             }
             HelperCallKind::Unsupported => return Ok(None),
         };
+        let sibling = if in_impl {
+            quote! {}
+        } else {
+            emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_ptr, arity)
+        };
         quote! {
             #float_abi
-            #ctor
+            #sibling
         }
-    } else if register_fnaddr {
-        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trace_target_name, arity)
+    } else if register_fnaddr && !in_impl {
+        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trace_ptr, arity)
     } else {
         quote! {}
     };
@@ -1991,10 +2270,40 @@ fn emit_helper_call_target_fn(
         (trace_target_name.clone(), quote! {})
     };
 
+    let import_ret = match return_kind {
+        HelperCallKind::Void => quote! {},
+        HelperCallKind::Float => quote! { -> f64 },
+        HelperCallKind::Int | HelperCallKind::Ref => quote! { -> i64 },
+        HelperCallKind::Unsupported => return Ok(None),
+    };
+    let impl_registration = if register_fnaddr && in_impl {
+        let published_ident = if has_float_arg {
+            &fnaddr_name
+        } else {
+            &trace_target_name
+        };
+        let register_fn = emit_impl_helper_fnaddr_register_fn(
+            &fnaddr_path_names,
+            published_ident,
+            &fnaddr_params,
+            &import_ret,
+            arity,
+            method_span,
+        );
+        let wasm_ctor = emit_impl_helper_fnaddr_wasm_ctor(published_ident, method_span);
+        quote! {
+            #register_fn
+            #wasm_ctor
+        }
+    } else {
+        quote! {}
+    };
+
     let wrapper = quote! {
         #wrapper
         #registered
         #native_abi
+        #impl_registration
     };
 
     let concrete_name = if matches!(return_kind, HelperCallKind::Float) {
@@ -2020,8 +2329,11 @@ fn helper_policy_tokens_for_fn(
     else {
         return Ok(unsupported);
     };
-    let trace_addr = quote! { #trace_target_name as *const () };
-    let concrete_addr = quote! { #concrete_target_name as *const () };
+    // Sibling associated fns name the trampoline through `Self::` — a bare
+    // ident is not in scope inside the impl (`E0425`).
+    let in_impl = helper_has_shared_ref_receiver(func);
+    let trace_addr = trampoline_fn_ptr(trace_target_name, in_impl);
+    let concrete_addr = trampoline_fn_ptr(concrete_target_name, in_impl);
     // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
@@ -3438,9 +3750,11 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .filter_map(|&idx| {
             if has_self && idx == 0 {
-                // rlib/jit.py — promote self by identity (guard_value on pointer)
+                // rlib/jit.py — promote self by identity (`r_guard_value` on a
+                // GC instance pointer). `as usize` records `cast_ptr_to_int`
+                // on every call (`celldict.py getdictvalue_no_unwrapping`).
                 Some(quote! {
-                    let _ = majit_ir::jit::promote(self as *const _ as usize);
+                    let _ = majit_ir::jit::promote(self as *const _);
                 })
             } else {
                 let named_idx = if has_self { idx - 1 } else { idx };
@@ -4002,6 +4316,25 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
             Ok(None) => None,
             Err(err) => return err.to_compile_error(),
         };
+    // The `@dont_look_inside` trampoline is a different graph
+    // (`call.py CallControl.get_jitcode` keys by graph). Residual CALL
+    // of `{name}_trampoline` (wrapper else-branch, or a specialized
+    // residual when the predicate is false) needs its own adapter.
+    // Aliasing that name onto the wrapper re-enters the iff dispatch.
+    let mut trampoline_func = func.clone();
+    trampoline_func.sig.ident = trampoline_name.clone();
+    let trampoline_call_target_fn = match emit_helper_call_target_fn(
+        &trampoline_func,
+        true,
+        None,
+        "look_inside_iff",
+        &[],
+        false,
+    ) {
+        Ok(Some((_, _, tokens))) => Some(tokens),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error(),
+    };
 
     quote! {
         // rlib/jit.py — func = unroll_safe(func)
@@ -4051,6 +4384,7 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
         }
 
         #call_target_fn
+        #trampoline_call_target_fn
     }
 }
 
@@ -5176,9 +5510,20 @@ mod tests {
             ),
             Some(HelperFnAddrSkip::ResultReturn)
         );
+        assert_eq!(skip("fn f(&self, x: i64) -> i64 { x }"), None);
         assert_eq!(
-            skip("fn f(&self, x: i64) -> i64 { x }"),
+            skip("fn f(&mut self, x: i64) -> i64 { x }"),
             Some(HelperFnAddrSkip::MethodReceiver)
+        );
+        assert_eq!(
+            skip("fn f(self, x: i64) -> i64 { x }"),
+            Some(HelperFnAddrSkip::MethodReceiver)
+        );
+        assert_eq!(
+            skip(
+                "fn f(&self, v: VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }"
+            ),
+            None
         );
         assert_eq!(
             skip("fn f(x: String) -> i64 { 0 }"),
@@ -5203,6 +5548,53 @@ mod tests {
         assert_eq!(
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
+        );
+    }
+
+    #[test]
+    fn look_inside_iff_trampoline_emits_its_own_word_abi_adapter() {
+        let func = parse_fn(
+            "fn store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) -> bool { true }",
+        );
+        assert_eq!(trampoline_skip_reason(&func, "look_inside_iff", &[]), None);
+        let (_, _, wrapper_tokens) =
+            emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], false)
+                .expect("emit wrapper")
+                .expect("wrapper adapter");
+        let wrapper_text = wrapper_tokens.to_string();
+        assert!(
+            wrapper_text.contains("fn __majit_call_target_store ("),
+            "{wrapper_text}"
+        );
+        assert!(
+            wrapper_text.contains("stringify ! (store)"),
+            "{wrapper_text}"
+        );
+
+        let mut trampoline = func.clone();
+        trampoline.sig.ident = format_ident!("store_trampoline");
+        let (_, _, tramp_tokens) =
+            emit_helper_call_target_fn(&trampoline, true, None, "look_inside_iff", &[], false)
+                .expect("emit trampoline")
+                .expect("trampoline adapter");
+        let tramp_text = tramp_tokens.to_string();
+        assert!(
+            tramp_text.contains(
+                "fn __majit_call_target_store_trampoline (__majit_arg_0 : i64 , __majit_arg_1 : i64 , __majit_arg_2 : i64)"
+            ),
+            "{tramp_text}"
+        );
+        assert!(
+            tramp_text.contains("store_trampoline ("),
+            "adapter must call the trampoline graph, got {tramp_text}"
+        );
+        assert!(
+            tramp_text.contains("stringify ! (store_trampoline)"),
+            "HELPER_FNADDRS path must be the trampoline name, got {tramp_text}"
+        );
+        assert!(
+            !wrapper_text.contains("stringify ! (store_trampoline)"),
+            "wrapper adapter must not publish the trampoline name, got {wrapper_text}"
         );
     }
 
@@ -5367,6 +5759,116 @@ mod tests {
         );
         assert!(text.contains("stringify ! (leaf)"), "{text}");
     }
+
+    #[test]
+    fn shared_self_receiver_emits_one_word_trampoline() {
+        let func = parse_fn(
+            "fn _orig_leaf_unlikely_name(&self, v: VersionTag, o: PyObjectRef, k: &str) -> Option<PyObjectRef> { None }",
+        );
+        assert_eq!(trampoline_skip_reason(&func, "elidable", &[]), None);
+        let wrapper: Ident = syn::parse_str("leaf").unwrap();
+        let (trace_name, concrete_name, tokens) =
+            emit_helper_call_target_fn(&func, true, Some(&wrapper), "elidable", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target__orig_leaf_unlikely_name (__majit_arg_0 : i64 , __majit_arg_1 : i64 , __majit_arg_2 : i64 , __majit_arg_3 : i64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("* const Self"), "{text}");
+        assert!(text.contains("Self :: _orig_leaf_unlikely_name"), "{text}");
+        assert!(
+            text.contains("VersionTag ((__majit_arg_1) as u64)"),
+            "{text}"
+        );
+        assert!(text.contains("register_impl_method"), "{text}");
+        assert!(text.contains("type_name"), "{text}");
+        assert!(text.contains("export_name"), "{text}");
+        assert!(text.contains("link_name"), "{text}");
+        assert!(text.contains("__MAJIT_IMPL_FNADDR__"), "{text}");
+        assert!(
+            text.contains("__MAJIT_IMPL_TRAMPOLINE__"),
+            "wasm32 must export the trampoline and take that export's address: {text}"
+        );
+        assert!(
+            text.contains("__majit_impl_trampoline_import"),
+            "wasm32 capture must go through the trampoline export, not Self::trampoline: {text}"
+        );
+        assert!(
+            text.contains("line ! ()"),
+            "export names must include line!() at the method span: {text}"
+        );
+        assert!(
+            text.contains("column ! ()"),
+            "export names must include column!() at the method span: {text}"
+        );
+        assert!(text.contains(":: ctor ::"), "{text}");
+        assert!(
+            text.contains("fn __majit_impl_fnaddr_ctor_"),
+            "wasm32 ctor must be an impl item, not a nested function: {text}"
+        );
+        let policy =
+            helper_policy_tokens_for_fn(&func, "elidable", Some(&trace_name), Some(&concrete_name))
+                .expect("policy");
+        let policy_text = policy.to_string();
+        assert!(
+            policy_text
+                .contains("Self :: __majit_call_target__orig_leaf_unlikely_name as * const ()"),
+            "{policy_text}"
+        );
+    }
+
+    #[test]
+    fn float_returning_impl_method_exports_f64_wasm_import() {
+        let func = parse_fn("fn value(&self) -> f64 { 0.0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("fn __majit_call_target_value (__majit_arg_0 : i64) -> f64"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fn __majit_impl_trampoline_import (__majit_arg_0 : i64) -> f64"),
+            "wasm import must match the f64 trampoline: {text}"
+        );
+        assert!(text.contains("export_name"), "{text}");
+        assert!(text.contains("register_impl_method"), "{text}");
+        assert!(text.contains("line ! ()"), "{text}");
+        assert!(text.contains("column ! ()"), "{text}");
+    }
+
+    #[test]
+    fn float_argument_impl_method_publishes_declaration_order_abi() {
+        let func = parse_fn("fn value(&self, x: f64) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_fnaddr_target_value (__majit_arg_0 : i64 , __majit_arg_1 : f64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "fn __majit_impl_trampoline_import (__majit_arg_0 : i64 , __majit_arg_1 : f64) -> i64"
+            ),
+            "wasm import must match the float-ABI trampoline: {text}"
+        );
+        assert!(text.contains("register_impl_method"), "{text}");
+        assert!(text.contains("export_name"), "{text}");
+        assert!(text.contains("line ! ()"), "{text}");
+        assert!(text.contains("column ! ()"), "{text}");
+    }
+
     fn specialize_argtype_tokens(attr: &str, src: &str) -> proc_macro2::TokenStream {
         let args: SpecializeArgtypeArgs = syn::parse_str(attr).expect("indices parse");
         expand_specialize_argtype(&args.indices, &parse_fn(src))

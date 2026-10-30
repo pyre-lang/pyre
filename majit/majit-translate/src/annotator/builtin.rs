@@ -2160,9 +2160,30 @@ fn cast_instance_intrinsic(
             SomeValue::Instance(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
+            | SomeValue::RustVec(_)
             | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for list root {root:?}: {other:?}"
+            ))),
+        };
+    }
+    // A `Vec` of one-word items is `SomeRustVec` (`project_rust_vec`),
+    // not `SomeList`. The unique-graph of `gc_alloc_young_storage_box`
+    // (`specialize:argtype(0)`) seeds that dest as RustVec; a list /
+    // GCREF operand that fell through to the pin_root List pass-through
+    // below returned List and `mergeinputargs` then saw List ∪ RustVec.
+    // Recast to the dest annotation the way the List / Tuple / Dict
+    // arms already recast a pointer-shaped operand.
+    if matches!(&projected, SomeValue::RustVec(_)) {
+        return match operand {
+            SomeValue::RustVec(_) => Ok(operand.clone()),
+            SomeValue::Instance(_)
+            | SomeValue::Ptr(_)
+            | SomeValue::Address(_)
+            | SomeValue::List(_)
+            | SomeValue::None_(_) => Ok(projected),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-pointer operand for rust-vec root {root:?}: {other:?}"
             ))),
         };
     }
@@ -2806,6 +2827,26 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
     SomeValue::Ptr(SomePtr::new(*ptr_ty))
 }
 
+/// `Ptr(STR)` / `rpy_string` — the dest of `cast_int_to_ptr` that is
+/// the string itself (`front/mir/lltype.rs` `node_is_string_value`).
+fn lltype_ptr_is_str(ll: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    if ll == &*STRPTR {
+        return true;
+    }
+    let LowLevelType::Ptr(ptr_ty) = ll else {
+        return false;
+    };
+    match &ptr_ty.TO {
+        PtrTarget::Struct(st) => st._name == "rpy_string",
+        PtrTarget::ForwardReference(fwd) => fwd.resolved().is_some_and(
+            |inner| matches!(inner, LowLevelType::Struct(st) if st._name == "rpy_string"),
+        ),
+        _ => false,
+    }
+}
+
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
 /// (rpython/rtyper/lltypesystem/lltype.py).
 ///
@@ -2845,6 +2886,13 @@ fn lltype_cast_int_to_ptr(
                 "ann_cast_int_to_ptr: PtrT.const is not a Ptr",
             ));
         };
+        // `ann_cast_int_to_ptr` of `Ptr(STR)` is the string itself
+        // (`front/mir/lltype.rs` `node_is_string_value`). The 1-arg
+        // form still has no concrete Ptr and keeps the Gc-Opaque
+        // placeholder below.
+        if lltype_ptr_is_str(ll.as_ref()) {
+            return Ok(SomeValue::String(SomeString::new(false, false)));
+        }
         return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
     }
     let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
@@ -5256,6 +5304,69 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_gcref_or_list_to_one_word_vec_is_somerustvec() {
+        // Unique-graph of `gc_alloc_young_storage_box::<Vec<*mut PyObject>>`
+        // seeds arg 0 as SomeRustVec. A GCREF / list operand recast to
+        // that dest must answer SomeRustVec so mergeinputargs does not
+        // see List ∪ RustVec.
+        let bk = bk();
+        let s_gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("Vec<*mut PyObject>"))
+            .expect("one-word Vec root constant");
+        let from_gcref = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_gcref), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("GCREF to Vec<*mut PyObject> must annotate");
+        assert!(
+            matches!(from_gcref, SomeValue::RustVec(_)),
+            "GCREF dest Vec<*mut PyObject> is SomeRustVec, got {from_gcref:?}"
+        );
+
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            super::super::model::s_none(),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(super::super::model::SomeList::new(listdef));
+        let from_list = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("list operand recast to one-word Vec must annotate");
+        assert!(
+            matches!(from_list, SomeValue::RustVec(_)),
+            "list dest Vec<*mut PyObject> is SomeRustVec, got {from_list:?}"
+        );
+
+        let s_vec = SomeValue::RustVec(super::super::model::SomeRustVec::for_kind(
+            majit_ir::rvec::VecItemKind::Ref,
+        ));
+        let s_slice = bk
+            .immutablevalue(&ConstValue::byte_str("&[PyObjectRef]"))
+            .expect("object-ref slice root constant");
+        let to_slice = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_vec), Some(s_slice)],
+            &no_kwds(),
+        )
+        .expect("one-word Vec recast to &[PyObjectRef] must annotate");
+        assert!(
+            matches!(to_slice, SomeValue::List(_)),
+            "RustVec dest &[PyObjectRef] is SomeList, got {to_slice:?}"
+        );
+    }
+
+    #[test]
     fn cast_instance_intrinsic_dyn_fat_tuple_operand_uses_data_word() {
         // Residual `&dyn Trait` / `Box<dyn Trait>` is
         // `dyn_fat_field_annotation` SomeTuple. The cast dest is a
@@ -6370,6 +6481,25 @@ mod tests {
         let added = lltype_direct_ptradd(&bk(), &[Some(out.clone()), Some(s_n)], &no_kwds())
             .expect("ann_direct_ptradd of CArrayPtr");
         assert_eq!(added, out);
+    }
+
+    #[test]
+    fn ann_cast_int_to_ptr_two_arg_strptr_is_somestring() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
+        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            (*STRPTR).clone(),
+        ))));
+        assert!(s_ptrt.is_constant());
+        let s_int = SomeValue::Integer(super::super::model::SomeInteger::default());
+        let out = lltype_cast_int_to_ptr(&bk(), &[Some(s_ptrt), Some(s_int)], &no_kwds())
+            .expect("ann_cast_int_to_ptr of Ptr(STR) is SomeString");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "Ptr(STR) is the string itself, got {out:?}"
+        );
     }
 
     #[test]

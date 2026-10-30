@@ -1233,18 +1233,21 @@ fn projected_contains_list(value: &SomeValue) -> bool {
     }
 }
 
-/// `FixedObjectArray._items` is the flexible object array (`rlist.py`
-/// `l.items`). `ItemsBlock` keeps its `capacity` field, so it stays a
-/// struct: projecting it to the item list makes `getattr("capacity")` miss.
-fn fixed_object_array_items_field(canonical: &str) -> Option<&'static str> {
-    let leaf = canonical
-        .rsplit("::")
-        .next()
-        .unwrap_or(canonical)
-        .split('<')
-        .next()
-        .unwrap_or(canonical);
-    (leaf == "FixedObjectArray").then_some("_items")
+/// Last declared field when it is a flexible array (`[T; 0]` /
+/// `Array<T; 0>`), the `GcStruct._arrayfld` fact (`lltype.py`). The
+/// field *name* is whatever the declaration wrote; a renamed struct
+/// with the same tail shape answers the same way, and a same-leaf
+/// struct whose last field is not a flexible array does not.
+pub(super) fn flexible_gcarray_items_field(
+    reg: &crate::front::StructFieldRegistry,
+    owner: &str,
+) -> Option<(String, String)> {
+    let rows = reg.field_rows(owner)?;
+    let last = rows.last()?;
+    let (_, 0) = crate::front::mir::shaped_array_parts(&last.ty)? else {
+        return None;
+    };
+    Some((last.name.clone(), last.ty.clone()))
 }
 
 impl Bookkeeper {
@@ -1619,6 +1622,21 @@ impl Bookkeeper {
     /// second call overwrites the previous map.
     pub fn set_enum_variant_by_discriminant(&self, map: Rc<HashMap<String, HashMap<i64, String>>>) {
         *self.enum_variant_by_discriminant.borrow_mut() = Some(map);
+    }
+
+    /// True when `ty` is a harvested enum whose TypeDecl has zero
+    /// variants (`enum Infallible {}`). Lookup is the exact registered
+    /// key (qualified path, crate-stripped path, or the dual-published
+    /// leaf): a same-leaf enum with variants, or a struct that merely
+    /// shares the leaf, does not match.
+    fn enum_decl_has_zero_variants(&self, ty: &str) -> bool {
+        let t = majit_ir::descr::strip_generic_args(ty.trim());
+        let t = t.as_ref();
+        let guard = self.enum_variant_by_discriminant.borrow();
+        let Some(map) = guard.as_ref() else {
+            return false;
+        };
+        map.get(t).is_some_and(HashMap::is_empty)
     }
 
     /// TODO: no upstream equivalent.  Wire the trait →
@@ -4393,9 +4411,31 @@ impl Bookkeeper {
                 }
             }
         }
-        if let Some(inner) = strip_generic_one(stripped, "Result<") {
+        if let Some(inner) = {
+            let leaf = majit_ir::descr::class_root_leaf(stripped);
+            strip_generic_one(leaf, "Result<")
+        } {
             let parts = split_generic_args(inner);
             if parts.len() == 2 {
+                // `Try::branch` on `Result<T, E>` returns
+                // `ControlFlow<Result<Infallible, E>, T>`. Charon spells
+                // that uninhabited Ok as `Never` / `??scalar`. `impossible
+                // ∪ E = E` (`model.py`) would FORCE `ControlFlow::Break.__pos_0`
+                // as `E`, then setattr of the translator's `Result::Err`
+                // instance fails (`lower_result_branch_as_match` / `enum_site`
+                // keep the Result kind). Project the Result class, matching
+                // Option's tagged-enum fallback.
+                if is_uninhabited_ok_spelling(parts[0], self) {
+                    let root = majit_ir::descr::canonical_struct_name(stripped);
+                    return match self.getuniqueclassdef_for_struct_root(&root) {
+                        Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
+                            Some(classdef),
+                            false,
+                            std::collections::BTreeMap::new(),
+                        )),
+                        Err(_) => SomeValue::Impossible,
+                    };
+                }
                 let s_ok = self.project_struct_field_type(parts[0]);
                 let s_err = self.project_struct_field_type(parts[1]);
                 return super::model::unionof([&s_ok, &s_err]).unwrap_or(SomeValue::Impossible);
@@ -4476,33 +4516,32 @@ impl Bookkeeper {
                 return self.project_struct_field_type(parts[1]);
             }
         }
-        // `FixedObjectArray { len: usize, _items: [PyObjectRef; 0] }` is a
-        // flexible object array.  An `arr[idx]` access lowers (front-end
-        // ArrayRead -> flowspace `getitem`) onto the receiver, so the
-        // receiver must model as the element list — not the wrapping
-        // struct, whose `getitem` over `SomeInstance(None)` would rewrite
-        // to `getattr("__getitem__")` and dead-end.  The list identity is
-        // `ClassDef.attrs["_items"].s_value` (`Attribute.s_value`); two
+        // A `GcStruct` whose last field is an `Array` (`lltype.py`
+        // `_arrayfld`) is the variable-sized array itself: `rlist.py`
+        // `l.items`, `rordereddict.py` `DICTENTRYARRAY = GcArray(DICTENTRY)`.
+        // An `arr[idx]` access lowers (front-end ArrayRead -> flowspace
+        // `getitem`) onto the receiver, so the receiver must model as the
+        // element list — not the wrapping struct, whose `getitem` over
+        // `SomeInstance` would rewrite to `getattr("__getitem__")` and
+        // dead-end (`getitem_SomeInstance`). The list identity is
+        // `ClassDef.attrs[items_field].s_value` (`Attribute.s_value`); two
         // projections of this field share that attribute rather than
-        // minting a second `ListDef`.
-        let canonical_stripped = majit_ir::descr::canonical_struct_name(stripped);
-        let items_field = fixed_object_array_items_field(&canonical_stripped);
-        if let Some(items_field) = items_field {
-            let items_ty = self
-                .struct_fields
-                .borrow()
-                .as_ref()
-                .and_then(|reg| reg.field_type(stripped, items_field).map(str::to_string));
-            if let Some(items_ty) = items_ty {
-                if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(stripped)
-                    && let Some(s_items) =
-                        super::classdesc::ClassDef::about_attribute(&classdef, "_items")
-                    && matches!(s_items, SomeValue::List(_))
-                {
-                    return s_items;
-                }
-                return self.project_struct_field_type(&items_ty);
+        // minting a second `ListDef`. The tail field is read from the
+        // declared rows, not from an owner-leaf allowlist.
+        let items_field = self
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .and_then(|reg| flexible_gcarray_items_field(reg, stripped));
+        if let Some((items_field, items_ty)) = items_field {
+            if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(stripped)
+                && let Some(s_items) =
+                    super::classdesc::ClassDef::about_attribute(&classdef, &items_field)
+                && matches!(s_items, SomeValue::List(_))
+            {
+                return s_items;
             }
+            return self.project_struct_field_type(&items_ty);
         }
         // Named generic structs in Charon's registry are stored under their
         // declaration template (`CodeObject`), while a concrete field row can
@@ -5811,6 +5850,20 @@ fn collect_referenced_struct_names(
     if reg.fields.contains_key(stripped) {
         out.push(stripped.to_string());
     }
+}
+
+/// Ok-type of the `Try::branch` residual `Result<Infallible, E>`.
+/// `!` / `Never` / `??scalar` are Charon Never *type-kind* spellings
+/// (`result_exc::is_uninhabited_ok`). A user enum is uninhabited when
+/// its declaration has zero variants (`enum Infallible {}`), not when
+/// its leaf happens to be `Infallible`.
+pub(super) fn is_uninhabited_ok_spelling(ty: &str, bk: &Bookkeeper) -> bool {
+    let t = ty.trim();
+    let leaf = t.rsplit("::").next().unwrap_or(t);
+    if matches!(leaf, "!" | "Never" | "??scalar") {
+        return true;
+    }
+    bk.enum_decl_has_zero_variants(t)
 }
 
 /// Whether a field-type spelling names a sum type that
@@ -7454,6 +7507,261 @@ mod tests {
     }
 
     #[test]
+    fn project_struct_field_type_infallible_result_is_result_class() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "error::PyError".to_string(),
+            vec![("kind".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let mut enums: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        enums.insert("Infallible".to_string(), HashMap::new());
+        enums.insert("core::convert::Infallible".to_string(), HashMap::new());
+        enums.insert("convert::Infallible".to_string(), HashMap::new());
+        bk.set_enum_variant_by_discriminant(Rc::new(enums));
+
+        for spelling in [
+            "Result<??scalar, error::PyError>",
+            "Result<Never, error::PyError>",
+            "Result<Infallible, error::PyError>",
+            "result::Result<??scalar,error::PyError>",
+            "core::result::Result<core::convert::Infallible, error::PyError>",
+        ] {
+            let projected = bk.project_struct_field_type(spelling);
+            let SomeValue::Instance(inst) = &projected else {
+                panic!("{spelling} must intern the Result class, got {projected:?}");
+            };
+            let name = inst
+                .classdef
+                .as_ref()
+                .expect("Result classdef")
+                .borrow()
+                .name
+                .clone();
+            let leaf = majit_ir::descr::class_root_leaf(&name);
+            assert!(
+                leaf.starts_with("Result"),
+                "{spelling} intern's Result, got {name}"
+            );
+        }
+
+        let peeled = bk.project_struct_field_type("Result<error::PyError, error::PyError>");
+        let SomeValue::Instance(inst) = &peeled else {
+            panic!("inhabited Result still unions payloads, got {peeled:?}");
+        };
+        let name = inst
+            .classdef
+            .as_ref()
+            .expect("PyError classdef")
+            .borrow()
+            .name
+            .clone();
+        assert!(
+            majit_ir::descr::class_root_leaf(&name).ends_with("PyError"),
+            "inhabited Result<E, E> stays the payload class, got {name}"
+        );
+    }
+
+    #[test]
+    fn uninhabited_ok_is_zero_variant_enum_not_the_infallible_leaf() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "error::PyError".to_string(),
+            vec![("kind".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut enums: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        enums.insert("Void".to_string(), HashMap::new());
+        enums.insert("mymod::Void".to_string(), HashMap::new());
+        let mut inhabited = HashMap::new();
+        inhabited.insert(0i64, "Something".to_string());
+        enums.insert("Infallible".to_string(), inhabited.clone());
+        enums.insert("mymod::Infallible".to_string(), inhabited);
+        bk.set_enum_variant_by_discriminant(Rc::new(enums));
+
+        assert!(
+            is_uninhabited_ok_spelling("Void", &bk),
+            "a renamed zero-variant enum is uninhabited"
+        );
+        assert!(
+            is_uninhabited_ok_spelling("mymod::Void", &bk),
+            "the qualified zero-variant enum is uninhabited"
+        );
+        assert!(
+            !is_uninhabited_ok_spelling("Infallible", &bk),
+            "same leaf with a variant is not the never type"
+        );
+        assert!(
+            !is_uninhabited_ok_spelling("mymod::Infallible", &bk),
+            "a same-leaf inhabited enum is not the never type"
+        );
+        assert!(
+            is_uninhabited_ok_spelling("??scalar", &bk),
+            "Charon Never kind spelling stays uninhabited"
+        );
+
+        let SomeValue::Instance(renamed) =
+            bk.project_struct_field_type("Result<mymod::Void, error::PyError>")
+        else {
+            panic!("Result of a renamed zero-variant Ok must intern the Result class")
+        };
+        let renamed_name = renamed
+            .classdef
+            .as_ref()
+            .expect("Result classdef")
+            .borrow()
+            .name
+            .clone();
+        assert!(
+            majit_ir::descr::class_root_leaf(&renamed_name).starts_with("Result"),
+            "Result<Void, E> intern's Result, got {renamed_name}"
+        );
+
+        let peeled = bk.project_struct_field_type("Result<mymod::Infallible, error::PyError>");
+        match &peeled {
+            SomeValue::Instance(inst) => {
+                let name = inst
+                    .classdef
+                    .as_ref()
+                    .map(|cd| cd.borrow().name.clone())
+                    .unwrap_or_default();
+                assert!(
+                    !majit_ir::descr::class_root_leaf(&name).starts_with("Result"),
+                    "inhabited same-leaf Infallible must not intern the Result class, got {name}"
+                );
+            }
+            SomeValue::Impossible => {}
+            other => panic!("inhabited Result Ok/Err union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_flow_break_infallible_result_payload_is_result_class() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "ControlFlow".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "ControlFlow::Break".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar#0".to_string())],
+        );
+        reg.fields.insert(
+            "ControlFlow<Result<??scalar,error::PyError>,*mut PyObject>::Break".to_string(),
+            vec![(
+                "__pos_0".to_string(),
+                "Result<??scalar,error::PyError>".to_string(),
+            )],
+        );
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "error::PyError".to_string(),
+            vec![("kind".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let cd = bk
+            .getuniqueclassdef_for_enum_variant(
+                "ControlFlow<Result<??scalar,error::PyError>,*mut PyObject>",
+                "Break",
+            )
+            .expect("Break variant");
+        let payload = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("Break.__pos_0")
+            .s_value
+            .clone();
+        let SomeValue::Instance(inst) = payload else {
+            panic!("Break.__pos_0 must be the Result class, got {payload:?}");
+        };
+        let name = inst
+            .classdef
+            .as_ref()
+            .expect("Result classdef")
+            .borrow()
+            .name
+            .clone();
+        assert!(
+            majit_ir::descr::class_root_leaf(&name).starts_with("Result"),
+            "must not peel Result<Never, E> to E, got {name}"
+        );
+    }
+
+    #[test]
+    fn control_flow_break_template_typevar_instantiates_to_result_class() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "ControlFlow".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "ControlFlow::Break".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar#0".to_string())],
+        );
+        reg.fields.insert(
+            "result::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "error::PyError".to_string(),
+            vec![("kind".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let cd = bk
+            .getuniqueclassdef_for_enum_variant(
+                "ControlFlow<Result<??scalar,error::PyError>,*mut PyObject>",
+                "Break",
+            )
+            .expect("Break variant from template");
+        let payload = cd
+            .borrow()
+            .attrs
+            .get("__pos_0")
+            .expect("Break.__pos_0")
+            .s_value
+            .clone();
+        let SomeValue::Instance(inst) = payload else {
+            panic!("template TypeVar must instantiate to Result, got {payload:?}");
+        };
+        let name = inst
+            .classdef
+            .as_ref()
+            .expect("Result classdef")
+            .borrow()
+            .name
+            .clone();
+        assert!(
+            majit_ir::descr::class_root_leaf(&name).starts_with("Result"),
+            "template fallback must not peel to PyError, got {name}"
+        );
+    }
+
+    #[test]
     fn struct_root_alias_and_registered_root_share_one_classdef() {
         use crate::annotator::model::SomeValue;
         use crate::front::StructFieldRegistry;
@@ -7509,6 +7817,128 @@ mod tests {
                 .as_ref()
                 .is_some_and(|classdef| Rc::ptr_eq(classdef, &root_classdef))
         );
+    }
+
+    #[test]
+    fn gc_entries_projects_to_dictentryarray_list() {
+        // `DICTENTRYARRAY = GcArray(DICTENTRY)` (`rordereddict.py`).
+        // `entry_valid` is `entries[i].f_valid`; a SomeInstance receiver
+        // rewrites that index to getattr `__getitem__` and Blocks.
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "rordereddict_entries::GcEntries".to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                (
+                    "items".to_string(),
+                    "[rordereddict_entries::Entry<i64, *mut PyObject>; 0]".to_string(),
+                ),
+            ],
+        );
+        reg.fields.insert(
+            "rordereddict_entries::Entry".to_string(),
+            vec![
+                ("key".to_string(), "i64".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        for spelling in [
+            "GcEntries<i64, *mut PyObject>",
+            "*mut GcEntries<i64, *mut PyObject>",
+            "rordereddict_entries::GcEntries<i64, *mut PyObject>",
+            "*mut rordereddict_entries::GcEntries<i64, *mut PyObject>",
+        ] {
+            let SomeValue::List(_) = bk.project_struct_field_type(spelling) else {
+                panic!("{spelling} must project to the DICTENTRYARRAY list")
+            };
+        }
+
+        let SomeValue::List(_) =
+            bk.project_struct_field_type("*mut rordereddict_entries::GcEntries")
+        else {
+            panic!("registry GcEntries pointer must project to its item list")
+        };
+    }
+
+    #[test]
+    fn flexible_gcarray_items_field_is_the_declared_tail_not_the_leaf() {
+        use crate::front::StructFieldRegistry;
+
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::VarBuf".to_string(),
+            vec![
+                ("count".to_string(), "usize".to_string()),
+                ("payload".to_string(), "[i64; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "GcEntries".to_string(),
+            vec![("flag".to_string(), "bool".to_string())],
+        );
+        reg.fields.insert(
+            "FixedObjectArray".to_string(),
+            vec![("note".to_string(), "i64".to_string())],
+        );
+
+        assert_eq!(
+            flexible_gcarray_items_field(&reg, "storage::VarBuf"),
+            Some(("payload".to_string(), "[i64; 0]".to_string())),
+            "a renamed struct whose last field is [T; 0] is the array"
+        );
+        assert_eq!(
+            flexible_gcarray_items_field(&reg, "GcEntries"),
+            None,
+            "same leaf as DICTENTRYARRAY without a flexible tail is not the array"
+        );
+        assert_eq!(
+            flexible_gcarray_items_field(&reg, "FixedObjectArray"),
+            None,
+            "same leaf as the object array without a flexible tail is not the array"
+        );
+    }
+
+    #[test]
+    fn renamed_flexible_gcarray_projects_to_item_list_same_leaf_does_not() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "storage::VarBuf".to_string(),
+            vec![
+                ("count".to_string(), "usize".to_string()),
+                ("payload".to_string(), "[i64; 0]".to_string()),
+            ],
+        );
+        reg.fields.insert(
+            "GcEntries".to_string(),
+            vec![("flag".to_string(), "bool".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let SomeValue::List(_) = bk.project_struct_field_type("storage::VarBuf") else {
+            panic!("renamed [T; 0] tail struct must project to its item list")
+        };
+        let SomeValue::List(_) = bk.project_struct_field_type("*mut storage::VarBuf") else {
+            panic!("pointer to a renamed [T; 0] tail struct must project to its item list")
+        };
+        match bk.project_struct_field_type("GcEntries") {
+            SomeValue::List(_) => {
+                panic!("same-leaf GcEntries without a flexible tail must not project as a list")
+            }
+            SomeValue::Instance(_) => {}
+            other => panic!("expected the wrapping struct instance, got {other:?}"),
+        }
     }
 
     #[test]

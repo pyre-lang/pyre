@@ -274,6 +274,23 @@ pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of(body, llbc).as_deref() == Some("core::result::Result")
 }
 
+/// True when `owner` names `core::result::Result` after stripping a
+/// trailing `::Ok` / `::Err` and the instantiation suffix. The
+/// crate-stripped `result::Result` spelling `class_identity_spelling`
+/// publishes is the same TypeDecl; `std::result::Result` is the
+/// reexport. A same-leaf user enum (`mymod::Result`) is not.
+pub(crate) fn owner_is_core_result(owner: &str) -> bool {
+    let owner = owner
+        .strip_suffix("::Ok")
+        .or_else(|| owner.strip_suffix("::Err"))
+        .unwrap_or(owner);
+    let base = majit_ir::descr::strip_instantiation_suffix(owner);
+    matches!(
+        base,
+        "core::result::Result" | "std::result::Result" | "result::Result"
+    )
+}
+
 /// The per-instantiation `<…>` suffix for a scoped callee's
 /// `Result<T, PyError>` return type, or `None` when the instantiation is
 /// not Ref-shaped (bool/int payloads stay on the bare `Result::Ok`
@@ -284,14 +301,18 @@ pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
 /// both writers agree on one ClassDef and the `__pos_0` payload no longer
 /// unions across instantiations.  Both the `Ok` and `Err` shells of one
 /// callee share this suffix so the two variants share one base ClassDef.
-pub(crate) fn tyref_result_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+pub(crate) fn tyref_result_instantiation_suffix(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let adt = body.get("Adt")?.as_object()?;
-    crate::front::mir::adt_head_instantiation_suffix(adt, llbc)
+    crate::front::mir::adt_head_instantiation_suffix(adt, llbc, tombstoned)
 }
 
 /// True when `ty` is `Result<(), PyError>` — the Ok payload is the unit

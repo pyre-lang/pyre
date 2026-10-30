@@ -1021,3 +1021,44 @@ fn core_option_result_method_paths() {
         "filter"
     ));
 }
+
+#[test]
+fn classed_result_enum_owner_is_core_result_path() {
+    use crate::front::result_exc::owner_is_core_result;
+    use crate::model::ValueType;
+
+    assert!(owner_is_core_result("core::result::Result"));
+    assert!(owner_is_core_result("core::result::Result<Infallible, E>"));
+    assert!(owner_is_core_result(
+        "core::result::Result<Infallible, E>::Err"
+    ));
+    assert!(owner_is_core_result("result::Result<??scalar, i64>"));
+    assert!(owner_is_core_result("std::result::Result"));
+    assert!(
+        !owner_is_core_result("mymod::Result<Infallible, E>"),
+        "a same-leaf user enum is not core::result::Result"
+    );
+    assert!(
+        !owner_is_core_result("Result<Infallible, E>"),
+        "a bare Result leaf is not the std item"
+    );
+
+    let core = ValueType::Ref(Some("core::result::Result<Infallible, E>".to_string()));
+    assert_eq!(
+        super::classed_result_enum_owner(&core),
+        Some("core::result::Result<Infallible, E>")
+    );
+    let stripped = ValueType::Ref(Some("result::Result<??scalar, i64>".to_string()));
+    assert_eq!(
+        super::classed_result_enum_owner(&stripped),
+        Some("result::Result<??scalar, i64>")
+    );
+    let user = ValueType::Ref(Some("mymod::Result<Infallible, E>".to_string()));
+    assert_eq!(
+        super::classed_result_enum_owner(&user),
+        None,
+        "user Result must not intern as the std Result wrap"
+    );
+    let leaf = ValueType::Ref(Some("Result<Infallible, E>".to_string()));
+    assert_eq!(super::classed_result_enum_owner(&leaf), None);
+}

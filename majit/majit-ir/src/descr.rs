@@ -7149,26 +7149,17 @@ impl Descr for SimpleFieldDescr {
         self.ei_index.store(ei_index, Ordering::Relaxed);
     }
     fn is_always_pure(&self) -> bool {
-        // `llsupport/descr.py get_field_descr` sets
-        // `is_pure = STRUCT._immutable_field(fieldname) != False`, and a `?`
-        // entry ranks `IR_QUASIIMMUTABLE`, an `ImmutableRanking` instance
-        // whose `__nonzero__` is false but which is not `False` — so upstream
-        // answers true here for a quasi-immutable field.
-        //
-        // pyre answers false on purpose, and the reason is the const-fold this
-        // word also licenses: upstream can afford it because the codewriter
-        // emits `record_quasiimmut_field` immediately before every
-        // quasi-immutable read (`jtransform.py`), so the marker and its
-        // `GUARD_NOT_INVALIDATED` are always already there.  pyre's emitters do
-        // not all pair them, and a read that folds without the marker leaves a
-        // loop no write can retire.  The nine `function.rs` `?` fields depend
-        // on this; see `pyre-jit-trace/src/descr.rs`.
-        //
-        // The other half of upstream's word — that a quasi-immutable entry
-        // survives a call's cache wipe — is not skipped, it is spelled at the
-        // invalidation sites in `optimizeopt/heap.rs` instead, which is why
-        // this stays a const-fold gate only.
-        self.is_immutable && !self.is_quasi_immutable
+        // `llsupport/descr.py get_field_descr`:
+        //     is_pure = STRUCT._immutable_field(fieldname) != False
+        // A `?` entry ranks `IR_QUASIIMMUTABLE`, an `ImmutableRanking`
+        // instance: `__nonzero__` is false (`is_immutable` column) but the
+        // object is not `False`, so `_is_pure` is true. `is_immutable` here
+        // is that `__nonzero__` bit; `is_quasi_immutable` is the `?` rank.
+        // Together they are `_immutable_field(name) != False`.
+        // `jtransform.py rewrite_op_getfield` then emits `getfield_*_pure`
+        // after `record_quasiimmut_field`; heap.py
+        // `optimize_GETFIELD_GC_I` constant-folds on this word.
+        self.is_immutable || self.is_quasi_immutable
     }
     fn is_quasi_immutable(&self) -> bool {
         self.is_quasi_immutable
@@ -9451,6 +9442,28 @@ mod acquire_load_tests {
         .with_load_is_acquire(true);
         assert!(version.load_is_acquire());
         assert!(!pointer_field(true, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
+    }
+
+    #[test]
+    fn quasi_immutable_field_is_always_pure() {
+        // descr.py get_field_descr: is_pure = _immutable_field(name) != False
+        let quasi = pointer_field(true, "W_ModuleDictObject.mstrategy", "mstrategy");
+        assert!(quasi.is_quasi_immutable());
+        assert!(Descr::is_always_pure(&quasi));
+        let mutable = pointer_field(false, "W_DictObject.dstorage", "dstorage");
+        assert!(!Descr::is_always_pure(&mutable));
+        let immutable = SimpleFieldDescr::new_with_name(
+            0,
+            8,
+            8,
+            Type::Ref,
+            true,
+            ArrayFlag::Pointer,
+            "W_UnicodeObject.length".to_string(),
+            "length",
+        );
+        assert!(Descr::is_always_pure(&immutable));
+        assert!(!immutable.is_quasi_immutable());
     }
 }
 

@@ -899,11 +899,14 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
 fn latched_vable_scalars<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> (Option<usize>, Option<isize>) {
+    latched_vable_scalar_pair(ctx.trace_ctx)
+}
+
+fn latched_vable_scalar_pair(ctx: &TraceCtx) -> (Option<usize>, Option<isize>) {
     let vable_int = |name: &str| {
-        ctx.trace_ctx
-            .virtualizable_info()
+        ctx.virtualizable_info()
             .and_then(|info| info.static_field_index_by_name(name))
-            .and_then(|idx| ctx.trace_ctx.virtualizable_entry_at(idx))
+            .and_then(|idx| ctx.virtualizable_entry_at(idx))
             .and_then(|(_, value)| match value {
                 majit_ir::Value::Int(value) => Some(value),
                 _ => None,
@@ -913,6 +916,70 @@ fn latched_vable_scalars<Sym: WalkSym>(
         vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
     let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
     (valuestackdepth, last_instr)
+}
+
+/// Operand-stack slots `nlocals..valuestackdepth` of the standard
+/// virtualizable (`_opimpl_setarrayitem_vable` stores into
+/// `metainterp.virtualizable_boxes`).
+fn stack_slots_from_vable_boxes(
+    ctx: &TraceCtx,
+    nlocals: usize,
+    valuestackdepth: usize,
+) -> Option<Vec<pyre_object::PyObjectRef>> {
+    let info = ctx.virtualizable_info()?;
+    let lengths = ctx.virtualizable_array_lengths()?;
+    let array_idx = info.array_field_index_by_name("locals_cells_stack_w")?;
+    if valuestackdepth < nlocals {
+        return None;
+    }
+    let array_len = *lengths.get(array_idx)?;
+    if valuestackdepth > array_len {
+        return None;
+    }
+    let mut slots = Vec::with_capacity(valuestackdepth - nlocals);
+    for item in nlocals..valuestackdepth {
+        let flat = info.get_index_in_array(array_idx, item, lengths);
+        match ctx.virtualizable_entry_at(flat) {
+            Some((_, majit_ir::Value::Ref(value))) if value != majit_ir::GcRef::NO_CONCRETE => {
+                slots.push(value.as_usize() as pyre_object::PyObjectRef);
+            }
+            _ => return None,
+        }
+    }
+    Some(slots)
+}
+
+fn resolve_operand_boxes<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    boxes: &[OpRef],
+    height: usize,
+    origin: &'static str,
+) -> Option<Vec<pyre_object::PyObjectRef>> {
+    if boxes.len() < height {
+        latchdbg!(
+            "origin={origin} paused-portal-mirror stack short \
+             have={} need={height}",
+            boxes.len(),
+        );
+        return None;
+    }
+    let mut slots = Vec::with_capacity(height);
+    for &opref in &boxes[..height] {
+        match ctx.trace_ctx.concrete_of_opref(opref) {
+            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
+                slots.push(value.as_usize() as pyre_object::PyObjectRef);
+            }
+            other => {
+                latchdbg!(
+                    "origin={origin} paused-portal-mirror slot {}/{height} unresolved \
+                     opref={opref:?} concrete={other:?}",
+                    slots.len(),
+                );
+                return None;
+            }
+        }
+    }
+    Some(slots)
 }
 
 /// Rebuild frame 0's post-CALL operand stack from the exact caller image
@@ -1076,7 +1143,16 @@ pub(crate) fn helper_index_for_sub_body(sub_body: &SubJitCodeBody) -> Option<usi
 /// `capture_root_parent_resume_stack` needs `first_inline()`; a helper
 /// entered from the portal has only `framestack[0]` (`InlineFrame::portal`)
 /// plus `bind_paused_caller_regs` live banks.
-fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
+///
+/// The paused `vstack_boxes` snapshot is the opcode-ENTRY stack. Portal
+/// jitcode that pops before the CALL has already run
+/// `_opimpl_setarrayitem_vable` / `_opimpl_setfield_vable`. Helper-entry
+/// mirroring rewrites the vable scalars to the opcode-entry image for
+/// guard snapshots; the abort-point pair is on the paused portal
+/// `LiveFrameRegs`. A ForceQuasiImmutable abort resumes that MIFrame at
+/// the CALL's `next_pc` (`blackhole.py _setup_return_value_*`), so the
+/// published image is the abort-point stack (`_copy_data_from_miframe`).
+pub(crate) fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     origin: &'static str,
 ) -> Option<MirrorStackImage> {
@@ -1088,24 +1164,42 @@ fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
             .and_then(|frame| frame.paused_live())
     }?;
     let py_pc = ctx.fbw_mode.inline_caller_py_pc.unwrap_or(0) as usize;
-    let boxes = paused.frame_state().borrow().vstack_boxes.clone();
-    let mut slots = Vec::with_capacity(boxes.len());
-    for &opref in &boxes {
-        match ctx.trace_ctx.concrete_of_opref(opref) {
-            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
-                slots.push(value.as_usize() as pyre_object::PyObjectRef);
-            }
-            other => {
-                latchdbg!(
-                    "origin={origin} paused-portal-mirror slot {}/{} unresolved \
-                     opref={opref:?} concrete={other:?}",
-                    slots.len(),
-                    boxes.len(),
-                );
+    let (abort_vsd, abort_last) = paused.abort_point_scalars();
+    if let Some(valuestackdepth) = abort_vsd {
+        let nlocals = {
+            let sym = ctx.fbw_mode.snapshot_sym;
+            if sym.is_null() {
+                latchdbg!("origin={origin} paused-portal-mirror no-snapshot-sym");
                 return None;
             }
+            // SAFETY: pointer live for the full-body walk; read-only.
+            let n = unsafe { (*sym).nlocals() };
+            let frame = unsafe { (*sym).live_vable_frame_addr() };
+            crate::state::concrete_nlocals(frame).unwrap_or(n)
+        };
+        if valuestackdepth < nlocals {
+            latchdbg!(
+                "origin={origin} paused-portal-mirror abort vsd={valuestackdepth} \
+                 below nlocals={nlocals}"
+            );
+            return None;
         }
+        let height = valuestackdepth - nlocals;
+        let slots = stack_slots_from_vable_boxes(ctx.trace_ctx, nlocals, valuestackdepth).or_else(
+            || {
+                let boxes = paused.frame_state().borrow().vstack_boxes.clone();
+                resolve_operand_boxes(ctx, &boxes, height, origin)
+            },
+        )?;
+        return Some(MirrorStackImage {
+            py_pc,
+            slots,
+            valuestackdepth: Some(valuestackdepth),
+            last_instr: abort_last,
+        });
     }
+    let boxes = paused.frame_state().borrow().vstack_boxes.clone();
+    let slots = resolve_operand_boxes(ctx, &boxes, boxes.len(), origin)?;
     let (valuestackdepth, last_instr) = latched_vable_scalars(ctx);
     Some(MirrorStackImage {
         py_pc,
@@ -1430,7 +1524,17 @@ pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
         // This is a new unwind, so a retained image and claim from a
         // recovered sub-walk must not replace its coordinate.
         discard_staged_abort(ctx.session);
-        let _ = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
+        let latched = latch_abort_blackhole(ctx, resume_pc, "force-qmut");
+        // Same ancestor splice as `walk`'s `blackhole_if_trace_too_long`
+        // arm (`finish_helper_abort_latch`). `SwitchToBlackhole` resumes
+        // every `metainterp.framestack` level (`convert_and_run_from_pyjitpl`);
+        // portal + innermost `mutated` alone returns into the portal at the
+        // next Python opcode and skips `_setitem_str_cell_known`'s store.
+        if latched && ctx.fbw_mode.transparent_helper_subwalk {
+            let splice_ok =
+                super::inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+            let _ = finish_helper_abort_latch(ctx.session, splice_ok);
+        }
     } else if ctx.vstack_valid && !ctx.trace_ctx.is_bridge_trace {
         fbw_qmut_abort_stack_latch(
             ctx.vstack_cur_pypc as usize,
@@ -1439,7 +1543,13 @@ pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
     }
     // The session flag survives recovered sub-walks; always overwrite it at
     // the raise site so a later root-frame abort cannot inherit `true`.
-    ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
+    // A failed helper splice discarded the image and the claim, so the
+    // enclosing Python CALL may latch (`mod2730`).
+    ctx.session.borrow_mut().abort_in_subwalk = if ctx.fbw_mode.transparent_helper_subwalk {
+        abort_blackhole_latched()
+    } else {
+        ctx.fbw_mode.inline_subwalk
+    };
 }
 
 /// Whether the blackhole may stop inside this codeless level instead of
@@ -9140,8 +9250,11 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
-    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
-    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
+    // Pause the caller before installing the callee index:
+    // `run_codewriter_helper_inline_call` computes `helper_subwalk_level`
+    // then overwrites `transparent_helper_jitcode_index`, matching
+    // `walk_translated_builtin_wrapper` / `pyjitpl.py`
+    // `do_residual_or_indirect_call` (`perform_call` / `newframe`).
     let exc_before = ctx.last_exc_value();
     let walk = run_codewriter_helper_inline_call(
         ctx,
@@ -9153,7 +9266,6 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         &ref_concretes,
         f_args,
     );
-    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
     let walk_outcome = match walk {
         Ok(outcome) => outcome,
         Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {

@@ -147,6 +147,16 @@ impl DictArgKey {
             }
         }
     }
+
+    /// `history.py same_box` for a already-resolved struct box: Const
+    /// terminals key by value so two minted `ConstPtr`s of the same
+    /// gcref hit, producers key by identity.
+    fn from_resolved(obj: &Operand, ctx: &OptContext) -> Self {
+        match ctx.get_constant_box(obj) {
+            Some(value) => DictArgKey::Const(value),
+            None => DictArgKey::Op(obj.clone()),
+        }
+    }
 }
 
 /// Cache key for a field access: (struct OpRef, field descriptor identity).
@@ -250,25 +260,10 @@ impl CachedField {
     /// longer need to gate manually.
     fn invalidate(&mut self, descr: &DescrRef, field_idx: u32, ctx: &mut OptContext) {
         // `CachedField.invalidate`: `if descr.is_always_pure(): return`.
-        // Upstream's word covers a quasi-immutable field too — `is_pure` is
-        // `_immutable_field(name) != False` and `IR_QUASIIMMUTABLE` is an
-        // instance, not `False` — so a `?` field's cache survives a call and
-        // the loop keeps one read, with `guard_not_invalidated` carrying the
-        // per-window check. pyre's `is_always_pure` answers false for a `?`
-        // field to withhold the const-fold that same word licenses, so the
-        // surviving-a-call half is spelled here instead. Without it every
-        // residual call forces a re-read; over the scored bench dir that is 2
-        // of the 5 `ExecutionContext.w_tracefunc` getfield+guard pairs left in
-        // a peeled body. The other three read a different struct box each
-        // time, so no cache can reach them: upstream gets one box per loop from
-        // `ThreadLocalReference(ExecutionContext, loop_invariant=True)`.
-        //
-        // Instance `w_class` is an ordinary mutable field, the analog of
-        // mapdict `inst_map` (`BaseUserClassMapdict.setclass`). Type objects
-        // keep their own quasi-immutable fields. A residual
-        // `CallMayForce` therefore drops the instance class the way
-        // `heap.py clean_caches` drops `inst_map`.
-        if descr.is_always_pure() || descr.is_quasi_immutable() {
+        // A `?` field's descr answers true (`descr.py get_field_descr`
+        // `_immutable_field(name) != False`), so its cache survives a call
+        // and `guard_not_invalidated` carries the per-window check.
+        if descr.is_always_pure() {
             return;
         }
         let descr_idx = field_idx;
@@ -892,12 +887,12 @@ pub struct OptHeap {
     /// The map key is the descriptor object's identity; `descr.index()` is
     /// not globally unique across descriptor objects.
     corresponding_array_descrs: crate::FxIndexMap<usize, (DescrRef, usize)>,
-    /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
-    /// OpRef. Keyed by the object's `Operand` identity (heap keys structs by box,
-    /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
-    /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
-    /// GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: crate::FxIndexMap<(Operand, usize), OpRef>,
+    /// Fields known to be quasi-immutable: (obj, field descr) -> cached value
+    /// OpRef. Obj keys with [`DictArgKey`] so two minted `ConstPtr`s of the
+    /// same gcref hit (`history.py same_box` / `util.py args_dict`). Populated
+    /// by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*. Survives
+    /// calls (guarded by GUARD_NOT_INVALIDATED).
+    quasi_immut_cache: crate::FxIndexMap<(DictArgKey, usize), OpRef>,
 }
 
 impl OptHeap {
@@ -2406,7 +2401,7 @@ impl OptHeap {
         // Keyed by the object's canonical box identity.
         {
             let qi_obj = ctx.resolve_operand_operand(&obj_box);
-            let qi_key = (qi_obj, descr_id);
+            let qi_key = (DictArgKey::from_resolved(&qi_obj, ctx), descr_id);
             if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).copied() {
                 if !qi_cached.is_none() {
                     // Subsequent read: reuse the cached value.
@@ -2417,6 +2412,12 @@ impl OptHeap {
                 }
                 // First read after QUASIIMMUT_FIELD: emit the load, then cache
                 // the result so it survives calls (unlike normal mutable fields).
+                // heap.py `optimize_QUASIIMMUT_FIELD`: "If 's' is a constant
+                // we rely on the rest of the optimizations to constant-fold
+                // the following pure getfield_gc." That fold is the early
+                // `descr.is_always_pure()` arm (`optimize_GETFIELD_GC_I`);
+                // a `?` field's FieldDescr answers true
+                // (`descr.py get_field_descr` `!= False`).
                 self.quasi_immut_cache.insert(qi_key, op.pos().get());
                 make_nonnull_box(ctx, &op.arg(0));
                 let obj_box = ctx.resolve_operand_operand(&obj_box);
@@ -3578,7 +3579,8 @@ impl OptHeap {
                             .as_quasi_immut_descr()
                             .map_or(descr, |q| q.fielddescr()),
                     );
-                    self.quasi_immut_cache.insert((obj_box, key), OpRef::NONE);
+                    let obj_key = DictArgKey::from_resolved(&obj_box, ctx);
+                    self.quasi_immut_cache.insert((obj_key, key), OpRef::NONE);
                 }
                 OptimizationResult::Remove
             }
@@ -4764,8 +4766,8 @@ mod tests {
     }
 
     /// `CachedField.invalidate` keeps a `?` field across `clean_caches`
-    /// (pyre spelling of upstream `is_always_pure` covering
-    /// `IR_QUASIIMMUTABLE`). Instance `w_class` is ordinary mutable
+    /// (`descr.is_always_pure()` covering `IR_QUASIIMMUTABLE`).
+    /// Instance `w_class` is ordinary mutable
     /// (`mapdict.py BaseUserClassMapdict.setclass` / `inst_map`), so a
     /// MOST_GENERAL residual setattr drops it. `ExecutionContext.w_tracefunc`
     /// stays.

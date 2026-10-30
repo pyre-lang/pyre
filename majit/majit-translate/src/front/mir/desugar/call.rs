@@ -155,8 +155,14 @@ impl<'a> Lowering<'a> {
         };
         let dest_class_ty: &TyRef = match &fd_output {
             Some(out)
-                if tyref_enum_instantiation_suffix(&call.dest.ty, self.llbc).is_empty()
-                    && !tyref_enum_instantiation_suffix(out, self.llbc).is_empty() =>
+                if tyref_enum_instantiation_suffix(
+                    &call.dest.ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                )
+                .is_empty()
+                    && !tyref_enum_instantiation_suffix(out, self.llbc, self.tombstoned_leaves)
+                        .is_empty() =>
             {
                 out
             }
@@ -582,7 +588,8 @@ impl<'a> Lowering<'a> {
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
-        let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
+        let raw_scalar_spills =
+            self.raw_scalar_borrow_spills(&call.func, &call_arg_tys, &arg_locals);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -1077,7 +1084,7 @@ impl<'a> Lowering<'a> {
                                     target,
                                     args[0].clone(),
                                     "cast_int_to_ptr",
-                                    ValueType::Ref(None),
+                                    dst_vt,
                                 );
                             }
                             _ => {}
@@ -7482,6 +7489,7 @@ impl<'a> Lowering<'a> {
             let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
                 &call.dest.ty,
                 self.llbc,
+                self.tombstoned_leaves,
             );
             // `Result<(), PyError>`: the transformed callee returns void
             // (`tyref_result_ok_is_unit`), so the payload is `Void`, not the
@@ -8515,13 +8523,16 @@ impl<'a> Lowering<'a> {
             &resolved_call_args,
             &call.dest.ty,
         )?;
-        self.local_var[dest_local] = Some(match slice_next {
-            Some(LocalValue::SliceIter { items, .. }) => LocalValue::SliceIter {
-                items,
-                index: result_var.clone(),
-            },
-            _ => LocalValue::One(result_var.clone()),
-        });
+        let dest_is_cell = self.is_cell_local(dest_local);
+        if !dest_is_cell {
+            self.local_var[dest_local] = Some(match slice_next {
+                Some(LocalValue::SliceIter { items, .. }) => LocalValue::SliceIter {
+                    items,
+                    index: result_var.clone(),
+                },
+                _ => LocalValue::One(result_var.clone()),
+            });
+        }
         // A fat `&dyn` / `Box<dyn>` result is two words. Record it so
         // `front::dyn_fat` can splice the callee before the vtable word
         // is dropped on the one-word return.
@@ -8617,7 +8628,10 @@ impl<'a> Lowering<'a> {
         for owner in converted_window_owners {
             self.emit_keepalive(mir_bb, owner);
         }
-        if let Some(slot) = window_ret_slot {
+        if dest_is_cell {
+            self.emit_cell_store(mir_bb, dest_local, result_var.clone())?;
+        }
+        if !dest_is_cell && let Some(slot) = window_ret_slot {
             let len = self.emit_path_call(
                 mir_bb,
                 majit_ir::rvec::SLICE_LEN_SLOT_TAKE,
@@ -8657,7 +8671,7 @@ impl<'a> Lowering<'a> {
         // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
         // already-resolved results and production codegen are unaffected; only
         // a `Ref(None)` raw-`PyObjectRef` result gains its pointee class.
-        if let Some(root) = result_narrow_root {
+        if !dest_is_cell && let Some(root) = result_narrow_root {
             let narrowed = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);

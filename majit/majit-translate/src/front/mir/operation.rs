@@ -963,7 +963,12 @@ impl<'a> Lowering<'a> {
                             }
                         }
                         PlaceKind::Local(i) => {
-                            self.local_var[i as usize] = Some(LocalValue::One(value_var(&value)));
+                            let i = i as usize;
+                            if self.is_cell_local(i) {
+                                self.emit_cell_store(mir_bb, i, value_var(&value))?;
+                                return Ok(());
+                            }
+                            self.local_var[i] = Some(LocalValue::One(value_var(&value)));
                             return Ok(());
                         }
                         _ => {}
@@ -1019,7 +1024,12 @@ impl<'a> Lowering<'a> {
                     // recursion; `jtransform.py rewrite_op_getsubstruct`).
                     // The typeptr leaf stays for `rewrite_op_setfield` /
                     // `is_typeptr_getset` to drop on a vtable object.
-                    if let Some(nested) = tyref_by_value_struct_decl(dest_ty, self.llbc) {
+                    // An integer newtype (`VersionTag(u64)`) is one word
+                    // (`history.getkind`): leaf-copy would GETFIELD
+                    // `__pos_0` with that Int as the base.
+                    if let Some(nested) =
+                        tyref_by_value_struct_decl(dest_ty, self.llbc, self.gc_struct_ids)
+                    {
                         let src = value.as_variable().cloned().ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
@@ -2174,6 +2184,16 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
+                    // `i64 as *mut Utf8Str` is `cast_int_to_ptr(Ptr(STR), int)`:
+                    // the value is rstr `STR` (`node_is_string_value`), not
+                    // the 1-arg `MAJIT_REF_OPAQUE` placeholder.
+                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, arg);
+                        return Ok((None, raw));
+                    }
                     // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
                     // Overlay `as *const T` must not alias or fold back to
                     // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
@@ -2427,6 +2447,10 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, kind, .. } => {
+                if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    let v = self.defined_local(mir_bb, cell)?;
+                    return Ok((None, v));
+                }
                 // `&mut *p` of a cell parameter is that cell. The reborrow
                 // does not load `value`.
                 if borrow_kind_is_exclusive(&kind)
@@ -2466,6 +2490,10 @@ impl<'a> Lowering<'a> {
             // `&raw const *p` is the address `p`. Resolving the deref
             // would `RawLoad` the pointee (`rewrite_op_raw_load`).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    let v = self.defined_local(mir_bb, cell)?;
+                    return Ok((None, v));
+                }
                 if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
@@ -2630,6 +2658,14 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 );
+                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    && matches!(dst_kind, ValueType::Str)
+                    && tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, v);
+                    return Ok((None, raw));
+                }
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
                     || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
                 if crosses_raw_ref
@@ -3067,9 +3103,11 @@ impl<'a> Lowering<'a> {
                 // data word. The discriminant is that null test, not a
                 // `__discriminant` field of a tagged aggregate. The data
                 // word is CCHARP (`Ptr(Array Char)`); `p is None` is
-                // `rnone.py` `rtype_is_None` → `ptr_iszero`, the same
-                // `is_(opt, null)` then `eq(_, False)` sequence the
-                // niche-pointer Discriminant arm emits (`push_niche_is_some`).
+                // `rnone.py` `rtype_is_None` → `ptr_iszero`. Keep
+                // `is_(data, None)` then `eq(_, False)` so the switch stays
+                // Some=1 (`push_niche_is_some`). The pointer-niche
+                // Discriminant arm below emits `bool(p)`
+                // (`CanBeNull.rtype_bool` / `ptr_nonzero`), also Some=1.
                 // `Constant(None)` is Void (`pairtype(Repr, VoidRepr)`);
                 // integer 0 is not a pointer null (`lltype.nullptr`).
                 if tyref_is_u8_window(&place.ty, self.llbc)
@@ -3223,62 +3261,25 @@ impl<'a> Lowering<'a> {
                     return Ok((None, decoded));
                 }
                 // A one-word niche `Option` is represented by its payload
-                // pointer: `None`
-                // = null, `Some(p)` = the non-null pointer.  Its
-                // discriminant is the pointer-null test `base != null`
-                // (`None` = 0, `Some` = 1), not a `__discriminant` field off
-                // a two-word aggregate base (there is none).  Emit the null
-                // pointer, then compare — a `ne` on two `Ref` operands
-                // lowers to `ptr_ne` (`jtransform`), and its `Int` result
-                // feeds the match switch exactly as a `__discriminant` read
-                // would.  The null is a `null_mut()` call, not a
-                // `ConstRefNull`: `null_mut()` rtypes to `convert_const(None)`
-                // on the result repr (`rbuiltin::rtype_ptr_null`), so it
-                // adapts to the `base` pointer's own `InstanceRepr` and the
-                // `ptr_ne` sees two same-repr operands.  A `ConstRefNull` is a
-                // fixed GCREF `_ptr`, which cannot rtype against an
-                // `InstanceRepr(PyObject)` base at the `ne`.  Modelling the
-                // maybe-null pointer this way is the orthodox representation
-                // (RPython has no `Option`; a maybe-null `Ptr` tests
-                // `ptr_nonzero`).
+                // pointer: `None` = null, `Some(p)` = the non-null pointer.
+                // Rust's Discriminant of `Option` is Some=1; emit `bool(p)`,
+                // the hop `rptr.py` / `rnone.py` `CanBeNull.rtype_bool` turns
+                // into `ptr_nonzero`. jtransform rewrites `bool` on a ref to
+                // `ptr_nonzero` and `optimize_goto_if_not` fuses that into
+                // `goto_if_not_ptr_nonzero`, so the walker records
+                // `guard_nonnull` / `guard_isnull` and the heapcache answers
+                // a second check. `is_(p, None)` is true for None and would
+                // invert every non-switch use (`Eq(d, 1)`, a stored or
+                // returned discriminant). Not a `__discriminant` field off a
+                // two-word aggregate.
                 if self.tyref_is_niche_option_ptr(&place.ty) {
-                    let option_ty = clone_tyref(&place.ty);
                     let base = self.resolve_place(mir_bb, place)?;
-                    let nullc = self.push_niche_null_ptr(mir_bb, &option_ty);
-                    // Preserve PyPy's identity test: first compute
-                    // `base is None`, then negate that bool for the Rust
-                    // discriminant (`Some` = 1). `ne` would dispatch to value
-                    // inequality on StringRepr/ListRepr, which is not a null
-                    // test (and FixedSizeListRepr deliberately has no such
-                    // operation). The final bool must close a `SwitchInt`
-                    // with `ExitCase::Bool`, so record its result id.
-                    let is_none = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let false_var = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let bb_id = self.emit_bb(mir_bb);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(is_none.clone()),
-                        kind: OpKind::BinOp {
-                            op: "is_".to_string(),
-                            lhs: base,
-                            rhs: nullc,
-                            result_ty: ValueType::Int,
-                        },
-                    });
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(false_var.clone()),
-                        kind: OpKind::ConstBool(false),
-                    });
                     self.niche_disc_vars.insert(res.id());
                     return Ok((
-                        Some(OpKind::BinOp {
-                            op: "eq".to_string(),
-                            lhs: is_none,
-                            rhs: false_var,
-                            result_ty: ValueType::Int,
+                        Some(OpKind::UnaryOp {
+                            op: "bool".to_string(),
+                            operand: base,
+                            result_ty: ValueType::Bool,
                         }),
                         res,
                     ));
@@ -3912,6 +3913,12 @@ impl<'a> Lowering<'a> {
         use crate::translator::rtyper::lltypesystem::lltype::{
             GcKind, LowLevelType, Ptr, Struct, frozendict,
         };
+        // `ann_cast_int_to_ptr` of `Ptr(STR)` is the string itself
+        // (`node_is_string_value`). Overlay would recast that header as a
+        // raw `SomePtr` and merge `Ptr ∪ String` with a field-load STR.
+        if tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc) {
+            return None;
+        }
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
@@ -5362,6 +5369,9 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: const struct local {i} read as one word"
                 )))
             }
+            PlaceKind::Local(i) if self.is_cell_local(i as usize) => {
+                self.emit_cell_load(mir_bb, i as usize)
+            }
             PlaceKind::Local(i) => self
                 .local_var
                 .get(i as usize)
@@ -5437,8 +5447,15 @@ impl<'a> Lowering<'a> {
                     }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
-                    // word. The only projection that view emits is `__pos_0`.
-                    if field_name == "__pos_0"
+                    // word. Charon spells the positional field `_0`
+                    // (`is_positional`); the front names it `__pos_0`.
+                    // A by-value integer newtype (`VersionTag(u64)`) is
+                    // the same word (`history.getkind`).
+                    // A `&Newtype` is an address: `(*self).0` loads that
+                    // integer (`history.getkind` of the field). Aliasing
+                    // the deref would return the Ref receiver as the
+                    // payload.
+                    if (field_name == "__pos_0" || field_name == "_0")
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
                             self.llbc,
@@ -5448,9 +5465,26 @@ impl<'a> Lowering<'a> {
                         )
                         .is_some()
                     {
-                        let wrapper_ty = clone_tyref(&inner.ty);
-                        let base = self.resolve_place(mir_bb, *inner)?;
-                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                        let load_from_address = match &inner.kind {
+                            PlaceKind::Projection(pre, ProjectionElem::Atom(atom))
+                                if atom == "Deref" =>
+                            {
+                                tyref_transparent_inner_value_type(
+                                    &pre.ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
+                                )
+                                .is_none()
+                            }
+                            _ => false,
+                        };
+                        if !load_from_address {
+                            let wrapper_ty = clone_tyref(&inner.ty);
+                            let base = self.resolve_place(mir_bb, *inner)?;
+                            return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                        }
                     }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the
@@ -6530,7 +6564,13 @@ impl<'a> Lowering<'a> {
                 // and field-bearing strategy holders, whose address is stored
                 // in W_DictObject.dstrategy. A bare ConstRefAddr would instead
                 // annotate the latter as SomePtr and lose its instance repr.
-                if let Some(root) = self.refs_static_struct_root(&place_ty)
+                // `FnPtrCell` hook statics are Opaque in the consuming
+                // crate's LLBC (`majit_gc::hook_cell::FnPtrCell`), so
+                // `refs_static_struct_root` is empty; `immutablevalue`
+                // still annotates the prebuilt with its class.
+                if let Some(root) = self
+                    .refs_static_struct_root(&place_ty)
+                    .or_else(|| tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves))
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.emit_bb(mir_bb);
@@ -7203,7 +7243,9 @@ impl<'a> Lowering<'a> {
                 // and union every payload onto one `__pos_0`.
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
-                let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
+                let suffix = inst_adt.and_then(|h| {
+                    adt_head_instantiation_suffix(h, self.llbc, self.tombstoned_leaves)
+                });
                 let leaf = match suffix {
                     Some(suffix) => majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix),
                     None => type_leaf,
@@ -7392,7 +7434,7 @@ impl<'a> Lowering<'a> {
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            match adt_head_instantiation_suffix(head, self.llbc) {
+            match adt_head_instantiation_suffix(head, self.llbc, self.tombstoned_leaves) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
                 None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
                     Some(suffix) => {
@@ -7642,7 +7684,7 @@ impl<'a> Lowering<'a> {
         let def_id = inline_adt_def_id(v)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
         let adt = v.as_object()?.get("Adt")?.as_object()?;
-        match adt_head_instantiation_suffix(adt, self.llbc) {
+        match adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves) {
             Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                 &name_path, &suffix,
             )),
@@ -8819,6 +8861,42 @@ pub(in crate::front::mir) fn overlay_field_lltype(
         return LowLevelType::Ptr(Box::new(NONGCREF.clone()));
     }
     tyref_to_external_lltype(ty, llbc)
+}
+
+/// `lltype.cast_int_to_ptr(Ptr(STR), int)` for an integer word that is
+/// already an rstr `STR` (`alloc_utf8_payload` / `bh_alloc_str_nofill`).
+/// The 1-arg form annotates as `SomePtr(MAJIT_REF_OPAQUE)` and unions
+/// with a field-load `SomeString` (`w_str_storage`) at
+/// `module_dict_key_block`. `ann_cast_int_to_ptr` of `Ptr(STR)` is the
+/// string itself (`node_is_string_value`).
+pub(in crate::front::mir) fn emit_cast_int_to_strptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let ptr_ty = STRPTR.clone();
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+    stamp_as_rstr_str(&raw);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(addr),
+            ],
+            result_ty: ValueType::Str,
+        },
+    });
+    raw
 }
 
 /// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).

@@ -267,6 +267,61 @@ fn restore_offset_pointer_type_recasts_ccharp_to_entry_ptr() {
 }
 
 #[test]
+fn emit_cast_int_to_strptr_is_two_arg_strptr() {
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let mut graph = FunctionGraph::new("test");
+    let bb = graph.startblock;
+    let addr = graph
+        .push_op_var(bb, OpKind::ConstInt(0x1000), true)
+        .expect("address word");
+    let raw = super::emit_cast_int_to_strptr(&mut graph, bb, addr.clone());
+    assert_eq!(
+        raw.concretetype().as_ref(),
+        Some(&*STRPTR),
+        "result is Ptr(STR)"
+    );
+    let op = graph
+        .block(bb)
+        .operations
+        .iter()
+        .find(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+            _ => false,
+        })
+        .expect("cast_int_to_ptr");
+    match &op.kind {
+        OpKind::Call {
+            args, result_ty, ..
+        } => {
+            assert_eq!(op.result.as_ref(), Some(&raw));
+            assert_eq!(*result_ty, ValueType::Str);
+            assert_eq!(
+                args.len(),
+                2,
+                "cast_int_to_ptr(Ptr(STR), int), got {args:?}"
+            );
+            assert!(
+                matches!(
+                    &args[0],
+                    crate::model::LinkArg::Const(c)
+                        if matches!(
+                            c.value,
+                            crate::flowspace::model::ConstValue::LowLevelType(_)
+                        )
+                ),
+                "PTRTYPE is Ptr(STR), got {:?}",
+                args[0]
+            );
+            assert_eq!(args[1], crate::model::LinkArg::Value(addr));
+        }
+        other => panic!("expected cast_int_to_ptr call, got {other:?}"),
+    }
+}
+
+#[test]
 fn restore_offset_pointer_type_keeps_ptradd_when_entry_is_signed() {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     let mut graph = FunctionGraph::new("test");

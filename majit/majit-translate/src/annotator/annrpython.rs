@@ -2841,6 +2841,24 @@ impl RPythonAnnotator {
                                 crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
                             ),
                         ),
+                        // `lltype.malloc(T, flavor='raw')` after
+                        // `flowspace_adapter` emits the rtyped
+                        // `malloc(TYPE, flags)` / `malloc_varsize` llop.
+                        // `from_opname` has no `malloc`; the residual
+                        // `ll_raw_malloc_fixedsize` is a Signed address
+                        // (`history.py` `getkind` of a raw pointer).
+                        "malloc" if sp.args.len() == 2 => Some(SomeValue::Integer(
+                            super::model::SomeInteger::new(false, false),
+                        )),
+                        "malloc_varsize" if sp.args.len() == 3 => Some(SomeValue::Integer(
+                            super::model::SomeInteger::new(false, false),
+                        )),
+                        // `lltype.free(p, flavor='raw')` → `free` llop.
+                        "free" if sp.args.len() == 2 => Some(
+                            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                            ),
+                        ),
                         _ => None,
                     }
                 };

@@ -528,4 +528,75 @@ mod tests {
             "in_code copies the forwarded address, not the rewrite-time one"
         );
     }
+
+    static TEST_RD_CONSTS_POOL: parking_lot::Mutex<
+        Option<std::sync::Arc<majit_ir::SharedConstPool>>,
+    > = parking_lot::Mutex::new(None);
+    static TEST_RD_CONSTS_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    fn walk_test_rd_consts_pool(visitor: &mut dyn FnMut(&mut GcRef)) {
+        let guard = TEST_RD_CONSTS_POOL.lock();
+        let Some(pool) = guard.as_ref() else {
+            return;
+        };
+        let generation = TEST_RD_CONSTS_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let is_minor = crate::shadow_stack::extra_root_walk_kind()
+            == crate::shadow_stack::ExtraRootWalkKind::Minor;
+        // Production `visit_pool` passes `majit_gc::can_move`. This unit
+        // test uses a local MiniMark, so ACTIVE_CAN_MOVE is unset; any
+        // non-null slot is treated as a live edge so a pin that left the
+        // referent in the nursery re-arms the same way `can_move` would.
+        pool.visit_gc_refs(generation, is_minor, visitor, |g| !g.is_null());
+    }
+
+    struct ClearTestRdConstsPool;
+
+    impl Drop for ClearTestRdConstsPool {
+        fn drop(&mut self) {
+            *TEST_RD_CONSTS_POOL.lock() = None;
+        }
+    }
+
+    #[test]
+    fn shared_const_pool_pinned_slot_survives_second_minor() {
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let _clear = ClearTestRdConstsPool;
+        crate::shadow_stack::register_extra_root_walker(
+            walk_test_rd_consts_pool,
+            "test_shared_const_pool",
+        );
+        let mut owner = crate::collector::MiniMarkGC::with_config(crate::collector::GcConfig {
+            nursery_size: 65536,
+            large_object_threshold: 1024,
+            ..crate::collector::GcConfig::default()
+        });
+        let type_id = owner.register_type(crate::TypeInfo::simple(16));
+        let root = owner.alloc_with_type(type_id, 16);
+        unsafe { *(root.0 as *mut u64) = 0xA11C_E703 };
+        assert!(
+            owner.pin(root),
+            "TypeInfo::simple has no GC pointers, so pin is allowed"
+        );
+        let pool = majit_ir::SharedConstPool::new(vec![majit_ir::Const::from_gcref(root)]);
+        *TEST_RD_CONSTS_POOL.lock() = Some(pool.clone());
+        owner.do_collect_nursery();
+        assert_eq!(
+            pool[0].getref_base(),
+            root,
+            "a pinned nursery Const::Ref is not copied on the first drain"
+        );
+        assert!(
+            pool.take_minor_scan_pending(),
+            "a still-young Const::Ref re-arms the remembered set for the next minor"
+        );
+        pool.mark_minor_scan_pending();
+        owner.unpin(root);
+        owner.do_collect_nursery();
+        let after_unpin = pool[0].getref_base();
+        assert_ne!(
+            after_unpin, root,
+            "unpin then a second minor copies the young slot out"
+        );
+        assert_eq!(unsafe { *(after_unpin.0 as *const u64) }, 0xA11C_E703);
+    }
 }

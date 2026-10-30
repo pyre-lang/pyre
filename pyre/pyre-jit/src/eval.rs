@@ -1240,10 +1240,11 @@ unsafe fn module_dict_object_custom_trace(
         // A module holder owns the concrete ModuleDictStrategy.  Forward the
         // actual owner slot after forwarding `mstrategy`, so the holder and
         // its version/cache state have the same reachability chain as PyPy's
-        // strategy instance.  Static strategy holders have a null owner.
-        // Only the per-module holder is collector-owned.  After promotion the
-        // slot points at the immutable process-wide ObjectDictStrategy holder;
-        // do not manufacture a mutable reference to that static.
+        // strategy instance.  Process-wide immortal holders have a null owner.
+        // Only the per-module MiniMark holder is collector-owned.  After
+        // promotion the slot points at the immortal process-wide
+        // ObjectDictStrategy holder; do not manufacture a mutable reference
+        // to that prebuilt.
         if !md.mstrategy.is_null()
             && pyre_object::gc_hook::try_gc_owns_object(md.mstrategy as pyre_object::gc_hook::GCREF)
         {

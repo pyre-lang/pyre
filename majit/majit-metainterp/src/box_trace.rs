@@ -19,6 +19,21 @@ fn getfield_gc_i_pureornot(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     use majit_ir::Value;
+    // pyjitpl.py `opimpl_getfield_gc_i`: a ConstPtr receiver through an
+    // always-pure descr bypasses the heapcache completely — execute the
+    // load now and substitute a ConstInt, recording no op.
+    if obj.is_constant() && descr.is_always_pure() {
+        if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(Value::Int(n)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                {
+                    return ctx.const_int(n);
+                }
+            }
+        }
+    }
     // heapcache: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
@@ -228,6 +243,19 @@ pub fn getfield_gc_f_pureornot(
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     use majit_ir::Value;
+    // pyjitpl.py `opimpl_getfield_gc_f`: ConstPtr + always-pure bypass.
+    if obj.is_constant() && descr.is_always_pure() {
+        if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(Value::Float(f)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+                {
+                    return ctx.const_float(f.to_bits() as i64);
+                }
+            }
+        }
+    }
     let field_index = descr.index();
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
         // pyjitpl.py:941-945 cache-hit sanity check (float arm).

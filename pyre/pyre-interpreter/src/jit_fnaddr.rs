@@ -2311,6 +2311,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::dict_display_setitem",
         crate::opcode_ops::jit_baseobjspace_dict_display_setitem,
     );
+    // STORE_NAME / STORE_GLOBAL void `inline_call_r_v`
+    // (`flatten.rs inline_call_targets`). The graphs are
+    // `store_name_value_w` / `store_global_value_w`; these bridges are the
+    // one-word addresses blackhole calls.
+    cp3!(
+        &mut entries,
+        "pyre_interpreter::eval::store_name_value_w",
+        crate::opcode_ops::jit_eval_store_name_value_w,
+    );
+    cp3!(
+        &mut entries,
+        "pyre_interpreter::eval::store_global_value_w",
+        crate::opcode_ops::jit_eval_store_global_value_w,
+    );
     cp1!(
         &mut entries,
         "pyre_interpreter::type_methods::format_simple_w",
@@ -6092,7 +6106,14 @@ fn intern_fnaddr_path(s: String) -> &'static str {
 /// published as the full `module_path!()::name` and, when the function is
 /// nested and `{crate}::{leaf}` is unique among full paths, that short alias.
 /// `register_macro_helper_trace_fnaddr` then adds the crate-stripped and
-/// `crate::` spellings from those keys.
+/// `crate::` spellings from those keys. Inherent `&self` trampolines keep
+/// the free-function spelling on [`HelperFnAddr::path`]; this merge
+/// publishes their `module::Type::method` keys from
+/// [`HelperFnAddr::impl_method_fnaddr_paths`] so a residual reloc uses
+/// the address captured in the defining crate. Those keys are not fed
+/// through the `{crate}::{leaf}` unique-short-alias rule: inventing
+/// `crate::leaf` next to `crate::Type::leaf` shares the trampoline with
+/// a spelling the uniqueness census cannot pair.
 #[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
 fn merge_macro_helper_fnaddrs(
     entries: &mut Vec<(&'static str, i64)>,
@@ -6106,7 +6127,7 @@ fn merge_macro_helper_fnaddrs(
     let mut rows: Vec<(&str, i64, u8)> = Vec::new();
     majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
         let addr = desc.get() as i64;
-        if addr == 0 {
+        if addr == 0 || desc.is_impl_method() {
             return;
         }
         rows.push((desc.path, addr, desc.arity));
@@ -6169,6 +6190,47 @@ fn merge_macro_helper_fnaddrs(
             occupied.insert(path);
         }
     }
+
+    // Type-qualified reloc keys for inherent `&self` trampolines. Native
+    // occupied hand-listed rows keep their address (pre-existing
+    // `PyFrame::pop` spellings). On wasm32 the defining-crate trampoline
+    // replaces that slot, matching the free-function pass: a cross-crate
+    // `fn as *const ()` is a different table entry. A `{crate}::{leaf}`
+    // short alias is not derived.
+    majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+        let addr = desc.get() as i64;
+        if addr == 0 || !desc.is_impl_method() {
+            return;
+        }
+        for path in desc.impl_method_fnaddr_paths() {
+            let path = intern_fnaddr_path(path);
+            match arities.entry(path) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    debug_assert_eq!(
+                        *existing.get(),
+                        desc.arity,
+                        "duplicate helper fnaddr arity mismatch for {path}"
+                    );
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(desc.arity);
+                }
+            }
+            if occupied.contains(path) {
+                #[cfg(target_arch = "wasm32")]
+                if let Some(slot) = entries
+                    .iter_mut()
+                    .find(|(entry_path, _)| *entry_path == path)
+                    && !abi_unsound_arguments.contains(&slot.1)
+                {
+                    slot.1 = addr;
+                }
+                continue;
+            }
+            entries.push((path, addr));
+            occupied.insert(path);
+        }
+    });
 }
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
@@ -6756,49 +6818,49 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         ),
         // A translated `W_DictObject.dstrategy` holds the address of the
         // non-zero-sized holder, not the zero-sized strategy implementation.
-        // These are the concrete prebuilt instances corresponding to PyPy's
-        // `space.fromcache(StrategyClass)` results and are therefore GCREF
-        // constants in the translated graph, exactly like the implementation
-        // rows above but with the identity the live dict slot actually reads.
-        ref_addr!(
+        // These are the concrete prebuilt GC instances corresponding to
+        // PyPy's `space.fromcache(StrategyClass)` results (`w_none` shape:
+        // OnceLock accessor, `malloc_typed_immortal`). The registered
+        // address is the GC object, not the lock.
+        (
             "dictmultiobject::OBJECT_DICT_STRATEGY_REF",
-            dictmultiobject::OBJECT_DICT_STRATEGY_REF
+            pyre_object::dictmultiobject::object_dict_strategy_ref() as *const _ as i64,
         ),
-        ref_addr!(
+        (
             "dictmultiobject::EMPTY_DICT_STRATEGY_REF",
-            dictmultiobject::EMPTY_DICT_STRATEGY_REF
+            pyre_object::dictmultiobject::empty_dict_strategy_ref() as *const _ as i64,
         ),
-        ref_addr!(
+        (
             "dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF",
-            dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF
+            pyre_object::dictmultiobject::empty_kwargs_dict_strategy_ref() as *const _ as i64,
         ),
-        ref_addr!(
+        (
             "dictmultiobject::BYTES_DICT_STRATEGY_REF",
-            dictmultiobject::BYTES_DICT_STRATEGY_REF
+            pyre_object::dictmultiobject::bytes_dict_strategy_ref() as *const _ as i64,
         ),
-        ref_addr!(
+        (
             "dictmultiobject::UNICODE_DICT_STRATEGY_REF",
-            dictmultiobject::UNICODE_DICT_STRATEGY_REF
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64,
         ),
-        ref_addr!(
+        (
             "dictmultiobject::INT_DICT_STRATEGY_REF",
-            dictmultiobject::INT_DICT_STRATEGY_REF
+            pyre_object::dictmultiobject::int_dict_strategy_ref() as *const _ as i64,
         ),
         ref_addr!(
             "identitydict::IDENTITY_DICT_STRATEGY",
             identitydict::IDENTITY_DICT_STRATEGY
         ),
-        ref_addr!(
+        (
             "identitydict::IDENTITY_DICT_STRATEGY_REF",
-            identitydict::IDENTITY_DICT_STRATEGY_REF
+            pyre_object::identitydict::identity_dict_strategy_ref() as *const _ as i64,
         ),
         ref_addr!(
             "kwargsdict::KWARGS_DICT_STRATEGY",
             kwargsdict::KWARGS_DICT_STRATEGY
         ),
-        ref_addr!(
+        (
             "kwargsdict::KWARGS_DICT_STRATEGY_REF",
-            kwargsdict::KWARGS_DICT_STRATEGY_REF
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref() as *const _ as i64,
         ),
         // `W_SetObject.strategy` holds the holder the same way; `w_set_new`
         // stores `EmptySetStrategy`'s.
@@ -6808,7 +6870,11 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         ),
         (
             "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
-            &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
+            crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
+        ),
+        (
+            "objspace::std::classdict::CLASS_DICT_STRATEGY_REF",
+            crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64,
         ),
         // Prebuilt object singletons (`None` / `NotImplemented` /
         // `Ellipsis` / `True` / `False`).  The accessors `w_none`,
@@ -6875,6 +6941,18 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
         (
             "stack_check::PYRE_STACKTOOBIG",
             &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64,
+        ),
+        // Process-global `FnPtrCell` alloc hooks. `try_gc_alloc_stable`
+        // reads `GC_ALLOC_STABLE_HOOK.get()`; without this row the Global
+        // place becomes a nullary Call on the static's path and the
+        // caller's lift dies as `not registered in CallRegistry`.
+        (
+            "gc_hook::GC_ALLOC_HOOK",
+            pyre_object::gc_hook::gc_alloc_hook_static_addr() as i64,
+        ),
+        (
+            "gc_hook::GC_ALLOC_STABLE_HOOK",
+            pyre_object::gc_hook::gc_alloc_stable_hook_static_addr() as i64,
         ),
         // `gil.py` `GILThreadLocals.gil_ready`. `static mut`, so the
         // address is the live cell: a translated field load must not
@@ -7235,6 +7313,45 @@ mod tests {
     }
 
     #[test]
+    fn jit_trace_fnaddrs_publishes_module_dict_getdictvalue_from_impl_row() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let mut expected = None;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.impl_fnaddr_binding()
+                == Some((
+                    "pyre_object::celldict",
+                    "ModuleDictStrategy",
+                    "_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+                ))
+            {
+                expected = Some(desc.get() as i64);
+            }
+        });
+        let expected = expected.expect("defining-crate impl-method trampoline");
+        for path in [
+            "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "pyre_object::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "pyre_object::celldict::ModuleDictStrategy::_getdictvalue_no_unwrapping_pure",
+            "pyre_object::ModuleDictStrategy::_getdictvalue_no_unwrapping_pure",
+        ] {
+            assert_eq!(
+                bindings.get(path),
+                Some(&expected),
+                "{path} must publish the defining-crate trampoline"
+            );
+        }
+        assert!(
+            !bindings
+                .contains_key("pyre_object::_orig__getdictvalue_no_unwrapping_pure_unlikely_name"),
+            "impl-method merge must not invent a {{crate}}::{{leaf}} short alias"
+        );
+        assert!(
+            !bindings.contains_key("pyre_object::_getdictvalue_no_unwrapping_pure"),
+            "impl-method merge must not invent a {{crate}}::{{leaf}} short alias"
+        );
+    }
+
+    #[test]
     fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         assert!(
@@ -7566,6 +7683,14 @@ mod tests {
                 "pyre_interpreter::baseobjspace::dict_display_setitem",
                 crate::opcode_ops::jit_baseobjspace_dict_display_setitem as *const () as usize
                     as i64,
+            ),
+            (
+                "pyre_interpreter::eval::store_name_value_w",
+                crate::opcode_ops::jit_eval_store_name_value_w as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::eval::store_global_value_w",
+                crate::opcode_ops::jit_eval_store_global_value_w as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::opcode_ops::set_add_value",
@@ -8071,19 +8196,23 @@ mod tests {
 
         assert_eq!(
             bindings["dictmultiobject::OBJECT_DICT_STRATEGY_REF"],
-            &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF as *const _ as i64
+            pyre_object::dictmultiobject::object_dict_strategy_ref() as *const _ as i64
         );
         assert_eq!(
             bindings["identitydict::IDENTITY_DICT_STRATEGY_REF"],
-            &pyre_object::identitydict::IDENTITY_DICT_STRATEGY_REF as *const _ as i64
+            pyre_object::identitydict::identity_dict_strategy_ref() as *const _ as i64
         );
         assert_eq!(
             bindings["kwargsdict::KWARGS_DICT_STRATEGY_REF"],
-            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF as *const _ as i64
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref() as *const _ as i64
         );
         assert_eq!(
             bindings["objspace::std::mapdict::MAP_DICT_STRATEGY_REF"],
-            &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64
+            crate::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64
+        );
+        assert_eq!(
+            bindings["objspace::std::classdict::CLASS_DICT_STRATEGY_REF"],
+            crate::objspace::std::classdict::class_dict_strategy_ref() as *const _ as i64
         );
         assert_eq!(
             bindings["stack_check::PYRE_STACKTOOBIG"],

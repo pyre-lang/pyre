@@ -269,7 +269,10 @@ pub fn residual_call<T: HostState>(
         }
         if nparams != nargs + 1 {
             return Err(Error::msg(format!(
-                "residual sret param count {nparams} != nargs {nargs} + 1"
+                "residual sret param count {nparams} != nargs {nargs} + 1 \
+                 (slot {slot}, result_size {result_size}, params {:?}, results {:?})",
+                ty.params().collect::<Vec<_>>(),
+                ty.results().collect::<Vec<_>>(),
             )));
         }
     } else if nargs != 0 && nargs != nparams {

@@ -3,6 +3,7 @@ pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use header::{
     GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
     GCFLAG_NO_HEAP_PTRS, GCFLAG_TRACK_YOUNG_PTRS, GCREF, GCREFOpaque, GcType,
+    is_immortal_header_payload,
 };
 
 /// `history.py` `ConstPtr` is rooted by the holder that stores the box

@@ -760,6 +760,15 @@ pub(crate) struct LiveFrameRegs {
     pub(crate) registers_i: RegisterBank,
     pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
+    /// Portal jitcode `last_instr` / `valuestackdepth` as of the CALL that
+    /// paused this frame (`_opimpl_setfield_vable` /
+    /// `_opimpl_setarrayitem_vable` before the helper). Guard snapshots
+    /// during the helper walk use the opcode-entry image mirrored onto
+    /// `virtualizable_boxes`; a ForceQuasiImmutable abort resumes this
+    /// MIFrame at the CALL's `next_pc` (`blackhole.py
+    /// _setup_return_value_*`) and needs this abort-point pair.
+    abort_point_valuestackdepth: Option<usize>,
+    abort_point_last_instr: Option<isize>,
 }
 
 impl LiveFrameRegs {
@@ -774,7 +783,16 @@ impl LiveFrameRegs {
             registers_i: registers_i.clone(),
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
+            abort_point_valuestackdepth: None,
+            abort_point_last_instr: None,
         }
+    }
+
+    pub(crate) fn abort_point_scalars(&self) -> (Option<usize>, Option<isize>) {
+        (
+            self.abort_point_valuestackdepth,
+            self.abort_point_last_instr,
+        )
     }
 
     pub(crate) fn frame_state(&self) -> &WalkFrameState {
@@ -4047,6 +4065,11 @@ impl DispatchError {
                     blackhole_required: true,
                     ..
                 }
+                // A live tracer is a stop-tracing decision at a Python
+                // dispatch boundary, not a missing register. Like
+                // `blackhole.py convert_and_run_from_pyjitpl`, continue from
+                // the live image; entry replay would repeat hook events.
+                | Self::PortalFrameTracerArmed { .. }
                 // Forcing the watcher leaves every register bound.
                 | Self::ForceQuasiImmutable { .. }
                 // Emitted only after both segment-cut blackhole preflights
@@ -4079,7 +4102,6 @@ impl DispatchError {
             self,
             Self::AbortMarkerReached { .. }
                 | Self::AbortPermanentMarkerReached { .. }
-                | Self::PortalFrameTracerArmed { .. }
                 | Self::NotInTraceRequiresConcreteExecution { .. }
                 | Self::KwonlyDefaultsMappingRacedRecord { .. }
                 | Self::FunctionCodeRacedRecord { .. }
@@ -5134,6 +5156,27 @@ pub fn step<Sym: WalkSym>(
     // unless the full-body walk owns the virtualizable shadow and the
     // mirror is still valid.
     step_vstack_mirror(ctx, pc);
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` hands off the
+    // current frame before executing the next bytecode. Do the live-tracer
+    // admission at every Python dispatch boundary, including carrier/inline
+    // floors which have no explicit jit_merge_point. Reconcile the retired
+    // opcode's stack first so cancellation cannot replay its callback effects.
+    if let Some(active) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym)
+        && !active.0.code_ptr.is_null()
+        && active.0.metadata.built_as_portal
+        && std::ptr::eq(code.as_ptr(), active.0.jitcode.code.as_slice().as_ptr())
+        && active
+            .0
+            .metadata
+            .py_floor_by_jit_pc
+            .binary_search_by_key(&(pc as u32), |&(off, _)| off)
+            .is_ok()
+    {
+        let ec = pyre_interpreter::call::getexecutioncontext();
+        if !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() } {
+            return Err(DispatchError::PortalFrameTracerArmed { pc });
+        }
+    }
     let effects_before = fbw_executed_effect_count();
     let result = handle(&op, code, ctx);
     if matches!(
@@ -5186,13 +5229,35 @@ pub fn walk<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     let mut pc = start_pc;
+    let mut check_entry_tracer = true;
     loop {
         // A sub-walk error recovered inside an earlier opcode must not make a
         // later abort of this frame decline. The flag is raised again only
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
-        let (outcome, next_pc) = match step(code, pc, ctx) {
+        // A guard bridge may start inside dispatch_bytecode, after its
+        // portal marker. Cancel before its first concrete instruction, using
+        // the exact JitCode resume position rather than Python-opcode replay.
+        let entry_tracer_armed = check_entry_tracer
+            && !ctx.fbw_mode.transparent_helper_subwalk
+            && ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym).is_some_and(
+                |active| {
+                    !active.0.code_ptr.is_null()
+                        && std::ptr::eq(code.as_ptr(), active.0.jitcode.code.as_slice().as_ptr())
+                },
+            )
+            && {
+                let ec = pyre_interpreter::call::getexecutioncontext();
+                !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() }
+            };
+        check_entry_tracer = false;
+        let stepped = if entry_tracer_armed {
+            Err(DispatchError::PortalFrameTracerArmed { pc })
+        } else {
+            step(code, pc, ctx)
+        };
+        let (outcome, next_pc) = match stepped {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
             // sub-walk driver to push its callee.  Preserve this frame at the
@@ -12896,7 +12961,7 @@ pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
 }
 
 /// Pin one `executioncontext.py` `?` field on a boxed EC. Portal guards
-/// (`record_portal_tracefunc_guard` / `record_portal_profilefunc_guard`)
+/// (`record_execute_frame_tracefunc_guard` / `record_execute_frame_profilefunc_guard`)
 /// look the mutate descr up the same way; this helper exists so tests can
 /// record without a portal snapshot.
 #[cfg(test)]
@@ -14041,52 +14106,23 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// Read live off the running context rather than from a recorded box.  The
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
-/// was recorded — is `record_portal_tracefunc_guard` for a trace function and
-/// `record_portal_profilefunc_guard` (`profilefunc?`) for a profiler.
+/// was recorded — is `record_execute_frame_tracefunc_guard` for a trace function and
+/// `record_execute_frame_profilefunc_guard` (`profilefunc?`) for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
 }
 
-/// The global trace function `executioncontext.py gettrace` reads —
-/// `jit.promote(self.w_tracefunc)` — pinned NULL at the portal merge point.
-///
-/// The events an inlined callee owes a trace function are `call_trace` /
-/// `return_trace`, which `pyframe.py execute_frame` runs around the eval loop.
-/// Upstream traces through both, so whatever inlines the callee inlines their
-/// `gettrace()` reads with it and the compiled loop carries a guard; this
-/// walker synthesizes the call instead (`walker_ec_enter`, `inline_call.rs`)
-/// and records neither, so without a guard a loop compiled with no tracer goes
-/// on inlining — and silencing — its callees after one is installed.  Measured
-/// over a 100 000-iteration tail with `sys.settrace` armed from inside the
-/// loop: 1 043 `call` events for a callee the walker inlines, against 100 000
-/// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
-///
-/// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
-/// read starts from the portal's own `ec` red (`interp_jit.py reds =
-/// ['frame', 'ec']`) rather than a frame field; only a bridge whose red has
-/// not been seeded needs `walker_ensure_execution_context` to recover it from
-/// the frame.  The slot is `w_tracefunc?`, so the pin is a `QUASIIMMUT_FIELD`
-/// marker plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// The `GuardIsnull` is the `promote(None)` half.  The read is registered
-/// with the heapcache, so a run of merge points with no intervening call
-/// collapses to one loop-invariant read.
-///
-/// A trace recorded while the slot is ALREADY non-NULL records nothing: there
-/// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
-/// declines every Python-callee inline in that state, so the events come from
-/// the interpreter's own `execute_frame`.  `sys.setprofile` is the
-/// sibling `profilefunc?` pin (`record_portal_profilefunc_guard`), not
-/// this slot.
-fn record_portal_tracefunc_guard<Sym: WalkSym>(
+/// `executioncontext.py call_trace` promotes `w_tracefunc` before
+/// `pyframe.py execute_frame` dispatches a callee. Pin that read before the
+/// synthesized activation. `interp_jit.py PyFrame.dispatch` reads frame-local
+/// `debugdata.w_f_trace`, not the global hook at every merge point. Those
+/// frame reads and the profiling green protect active-frame hooks; extra
+/// global reads fragment call-free segments.
+fn record_execute_frame_tracefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    // An inlined callee's own header is not the portal loop the compiled code
-    // re-enters, and the sub-walk's boxes describe the callee frame.
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
         return Ok(());
@@ -14140,23 +14176,14 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     Ok(())
 }
 
-/// `executioncontext.py` `profilefunc?`.  We do not trace through
-/// `execute_frame`, so PyPy's `getfield + int_is_zero + guard_true` is
-/// not a compiled-loop read we have to replay.  The `?` watcher is what
-/// `setllprofile` needs: a compiled loop jumps to itself and never
-/// re-reads the `is_being_profiled` green, and GNI fails when the slot
-/// is written.  Recording the promote half here ate five ops of a
-/// `trace_limit=8` walk and fragmented `trace_too_long_effect_replay`
-/// (aborts 17→46, guard_failures 1247→7746).  Marker only, followed by the
-/// `GUARD_NOT_INVALIDATED` that `pyjitpl.py opimpl_record_quasiimmut_field`
-/// generates when the heapcache still needs one.
-fn record_portal_profilefunc_guard<Sym: WalkSym>(
+/// `executioncontext.py call_trace` / `leave` read `profilefunc?` around
+/// the activation. `setllprofile` forces existing frames and updates their
+/// `is_being_profiled` flag; generated dispatch promotes that green before
+/// every merge point, including bytecode-level C calls.
+fn record_execute_frame_profilefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Result<(), DispatchError> {
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(());
-    }
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() || unsafe { (*ec).profilefunc.is_some() } {
         return Ok(());
@@ -17156,15 +17183,16 @@ fn handle<Sym: WalkSym>(
                 }
             }
 
-            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
-            // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
-            // `dispatch_bytecode`'s jitted arm (`_d = self.debugdata` /
-            // `_d.w_f_trace`) is jitcode after `last_instr`, walked as
-            // ordinary `getfield_vable_r` / `goto_if_not_ptr_iszero`.
-            record_portal_tracefunc_guard(ctx, op.pc)?;
-            record_portal_profilefunc_guard(ctx, op.pc)?;
+            // Preserve the existing refusal to record with a live tracer.
+            // This is admission only: activation reads belong at call entry,
+            // and frame-local tracing is generated dispatch_bytecode jitcode.
+            // An inline retains its seeded-frame handoff and decline policy.
+            if !ctx.fbw_mode.inline_subwalk {
+                let ec = pyre_interpreter::call::getexecutioncontext();
+                if !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() } {
+                    return Err(DispatchError::PortalFrameTracerArmed { pc: op.pc });
+                }
+            }
 
             // `opimpl_jit_merge_point` (`pyjitpl.py`) with
             // `portal_call_depth > 0`: a generator resume is that nested

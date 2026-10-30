@@ -329,6 +329,12 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// outside [`Lowering::multi_assigned_locals`] enter, for the same
     /// reason as [`Lowering::atomic_ref_place`].
     pub(in crate::front::mir) scalar_address_locals: Vec<usize>,
+    /// Function-local primitive scalars whose address is a raw scalar
+    /// pointer argument. `local_var` holds the Char-varsize cell pointer;
+    /// reads `raw_load`, writes `raw_store`.
+    pub(in crate::front::mir) cell_locals: bit_set::BitSet,
+    pub(in crate::front::mir) cell_descr: Vec<Option<(ValueType, usize, bool)>>,
+    pub(in crate::front::mir) cell_has_storage_live: bit_set::BitSet,
     /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
     /// the variant's name.
     ///
@@ -1258,6 +1264,7 @@ impl<'a> Lowering<'a> {
         let forward_reached = forward_reachable_mask(llbc, body);
         let lowered = lowered_reachable_mask(llbc, body);
         let block_id = MirBlockMap::from_lowered(&mut graph, &lowered);
+        let cell_plan = collect_cell_scalar_locals(llbc, body, arg_count, &forward_reached);
         let mut extra_live = compute_index_write_extra_live(body, llbc, gc_struct_ids);
         let interior_live = compute_interior_field_extra_live(body, llbc, tombstoned_leaves);
         if extra_live.len() < interior_live.len() {
@@ -1319,7 +1326,15 @@ impl<'a> Lowering<'a> {
         for (bb_idx, locals) in owner_dead.into_iter().enumerate() {
             extra_live[bb_idx].extend(locals);
         }
-        let mut block_live_in = compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops);
+        let cell_extra = cell_scope_extra_live(llbc, body, &cell_plan, &forward_reached);
+        if extra_live.len() < cell_extra.len() {
+            extra_live.resize(cell_extra.len(), Vec::new());
+        }
+        for (bb_idx, locals) in cell_extra.into_iter().enumerate() {
+            extra_live[bb_idx].extend(locals);
+        }
+        let mut block_live_in =
+            compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops, &cell_plan.locals);
         // The erased guard, its borrows, its `base()` results, the
         // `base + k` and `shadow_stack_len` indices, the `pin_roots`
         // argument temporaries and the closure-capture temporaries bind no
@@ -1430,6 +1445,17 @@ impl<'a> Lowering<'a> {
             ]);
             local_var[local] = Some(LocalValue::One(items));
         }
+        for local in cell_plan.locals.iter() {
+            if cell_plan.has_storage_live.contains(local) {
+                continue;
+            }
+            let Some((_, itemsize, _)) = cell_plan.descr.get(local).and_then(|d| d.as_ref()) else {
+                continue;
+            };
+            let start = graph.startblock;
+            let ptr = emit_raw_cell_malloc(&mut graph, start, *itemsize);
+            local_var[local] = Some(LocalValue::One(ptr));
+        }
         if !block_entry_local_var.is_empty() {
             block_entry_local_var[0] = PackedLocalRow::pack(&link_words_of(&local_var));
         }
@@ -1530,6 +1556,9 @@ impl<'a> Lowering<'a> {
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
             scalar_address_locals: Vec::new(),
+            cell_locals: cell_plan.locals,
+            cell_descr: cell_plan.descr,
+            cell_has_storage_live: cell_plan.has_storage_live,
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
@@ -2472,14 +2501,28 @@ impl<'a> Lowering<'a> {
         kind: StmtKind,
     ) -> Result<(), LowerError> {
         match kind {
-            // `StorageLive` carries no IR. `StorageDead` of a window pair
-            // plants `objectmodel.keepalive_until_here` on the GC owner
-            // after the last use of the window local.
-            StmtKind::StorageLive(_) | StmtKind::Borrowck(_) => Ok(()),
-            StmtKind::StorageDead(local) => {
-                self.emit_window_owner_keepalive(mir_bb, local as usize);
+            // `StorageLive` carries no IR except for a scoped Char-varsize
+            // cell (`lltype.py` `ScopedAlloc.__enter__`). `StorageDead` of
+            // a window pair plants `objectmodel.keepalive_until_here` on
+            // the GC owner after the last use of the window local; a cell
+            // local is `raw_free`'d (`ScopedAlloc.__exit__`).
+            StmtKind::StorageLive(local) => {
+                let local = local as usize;
+                if self.is_cell_local(local) && self.cell_has_storage_live.contains(local) {
+                    self.emit_cell_free(mir_bb, local)?;
+                    self.emit_cell_malloc_bind(mir_bb, local)?;
+                }
                 Ok(())
             }
+            StmtKind::StorageDead(local) => {
+                let local = local as usize;
+                if self.is_cell_local(local) {
+                    self.emit_cell_free(mir_bb, local)?;
+                }
+                self.emit_window_owner_keepalive(mir_bb, local);
+                Ok(())
+            }
+            StmtKind::Borrowck(_) => Ok(()),
 
             // `let _ = place` — read for side-effect tracking only.
             // The JIT does not need to materialize anything.
@@ -2633,6 +2676,11 @@ impl<'a> Lowering<'a> {
             }
             return Ok(());
         }
+        if self.cell_address_escapes_scope(&dest, &rvalue) {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: raw scalar spill address would escape the storage scope"
+            )));
+        }
         let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
@@ -2781,6 +2829,18 @@ impl<'a> Lowering<'a> {
                     self.positional_aggregate_locals.remove(&dest_local);
                     return Ok(());
                 }
+                if self.is_cell_local(dest_local) {
+                    let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                    if let Some(op) = op {
+                        let bb_id = self.emit_bb(mir_bb);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(result_var.clone()),
+                            kind: op,
+                        });
+                    }
+                    self.emit_cell_store(mir_bb, dest_local, result_var)?;
+                    return Ok(());
+                }
                 if self.list_view_locals.contains(&dest_local)
                     && tyref_is_u8_window(&dest_ty, self.llbc)
                 {
@@ -2927,6 +2987,17 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         match term {
             TermKind::Return => {
+                if let Some(ret) = self
+                    .local_var
+                    .get(0)
+                    .and_then(|slot| slot.as_ref())
+                    .and_then(|value| value.one().ok())
+                    && self.variable_is_cell_ptr(&ret)
+                {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: raw scalar spill address would escape the storage scope"
+                    )));
+                }
                 // A `-> ()` body materializes its implicit return as a
                 // unit aggregate (`_0 = ()`), which lowers to a
                 // Ref-typed transparent ctor.  Feeding that into the
@@ -2949,6 +3020,7 @@ impl<'a> Lowering<'a> {
                         );
                     }
                 }
+                self.free_bound_cells(mir_bb)?;
                 if is_unit_type(&self.body.locals.locals[0].ty, self.llbc) {
                     self.graph.set_return(bb_id, None);
                     return Ok(());
@@ -3005,6 +3077,7 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             TermKind::Abort(_) | TermKind::Panic { .. } | TermKind::UndefinedBehavior => {
+                self.free_bound_cells(mir_bb)?;
                 // A Rust panic-abort (`unreachable!()`, `panic!`,
                 // failed `unwrap`), Charon `TerminatorKind::Panic`,
                 // or Charon `TerminatorKind::UndefinedBehavior`.
@@ -3027,6 +3100,7 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             TermKind::UnwindResume | TermKind::UnwindTerminate => {
+                self.free_bound_cells(mir_bb)?;
                 // Unwind-table cleanup resume, or Charon
                 // `TerminatorKind::UnwindTerminate`.  Its only inbound edges
                 // are `on_unwind` edges, all of which this lowering
@@ -3202,10 +3276,11 @@ impl<'a> Lowering<'a> {
             }
             SwitchTargets::SwitchInt(_int_ty, arms, default) => {
                 // A `SwitchInt` on a one-word niche `Option` discriminant
-                // switches on the pointer null-test `ne(base, null)` — a
-                // `SomeBool`, not an `Int` tag.  RPython never switches on a
-                // bool: `None`/`Some` on a maybe-null `Ptr` is a True/False
-                // `If` (`ptr_nonzero`).  Route it through `set_branch` so the
+                // switches on a pointer null-test (`bool(p)` /
+                // `ne(base, null)`) — a `SomeBool`, not an `Int` tag.
+                // RPython never switches on a bool: `None`/`Some` on a
+                // maybe-null `Ptr` is a True/False `If` (`ptr_nonzero`).
+                // Route it through `set_branch` so the
                 // bool exitswitch closes with `ExitCase::Bool`, matching the
                 // `If` terminator path; a `SwitchInt` here would emit
                 // `ExitCase::Const(Int)`, which rtype rejects against the
@@ -3261,13 +3336,14 @@ impl<'a> Lowering<'a> {
     }
 
     /// Close a `SwitchInt` whose discriminant is a one-word niche `Option`
-    /// null-test (`ne(base, null)`, a `SomeBool`) as a True/False `If` via
-    /// [`FunctionGraph::set_branch`], so the bool exitswitch closes with
-    /// `ExitCase::Bool` instead of `ExitCase::Const(Int)`.  `Some` = tag 1 =
-    /// non-null → the `if_true` arm; `None` = tag 0 = null → the `if_false`
-    /// arm.  A two-variant match lowers to one explicit `(scalar, bb)` arm
-    /// plus a `default` covering the complementary tag, so whichever of {0,1}
-    /// is absent from `arms` is taken from `default` (the same 0/1/default
+    /// null-test as a True/False `If` via [`FunctionGraph::set_branch`], so
+    /// the bool exitswitch closes with `ExitCase::Bool` instead of
+    /// `ExitCase::Const(Int)`.  Every niche Discriminant is Some=1
+    /// (`bool(p)` / `ne` / `eq(is_none, false)`): `Some` = tag 1 = non-null
+    /// → the `if_true` arm; `None` = tag 0 = null → the `if_false` arm.
+    /// A two-variant match lowers to one explicit `(scalar, bb)` arm plus a
+    /// `default` covering the complementary tag, so whichever of {0,1} is
+    /// absent from `arms` is taken from `default` (the same 0/1/default
     /// triage as [`crate::front::result_exc::split_diamond_exits`]); a
     /// both-explicit shape (`arms.len() == 2`, no live default) is tolerated.
     pub(in crate::front::mir) fn lower_niche_option_switch(
@@ -3310,14 +3386,16 @@ impl<'a> Lowering<'a> {
         }
         let some_bb = some_bb.expect("some arm resolved above");
         let none_bb = none_bb.expect("none arm resolved above");
-        let true_args = self.edge_args(mir_bb, some_bb as usize)?;
-        let false_args = self.edge_args(mir_bb, none_bb as usize)?;
+        // Discriminant value is Some=1 (`bool(p)` / `ne` / `eq(is_none, false)`).
+        let (true_bb, false_bb) = (some_bb, none_bb);
+        let true_args = self.edge_args(mir_bb, true_bb as usize)?;
+        let false_args = self.edge_args(mir_bb, false_bb as usize)?;
         self.graph.set_branch(
             bb_id,
             discr_var,
-            self.block_id[some_bb as usize],
+            self.block_id[true_bb as usize],
             true_args,
-            self.block_id[none_bb as usize],
+            self.block_id[false_bb as usize],
             false_args,
         );
         Ok(())

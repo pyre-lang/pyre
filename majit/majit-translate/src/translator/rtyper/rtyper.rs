@@ -2524,6 +2524,89 @@ impl RPythonTyper {
                     GenopResult::LLType(result_lltype),
                 ))
             }
+            // `rtype_malloc` genops `malloc(TYPE, flags)` /
+            // `malloc_varsize(TYPE, flags, n)` with `MemoryError`.
+            // TYPE stays a Void-typed constant whose `.value` is the
+            // `LowLevelType` `jtransform.py _rewrite_raw_malloc` reads.
+            "malloc" => {
+                if hop.nb_args() != 2 {
+                    return Err(TyperError::message(
+                        "malloc: lltype.malloc(TYPE, flags) needs 2 args",
+                    ));
+                }
+                let v_type = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Void), 0)?;
+                let v_flags = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Void), 1)?;
+                hop.has_implicit_exception("MemoryError");
+                hop.exception_is_here()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message("malloc: r_result not populated before genop")
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "malloc",
+                    vec![v_type, v_flags],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
+            "malloc_varsize" => {
+                if hop.nb_args() != 3 {
+                    return Err(TyperError::message(
+                        "malloc_varsize: lltype.malloc(TYPE, n, flags) needs 3 args",
+                    ));
+                }
+                let v_type = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Void), 0)?;
+                let v_flags = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Void), 1)?;
+                let v_n = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 2)?;
+                hop.has_implicit_exception("MemoryError");
+                hop.exception_is_here()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message("malloc_varsize: r_result not populated before genop")
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "malloc_varsize",
+                    vec![v_type, v_flags, v_n],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
+            // `rtype_free` genops `free(p, flags)`; the call cannot raise.
+            // `GenopResult::Void` drops the result Variable;
+            // `translate_no_return_value` then rejects `s_None`. Keep the
+            // Void lowleveltype on the result, matching `raw_store`.
+            "free" => {
+                if hop.nb_args() != 2 {
+                    return Err(TyperError::message(
+                        "free: lltype.free(p, flags) needs 2 args",
+                    ));
+                }
+                let v_ptr = hop.inputarg_llop_intkind_or_signed(0)?;
+                let v_flags = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Void), 1)?;
+                hop.exception_cannot_occur()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message("free: r_result not populated before genop")
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "free",
+                    vec![v_ptr, v_flags],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
             // `llop.threadlocalref_get` (`rthread.py ThreadLocalField.getraw`).
             // Front emits BinOp (offset, loop_invariant); only the offset
             // is an llop operand. The flag selects ExtraEffect in

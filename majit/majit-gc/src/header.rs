@@ -11,6 +11,9 @@
 //! bits, just like a translated 32-bit PyPy.  The upper four bytes are ABI
 //! padding, not an extension of either field.
 
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::GcFlags;
 
 /// Number of bits reserved for the type ID in the lower half.
@@ -314,6 +317,182 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
     alloc_with_gc_header_flags(value, GcHeader::new(type_id))
 }
 
+/// Dedicated host mapping for [`alloc_with_gc_header_immortal`]. MiniMark's
+/// `get_actual_typeid` reads `HDR.tid` only inside nursery/oldgen
+/// (`incminimark.py` `get_type_id`); a `std::alloc` immortal sits outside
+/// those ranges, so the foreign classptr path would misread a non-object
+/// payload. Birth here makes membership a range test over every published
+/// segment. The typeid still lives on the header. Segments are `std::alloc`
+/// (wasm32 has no mmap). An object never leaves this arena: when the current
+/// segment is full a new one is published, up to
+/// [`IMMORTAL_ARENA_MAX_SEGMENTS`].
+const IMMORTAL_ARENA_FIRST_CAP: usize = 8 * 1024 * 1024;
+const IMMORTAL_ARENA_MAX_SEG_CAP: usize = 64 * 1024 * 1024;
+const IMMORTAL_ARENA_MAX_SEGMENTS: usize = 64;
+
+struct ImmortalSegment {
+    /// Segment base, 0 until published with Release.
+    base: AtomicUsize,
+    cap: AtomicUsize,
+    bump: AtomicUsize,
+}
+
+struct ImmortalArena {
+    segments: [ImmortalSegment; IMMORTAL_ARENA_MAX_SEGMENTS],
+    /// Count of published segments; readers load Acquire.
+    nseg: AtomicUsize,
+    /// 0/1 grower lock so only one thread publishes the next segment.
+    growing: AtomicUsize,
+}
+
+static IMMORTAL_ARENA: OnceLock<ImmortalArena> = OnceLock::new();
+
+fn empty_segment() -> ImmortalSegment {
+    ImmortalSegment {
+        base: AtomicUsize::new(0),
+        cap: AtomicUsize::new(0),
+        bump: AtomicUsize::new(0),
+    }
+}
+
+fn immortal_arena() -> &'static ImmortalArena {
+    IMMORTAL_ARENA.get_or_init(|| ImmortalArena {
+        segments: std::array::from_fn(|_| empty_segment()),
+        nseg: AtomicUsize::new(0),
+        growing: AtomicUsize::new(0),
+    })
+}
+
+fn segment_cap_for(idx: usize, min_total: usize) -> usize {
+    let shift = idx.min(3);
+    let mut cap = IMMORTAL_ARENA_FIRST_CAP.saturating_mul(1usize << shift);
+    cap = cap.min(IMMORTAL_ARENA_MAX_SEG_CAP).max(min_total);
+    let align = GcHeader::SIZE;
+    cap.checked_add(align - 1)
+        .map(|n| n & !(align - 1))
+        .unwrap_or(min_total)
+}
+
+fn immortal_oom(total: usize, align: usize) -> ! {
+    let layout = std::alloc::Layout::from_size_align(total.max(1), align.max(1))
+        .unwrap_or_else(|_| std::alloc::Layout::from_size_align(1, 1).unwrap());
+    std::alloc::handle_alloc_error(layout);
+}
+
+impl ImmortalArena {
+    fn ensure_segment(&self, idx: usize, min_total: usize) {
+        if idx >= IMMORTAL_ARENA_MAX_SEGMENTS {
+            immortal_oom(min_total, GcHeader::SIZE);
+        }
+        loop {
+            if self.nseg.load(Ordering::Acquire) > idx {
+                return;
+            }
+            if self
+                .growing
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                while self.nseg.load(Ordering::Acquire) <= idx
+                    && self.growing.load(Ordering::Acquire) != 0
+                {
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+            if self.nseg.load(Ordering::Acquire) > idx {
+                self.growing.store(0, Ordering::Release);
+                return;
+            }
+            let cap = segment_cap_for(idx, min_total);
+            let layout = std::alloc::Layout::from_size_align(cap, GcHeader::SIZE)
+                .expect("immortal segment layout");
+            let mem = unsafe { std::alloc::alloc(layout) };
+            if mem.is_null() {
+                self.growing.store(0, Ordering::Release);
+                std::alloc::handle_alloc_error(layout);
+            }
+            let seg = &self.segments[idx];
+            seg.cap.store(cap, Ordering::Relaxed);
+            seg.bump.store(0, Ordering::Relaxed);
+            seg.base.store(mem as usize, Ordering::Release);
+            self.nseg.store(idx + 1, Ordering::Release);
+            self.growing.store(0, Ordering::Release);
+            return;
+        }
+    }
+}
+
+fn alloc_immortal_raw(total: usize, align: usize) -> *mut u8 {
+    let arena = immortal_arena();
+    let align = align.max(1);
+    let mask = align - 1;
+    loop {
+        let n = arena.nseg.load(Ordering::Acquire);
+        if n == 0 {
+            arena.ensure_segment(0, total);
+            continue;
+        }
+        let idx = n - 1;
+        let seg = &arena.segments[idx];
+        let base = seg.base.load(Ordering::Acquire);
+        if base == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let cap = seg.cap.load(Ordering::Relaxed);
+        let off = seg.bump.load(Ordering::Relaxed);
+        let aligned = off.wrapping_add(mask) & !mask;
+        match aligned.checked_add(total) {
+            Some(next) if next <= cap => {
+                if seg
+                    .bump
+                    .compare_exchange_weak(off, next, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return (base + aligned) as *mut u8;
+                }
+            }
+            _ => {
+                if n >= IMMORTAL_ARENA_MAX_SEGMENTS {
+                    immortal_oom(total, align);
+                }
+                arena.ensure_segment(n, total);
+            }
+        }
+    }
+}
+
+/// Whether `addr` is a payload from [`alloc_with_gc_header_immortal`]'s arena.
+///
+/// `get_actual_typeid` uses this to read `HDR.tid` for prebuilts that are
+/// not MiniMark nursery/oldgen objects (`w_not_implemented`, process-wide
+/// `DictStrategyRef` holders, interned exact-str wrappers). Checks every
+/// published segment.
+#[inline]
+pub fn is_immortal_header_payload(addr: usize) -> bool {
+    let Some(arena) = IMMORTAL_ARENA.get() else {
+        return false;
+    };
+    let n = arena
+        .nseg
+        .load(Ordering::Acquire)
+        .min(IMMORTAL_ARENA_MAX_SEGMENTS);
+    for i in 0..n {
+        let seg = &arena.segments[i];
+        let base = seg.base.load(Ordering::Acquire);
+        if base == 0 || addr < base {
+            continue;
+        }
+        let off = addr - base;
+        let used = seg.bump.load(Ordering::Acquire);
+        if off >= GcHeader::SIZE && off <= used {
+            return true;
+        }
+    }
+    false
+}
+
 /// [`alloc_with_gc_header`] for a genuine immortal leaf — `init_gc_object_immortal`
 /// (`NO_HEAP_PTRS | TRACK_YOUNG_PTRS`), incminimark's prebuilt shape.
 ///
@@ -335,13 +514,25 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
 /// never-updated slots into freed memory. See [`alloc_with_gc_header`] for the
 /// measured failure that rule comes from.
 pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
-    alloc_with_gc_header_flags(
-        value,
-        GcHeader::with_flags(
-            type_id,
-            crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
-        ),
-    )
+    const {
+        assert!(
+            std::mem::align_of::<T>() <= GcHeader::SIZE,
+            "alloc_with_gc_header_immortal: align_of::<T>() exceeds GcHeader::SIZE; the fixed obj - SIZE header offset would misalign the payload",
+        )
+    };
+    let header = GcHeader::with_flags(
+        type_id,
+        crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
+    );
+    let total = GcHeader::SIZE + std::mem::size_of::<T>();
+    let align = std::mem::align_of::<T>().max(GcHeader::SIZE);
+    let raw = alloc_immortal_raw(total, align);
+    unsafe {
+        (raw as *mut GcHeader).write(header);
+        let ptr = raw.add(GcHeader::SIZE) as *mut T;
+        ptr.write(value);
+        ptr
+    }
 }
 
 /// Varsize analogue of [`alloc_with_gc_header_immortal`].
@@ -351,7 +542,9 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
 /// `incminimark.py`). The returned pointer is the address after the header, so
 /// `{hash, len, chars}` readers stay unchanged. A payload holds no GC pointer,
 /// so it is a true leaf (`GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`).
-/// Returns null on overflow or allocation failure.
+/// Returns null on payload-size overflow. Arena exhaustion aborts rather
+/// than allocating outside the immortal range (`get_actual_typeid` would
+/// otherwise misread `HDR.tid`).
 ///
 /// `malloc_varsize` + `init_gc_object_immortal`. Opaque to the tracer so the
 /// dispatcher does not look inside.
@@ -378,27 +571,28 @@ fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
     type_id: u32,
     zeroed: bool,
 ) -> *mut u8 {
-    let Some(layout) = varsize_immortal_layout(payload_size) else {
+    let Some(total) = GcHeader::SIZE.checked_add(payload_size) else {
         return std::ptr::null_mut();
     };
+    let raw = alloc_immortal_raw(total, GcHeader::SIZE);
     unsafe {
-        let raw = if zeroed {
-            std::alloc::alloc_zeroed(layout)
-        } else {
-            std::alloc::alloc(layout)
-        };
-        if raw.is_null() {
-            return std::ptr::null_mut();
-        }
         (raw as *mut GcHeader).write(GcHeader::with_flags(
             type_id,
             crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
         ));
-        raw.add(GcHeader::SIZE)
+        let payload = raw.add(GcHeader::SIZE);
+        if zeroed {
+            std::ptr::write_bytes(payload, 0, payload_size);
+        }
+        payload
     }
 }
 
 /// Free a payload returned by [`alloc_varsize_with_gc_header_immortal`].
+///
+/// Arena payloads are immortal (`init_gc_object_immortal`) and are never
+/// deallocated. A non-arena pointer keeps the historical `std::alloc`
+/// layout free for callers that still hold one.
 ///
 /// # Safety
 /// `payload` must be a live pointer from that allocator, and `payload_size`
@@ -406,6 +600,9 @@ fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
 #[majit_macros::dont_look_inside]
 pub unsafe fn dealloc_varsize_with_gc_header(payload: GCREF, payload_size: usize) {
     if payload.is_null() {
+        return;
+    }
+    if is_immortal_header_payload(payload as usize) {
         return;
     }
     let layout = varsize_immortal_layout(payload_size).expect("dealloc_varsize_with_gc_header");
@@ -556,6 +753,21 @@ mod tests {
             assert!(!(*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert!(!(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
         }
+        assert!(!is_immortal_header_payload(p as usize));
+    }
+
+    #[test]
+    fn alloc_with_gc_header_immortal_is_an_arena_payload() {
+        let p = alloc_with_gc_header_immortal(0xABCDu64, 0x99);
+        unsafe {
+            assert_eq!(*p, 0xABCD);
+            let hdr = header_of(p as usize);
+            assert_eq!((*hdr).type_id(), 0x99);
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        }
+        assert!(is_immortal_header_payload(p as usize));
+        assert!(!is_immortal_header_payload(0));
     }
 
     #[test]
@@ -569,7 +781,56 @@ mod tests {
             assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
             assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert_eq!(*(p as *const u64), 0x1111_2222_3333_4444);
+            assert!(is_immortal_header_payload(p as usize));
             dealloc_varsize_with_gc_header(p.cast(), 16);
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "dealloc must not drop an arena payload"
+            );
+            assert_eq!((*header_of(p as usize)).type_id(), 0x2468);
+        }
+    }
+
+    #[test]
+    fn immortal_arena_grows_across_segments_and_keeps_typeids() {
+        const N: usize = 20;
+        const PAYLOAD: usize = 512 * 1024;
+        let mut ptrs: Vec<(*mut u8, u32)> = Vec::with_capacity(N + 8);
+        for i in 0..N {
+            let tid = 0xB100 + i as u32;
+            let p = alloc_varsize_with_gc_header_immortal(PAYLOAD, tid);
+            assert!(!p.is_null(), "varsize immortal {i}");
+            unsafe {
+                *p = i as u8;
+                assert_eq!((*header_of(p as usize)).type_id(), tid);
+            }
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "varsize {i} must stay in the arena"
+            );
+            ptrs.push((p, tid));
+        }
+        for i in 0..8 {
+            let tid = 0xC100 + i as u32;
+            let p = alloc_with_gc_header_immortal(0xFEEDu64, tid);
+            unsafe {
+                assert_eq!(*p, 0xFEED);
+                assert_eq!((*header_of(p as usize)).type_id(), tid);
+            }
+            assert!(
+                is_immortal_header_payload(p as usize),
+                "fixed {i} must stay in the arena"
+            );
+            ptrs.push((p as *mut u8, tid));
+        }
+        for (p, tid) in &ptrs {
+            assert!(
+                is_immortal_header_payload(*p as usize),
+                "cross-segment payload tid={tid} must remain a member"
+            );
+            unsafe {
+                assert_eq!((*header_of(*p as usize)).type_id(), *tid);
+            }
         }
     }
 

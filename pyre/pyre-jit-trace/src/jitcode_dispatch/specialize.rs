@@ -2535,7 +2535,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             ctx,
             op_pc,
             dict_op,
-            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
+            pyre_interpreter::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
         )?;
 
         let carrier_op =
@@ -6572,7 +6572,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             ctx,
             op_pc,
             strategy,
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64,
         )?;
         walker_guard_exact_str(ctx, op_pc, key_op)?;
 
@@ -7642,9 +7642,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
         Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
-        Some(B::And | B::InplaceAnd) => OpCode::IntAnd,
-        Some(B::Or | B::InplaceOr) => OpCode::IntOr,
-        Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
         Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder) => {
             OpCode::CallI
         }
@@ -7675,10 +7672,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
         let is_div = matches!(op, Some(B::FloorDivide | B::InplaceFloorDivide));
         walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, is_div)
-    } else if matches!(
-        opcode,
-        OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
-    ) {
+    } else {
         let (raw, ovf_flag) = record_int_ovf(ctx, op_pc, opcode, lhs_raw, rhs_raw, Some((la, rb)))?;
         let heap_ovf = match opcode {
             OpCode::IntAddOvf => la.checked_add(rb).is_none(),
@@ -7714,37 +7708,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
             return Ok(None);
         };
         (raw, concrete)
-    } else {
-        let raw = ctx.trace_ctx.record_op(opcode, &[lhs_raw, rhs_raw]);
-        let concrete = match opcode {
-            OpCode::IntAnd => la & rb,
-            OpCode::IntOr => la | rb,
-            OpCode::IntXor => la ^ rb,
-            _ => return Ok(None),
-        };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(concrete));
-        (raw, concrete)
     };
-    let lhs_obj = lhs_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(lhs_obj);
-    let rhs_obj = rhs_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(rhs_obj);
-    let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
-    if both_bools && matches!(opcode, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor) {
-        let observed = concrete != 0;
-        let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
-            return Ok(None);
-        };
-        let _ = (dst, dst_bank);
-        return Ok(Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }));
-    }
     // `walker_box_int` records `wrapint` and that recording can minor-collect.
     // Allocate the concrete after it and stamp before the next call, the
     // same order as `walker_read_int_mutable_cell`. A `w_int_new` before
@@ -10844,7 +10808,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
         canonical_dict,
     )?;
 
-    let strategy_ref = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64;
+    let strategy_ref = pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64;
     let lookup_helper = pyre_interpreter::residual_word_addr!(
         2,
         crate::helpers::jit_dict_exact_unicode_lookup_or_null
@@ -10977,7 +10941,7 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         ctx,
         op_pc,
         dict_op,
-        &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
+        pyre_object::dictmultiobject::int_dict_strategy_ref() as *const _ as i64,
     )?;
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     walker_guard_exact_instance(
@@ -16663,6 +16627,15 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     };
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
+        // The saved pair is the abort-point image portal jitcode wrote
+        // (`_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` before
+        // this CALL). Guard snapshots during the helper walk need the
+        // opcode-entry `last_instr` / `valuestackdepth` mirrored below;
+        // a ForceQuasiImmutable multi-frame blackhole resumes this
+        // MIFrame at the CALL's `next_pc` (`blackhole.py
+        // _setup_return_value_*`) and reads the abort-point off the
+        // paused portal `LiveFrameRegs`.
+        super::vable_ops::record_paused_portal_abort_point(ctx.session, ctx.trace_ctx);
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -16749,6 +16722,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = saved_lookup;
     if let Some(saved) = saved_vable {
         crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
+        super::vable_ops::clear_paused_portal_abort_point(ctx.session);
     }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
@@ -16798,7 +16772,16 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
     let sym = unsafe { &*sym_ptr };
     let nested_entry = orthodox_helper_nested_entry(ctx, op_pc, HelperReturn::CallResult)
         .map_err(|_| DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?;
-    run_orthodox_helper_subwalk(
+    // `do_residual_or_indirect_call` keeps the caller `MIFrame` current
+    // while `perform_call` / `newframe` pushes the callee (`pyjitpl.py`).
+    // `helper_subwalk_level` therefore numbers the caller at the CALL;
+    // install the callee index only after that pause, matching
+    // `walk_translated_builtin_wrapper`.
+    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+    if let Some(index) = residual_call::helper_index_for_sub_body(sub_body) {
+        ctx.fbw_mode.transparent_helper_jitcode_index = Some(index);
+    }
+    let result = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
@@ -16812,7 +16795,9 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
         ref_arg_concretes,
         float_args,
     )
-    .map(|(outcome, _)| outcome)
+    .map(|(outcome, _)| outcome);
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
+    result
 }
 
 /// Re-read a ref the collector may have moved.

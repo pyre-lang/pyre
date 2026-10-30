@@ -29,12 +29,19 @@ pub unsafe trait FieldlessEnumArg: Copy {
 #[derive(Clone, Copy)]
 pub struct HelperFnAddr {
     /// `concat!(module_path!(), "::", stringify!(name))` of the annotated
-    /// function — the `FunctionPath` a residual call names.
+    /// function — the `FunctionPath` a residual call names. Inherent `&self`
+    /// trampolines keep this free-function spelling and carry the impl type
+    /// in [`Self::impl_fnaddr_binding`].
     pub path: &'static str,
     /// Trampoline pointer captured in the defining crate.
     addr: *const (),
     /// Argument count in source order, matching the trampoline.
     pub arity: u8,
+    /// `Some(type_name::<Self>())` for an inherent `&self` trampoline, the
+    /// string itself captured in the defining impl. Free functions leave
+    /// this `None`. `#[jit_module]` records the same triple as
+    /// `(module_path!(), impl_type_as_written, method)`.
+    impl_type_name: Option<&'static str>,
 }
 
 // Safety: `path` is `'static` and `addr` is a process-global function
@@ -46,12 +53,92 @@ impl HelperFnAddr {
     /// Build a registry row. Called from a `const` static initializer in the
     /// defining crate, where `fn as *const ()` is a valid initializer.
     pub const fn new(path: &'static str, addr: *const (), arity: u8) -> Self {
-        Self { path, addr, arity }
+        Self {
+            path,
+            addr,
+            arity,
+            impl_type_name: None,
+        }
+    }
+
+    /// Registry row for an inherent `&self` trampoline.
+    ///
+    /// `impl_type_name` is `type_name::<Self>()` captured in the impl so
+    /// [`Self::impl_fnaddr_binding`] can feed
+    /// `CallControl::register_macro_impl_helper_trace_fnaddr`. The ctor
+    /// evaluates the string in the defining crate; merge must not call a
+    /// `fn() -> &'static str` table slot to recover it.
+    pub const fn new_impl_method(
+        path: &'static str,
+        addr: *const (),
+        arity: u8,
+        impl_type_name: &'static str,
+    ) -> Self {
+        Self {
+            path,
+            addr,
+            arity,
+            impl_type_name: Some(impl_type_name),
+        }
     }
 
     /// Address captured in the defining crate, as a `usize`.
     pub fn get(&self) -> usize {
         self.addr as usize
+    }
+
+    /// Inherent `&self` trampoline, keyed as `module::Type::method`.
+    pub fn is_impl_method(&self) -> bool {
+        self.impl_type_name.is_some()
+    }
+
+    /// `(module_path_with_crate, impl_type_as_written, method)` for
+    /// `CallControl::register_macro_impl_helper_trace_fnaddr`.
+    ///
+    /// `impl_type_as_written` is the suffix of `type_name::<Self>()` after
+    /// `module_path!()`, or after the crate segment when the impl type lives
+    /// in another module — the same bare / qualified spelling `#[jit_module]`
+    /// takes from the `impl` header.
+    pub fn impl_fnaddr_binding(&self) -> Option<(&'static str, &'static str, &'static str)> {
+        let type_name = self.impl_type_name?;
+        let (module, method) = self.path.rsplit_once("::")?;
+        let impl_type = type_name
+            .strip_prefix(module)
+            .and_then(|rest| rest.strip_prefix("::"))
+            .filter(|rest| !rest.is_empty())
+            .or_else(|| {
+                let crate_name = module.split_once("::").map(|(crate_name, _)| crate_name)?;
+                type_name
+                    .strip_prefix(crate_name)
+                    .and_then(|rest| rest.strip_prefix("::"))
+                    .filter(|rest| !rest.is_empty())
+            })
+            .unwrap_or(type_name);
+        Some((module, impl_type, method))
+    }
+
+    /// Type-qualified `jit_trace_fnaddrs` keys for an inherent `&self`
+    /// trampoline.
+    ///
+    /// [`Self::path`] is the free-function spelling (`module::method`).
+    /// Residual reloc keys use `module::Type::method` and `crate::Type::method`.
+    /// Wasm32 table slots are not stable across `fn as *const ()` cast sites,
+    /// so merge publishes these keys with the address captured in the
+    /// defining impl.
+    pub fn impl_method_fnaddr_paths(&self) -> Vec<String> {
+        let Some((module, impl_type, method)) = self.impl_fnaddr_binding() else {
+            return Vec::new();
+        };
+        let mut paths = vec![format!("{module}::{impl_type}::{method}")];
+        if !impl_type.contains("::")
+            && let Some((crate_name, _)) = module.split_once("::")
+        {
+            let crate_type = format!("{crate_name}::{impl_type}::{method}");
+            if crate_type != paths[0] {
+                paths.push(crate_type);
+            }
+        }
+        paths
     }
 }
 
@@ -80,6 +167,39 @@ pub fn register(path: &'static str, addr: *const (), arity: u8) {
         .push(HelperFnAddr::new(path, addr, arity));
 }
 
+/// Native constructor-populated rows for inherent `&self` trampolines.
+///
+/// `HELPER_FNADDRS` is a `distributed_slice` of function-local statics.
+/// Those initializers cannot name `Self` (`E0401`), and associated statics
+/// are not allowed, so the macros construct the row in an associated
+/// function and call [`register_impl_method`] from a constructor.
+#[cfg(not(target_arch = "wasm32"))]
+pub static IMPL_HELPER_FNADDRS: std::sync::Mutex<Vec<HelperFnAddr>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Append an inherent `&self` trampoline.
+///
+/// Called only from the constructor the macros emit. An entry appended after
+/// the address table has been read is not published.
+pub fn register_impl_method(
+    path: &'static str,
+    addr: *const (),
+    arity: u8,
+    impl_type_name: &'static str,
+) {
+    let row = HelperFnAddr::new_impl_method(path, addr, arity, impl_type_name);
+    #[cfg(target_arch = "wasm32")]
+    WASM_HELPER_FNADDRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(row);
+    #[cfg(not(target_arch = "wasm32"))]
+    IMPL_HELPER_FNADDRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(row);
+}
+
 /// Error a residual trampoline can report out of band.
 ///
 /// RPython residual calls return the value and store the exception in
@@ -94,8 +214,16 @@ pub trait ResidualError {
 /// Visit every registered trampoline, whichever population the target carries.
 pub fn for_each_helper_fnaddr(mut visit: impl FnMut(&HelperFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]
-    for desc in HELPER_FNADDRS {
-        visit(desc);
+    {
+        for desc in HELPER_FNADDRS {
+            visit(desc);
+        }
+        let guard = IMPL_HELPER_FNADDRS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for desc in guard.iter() {
+            visit(desc);
+        }
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -464,5 +592,86 @@ mod residual_inst_suffix_tests {
         assert!(identity.contains("RandomState"), "{identity}");
         assert!(int.contains("i64"), "{int}");
         assert!(!int.contains("IdentityKey"), "{int}");
+    }
+}
+
+#[cfg(test)]
+mod impl_fnaddr_binding_tests {
+    use super::HelperFnAddr;
+
+    #[test]
+    fn impl_binding_strips_module_path_from_type_name() {
+        let desc = HelperFnAddr::new_impl_method(
+            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            std::ptr::null(),
+            4,
+            "pyre_object::celldict::ModuleDictStrategy",
+        );
+        assert!(desc.is_impl_method());
+        assert_eq!(
+            desc.impl_fnaddr_binding(),
+            Some((
+                "pyre_object::celldict",
+                "ModuleDictStrategy",
+                "_orig__getdictvalue_no_unwrapping_pure_unlikely_name"
+            ))
+        );
+    }
+
+    #[test]
+    fn free_function_row_has_no_impl_binding() {
+        let desc = HelperFnAddr::new(
+            "pyre_object::celldict::next_version_tag_serial",
+            std::ptr::null(),
+            0,
+        );
+        assert!(!desc.is_impl_method());
+        assert_eq!(desc.impl_fnaddr_binding(), None);
+    }
+
+    #[test]
+    fn impl_binding_keeps_qualified_type_when_not_under_module_path() {
+        let desc = HelperFnAddr::new_impl_method(
+            "pyre_object::other::bar",
+            std::ptr::null(),
+            1,
+            "pyre_object::a::Foo",
+        );
+        assert_eq!(
+            desc.impl_fnaddr_binding(),
+            Some(("pyre_object::other", "a::Foo", "bar"))
+        );
+    }
+
+    #[test]
+    fn impl_method_fnaddr_paths_include_type_qualified_spellings() {
+        let desc = HelperFnAddr::new_impl_method(
+            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            std::ptr::null(),
+            4,
+            "pyre_object::celldict::ModuleDictStrategy",
+        );
+        let paths = desc.impl_method_fnaddr_paths();
+        assert_eq!(
+            paths,
+            vec![
+                "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+                "pyre_object::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            ]
+        );
+    }
+
+    #[test]
+    fn impl_method_fnaddr_paths_keep_qualified_type() {
+        let desc = HelperFnAddr::new_impl_method(
+            "pyre_object::other::bar",
+            std::ptr::null(),
+            1,
+            "pyre_object::a::Foo",
+        );
+        assert_eq!(
+            desc.impl_method_fnaddr_paths(),
+            vec!["pyre_object::other::a::Foo::bar"]
+        );
     }
 }

@@ -5862,7 +5862,7 @@ pub unsafe fn mapdict_switch_to_object_strategy(w_dict: PyObjectRef) {
         &mut *(pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut pyre_object::W_DictObject)
     };
     dict.dstorage = dstorage;
-    dict.dstrategy = &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF;
+    dict.dstrategy = pyre_object::dictmultiobject::object_dict_strategy_ref();
     // `setfield_gc` on `w_dict.dstorage`: the fresh table is born young and
     // an already-old dict has to be remembered before the next minor.
     pyre_object::gc_hook::try_gc_write_barrier(
@@ -5892,7 +5892,7 @@ pub unsafe fn mapdict_switch_to_text_strategy(w_dict: PyObjectRef) {
         &mut *(pyre_object::gc_roots::shadow_stack_get(dict_slot) as *mut pyre_object::W_DictObject)
     };
     dict.dstorage = dstorage;
-    dict.dstrategy = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
+    dict.dstrategy = pyre_object::dictmultiobject::unicode_dict_strategy_ref();
     // `setfield_gc` on `w_dict.dstorage`: the fresh table is born young and
     // an already-old dict has to be remembered before the next minor.
     pyre_object::gc_hook::try_gc_write_barrier(
@@ -5936,14 +5936,12 @@ pub fn make_instance_dict() -> PyObjectRef {
 /// ZST contract as [`pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY`].
 pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
 
-/// The [`pyre_object::dictmultiobject::DictStrategyRef`] holder a dict's
-/// `dstrategy` slot points at.
-pub static MAP_DICT_STRATEGY_REF: pyre_object::dictmultiobject::DictStrategyRef =
-    pyre_object::dictmultiobject::DictStrategyRef {
-        kind: pyre_object::dictmultiobject::StrategyKind::Map,
-        imp: &MAP_DICT_STRATEGY,
-        owner: std::ptr::null_mut(),
-    };
+pyre_object::define_prebuilt_dict_strategy_ref!(
+    MAP_DICT_STRATEGY_REF,
+    map_dict_strategy_ref,
+    pyre_object::dictmultiobject::StrategyKind::Map,
+    &MAP_DICT_STRATEGY
+);
 
 pyre_object::register_dyn_impl_vtable!(DYN_IMPL_MapDictStrategy, MapDictStrategy, DictStrategy);
 impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
@@ -6191,7 +6189,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let _roots = pyre_object::gc_roots::push_roots();
         let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict]);
         let copy_slot = pyre_object::gc_roots::pin_roots(&[pyre_object::w_dict_new_with(
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref(),
             pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage(),
         )]);
         let items = instance_node_dict_items(mapdict_strategy_unerase(
@@ -6347,7 +6345,7 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     // relocated address.
     let dict_slot = self_slot + 1;
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new_with(
-        &MAP_DICT_STRATEGY_REF,
+        map_dict_strategy_ref(),
         pyre_object::gc_roots::shadow_stack_get(self_slot) as pyre_object::gc_hook::GCREF,
     ));
     unsafe {
@@ -7181,7 +7179,7 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
             let w_dict = pyre_object::w_dict_new_with(
-                &MAP_DICT_STRATEGY_REF,
+                map_dict_strategy_ref(),
                 obj_ref as pyre_object::gc_hook::GCREF,
             );
 
@@ -7251,7 +7249,7 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, &sur, sentinel(0x55)));
 
             let w_dict = pyre_object::w_dict_new_with(
-                &MAP_DICT_STRATEGY_REF,
+                map_dict_strategy_ref(),
                 obj_ref as pyre_object::gc_hook::GCREF,
             );
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
@@ -7416,7 +7414,7 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("y"), sentinel(0x22)));
 
             let w_dict = pyre_object::w_dict_new_with(
-                &MAP_DICT_STRATEGY_REF,
+                map_dict_strategy_ref(),
                 obj_ref as pyre_object::gc_hook::GCREF,
             );
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
@@ -7460,7 +7458,7 @@ mod tests {
             assert!(instance_node_setdictvalue(obj_ref, wn("a"), sentinel(0x55)));
 
             let w_dict = pyre_object::w_dict_new_with(
-                &MAP_DICT_STRATEGY_REF,
+                map_dict_strategy_ref(),
                 obj_ref as pyre_object::gc_hook::GCREF,
             );
 

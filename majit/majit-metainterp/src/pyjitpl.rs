@@ -2561,17 +2561,21 @@ pub struct MetaInterp<M: Clone> {
     /// Bumped by every insertion into and removal from `compiled_loops`, in
     /// this file's non-test code. One input of [`Self::runnable_generation`].
     compiled_loops_generation: u64,
-    /// Aggregate write-barrier bit for the GC-traced graphs stored off-heap
-    /// under `compiled_loops` (`ResumeGuardDescr.rd_consts` and
-    /// `TargetToken` virtual-state/short-preamble fields).
+    /// Aggregate write-barrier bit for the off-heap compiled-loop graphs
+    /// that have no per-object pending bit: `trace.ops` ConstPtr indexes
+    /// and `trace.constants`. `ResumeGuardDescr.rd_consts` and
+    /// `TargetToken` graphs carry their own `minor_scan_pending` bits
+    /// (`SharedConstPool`, `TargetTokenAttrs`) and a minor walk honors
+    /// those even when this aggregate bit is clean.
     ///
-    /// In RPython these owners are GC objects. MiniMark's write barrier puts
+    /// In RPython the owners are GC objects. MiniMark's write barrier puts
     /// the modified object on `old_objects_pointing_to_young`, so a minor
     /// collection never searches the whole compiled-loop graph merely to find
-    /// each object's dirty bit. Pyre's Rust-owned graph has no GC header; this
-    /// owner bit is its remembered-set boundary. Every compilation path arms
-    /// it before it can publish or mutate one of those fields, and the next
-    /// minor root walk consumes it. Major marking still scans everything.
+    /// each object's dirty bit. Pyre's Rust-owned ops/constants have no GC
+    /// header; this owner bit is their remembered-set boundary. Every
+    /// compilation path arms it before it can publish or mutate those
+    /// fields, and the next minor root walk consumes it, then re-arms if a
+    /// walked slot still `can_move`. Major marking still scans everything.
     compiled_graph_minor_scan_pending: bool,
     /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
     /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
@@ -2839,11 +2843,12 @@ pub struct MetaInterp<M: Clone> {
     ///
     /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
     /// guard is handed the memo's own list and one GC object roots the pool for
-    /// the whole optimizer. Pyre copies the pool into a per-guard
-    /// [`majit_ir::SharedConstPool`], which the loop below only reaches once the
-    /// guard is attached to a compiled trace; until then the memo's live
-    /// `consts` — and the raw-address keys of its `refs` cache — name nothing
-    /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
+    /// the whole optimizer. Pyre shares that list as a [`majit_ir::SharedConstPool`]
+    /// Arc; `walk_rd_consts_refs` reaches the descr copy once the guard is
+    /// attached, and reaches the memo itself through this vec for the window
+    /// an Optimizer still holds it (`publish_resume_memo` /
+    /// `UnrollOptimizer::register_resume_memo`). Emptied by
+    /// [`CompileSnapshotRootsGuard`].
     pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
     /// `ConstPtr` index of the virtualizable for the in-flight compile.
     ///
@@ -3605,37 +3610,17 @@ impl<M: Clone> MetaInterp<M> {
         ) {
             let Some(pool) = pool else { return };
             // `compile.py:ResumeGuardDescr._attrs_` makes `rd_consts` an
-            // ordinary GC-traced field upstream.  Its write barrier puts the
-            // newly assigned list in MiniMark's remembered set for one minor;
-            // survivors are promoted directly to oldgen, so clean pools do
-            // not participate in later minor root walks.  Major marking still
-            // visits every pool below.
-            if is_minor && !pool.take_minor_scan_pending() {
-                return;
-            }
-            // Each pool records the generation of the walk that last visited
-            // it, so a pool reached twice in one walk is visited once without
-            // a visit set.  The counter is process-global because
-            // `register_thread_root_areas` registers this walker per mutator:
-            // per-`MetaInterp` counters would advance independently and
-            // collide, and a collision skips a pool whose slots then never
-            // reach the visitor.
-            if !pool.mark_visited_generation(generation) {
-                return;
-            }
-            // SAFETY: pyre is single-threaded and the minor-collection
-            // walker is the only writer; concurrent readers run outside
-            // GC cycles.
-            // history.py ConstPtr.value is the field; this pool is the
-            // holder, so the walk writes it. ResumeGuardDescr.rd_consts is
-            // a GC list of Const; a constant that no descr still names is
-            // not a root.
-            let consts = unsafe { pool.as_mut_vec_for_gc() };
-            for c in consts.iter_mut() {
-                if let Const::Ref(gcref) = c {
-                    visitor(gcref);
-                }
-            }
+            // ordinary GC-traced field. MiniMark's write barrier puts the
+            // newly assigned list in `old_objects_pointing_to_young`;
+            // `collect_pending_gc_tables_to_nursery` re-queues a table
+            // whose slots still `can_move`. `visit_gc_refs` is that
+            // consume-and-re-arm for this off-GC list. Each pool records
+            // the generation of the walk that last visited it, so a pool
+            // reached twice in one walk is visited once without a visit
+            // set. The counter is process-global because
+            // `register_thread_root_areas` registers this walker per
+            // mutator.
+            pool.visit_gc_refs(generation, is_minor, visitor, majit_gc::can_move);
         }
 
         let generation = RD_CONSTS_WALK_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -3644,117 +3629,143 @@ impl<M: Clone> MetaInterp<M> {
         // MiniMark enters `old_objects_pointing_to_young` directly; it does
         // not traverse the complete old object graph to inspect each owner's
         // dirty flag. `compiled_graph_minor_scan_pending` is the off-GC owner
-        // bit for this whole Rust graph, armed at every compilation boundary.
-        // Keep the per-pool/per-token bits below as the second-level exact
-        // filter when a publication did change only part of the graph.
+        // bit for ops/constants, which have no per-object pending flag.
+        // Per-pool and per-token bits below are the remembered-set membership
+        // of `rd_consts` lists and `TargetToken` graphs: a minor still
+        // honors those when the aggregate bit is clean.
         let scan_compiled_graph =
             !is_minor || std::mem::take(&mut self.compiled_graph_minor_scan_pending);
-        if scan_compiled_graph {
-            for entry in self.compiled_loops.values_mut() {
+        let mut graph_still_young = false;
+        for entry in self.compiled_loops.values_mut() {
+            if scan_compiled_graph {
                 for trace in entry.traces.values_mut() {
                     // Blackhole replays `trace.ops`. Those `ConstPtr`
                     // indexes stay live for the loop, same as the guard
                     // pools below.
                     for op in &trace.ops {
-                        op.walk_const_ptr_refs_mut(&mut visitor);
+                        op.walk_const_ptr_refs_mut(&mut |slot| {
+                            visitor(slot);
+                            if is_minor && majit_gc::can_move(*slot) {
+                                graph_still_young = true;
+                            }
+                        });
                     }
                     for constant in trace.constants.values_mut() {
                         if let majit_ir::Const::Ref(gcref) = constant {
                             visitor(gcref);
-                        }
-                    }
-                    for layout in trace.exit_layouts.values_mut() {
-                        let descr_pool = layout
-                            .descr
-                            .as_ref()
-                            .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_pool());
-                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
-                    }
-                    for layout in trace.terminal_exit_layouts.values_mut() {
-                        let descr_pool = layout
-                            .descr
-                            .as_ref()
-                            .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_pool());
-                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
-                    }
-                }
-                // `compile.py:ResumeGuardDescr._attrs_` traces `rd_consts` on
-                // every guard descr, and a bridge's descrs are reachable only
-                // through the backend: `assembler.py gcreftracers.append(tracer)`
-                // pins them on the loop token's `asmmemmgr_gcreftracers`
-                // (`model.py CompiledLoopToken`).  Walk those tracers so a
-                // bridge guard's pool is a root for the token's lifetime,
-                // the same way the root loop's descrs are reached above.
-                // Dynasm registers `FailDescrStore` (shared via
-                // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
-                // the other tracer kinds (GcTables) are rooted through
-                // the gcreftracer registry.
-                let mut tokens: Vec<std::sync::Arc<JitCellToken>> = entry
-                    .live_token()
-                    .into_iter()
-                    .chain(
-                        entry
-                            .previous_tokens
-                            .iter()
-                            .filter_map(std::sync::Weak::upgrade),
-                    )
-                    .collect();
-                // `history.py JitCellToken.record_jump_to` keeps the target
-                // of a JUMP alive through `_keepalive_jitcell_tokens` even
-                // after its own cell row is gone; follow that set to a fixed
-                // point so those tokens are walked with the ones above.
-                let mut next = 0;
-                while next < tokens.len() {
-                    let kept: Vec<std::sync::Arc<JitCellToken>> =
-                        tokens[next].keepalive_tokens.lock().clone();
-                    for token in kept {
-                        if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
-                            tokens.push(token);
-                        }
-                    }
-                    next += 1;
-                }
-                for token in &tokens {
-                    let Some(clt) = token.compiled_loop_token() else {
-                        continue;
-                    };
-                    for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
-                        let mut visit_descr = |descr: &dyn majit_ir::Descr| {
-                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
-                            visit_pool(pool, generation, is_minor, &mut visitor);
-                        };
-                        if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
-                            for cell in store.iter() {
-                                visit_descr(&*cell.descr);
-                            }
-                        } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
-                            for descr in descrs {
-                                visit_descr(&**descr);
+                            if is_minor && majit_gc::can_move(*gcref) {
+                                graph_still_young = true;
                             }
                         }
-                    }
-                }
-                // A displaced token stays alive while a JUMP still enters it
-                // (`history.py JitCellToken.record_jump_to`), and its
-                // `TargetToken.virtual_state` / `short_preamble` graphs with
-                // it, so the walk covers the same live-plus-previous set as
-                // the descr pools above.
-                let target_tokens = tokens
-                    .iter()
-                    .flat_map(|token| crate::history::target_tokens_of(token));
-                for tt in target_tokens {
-                    // `history.TargetToken` is a GC object upstream. MiniMark
-                    // visits it in a minor only while its write barrier is
-                    // dirty; after forwarding its graph, clean tokens stay out
-                    // of later minor walks until another traced-field store. A
-                    // major must still see every token graph.
-                    if !is_minor || tt.take_minor_scan_pending() {
-                        walk_target_token_const_ptrs(&tt, &mut visitor);
                     }
                 }
             }
+            for trace in entry.traces.values_mut() {
+                for layout in trace.exit_layouts.values_mut() {
+                    let descr_pool = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                        .and_then(|fd| fd.rd_consts_pool());
+                    visit_pool(descr_pool, generation, is_minor, &mut visitor);
+                }
+                for layout in trace.terminal_exit_layouts.values_mut() {
+                    let descr_pool = layout
+                        .descr
+                        .as_ref()
+                        .and_then(|descr| descr.as_fail_descr())
+                        .and_then(|fd| fd.rd_consts_pool());
+                    visit_pool(descr_pool, generation, is_minor, &mut visitor);
+                }
+            }
+            // `compile.py:ResumeGuardDescr._attrs_` traces `rd_consts` on
+            // every guard descr, and a bridge's descrs are reachable only
+            // through the backend: `assembler.py gcreftracers.append(tracer)`
+            // pins them on the loop token's `asmmemmgr_gcreftracers`
+            // (`model.py CompiledLoopToken`).  Walk those tracers so a
+            // bridge guard's pool is a root for the token's lifetime,
+            // the same way the root loop's descrs are reached above.
+            // Dynasm registers `FailDescrStore` (shared via
+            // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
+            // the other tracer kinds (GcTables) are rooted through
+            // the gcreftracer registry.
+            let mut tokens: Vec<std::sync::Arc<JitCellToken>> = entry
+                .live_token()
+                .into_iter()
+                .chain(
+                    entry
+                        .previous_tokens
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade),
+                )
+                .collect();
+            // `history.py JitCellToken.record_jump_to` keeps the target
+            // of a JUMP alive through `_keepalive_jitcell_tokens` even
+            // after its own cell row is gone; follow that set to a fixed
+            // point so those tokens are walked with the ones above.
+            let mut next = 0;
+            while next < tokens.len() {
+                let kept: Vec<std::sync::Arc<JitCellToken>> =
+                    tokens[next].keepalive_tokens.lock().clone();
+                for token in kept {
+                    if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
+                        tokens.push(token);
+                    }
+                }
+                next += 1;
+            }
+            for token in &tokens {
+                let Some(clt) = token.compiled_loop_token() else {
+                    continue;
+                };
+                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                        let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
+                        visit_pool(pool, generation, is_minor, &mut visitor);
+                    };
+                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                        for cell in store.iter() {
+                            visit_descr(&*cell.descr);
+                        }
+                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                        for descr in descrs {
+                            visit_descr(&**descr);
+                        }
+                    }
+                }
+            }
+            // A displaced token stays alive while a JUMP still enters it
+            // (`history.py JitCellToken.record_jump_to`), and its
+            // `TargetToken.virtual_state` / `short_preamble` graphs with
+            // it, so the walk covers the same live-plus-previous set as
+            // the descr pools above.
+            let target_tokens = tokens
+                .iter()
+                .flat_map(|token| crate::history::target_tokens_of(token));
+            for tt in target_tokens {
+                // `history.TargetToken` is a GC object upstream. MiniMark
+                // visits it in a minor only while its write barrier is
+                // dirty; after forwarding its graph, clean tokens stay out
+                // of later minor walks until another traced-field store. A
+                // major must still see every token graph. Re-arm when a
+                // walked slot still `can_move`, matching
+                // `collect_pending_gc_tables_to_nursery`.
+                if !is_minor || tt.take_minor_scan_pending() {
+                    let mut still_young = false;
+                    walk_target_token_const_ptrs(&tt, &mut |slot| {
+                        visitor(slot);
+                        if is_minor && majit_gc::can_move(*slot) {
+                            still_young = true;
+                        }
+                    });
+                    if still_young {
+                        tt.mark_minor_scan_pending();
+                    }
+                }
+            }
+        }
+        if graph_still_young {
+            self.remember_compiled_graph_write();
         }
         if let Some(slot_addr) = self.compile_target_tokens {
             // SAFETY: compile_loop_body / compile_retrace publish
@@ -6419,7 +6430,21 @@ impl<M: Clone> MetaInterp<M> {
         ));
     }
 
-    fn make_optimizer(&self) -> Optimizer {
+    /// Root `optimizer.resumedata_memo` until this compile returns.
+    ///
+    /// `resume.py finish` assigns `storage.rd_consts = self.memo.consts`, so
+    /// RPython traces the pool through the Optimizer the compiling frame
+    /// holds. `UnrollOptimizer::register_resume_memo` publishes the same
+    /// Weak for preamble/peeled-loop optimizers; `compile_bridge` /
+    /// `compile_simple_loop` / `finish_and_compile` mint an Optimizer
+    /// without that unroll slot, and cranelift can collect several times
+    /// before the descrs reach `compiled_loops`.
+    fn publish_resume_memo(&mut self, opt: &Optimizer) {
+        self.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&opt.resumedata_memo));
+    }
+
+    fn make_optimizer(&mut self) -> Optimizer {
         // compile.py `CompileData.optimize_trace` → `build_opt_chain(enable_opts)`.
         let jd = self.active_jitdriver_sd.unwrap_or(0);
         let enable_opts = self
@@ -6430,6 +6455,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut opt =
             Optimizer::build_opt_chain(&enable_opts, self.current_virtualizable_optimizer_config());
         self.pin_optimizer_host_state(&mut opt);
+        self.publish_resume_memo(&opt);
         opt
     }
 
@@ -9598,6 +9624,7 @@ impl<M: Clone> MetaInterp<M> {
                         let mut simple_opt =
                             Optimizer::build_opt_chain(&enable_opts, vable_config.clone());
                         self.pin_optimizer_host_state(&mut simple_opt);
+                        self.publish_resume_memo(&simple_opt);
                         // Clone rather than move: only the success arm below hands
                         // the list back, so a retry that aborts would otherwise
                         // leave `unroll_opt.all_descrs` empty, and the
@@ -12622,6 +12649,7 @@ impl<M: Clone> MetaInterp<M> {
         let num_ops_before = trace_ops.len();
         let mut optimizer = Optimizer::build_opt_chain(&enable_opts, vable_config);
         self.pin_optimizer_host_state(&mut optimizer);
+        self.publish_resume_memo(&optimizer);
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
@@ -13192,6 +13220,7 @@ impl<M: Clone> MetaInterp<M> {
         // Simple optimizer — no unrolling (compile.py SimpleCompileData).
         let mut optimizer = Optimizer::build_opt_chain(&enable_opts, vable_config);
         self.pin_optimizer_host_state(&mut optimizer);
+        self.publish_resume_memo(&optimizer);
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
@@ -32728,11 +32757,82 @@ mod tests {
         assert_eq!(ctx.virtualizable_heap_ptr(), Some(0x8000 as *const u8));
     }
 
-    /// `incminimark.py old_objects_pointing_to_young`: the off-GC compiled
-    /// graph is absent from clean minor walks, is visited once after its
-    /// publication barrier fires, and remains visible to every major walk.
+    /// `incminimark.py old_objects_pointing_to_young`: ops/constants on the
+    /// off-GC compiled graph are absent from clean minor walks, visited
+    /// once after the aggregate publication barrier fires, and remain
+    /// visible to every major walk. Descr pools have their own pending
+    /// bit; this test keeps them empty so only the aggregate bit is under
+    /// test.
     #[test]
     fn compiled_graph_root_walk_consumes_its_aggregate_minor_barrier() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let _serial = majit_ir::const_ptr_table::test_serial();
+        let mut constants = majit_ir::ConstMap::default();
+        constants.insert(0, majit_ir::Const::from_gcref(GcRef(0x96_0000_1000)));
+        let mut traces = crate::FxIndexMap::default();
+        traces.insert(
+            1,
+            CompiledTrace {
+                inputargs: Vec::new(),
+                ops: Vec::new(),
+                constants,
+                exit_layouts: crate::FxIndexMap::default(),
+                terminal_exit_layouts: crate::FxIndexMap::default(),
+            },
+        );
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.insert_compiled_loop(
+            7,
+            CompiledEntry {
+                token: std::sync::Weak::new(),
+                meta: std::sync::Arc::new(()),
+                root_trace_id: 1,
+                traces,
+                previous_tokens: Vec::new(),
+                loop_header_pc: None,
+                next_global_opref: 0,
+                front_target: None,
+            },
+        );
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
+        meta.compiled_graph_minor_scan_pending = false;
+        let mut seen = 0;
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 0, "a clean compiled graph is absent from a minor");
+
+        meta.remember_compiled_graph_write();
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|slot| {
+            seen += 1;
+            if slot.0 == 0x96_0000_1000 {
+                *slot = GcRef(0x96_0000_2000);
+            }
+        });
+        assert_eq!(seen, 1, "a dirty compiled graph traces its Const::Ref slot");
+        assert_eq!(
+            meta.compiled_loops[&(0, 7)].traces[&1].constants[&0].getref_base(),
+            GcRef(0x96_0000_2000)
+        );
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 1, "the publication barrier is consumed once");
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        meta.walk_rd_consts_refs(|_| seen += 1);
+        assert_eq!(seen, 2, "major marking traces the constants again");
+    }
+
+    /// MiniMark traces `ResumeGuardDescr.rd_consts` as a GC list whenever
+    /// the descr is reachable. The aggregate `compiled_graph_minor_scan_pending`
+    /// bit is only for ops/constants; a descr pool is walked even when that
+    /// bit is clean. A skipped nursery `Const::Ref` dies and a later walk
+    /// copies reused payload (`pickle_terminal_raise_resume`
+    /// `extra_area=rd_consts`).
+    #[test]
+    fn compiled_graph_minor_still_visits_dirty_rd_consts_pool() {
         let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
 
@@ -32742,7 +32842,7 @@ mod tests {
             .as_fail_descr()
             .expect("resume guard")
             .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(GcRef(
-                0x96_0000_1000,
+                0x97_0000_1000,
             ))]));
         let mut exit_layouts = crate::FxIndexMap::default();
         exit_layouts.insert(
@@ -32784,18 +32884,17 @@ mod tests {
         set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
         meta.compiled_graph_minor_scan_pending = false;
         let mut seen = 0;
-        meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 0, "a clean compiled graph is absent from a minor");
-
-        meta.remember_compiled_graph_write();
-        let _wave = majit_ir::const_ptr_table::Wave::enter();
         meta.walk_rd_consts_refs(|slot| {
             seen += 1;
-            if slot.0 == 0x96_0000_1000 {
-                *slot = GcRef(0x96_0000_2000);
+            if slot.0 == 0x97_0000_1000 {
+                *slot = GcRef(0x97_0000_2000);
             }
         });
-        assert_eq!(seen, 1, "a dirty pool traces its Const::Ref slot");
+        assert_eq!(
+            seen, 1,
+            "a dirty rd_consts pool is a remembered-set member even when \
+             the aggregate compiled-graph bit is clean"
+        );
         assert_eq!(
             descr
                 .as_fail_descr()
@@ -32803,15 +32902,57 @@ mod tests {
                 .rd_consts_arc()
                 .expect("pool")[0]
                 .getref_base(),
-            GcRef(0x96_0000_2000)
+            GcRef(0x97_0000_2000)
         );
         meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 1, "the publication barrier is consumed once");
+        assert_eq!(
+            seen, 2,
+            "a reachable rd_consts list is traced every minor, matching a GC list"
+        );
+    }
 
-        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
-        let _wave = majit_ir::const_ptr_table::Wave::enter();
-        meta.walk_rd_consts_refs(|_| seen += 1);
-        assert_eq!(seen, 2, "major marking traces the pool again");
+    /// `resume.py finish` keeps `self.memo.consts` alive through the Optimizer
+    /// the compiling frame holds. A `compile_bridge` Optimizer is not an
+    /// `UnrollOptimizer` child, so its memo is published onto
+    /// `compile_resume_memos` until the descrs reach `compiled_loops`.
+    #[test]
+    fn in_flight_resume_memo_is_traced_before_compiled_loops_attach() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let _serial = majit_ir::const_ptr_table::test_serial();
+        let memo = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::resume::ResumeDataLoopMemo::new(),
+        ));
+        memo.borrow_mut()
+            .getconst_ref(0x98_0000_1000)
+            .expect("pool a nursery-shaped ref");
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.compiled_graph_minor_scan_pending = false;
+        set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
+        let mut seen = 0;
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == 0x98_0000_1000 {
+                seen += 1;
+            }
+        });
+        assert_eq!(
+            seen, 0,
+            "an unpublished memo is invisible to the extra-area walk"
+        );
+        meta.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&memo));
+        meta.walk_rd_consts_refs(|slot| {
+            if slot.0 == 0x98_0000_1000 {
+                *slot = GcRef(0x98_0000_2000);
+                seen += 1;
+            }
+        });
+        assert_eq!(seen, 1, "an in-flight Optimizer memo is a root");
+        assert_eq!(
+            memo.borrow().consts()[0].getref_base(),
+            GcRef(0x98_0000_2000)
+        );
     }
 
     /// `history.py TargetToken` is a GC object on

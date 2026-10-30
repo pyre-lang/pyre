@@ -1860,25 +1860,30 @@ impl Drop for ClearReplaceFrames {
 impl TraceCtx {
     /// `fielddescr.get_vinfo()`. Codewriter emits the vinfo's own
     /// FieldDescr, which already holds the Weak backref.
+    ///
+    /// A descr that identity-matches the *active* vinfo's
+    /// `static_field_descrs` / `array_field_descrs` answers with that
+    /// active object, not the Weak `finalize_arc` stamped.
+    /// `retain_or_store_vinfo` may wrap a clone, and
+    /// `_nonstandard_virtualizable` compares `vinfo is fielddescr.get_vinfo()`
+    /// by object identity (`pyjitpl.py`). The Weak would name the
+    /// original Arc and skip the `PTR_EQ` / `replace_box` arm, so
+    /// `_opimpl_setfield_vable` would take the SETFIELD_GC fallback and
+    /// leave `virtualizable_boxes` untouched.
     fn vinfo_from_fielddescr(
         &self,
         fielddescr: &DescrRef,
     ) -> Option<std::sync::Arc<dyn majit_ir::descr::VinfoMarker>> {
+        if let Some(vi) = self.virtualizable_info.as_ref()
+            && (vi.static_field_by_descr(fielddescr).is_some()
+                || vi.array_field_by_descr(fielddescr).is_some())
+        {
+            return Some(
+                std::sync::Arc::clone(vi) as std::sync::Arc<dyn majit_ir::descr::VinfoMarker>
+            );
+        }
         if let Some(v) = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo()) {
             return Some(v);
-        }
-        let vi = self.virtualizable_info.as_ref()?;
-        if let Some(idx) = vi.static_field_by_descr(fielddescr) {
-            return vi
-                .static_field_descr(idx)
-                .as_field_descr()
-                .and_then(|fd| fd.get_vinfo());
-        }
-        if let Some(idx) = vi.array_field_by_descr(fielddescr) {
-            return vi
-                .array_pointer_field_descr(idx)
-                .as_field_descr()
-                .and_then(|fd| fd.get_vinfo());
         }
         None
     }
