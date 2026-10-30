@@ -10817,12 +10817,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.clear_compiled_loops();
     }
 
-    /// Invalidate compiled code for a specific trace_id, removing the
-    /// compiled_loops entry whose root_trace_id matches.
-    pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
-        self.meta.invalidate_compiled_trace(trace_id);
-    }
-
     /// warmspot.py:449 — set the per-driver result_type.
     pub fn set_result_type(&mut self, tp: Type) {
         self.meta.set_result_type(tp);
@@ -12017,7 +12011,9 @@ mod tests {
     }
 
     use crate::resume::ReconstructedFrame;
-    use majit_ir::{GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value};
+    use majit_ir::{
+        Descr, FailDescr, GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value,
+    };
     use std::sync::Arc;
 
     fn compiled_guard_descr(
@@ -13781,7 +13777,6 @@ mod tests {
             key.get_uhash(),
             crate::pyjitpl::CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -13862,7 +13857,6 @@ mod tests {
             key.get_uhash(),
             crate::pyjitpl::CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -14005,19 +13999,16 @@ mod tests {
         let key = gk(0x7e1b);
         let meta0 = Arc::new(());
         let meta1 = Arc::new(());
-        let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
-            meta,
-            root_trace_id,
-        };
+        let entry = |meta: Arc<()>| crate::pyjitpl::CompiledEntry { meta };
         driver.meta.insert_compiled_loop_on_driver(
             idx0,
             key.get_uhash(),
-            entry(Arc::clone(&meta0), 1),
+            entry(Arc::clone(&meta0)),
         );
         driver.meta.insert_compiled_loop_on_driver(
             idx1,
             key.get_uhash(),
-            entry(Arc::clone(&meta1), 2),
+            entry(Arc::clone(&meta1)),
         );
         driver.meta.active_jitdriver_sd = Some(idx0);
         assert!(
@@ -15626,10 +15617,10 @@ mod tests {
              previously compiled trace's high-water (a={high_a}, b={high_b})"
         );
 
-        let trace_id = driver
-            .meta
-            .compiled_root_trace_id(key_b.get_uhash())
-            .expect("compiled loop should have a root trace_id");
+        let trace_id = compiled_guard_descr(&driver.meta, key_b.get_uhash(), fail_index)
+            .as_fail_descr()
+            .expect("compiled guard descr")
+            .trace_id();
         assert_eq!(
             driver.meta.close_bridge(
                 key_b.get_uhash(),
@@ -15734,14 +15725,13 @@ mod tests {
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
-        // Use the actual root trace_id allocated at compile_loop time.
-        // RPython has no `trace_id == 0 → root_trace_id` normalize step;
-        // the descr identity carries the exact trace_id, and tests must
-        // pass the same identity.
-        let trace_id = driver
-            .meta
-            .compiled_root_trace_id(key.get_uhash())
-            .expect("compiled loop should have a root trace_id");
+        // The fail descr carries the owning-trace stamp from
+        // `record_loop_or_bridge`. RPython has no numeric normalize
+        // step; tests pass the same descr identity.
+        let trace_id = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index)
+            .as_fail_descr()
+            .expect("compiled guard descr")
+            .trace_id();
         let result = driver.meta.close_bridge(
             key.get_uhash(),
             trace_id,
@@ -15838,10 +15828,10 @@ mod tests {
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
-        let trace_id = driver
-            .meta
-            .compiled_root_trace_id(key.get_uhash())
-            .expect("compiled loop should have a root trace_id");
+        let trace_id = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index)
+            .as_fail_descr()
+            .expect("compiled guard descr")
+            .trace_id();
         assert_eq!(
             driver.meta.close_bridge(
                 key.get_uhash(),
