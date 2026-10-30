@@ -3101,9 +3101,10 @@ where
                             opcode = code[position];
                         }
                     }
-                    if opcode == jitcode::insns::BC_CATCH_EXCEPTION && position + 2 < code.len() {
-                        let target =
-                            u16::from_le_bytes([code[position + 1], code[position + 2]]) as usize;
+                    if opcode == jitcode::insns::BC_CATCH_EXCEPTION
+                        && position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE < code.len()
+                    {
+                        let target = majit_jitcode::jitcode::read_label_at(code, position + 1);
                         frame.pc = target;
                         frame.code_cursor = target;
                         handled = true;
@@ -4192,10 +4193,14 @@ where
                     continue;
                 }
                 Some(jitcode::insns::BC_JUMP) => {
-                    frame.code_cursor = frame
-                        .peek_u16_at(pc + 1)
-                        .expect("BC_JUMP target operand is truncated")
-                        as usize;
+                    let target = {
+                        let code = frame.bytecode();
+                        if pc + 1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE > code.len() {
+                            panic!("BC_JUMP target operand is truncated");
+                        }
+                        majit_jitcode::jitcode::read_label_at(code, pc + 1)
+                    };
+                    frame.code_cursor = target;
                     self.optrace_step();
                     continue;
                 }
@@ -4792,11 +4797,11 @@ where
     /// resume position is this op, so on failure the blackhole re-executes
     /// `int_*_jump_if_ovf` and performs the overflow branch itself.
     fn trace_int_binop_jump_if_ovf(&mut self, ctx: &mut TraceCtx, sym: &mut S, opcode: OpCode) {
-        // Canonical `Lii>i` encoding: [target:u16][lhs:u8][rhs:u8][dst:u8].
+        // Canonical `Lii>i` encoding: [target:L][lhs:u8][rhs:u8][dst:u8].
         let (opcode_pc, target, lhs_idx, rhs_idx, dst) = {
             let frame = self.frames.current_mut();
             let opcode_pc = frame.code_cursor - 1;
-            let target = frame.next_u16() as usize;
+            let target = frame.next_label();
             let lhs_idx = frame.next_u8() as usize;
             let rhs_idx = frame.next_u8() as usize;
             let dst = frame.next_u8() as usize;

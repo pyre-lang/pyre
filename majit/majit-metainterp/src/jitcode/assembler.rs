@@ -8,7 +8,10 @@ use std::cmp::max;
 
 use majit_backend::JitCellToken;
 use majit_ir::OpCode;
-use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec, HEADERLESS_SIZE_OWNER_MARKER};
+use majit_jitcode::jitcode::{
+    BhFieldSpec, BhSizeSpec, HEADERLESS_SIZE_OWNER_MARKER, LABEL_TARGET_MAX,
+    push_label_placeholder, write_label_at,
+};
 use majit_jitcode::rclass::ImmutableRank;
 
 use crate::jitcode;
@@ -141,8 +144,8 @@ pub struct JitCodeBuilder {
     /// byte goes through one of those.
     startpoints: indexmap::IndexSet<usize>,
     /// RPython `assembler.py` `self.alllabels.add(len(self.code))` —
-    /// every TLabel emit records the bytecode offset of the 2-byte
-    /// label slot so `JitCode.follow_jump` (RPython `jitcode.py`)
+    /// every TLabel emit records the bytecode offset of the label slot
+    /// so `JitCode.follow_jump` (RPython `jitcode.py`)
     /// can fire its non-translated `assert position in self._alllabels`
     /// debug check.  Populated by `push_label_ref`.
     alllabels: indexmap::IndexSet<usize>,
@@ -3135,7 +3138,7 @@ impl JitCodeBuilder {
     /// these as `IntAddOvf`/`IntSubOvf`/`IntMulOvf` + `GuardNoOverflow`
     /// (`pyjitpl/dispatch.rs`); on guard failure the blackhole resumes at this
     /// op and performs the overflow branch itself.  Byte layout follows argcode
-    /// `Lii>i` (`assembler.py:165-174`): `[target:u16][lhs][rhs][dst]`, matching
+    /// `Lii>i` (`assembler.py` `write_insn`): `[target:L][lhs][rhs][dst]`, matching
     /// the `bhhandler_ovf_jump_ii!` decoder.  A caller-emitted `-live-` must
     /// precede the op (like every guard/branch) so the guard snapshot decodes.
     pub fn int_add_jump_if_ovf(&mut self, dst: u16, lhs: u16, rhs: u16, label: u16) {
@@ -3381,12 +3384,12 @@ impl JitCodeBuilder {
     }
 
     pub fn new_label(&mut self) -> u16 {
-        // A label id addresses `self.labels` and is patched into a two-byte
-        // jump-target slot (`assembler.py fix_labels`), so the id
-        // space ends at `u16::MAX`.  Past it the `as u16` truncation would
-        // alias a fresh label onto an earlier one and silently patch the
-        // wrong target; record the overflow so `try_finish` declines the
-        // whole jitcode instead.
+        // A label id addresses `self.labels`. The id space ends at
+        // `u16::MAX`; past it the `as u16` truncation would alias a
+        // fresh label onto an earlier one and silently patch the wrong
+        // target; record the overflow so `try_finish` declines the
+        // whole jitcode instead. Jump-target *values* use the three-byte
+        // `L` operand (`assembler.py` `fix_labels`).
         let label = self.labels.len();
         self.encoding_overflow |= label > u16::MAX as usize;
         self.labels.push(None);
@@ -3395,8 +3398,9 @@ impl JitCodeBuilder {
 
     pub fn mark_label(&mut self, label: u16) {
         let target = self.code.len();
-        // `assembler.py` `fix_labels`: `assert 0 <= target <= 0xFFFF`.
-        if target > u16::MAX as usize {
+        // `assembler.py` `fix_labels` asserts `0 <= target <= 0xFFFF`.
+        // pyre's three-byte `L` operand declines at `LABEL_TARGET_MAX`.
+        if target > LABEL_TARGET_MAX {
             self.encoding_overflow = true;
         }
         let slot = self
@@ -3432,8 +3436,8 @@ impl JitCodeBuilder {
     // emitted by flatten.py:247-250 as `goto_if_not_int_lt/iiL`.
     // blackhole.py:864-911 semantics: take branch iff comparison is
     // false, i.e. `int_lt(a, b) == False` → `position = target`.
-    // Canonical layout (`assembler.py:165-174` argcode `iiL`):
-    // [a:u8][b:u8][target:u16]. Float and ref variants share the same
+    // Canonical layout (`assembler.py` `write_insn` argcode `iiL`):
+    // [a:u8][b:u8][target:L]. Float and ref variants share the same
     // shape with their respective reg classes.
     pub fn goto_if_not_int_lt(&mut self, a: u16, b: u16, label: u16) {
         self.touch_reg(a);
@@ -6921,11 +6925,14 @@ impl JitCodeBuilder {
     }
 
     fn push_label_ref(&mut self, label: u16) {
-        // RPython `assembler.py:176` records the offset of the 2-byte
-        // label slot in `alllabels` just before the temp bytes go in.
+        // `assembler.py` `fix_labels` writes a two-byte target and
+        // asserts `0 <= target <= 0xFFFF`. RPython JitCodes come from
+        // bounded RPython functions; pyre builds one JitCode per
+        // CodeObject, which has no length bound, so the operand is
+        // three little-endian bytes (target < 2**24).
         let patch_offset = self.code.len();
         self.alllabels.insert(patch_offset);
-        self.push_u16(0);
+        push_label_placeholder(&mut self.code);
         self.patches.push((label as usize, patch_offset));
     }
 
@@ -7072,7 +7079,7 @@ impl JitCodeBuilder {
     fn patch_labels(&mut self) {
         for &(label_idx, patch_offset) in &self.patches {
             let target = match self.labels.get(label_idx).copied().flatten() {
-                Some(target) => target as u16,
+                Some(target) => target,
                 None => {
                     // A label was *referenced* (a goto / switch / forwarder operand was
                     // emitted at these code offsets) but never *marked* (its
@@ -7110,9 +7117,7 @@ impl JitCodeBuilder {
                     );
                 }
             };
-            let bytes = target.to_le_bytes();
-            self.code[patch_offset] = bytes[0];
-            self.code[patch_offset + 1] = bytes[1];
+            write_label_at(&mut self.code, patch_offset, target);
         }
     }
 
@@ -9014,9 +9019,9 @@ mod tests {
         assert!(builder.try_finish().is_some());
     }
 
-    /// `fix_labels` names a target with two unsigned bytes
-    /// (`assert 0 <= target <= 0xFFFF`). A body longer than `i16::MAX`
-    /// is still addressable.
+    /// `fix_labels` names a target with three unsigned bytes
+    /// (`assert 0 <= target <= LABEL_TARGET_MAX`). A body longer than
+    /// `i16::MAX` is still addressable.
     #[test]
     fn try_finish_accepts_code_longer_than_i16() {
         let mut builder = JitCodeBuilder::new();
@@ -9033,13 +9038,34 @@ mod tests {
         assert!(builder.try_finish().is_some());
     }
 
-    /// `fix_labels` `assert 0 <= target <= 0xFFFF`: a label whose mark
-    /// sits past that range latches `encoding_overflow`.
+    /// A label whose mark sits past `u16::MAX` still assembles: the `L`
+    /// operand is three bytes (`LABEL_TARGET_MAX`).
     #[test]
-    fn try_finish_declines_label_target_past_u16() {
+    fn try_finish_accepts_label_target_past_u16() {
         let mut builder = JitCodeBuilder::new();
         let label = builder.new_label();
+        builder.jump(label);
         builder.code.resize(u16::MAX as usize + 1, 0);
+        builder.mark_label(label);
+        // `follow_jump` requires `target < len(code)`.
+        builder.code.push(0);
+        assert!(!builder.encoding_overflow);
+        let jitcode = builder
+            .try_finish()
+            .expect("label target 65536 must assemble");
+        assert_eq!(
+            jitcode.follow_jump(1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE),
+            u16::MAX as usize + 1
+        );
+    }
+
+    /// Three-byte `L`: a label whose mark sits at `2**24` latches
+    /// `encoding_overflow`.
+    #[test]
+    fn try_finish_declines_label_target_past_u24() {
+        let mut builder = JitCodeBuilder::new();
+        let label = builder.new_label();
+        builder.code.resize(LABEL_TARGET_MAX + 1, 0);
         builder.mark_label(label);
         assert!(builder.encoding_overflow);
         assert!(builder.try_finish().is_none());

@@ -968,6 +968,39 @@ impl Deref for JitCode {
     }
 }
 
+/// Width of a jitcode jump-target operand (`L` argcode).
+///
+/// `assembler.py` `fix_labels` writes two bytes and asserts
+/// `0 <= target <= 0xFFFF`. RPython JitCodes come from bounded RPython
+/// functions. pyre builds one JitCode per CodeObject, which has no
+/// length bound, so the operand is three little-endian bytes and a
+/// target must be `< 2**24`.
+pub const LABEL_OPERAND_SIZE: usize = 3;
+
+/// Inclusive maximum jump target a three-byte `L` operand can name.
+pub const LABEL_TARGET_MAX: usize = (1 << 24) - 1;
+
+/// Read a three-byte little-endian jump target at `pos`.
+#[inline]
+pub fn read_label_at(code: &[u8], pos: usize) -> usize {
+    (code[pos] as usize) | ((code[pos + 1] as usize) << 8) | ((code[pos + 2] as usize) << 16)
+}
+
+/// Write a three-byte little-endian jump target at `pos`.
+#[inline]
+pub fn write_label_at(code: &mut [u8], pos: usize, target: usize) {
+    debug_assert!(target <= LABEL_TARGET_MAX);
+    code[pos] = target as u8;
+    code[pos + 1] = (target >> 8) as u8;
+    code[pos + 2] = (target >> 16) as u8;
+}
+
+/// Append a three-byte zero placeholder for a later `fix_labels` patch.
+#[inline]
+pub fn push_label_placeholder(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0, 0, 0]);
+}
+
 impl JitCode {
     /// RPython `jitcode.py` `def dump(self)`:
     ///
@@ -1041,13 +1074,17 @@ impl JitCode {
     /// in `_alllabels` (RPython `assembler.py:setup_labels`, pyre
     /// `JitCodeBuilder::finish` derives it from the builder's
     /// `labels: Vec<Option<usize>>`).
+    ///
+    /// `assembler.py` `fix_labels` writes two bytes; pyre writes
+    /// [`LABEL_OPERAND_SIZE`] because a per-CodeObject JitCode has no
+    /// length bound.
     pub fn follow_jump(&self, position: usize) -> usize {
-        // RPython `:104-105`: `position -= 2; assert position >= 0`.
+        // RPython `follow_jump`: `position -= 2; assert position >= 0`.
         // `checked_sub` + `expect` mirrors the non-negativity assert.
         let position = position
-            .checked_sub(2)
-            .expect("follow_jump: position underflow before 2-byte label slot");
-        // RPython `:107-108`: `if not we_are_translated(): assert
+            .checked_sub(LABEL_OPERAND_SIZE)
+            .expect("follow_jump: position underflow before label slot");
+        // RPython `follow_jump`: `if not we_are_translated(): assert
         // position in self._alllabels`. PyPy upstream does not gate the
         // assert on `_alllabels is not None` — `pc in None` would raise
         // TypeError; the contract is that any jitcode reaching
@@ -1062,7 +1099,7 @@ impl JitCode {
                 .contains(&position),
             "follow_jump: position {position} is not in _alllabels"
         );
-        let labelvalue = (self.code[position] as usize) | ((self.code[position + 1] as usize) << 8);
+        let labelvalue = read_label_at(&self.code, position);
         assert!(labelvalue < self.code.len(), "follow_jump out of range");
         labelvalue
     }
@@ -3949,7 +3986,7 @@ mod tests {
             alllabels: Some(indexmap::IndexSet::new()),
             ..JitCodeBody::default()
         });
-        jc.follow_jump(2);
+        jc.follow_jump(3);
     }
 
     fn test_bh_field(name: &str) -> BhFieldSpec {

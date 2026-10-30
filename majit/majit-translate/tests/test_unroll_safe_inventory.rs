@@ -186,6 +186,14 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "locals_plus_value",
         "fast2locals' scan of the same locals-plus array, read through the proxy",
     ),
+    // Write twin of `locals_plus_value`: `framelocalsproxy_setitem` walks
+    // the same locals-plus names to decide a fast slot versus
+    // `f_extra_locals`. Without the hint `__setitem__` is one residual
+    // `store_subscr` and a traced extra-key store aborts `ABORT_ESCAPE`.
+    (
+        "fast_local_index",
+        "fast2locals' scan of the same locals-plus array, write through the proxy",
+    ),
     // The undeduplicated `keys` / `values` / `items` scan behind the same
     // proxy, and the count `__len__` answers without materializing anything.
     // Both are bounded by the very `locals_plus_names` array `fast2locals`

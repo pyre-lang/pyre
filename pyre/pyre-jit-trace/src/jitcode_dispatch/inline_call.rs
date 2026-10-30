@@ -614,6 +614,8 @@ enum FreshFrameGotoFold {
 /// or known-non-null box), so a `goto_if_not_ptr_iszero` of that
 /// `getfield_vable_r` follows only the arm the constructor takes and is
 /// itself not yielded. Ops reachable only through the other arm are dropped.
+/// The LOAD_FAST unbound-local test (`goto_if_not_ptr_nonzero` after
+/// `getarrayitem_vable_r`) folds to its bound arm the same way.
 ///
 /// [`decoded_ops_on_fresh_frame`] is the null-`debugdata` fold. A callee
 /// built with a non-null payload uses [`decoded_ops_on_fresh_frame_kind`].
@@ -846,6 +848,9 @@ fn fresh_frame_goto_fold(
     {
         return FreshFrameGotoFold::Fallthrough;
     }
+    if is_load_fast_unbound_check_goto(code, pred, op) {
+        return FreshFrameGotoFold::Fallthrough;
+    }
     FreshFrameGotoFold::None
 }
 
@@ -948,12 +953,14 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
         // Undecodable reachable op — be conservative and decline the fast path.
         return false;
     };
-    for d in &ops {
+    for (idx, d) in ops.iter().enumerate() {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            if fbw_strict_diag_enabled() {
-                eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+            if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
+                if fbw_strict_diag_enabled() {
+                    eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+                }
+                return false;
             }
-            return false;
         }
         // A vable op is inlinable on the strict straight-line path when it is
         // either a static const-field read (`pycode` / `w_globals`, resolved
@@ -1192,9 +1199,9 @@ mod seeded_frame_op_tests {
         // Production arm: getfield_vable_r, live/, goto_if_not_ptr_iszero.
         // pc 0: getfield_vable_r r0, descr0 -> r1
         // pc 5: live/
-        // pc 8: goto_if_not_ptr_iszero r1, 14
-        // pc 12: int_return i0
-        // pc 14: dead arm
+        // pc 8: goto_if_not_ptr_iszero r1, 15
+        // pc 13: int_return i0
+        // pc 15: dead arm
         let code = vec![
             getfield,
             0,
@@ -1206,7 +1213,8 @@ mod seeded_frame_op_tests {
             0,
             goto_z,
             1,
-            14,
+            15,
+            0,
             0,
             int_ret,
             0,
@@ -1246,7 +1254,9 @@ mod seeded_frame_op_tests {
         let getfield = insn("getfield_vable_r/rd>r");
         let goto_z = insn("goto_if_not_ptr_iszero/rL");
         let int_ret = insn("int_return/i");
-        let code = vec![getfield, 0, 0, 0, 1, goto_z, 1, 11, 0, int_ret, 0, raise, 0];
+        let code = vec![
+            getfield, 0, 0, 0, 1, goto_z, 1, 12, 0, 0, int_ret, 0, raise, 0,
+        ];
         let descrs = vec![crate::frame_layout::pyframe_static_field_descr(0)];
         let ops = decoded_ops_on_fresh_frame(&code, &descrs).expect("body must decode");
         let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
@@ -1298,6 +1308,36 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRe
 pub(crate) fn callee_body_owns_loop_header(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
     decoded_ops_on_fresh_frame(body_code, descr_refs)
         .is_some_and(|ops| ops.iter().any(|op| op.opname == "loop_header"))
+}
+
+/// `pyopcode.py LOAD_FAST`'s unbound-local test, as `emit_load_fast_checked!`
+/// flattens it: `getarrayitem_vable_r` of the local, then
+/// `goto_if_not_ptr_nonzero` on that register.
+/// A bound local is never null, so the walk records `GUARD_NONNULL` and takes
+/// the bound arm; the raising arm is a guard-failure resume and is never
+/// walked.  Like the fresh-frame `debugdata` test it is dispatch protocol,
+/// not app-level control flow.
+fn is_load_fast_unbound_check_goto(
+    body_code: &[u8],
+    last_non_live: Option<&crate::jitcode_runtime::DecodedOp>,
+    goto: &crate::jitcode_runtime::DecodedOp,
+) -> bool {
+    let Some(prev) = last_non_live else {
+        return false;
+    };
+    if !prev.opname.starts_with("getarrayitem_vable_r") {
+        return false;
+    }
+    if goto.opname != "goto_if_not_ptr_nonzero" {
+        return false;
+    }
+    let Some(&dst) = body_code.get(prev.next_pc.wrapping_sub(1)) else {
+        return false;
+    };
+    let Some(&src) = body_code.get(goto.pc + 1) else {
+        return false;
+    };
+    dst == src
 }
 
 /// Whether running a straight-line callee body before deciding to keep it can
@@ -1393,9 +1433,11 @@ fn body_sample_safe_with(
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
         return false;
     };
-    for d in &ops {
+    for (idx, d) in ops.iter().enumerate() {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            return false;
+            if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
+                return false;
+            }
         }
         let ref_slot_access = d.opname.starts_with("getarrayitem_vable_r")
             || d.key.starts_with("setarrayitem_vable_r");
@@ -1507,8 +1549,10 @@ pub(crate) fn exception_string_override_straight_line(
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, descr_refs) else {
         return false;
     };
-    ops.iter()
-        .all(|d| !d.opname.starts_with("goto_if_not") && !d.opname.starts_with("switch"))
+    ops.iter().enumerate().all(|(idx, d)| {
+        !(d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch"))
+            || is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d)
+    })
 }
 
 /// The un-lowered helper a descent into this jitcode body can reach on a path
@@ -2110,6 +2154,7 @@ fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> O
     while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
             'j' => cursor += 2,
             'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
             'd' => {
@@ -4206,6 +4251,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ctx.trace_ctx.finish_recorded_virtual_ref(false, false);
         return Err(err);
     }
+    flush_pending_residual_locals_adopt(ctx);
     // `execute_frame`'s `finally: ec.leave(...)`.  A `finally` runs on every
     // exit, and compiled code has no such construct, so the leave is recorded
     // at the earliest point the call is known to have returned: after
@@ -4725,6 +4771,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         abandon_portal_scope(ctx);
         return Err(err);
     }
+    flush_pending_residual_locals_adopt(ctx);
     if portal_vref.is_some() {
         let escaped = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
             Some(majit_ir::Value::Ref(frame)) if frame.0 != 0 => unsafe {
@@ -5745,18 +5792,30 @@ pub(crate) fn cut_declined_subwalk<Sym: WalkSym>(
 /// The point a builtin descent cuts back to, with the effect state it was
 /// entered with.
 #[derive(Clone, Copy)]
-struct SubWalkRewind {
+pub(crate) struct SubWalkRewind {
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     effects_before: usize,
     unjournaled_before: bool,
 }
 
 impl SubWalkRewind {
+    pub(crate) fn new(
+        pre_fold_pos: majit_metainterp::recorder::TracePosition,
+        effects_before: usize,
+        unjournaled_before: bool,
+    ) -> Self {
+        Self {
+            pre_fold_pos,
+            effects_before,
+            unjournaled_before,
+        }
+    }
+
     /// Whether the walk applied nothing since the rewind point, so the
     /// ordinary residual call applies every effect exactly once.  The
     /// gateway's rollback arm in [`try_walker_inline_builtin_call`] says why
     /// an unjournaled effect from before the rewind point also refuses.
-    fn nothing_applied(&self) -> bool {
+    pub(crate) fn nothing_applied(&self) -> bool {
         fbw_executed_effect_count() == self.effects_before
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
@@ -7795,7 +7854,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     // The odometer counts every journaled effect — a store, a list append/pop,
     // a cell store — where the store journal counts only the first.  The
     // rewind arm below reads it to decide whether this descent already applied
@@ -8056,9 +8115,21 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
             },
             op.next_pc,
         ))),
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // `opimpl_jit_merge_point` else: this helper body owns a
+            // `loop_header`. Residualize the CALL rather than
+            // `SubWalkClosedLoop` abort the parent
+            // (`try_walker_inline_resolved_user_call` on `token is None`),
+            // but only when the descent applied nothing — the neighbouring
+            // `OrthodoxSubWalkTraceUnsupported` rewind arm.
+            if rewind.nothing_applied() {
+                cut_declined_subwalk(ctx, pre_fold_pos);
+                return Ok(None);
+            }
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
-        | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
         | DispatchOutcome::SegmentTrace { .. } => {
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
@@ -8346,7 +8417,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     // A nested helper's byte offset is not a coordinate in the Python
     // jitcode. Keep the outermost CALL so a portal entered from inside
     // the helper still names that call.
@@ -8440,9 +8511,22 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             },
             op.next_pc,
         ))),
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
+            // `opimpl_jit_merge_point` else: this helper body owns a
+            // `loop_header`. Residualize the CALL rather than
+            // `SubWalkClosedLoop` abort the parent
+            // (`try_walker_inline_resolved_user_call` on `token is None`),
+            // but only when the descent applied nothing — the neighbouring
+            // `OrthodoxSubWalkTraceUnsupported` rewind arm. `rewind` was
+            // taken before `__new__`, so an applied `__new__` keeps the abort.
+            if rewind.nothing_applied() {
+                cut_declined_subwalk(ctx, rewind.pre_fold_pos);
+                return Ok(None);
+            }
+            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        }
         DispatchOutcome::CloseLoop { .. }
         | DispatchOutcome::CompileTracePending { .. }
-        | DispatchOutcome::SubLoopCalleeCallAssembler { .. }
         | DispatchOutcome::SegmentTrace { .. } => {
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
@@ -11273,7 +11357,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 transparent_helper_jitcode_index: None,
                 transparent_helper_effects_at_entry: None,
                 transparent_helper_journal_at_entry: None,
-                ..ctx.fbw_mode
+                pending_residual_locals_adopt: None,
+                ..ctx.fbw_mode.clone()
             },
             session: ctx.session,
             registers_r: &callee_regs_r,
@@ -11404,10 +11489,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .get(callee_portal_frame_reg as usize)
                     .expect("ref register in range");
             }
-            if !try_multiframe {
+            {
                 let mut state = sub_wc.frame_state.borrow_mut();
                 let shadow = state.callee_shadow.as_mut().unwrap();
-                shadow.fold_frame_reg = callee_portal_frame_reg;
+                if !try_multiframe {
+                    shadow.fold_frame_reg = callee_portal_frame_reg;
+                }
                 // The fold's premise (`setarrayitem_vable_via_metainterp`) is
                 // that it writes away from an UNSEEDED portal frame — a pure
                 // SSA mirror with no heap array behind it.  The seed block
@@ -11428,6 +11515,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // now carries one, so the remaining question is only whether
                 // the callee's own frame reds were seeded; an unseeded callee
                 // keeps folding.
+                // A `try_multiframe` level seeds the same real `PyFrame`; its
+                // flag arms the post-residual live-array read in
+                // `getarrayitem_vable_via_metainterp`, the nonstandard
+                // `_opimpl_getarrayitem_vable` executing against the frame the
+                // residual wrote (`pyjitpl.py`).
                 shadow.frame_materialized = callee_frame_materialized_has_resume;
             }
             for i in 0..seeded_locals {
@@ -16617,11 +16709,11 @@ pub(crate) struct GeneratorResumeCensus {
     /// hook against the ones a straight-line resume would already serve.
     ///
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
-    /// `loop_header` op.  A generator body is never a true portal, so that
-    /// jitcode test answers `false` for every generator whatever its source
-    /// says.  `merge_entry_by_green` is `find_loop_header_pcs` plus function
-    /// entry and is built for every code object, so it survives the portal
-    /// distinction.
+    /// `loop_header` op (`interp_jit.py` `jump_absolute`). Generator
+    /// `merge_entry_by_green` is still `find_loop_header_pcs` plus function
+    /// entry and is built for every code object. True-portal tables also
+    /// list instruction-start greens (`interp_jit.py PyFrame.dispatch`);
+    /// generators do not.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
     /// distinguishable from one whose tables simply do not resolve it.
@@ -16762,29 +16854,29 @@ fn generator_resume_op_scan(body_code: &[u8]) -> (usize, usize, usize) {
 /// The JitCode byte offset a walk of this body enters at to resume at
 /// `resume_py_pc`.
 ///
-/// `merge_entry_for` cannot answer it: `merge_entry_by_green` is built from
-/// `find_loop_header_pcs` plus function entry, and a generator's resume
-/// coordinate is neither.  Widening THAT table is not the fix — the portal
-/// reads it, so publishing resume coordinates there would start portal traces
-/// that walk straight into the `abort_permanent` the yield bakes.
+/// `merge_entry_for` cannot answer it: generator `merge_entry_by_green` is
+/// built from `find_loop_header_pcs` plus function entry, and a generator's
+/// resume coordinate is neither.  Publishing yield-resume coordinates there
+/// is not the fix — the portal reads the table, so a yield PC would start a
+/// walk into the `abort_permanent` the yield bakes. True-portal instruction
+/// starts belong in the table (`interp_jit.py PyFrame.dispatch` greens);
+/// generator resume PCs do not.
 ///
-/// The shipped per-Python-PC tables already carry what the codewriter's own
-/// `derive_resume_marker` reads.  `py_exact_by_jit_pc` records one entry per
-/// contiguous emission run, so the smallest offset a Python PC owns is that
-/// PC's first emitted op — the `first_op_by_py_pc` value — and
-/// `block_head_py_by_jit_pc` is the table it resolves against.  Rebuilding the
-/// first-op column here and calling the same derivation keeps one definition
-/// of the resolution rather than a second spelling of it.
+/// `resume_execute_frame` starts at `next_instr()`, the first op of that
+/// Python pc. `derive_resume_marker` answers the block-head `-live-`
+/// at-or-before that first op; a yield's `abort_permanent` does not open a
+/// new block, so the RESUME that follows it (`last_instr+1`) still has the
+/// yield's block head. Walking from there hits the yield's
+/// `setarrayitem_vable_r` of the operand-stack color before the walk has
+/// defined it (`RegisterReadUnbound`). The first-op column is the
+/// instruction start `dispatch` would enter.
 fn generator_resume_marker_offset(
     pjc: &crate::pyjitcode::PyJitCode,
     resume_py_pc: usize,
 ) -> Option<usize> {
     let metadata = &pjc.metadata;
     let n_py = metadata.n_py_instrs as usize;
-    if metadata.py_exact_by_jit_pc.is_empty()
-        || metadata.block_head_py_by_jit_pc.is_empty()
-        || resume_py_pc >= n_py
-    {
+    if metadata.py_exact_by_jit_pc.is_empty() || resume_py_pc >= n_py {
         return None;
     }
     let mut first_op_by_py_pc = vec![usize::MAX; n_py];
@@ -16792,6 +16884,10 @@ fn generator_resume_marker_offset(
         if let Some(slot) = first_op_by_py_pc.get_mut(py as usize) {
             *slot = (*slot).min(off as usize);
         }
+    }
+    let first = first_op_by_py_pc[resume_py_pc];
+    if first != usize::MAX {
+        return Some(first);
     }
     crate::pyjitcode::derive_resume_marker(
         &first_op_by_py_pc,
@@ -17117,6 +17213,7 @@ fn descend_generatorentry<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    flush_pending_residual_locals_adopt(ctx);
     // `direct_assembler_call` keeps the assembler target alive between
     // `GUARD_NOT_FORCED` and `handle_possible_exception`.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[iter_op]);
@@ -17292,7 +17389,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         (*gen_frame).pushvalue_none();
     };
 
-    let saved_fbw_mode = ctx.fbw_mode;
+    let saved_fbw_mode = ctx.fbw_mode.clone();
     ctx.fbw_mode.inline_subwalk = true;
 
     // Load `gen.frame` from the guarded iterator so the compiled loop
@@ -17328,6 +17425,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         frame_box,
         yield_marker_jit_pc: yield_marker,
         yield_py_pc: shape.last_instr as u32,
+        unroll_iterations: 1,
     });
     let ec_box = ctx
         .trace_ctx
@@ -19623,6 +19721,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(majit_ir::OpCode::GuardNotForced, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
+        flush_pending_residual_locals_adopt(ctx);
     }
     // `pyjitpl.py handle_possible_exception`: a standing last_exc_value
     // always `finishframe_exception`s.  The EI `can_raise` flag only
@@ -19793,7 +19892,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
         let mut walk_ctx = WalkContext {
             frame_state: self.frame_state.clone(),
             inline_callee_consts: self.inline_callee_consts,
-            fbw_mode: self.fbw_mode,
+            fbw_mode: self.fbw_mode.clone(),
             session: self.session,
             registers_r: &self.registers_r,
             registers_i: &self.registers_i,
@@ -20894,7 +20993,8 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 .fbw_mode
                 .inline_caller_py_pc
                 .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
-            ..ctx.fbw_mode
+            pending_residual_locals_adopt: None,
+            ..ctx.fbw_mode.clone()
         },
         session: ctx.session,
         descr_refs: ctx.descr_refs,
@@ -21295,13 +21395,15 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
-            // The loop-callee CALL_ASSEMBLER request is surfaced from a
-            // multi-frame inline at a `residual_call` site and consumed by
-            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
-            // jitcode-op path. Fail loud (safe decline) if that invariant ever
-            // breaks.
-            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: bubble to
+            // `try_walker_inline_user_call` / `walk`, which residualizes
+            // or emits CALL_ASSEMBLER. Aborting here retraced the parent
+            // (`SubWalkClosedLoop` is unclassified `Abort`).
+            Ok((
+                DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+                op.next_pc,
+            ))
         }
         DispatchOutcome::SegmentTrace { .. } => {
             // The segmenting cut is gated on `is_top_level` for the same
@@ -21790,13 +21892,15 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
-            // The loop-callee CALL_ASSEMBLER request is surfaced from a
-            // multi-frame inline at a `residual_call` site and consumed by
-            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
-            // jitcode-op path. Fail loud (safe decline) if that invariant ever
-            // breaks.
-            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: bubble to
+            // `try_walker_inline_user_call` / `walk`, which residualizes
+            // or emits CALL_ASSEMBLER. Aborting here retraced the parent
+            // (`SubWalkClosedLoop` is unclassified `Abort`).
+            Ok((
+                DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+                op.next_pc,
+            ))
         }
         DispatchOutcome::SegmentTrace { .. } => {
             // The segmenting cut is gated on `is_top_level` for the same
@@ -22029,13 +22133,15 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
             // arm if that invariant ever breaks.
             Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
         }
-        DispatchOutcome::SubLoopCalleeCallAssembler { .. } => {
-            // The loop-callee CALL_ASSEMBLER request is surfaced from a
-            // multi-frame inline at a `residual_call` site and consumed by
-            // `try_walker_inline_user_call`; it cannot reach the `inline_call_*`
-            // jitcode-op path. Fail loud (safe decline) if that invariant ever
-            // breaks.
-            Err(DispatchError::SubWalkClosedLoop { pc: op.pc })
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `opimpl_jit_merge_point` else: bubble to
+            // `try_walker_inline_user_call` / `walk`, which residualizes
+            // or emits CALL_ASSEMBLER. Aborting here retraced the parent
+            // (`SubWalkClosedLoop` is unclassified `Abort`).
+            Ok((
+                DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
+                op.next_pc,
+            ))
         }
         DispatchOutcome::SegmentTrace { .. } => {
             // The segmenting cut is gated on `is_top_level` for the same

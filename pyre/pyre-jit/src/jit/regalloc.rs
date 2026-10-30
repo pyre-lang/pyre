@@ -138,8 +138,8 @@ impl<'a> RegAllocator<'a> {
     }
 
     /// `make_dependencies`, recording only the edges whose two endpoints are
-    /// both in `tracked` (every edge when `None`).  Nodes are still added for
-    /// every variable, and liveness is computed over all of them.
+    /// both in `tracked` (every edge when `None`).  An untracked variable
+    /// gets no node either.
     fn make_dependencies_among(&mut self, tracked: Option<&HashSet<super::flow::VariableId>>) {
         let kind = self.kind;
         let is_tracked = |v: &super::flow::VariableId| tracked.is_none_or(|set| set.contains(v));
@@ -230,10 +230,10 @@ impl<'a> RegAllocator<'a> {
                     .map(|v| self.merged_rep(v.id)),
             );
             for (i, &v) in livevar_reps.iter().enumerate() {
-                self._depgraph.add_node(v);
                 if !is_tracked(&v) {
                     continue;
                 }
+                self._depgraph.add_node(v);
                 for j in 0..i {
                     // Pre-merged inputargs can collapse to the same
                     // representative.  RPython's DependencyGraph asserts
@@ -257,7 +257,6 @@ impl<'a> RegAllocator<'a> {
                 if let Some(result) = op.result.as_ref().and_then(FlowValue::as_variable) {
                     if result.kind == Some(kind) {
                         let rep = self.merged_rep(result.id);
-                        self._depgraph.add_node(rep);
                         // upstream (`regalloc.py:73`): add an edge from
                         // every live var to `result`.  `result` is added
                         // to `livevars` only *after* the loop upstream.
@@ -265,6 +264,7 @@ impl<'a> RegAllocator<'a> {
                         // inputarg and this result share a representative,
                         // so keep the RPython add_edge invariant locally.
                         if is_tracked(&rep) {
+                            self._depgraph.add_node(rep);
                             for &v in &livevars {
                                 if v != rep {
                                     self._depgraph.add_edge(v, rep);

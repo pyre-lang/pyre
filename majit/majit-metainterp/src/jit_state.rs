@@ -984,6 +984,14 @@ pub trait JitState: Sized {
         None
     }
 
+    /// Register the state's red fields that hold GC references as resume
+    /// roots (`majit_gc::shadow_stack::push_resume_ref_roots`), so a
+    /// collection during bridge setup forwards them in place the way
+    /// `shadowstack.py` rewrites a GCREF local across a collecting call.
+    /// The caller pops them with `pop_resume_ref_roots_to`. `self` must not
+    /// move while they are registered.
+    fn push_red_gcref_roots(&mut self) {}
+
     fn virtualizable_array_lengths(
         &self,
         _meta: &Self::Meta,

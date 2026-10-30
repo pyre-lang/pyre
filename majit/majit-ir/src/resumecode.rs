@@ -5,7 +5,8 @@
 //! Encoding: variable-length integers with zigzag encoding.
 //! - 7-bit:  0xxxxxxx
 //! - 14-bit: 1xxxxxxx 0xxxxxxx
-//! - 21-bit: 1xxxxxxx 1xxxxxxx xxxxxxxx
+//! - 21-bit: 1xxxxxxx 1xxxxxxx 0xxxxxxx
+//! - 28-bit: 1xxxxxxx 1xxxxxxx 1xxxxxxx xxxxxxxx
 
 /// resumecode.py: append_numbering(lst, item)
 pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
@@ -20,16 +21,22 @@ pub fn encode_varint(buf: &mut Vec<u8>, value: i32) {
     } else if item < (1 << 14) {
         buf.push((item | 0x80) as u8);
         buf.push((item >> 7) as u8);
-    } else {
-        // `resumecode.py` `append_numbering` asserts `item < 2**16` because
-        // `append_int` feeds it a SHORT. A jitcode pc is a `fix_labels`
-        // target (`0 <= target <= 0xFFFF`); its zigzag is `target * 2` and
-        // still fits this 3-byte form (`item >> 14` in one byte, so
-        // `item < 2**22`).
-        assert!(item < (1 << 22), "resumecode item too large: {item}");
+    } else if item < (1 << 21) {
+        // Three-byte form: `assembler.py` `fix_labels` targets were
+        // `<= 0xFFFF` (zigzag `< 2**17`). pyre's three-byte `L` names
+        // a pc `< 2**24`; zigzag `< 2**21` still fits here with the
+        // third-byte high bit clear, so existing encodings decode.
         buf.push((item | 0x80) as u8);
         buf.push(((item >> 7) | 0x80) as u8);
         buf.push((item >> 14) as u8);
+    } else {
+        // Four-byte form: zigzag `>= 2**21` (pc `>= 2**20`). The third
+        // byte's high bit continues; the fourth holds `item >> 21`.
+        assert!(item < (1 << 29), "resumecode item too large: {item}");
+        buf.push((item | 0x80) as u8);
+        buf.push(((item >> 7) | 0x80) as u8);
+        buf.push(((item >> 14) | 0x80) as u8);
+        buf.push((item >> 21) as u8);
     }
 }
 
@@ -51,6 +58,10 @@ pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
         let b1 = buf[last];
         if b1 & (1 << 7) != 0 {
             last = index + 2;
+            let b2 = buf[last];
+            if b2 & (1 << 7) != 0 {
+                last = index + 3;
+            }
         }
     }
     let _ = buf[last];
@@ -59,7 +70,7 @@ pub fn decode_varint(buf: &[u8], index: usize) -> (i32, usize) {
 }
 
 /// `resumecode.py` `numb_next_item`. `_always_inline_ = True`: the
-/// one-, two-, and three-byte forms are one function.
+/// one- through four-byte forms are one function.
 ///
 /// # Safety
 /// `index` is the start of a complete encoded item in `ptr[..len]`
@@ -85,7 +96,7 @@ unsafe fn decode_varint_at(
 }
 
 /// # Safety
-/// Same as [`decode_varint_at`]: `index` starts a two- or three-byte
+/// Same as [`decode_varint_at`]: `index` starts a two- through four-byte
 /// item that is fully inside `ptr[..len]`.
 #[inline(always)]
 unsafe fn decode_varint_rest(
@@ -111,6 +122,15 @@ unsafe fn decode_varint_rest(
         value &= (1 << 14) - 1;
         value |= (unsafe { *ptr.add(index) } as i64) << 14;
         index += 1;
+        if value & (1 << 21) != 0 {
+            #[cfg(debug_assertions)]
+            if index >= len {
+                varint_oob(ptr, len, index);
+            }
+            value &= (1 << 21) - 1;
+            value |= (unsafe { *ptr.add(index) } as i64) << 21;
+            index += 1;
+        }
     }
     if value & 1 != 0 {
         value = -1 - value;
@@ -199,20 +219,20 @@ impl Writer {
     #[track_caller]
     pub fn append_int(&mut self, item: i64) {
         // `resumecode.py` `append_int` casts through `rffi.SHORT`. A jitcode
-        // pc is also a `fix_labels` target (`assert 0 <= target <= 0xFFFF`),
-        // so that unsigned range has to round-trip too.
+        // pc is also a `fix_labels` target; pyre's three-byte `L` names
+        // `0..=(2**24-1)`, so that unsigned range has to round-trip too.
         let fits_short = (item as i16) as i64 == item;
-        let fits_label = (0..=u16::MAX as i64).contains(&item);
+        let fits_label = (0..=((1 << 24) - 1) as i64).contains(&item);
         assert!(
             fits_short || fits_label,
-            "append_int: value {item} out of i16 range and fix_labels u16 range"
+            "append_int: value {item} out of i16 range and three-byte label range"
         );
         self.append_short(item as i32);
     }
 
     /// Byte list `Writer.create_numbering` builds before `lltype.malloc`.
     pub fn encode_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.current.len() * 3);
+        let mut buf = Vec::with_capacity(self.current.len() * 4);
         for &item in &self.current {
             encode_varint(&mut buf, item);
         }
@@ -864,14 +884,31 @@ mod tests {
 
     #[test]
     fn decode_varint_roundtrips_item_widths() {
-        // one byte: zigzag `item < 2**7` (0, ±1, ±63). Then two- and three-byte items.
+        // one byte: zigzag `item < 2**7` (0, ±1, ±63). Then two-, three-,
+        // and four-byte items (four-byte starts at zigzag `2**21`, pc `2**20`).
         let cases: &[(&str, &[i32])] = &[
             ("one_byte", &[0, 1, -1, 63, -63]),
             (
                 "two_and_three_byte",
                 &[
-                    64, -64, 127, -128, 8191, -8192, 16383, -16384, 32768, 40479, 65535,
+                    64,
+                    -64,
+                    127,
+                    -128,
+                    8191,
+                    -8192,
+                    16383,
+                    -16384,
+                    32768,
+                    40479,
+                    65535,
+                    65536,
+                    (1 << 20) - 1,
                 ],
+            ),
+            (
+                "four_byte",
+                &[1 << 20, (1 << 21) - 1, 1 << 21, (1 << 24) - 1],
             ),
         ];
         for (name, values) in cases {

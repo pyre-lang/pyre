@@ -1551,6 +1551,12 @@ pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
     u16::from_le_bytes([lo, hi])
 }
 
+pub(crate) fn read_label(code: &[u8], cursor: &mut usize) -> usize {
+    let value = majit_jitcode::jitcode::read_label_at(code, *cursor);
+    *cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

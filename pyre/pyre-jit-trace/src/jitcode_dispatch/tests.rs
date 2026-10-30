@@ -580,11 +580,17 @@ fn residual_call_with_funcbox(funcbox: u8) -> Vec<u8> {
     vec![byte, funcbox, 0, 0, 0, 0]
 }
 
-fn goto_if_not(cond: u8, target: u16) -> Vec<u8> {
+fn goto_if_not(cond: u8, target: usize) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not/iL")
         .expect("`goto_if_not/iL` must be in insns table");
-    vec![byte, cond, target as u8, (target >> 8) as u8]
+    vec![
+        byte,
+        cond,
+        target as u8,
+        (target >> 8) as u8,
+        (target >> 16) as u8,
+    ]
 }
 
 /// One `inline_call_r_v/dR` with an empty argument varlist, naming descriptor
@@ -646,11 +652,16 @@ fn int_copy_reg(src: u8, dst: u8) -> Vec<u8> {
     vec![byte, src, dst]
 }
 
-fn goto_l(target: u16) -> Vec<u8> {
+fn goto_l(target: usize) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
-    vec![byte, target as u8, (target >> 8) as u8]
+    vec![
+        byte,
+        target as u8,
+        (target >> 8) as u8,
+        (target >> 16) as u8,
+    ]
 }
 
 /// `conditional_call_value_ir_i/iiIRd>i` with empty I/R lists, value in the
@@ -678,11 +689,11 @@ fn arraylen_gc(array: u8, descr: u16, dst: u8) -> Vec<u8> {
 #[test]
 fn a_blocker_on_an_arm_reached_without_an_effect_is_not_a_decline() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
-    let mut code = goto_if_not(0, 11);
+    let mut code = goto_if_not(0, 12);
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
     code.extend(void_return());
-    assert_eq!(code.len(), 12, "the reject arm ends at the second return");
+    assert_eq!(code.len(), 13, "the reject arm ends at the second return");
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
     assert_eq!(summary.blocker_effect_free, Some(symbolic));
@@ -703,11 +714,11 @@ fn a_blocker_behind_an_executed_call_is_a_decline() {
     assert!(!majit_jitcode::codewriter::call::is_symbolic_fnaddr(real));
 
     let mut code = residual_call_with_funcbox(1);
-    code.extend(goto_if_not(0, 17));
+    code.extend(goto_if_not(0, 18));
     code.extend(residual_call_with_funcbox(2));
     code.extend(void_return());
     code.extend(void_return());
-    assert_eq!(code.len(), 18);
+    assert_eq!(code.len(), 19);
 
     let summary =
         super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
@@ -729,20 +740,20 @@ fn a_known_goto_condition_does_not_scan_the_dead_arm() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
-    // 0: i0 = const <src>; 3: goto_if_not i0 -> 20
-    // 7: residual(real); 13: residual(symbolic); 19: return; 20: return
+    // 0: i0 = const <src>; 3: goto_if_not i0 -> 21
+    // 8: residual(real); 14: residual(symbolic); 20: return; 21: return
     //
     // `int_copy/c>i` carries its source inline as one signed byte, so the
     // condition is spelled by that byte and there is no `constants_i` slot to
     // vary: the two bodies differ only in it.
     let body = |src: u8| {
         let mut code = int_copy_const(src, 0);
-        code.extend(goto_if_not(0, 20));
+        code.extend(goto_if_not(0, 21));
         code.extend(residual_call_with_funcbox(2));
         code.extend(residual_call_with_funcbox(3));
         code.extend(void_return());
         code.extend(void_return());
-        assert_eq!(code.len(), 21);
+        assert_eq!(code.len(), 22);
         code
     };
 
@@ -768,15 +779,15 @@ fn a_known_wrapper_array_length_selects_only_the_executed_arity_arm() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let real = 0x1234_5678i64;
 
-    // 0: i0 = arraylen(r0); 5: goto_if_not i0 -> 22
-    // 9: residual(real); 15: residual(symbolic); 21: return; 22: return
+    // 0: i0 = arraylen(r0); 5: goto_if_not i0 -> 23
+    // 10: residual(real); 16: residual(symbolic); 22: return; 23: return
     let mut code = arraylen_gc(0, 0, 0);
-    code.extend(goto_if_not(0, 22));
+    code.extend(goto_if_not(0, 23));
     code.extend(residual_call_with_funcbox(1));
     code.extend(residual_call_with_funcbox(2));
     code.extend(void_return());
     code.extend(void_return());
-    assert_eq!(code.len(), 23);
+    assert_eq!(code.len(), 24);
 
     let scan = |len| {
         super::inline_call::summarize_body_blockers_with(
@@ -1017,11 +1028,16 @@ fn live() -> Vec<u8> {
     v
 }
 
-fn catch_exception(target: u16) -> Vec<u8> {
+fn catch_exception(target: usize) -> Vec<u8> {
     let byte = *insns_opname_to_byte()
         .get("catch_exception/L")
         .expect("`catch_exception/L` must be in insns table");
-    vec![byte, target as u8, (target >> 8) as u8]
+    vec![
+        byte,
+        target as u8,
+        (target >> 8) as u8,
+        (target >> 16) as u8,
+    ]
 }
 
 /// A raise caught in this frame is not a frame exit.  `finishframe_lookahead_at`
@@ -1033,10 +1049,10 @@ fn a_raise_caught_in_this_frame_reaches_its_handler() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
     let mut code = raise_r(0);
     code.extend(live());
-    let handler = (code.len() + 3 + 1) as u16;
+    let handler = code.len() + 4 + 1;
     code.extend(catch_exception(handler));
     code.extend(void_return());
-    assert_eq!(code.len(), handler as usize, "the handler follows the exit");
+    assert_eq!(code.len(), handler, "the handler follows the exit");
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
 
@@ -1063,14 +1079,10 @@ fn a_raise_caught_in_this_frame_reaches_its_handler() {
 #[test]
 fn a_blocker_in_a_handler_reads_its_funcbox_from_the_surviving_constants() {
     let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
-    let handler = 3 + 1;
+    let handler = 4 + 1;
     let mut code = catch_exception(handler);
     code.extend(void_return());
-    assert_eq!(
-        code.len(),
-        handler as usize,
-        "the handler follows the fallthrough"
-    );
+    assert_eq!(code.len(), handler, "the handler follows the fallthrough");
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
 
@@ -1161,7 +1173,7 @@ fn a_body_that_does_not_decode_to_the_end_is_a_decline() {
     let mut code = residual_call_with_funcbox(0);
     let goto = goto_if_not(0, 5);
     code.extend(&goto[..goto.len() - 1]);
-    assert_eq!(code.len(), 9, "the branch is one byte short of its label");
+    assert_eq!(code.len(), 10, "the branch is one byte short of its label");
 
     let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
     assert!(summary.body_not_walked);
@@ -1280,19 +1292,19 @@ fn a_maybe_symbolic_funcbox_join_is_a_blocker() {
     assert!(majit_jitcode::codewriter::call::is_callable_fnaddr(real));
 
     // i0 red condition, i1 dest; i2 symbolic, i3 real.
-    // 0: goto_if_not i0, 10
-    // 4: int_copy i2 -> i1
-    // 7: goto 13
-    // 10: int_copy i3 -> i1
-    // 13: residual i1
-    // 19: void_return
-    let mut code = goto_if_not(0, 10);
+    // 0: goto_if_not i0, 12
+    // 5: int_copy i2 -> i1
+    // 8: goto 15
+    // 12: int_copy i3 -> i1
+    // 15: residual i1
+    // 21: void_return
+    let mut code = goto_if_not(0, 12);
     code.extend(int_copy_reg(2, 1));
-    code.extend(goto_l(13));
+    code.extend(goto_l(15));
     code.extend(int_copy_reg(3, 1));
     code.extend(residual_call_with_funcbox(1));
     code.extend(void_return());
-    assert_eq!(code.len(), 20);
+    assert_eq!(code.len(), 22);
 
     let whole = super::inline_call::summarize_body_blockers(&code, 2, &[symbolic, real], |_| None);
     assert_eq!(whole.blocker_effect_free, Some(0));
@@ -2330,6 +2342,26 @@ fn rewind_dunder_admits_only_terminal_nested_raise_shape() {
     assert!(!dunder_body_facts_admissible_on_rewind(facts(
         true, true, true, true,
     )));
+}
+
+#[test]
+fn inlined_loop_header_without_compiled_token_surfaces_call_assembler() {
+    // `opimpl_jit_merge_point` else (`portal_call_depth`): finishframe +
+    // `do_recursive_call`. A missing / tmp-callback token residualizes the
+    // CALL; it must not return None and close the OUTER portal at this
+    // jumpto (`surface_inline_subloop_after_back_edge`).
+    let mut ctx = TraceCtx::for_test(1);
+    ctx.seen_loop_header_for_jdindex = 0;
+    let outcome = surface_inline_subloop_after_back_edge(&mut ctx, None, 10, false, 0, 1, false);
+    match outcome {
+        Some((DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc }, next_pc)) => {
+            assert!(token.is_none());
+            assert_eq!(target_pc, 10);
+            assert_eq!(next_pc, 1);
+        }
+        other => panic!("expected SubLoopCalleeCallAssembler, got {other:?}"),
+    }
+    assert_eq!(ctx.seen_loop_header_for_jdindex, -1);
 }
 
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the
@@ -3679,9 +3711,11 @@ fn drive_int_add_jump_if_ovf(
     let live_byte = *insns_opname_to_byte()
         .get("live/")
         .expect("live must be in the runtime instruction table");
-    // Lii>i: target 9, source registers 0/1, destination register 2.
-    // Separate live tails at 6 and 9 make fallthrough and jump observable.
-    let code = [ovf_byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    // Lii>i: target 10, source registers 0/1, destination register 2.
+    // Separate live tails at 7 and 10 make fallthrough and jump observable.
+    let code = [
+        ovf_byte, 10, 0, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0,
+    ];
     let _ = test_outer_resume_jitcode_index();
     let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
     let lhs = OpRef::input_arg_int(0);
@@ -3774,7 +3808,7 @@ fn int_add_jump_if_ovf_no_overflow_records_guard_no_overflow_and_writes_dst() {
         guard_resume_pc, 0,
         "the guard resumes at the overflow opcode"
     );
-    assert_eq!(next_pc, 6, "no overflow continues at op.next_pc");
+    assert_eq!(next_pc, 7, "no overflow continues at op.next_pc");
     assert_eq!(dst, resbox, "the no-overflow continue writes resbox to dst");
 }
 
@@ -3790,7 +3824,7 @@ fn int_add_jump_if_ovf_overflow_records_guard_overflow_and_jumps() {
         "the guard resumes at the overflow opcode"
     );
     assert_eq!(dst, OpRef::NONE, "the overflow jump does not write dst");
-    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+    assert_eq!(next_pc, 10, "overflow jumps to the handler target");
 }
 
 #[test]
@@ -3798,7 +3832,7 @@ fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
     let byte = *insns_opname_to_byte()
         .get("int_add_jump_if_ovf/Lii>i")
         .expect("int_add_jump_if_ovf must be in the runtime instruction table");
-    let code = [byte, 6, 0, 0, 1, 2];
+    let code = [byte, 7, 0, 0, 0, 1, 2];
     let mut tc = fresh_trace_ctx();
     let lhs = tc.const_int(40);
     let rhs = tc.const_int(2);
@@ -3806,7 +3840,7 @@ fn int_ovf_jump_constant_operands_fold_without_recording_an_ovf_op() {
     let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut [], &mut [], &mut regs_i)
         .expect("constant overflow arithmetic must fold");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 6);
+    assert_eq!(next_pc, 7);
     assert_eq!(
         tc.num_ops(),
         0,
@@ -3820,7 +3854,7 @@ fn int_ovf_jump_declines_when_an_operand_is_not_concrete() {
     let byte = *insns_opname_to_byte()
         .get("int_add_jump_if_ovf/Lii>i")
         .expect("int_add_jump_if_ovf must be in the runtime instruction table");
-    let code = [byte, 6, 0, 0, 1, 2];
+    let code = [byte, 7, 0, 0, 0, 1, 2];
     let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
     let lhs = OpRef::input_arg_int(0);
     let rhs = OpRef::input_arg_int(1);
@@ -3843,7 +3877,7 @@ fn int_ovf_jump_recovers_overflow_from_int_bank_shadow() {
     let live_byte = *insns_opname_to_byte()
         .get("live/")
         .expect("live must be in the runtime instruction table");
-    let code = [byte, 9, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
+    let code = [byte, 10, 0, 0, 0, 1, 2, live_byte, 0, 0, live_byte, 0, 0];
     let mut tc = TraceCtx::for_test_types(&[Type::Int, Type::Int]);
     let lhs = OpRef::input_arg_int(0);
     let rhs = OpRef::input_arg_int(1);
@@ -3865,7 +3899,7 @@ fn int_ovf_jump_recovers_overflow_from_int_bank_shadow() {
     )
     .expect("int-bank shadow recovers the overflow decision");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 9, "overflow jumps to the handler target");
+    assert_eq!(next_pc, 10, "overflow jumps to the handler target");
     let opcodes: Vec<_> = tc.ops().iter().map(|op| op.opcode).collect();
     assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardOverflow]);
 }
@@ -4387,7 +4421,7 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_int_eq/iiL")
         .expect("`goto_if_not_int_eq/iiL` must be in insns table");
-    let code = [byte, 0x00, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x00, 0x09, 0x00, 0x00];
     let mut same_tc = TraceCtx::for_test_types(&[Type::Int]);
     let same = OpRef::input_arg_int(0);
     let mut same_regs = [same];
@@ -4400,7 +4434,7 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
         "same-box equality records no compare or guard"
     );
 
-    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let code = [byte, 0x00, 0x01, 0x09, 0x00, 0x00];
     let mut const_tc = fresh_trace_ctx();
     let lhs = const_tc.const_int(4);
     let rhs = const_tc.const_int(5);
@@ -4417,7 +4451,7 @@ fn fused_int_compare_folds_same_box_and_constant_operands_without_guards() {
     let ptr_byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_ne/rrL")
         .expect("`goto_if_not_ptr_ne/rrL` must be in insns table");
-    let ptr_code = [ptr_byte, 0x00, 0x00, 0x09, 0x00];
+    let ptr_code = [ptr_byte, 0x00, 0x00, 0x09, 0x00, 0x00];
     let mut ptr_tc = TraceCtx::for_test_types(&[Type::Ref]);
     let same_ptr = OpRef::input_arg_ref(0);
     let mut ptr_regs = [same_ptr];
@@ -4440,7 +4474,7 @@ fn fused_int_is_zero_folds_a_const_operand_without_recording() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_int_is_zero/iL")
         .expect("`goto_if_not_int_is_zero/iL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = tc.const_int(5);
     let mut regs_i = [operand];
@@ -4459,7 +4493,7 @@ fn fused_ptr_compare_uses_ref_shadows_for_the_runtime_direction() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_eq/rrL")
         .expect("`goto_if_not_ptr_eq/rrL` must be in insns table");
-    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let code = [byte, 0x00, 0x01, 0x09, 0x00, 0x00];
     let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
     let lhs = OpRef::input_arg_ref(0);
     let rhs = OpRef::input_arg_ref(1);
@@ -4537,8 +4571,8 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    // `rL`: 1B ref reg + 2B label (target 9).
-    let code = [byte, 0x00, 0x09, 0x00];
+    // `rL`: 1B ref reg + 3B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
@@ -4549,8 +4583,8 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
         .expect("`goto_if_not_ptr_nonzero/rL` must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
-        next_pc, 4,
-        "a non-null pointer falls through past the 3 operand bytes"
+        next_pc, 5,
+        "a non-null pointer falls through past the 4 operand bytes"
     );
     let last = tc.ops().last().expect("recorded op must exist");
     assert_eq!(
@@ -4569,7 +4603,7 @@ fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_iszero/rL")
         .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
@@ -4592,7 +4626,8 @@ fn goto_if_not_ptr_iszero_uses_aligned_cast_int_to_ptr_box_when_register_is_null
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_iszero/rL")
         .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    // `rL`: 1B ref reg + 3B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let aligned = 0x1000_usize;
@@ -4609,7 +4644,7 @@ fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let mut regs_r = [operand];
@@ -4626,7 +4661,7 @@ fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    let code = [byte, 0x00, 0x09, 0x00];
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = dummy_ptr_eq_box(&mut tc);
     let ops_before = tc.num_ops();
@@ -4649,8 +4684,8 @@ fn goto_if_not_ptr_nonzero_uses_known_nonnull_heapcache_without_a_ref_shadow() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_ptr_nonzero/rL")
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
-    // `rL`: 1B ref reg + 2B label (target 9).
-    let code = [byte, 0x00, 0x09, 0x00];
+    // `rL`: 1B ref reg + 3B label (target 9).
+    let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let operand = tc.record_op(majit_ir::OpCode::New, &[]);
     tc.heap_cache_mut().new_object(operand);
@@ -4663,7 +4698,7 @@ fn goto_if_not_ptr_nonzero_uses_known_nonnull_heapcache_without_a_ref_shadow() {
         .expect("a heapcache-known non-null box needs no ref shadow");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
-        next_pc, 4,
+        next_pc, 5,
         "a known non-null pointer falls through without reading a shadow"
     );
     assert_eq!(
@@ -5421,7 +5456,7 @@ fn switch_id_requires_concrete_int_value() {
 #[test]
 fn goto_if_not_truthy_records_guard_true_and_falls_through() {
     // `goto_if_not/iL` with a concrete non-zero Int: emit GuardTrue,
-    // do NOT take the jump (pc advances past the 3-byte operand
+    // do NOT take the jump (pc advances past the 4-byte operand
     // block).  RPython `pyjitpl.py opimpl_goto_if_not`
     // `if switchcase: opnum = rop.GUARD_TRUE; ... if not switchcase: self.pc = target`.
     let goto_if_byte = *insns_opname_to_byte()
@@ -5431,6 +5466,7 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         goto_if_byte,
         0x00, // i register 0
         0x40,
+        0x00,
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
@@ -5495,6 +5531,7 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         goto_if_byte,
         0x00, // i register 0
         0x40,
+        0x00,
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
@@ -5559,6 +5596,7 @@ fn goto_if_not_requires_concrete_int_value() {
         goto_if_byte,
         0x00, // i register 0
         0x40,
+        0x00,
         0x00, // L target = 0x0040
     ];
     let mut tc = fresh_trace_ctx();
@@ -7087,7 +7125,8 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                 for c in op.argcodes.chars() {
                     match c {
                         'i' | 'c' | 'r' | 'f' => cursor += 1,
-                        'L' | 'j' => cursor += 2,
+                        'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+                        'j' => cursor += 2,
                         'd' => {
                             let lo = code[cursor] as u16;
                             let hi = code[cursor + 1] as u16;
@@ -7136,10 +7175,8 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                     'i' | 'c' | 'r' | 'f' => cursor += 1,
                     'd' | 'j' => cursor += 2,
                     'L' => {
-                        let lo = truediv.code[cursor] as u16;
-                        let hi = truediv.code[cursor + 1] as u16;
-                        labels.push(lo | (hi << 8));
-                        cursor += 2;
+                        labels.push(majit_jitcode::jitcode::read_label_at(&truediv.code, cursor));
+                        cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
                     }
                     'I' | 'R' | 'F' => {
                         let n = truediv.code[cursor] as usize;
@@ -7201,16 +7238,15 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
                         'i' | 'c' | 'r' | 'f' => cursor += 1,
                         'd' | 'j' => cursor += 2,
                         'L' => {
-                            let lo = truediv.code[cursor] as u16;
-                            let hi = truediv.code[cursor + 1] as u16;
-                            let target = (lo | (hi << 8)) as usize;
+                            let target =
+                                majit_jitcode::jitcode::read_label_at(&truediv.code, cursor);
                             assert!(
                                 target >= op.next_pc,
                                 "_truediv must not back-edge ({opname} {pc} → {target}); that CFG hung the helper walk",
                                 opname = op.opname,
                                 pc = op.pc,
                             );
-                            cursor += 2;
+                            cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
                         }
                         'I' | 'R' | 'F' => {
                             let n = truediv.code[cursor] as usize;
@@ -7306,6 +7342,27 @@ fn descr_get_tb_lineno_is_the_pypy_leaf() {
     assert!(
         addr2line_ops.iter().any(|op| *op == "residual_call_ir_i"),
         "{addr2line_path} must residualise _offset2lineno; ops={addr2line_ops:?}"
+    );
+}
+
+#[test]
+fn descr_get_f_back_is_the_pypy_leaf() {
+    // pyframe.py `fget_f_back` → `getnextframe_nohidden`. LOAD_ATTR of
+    // `f_back` descends this graph instead of residualising `bh_load_attr_fn`.
+    let path = "pyre_interpreter::pyframe::descr_get_f_back";
+    let getter = crate::jitcode_runtime::pathed_jitcode(path)
+        .expect("descr_get_f_back must be a discovered jitcode");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&getter.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        !getter.code.is_empty(),
+        "{path} must carry assembled bytecode; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.contains("call_may_force") || op.contains("getattr")),
+        "{path} must not force through getattr; ops={ops:?}"
     );
 }
 
@@ -9807,14 +9864,14 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
 
 #[test]
 fn step_through_goto_jumps_to_label_target() {
-    // `goto/L` reads its 2-byte LE label and the walker
+    // `goto/L` reads its three-byte LE label and the walker
     // returns Continue at the label target, not the linear next pc.
     // RPython `blackhole.py bhimpl_goto(target): return target`.
     let goto_byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
     // target = 0x002A = 42
-    let code = [goto_byte, 0x2A, 0x00];
+    let code = [goto_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
@@ -9863,7 +9920,7 @@ fn step_through_goto_jumps_to_label_target() {
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
         next_pc, 42,
-        "goto/L must jump to its 2-byte LE label target",
+        "goto/L must jump to its three-byte LE label target",
     );
     drop(wc);
     assert_eq!(
@@ -9875,13 +9932,13 @@ fn step_through_goto_jumps_to_label_target() {
 
 #[test]
 fn step_through_goto_handles_high_byte_of_label() {
-    // Confirm the LE decode reads both bytes (regression guard for
-    // accidentally treating L as a single byte).
+    // Confirm the LE decode reads all three bytes (regression guard for
+    // accidentally treating L as a single byte or as two).
     let goto_byte = *insns_opname_to_byte()
         .get("goto/L")
         .expect("`goto/L` must be in insns table");
-    // target = 0x0102 = 258
-    let code = [goto_byte, 0x02, 0x01];
+    // target = 0x010102 = 65794
+    let code = [goto_byte, 0x02, 0x01, 0x01];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -9927,7 +9984,7 @@ fn step_through_goto_handles_high_byte_of_label() {
     };
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
-    assert_eq!(next_pc, 258);
+    assert_eq!(next_pc, 65794);
 }
 
 #[test]
@@ -9953,7 +10010,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
         .expect("goto/L must be in insns");
 
     // (1) live/ + catch_exception/L target=42 → CatchTarget(42).
-    let code_catch = [live_byte, 0x00, 0x00, catch_byte, 0x2A, 0x00];
+    let code_catch = [live_byte, 0x00, 0x00, catch_byte, 0x2A, 0x00, 0x00];
     assert_eq!(
         finishframe_lookahead_at(&code_catch, 0),
         FinishframeLookahead::CatchTarget(0x2A),
@@ -9962,7 +10019,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
     // (2) catch_exception/L without leading live/ → still
     //     CatchTarget (RPython's `if opcode == op_live: skip` is
     //     conditional, not required).
-    let code_no_live_catch = [catch_byte, 0x10, 0x01];
+    let code_no_live_catch = [catch_byte, 0x10, 0x01, 0x00];
     assert_eq!(
         finishframe_lookahead_at(&code_no_live_catch, 0),
         FinishframeLookahead::CatchTarget(0x110),
@@ -9970,7 +10027,7 @@ fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
 
     // (3) live/ + goto/L (NOT catch nor rvmprof) → NoMatch (the
     //     caller continues unwinding).
-    let code_no_match = [live_byte, 0x00, 0x00, goto_byte, 0x00, 0x00];
+    let code_no_match = [live_byte, 0x00, 0x00, goto_byte, 0x00, 0x00, 0x00];
     assert_eq!(
         finishframe_lookahead_at(&code_no_match, 0),
         FinishframeLookahead::NoMatch,
@@ -9993,7 +10050,7 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
     let catch_byte = *insns_opname_to_byte()
         .get("catch_exception/L")
         .expect("`catch_exception/L` must be in insns table");
-    let code = [catch_byte, 0x2A, 0x00];
+    let code = [catch_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let regs = distinct_const_refs(&mut tc, 4);
     let active_exc = regs[0];
@@ -10057,11 +10114,11 @@ fn step_through_catch_exception_advances_past_label_operand() {
     // `catch_exception/L` records nothing on the normal
     // walk (RPython `pyjitpl.py opimpl_catch_exception` is
     // an `assert not last_exc_value` only) and the walker advances
-    // linearly past the 2-byte target.
+    // linearly past the three-byte target.
     let catch_byte = *insns_opname_to_byte()
         .get("catch_exception/L")
         .expect("`catch_exception/L` must be in insns table");
-    let code = [catch_byte, 0x2A, 0x00];
+    let code = [catch_byte, 0x2A, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
@@ -10109,8 +10166,8 @@ fn step_through_catch_exception_advances_past_label_operand() {
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
     assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(
-        next_pc, 3,
-        "catch_exception/L must advance past the 2-byte target operand",
+        next_pc, 4,
+        "catch_exception/L must advance past the three-byte target operand",
     );
     drop(wc);
     assert_eq!(
@@ -10719,9 +10776,9 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
     //     opcode(1) + d(2) + R-len(1) + R[0](1) + dst(1)
     //   pc=6..9   live + 2-byte liveness offset (OFFSET_SIZE=2)
     //     opcode(1) + slot(2)
-    //   pc=9..12  catch_exception/L target=12 (LE little-endian)
-    //     opcode(1) + target(2)
-    //   pc=12..14 handler body: ref_return r5
+    //   pc=9..13  catch_exception/L target=13 (LE little-endian)
+    //     opcode(1) + target(3)
+    //   pc=13..15 handler body: ref_return r5
     //     opcode(1) + reg(1)
     let caller_code = vec![
         inline_byte,
@@ -10734,12 +10791,13 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         0x00,
         0x00,
         catch_byte,
-        0x0C,
+        0x0D,
+        0x00,
         0x00,
         ret_byte,
         0x05,
     ];
-    assert_eq!(caller_code.len(), 14);
+    assert_eq!(caller_code.len(), 15);
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 8);
     let exc_arg = regs_r[3];
@@ -10796,8 +10854,8 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         "caller must reach handler's ref_return and terminate (not bubble SubRaise)",
     );
     assert_eq!(
-        end_pc, 14,
-        "walker must terminate at handler's ref_return r5 (pc=12..14)",
+        end_pc, 15,
+        "walker must terminate at handler's ref_return r5 (pc=13..15)",
     );
     assert_eq!(
         wc.last_exc_value(),
@@ -10866,6 +10924,7 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         0x02,
         0x05,
         goto_byte,
+        0x00,
         0x00,
         0x00,
     ];
@@ -12516,7 +12575,7 @@ fn fused_float_compare_folds_const_operands_without_guards() {
     let byte = *insns_opname_to_byte()
         .get("goto_if_not_float_lt/ffL")
         .expect("`goto_if_not_float_lt/ffL` must be in insns table");
-    let code = [byte, 0x00, 0x01, 0x09, 0x00];
+    let code = [byte, 0x00, 0x01, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
     let lhs = tc.const_float((1.0f64).to_bits() as i64);
     let rhs = tc.const_float((2.0f64).to_bits() as i64);
@@ -14288,7 +14347,7 @@ fn call_descr_with_effect(idx: u32, extra: majit_ir::ExtraEffect) -> DescrRef {
 /// Convenience: builds a `_r_r`-shape CallDescr with both
 /// `extraeffect` and `oopspecindex` populated, for tests that need
 /// to drive [`do_not_in_trace_call_result`] /
-/// [`do_jit_force_virtual_guard`] / future oopspec-keyed guards.
+/// [`walker_do_jit_force_virtual`] / future oopspec-keyed guards.
 fn call_descr_with_oopspec(
     idx: u32,
     extra: majit_ir::ExtraEffect,
@@ -15794,17 +15853,10 @@ fn not_in_trace_with_a_destination_bank_stays_fail_loud() {
 }
 
 #[test]
-fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py` short-circuits
-    // `do_residual_call` via `_do_jit_force_virtual` when
-    // `effectinfo.oopspecindex == OS_JIT_FORCE_VIRTUAL`.  The
-    // walker can't reproduce that short-circuit (needs concrete
-    // `vref_ptr` resolver); fail-loud error keeps the path from
-    // silently recording `CALL_MAY_FORCE_*` instead.
-    let residual_byte = *insns_opname_to_byte()
-        .get("residual_call_r_r/iRd>r")
-        .expect("`residual_call_r_r/iRd>r` must be in insns table");
-    let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+fn jit_force_virtual_without_vinfo_falls_through() {
+    // `pyjitpl.py _do_jit_force_virtual`: no virtualizable_info and no
+    // greenfield_info returns None, then `do_residual_call` records
+    // CALL_MAY_FORCE.
     let mut tc = fresh_trace_ctx();
     let regs_i = distinct_const_refs(&mut tc, 1);
     let regs_r = distinct_const_refs(&mut tc, 4);
@@ -15813,8 +15865,7 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
         majit_ir::OopSpecIndex::JitForceVirtual,
     );
-    let descr_pool = vec![force_virtual_descr];
-    let frame_done_descr = done_descr_ref_for_tests();
+    let descr_pool = vec![force_virtual_descr.clone()];
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
@@ -15832,7 +15883,6 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         registers_r: &RegisterBank::new(regs_r.iter().copied()),
         registers_i: &RegisterBank::new(regs_i.iter().copied()),
         registers_f: &RegisterBank::default(),
-
         concrete_registers_i: &mut [],
         descr_refs: &descr_pool,
         raw_descrs: RawDescrPool::Global,
@@ -15843,23 +15893,318 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
-
         pending_guard_snapshot_error: None,
-
         vstack_depth: 0,
         vstack_cur_pypc: 0,
         vstack_valid: false,
-
         vstack_reorder_ceiling: u32::MAX,
-
         vstack_handler_landing_py: None,
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let err = step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![regs_i[0], regs_r[0]];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("no vinfo is a fall-through, not an error");
+    assert_eq!(outcome, None);
+}
+
+#[test]
+fn jit_force_virtual_identity_returns_standard_box() {
+    // `pyjitpl.py _do_jit_force_virtual`: `if standard_box is vref_box:
+    // return vref_box`.
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let standard = tc
+        .standard_virtualizable_box()
+        .expect("bind_fake_vable seeds virtualizable_boxes[-1]");
+    let func = tc.const_int(0);
+    let regs_r = [standard, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, standard];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("identity short-circuit must not fail loud");
+    assert_eq!(outcome, Some(DispatchOutcome::Continue));
+    assert_eq!(wc.registers_r.get(0), Some(standard));
+}
+
+#[test]
+fn jit_force_virtual_wrong_arity_fails_loud() {
+    // pyjitpl.py `_do_jit_force_virtual`: `assert len(allboxes) == 2`
+    // even when vinfo/ginfo are absent. Must not fall through to CALL_MAY_FORCE.
+    let mut tc = fresh_trace_ctx();
+    let regs_i = distinct_const_refs(&mut tc, 1);
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![regs_i[0]];
+    let call = std::panic::AssertUnwindSafe(|| {
+        walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+    });
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            std::panic::catch_unwind(call).is_err(),
+            "arity != 2 must debug_assert, not fall through to CALL_MAY_FORCE"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(
+            matches!(
+                call.0(),
+                Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 })
+            ),
+            "arity != 2 must fail loud in release"
+        );
+    }
+}
+
+#[test]
+fn jit_force_virtual_missing_standard_box_fails_loud() {
+    // pyjitpl.py `_do_jit_force_virtual`: `virtualizable_boxes[-1]` is an
+    // IndexError when the standard box is missing. Not a may-force residual.
+    let mut tc = fresh_trace_ctx();
+    tc.install_virtualizable_info(crate::frame_layout::build_pyframe_virtualizable_info());
+    let func = tc.const_int(0);
+    let vref = tc.const_null();
+    let regs_r = [vref, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, vref];
+    let call = std::panic::AssertUnwindSafe(|| {
+        walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+    });
+    #[cfg(debug_assertions)]
+    {
+        assert!(
+            std::panic::catch_unwind(call).is_err(),
+            "missing virtualizable_boxes[-1] must debug_assert"
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        assert!(matches!(
+            call.0(),
+            Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 })
+        ));
+    }
+}
+
+#[test]
+fn jit_force_virtual_known_nonstandard_records_no_ptr_eq() {
+    // pyjitpl.py `_do_jit_force_virtual`: heapcache short-circuit counts
+    // HEAPCACHED_OPS and returns None without recording PTR_EQ.
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let standard = tc
+        .standard_virtualizable_box()
+        .expect("bind_fake_vable seeds virtualizable_boxes[-1]");
+    let func = tc.const_int(0);
+    // heapcache.py `nonstandard_virtualizables_now_known`: Const boxes
+    // are ignored, so the vref must be a recorded non-const.
+    let vref = dummy_ptr_eq_box(&mut tc);
+    assert_ne!(vref, standard);
+    tc.heap_cache_mut()
+        .nonstandard_virtualizables_now_known(vref);
+    let ops_before = tc.num_ops();
+    let heapcached_before = tc.profiler().snapshot().heapcached_ops;
+    let regs_r = [vref, tc.const_null(), tc.const_null(), tc.const_null()];
+    let regs_i = [func];
+    let force_virtual_descr = call_descr_with_oopspec(
+        42,
+        majit_ir::ExtraEffect::ForcesVirtualOrVirtualizable,
+        majit_ir::OopSpecIndex::JitForceVirtual,
+    );
+    let descr_pool = vec![force_virtual_descr.clone()];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let ei = force_virtual_descr
+        .as_call_descr()
+        .expect("call descr")
+        .get_extra_info();
+    let allboxes = vec![func, vref];
+    let outcome = walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
+        .expect("known-nonstandard is a fall-through, not an error");
+    assert_eq!(outcome, None);
+    assert_eq!(wc.trace_ctx.num_ops(), ops_before, "must not record PTR_EQ");
     assert_eq!(
-        err,
-        DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 },
+        wc.trace_ctx.profiler().snapshot().heapcached_ops,
+        heapcached_before + 1
     );
 }
 
@@ -20929,6 +21274,115 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     }
 }
 
+/// `pyjitpl.py` `opimpl_jit_merge_point` snapshots `history.any_operation()`
+/// before `debug_merge_point` records `DEBUG_MERGE_POINT`. An empty history
+/// visiting an already-compiled green stays inert even though that record
+/// (and the portal debugdata/tracefunc/profilefunc guards) runs first.
+#[test]
+fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x02, 0x00, 0x01, // gi: [next_instr, is_being_profiled]
+        0x01, 0x00, // gr: [pycode]
+        0x00, // gf
+        0x00, // ri
+        0x02, 0x01, 0x02, // rr: [frame, ec]
+        0x00, // rf
+    ];
+    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.portal_call_depth_fn = Some(Box::new(|| 0));
+    tc.has_compiled_targets_fn = Some(Box::new(|_| true));
+    assert_eq!(tc.num_ops(), 0);
+    let next_instr = tc.const_int(42);
+    let pycode = tc.const_ref(0x1_0000);
+    let red0 = tc.const_ref(0x2_0000);
+    let red1 = tc.const_ref(0x3_0000);
+    let is_being_profiled = tc.const_int(0);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new([pycode, red0, red1]),
+        registers_i: &RegisterBank::new([next_instr, is_being_profiled]),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    let (outcome, next) = step(&code, 0, &mut wc).expect("jit_merge_point must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next, code.len());
+    assert_eq!(
+        wc.trace_ctx.seen_loop_header_for_jdindex, -1,
+        "empty history must not auto-stamp a compiled green"
+    );
+    assert!(
+        wc.trace_ctx.num_ops() > 0,
+        "debug_merge_point still records DEBUG_MERGE_POINT on the inert path"
+    );
+}
+
+/// True-portal instruction starts emit `get_is_being_profiled`'s diamond
+/// in front of `jit_merge_point`. The synthesizer must see that marker
+/// ahead and leave `DEBUG_MERGE_POINT` to `opimpl_jit_merge_point`.
+#[test]
+fn jit_merge_point_ahead_sees_the_dispatch_marker() {
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    let code = [
+        jmp_byte, 0x00, // c: jdindex
+        0x02, 0x00, 0x01, // gi
+        0x01, 0x00, // gr
+        0x00, // gf
+        0x00, // ri
+        0x02, 0x01, 0x02, // rr
+        0x00, // rf
+    ];
+    assert!(
+        jit_merge_point_ahead(&code, 0, code.len()),
+        "the dispatch marker at the scan start must count as ahead"
+    );
+    assert!(
+        !jit_merge_point_ahead(&code, code.len(), code.len()),
+        "past the marker there is nothing to find"
+    );
+    assert!(
+        !jit_merge_point_ahead(&[], 0, 0),
+        "an empty body has no dispatch marker"
+    );
+}
+
 /// `pyjitpl.py put_back_list_of_boxes3`: a first visit that registers
 /// the merge point and continues must write SAME_AS-wrapped reds back
 /// into `MIFrame.registers_r`, so later snapshots do not keep the Const.
@@ -21213,18 +21667,19 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     let jmp_byte = *insns_opname_to_byte()
         .get("jit_merge_point/cIRFIRF")
         .expect("`jit_merge_point/cIRFIRF` must be in insns table");
-    // loop_header/i (2) + goto/L (3) + jit_merge_point/cIRFIRF with empty reds.
+    // loop_header/i (2) + goto/L (4) + jit_merge_point/cIRFIRF with empty reds.
     // The goto is an exact `py_floor_by_jit_pc` key sitting between the stamp
     // and the marker, so a hand close on the synthesized boundary would fire
     // there.
     let goto_pc = 2u32;
-    let merge_pc = 5usize;
+    let merge_pc = 6usize;
     let bytes = vec![
         lh_byte,
         0x02, // i2 = jdindex
         goto_byte,
         merge_pc as u8,
         (merge_pc >> 8) as u8,
+        (merge_pc >> 16) as u8,
         jmp_byte,
         0x00, // c: jdindex
         0x02,
@@ -21256,8 +21711,9 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     pyjit.metadata.built_as_portal = true;
     // Offset 0 keeps `containing_py_pc_for_jitcode_pc` defined for the
     // header byte. Offset 2 is the goto, the boundary between the stamp
-    // and the marker.
-    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (goto_pc, 9)];
+    // and the marker. Offset `merge_pc` starts the next Python opcode, so
+    // the goto's floor segment does not contain the `jit_merge_point` marker.
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (goto_pc, 9), (merge_pc as u32, 10)];
     let pyjit = std::sync::Arc::new(pyjit);
     let installed =
         crate::state::install_jitcode_for(w_code as *const (), std::sync::Arc::clone(&pyjit))
@@ -23035,4 +23491,41 @@ fn push_exc_info_prev_save_without_anchor_does_not_bake_w_prev() {
     );
 
     super::fbw_store_journal_reset();
+}
+
+fn load_fast_unbound_check_body(goto_src: u8) -> [u8; 15] {
+    let load = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .expect("`getarrayitem_vable_r/ridd>r` must be in insns table");
+    let goto = *insns_opname_to_byte()
+        .get("goto_if_not_ptr_nonzero/rL")
+        .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
+    let ret = *insns_opname_to_byte()
+        .get("ref_return/r")
+        .expect("`ref_return/r` must be in insns table");
+    [
+        load, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // ridd>r dst 2
+        goto, goto_src, 0x0e, 0x00, 0x00, // rL
+        ret, 0x02,
+    ]
+}
+
+#[test]
+fn exception_string_override_straight_line_accepts_load_fast_unbound_check() {
+    // pyopcode.py LOAD_FAST / emit_load_fast_checked!: getarrayitem_vable_r
+    // of the local, then goto_if_not_ptr_nonzero on that same register.
+    let body = load_fast_unbound_check_body(0x02);
+    let load = crate::jitcode_runtime::decode_op_at(&body, 0).expect("load");
+    assert_eq!(load.key, "getarrayitem_vable_r/ridd>r");
+    let goto = crate::jitcode_runtime::decode_op_at(&body, load.next_pc).expect("goto");
+    assert_eq!(goto.key, "goto_if_not_ptr_nonzero/rL");
+    assert!(
+        exception_string_override_straight_line(&body, &[]),
+        "LOAD_FAST unbound-local check is dispatch protocol"
+    );
+    let mismatched = load_fast_unbound_check_body(0x03);
+    assert!(
+        !exception_string_override_straight_line(&mismatched, &[]),
+        "goto src must be the getarrayitem_vable_r dest"
+    );
 }

@@ -1644,10 +1644,10 @@ impl BlackholeInterpreter {
     /// issuing a new call must not pick up this already-caught exception).
     fn route_to_catch(&mut self, catch_pos: usize, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
-        if catch_pos + 2 >= code.len() {
+        if catch_pos + majit_jitcode::jitcode::LABEL_OPERAND_SIZE >= code.len() {
             return false;
         }
-        let target = (code[catch_pos + 1] as usize) | ((code[catch_pos + 2] as usize) << 8);
+        let target = majit_jitcode::jitcode::read_label_at(code, catch_pos + 1);
         // Take the exception into this frame's walked slot before anything
         // below can allocate.  `record` builds a traceback node, and on the
         // inline-callee path this slot is the exception's ONLY root at that
@@ -1975,8 +1975,8 @@ impl BlackholeInterpreter {
                         continue;
                     }
                     jitcode::insns::BC_JUMP => {
-                        // SAFETY: well-formed `goto/L` carries two operand bytes.
-                        position = unsafe { bh_code_u16(code, position) };
+                        // SAFETY: well-formed `goto/L` carries a three-byte label.
+                        position = unsafe { bh_code_label(code, position) };
                         continue;
                     }
                     jitcode::insns::BC_GOTO_IF_NOT | jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
@@ -1985,8 +1985,12 @@ impl BlackholeInterpreter {
                         // is `bhimpl_goto_if_not`.
                         // SAFETY: operand bytes and the named int register exist.
                         let a = unsafe { *regs_i.add(*code.get_unchecked(position) as usize) };
-                        let target = unsafe { bh_code_u16(code, position + 1) };
-                        position = bhimpl_goto_if_not(a, target, position + 3);
+                        let target = unsafe { bh_code_label(code, position + 1) };
+                        position = bhimpl_goto_if_not(
+                            a,
+                            target,
+                            position + 1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+                        );
                         continue;
                     }
                     jitcode::insns::BC_INT_IS_TRUE => {
@@ -2091,8 +2095,12 @@ impl BlackholeInterpreter {
                         unsafe {
                             let a = *regs_i.add(*code.get_unchecked(position) as usize);
                             let b = *regs_i.add(*code.get_unchecked(position + 1) as usize);
-                            let target = bh_code_u16(code, position + 2);
-                            position = if a == b { position + 4 } else { target };
+                            let target = bh_code_label(code, position + 2);
+                            position = if a == b {
+                                position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE
+                            } else {
+                                target
+                            };
                         }
                         continue;
                     }
@@ -6999,7 +7007,7 @@ mod tests {
             builder.setup_insns(&loop_insns);
             super::wire_bhimpl_handlers(&mut builder);
             let code = [
-                0, 0x16, 2, 0x10, 0, 1, 0x17, 0x16, 0x17, 2, 0x16, 1, 0x16, 3, 0, 0, 4, 0x17,
+                0, 0x16, 2, 0x12, 0, 0, 1, 0x17, 0x16, 0x17, 2, 0x16, 1, 0x16, 3, 0, 0, 0, 4, 0x17,
             ];
             let mut bh = builder.acquire_interp();
             bh.registers_i = vec![0; 0x18];
@@ -8563,14 +8571,14 @@ fn handler_live(
     Ok(position + majit_jitcode::liveness::OFFSET_SIZE)
 }
 
-/// Handler for `goto/L` — unconditional jump. Argcodes: `L` (2-byte label).
+/// Handler for `goto/L` — unconditional jump. Argcodes: `L` (three-byte label).
 /// RPython blackhole.py: `def bhimpl_goto(target): return target`.
 fn handler_goto(
     _bh: &mut BlackholeInterpreter,
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
+    let target = majit_jitcode::jitcode::read_label_at(code, position);
     Ok(bhimpl_goto(target))
 }
 
@@ -8996,7 +9004,7 @@ bhhandler_ii_i!(handler_uint_ge, bhimpl_uint_ge);
 // ── goto_if_not_int_* conditionals (RPython blackhole.py:871-920) ───
 
 /// Decode pattern `@arguments("i", "i", "L", "pc", returns="L")`.
-/// Read 2 int registers + 2-byte label; compare; return target or pc.
+/// Read 2 int registers + three-byte label; compare; return target or pc.
 macro_rules! bhhandler_goto_if_not_ii {
     ($name:ident, $cmp:expr) => {
         fn $name(
@@ -9006,8 +9014,8 @@ macro_rules! bhhandler_goto_if_not_ii {
         ) -> Result<usize, DispatchError> {
             let a = bh.registers_i[code[position] as usize];
             let b = bh.registers_i[code[position + 1] as usize];
-            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-            let pc = position + 4;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+            let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             if $cmp(a, b) { Ok(pc) } else { Ok(target) }
         }
     };
@@ -9022,8 +9030,8 @@ macro_rules! bhhandler_goto_if_not_short {
         ) -> Result<usize, DispatchError> {
             let a = code[position] as i8 as i64;
             let b = bh.registers_i[code[position + 1] as usize];
-            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-            let pc = position + 4;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+            let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             if $cmp(a, b) { Ok(pc) } else { Ok(target) }
         }
 
@@ -9034,8 +9042,8 @@ macro_rules! bhhandler_goto_if_not_short {
         ) -> Result<usize, DispatchError> {
             let a = bh.registers_i[code[position] as usize];
             let b = code[position + 1] as i8 as i64;
-            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-            let pc = position + 4;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+            let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             if $cmp(a, b) { Ok(pc) } else { Ok(target) }
         }
 
@@ -9046,8 +9054,8 @@ macro_rules! bhhandler_goto_if_not_short {
         ) -> Result<usize, DispatchError> {
             let a = code[position] as i8 as i64;
             let b = code[position + 1] as i8 as i64;
-            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-            let pc = position + 4;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+            let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             if $cmp(a, b) { Ok(pc) } else { Ok(target) }
         }
     };
@@ -9064,8 +9072,8 @@ fn handler_goto_if_not_int_eq(
 ) -> Result<usize, DispatchError> {
     let a = bh.registers_i[code[position] as usize];
     let b = bh.registers_i[code[position + 1] as usize];
-    let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-    let pc = position + 4;
+    let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+    let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
     if crate::bh_debug_enabled() {
         eprintln!(
             "[bh-brcond] pos={} int_eq i{}={} i{}={} target={} fallthrough={}",
@@ -9121,7 +9129,7 @@ bhhandler_goto_if_not_short!(
 );
 
 /// Decode pattern `@arguments("i", "L", "pc", returns="L")` — 1 int read +
-/// 2-byte label target; bhimpl chooses target or fall-through pc.
+/// three-byte label target; bhimpl chooses target or fall-through pc.
 macro_rules! bhhandler_goto_if_not_i {
     ($name:ident, $bhimpl:ident) => {
         fn $name(
@@ -9130,15 +9138,15 @@ macro_rules! bhhandler_goto_if_not_i {
             position: usize,
         ) -> Result<usize, DispatchError> {
             let a = bh.registers_i[code[position] as usize];
-            let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-            let pc = position + 3;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 1);
+            let pc = position + 1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             Ok($bhimpl(a, target, pc))
         }
     };
 }
 
 /// Decode pattern `@arguments("r", "L", "pc", returns="L")` — 1 ref read +
-/// 2-byte label target; bhimpl chooses target or fall-through pc.
+/// three-byte label target; bhimpl chooses target or fall-through pc.
 macro_rules! bhhandler_goto_if_not_r {
     ($name:ident, $bhimpl:ident) => {
         fn $name(
@@ -9147,15 +9155,15 @@ macro_rules! bhhandler_goto_if_not_r {
             position: usize,
         ) -> Result<usize, DispatchError> {
             let a = bh.registers_r[code[position] as usize];
-            let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-            let pc = position + 3;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 1);
+            let pc = position + 1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             Ok($bhimpl(a, target, pc))
         }
     };
 }
 
 /// Decode pattern `@arguments("r", "r", "L", "pc", returns="L")` — 2 ref reads +
-/// 2-byte label target; bhimpl chooses target or fall-through pc.
+/// three-byte label target; bhimpl chooses target or fall-through pc.
 macro_rules! bhhandler_goto_if_not_rr {
     ($name:ident, $bhimpl:ident) => {
         fn $name(
@@ -9165,8 +9173,8 @@ macro_rules! bhhandler_goto_if_not_rr {
         ) -> Result<usize, DispatchError> {
             let a = bh.registers_r[code[position] as usize];
             let b = bh.registers_r[code[position + 1] as usize];
-            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-            let pc = position + 4;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+            let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             Ok($bhimpl(a, b, target, pc))
         }
     };
@@ -9343,8 +9351,8 @@ fn bhimpl_int_mul_jump_if_ovf(a: i64, b: i64, target: usize, pc: usize) -> (Opti
     }
 }
 
-/// Decode pattern `@arguments("L", "i", "i", returns="iL")` — 2-byte label +
-/// 2 int reads + 1 int write (only on no-overflow path). Total 5 bytes.
+/// Decode pattern `@arguments("L", "i", "i", returns="iL")` — three-byte label +
+/// 2 int reads + 1 int write (only on no-overflow path).
 macro_rules! bhhandler_ovf_jump_ii {
     ($name:ident, $bhimpl:ident) => {
         fn $name(
@@ -9352,11 +9360,14 @@ macro_rules! bhhandler_ovf_jump_ii {
             code: &[u8],
             position: usize,
         ) -> Result<usize, DispatchError> {
-            let target = (code[position] as usize) | ((code[position + 1] as usize) << 8);
-            let a = bh.registers_i[code[position + 2] as usize];
-            let b = bh.registers_i[code[position + 3] as usize];
-            let result_reg = code[position + 4] as usize;
-            let pc = position + 5;
+            let target = majit_jitcode::jitcode::read_label_at(code, position);
+            let a = bh.registers_i
+                [code[position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE] as usize];
+            let b = bh.registers_i
+                [code[position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE + 1] as usize];
+            let result_reg =
+                code[position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE + 2] as usize;
+            let pc = position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE + 3;
             let (maybe_result, new_pos) = $bhimpl(a, b, target, pc);
             if let Some(r) = maybe_result {
                 bh.registers_i[result_reg] = r;
@@ -9387,8 +9398,8 @@ fn handler_goto_if_not(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let a = bh.registers_i[code[position] as usize];
-    let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
-    let pc = position + 3;
+    let target = majit_jitcode::jitcode::read_label_at(code, position + 1);
+    let pc = position + 1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
     if crate::bh_debug_enabled() {
         eprintln!(
             "[bh-brcond] pos={} cond_reg=i{} cond={} target={} fallthrough={}",
@@ -9499,6 +9510,16 @@ fn bh_store_float_field(struct_ptr: i64, value: f64, descr: &BhDescr) {
 #[inline(always)]
 unsafe fn bh_code_u16(code: &[u8], pos: usize) -> usize {
     unsafe { (*code.get_unchecked(pos) as usize) | ((*code.get_unchecked(pos + 1) as usize) << 8) }
+}
+
+/// Three-byte little-endian `L` jump target.
+#[inline(always)]
+unsafe fn bh_code_label(code: &[u8], pos: usize) -> usize {
+    unsafe {
+        (*code.get_unchecked(pos) as usize)
+            | ((*code.get_unchecked(pos + 1) as usize) << 8)
+            | ((*code.get_unchecked(pos + 2) as usize) << 16)
+    }
 }
 
 /// `d` argcode against the jitcode's own descr pool, then the builder table.
@@ -10249,8 +10270,8 @@ fn handler_catch_exception(
     _code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    // @arguments("L") — no-op, skip 2-byte label
-    Ok(position + 2)
+    // @arguments("L") — no-op, skip three-byte label
+    Ok(position + majit_jitcode::jitcode::LABEL_OPERAND_SIZE)
 }
 
 // Miscellaneous no-ops (`blackhole.py:1017-1049`)
@@ -10941,7 +10962,7 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
     // from setup_insns is a strict-dispatch error.
     //   * `live/` — operand-less; both paths skip 2-byte liveness offset.
     //   * `loop_header/i` — `i` is a 1-byte const-pool slot, RPython-aligned.
-    //   * `goto/L` — operand-less for registers; 2-byte label.
+    //   * `goto/L` — operand-less for registers; three-byte label.
     //   * `catch_exception/L` — same shape as `goto/L`.
     //   * `jit_merge_point/cIRFIRF` — both paths delegate to
     //     `bhimpl_jit_merge_point`, which decodes the post-opcode
@@ -11126,7 +11147,7 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
     ] {
         insns.insert(key.to_string(), byte);
     }
-    // A7 — branch family canonical 1-byte register + 2-byte label
+    // A7 — branch family canonical 1-byte register + three-byte label
     // encoding.  Every `goto_if_not_*` opname JitCodeBuilder emits,
     // matching the canonical `bhhandler_goto_if_not_*` decoders.
     for (key, byte) in [
@@ -12586,8 +12607,8 @@ macro_rules! bhhandler_goto_if_not_ff {
         ) -> Result<usize, DispatchError> {
             let a = f64::from_bits(bh.registers_f[code[position] as usize] as u64);
             let b = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
-            let target = (code[position + 2] as usize) | ((code[position + 3] as usize) << 8);
-            let pc = position + 4;
+            let target = majit_jitcode::jitcode::read_label_at(code, position + 2);
+            let pc = position + 2 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
             if $cmp(a, b) { Ok(pc) } else { Ok(target) }
         }
     };
@@ -12940,8 +12961,8 @@ fn handler_goto_if_exception_mismatch(
     p: usize,
 ) -> Result<usize, DispatchError> {
     let bounding_vtable = bh.registers_i[code[p] as usize];
-    let target = (code[p + 1] as usize) | ((code[p + 2] as usize) << 8);
-    let pc = p + 3;
+    let target = majit_jitcode::jitcode::read_label_at(code, p + 1);
+    let pc = p + 1 + majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
     let exc_obj = bh.exception_last_value;
     // blackhole.py:981 `assert real_instance` —
     // goto_if_exception_mismatch must only fire while an active caught

@@ -1305,6 +1305,46 @@ pub struct GraphFlattener<'a> {
     lowering_ctx: Option<LoweringContext>,
 }
 
+/// Heap work-list for `flatten.py` `make_bytecode_block` / `insert_exits`.
+///
+/// Upstream recurses `make_link` → `make_bytecode_block`. Pyre compiles
+/// user frames whose canraise fallthrough chain is one block per
+/// raising opcode; wasm32's linear-memory stack is 1 MiB, so that
+/// recursion exhausts it before `JitCodeBuilder::try_finish` can
+/// decline. Continuations preserve the bytes `insert_exits` emits
+/// *between* recursive `make_link` calls (`Label(link)` after the
+/// child subtree).
+enum FlattenWork {
+    Block(BlockRef, bool),
+    AfterCanraiseNormal {
+        normal_link: LinkRef,
+        catch_links: Vec<LinkRef>,
+    },
+    AfterCatch {
+        catch_links: Vec<LinkRef>,
+        index: usize,
+    },
+    AfterBoolTrue {
+        linkfalse: LinkRef,
+        handling_ovf: bool,
+    },
+    AfterOvfNormal {
+        exits: Vec<LinkRef>,
+    },
+    AfterOvfCatch1 {
+        exits: Vec<LinkRef>,
+    },
+    AfterSwitchDefault {
+        switches: Vec<LinkRef>,
+        handling_ovf: bool,
+    },
+    AfterSwitchCase {
+        switches: Vec<LinkRef>,
+        handling_ovf: bool,
+        index: usize,
+    },
+}
+
 impl<'a> GraphFlattener<'a> {
     /// `rpython/jit/codewriter/flatten.py GraphFlattener.__init__`.
     ///
@@ -1358,6 +1398,7 @@ impl<'a> GraphFlattener<'a> {
         self
     }
 
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
     pub fn serialize_op(&mut self, op: &SpaceOperation) {
         // `flatten.py serialize_op`: serialise an op into the
         // SSARepr via `emitline`.  Pyre's `flatten_space_operation`
@@ -1418,8 +1459,17 @@ impl<'a> GraphFlattener<'a> {
             if op.opname == "abort_permanent" {
                 self.ssarepr.abort_permanent_insn_pos.push((pos, py_pc));
             }
-            // Open a new run only where the owning PC actually changes, so the
-            // table stays one entry per contiguous region.
+        }
+        // Open a new run only where the owning PC actually changes, so the
+        // table stays one entry per contiguous region.  A block-entry `-live-`
+        // opens its block's run, so a jump that lands on the label reads the
+        // destination pc, not the pc laid out before the label.
+        let open_pc_run = op.offset >= 0
+            && (op.opname != OPNAME_LIVE
+                || matches!(self.ssarepr.insns.last(), Some(Insn::Label(_))));
+        if open_pc_run {
+            let py_pc = op.offset;
+            let pos = self.ssarepr.insns.len();
             if self
                 .ssarepr
                 .pc_run_insn_pos
@@ -1550,7 +1600,8 @@ impl<'a> GraphFlattener<'a> {
         self.emitline(Insn::Unreachable);
     }
 
-    fn make_link(&mut self, link: &LinkRef, handling_ovf: bool) {
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn make_link(&mut self, link: &LinkRef, handling_ovf: bool, work: &mut Vec<FlattenWork>) {
         // `rpython/jit/codewriter/flatten.py make_link`:
         //
         //     if (link.target.exits == ()
@@ -1609,10 +1660,16 @@ impl<'a> GraphFlattener<'a> {
             return;
         }
         self.insert_renamings(link);
-        self.make_bytecode_block(target, handling_ovf);
+        work.push(FlattenWork::Block(target, handling_ovf));
     }
 
-    fn make_exception_link(&mut self, link: &LinkRef, handling_ovf: bool) {
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn make_exception_link(
+        &mut self,
+        link: &LinkRef,
+        handling_ovf: bool,
+        work: &mut Vec<FlattenWork>,
+    ) {
         // RPython `flatten.py make_exception_link` requires
         // `link.last_exception` and `link.last_exc_value` to be seeded
         // by upstream `guessexception` (`flowcontext.py`).  In
@@ -1685,7 +1742,7 @@ impl<'a> GraphFlattener<'a> {
             self.emitline(Insn::Unreachable);
             return;
         }
-        self.make_link(link, handling_ovf);
+        self.make_link(link, handling_ovf, work);
     }
 
     /// `rpython/jit/codewriter/flatten.py:189-204` `_ovf` rewrite of
@@ -1712,7 +1769,12 @@ impl<'a> GraphFlattener<'a> {
     /// `->` result hint kept as `Insn::Op::result`".  The popped
     /// `_ovf` op's `opname[:7]` always yields the upstream "int_xxx"
     /// prefix (`int_add`, `int_sub`, `int_mul`, `int_neg`, …).
-    fn flatten_ovf_canraise(&mut self, exits: &[LinkRef], raising_opname: &str) {
+    fn flatten_ovf_canraise(
+        &mut self,
+        exits: &[LinkRef],
+        raising_opname: &str,
+        work: &mut Vec<FlattenWork>,
+    ) {
         // `flatten.py line = self.popline()`.  The most recent
         // serialized op is the `_ovf` arithmetic itself.
         let line = self
@@ -1761,40 +1823,16 @@ impl<'a> GraphFlattener<'a> {
             exits.len(),
         );
         // `flatten.py self.make_link(block.exits[0], False)`.
-        self.make_link(&exits[0], false);
-        // `flatten.py self.emitline(Label(block.exits[1]))`.
-        let exit1_label = self.label_for_link(&exits[1]);
-        self.emitline(exit1_label);
-        // `flatten.py self.make_exception_link(block.exits[1], True)`.
-        self.make_exception_link(&exits[1], true);
-        if exits.len() == 3 {
-            // `flatten.py assert block.exits[2].exitcase is Exception`.
-            // pyre represents the `Exception` catch-all by an exception
-            // link with the extravars (`last_exception`, `last_exc_value`)
-            // pair seeded by `attach_catch_exception_edge`, no typed
-            // `llexitcase` (untyped catch-all), and arity-2 args mirroring
-            // the reraise shape — together those distinguish the catch-all
-            // from a normal-flow link (which has all three None) and from
-            // a typed catch (which has `llexitcase = Some(case)`).
-            let exit2 = exits[2].borrow();
-            assert!(
-                exit2.llexitcase.is_none(),
-                "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
-                 the `Exception` catch-all (llexitcase=None) per flatten.py:202",
-            );
-            assert!(
-                exit2.last_exception.is_some() && exit2.last_exc_value.is_some(),
-                "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
-                 an exception link with extravars seeded per flowcontext.py:130-143 \
-                 (matches `exitcase is Exception` invariant from flatten.py:202)",
-            );
-            drop(exit2);
-            // `flatten.py self.make_exception_link(block.exits[2], False)`.
-            self.make_exception_link(&exits[2], false);
-        }
+        // The Label(exits[1]) / make_exception_link tail runs after that
+        // subtree (`AfterOvfNormal`).
+        work.push(FlattenWork::AfterOvfNormal {
+            exits: exits.to_vec(),
+        });
+        self.make_link(&exits[0], false, work);
     }
 
-    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool, work: &mut Vec<FlattenWork>) {
         let exits = block.borrow().exits.clone();
         // `flatten.py insert_exits` chooses the arm from `len(exits)` and
         // `block.canraise` (`exitswitch is c_last_exception`). A `raise`
@@ -1841,10 +1879,10 @@ impl<'a> GraphFlattener<'a> {
                 self.emitline(Insn::op("catch_exception", vec![catch_label]));
                 let handler_label = self.label_for_link(link);
                 self.emitline(handler_label);
-                self.make_exception_link(link, handling_ovf);
+                self.make_exception_link(link, handling_ovf, work);
                 return;
             }
-            self.make_link(link, handling_ovf);
+            self.make_link(link, handling_ovf, work);
             return;
         }
         if block.borrow().canraise() {
@@ -1891,7 +1929,7 @@ impl<'a> GraphFlattener<'a> {
                 .map(|op| op.opname.clone())
                 .unwrap_or_default();
             if raising_opname.contains("_ovf") {
-                self.flatten_ovf_canraise(&exits, &raising_opname);
+                self.flatten_ovf_canraise(&exits, &raising_opname, work);
                 return;
             }
             // RPython `flatten.py:223-238` invariant: typed catches
@@ -1937,44 +1975,16 @@ impl<'a> GraphFlattener<'a> {
                 .last()
                 .map_or(false, |op| op.opname == OPNAME_LIVE);
             if !self.include_all_exc_links && !block_can_raise {
-                self.make_link(&normal_link, false);
+                self.make_link(&normal_link, false, work);
                 return;
             }
             let catch_label = self.tlabel_for_link(&normal_link);
             self.emitline(Insn::op("catch_exception", vec![catch_label]));
-            self.make_link(&normal_link, false);
-            let normal_label = self.label_for_link(&normal_link);
-            self.emitline(normal_label);
-            let mut captured_all = false;
-            for link in &catch_links {
-                // `flatten.py insert_exits` lowers every catch link
-                // (`block.exits[1:]`) through `make_exception_link`, which
-                // asserts both `last_exception` and `last_exc_value` are seeded
-                // (`flatten.py`).  There is no ordinary-`make_link` arm
-                // for a catch link: one that is not a fully seeded exception
-                // link is a graph-construction bug and fails loud inside
-                // `make_exception_link`.
-                let llexitcase = link.borrow().llexitcase.clone();
-                if let Some(case) = llexitcase {
-                    let case_operand = self.getcolor(&case);
-                    let mismatch_label = self.tlabel_for_link(link);
-                    self.emitline(Insn::op(
-                        "goto_if_exception_mismatch",
-                        vec![case_operand, mismatch_label],
-                    ));
-                    self.make_exception_link(link, false);
-                    let link_label = self.label_for_link(link);
-                    self.emitline(link_label);
-                } else {
-                    self.make_exception_link(link, false);
-                    captured_all = true;
-                    break;
-                }
-            }
-            if !captured_all {
-                self.emitline(Insn::op("reraise", Vec::new()));
-                self.emitline(Insn::Unreachable);
-            }
+            work.push(FlattenWork::AfterCanraiseNormal {
+                normal_link: normal_link.clone(),
+                catch_links,
+            });
+            self.make_link(&normal_link, false, work);
             return;
         }
         let exitswitch = block.borrow().exitswitch.clone();
@@ -1996,13 +2006,14 @@ impl<'a> GraphFlattener<'a> {
             opargs.push(self.tlabel_for_link(&linkfalse));
             self.emitline(Insn::live(Vec::new()));
             self.emitline(Insn::op(opname, opargs));
-            self.make_link(&linktrue, handling_ovf);
-            let false_label = self.label_for_link(&linkfalse);
-            self.emitline(false_label);
-            self.make_link(&linkfalse, handling_ovf);
+            work.push(FlattenWork::AfterBoolTrue {
+                linkfalse,
+                handling_ovf,
+            });
+            self.make_link(&linktrue, handling_ovf, work);
             return;
         }
-        self.insert_switch_exits(&exits, exitswitch, handling_ovf);
+        self.insert_switch_exits(&exits, exitswitch, handling_ovf, work);
     }
 
     fn flatten_tuple_exitswitch(
@@ -2040,6 +2051,7 @@ impl<'a> GraphFlattener<'a> {
         exits: &[LinkRef],
         exitswitch: Option<super::flow::ExitSwitch>,
         handling_ovf: bool,
+        work: &mut Vec<FlattenWork>,
     ) {
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
@@ -2109,17 +2121,74 @@ impl<'a> GraphFlattener<'a> {
             .last()
             .filter(|link| is_default_exitcase(&link.borrow().exitcase))
         {
-            self.make_link(default_link, handling_ovf);
+            let default_link = default_link.clone();
+            work.push(FlattenWork::AfterSwitchDefault {
+                switches,
+                handling_ovf,
+            });
+            self.make_link(&default_link, handling_ovf, work);
         } else {
             self.emitline(Insn::op("unreachable", Vec::new()));
             self.emitline(Insn::Unreachable);
+            self.continue_switch_cases(switches, handling_ovf, 0, work);
         }
-        for switch in switches {
-            let link_label = self.label_for_link(&switch);
-            self.emitline(link_label);
-            self.emitline(Insn::live(Vec::new()));
-            self.make_link(&switch, handling_ovf);
+    }
+
+    /// `flatten.py insert_exits` catch loop after `Label(normal_link)`.
+    ///
+    /// Typed catch: `goto_if_exception_mismatch` then `make_exception_link`
+    /// then `Label(link)` (the mismatch continuation). Catch-all
+    /// (`llexitcase is None`): `make_exception_link` only, no reraise.
+    /// If every catch is typed: `reraise` + `Unreachable`.
+    fn continue_catch_links(
+        &mut self,
+        catch_links: Vec<LinkRef>,
+        index: usize,
+        work: &mut Vec<FlattenWork>,
+    ) {
+        if index >= catch_links.len() {
+            self.emitline(Insn::op("reraise", Vec::new()));
+            self.emitline(Insn::Unreachable);
+            return;
         }
+        let link = catch_links[index].clone();
+        let llexitcase = link.borrow().llexitcase.clone();
+        if let Some(case) = llexitcase {
+            let case_operand = self.getcolor(&case);
+            let mismatch_label = self.tlabel_for_link(&link);
+            self.emitline(Insn::op(
+                "goto_if_exception_mismatch",
+                vec![case_operand, mismatch_label],
+            ));
+            work.push(FlattenWork::AfterCatch { catch_links, index });
+            self.make_exception_link(&link, false, work);
+        } else {
+            self.make_exception_link(&link, false, work);
+        }
+    }
+
+    /// `flatten.py insert_switch_exits` case loop after the default
+    /// subtree: `Label(switch)` / `-live-` / `make_link(switch)`.
+    fn continue_switch_cases(
+        &mut self,
+        switches: Vec<LinkRef>,
+        handling_ovf: bool,
+        index: usize,
+        work: &mut Vec<FlattenWork>,
+    ) {
+        if index >= switches.len() {
+            return;
+        }
+        let switch = switches[index].clone();
+        let link_label = self.label_for_link(&switch);
+        self.emitline(link_label);
+        self.emitline(Insn::live(Vec::new()));
+        work.push(FlattenWork::AfterSwitchCase {
+            switches,
+            handling_ovf,
+            index,
+        });
+        self.make_link(&switch, handling_ovf, work);
     }
 
     fn insert_renamings(&mut self, link: &LinkRef) {
@@ -2262,13 +2331,97 @@ impl<'a> GraphFlattener<'a> {
     }
 
     /// `rpython/jit/codewriter/flatten.py generate_ssa_form` —
-    /// reset `seen_blocks` and recurse from `self.graph.startblock`.
+    /// reset `seen_blocks` and walk from `self.graph.startblock`.
+    ///
+    /// Upstream recurses `make_link` → `make_bytecode_block`. The heap
+    /// work-list keeps that DFS order (continuations emit the bytes
+    /// `insert_exits` writes *after* each recursive `make_link`) without
+    /// stacking one Rust frame per canraise block.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
-        self.make_bytecode_block(self.graph.startblock.clone(), false);
+        let mut work = vec![FlattenWork::Block(self.graph.startblock.clone(), false)];
+        while let Some(item) = work.pop() {
+            match item {
+                FlattenWork::Block(block, handling_ovf) => {
+                    self.make_bytecode_block(block, handling_ovf, &mut work);
+                }
+                FlattenWork::AfterCanraiseNormal {
+                    normal_link,
+                    catch_links,
+                } => {
+                    let normal_label = self.label_for_link(&normal_link);
+                    self.emitline(normal_label);
+                    self.continue_catch_links(catch_links, 0, &mut work);
+                }
+                FlattenWork::AfterCatch { catch_links, index } => {
+                    let link_label = self.label_for_link(&catch_links[index]);
+                    self.emitline(link_label);
+                    self.continue_catch_links(catch_links, index + 1, &mut work);
+                }
+                FlattenWork::AfterBoolTrue {
+                    linkfalse,
+                    handling_ovf,
+                } => {
+                    let false_label = self.label_for_link(&linkfalse);
+                    self.emitline(false_label);
+                    self.make_link(&linkfalse, handling_ovf, &mut work);
+                }
+                FlattenWork::AfterOvfNormal { exits } => {
+                    let exit1 = exits[1].clone();
+                    let exit1_label = self.label_for_link(&exit1);
+                    self.emitline(exit1_label);
+                    work.push(FlattenWork::AfterOvfCatch1 { exits });
+                    self.make_exception_link(&exit1, true, &mut work);
+                }
+                FlattenWork::AfterOvfCatch1 { exits } => {
+                    if exits.len() == 3 {
+                        // `flatten.py` `assert block.exits[2].exitcase is Exception`.
+                        let exit2 = exits[2].borrow();
+                        assert!(
+                            exit2.llexitcase.is_none(),
+                            "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
+                             the `Exception` catch-all (llexitcase=None) per flatten.py \
+                             insert_exits `_ovf` arm",
+                        );
+                        assert!(
+                            exit2.last_exception.is_some() && exit2.last_exc_value.is_some(),
+                            "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
+                             an exception link with extravars seeded per guessexception \
+                             (matches `exitcase is Exception`)",
+                        );
+                        drop(exit2);
+                        self.make_exception_link(&exits[2], false, &mut work);
+                    }
+                }
+                FlattenWork::AfterSwitchDefault {
+                    switches,
+                    handling_ovf,
+                } => {
+                    self.continue_switch_cases(switches, handling_ovf, 0, &mut work);
+                }
+                FlattenWork::AfterSwitchCase {
+                    switches,
+                    handling_ovf,
+                    index,
+                } => {
+                    self.continue_switch_cases(switches, handling_ovf, index + 1, &mut work);
+                }
+            }
+        }
     }
 
-    fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
+    /// `flatten.py` `make_bytecode_block`. A user frame with a long
+    /// canraise chain (each `%`/`+` is its own block) used to recurse
+    /// once per block; wasm32's linear-memory stack is 1 MiB, so that
+    /// walk exhausted it before `JitCodeBuilder::try_finish` could
+    /// decline an over-wide pool. Successors are queued on `work`.
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn make_bytecode_block(
+        &mut self,
+        block: BlockRef,
+        handling_ovf: bool,
+        work: &mut Vec<FlattenWork>,
+    ) {
         if block.borrow().exits.is_empty() {
             // `rpython/jit/codewriter/flatten.py:107-109`: empty-exits
             // blocks are `returnblock` (1 arg) or `exceptblock` (2 args)
@@ -2331,9 +2484,10 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         drop(block_borrow);
-        self.insert_exits(&block, handling_ovf);
+        self.insert_exits(&block, handling_ovf, work);
     }
 
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
     fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
         // If the GraphFlattener was constructed with a `LoweringContext`,
         // retired-family HLOp opnames (`add` / `lt` / ... / `bool` /
@@ -5647,6 +5801,7 @@ where
 /// avoid double-handling of non-HLOp ops — the caller's own
 /// passthrough emits them, so the dispatcher must only claim the
 /// four retired families and leave everything else to the caller.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
 pub fn try_flatten_retired_family_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,

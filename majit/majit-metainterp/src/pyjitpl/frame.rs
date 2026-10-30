@@ -404,6 +404,13 @@ impl MIFrame {
         read_u16(unsafe { &*code }, &mut self.code_cursor)
     }
 
+    /// Read one `L` jump-target operand (three little-endian bytes).
+    pub fn next_label(&mut self) -> usize {
+        let code: *const [u8] = self.bytecode;
+        // SAFETY: as in `bytecode`.
+        crate::jitcode::read_label(unsafe { &*code }, &mut self.code_cursor)
+    }
+
     /// Peek a u16 at absolute position `pos` without advancing the
     /// cursor.  Mirrors the canonical decode helper on
     /// `BlackholeInterpreter::peek_u16_at` so trace dispatch can do the

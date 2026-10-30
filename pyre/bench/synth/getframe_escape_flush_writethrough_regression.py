@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=entry-bridge:bump
+# pyre-check: selfcheck-compiles=loop:_regular_sum,loop:main
 # The `root:` arm is measured, not a relaxation: this fixture's loop aborts
 # five times with ABORT_ESCAPE and what reaches the JIT is the root trace
 # `finish_and_compile` attaches. The declining arm is the `f_locals` LoadAttr

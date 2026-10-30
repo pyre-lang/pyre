@@ -3295,7 +3295,8 @@ pub fn decode_op_at(code: &[u8], pc: usize) -> Option<DecodedOp> {
     while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
-            'L' | 'd' | 'j' => cursor += 2,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+            'd' | 'j' => cursor += 2,
             'I' | 'R' | 'F' => {
                 // blackhole.py:139-143: varlist opens with a 1-byte length,
                 // followed by that many 1-byte register indices.
@@ -3369,11 +3370,10 @@ pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
             while let Some(c) = chars.next() {
                 match c {
                     'L' => {
-                        work.push(
-                            (*code.get(cursor)? as usize)
-                                | ((*code.get(cursor + 1)? as usize) << 8),
-                        );
-                        cursor += 2;
+                        let _ =
+                            *code.get(cursor + majit_jitcode::jitcode::LABEL_OPERAND_SIZE - 1)?;
+                        work.push(majit_jitcode::jitcode::read_label_at(code, cursor));
+                        cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
                     }
                     'i' | 'c' | 'r' | 'f' => cursor += 1,
                     'd' | 'j' => cursor += 2,
@@ -3430,8 +3430,9 @@ pub enum ResolvedOperand {
     RefReg { reg: u8, value: i64 },
     /// `f`: `self.registers_f[code[pc]]` (blackhole.py:127-129).
     FloatReg { reg: u8, value: i64 },
-    /// `L`: 2-byte little-endian unsigned label (blackhole.py:133-138).
-    Label { target: u16 },
+    /// `L`: three-byte little-endian unsigned label (`assembler.py`
+    /// `fix_labels` writes two; pyre writes three).
+    Label { target: usize },
     /// `d`|`j`: 2-byte little-endian descr index into
     /// `metainterp_sd.descrs` (blackhole.py:150-157). `j` carries the
     /// additional RPython assertion `isinstance(value, JitCode)`; the
@@ -3552,12 +3553,10 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
                 operands.push(ResolvedOperand::FloatReg { reg, value });
             }
             'L' => {
-                let lo = *code.get(cursor)? as u16;
-                let hi = *code.get(cursor + 1)? as u16;
-                cursor += 2;
-                operands.push(ResolvedOperand::Label {
-                    target: lo | (hi << 8),
-                });
+                let _ = *code.get(cursor + majit_jitcode::jitcode::LABEL_OPERAND_SIZE - 1)?;
+                let target = majit_jitcode::jitcode::read_label_at(code, cursor);
+                cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
+                operands.push(ResolvedOperand::Label { target });
             }
             'd' | 'j' => {
                 let lo = *code.get(cursor)? as u16;
@@ -4876,11 +4875,12 @@ mod tests {
                 .get(key)
                 .unwrap_or_else(|| panic!("{key} must be in insns table"))
         };
-        // 0: goto 7 | 3: int_add (skipped) | 7: goto_if_not r0, 14
-        // | 11: void_return | 12: ... | 14: void_return
+        // 0: goto 8 | 4: int_add (skipped) | 8: goto_if_not r0, 15
+        // | 13: void_return | 14: ... | 15: void_return
         let code = [
             byte("goto/L"),
-            7,
+            8,
+            0,
             0,
             byte("int_add/ii>i"),
             1,
@@ -4888,15 +4888,16 @@ mod tests {
             3,
             byte("goto_if_not/iL"),
             0,
-            14,
+            15,
+            0,
             0,
             byte("void_return/"),
             byte("void_return/"),
             byte("void_return/"),
             byte("void_return/"),
         ];
-        assert_eq!(reachable_starts_from(&code, 0), Some(vec![0, 7, 11, 14]));
-        assert_eq!(reachable_starts_from(&code, 3), Some(vec![3, 7, 11, 14]));
+        assert_eq!(reachable_starts_from(&code, 0), Some(vec![0, 8, 13, 15]));
+        assert_eq!(reachable_starts_from(&code, 4), Some(vec![4, 8, 13, 15]));
     }
 
     #[test]
@@ -5547,9 +5548,9 @@ mod tests {
         //   PC=0:  live/
         //   PC=3:  LOOP: int_lt r0, r1 → r3
         //   PC=7:        goto_if_not r3, END   (forward jump)
-        //   PC=11:       int_add r0, r2 → r0
-        //   PC=15:       goto LOOP=3            (backward jump)
-        //   PC=18: END:  int_return r0
+        //   PC=12:       int_add r0, r2 → r0
+        //   PC=16:       goto LOOP=3            (backward jump)
+        //   PC=20: END:  int_return r0
         //
         // RPython parity: blackhole.py `bhimpl_goto_if_not`
         // — target is an absolute byte offset into the jitcode
@@ -5572,9 +5573,9 @@ mod tests {
             .get("int_return/i")
             .expect("`int_return/i` must be in insns");
 
-        // PC offsets (must match the layout above): LOOP_HEAD = 3, END = 18.
+        // PC offsets (must match the layout above): LOOP_HEAD = 3, END = 20.
         const LOOP_HEAD: u8 = 3;
-        const END: u8 = 18;
+        const END: u8 = 20;
         let code: Vec<u8> = vec![
             // PC=0:  live/  (1 + OFFSET_SIZE = 3 bytes)
             live_byte,
@@ -5585,25 +5586,27 @@ mod tests {
             0x00,
             0x01,
             0x03, //
-            // PC=7:  goto_if_not r3, END  (1 + 1 + 2 = 4 bytes)
+            // PC=7:  goto_if_not r3, END  (1 + 1 + 3 = 5 bytes)
             goto_if_not_byte,
             0x03,
             END,
+            0x00,
             0x00, //
-            // PC=11: int_add r0, r2 → r0  (1 + 3 = 4 bytes)
+            // PC=12: int_add r0, r2 → r0  (1 + 3 = 4 bytes)
             int_add_byte,
             0x00,
             0x02,
             0x00, //
-            // PC=15: goto LOOP_HEAD  (1 + 2 = 3 bytes)
+            // PC=16: goto LOOP_HEAD  (1 + 3 = 4 bytes)
             goto_byte,
             LOOP_HEAD,
+            0x00,
             0x00, //
-            // PC=18: int_return r0  (1 + 1 = 2 bytes)
+            // PC=20: int_return r0  (1 + 1 = 2 bytes)
             int_return_byte,
             0x00,
         ];
-        assert_eq!(code.len(), 20, "loop bytecode must be exactly 20 bytes");
+        assert_eq!(code.len(), 22, "loop bytecode must be exactly 22 bytes");
 
         let mut bh = builder.acquire_interp();
         bh.registers_i = vec![0i64; 4];

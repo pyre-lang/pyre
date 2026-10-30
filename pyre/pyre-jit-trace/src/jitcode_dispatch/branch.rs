@@ -414,7 +414,8 @@ pub(crate) fn branch_arm_reads_unrestorable_ref(
                     }
                     cursor += 1;
                 }
-                'L' | 'd' | 'j' => cursor += 2,
+                'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
+                'd' | 'j' => cursor += 2,
                 'I' | 'F' => {
                     let Some(&len) = code.get(cursor) else {
                         return true;

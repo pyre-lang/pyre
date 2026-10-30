@@ -15,6 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::call::{CallControl, extract_element_type_from_str};
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
+use majit_jitcode::jitcode::{LABEL_TARGET_MAX, push_label_placeholder, write_label_at};
 
 fn reg_label(reg: crate::flatten::Register) -> String {
     reg.repr()
@@ -654,23 +655,21 @@ impl AssemblerExt for Assembler {
                 .label_positions
                 .get(label)
                 .unwrap_or_else(|| panic!("undefined TLabel {label:?} at fixup {fixup_pos}"));
-            let target_u16 = target as u16;
-            // RPython `assembler.py assert 0 <= target <= 0xFFFF`.
+            // `assembler.py` `fix_labels` asserts `0 <= target <= 0xFFFF`.
+            // pyre's three-byte `L` operand declines at `LABEL_TARGET_MAX`.
             assert!(
-                target <= 0xFFFF,
-                "label target {target} exceeds u16 range in {}",
+                target <= LABEL_TARGET_MAX,
+                "label target {target} exceeds three-byte range in {}",
                 self.current_graph_name.as_deref().unwrap_or("?")
             );
-            // RPython `assembler.py:252-253 assert self.code[pos] == "temp 1"`
-            // — the fixup must point to two reserved placeholder
-            // bytes still in range.
+            // RPython `assembler.py` `fix_labels` asserts the placeholder
+            // bytes are still in range.
             assert!(
-                fixup_pos + 1 < state.code.len(),
+                *fixup_pos + 2 < state.code.len(),
                 "tlabel fixup position {fixup_pos} past end of code (len={})",
                 state.code.len(),
             );
-            state.code[*fixup_pos] = (target_u16 & 0xFF) as u8;
-            state.code[*fixup_pos + 1] = (target_u16 >> 8) as u8;
+            write_label_at(&mut state.code, *fixup_pos, target);
         }
         for descr in &mut self.descrs {
             let AssemblerDescr::PendingSwitch { cases } = descr else {
@@ -918,11 +917,10 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum("goto/L");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                // RPython assembler.py:175-179: TLabel → record position + 2 placeholder bytes
+                // TLabel → record position + label-operand placeholder.
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*label, state.code.len()));
-                state.code.push(0);
-                state.code.push(0);
+                push_label_placeholder(&mut state.code);
             }
 
             FlatOp::CatchException { target } => {
@@ -931,8 +929,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push(opnum);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
-                state.code.push(0);
-                state.code.push(0);
+                push_label_placeholder(&mut state.code);
             }
 
             FlatOp::GotoIfExceptionMismatch { llexitcase, target } => {
@@ -948,8 +945,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push(encoded_llexitcase);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
-                state.code.push(0);
-                state.code.push(0);
+                push_label_placeholder(&mut state.code);
             }
 
             // RPython flatten.py: goto_if_not(cond, TLabel(false_path))
@@ -979,8 +975,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push(cond.index as u8);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
-                state.code.push(0);
-                state.code.push(0);
+                push_label_placeholder(&mut state.code);
             }
 
             // RPython `flatten.py:247` fused guard: the jitcode key is
@@ -1018,8 +1013,7 @@ impl AssemblerEncode for Assembler {
                 }
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
-                state.code.push(0);
-                state.code.push(0);
+                push_label_placeholder(&mut state.code);
             }
 
             FlatOp::Switch { value, targets } => {
@@ -1093,8 +1087,7 @@ impl AssemblerEncode for Assembler {
                 state.code.push(opnum);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
-                state.code.push(0);
-                state.code.push(0);
+                push_label_placeholder(&mut state.code);
                 state.code.push(lhs.index as u8);
                 state.code.push(rhs.index as u8);
                 state.code.push(dst.index as u8);
@@ -1343,7 +1336,7 @@ impl AssemblerEncode for Assembler {
     /// Where args are:
     /// - Register: 1 byte (index), argcode = kind char ('i','r','f')
     /// - Constant: 1 byte (pool index), argcode = kind char
-    /// - TLabel: 2 bytes (u16 LE offset), argcode = 'L'
+    /// - TLabel: three-byte little-endian offset, argcode = 'L'
     /// - ListOfKind: 1 byte (len) + items, argcode = uppercase kind
     /// - Descr: 2 bytes (u16 LE index), argcode = 'd'
     fn encode_op(

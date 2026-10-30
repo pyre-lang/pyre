@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=0a48817163379081 platform=darwin
+# corpus=ea5ae3ab94523bd9 platform=darwin
 direct-skip (never reaches unported_category)	majit_rlib::rposix::strerror
 direct-skip (never reaches unported_category)	pyre_interpreter::argument::<Impl>::new::<Impl>::call_once
 direct-skip (never reaches unported_category)	pyre_interpreter::baseobjspace::finditem_str_named
@@ -19,6 +19,7 @@ two-phase-annotate-skipped	eval_loop_jit_portal
 two-phase-annotate-skipped	generatorentry_portal_portal
 two-phase-annotate-skipped	jit::codewriter::with_codewriter_slot__spec_CodeWriter__closure_f9f77ec80ef1be6d
 two-phase-annotate-skipped	majit_rlib::lltypesystem::rlist::try_typed_items_block_layout
+two-phase-annotate-skipped	majit_rlib::rffi::buffer::raw_malloc_or_memory_error
 two-phase-annotate-skipped	majit_rlib::rffi::buffer::str2charp
 two-phase-annotate-skipped	majit_rlib::rposix::c_ioctl_voidp
 two-phase-annotate-skipped	module::_cffi_backend::ffi_obj::ffi_error__spec_String_50f799566915b726
@@ -1248,6 +1249,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__setitem__
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::copy
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::entry_count
+two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::fast_local_index
+two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::fast_local_index::<Impl>::call
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::force_locals
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::get
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::items
@@ -1569,7 +1572,6 @@ two-phase-annotate-skipped	pyre_interpreter::typedef::unicode_check_encoding_err
 two-phase-annotate-skipped	pyre_interpreter::typedef::unicode_encode_error
 two-phase-annotate-skipped	pyre_interpreter::typedef::unicode_error_position_w
 two-phase-annotate-skipped	pyre_interpreter::warn::<Impl>::get
-two-phase-annotate-skipped	pyre_interpreter::warn::warn
 two-phase-annotate-skipped	pyre_interpreter::warn::warn_category
 two-phase-annotate-skipped	pyre_interpreter::warn::warn_category_w
 two-phase-annotate-skipped	pyre_interpreter::warn::warn_category_w_source
@@ -1588,6 +1590,9 @@ two-phase-annotate-skipped	pyre_jit::eval::interpret_abort_switch_to_blackhole
 two-phase-annotate-skipped	pyre_jit::eval::jit_is_off
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_return_trace
 two-phase-annotate-skipped	pyre_jit::eval::portal_diag_bump
 two-phase-annotate-skipped	pyre_jit::eval::portal_metatrace_skip
 two-phase-annotate-skipped	pyre_jit::eval::portal_runner_dispatch
@@ -1658,12 +1663,15 @@ two-phase-annotate-skipped	pyre_module::module::_csv::get_codepoint
 two-phase-annotate-skipped	pyre_module::module::_csv::get_str
 two-phase-annotate-skipped	pyre_module::module::_csv::is_csv_dialect
 two-phase-annotate-skipped	pyre_module::module::_csv::lookup_registered_dialect
+two-phase-annotate-skipped	pyre_module::module::_hashlib::<Impl>::canonical_name
 two-phase-annotate-skipped	pyre_module::module::_hashlib::<Impl>::digest_bytes
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::<Impl>::__repr__
+two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::<Impl>::block_size
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::<Impl>::copy
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::<Impl>::digest
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::<Impl>::update
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::__majit_wrap___repr__
+two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::__majit_wrap_block_size
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::__majit_wrap_copy
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::__majit_wrap_digest
 two-phase-annotate-skipped	pyre_module::module::_hashlib::hash_state_class::__majit_wrap_hexdigest
@@ -2312,7 +2320,6 @@ two-phase-never-a-subject	ll_max__int
 two-phase-never-a-subject	ll_max__uint
 two-phase-never-a-subject	ll_min__int
 two-phase-never-a-subject	ll_min__uint
-two-phase-never-a-subject	ll_search
 two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_sint
 two-phase-rtype-skipped	majit_rlib::jit_libffi::imp::do_ffi_call_uint
 two-phase-rtype-skipped	majit_rlib::rffi::buffer::charpsize2str
@@ -2331,8 +2338,6 @@ two-phase-rtype-skipped	pyre_interpreter::pyopcode::execute_return_value
 two-phase-rtype-skipped	pyre_interpreter::pyopcode::execute_return_value__AccessDirect_None
 two-phase-rtype-skipped	pyre_interpreter::type_methods::complex_component_spec
 two-phase-rtype-skipped	pyre_interpreter::type_methods::padded_byte_len
-two-phase-rtype-skipped	pyre_jit::eval::exit_frame_handler_needs_unwritten_stack
-two-phase-rtype-skipped	pyre_jit::eval::exit_frame_handler_needs_unwritten_stack__AccessDirect_None
 two-phase-rtype-skipped	pyre_module::module::mmap::interp_mmap::mmap_get_attr_i64::<Impl>::call_once
 two-phase-rtype-skipped	pyre_object::kwargsdict::<Impl>::copy
 two-phase-rtype-skipped	pyre_object::lowlevel_string::alloc_lowlevel_string

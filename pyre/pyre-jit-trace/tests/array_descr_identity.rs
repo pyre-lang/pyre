@@ -30,7 +30,7 @@ fn link_module_pytypes() {
 /// Pool indices of every `d`/`j` operand of `op`.
 ///
 /// The walk matches `decode_op_at`'s argcode sizes (`i|c|r|f` one byte, `L`
-/// two, `d|j` two little-endian, `I|R|F` length-prefixed, `>` plus its result
+/// three, `d|j` two little-endian, `I|R|F` length-prefixed, `>` plus its result
 /// char one byte) but records only descr indices. An unknown char — `P` is
 /// the live case — stops rather than guessing a pyre-only payload: a descr
 /// after that point is not one this pin can name, and inventing a skip would
@@ -42,7 +42,7 @@ fn descr_operands(code: &[u8], op: &DecodedOp) -> Vec<usize> {
     while let Some(c) = chars.next() {
         match c {
             'i' | 'c' | 'r' | 'f' => cursor += 1,
-            'L' => cursor += 2,
+            'L' => cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE,
             'd' | 'j' => {
                 let Some(&lo) = code.get(cursor) else { break };
                 let Some(&hi) = code.get(cursor + 1) else {

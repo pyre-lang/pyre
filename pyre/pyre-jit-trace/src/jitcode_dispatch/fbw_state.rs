@@ -421,7 +421,7 @@ pub fn fbw_debug_abort_enabled() -> bool {
 }
 
 /// Whether a may-force residual's own fastlocals writes are adopted into the
-/// walk (`adopt_residual_locals_writes`).  On unless
+/// walk (`flush_pending_residual_locals_adopt`).  On unless
 /// `PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS` is set; the switch exists so the two
 /// sides can be measured on one binary, since the shape that loses the write
 /// takes thousands of iterations to reach and cannot be reproduced by reading
@@ -1651,15 +1651,15 @@ pub(crate) fn fbw_foriter_inflight_popframe(owner: InflightForiterOwner) {
 
 /// #32 S2 deliver selector for the branch-flush leg.  Returns
 /// `Some((item, body_pc))` to push at the body ONLY when `resume_py_pc` is the
-/// header of a FOR_ITER whose consumed item is in flight (`body_pc ==
-/// resume_py_pc + 1`, and the opcode there really is a FOR_ITER) — Shape A, the
-/// abort parked on the FOR_ITER before its body ran, so the item is not yet on
-/// the flushed header stack and must be delivered.  Returns `None` when the
-/// resume pc is not such a header, or when the matching entry carries a
-/// body-effect signal (the R1 never-double guard: re-running the body would
-/// re-apply an irreversible mutation).  Read-only — the caller drops the stash
-/// via [`fbw_foriter_inflight_clear`] only after the flush commits, so a
-/// declined flush leaves the in-flight items intact for the legacy deliver.
+/// logical start of a FOR_ITER whose consumed item is in flight (`body_pc` is
+/// that instruction's opcode pc + 1) — Shape A, the abort parked on the
+/// FOR_ITER before its body ran, so the item is not yet on the flushed header
+/// stack and must be delivered.  Returns `None` when the resume pc is not such
+/// a header, or when the matching entry carries a body-effect signal (the R1
+/// never-double guard: re-running the body would re-apply an irreversible
+/// mutation).  Read-only — the caller drops the stash via
+/// [`fbw_foriter_inflight_clear`] only after the flush commits, so a declined
+/// flush leaves the in-flight items intact for the legacy deliver.
 pub fn fbw_foriter_inflight_take_for_resume(
     frame: usize,
     resume_py_pc: usize,
@@ -3225,6 +3225,38 @@ fn fbw_deny_hazardous_inline(callee_code_key: usize) {
     }
 }
 
+/// `disable_noninlinable_function` (`warmstate.py`) plus the walker-side
+/// hazardous-inline deny: name the CALLEE, not the enclosing portal.
+pub(crate) fn fbw_mark_callee_dont_trace<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    callee_code_key: usize,
+) {
+    fbw_deny_hazardous_inline(callee_code_key);
+    // Function-entry key for a callee named only by its code object:
+    // there is no merge-point operand here, so read the live frame
+    // (`PyFrame.get_is_being_profiled`).  Read before `try_driver_pair`
+    // so the session borrow inside `live_frame_is_being_profiled` is
+    // released across the driver call.
+    let is_being_profiled = live_frame_is_being_profiled(ctx);
+    // `fbw_deny_hazardous_inline` writes a thread-local set that only
+    // this walker reads, so the deny stayed invisible to the warm
+    // state: `dont_trace_here` counted zero on every fixture that
+    // reaches here.  `warmstate.py`
+    // `WarmEnterState.disable_noninlinable_function` is the call that sets
+    // `JC_DONT_TRACE_HERE` on the callee's cell, and that bit is what
+    // `can_inline_callable` reads, so the deny is spelled through it
+    // rather than beside it.  Pass the typed key so the verdict lands on
+    // the same comparekey-bearing cell consulted at the next call.
+    if let Some((driver, _)) = crate::driver::try_driver_pair() {
+        let key =
+            crate::driver::make_green_key_typed(callee_code_key as *const (), 0, is_being_profiled);
+        driver
+            .meta_interp_mut()
+            .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
+            .disable_noninlinable_function_for_key(&key);
+    }
+}
+
 pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -3296,37 +3328,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
     callee_code_key: Option<usize>,
 ) -> DispatchError {
     if let Some(callee_code_key) = callee_code_key {
-        fbw_deny_hazardous_inline(callee_code_key);
-        // Function-entry key for a callee named only by its code object:
-        // there is no merge-point operand here, so read the live frame
-        // (`PyFrame.get_is_being_profiled`).  Read before `try_driver_pair`
-        // so the session borrow inside `live_frame_is_being_profiled` is
-        // released across the driver call.
-        let is_being_profiled = live_frame_is_being_profiled(ctx);
-        // `fbw_deny_hazardous_inline` writes a thread-local set that only
-        // this walker reads, so the deny stayed invisible to the warm
-        // state: `dont_trace_here` counted zero on every fixture that
-        // reaches here.  `warmstate.py`
-        // `WarmEnterState.disable_noninlinable_function` is the call that sets
-        // `JC_DONT_TRACE_HERE` on the callee's cell, and that bit is what
-        // `can_inline_callable` reads, so the deny is spelled through it
-        // rather than beside it.  The mechanism is upstream's; the trigger is
-        // not, and the doc above says which.  The recursion-bound deny in
-        // `inline_call.rs` already calls it for the callee it names; this one
-        // names a callee the same way and had no reason not to.  Pass the
-        // typed key so the verdict lands on the same comparekey-bearing cell
-        // consulted at the next call.
-        if let Some((driver, _)) = crate::driver::try_driver_pair() {
-            let key = crate::driver::make_green_key_typed(
-                callee_code_key as *const (),
-                0,
-                is_being_profiled,
-            );
-            driver
-                .meta_interp_mut()
-                .warm_state_for_driver(crate::state::PyreJitState::PYPYJIT_JD_INDEX)
-                .disable_noninlinable_function_for_key(&key);
-        }
+        fbw_mark_callee_dont_trace(ctx, callee_code_key);
     }
     // A seeded inline already has the callee `PyFrame`, and
     // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py`) converts the

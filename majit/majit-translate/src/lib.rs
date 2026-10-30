@@ -2698,6 +2698,9 @@ fn analyze_pipeline_from_module_paths(
         // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
         // are handled by jitcode_lower (proc-macro level), not here.
         // They are macro_rules! that the codewriter AST parser does not expand.
+        // `jit.force_virtual` is `support.py _ll_1_jit_force_virtual`; the
+        // interpreter residual is `executioncontext::force_vref` and is
+        // marked below, not as `jit::force_virtual`.
     ] {
         // Register under common call-site path patterns.
         for path in [
@@ -2777,6 +2780,22 @@ fn analyze_pipeline_from_module_paths(
     call_control.mark_oopspec(
         parse::CallPath::from_segments(["sqrt_nonneg"]),
         "math.sqrt_nonneg(x)".to_string(),
+    );
+
+    // `support.py _ll_1_jit_force_virtual` owns
+    // `@oopspec("jit.force_virtual(inst)")`. The interpreter residual is
+    // `executioncontext::force_vref` (`virtualref.py
+    // force_virtual_if_necessary`), which also carries `#[oopspec]` so
+    // the harvester registers every alias path. This bare-name mark is
+    // the owner-side spelling `target_to_path` resolves for that callee;
+    // `_handle_jit_call` then asks for `OS_JIT_FORCE_VIRTUAL`.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["force_vref"]),
+        "jit.force_virtual(inst)".to_string(),
+    );
+    call_control.mark_oopspec_argnames(
+        parse::CallPath::from_segments(["force_vref"]),
+        vec!["inst".to_string()],
     );
 
     // rbuilder.py `ll_shrink_final` calls `rgc.ll_shrink_array(buf, size)`,

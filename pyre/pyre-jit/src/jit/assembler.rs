@@ -2962,7 +2962,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(jitcode.follow_jump(3), 3);
+        assert_eq!(jitcode.follow_jump(4), 4);
     }
 
     #[test]
@@ -3227,9 +3227,9 @@ mod tests {
             .get("goto_if_not_ptr_nonzero/rL")
             .expect("ptr_nonzero branch must be registered in wellknown insns");
         assert_eq!(jitcode.code[0], opcode);
-        // Canonical `rL` encoding: [opcode:1][src:u8][target:u16] = 4
-        // bytes; L1 lands at position 4 (the ref_return start).
-        assert_eq!(jitcode.follow_jump(4), 4);
+        // Canonical `rL` encoding: [opcode:1][src:u8][target:L] = 5
+        // bytes; L1 lands at position 5 (the ref_return start).
+        assert_eq!(jitcode.follow_jump(5), 5);
     }
 
     #[test]

@@ -47,9 +47,8 @@ pub const BC_INT_IS_TRUE: u8 = 2;
 /// One constant per Python instruction (`dispatch_bytecode`'s
 /// `last_instr = intmask(next_instr)`) overflows that cap. Payload is
 /// `r` + u16 imm + `d` (the same `VableField` descr as
-/// `setfield_vable_i/rid`). The value is a bytecode offset or
-/// `valuestackdepth`; both already fit in u16 because jump targets
-/// (`assembler.py` `fix_labels`) are u16.
+/// `setfield_vable_i/rid`). The value is a Python bytecode offset or
+/// `valuestackdepth`; both already fit in u16.
 pub const BC_SETFIELD_VABLE_I_IMM: u8 = 32;
 pub const BC_GETINTERIORFIELD_GC_I: u8 = 3;
 pub const BC_GETINTERIORFIELD_GC_R: u8 = 4;
@@ -509,7 +508,7 @@ pub const BC_CONVERT_FLOAT_BYTES_TO_LONGLONG: u8 = 229;
 pub const BC_CONVERT_LONGLONG_BYTES_TO_FLOAT: u8 = 230;
 
 // Overflow-checked arithmetic fused with its branch — `bhimpl_int_{add,sub,mul}
-// _jump_if_ovf` (`blackhole.py:478-497`).  Argcode `Lii>i`: a 2-byte overflow
+// _jump_if_ovf` (`blackhole.py`).  Argcode `Lii>i`: a three-byte overflow
 // label + two int reads + one int write (written only on the no-overflow path).
 // The metatracer records these as `IntAddOvf`/`IntSubOvf`/`IntMulOvf` + a
 // box-less `GuardNoOverflow`/`GuardOverflow` (`pyjitpl/dispatch.rs`); a guard
@@ -1009,7 +1008,7 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("int_add/ii>i", BC_INT_ADD);
     m.insert("int_sub/ii>i", BC_INT_SUB);
     m.insert("int_mul/ii>i", BC_INT_MUL);
-    // blackhole.py:478-497 overflow-checked arithmetic — `Lii>i`: 2-byte label +
+    // blackhole.py overflow-checked arithmetic — `Lii>i`: three-byte label +
     // 2 int reads + 1 int write (only on the no-overflow path).
     m.insert("int_add_jump_if_ovf/Lii>i", BC_INT_ADD_JUMP_IF_OVF);
     m.insert("int_sub_jump_if_ovf/Lii>i", BC_INT_SUB_JUMP_IF_OVF);

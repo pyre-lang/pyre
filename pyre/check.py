@@ -2612,7 +2612,9 @@ def synth_trace_shapes(path):
     The loop label is the code-object name `selfcheck-compiles` already uses:
     the first field of a `[loop-census] <arm> <name>` line. A bare name means
     the `loop` arm. `entry-bridge:<name>:...` (and the other census arms)
-    select that compile.
+    select that compile. Suffix the name with `@<pc>`
+    (`entry-bridge:rec_memo@0`) to select only the compiles whose census pc
+    field is `#<pc>`; omit `@` to keep matching every compile of that name.
 
     The body is the `jit-log-opt-loop` section `MAJIT_LOG` dumps for that
     compile — the last such section before the census line, which is the
@@ -2802,7 +2804,7 @@ _TRACE_SHAPE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # debug.rs wire format: `[<hex ts>] {<category>` … `[<hex ts>] <category>}`.
 _TRACE_SECTION_OPEN_RE = re.compile(r"^\[[0-9a-fA-F]+\] \{(\S+)\s*$")
 _TRACE_SECTION_CLOSE_RE = re.compile(r"^\[[0-9a-fA-F]+\] (\S+)\}\s*$")
-_TRACE_LOOP_CENSUS_RE = re.compile(r"^\[loop-census\] (\S+) (\S+)")
+_TRACE_LOOP_CENSUS_RE = re.compile(r"^\[loop-census\] (\S+) (\S+)(?:\s+#(\d+))?")
 # pyjitpl.rs refuses to print an optimized trace past this and emits an
 # op-count table instead. A count of zero over that table is not "the op is
 # absent".
@@ -2810,7 +2812,11 @@ _TRACE_TRUNCATED_MARK = "[trace too large for full dump, showing op counts]"
 
 
 def _split_trace_loop_spec(prefix):
-    """`(arm, name)` for a loop label. A bare name is the `loop` arm."""
+    """`(arm, name)` for a loop label. A bare name is the `loop` arm.
+
+    `name` may be a code-object name or `name@<pc>`; the `@<pc>` pin is part
+    of the key the trace map stores. A second `:` is still rejected.
+    """
     if ":" in prefix:
         arm, name = prefix.split(":", 1)
         if arm not in SELFCHECK_COMPILE_ARMS:
@@ -2839,7 +2845,8 @@ def _parse_trace_shape(raw):
 
     Each comma-separated piece is either `<loop>:<assertion>`, which starts a
     group, or a bare assertion, which continues the group just opened. The
-    loop label may itself contain one colon (`<arm>:<name>`).
+    loop label may itself contain one colon (`<arm>:<name>`) and an optional
+    `@<pc>` pin on the name.
     """
     parts = [part.strip() for part in raw.split(",") if part.strip()]
     if not parts:
@@ -2929,8 +2936,10 @@ def optimized_loop_traces(stderr):
             and pending is not None
             and all(category != "jit-log-opt-loop" for category, _body in stack)
         ):
-            key = (census.group(1), census.group(2))
-            traces.setdefault(key, []).append(pending)
+            arm, name, pc = census.group(1), census.group(2), census.group(3)
+            traces.setdefault((arm, name), []).append(pending)
+            if pc is not None:
+                traces.setdefault((arm, f"{name}@{pc}"), []).append(pending)
             pending = None
         if stack:
             stack[-1][1].append(line)
@@ -3020,6 +3029,32 @@ def _trace_shape_reader_selftest():
             ("loop", "inner", (("present", "IntAdd", None),)),
         ),
     )
+    try:
+        pinned = _parse_trace_shape(
+            "entry-bridge:rec_memo@0:present=GuardNonnullClass"
+        )
+    except ValueError as e:
+        pinned = e
+    check(
+        "an entry-pc pin on an arm-qualified name",
+        pinned == ((
+            "entry-bridge", "rec_memo@0", (
+                ("present", "GuardNonnullClass", None),
+            ),
+        ),),
+    )
+    try:
+        bare_pin = _parse_trace_shape("main@14:present=IntAdd")
+    except ValueError as e:
+        bare_pin = e
+    check(
+        "an entry-pc pin on a bare loop name",
+        bare_pin == ((
+            "loop", "main@14", (
+                ("present", "IntAdd", None),
+            ),
+        ),),
+    )
     for label, text in (
         ("empty", ""),
         ("no assertion", "main"),
@@ -3104,6 +3139,31 @@ def _trace_shape_reader_selftest():
                 ("absent", "BinaryOp", None),
             )),
         )) == [],
+    )
+    two_pcs = "\n".join([
+        "[1] {jit-log-opt-loop",
+        "--- trace (after opt) --- [2 ops]",
+        "  v0 = GuardNonnullClass(v1)",
+        "  Jump()",
+        "[2] jit-log-opt-loop}",
+        "[loop-census] entry-bridge rec_memo #0 LoadSmallInt",
+        "[3] {jit-log-opt-loop",
+        "--- trace (after opt) --- [1 ops]",
+        "  v0 = IntAdd(1, 2)",
+        "[4] jit-log-opt-loop}",
+        "[loop-census] entry-bridge rec_memo #66 LoadSmallInt",
+    ])
+    check(
+        "@0 selects only the #0 compile",
+        trace_shape_failures(two_pcs, (
+            ("entry-bridge", "rec_memo@0", (("present", "GuardNonnullClass", None),)),
+        )) == [],
+    )
+    check(
+        "a bare label still sees both compiles",
+        trace_shape_failures(two_pcs, (
+            ("entry-bridge", "rec_memo", (("present", "GuardNonnullClass", None),)),
+        )) == ["trace-shape entry-bridge:rec_memo#2: present GuardNonnullClass (saw 0)"],
     )
     truncated = "\n".join([
         "[1] {jit-log-opt-loop",

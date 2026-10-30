@@ -487,6 +487,12 @@ pub mod frame_locals_proxy {
             }
         }
 
+        /// `@jit.unroll_safe` for the same reason as [`Self::locals_plus_value`]:
+        /// the scan is bounded by the code object's varnames, cellvars and
+        /// freevars. Without the hint `contains_loop` declines `__setitem__`,
+        /// and a traced `fr.f_locals[k] = v` is one residual `store_subscr`
+        /// that `force_locals` treats as `TOKEN_TRACING_RESCALL` escape.
+        #[majit_macros::unroll_safe]
         fn fast_local_index(&self, key: PyObjectRef) -> Result<Option<usize>, crate::PyError> {
             // Every candidate name allocates its own string and both
             // `__hash__` and `__eq__` can run a Python method, so the caller's
@@ -518,33 +524,31 @@ pub mod frame_locals_proxy {
                         )?,
                 )
             };
-            // `range` + `ll_getitem_fast`, not `Enumerate`.
-            let mut index = 0usize;
-            for name in code.varnames.iter() {
+            // Positional indexing rather than `iter()` / `any()`: this
+            // graph is `unroll_safe`, and a collected iterator puts
+            // `Iterator::map` on the two-phase blocker frontier the way
+            // a collected `Vec` does for `fast2locals` / `locals_plus_value`.
+            let nvar = code.varnames.len();
+            for index in 0..nvar {
                 if hidden_local(code, index) {
-                    index += 1;
                     continue;
                 }
-                if matches(name.as_ref())? {
+                if matches(code.varnames[index].as_str())? {
                     return Ok(Some(index));
                 }
-                index += 1;
             }
-            let mut index = code.varnames.len();
-            for name in code.cellvars.iter() {
-                if code.varnames.iter().any(|local| local == name) {
-                    continue;
+            let npure = super::npure_cellvars(code);
+            for i in 0..npure {
+                let name = code.cellvars[super::nth_pure_cellvar_index(code, i)].as_str();
+                if matches(name)? {
+                    return Ok(Some(nvar + i));
                 }
-                if matches(name.as_ref())? {
-                    return Ok(Some(index));
-                }
-                index += 1;
             }
-            for name in code.freevars.iter() {
-                if matches(name.as_ref())? {
-                    return Ok(Some(index));
+            let nfree = code.freevars.len();
+            for i in 0..nfree {
+                if matches(code.freevars[i].as_str())? {
+                    return Ok(Some(nvar + npure + i));
                 }
-                index += 1;
             }
             Ok(None)
         }
@@ -3571,6 +3575,26 @@ register_frame_builtin_wrapper!(
     __majit_wrap_descr_typecheck_get_w_globals
 );
 
+/// `pyframe.py fget_f_back`: `return self.get_f_back()`, which is
+/// `ExecutionContext.getnextframe_nohidden(self)`. Flattened to a
+/// `PyObjectRef` so the walker can descend this graph the way PyPy traces
+/// the interp2app getter. A null parent is boxed as `None`.
+///
+/// `getframe` (`vm.py`) and `ExecutionContext.leave` are the sites that
+/// call `mark_as_escaped`. `fget_f_back` itself does not.
+#[inline(never)]
+pub fn descr_get_f_back(frame: PyObjectRef) -> PyObjectRef {
+    if frame.is_null() {
+        return pyre_object::w_none();
+    }
+    let back = unsafe { (*(frame as *const PyFrame)).fget_f_back() };
+    if back.is_null() {
+        pyre_object::w_none()
+    } else {
+        back as PyObjectRef
+    }
+}
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_back`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_back`.
@@ -3584,7 +3608,9 @@ register_frame_builtin_wrapper!(
 /// here costs instead — `f_backref` holds a `jit.virtual_ref`, so reading it
 /// IS the force, and it is the foldable one.
 ///
-/// Measured on `synth/getframe_inlined_callee_own_frame`: with the marker,
+/// Seeding it into the builtin-wrapper family puts [`descr_get_f_back`]
+/// on a discovered jitcode the walker can descend. Measured on
+/// `synth/getframe_inlined_callee_own_frame`: with a force marker,
 /// `frame.f_back` raised `VableEscapedDuringResidualCall` 35 times and the
 /// fixture compiled no loop; `frame.f_code`, whose field IS redirected, raised
 /// none because the walker folds that read instead of residualizing it.
@@ -3596,15 +3622,7 @@ pub fn __majit_wrap_descr_typecheck_fget_f_back(
         return Ok(pyre_object::w_none());
     }
     let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
-    let back = unsafe { &*anchor.live() }.fget_f_back();
-    Ok(if back.is_null() {
-        pyre_object::w_none()
-    } else {
-        // Exposing the frame to app level: mark escaped so the JIT
-        // materialises it (pyframe.py mark_as_escaped), mirroring `_getframe`.
-        unsafe { (*back).mark_as_escaped() };
-        back as pyre_object::PyObjectRef
-    })
+    Ok(descr_get_f_back(anchor.live() as PyObjectRef))
 }
 
 register_frame_builtin_wrapper!(

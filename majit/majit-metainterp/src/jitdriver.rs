@@ -11575,6 +11575,10 @@ impl<S: JitState> JitDriver<S> {
                 majit_gc::shadow_stack::push_resume_ref_roots(&mut seed_roots);
             }
         }
+        // The state's reds are GCREF copies too (`PyreJitState.frame` can be a
+        // moving CALL_ASSEMBLER callee frame); root them across the same
+        // window so `initialize_sym` reads the forwarded address.
+        state.push_red_gcref_roots();
         struct SeedRootsGuard {
             depth: usize,
         }

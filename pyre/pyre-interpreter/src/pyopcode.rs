@@ -118,6 +118,28 @@ pub fn decode_instruction_at(code: &CodeObject, pc: usize) -> Option<(Instructio
     Some(arg_state.get(code_unit))
 }
 
+/// The pc `dispatch_bytecode` starts the instruction containing `pc` at:
+/// the first `EXTENDED_ARG` of its prefix run, or `pc` itself.
+pub fn instruction_logical_start(code: &CodeObject, pc: usize) -> usize {
+    let mut start = pc;
+    while start > 0 && matches!(code.instructions[start - 1].op, Instruction::ExtendedArg) {
+        start -= 1;
+    }
+    start
+}
+
+/// The pc of the opcode an instruction starting at `pc` dispatches: `pc` after
+/// its `EXTENDED_ARG` prefix run.
+pub fn instruction_opcode_pc(code: &CodeObject, pc: usize) -> usize {
+    let mut opcode_pc = pc;
+    while opcode_pc < code_instructions_len(code)
+        && matches!(code.instructions[opcode_pc].op, Instruction::ExtendedArg)
+    {
+        opcode_pc += 1;
+    }
+    opcode_pc
+}
+
 /// Whether `code` contains a `FOR_ITER` opcode — i.e. it is loop-bearing
 /// through a `for` loop.  Used to gate the nested-inline decline: a residual
 /// reached inside a loop-bearing inline callee risks the FOR_ITER-exempt
@@ -2365,12 +2387,34 @@ pub fn execute_jump_backward<E: OpcodeStepExecutor>(
 where
     E: ControlFlowOpcodeHandler,
 {
-    let Instruction::JumpBackward { delta } = instruction else {
-        unreachable!()
+    let (target, skip_handler_only) = match instruction {
+        Instruction::JumpBackward { delta } => (
+            jump_target_backward_decoded(code, next_instr, delta, op_arg),
+            false,
+        ),
+        Instruction::JumpBackwardNoInterrupt { delta } => {
+            let tgt = label_arg_to_usize(delta, op_arg);
+            (next_instr - tgt, true)
+        }
+        _ => unreachable!(),
     };
-    let step = executor.jump_backward(jump_target_backward_decoded(
-        code, next_instr, delta, op_arg,
-    ))?;
+    // Remaining-sibling `JUMP_BACKWARD_NO_INTERRUPT` is a backward
+    // offset whose target does not dominate the jump (`pyopcode.py`
+    // `JUMP_FORWARD` on PyPy). The domination predicate is residual
+    // (`dont_look_inside`); both opcodes share this already-skipped
+    // generic so the no-interrupt body is not a new two-phase subject.
+    if skip_handler_only {
+        if target >= next_instr {
+            executor.set_next_instr(target)?;
+            return Ok(StepResult::Continue);
+        }
+        let source_pc = next_instr - 1;
+        if crate::backward_jump_is_handler_only_target(code, source_pc, target) {
+            executor.set_next_instr(target)?;
+            return Ok(StepResult::Continue);
+        }
+    }
+    let step = executor.jump_backward(target)?;
     // Rebuild the StepResult per variant so the Result-of-PyError
     // lowering sees a concrete `Ok(StepResult::_)` shell to rewrite. A
     // bare `Ok(step)` forward of the method's same-typed Result collapses
@@ -2459,23 +2503,6 @@ pub fn execute_pop_jump_if_not_none<E: OpcodeStepExecutor>(
         unreachable!()
     };
     executor.pop_jump_if_not_none(jump_target_forward_decoded(code, next_instr, delta, op_arg))?;
-    Ok(StepResult::Continue)
-}
-
-pub fn execute_jump_backward_no_interrupt<E: OpcodeStepExecutor>(
-    executor: &mut E,
-    instruction: Instruction,
-    op_arg: OpArg,
-    next_instr: usize,
-) -> Result<StepResult<<E as SharedOpcodeHandler>::Value>, PyError>
-where
-    E: ControlFlowOpcodeHandler,
-{
-    let Instruction::JumpBackwardNoInterrupt { delta } = instruction else {
-        unreachable!()
-    };
-    let tgt = label_arg_to_usize(delta, op_arg);
-    executor.set_next_instr(next_instr - tgt)?;
     Ok(StepResult::Continue)
 }
 
@@ -3865,7 +3892,7 @@ where
 
         // ── Loop / generator control ──
         Instruction::JumpBackwardNoInterrupt { .. } => {
-            execute_jump_backward_no_interrupt(executor, instruction, op_arg, next_instr)
+            execute_jump_backward(executor, code, instruction, op_arg, next_instr)
         }
 
         // ── Load fast and clear (comprehension scope) ──

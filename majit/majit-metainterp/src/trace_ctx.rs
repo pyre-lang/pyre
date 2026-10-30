@@ -343,7 +343,23 @@ pub struct TraceCtx {
     /// the live PyFrame after every standard vable setfield / setarrayitem
     /// (`virtualizable.py write_boxes`). `None` disables the
     /// write — unit-test or init-before-run path.
+    ///
+    /// The raw word is the address at the last
+    /// [`Self::set_virtualizable_heap_ptr`]. A nursery snapshot moves, and
+    /// once the old copy is poisoned `gc_current_object_address` cannot
+    /// recover it. [`Self::virtualizable_heap_ptr`] reads
+    /// [`Self::virtualizable_heap_root`] first, matching
+    /// `PyreSym::current_live_vable_frame`.
     virtualizable_heap_ptr: Option<*const u8>,
+    /// Forwards [`Self::virtualizable_heap_ptr`] across a minor.
+    ///
+    /// `walk_virtualizable_value_refs` updates the raw cell only when the
+    /// extra-root walk runs. CALL_ASSEMBLER bridge tracing can collect
+    /// without that walk (`refresh_virtualizable_from_heap` then reads a
+    /// reused corpse as `locals_cells_stack_w`). The owner root is the
+    /// same slot `snapshot_for_tracing`'s `FrameBox` already holds for the
+    /// snapshot itself.
+    virtualizable_heap_root: Option<majit_gc::shadow_stack::OwnerRootGuard>,
     /// Set when the current residual call receives a virtualizable array's raw
     /// base address. Drained by the post-call escape check.
     raw_vable_base_escape_pending: bool,
@@ -2386,6 +2402,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             virtualizable_heap_ptr: None,
+            virtualizable_heap_root: None,
             raw_vable_base_escape_pending: false,
             header_pc: 0,
             cut_inner_green_key: None,
@@ -2487,6 +2504,7 @@ impl TraceCtx {
             virtualizable_info: None,
             virtualizable_array_lengths: None,
             virtualizable_heap_ptr: None,
+            virtualizable_heap_root: None,
             raw_vable_base_escape_pending: false,
             header_pc: 0,
             cut_inner_green_key: None,
@@ -4018,11 +4036,51 @@ impl TraceCtx {
     /// that needs to know whether the frame it just mutated is the one the
     /// shadow tracks has no other way to ask.
     pub fn diag_virtualizable_heap_ptr(&self) -> usize {
-        self.virtualizable_heap_ptr.map_or(0, |p| p as usize)
+        self.virtualizable_heap_ptr().map_or(0, |p| p as usize)
     }
 
     pub fn set_virtualizable_heap_ptr(&mut self, ptr: *const u8) {
-        self.virtualizable_heap_ptr = if ptr.is_null() { None } else { Some(ptr) };
+        if ptr.is_null() {
+            self.install_virtualizable_heap_ptr(0);
+            return;
+        }
+        let addr = majit_gc::gc_current_object_address(ptr as usize);
+        self.install_virtualizable_heap_ptr(addr);
+    }
+
+    /// Write the raw cell and an already-planted owner root.
+    ///
+    /// Extra-area walks (`walk_my_extra_areas` / `walk_all_extra_areas`)
+    /// hold `lock_mutator_registry` for the whole visit. Planting a root
+    /// here would call `mutator_is_registered` and deadlock on that mutex
+    /// (`gc_varsize_item_const_shape` under `PYPY_GC_NURSERY=4096`).
+    fn store_forwarded_virtualizable_heap_ptr(&mut self, addr: usize) {
+        if addr == 0 {
+            self.virtualizable_heap_ptr = None;
+            return;
+        }
+        self.virtualizable_heap_ptr = Some(addr as *const u8);
+        if let Some(root) = self.virtualizable_heap_root.as_ref() {
+            root.set(majit_ir::GcRef(addr));
+        }
+    }
+
+    fn install_virtualizable_heap_ptr(&mut self, addr: usize) {
+        if addr == 0 {
+            self.virtualizable_heap_ptr = None;
+            self.virtualizable_heap_root = None;
+            return;
+        }
+        self.store_forwarded_virtualizable_heap_ptr(addr);
+        if majit_gc::gc_owns_object(addr) && majit_gc::shadow_stack::mutator_is_registered() {
+            if self.virtualizable_heap_root.is_none() {
+                self.virtualizable_heap_root = Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                    majit_ir::GcRef(addr),
+                ));
+            }
+        } else {
+            self.virtualizable_heap_root = None;
+        }
     }
 
     /// Inverse of `synchronize_virtualizable`: pull current heap virtualizable
@@ -4067,7 +4125,7 @@ impl TraceCtx {
     }
 
     fn refresh_virtualizable_from_heap(&mut self, overwrite_stamped: bool) {
-        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
         let Some(info) = self.virtualizable_info.clone() else {
@@ -4445,7 +4503,7 @@ impl TraceCtx {
     /// `skip_when_outer_owned` names the merge-point form whose write-back
     /// is not this function's to make; see the carve-out below.
     fn write_virtualizable_back(&self, skip_when_outer_owned: bool) {
-        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
         let Some(info) = self.virtualizable_info.as_ref() else {
@@ -4526,7 +4584,7 @@ impl TraceCtx {
     /// `skip_when_outer_owned` is the same carve-out as
     /// [`Self::write_virtualizable_back`].
     fn write_virtualizable_back_at(&self, index: usize, skip_when_outer_owned: bool) {
-        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
         let Some(info) = self.virtualizable_info.as_ref() else {
@@ -4601,7 +4659,7 @@ impl TraceCtx {
         bits: i64,
         skip_when_outer_owned: bool,
     ) {
-        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
         let Some(info) = self.virtualizable_info.as_ref() else {
@@ -4666,7 +4724,7 @@ impl TraceCtx {
             return;
         }
         let (Some(heap_ptr), Some(info), Some(boxes), Some(lengths)) = (
-            self.virtualizable_heap_ptr,
+            self.virtualizable_heap_ptr(),
             self.virtualizable_info.as_ref(),
             self.virtualizable_boxes.as_ref(),
             self.virtualizable_array_lengths.as_ref(),
@@ -4795,7 +4853,7 @@ impl TraceCtx {
     /// Slot `index` of the live virtualizable, `virtualizable.py read_boxes`
     /// layout: static fields, then each array's items, then the identity.
     fn virtualizable_heap_value_at(&self, index: usize) -> Option<Value> {
-        let heap_ptr = self.virtualizable_heap_ptr?;
+        let heap_ptr = self.virtualizable_heap_ptr()?;
         let info = self.virtualizable_info.as_ref()?;
         let lengths = self.virtualizable_array_lengths.as_deref().unwrap_or(&[]);
         let static_count = info.num_static_extra_boxes;
@@ -5003,7 +5061,9 @@ impl TraceCtx {
     /// object do these boxes describe" — `compile.py:510` — want the identity.
     pub fn standard_virtualizable_ptr(&self) -> Option<usize> {
         match self.standard_virtualizable_concrete()? {
-            Value::Ref(gcref) if gcref.as_usize() != 0 => Some(gcref.as_usize()),
+            Value::Ref(gcref) if gcref.as_usize() != 0 && gcref != majit_ir::GcRef::NO_CONCRETE => {
+                Some(gcref.as_usize())
+            }
             _ => None,
         }
     }
@@ -5122,7 +5182,7 @@ impl TraceCtx {
         if !live_holes.is_empty() {
             let dest_ptr = self
                 .standard_virtualizable_ptr()
-                .or_else(|| self.virtualizable_heap_ptr.map(|p| p as usize))
+                .or_else(|| self.virtualizable_heap_ptr().map(|p| p as usize))
                 .unwrap_or(0);
             self.fill_live_virtualizable_holes_from_heap(&info, dest_ptr, &lengths, &live_holes);
         }
@@ -5346,20 +5406,27 @@ impl TraceCtx {
         // object the cell names; re-deriving it from the identity would move
         // the synchronization target onto the live frame at whichever
         // collection happens to fire.
+        // A planted owner root is already forwarded in Phase 1b
+        // (`walk_roots` / `walk_all_roots` of `OWNER_ROOTS`) before this
+        // extra-area visit. Sync the raw cell from it and do not plant or
+        // re-enter the mutator registry lock held by `walk_my_extra_areas`.
+        if let Some(root) = self.virtualizable_heap_root.as_ref() {
+            let now = root.get().0;
+            if now != 0 {
+                self.virtualizable_heap_ptr = Some(now as *const u8);
+                return;
+            }
+        }
         let cell = self.virtualizable_heap_ptr;
         match cell {
             Some(ptr) if !ptr.is_null() && Some(ptr as usize) != identity_before => {
                 let mut target = majit_ir::GcRef(ptr as usize);
                 visitor(&mut target);
-                self.virtualizable_heap_ptr = Some(target.as_usize() as *const u8);
+                self.store_forwarded_virtualizable_heap_ptr(target.as_usize());
             }
             _ => {
                 if let Some(Value::Ref(identity)) = self.standard_virtualizable_concrete() {
-                    self.virtualizable_heap_ptr = if identity.is_null() {
-                        None
-                    } else {
-                        Some(identity.as_usize() as *const u8)
-                    };
+                    self.store_forwarded_virtualizable_heap_ptr(identity.as_usize());
                 }
             }
         }
@@ -5575,6 +5642,23 @@ impl TraceCtx {
         self.virtualizable_info.as_ref()
     }
 
+    /// pyjitpl.py `_do_jit_force_virtual` reads
+    /// `self.metainterp.jitdriver_sd.greenfield_info` — the current
+    /// driver, not the first registered one.
+    pub fn greenfield_info(&self) -> Option<&crate::greenfield::GreenFieldInfo> {
+        let jd = self.driver_descriptor.as_ref()?;
+        if let Some(i) = jd.index
+            && let Some(info) = self
+                .metainterp_sd
+                .jitdrivers_sd
+                .get(i)
+                .and_then(|live| live.greenfield_info.as_ref())
+        {
+            return Some(info);
+        }
+        jd.greenfield_info.as_ref()
+    }
+
     /// Cached array lengths for the active standard virtualizable.
     pub fn virtualizable_array_lengths(&self) -> Option<&[usize]> {
         self.virtualizable_array_lengths.as_deref()
@@ -5588,6 +5672,12 @@ impl TraceCtx {
     /// token protocol around a concrete-executed residual call
     /// (pyjitpl.py:3329-3330, 3349-3353).
     pub fn virtualizable_heap_ptr(&self) -> Option<*const u8> {
+        if let Some(root) = self.virtualizable_heap_root.as_ref() {
+            let now = root.get().0;
+            if now != 0 {
+                return Some(now as *const u8);
+            }
+        }
         self.virtualizable_heap_ptr
     }
 
@@ -5794,7 +5884,7 @@ impl TraceCtx {
             Some(Value::Ref(gcref)) if gcref.as_usize() != 0 => gcref.as_usize(),
             _ => self
                 .standard_virtualizable_ptr()
-                .or_else(|| self.virtualizable_heap_ptr.map(|p| p as usize))
+                .or_else(|| self.virtualizable_heap_ptr().map(|p| p as usize))
                 .filter(|&ptr| ptr != 0)
                 .unwrap_or(0),
         };
@@ -9997,6 +10087,29 @@ mod tests {
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+    }
+
+    #[test]
+    fn virtualizable_heap_ptr_roundtrips_a_non_gc_address() {
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_virtualizable_heap_ptr(0x9000 as *const u8);
+        assert_eq!(ctx.virtualizable_heap_ptr(), Some(0x9000 as *const u8));
+        ctx.set_virtualizable_heap_ptr(std::ptr::null());
+        assert_eq!(ctx.virtualizable_heap_ptr(), None);
+    }
+
+    /// Extra-area collection holds `lock_mutator_registry`. Forwarding the
+    /// raw cell must not re-enter that lock (`mutator_is_registered`).
+    #[test]
+    fn walk_virtualizable_heap_ptr_forwards_without_planting_a_root() {
+        let mut ctx = TraceCtx::for_test(0);
+        ctx.set_virtualizable_heap_ptr(0x9000 as *const u8);
+        ctx.walk_virtualizable_value_refs(|r| {
+            if r.0 == 0x9000 {
+                r.0 = 0xA000;
+            }
+        });
+        assert_eq!(ctx.virtualizable_heap_ptr(), Some(0xA000 as *const u8));
     }
 
     /// `add_merge_point_with_key` must stamp the header snapshot with the virtualizable

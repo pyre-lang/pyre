@@ -234,8 +234,8 @@ mod tests {
             // A malformed recovered red must never be dereferenced merely
             // because it is nonzero. There is no matching execution scope.
             bh.virtualizable_ptr = 2;
-            super::leave_resumed_blackhole_frame(&bh, false);
-            super::leave_resumed_blackhole_frame(&bh, true);
+            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
+            let _ = super::leave_resumed_blackhole_frame(&bh, true, pyre_object::w_none(), true);
             assert!(ec.topframeref.is_null());
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
         })
@@ -259,7 +259,7 @@ mod tests {
             ec.topframeref = &mut child;
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut parent) as i64;
-            super::leave_resumed_blackhole_frame(&bh, false);
+            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
             assert!(parent.frame_finished_execution());
             assert!(!child.frame_finished_execution());
             assert!(std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut child)));
@@ -286,7 +286,7 @@ mod tests {
             pyre_interpreter::call::set_last_exec_ctx(&mut ec);
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = base as i64;
-            super::leave_resumed_blackhole_frame(&bh, false);
+            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
             // Clear the TLS anchor before an assertion can unwind the frame owner.
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
             assert!(frames[0].frame_finished_execution());
@@ -312,13 +312,34 @@ mod tests {
             ec.topframeref = &mut child;
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
             bh.virtualizable_ptr = std::ptr::from_mut(&mut child) as i64;
-            super::leave_resumed_blackhole_frame(&bh, false);
+            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), true);
             assert!(child.frame_finished_execution());
             assert!(!parent.frame_finished_execution());
             assert!(std::ptr::eq(
                 ec.topframeref,
                 std::ptr::from_mut(&mut parent)
             ));
+            pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn blackhole_leave_skips_terminal_hooks_when_the_bracket_owns_them() {
+        // Interpreter-bracketed terminal: `portal_activation_leave` still
+        // runs `execute_frame`'s `return_trace` then `leave`. This helper
+        // must not emit `leaveframe` or close `topframeref` itself.
+        std::thread::spawn(|| {
+            let mut ec = pyre_interpreter::PyExecutionContext::default();
+            pyre_interpreter::call::set_last_exec_ctx(&mut ec);
+            let mut child = stack_pyframe();
+            ec.topframeref = &mut child;
+            let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
+            bh.virtualizable_ptr = std::ptr::from_mut(&mut child) as i64;
+            let _ = super::leave_resumed_blackhole_frame(&bh, false, pyre_object::w_none(), false);
+            assert!(!child.frame_finished_execution());
+            assert!(std::ptr::eq(ec.topframeref, std::ptr::from_mut(&mut child)));
             pyre_interpreter::call::set_last_exec_ctx(std::ptr::null_mut());
         })
         .join()
@@ -1186,7 +1207,7 @@ fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
     // identity, and is neither complete nor stable enough to choose the door.
     let outcome = match entry {
         PortalEntry::TracedActivation => crate::eval::portal_traced_activation_result(frame),
-        PortalEntry::Resume => crate::eval::portal_body_result(frame),
+        PortalEntry::Resume => crate::eval::call_assembler_portal_body_result(frame),
     };
     let result = match outcome {
         Ok(r) => r,
@@ -1389,30 +1410,31 @@ pub extern "C" fn bh_portal_runner_c(
         // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
         crate::eval::correct_resume_vsd(frame, pc);
     }
-    // The bracket is owed, but not for the reason a reading of
-    // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
-    // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
-    // recursive-portal arm (blackhole.py), taken when `nextblackholeinterp`
-    // is not None — a frame that already has a caller in the resumed chain,
-    // i.e. an inlined callee, mid-body at its own loop header.  That IS a
-    // resume, and upstream reaches it through `portal_ptr` = `dispatch`, one
-    // level below `execute_frame`.  What makes it an activation for pyre is
-    // where the frame came from: `emit_new_pyframe_inline_with_params` built
-    // it inside compiled code, and `walker_ec_enter` records only `enter`'s
-    // frame-chain half, never `call_trace` — so this is the frame's first and
-    // only bracket, not a second one.  The bottom level, which is the frame
-    // the interpreter itself bracketed, never arrives here: it raises
-    // `ContinueRunningNormally` and takes the unbracketed entry instead.
+    // `blackhole.py bhimpl_jit_merge_point` inner arm (`nextblackholeinterp`
+    // is not None): a portal merge reached by recursion.  Upstream calls
+    // `ll_portal_runner` which ends in `portal_ptr(*args)` (`warmspot.py`),
+    // and `portal_ptr` is `PyFrame.dispatch` — inside `execute_frame`'s
+    // bracket, on the same frame red.  Every true-portal instruction start
+    // now carries a `jit_merge_point` (`interp_jit.py PyFrame.dispatch`), so
+    // this arm is taken for an inlined callee the parent trace already
+    // entered, not only for a callee that was just constructed.  A second
+    // `ExecutionContext.enter` / `call_trace` / `leave` rewrites `f_backref`
+    // and `topframeref` while the still-open `virtual_ref` names the original
+    // frame, and the traceback then records a fresh copy whose `f_back` is
+    // wrong.  `portal_runner_body_result` keeps `ll_portal_runner`'s
+    // `maybe_compile_and_run` and runs the body without a second `enter`.
+    // `execute_frame`'s exit hooks run when this blackhole level finishes,
+    // in `leave_resumed_blackhole_frame` (`pyframe.py execute_frame`'s
+    // `return_trace` then `ExecutionContext.leave`).
     //
     // `ec` is a red arg and the frame no longer carries one, so publish it for
-    // the duration of the call: `execute_frame` reads its execution context
-    // through `space.getexecutioncontext()`, which is what the bracket below
-    // will consult.
+    // the duration of the call: `eval_loop_jit` reads its execution context
+    // through `space.getexecutioncontext()`.
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
-    let result = crate::eval::portal_activation_result(frame);
+    let result = crate::eval::portal_runner_body_result(frame);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => result as i64,
@@ -2144,7 +2166,7 @@ fn ca_complete_after_bridge_walk(
     // handle_blackhole_result performs.
     if ca_adopted_frame != 0 && ca_adopted_frame == callee_frame {
         let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
-        return match crate::eval::portal_body_result(frame) {
+        return match crate::eval::call_assembler_portal_body_result(frame) {
             Ok(result) => Some(result as i64),
             Err(mut err) => {
                 let exc_obj = err.to_exc_object();
@@ -2324,6 +2346,7 @@ fn jit_blackhole_resume_from_guard(
             all_virtuals,
             None, // `raw_deadframe` is rooted only by the copy made inside
             Some((fail_arg_root, descr_fd, n_fail_args)),
+            true,
         );
         return handle_blackhole_result(result);
     }
@@ -2559,44 +2582,93 @@ fn reject_non_exception_channel_value(
     );
 }
 
-/// `executioncontext.py ExecutionContext.leave`'s frame-chain half, for a
-/// frame a blackhole resumed into and has now finished.
+/// `pyframe.py execute_frame`'s exit sequence for a frame a blackhole
+/// resumed into and has now finished: `executioncontext.return_trace` then
+/// `ExecutionContext.leave` (`leaveframe_trace`, then the frame-chain half).
 ///
-/// The profile-hook half (`if self.profilefunc: self._trace(frame,
-/// 'leaveframe', w_exitvalue)`) stays with the interpreter's own
-/// [`pyre_interpreter::PyExecutionContext::leave`], for the reason
-/// `walker_ec_leave` states: `is_being_profiled` is a portal-driver green, so a
-/// trace recorded with profiling off is only ever entered with profiling off,
-/// and the blackhole resuming out of it inherits that key.
+/// Hands back `w_exitvalue` at its live address: both hooks run
+/// application-level Python and may move the recovered nursery frame and
+/// the exit value.  A hook that raises replaces the body's result, while
+/// the chain half still runs (`execute_frame`'s nested `try`/`finally`).
+///
+/// The hooks run only when this blackhole level owns that `finally`:
+/// an inlined / recursive-portal frame (`nextblackholeinterp` was Some),
+/// or the terminal CALL_ASSEMBLER door (`handle_blackhole_result`).
+/// The terminal level of an interpreter-bracketed portal still sits
+/// inside `portal_activation_bracketed`, which runs the same pair
+/// (`PyFrame.execute_frame`: one `return_trace` + one `leave` per frame).
+///
+/// The hooks run only when the recovered red is the open scope or is on
+/// the unforced EC chain; a garbage red is not dereferenced.
 fn leave_resumed_blackhole_frame(
     frame: &majit_metainterp::blackhole::BlackholeInterpreter,
     got_exception: bool,
-) {
+    w_exitvalue: PyObjectRef,
+    run_execute_frame_hooks: bool,
+) -> PyResult {
     let recovered = frame.virtualizable_ptr as *mut PyFrame;
     if recovered.is_null() {
-        return;
+        return Ok(w_exitvalue);
+    }
+    if !run_execute_frame_hooks {
+        return Ok(w_exitvalue);
     }
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
-        return;
+        return Ok(w_exitvalue);
     }
+    let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
+    let is_open = std::ptr::eq(open, recovered);
+    if !is_open && !frame_is_on_unforced_ec_chain(ec, recovered) {
+        return Ok(w_exitvalue);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let frame_slot = roots.pin_roots(&[recovered as PyObjectRef, w_exitvalue]);
+    let exit_slot = frame_slot + 1;
+    let recovered = roots.get(frame_slot) as *mut PyFrame;
+    let exit = roots.get(exit_slot);
+    let mut hook_err: Option<pyre_interpreter::PyError> = None;
+    let mut hook_err_slot = None;
+    match unsafe { (*ec).return_trace(recovered, exit) } {
+        Ok(_) => {}
+        Err(mut err) => {
+            hook_err_slot = Some(err.pin(&roots));
+            hook_err = Some(err);
+        }
+    }
+    let recovered = roots.get(frame_slot) as *mut PyFrame;
+    let exit = roots.get(exit_slot);
+    let return_trace_raised = hook_err.is_some();
+    match unsafe { (*ec).leaveframe_trace(recovered, exit) } {
+        Ok(_) => {}
+        Err(mut err) => {
+            hook_err_slot = Some(err.pin(&roots));
+            hook_err = Some(err);
+        }
+    }
+    let recovered = roots.get(frame_slot) as *mut PyFrame;
+    let chain_got_exception = got_exception || return_trace_raised;
     let open = unsafe { pyre_interpreter::executioncontext::vref_referent((*ec).topframeref) };
     if std::ptr::eq(open, recovered) {
         // `leave(frame)` is given the current top. The recovered red is that
         // frame, so run the chain half in full.
-        leave_compiled_frame_chain(recovered, got_exception);
-        return;
-    }
-    // Not the open scope. `leave` must not rewrite `topframeref` or it
-    // would drop an inlined callee still sitting there. The blackhole's
-    // own frame still needs the `dispatch_bytecode` / `handle_operation_error`
-    // finish mark if it is a live chain member (the portal under that
-    // callee). A garbage red is not on the chain and is not dereferenced.
-    if frame_is_on_unforced_ec_chain(ec, recovered) {
+        leave_compiled_frame_chain(recovered, chain_got_exception);
+    } else if frame_is_on_unforced_ec_chain(ec, recovered) {
+        // Not the open scope. `leave` must not rewrite `topframeref` or it
+        // would drop an inlined callee still sitting there. The blackhole's
+        // own frame still needs the `dispatch_bytecode` / `handle_operation_error`
+        // finish mark if it is a live chain member (the portal under that
+        // callee).
         unsafe {
             (*recovered).set_frame_finished_execution(true);
         }
+    }
+    if let (Some(mut err), Some(slot)) = (hook_err, hook_err_slot) {
+        err.reload(&roots, slot);
+        Err(err)
+    } else {
+        Ok(roots.get(exit_slot))
     }
 }
 
@@ -2808,6 +2880,11 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         &'df dyn majit_ir::FailDescr,
         usize,
     )>,
+    // Terminal `DoneWithThisFrame` / unhandled exception: CALL_ASSEMBLER
+    // (`handle_blackhole_result`) owns `execute_frame`'s hooks; an
+    // interpreter-bracketed portal still runs them in
+    // `portal_activation_bracketed`. Inlined levels always own the hooks.
+    terminal_owns_execute_frame_hooks: bool,
 ) -> BlackholeResult {
     let deadframe = if let Some((ref root, descr, n)) = held_deadframe_root {
         majit_backend::FailArgSource::from_held_root(root, descr, n)
@@ -3205,11 +3282,28 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             }
             // blackhole.py no handler here → propagate to the caller.
             let next = bh.nextblackholeinterp.take();
-            let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
+            // `leave_resumed_blackhole_frame` runs `return_trace` / `leave`
+            // and can force a caller vref; both collect. `shadowstack.py`
+            // `push_roots` / `pop_roots` reloads every live GC reference
+            // across that call — park the frame the same way `guard_exc_root`
+            // parks the exception, and read the forwarded address after.
+            let frame_root = (bh.virtualizable_ptr != 0).then(|| {
+                majit_gc::shadow_stack::OwnerRootGuard::new(GcRef(bh.virtualizable_ptr as usize))
+            });
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
-            leave_resumed_blackhole_frame(&bh, true);
+            let run_hooks = next.is_some() || terminal_owns_execute_frame_hooks;
+            if let Err(mut err) =
+                leave_resumed_blackhole_frame(&bh, true, pyre_object::w_none(), run_hooks)
+            {
+                majit_metainterp::blackhole::GUARD_EXC_VALUE
+                    .with(|c| c.set(err.to_exc_object() as i64));
+            }
             release_bh_rd(bh);
+            let frame_ptr = match &frame_root {
+                Some(root) => root.get().0 as *mut PyFrame,
+                None => std::ptr::null_mut(),
+            };
             match next {
                 Some(caller) => {
                     // `_run_forever` records a node at every frame boundary it
@@ -3390,11 +3484,16 @@ pub fn blackhole_resume_via_rd_numb<'df>(
             // — and with it `exception_last_value` — transitively traced for
             // its whole life; root the value across the equivalent window.
             let _exc_roots = pyre_object::gc_roots::push_roots();
-            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut exc_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(bh.exception_last_value as PyObjectRef);
             let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
             let next = bh.nextblackholeinterp.take();
-            let frame_ptr = bh.virtualizable_ptr as *mut PyFrame;
+            // Same `push_roots` / `pop_roots` window as the exception: the
+            // traceback record below and `leave_resumed_blackhole_frame` both
+            // collect, so the frame lives in a rooted slot rather than a
+            // copied `virtualizable_ptr`.
+            let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(bh.virtualizable_ptr as PyObjectRef);
             let jitcode_index = bh.jitcode.try_index().map(|v| v as i32);
             let last_opcode_position = bh.last_opcode_position;
             let bh_entry_position = bh.entry_position;
@@ -3430,39 +3529,54 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                 .get(last_opcode_position.saturating_sub(10)..=last_opcode_position + 1)
                 .unwrap_or(&[])
                 .to_vec();
-            let keeps_existing_traceback = bh_opcode_at
-                .is_some_and(|opcode| opcode == majit_metainterp::jitcode::insns::BC_RERAISE)
-                || jitcode_index.is_some_and(|index| {
-                    pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
-                        index,
-                        last_opcode_position as i32,
-                    )
-                });
+            // A raise out of `jit_merge_point` comes from the recursive portal
+            // run `bhimpl_jit_merge_point` made for this frame; that run
+            // already recorded the frame's traceback entry.
+            let keeps_existing_traceback = bh_opcode_at.is_some_and(|opcode| {
+                opcode == majit_metainterp::jitcode::insns::BC_RERAISE
+                    || opcode == majit_metainterp::jitcode::insns::BC_JIT_MERGE_POINT
+                    || opcode == majit_metainterp::jitcode::insns::BC_JIT_MERGE_POINT_C
+            }) || jitcode_index.is_some_and(|index| {
+                pyre_jit_trace::state::jitcode_pc_raise_keeps_existing_traceback(
+                    index,
+                    last_opcode_position as i32,
+                )
+            });
             // blackhole.py _run_forever propagates an unhandled exception one
             // BlackholeInterpreter frame at a time. Record each exiting
             // frame before advancing to nextblackholeinterp, matching
             // pytraceback.py record_application_traceback at every Python
             // frame boundary. A forwarding raise preserves the existing chain.
-            if !keeps_existing_traceback && !frame_ptr.is_null() {
+            if !keeps_existing_traceback {
                 let exc_value = pyre_object::gc_roots::shadow_stack_get(exc_slot) as i64;
-                if let Some(jitcode_index) = jitcode_index {
-                    record_caught_blackhole_traceback(
-                        exc_value,
-                        frame_ptr as i64,
-                        i64::from(jitcode_index),
-                        last_opcode_position as i64,
-                    );
-                } else {
-                    unsafe {
-                        pyre_interpreter::pytraceback::record_application_traceback(
-                            exc_value as PyObjectRef,
-                            frame_ptr,
-                            (*frame_ptr).last_instr as i64,
+                let frame_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame;
+                if !frame_ptr.is_null() {
+                    if let Some(jitcode_index) = jitcode_index {
+                        record_caught_blackhole_traceback(
+                            exc_value,
+                            frame_ptr as i64,
+                            i64::from(jitcode_index),
+                            last_opcode_position as i64,
                         );
+                    } else {
+                        unsafe {
+                            pyre_interpreter::pytraceback::record_application_traceback(
+                                exc_value as PyObjectRef,
+                                frame_ptr,
+                                (*frame_ptr).last_instr as i64,
+                            );
+                        }
                     }
                 }
             }
-            leave_resumed_blackhole_frame(&bh, true);
+            bh.virtualizable_ptr = pyre_object::gc_roots::shadow_stack_get(frame_slot) as i64;
+            let run_hooks = next.is_some() || terminal_owns_execute_frame_hooks;
+            if let Err(mut err) =
+                leave_resumed_blackhole_frame(&bh, true, pyre_object::w_none(), run_hooks)
+            {
+                exc_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(err.to_exc_object());
+            }
             release_bh_rd(bh);
             // Re-read through the pin: the records above are allocation
             // points, so the pinned slot — not the stale local — is the live
@@ -3545,42 +3659,80 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         }
 
         // blackhole.py:1632-1644: pass return value to caller by _return_type.
+        // `execute_frame`'s exit hooks run on the callee before the caller
+        // sees the value (`return_trace` then `leave`).
         use majit_metainterp::blackhole::BhReturnType;
         let rt = bh.return_type;
         let next = bh.nextblackholeinterp.take();
         let caller = next;
-        if caller.is_none() {
-            // blackhole.py _done_with_this_frame
-            // The terminal level has no caller branch below to close its
-            // execution scope. Root the result across ExecutionContext.leave,
-            // whose caller-vref force can collect.
-            let roots = pyre_object::gc_roots::push_roots();
-            if matches!(rt, BhReturnType::Ref) {
-                let _ = roots.pin_root(bh.get_tmpreg_r() as PyObjectRef);
+        let w_exitvalue = if matches!(rt, BhReturnType::Ref) {
+            bh.get_tmpreg_r() as PyObjectRef
+        } else {
+            pyre_object::w_none()
+        };
+        let roots = pyre_object::gc_roots::push_roots();
+        if matches!(rt, BhReturnType::Ref) {
+            let _ = roots.pin_root(w_exitvalue);
+        }
+        // `leave_resumed_blackhole_frame` collects (`return_trace` / `leave`
+        // / caller vref). Root the frame beside `w_exitvalue` and reload
+        // `virtualizable_ptr` so leave's copy is the forwarded address
+        // (`shadowstack.py` `push_roots` / `pop_roots`).
+        let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(bh.virtualizable_ptr as PyObjectRef);
+        let w_exitvalue = if matches!(rt, BhReturnType::Ref) {
+            roots.get(roots.base())
+        } else {
+            w_exitvalue
+        };
+        bh.virtualizable_ptr = roots.get(frame_slot) as i64;
+        let run_hooks = caller.is_some() || terminal_owns_execute_frame_hooks;
+        match leave_resumed_blackhole_frame(&bh, false, w_exitvalue, run_hooks) {
+            Ok(live) => {
+                if caller.is_none() {
+                    // blackhole.py _done_with_this_frame
+                    let result = match rt {
+                        BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
+                        BhReturnType::Int => {
+                            BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i())
+                        }
+                        BhReturnType::Ref => BlackholeResult::DoneWithThisFrameRef(live),
+                        BhReturnType::Float => BlackholeResult::DoneWithThisFrameFloat(
+                            f64::from_bits(bh.get_tmpreg_f() as u64),
+                        ),
+                    };
+                    release_bh_rd(bh);
+                    return result;
+                }
+                let mut caller_bh = caller.unwrap();
+                match rt {
+                    BhReturnType::Int => caller_bh.setup_return_value_i(bh.get_tmpreg_i()),
+                    BhReturnType::Ref => caller_bh.setup_return_value_r(live as i64),
+                    BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
+                    BhReturnType::Void => {}
+                }
+                release_bh_rd(bh);
+                bh = caller_bh;
             }
-            leave_resumed_blackhole_frame(&bh, false);
-            let result = match rt {
-                BhReturnType::Void => BlackholeResult::DoneWithThisFrameVoid,
-                BhReturnType::Int => BlackholeResult::DoneWithThisFrameInt(bh.get_tmpreg_i()),
-                BhReturnType::Ref => BlackholeResult::DoneWithThisFrameRef(roots.get(roots.base())),
-                BhReturnType::Float => BlackholeResult::DoneWithThisFrameFloat(f64::from_bits(
-                    bh.get_tmpreg_f() as u64,
-                )),
-            };
-            release_bh_rd(bh);
-            return result;
+            Err(mut err) => {
+                let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = roots.pin_root(err.to_exc_object());
+                let exc_value = roots.get(exc_slot) as i64;
+                release_bh_rd(bh);
+                let Some(mut caller_bh) = caller else {
+                    drain_backend_jit_exc();
+                    return BlackholeResult::ExitFrameWithExceptionRef(err);
+                };
+                caller_bh.last_opcode_position = caller_bh.position;
+                if caller_bh.handle_exception_in_frame(exc_value) {
+                    bh = caller_bh;
+                    continue;
+                }
+                caller_bh.exception_last_value = roots.get(exc_slot) as i64;
+                caller_bh.got_exception = true;
+                bh = caller_bh;
+            }
         }
-        let mut caller_bh = caller.unwrap();
-        // blackhole.py:1637-1644: dispatch by _return_type
-        match rt {
-            BhReturnType::Int => caller_bh.setup_return_value_i(bh.get_tmpreg_i()),
-            BhReturnType::Ref => caller_bh.setup_return_value_r(bh.get_tmpreg_r()),
-            BhReturnType::Float => caller_bh.setup_return_value_f(bh.get_tmpreg_f()),
-            BhReturnType::Void => {}
-        }
-        leave_resumed_blackhole_frame(&bh, false);
-        release_bh_rd(bh);
-        bh = caller_bh;
     }
 }
 
@@ -3713,7 +3865,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult) -> Option<i64> {
             if !ec.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(ec);
             }
-            let result = crate::eval::portal_body_result(frame);
+            let result = crate::eval::call_assembler_portal_body_result(frame);
             pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
             match result {
                 Ok(result) => Some(result as i64),

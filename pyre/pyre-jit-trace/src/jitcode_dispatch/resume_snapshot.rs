@@ -62,11 +62,34 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
 
 /// The `-live-` directly before `op_pc`: the liveness a plain guard reads
 /// (`get_list_of_active_boxes`, `pc = self.pc - SIZE_LIVE_OP`).
+/// The marker must be a decodable `-live-` startpoint, not an operand byte equal to `op_live`.
 pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
     const SIZE_LIVE_OP: usize = majit_jitcode::liveness::OFFSET_SIZE + 1;
     let pc = op_pc.checked_sub(SIZE_LIVE_OP)?;
     let marker = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), pc)?;
-    (marker.opname == "live" && marker.next_pc == op_pc).then_some(pc)
+    (marker.opname == "live"
+        && marker.next_pc == op_pc
+        && payload
+            .jitcode
+            .can_decode_live_vars(pc, crate::state::op_live()))
+    .then_some(pc)
+}
+
+/// The last `-live-` at or before `op_pc`.
+fn live_marker_at_or_before(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+        .take_while(|op| op.pc <= op_pc)
+        .filter(|op| op.opname == "live")
+        .last()
+        .map(|op| op.pc)
+}
+
+/// Whether a `jit_merge_point` sits in `[op_pc, marker)`.
+fn merge_point_between(payload: &crate::PyJitCode, op_pc: usize, marker: usize) -> bool {
+    crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice())
+        .skip_while(|op| op.pc < op_pc)
+        .take_while(|op| op.pc < marker)
+        .any(|op| op.opname == "jit_merge_point")
 }
 
 /// Resume coordinate for a plain (non-after-residual) guard.
@@ -85,9 +108,7 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
 /// point the opcode body re-executes from.
 pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: usize) -> i32 {
     let op_live = crate::state::op_live();
-    if payload.jitcode.can_decode_live_vars(op_pc, op_live)
-        || payload.jitcode.code.get(op_pc) == Some(&op_live)
-    {
+    if payload.jitcode.can_decode_live_vars(op_pc, op_live) {
         op_pc as i32
     } else {
         preceding_live_marker(payload, op_pc)
@@ -762,6 +783,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // depth_at_py_pc[py_pc]` — so the published scalar stays
                 // symmetric with the active-box layout.  Fall back to
                 // `sym.valuestackdepth` only when liveness is unavailable.
+                // The publish is snapshot-only like `last_instr`.
                 let vsd_value = unsafe {
                     let jc = &walked_owned;
                     if jc.payload.code_ptr.is_null() {
@@ -779,7 +801,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     }
                 };
                 let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes(
+                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
                     ctx.trace_ctx,
                     "valuestackdepth",
                     vsd_op,
@@ -973,8 +995,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
                 // twin at the guard's own `op_pc`.
-                let twin = unsafe { (&walked_owned).payload.resume_marker_for_jitcode_pc(op_pc) };
-                match twin {
+                // A guard recorded before its opcode's `jit_merge_point` (the
+                // `is_being_profiled` diamond, `promote_greens`, the merge
+                // itself) has a block-head marker AFTER it: the op2 `-live-`
+                // the opcode body resumes from.  Resuming there would skip the
+                // merge point, so `bhimpl_jit_merge_point` would never hand
+                // the opcode back to the interpreter.  Such a guard resumes at
+                // the `-live-` before it, `generate_guard(resumepc=orgpc)`
+                // (`pyjitpl.py`).
+                let payload = unsafe { &(&walked_owned).payload };
+                match payload.resume_marker_for_jitcode_pc(op_pc) {
+                    Some(jp) if merge_point_between(payload, op_pc, jp) => {
+                        live_marker_at_or_before(payload, op_pc).map_or(jp as i32, |m| m as i32)
+                    }
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }

@@ -1176,6 +1176,8 @@ two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::collect_entries
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::copy
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::entry_count
+two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::fast_local_index
+two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::fast_local_index::<Impl>::call
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::force_locals
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::get
 two-phase-annotate-skipped	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::items
@@ -1437,6 +1439,9 @@ two-phase-annotate-skipped	pyre_jit::eval::interpret_abort_switch_to_blackhole
 two-phase-annotate-skipped	pyre_jit::eval::jit_is_off
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed
 two-phase-annotate-skipped	pyre_jit::eval::portal_activation_bracketed::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_leave::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::portal_activation_return_trace
 two-phase-annotate-skipped	pyre_jit::eval::portal_body_result
 two-phase-annotate-skipped	pyre_jit::eval::portal_diag_bump
 two-phase-annotate-skipped	pyre_jit::eval::portal_metatrace_skip

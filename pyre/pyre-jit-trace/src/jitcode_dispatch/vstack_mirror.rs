@@ -16,7 +16,7 @@ use super::*;
 /// stack-effect grouping in [`crate::liveness`]'s `stack_effects`, but
 /// collapsed to the three categories the operand-stack box maintenance
 /// cares about.  `op_arg` is read only where the net effect depends on it
-/// (LOAD_GLOBAL's NULL-sentinel low bit).
+/// (LOAD_GLOBAL's NULL-sentinel low bit, LOAD_SUPER_ATTR's method bit).
 pub(crate) fn classify_vstack_opcode(
     instr: &pyre_interpreter::bytecode::Instruction,
     op_arg: pyre_interpreter::OpArg,
@@ -213,14 +213,19 @@ pub(crate) fn classify_vstack_opcode(
         }
         Instruction::LoadGlobal { .. } => VstackOpClass::ResultToTos,
 
-        // LOAD_SUPER_ATTR: the attribute (non-method form) is the sole new TOS.
-        // In the method form (`op_arg & 1`) it pushes `func` then `self` (net
-        // -1), so `self` is the new TOS (= last Ref written) and the `func` slot
-        // beneath becomes a NONE hole the general hole-fill recovers from the
-        // shadow (both pushed through `setarrayitem_vable_r`); like the
-        // method-form LOAD_GLOBAL the func slot survives to the CALL, and a
-        // short-circuit in the argument list can keep it across a branch guard
-        // on the way, which the kept-stack hazard handles there.
+        // LOAD_SUPER_ATTR pops `global_super`, `__class__`, and `self`
+        // (`liveness.rs` `Instruction::LoadSuperAttr`). Non-method form pushes
+        // one result (net -2); `ResultToTos` truncates to that depth and writes
+        // `vstack_last_ref` on the new TOS, leaving `global_super` in the
+        // surviving lower slot. Method form (`op_arg & 1`) pushes `func` then
+        // `self` (net -1). Under `ResultToTos` that truncate-and-stamp keeps
+        // `global_super` under TOS (`self`) instead of installing `func`;
+        // `LoadSuperAttrMethod` clears both pushed slots so the hole-fill
+        // sources them from the virtualizable shadow (`setarrayitem_vable_r`
+        // of `super_attr_unwrap` 0 and 1).
+        Instruction::LoadSuperAttr { namei } if u32::from(namei.get(op_arg)) & 1 != 0 => {
+            VstackOpClass::LoadSuperAttrMethod
+        }
         Instruction::LoadSuperAttr { .. } => VstackOpClass::ResultToTos,
 
         // LOAD_SPECIAL pops the context-manager object at `prev_depth - 1`
@@ -767,7 +772,9 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 .vstack_boxes
                 .resize(new_depth, OpRef::NONE);
         }
-        VstackOpClass::MultiResultFromShadow | VstackOpClass::LoadSpecialMethod => {
+        VstackOpClass::MultiResultFromShadow
+        | VstackOpClass::LoadSpecialMethod
+        | VstackOpClass::LoadSuperAttrMethod => {
             // UNPACK_* pops ONE sequence (at `prev_depth - 1`) and pushes its
             // elements upward.  Clear only the affected range
             // `[pop_point .. new_depth)` to NONE so the hole-fill below
@@ -786,11 +793,19 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             // this same opcode pushed one slot below — and calls it with the
             // receiver twice.  Stamp the constant, as the method-form
             // LOAD_GLOBAL arm above does for the other callable/NULL pair.
+            //
+            // Method-form LOAD_SUPER_ATTR pops three and pushes two (`func`,
+            // `self`); both pushed slots are already in the shadow, so clear
+            // `[new_depth - 2 .. new_depth)` and leave `trailing_null` unset.
             let trailing_null = match effective_class {
                 VstackOpClass::LoadSpecialMethod => Some(ctx.trace_ctx.const_null()),
                 _ => None,
             };
-            let pop_point = ctx.vstack_depth.saturating_sub(1);
+            let pop_point = if matches!(effective_class, VstackOpClass::LoadSuperAttrMethod) {
+                new_depth.saturating_sub(2)
+            } else {
+                ctx.vstack_depth.saturating_sub(1)
+            };
             ctx.frame_state
                 .borrow_mut()
                 .vstack_boxes
@@ -864,7 +879,9 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
             .get(new_depth - 2)
             .copied()
             == Some(OpRef::NONE);
-        if hole && result != OpRef::NONE {
+        // LoadSpecialMethod's last store is the trailing NULL sentinel, not
+        // the first push; a null-constant result would fill the hole wrongly.
+        if hole && result != OpRef::NONE && !opref_is_null_const_ptr(result) {
             ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 2] = result;
         }
     }
@@ -1419,7 +1436,15 @@ pub(crate) fn seed_vstack_mirror<Sym: WalkSym>(
         });
         let target_is_for_iter = metadata_block_head_py_pc(&jc.payload.metadata, start_pc)
             .and_then(|target| {
-                pyre_interpreter::decode_instruction_at(&*jc.payload.code_ptr, target as usize)
+                let code = &*jc.payload.code_ptr;
+                let target = target as usize;
+                if pyre_interpreter::instruction_logical_start(code, target) != target {
+                    return None;
+                }
+                pyre_interpreter::decode_instruction_at(
+                    code,
+                    pyre_interpreter::instruction_opcode_pc(code, target),
+                )
             })
             .is_some_and(|(instr, _)| {
                 matches!(
