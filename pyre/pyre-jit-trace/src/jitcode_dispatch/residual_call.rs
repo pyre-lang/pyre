@@ -9565,7 +9565,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // one OpRef in both representations prevents the cell fold from seeing the
     // codewriter's null trace-time placeholder while the surviving residual
     // sees the later replacement.
-    replace_movable_load_global_namespace_with_frame_globals(ctx, ei.runtime_helper, &mut r_args);
+    replace_movable_load_global_namespace_with_frame_globals(
+        ctx,
+        op.pc,
+        ei.runtime_helper,
+        &mut r_args,
+    )?;
 
     // The identity the fold ladder below is allowed to recognise, which under
     // a profile function is not this call's own — see
@@ -10860,7 +10865,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // the portal codewriter deliberately supplies NULL as a hint placeholder;
     // delaying replacement until the generic residual path makes the
     // LoadGlobal cell fold decline on that stale value.
-    replace_movable_load_global_namespace_with_frame_globals(ctx, runtime_helper_kind, &mut r_args);
+    replace_movable_load_global_namespace_with_frame_globals(
+        ctx,
+        op.pc,
+        runtime_helper_kind,
+        &mut r_args,
+    )?;
     // Void shape `_ir_v/iIRd` (`pyjitpl.py opimpl_residual_call_ir_v =
     // _opimpl_residual_call2`) has no `>X` dst byte; see
     // `dispatch_residual_call_iRd_kind` for the void operand-layout note.

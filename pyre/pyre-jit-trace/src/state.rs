@@ -2383,41 +2383,6 @@ pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, None, jitcode_pc)
 }
 
-/// Operand-stack Ref constants (`(semantic_slot, raw_ref)`) at the resume PC of
-/// a jitcode. The pcdep color map records live Variables only;
-/// `reconstruct_inline_recipe` uses this to refill the registerless constant
-/// slots an inlined-callee guard resume leaves empty after the color→slot
-/// inversion. Sources the slots from the predecessor-keyed
-/// `const_ref_slots_by_jit_pc` twin so the constant lookup uses the same
-/// coordinate as `pcdep_entries` and the liveness decode.
-pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> Vec<(u16, i64)> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
-            return Vec::new();
-        };
-        if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
-            let jp = jitcode_pc as usize;
-            if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                // Source the const slots directly from the carried
-                // genuine `jitcode_pc` via the predecessor-keyed twin — the same
-                // decode-identity shape the pcdep/depth twins use at
-                // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
-                // returns `Some` (an empty slot list is a legitimate hit).
-                if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
-                    return slots;
-                }
-            }
-        }
-        Vec::new()
-    })
-}
-
-pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
-    const_ref_slots_at_pc_at(jitcode_index, pc)
-}
-
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
@@ -5020,14 +4985,32 @@ pub(crate) fn trace_float_block_setitem_value(
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
 }
 
-/// `PyFrame.get_w_globals` common path: read the frame's own pycode, then its
-/// first-seen globals. Inline callers only use this after proving that the
-/// callee function globals is that code-global identity; the uncommon
-/// debugdata override stays on the residual path.
+/// `PyFrame.get_w_globals`: `debugdata.w_globals` when the frame carries a
+/// payload, else `jit.promote(self.pycode).w_globals`.
+///
+/// `opimpl_getfield_gc_r` is the walker getfield helper: a heapcache hit
+/// (the constructor store on a virtual inline frame — `ConstPtr(0)` or a
+/// `New` `FrameDebugData`) returns that box with no op; a miss records
+/// `GetfieldGcR` and stamps the live word via `field_sanity_load`. The
+/// walker caller emits `GuardIsnull` / `GuardNonnull` on that box with
+/// `walker_emit_fold_guard_with_snapshot` (the portal LOAD_GLOBAL arm's
+/// helper) before this function picks the arm. The only product caller is
+/// the inline arm of `replace_movable_load_global_namespace_with_frame_globals`;
+/// the portal arm reads `virtualizable_boxes` itself and does not call here,
+/// so the debugdata null-check is not recorded twice.
 ///
 /// `jtransform.py rewrite_op_getfield` records `record_quasiimmut_field`
 /// with `mutate_w_globals` before the load (`pycode.py` `"w_globals?"`).
 pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
+    let debugdata = opimpl_getfield_gc_r(ctx, frame, crate::descr::pyframe_debugdata_descr());
+    if frame_debugdata_box_is_known_non_null(ctx, debugdata) {
+        return opimpl_getfield_gc_r(
+            ctx,
+            debugdata,
+            crate::descr::frame_debug_data_w_globals_descr(),
+        );
+    }
+    // Const 0, a recorded null, or an unknown box: published `pycode.w_globals`.
     let code_descr = crate::descr::pyframe_code_descr();
     let pycode = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], code_descr.clone());
     // `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
@@ -5043,6 +5026,33 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
         record_quasiimmut_field(ctx, pycode, descr.clone(), Some(&mutate));
     }
     ctx.record_op_with_descr(OpCode::GetfieldGcR, &[pycode], descr)
+}
+
+/// Nullity already decided for a `debugdata` box: a `ConstPtr(0)` or a
+/// stamped null word. A `New` / `NewWithVtable` is never this arm.
+pub(crate) fn frame_debugdata_box_is_known_null(ctx: &TraceCtx, op: OpRef) -> bool {
+    if ctx.const_value(op) == Some(0) {
+        return true;
+    }
+    matches!(
+        ctx.concrete_of_opref(op),
+        Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+    )
+}
+
+/// Non-null already decided for a `debugdata` box: a non-zero constant, a
+/// stamped non-null word, or a `New` / `NewWithVtable` (constructor store).
+pub(crate) fn frame_debugdata_box_is_known_non_null(ctx: &TraceCtx, op: OpRef) -> bool {
+    if let Some(word) = ctx.const_value(op) {
+        return word != 0;
+    }
+    if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
+        && r != majit_ir::GcRef::NO_CONCRETE
+        && r.as_usize() != 0
+    {
+        return true;
+    }
+    matches!(ctx.opcode_of(op), Some(OpCode::New | OpCode::NewWithVtable))
 }
 
 /// `FixedObjectArray.len` sits at payload offset 0. `set_forwarding_address`
@@ -8606,9 +8616,10 @@ fn reconstruct_transparent_helper_recipe(
 /// model + super-instruction bytecode cannot guarantee those invariants for
 /// every reconstructed callee, so this returns `None` exactly where a rebuild
 /// would be unsound: a no-snapshot pc, an unresolved jitcode, a pure cellvar
-/// band, unrecoverable callee globals, an `enumerate_vars` count that disagrees
-/// with the encoded section (`consume_boxes`), or an int/float-bank register
-/// with no boxed-Ref source. Existing freevar cell objects, and a cellvar that
+/// band, unrecoverable callee globals, a missing callee frame red, an
+/// `enumerate_vars` count that disagrees with the encoded section
+/// (`consume_boxes`), or an int/float-bank register with no boxed-Ref source.
+/// Existing freevar cell objects, and a cellvar that
 /// overlaps a varname, are ordinary entries in the frame red's
 /// `locals_cells_stack_w` array and are rebuilt with that frame, exactly as
 /// `resume.py consume_boxes` rebuilds every MIFrame slot.
@@ -8985,8 +8996,8 @@ fn reconstruct_inline_recipe(
         semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color)
     });
     // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
-    // post-regalloc color). Built once here so the LiveRefColorUnmapped check,
-    // both portal returns, and the generic tail share the same vector.
+    // post-regalloc color). Built once here so the LiveRefColorUnmapped check
+    // and both portal returns share the same vector.
     let mut by_color_r: Vec<OpRef> = Vec::new();
     let mut by_color_c: Vec<majit_ir::Value> = Vec::new();
     let mut value_cursor = int_len;
@@ -9345,113 +9356,11 @@ fn reconstruct_inline_recipe(
         });
     }
 
-    // resume.py rebuild_from_resumedata / _callback_r writes every live
-    // register by color (`_prepare_next_section` → `enumerate_vars` →
-    // `_callback_r`). An empty per-PC map declines: there is no inversion
-    // to place those colors into the slot-indexed recipe banks
-    // (`load_local_value` / `stack_slot_reg_idx` /
-    // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
-    // by `locals_cells_stack_w` slot). Otherwise every live color is placed
-    // by the `pcdep_entries` color → slot inversion below, and every decoded
-    // live color, slotted or not, is kept by color in `registers_r_color`
-    // except a slot-less color whose decoded box is the encoder's CONST_NULL
-    // drop marker (LiveRefColorUnmapped, above).
-    if maps.pcdep_entries.is_empty() {
-        crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
-        return None;
-    }
-
-    // The reconstructed inline frame's `registers_r`/`concrete_r` are read
-    // SLOT-indexed (`assemble_bridge_inline_pending` seeds
-    // `locals_cells_stack_w[k]` and the resumed tracer reads LOAD_FAST's
-    // `nlocals + stack_idx`), so invert the COLOR-indexed decode from above
-    // — for a borrowed local pushed on the stack the color ≠ slot, and a
-    // color-indexed seed lands the value at the wrong slot.  The int/float
-    // banks were decoded above and need no inversion.
-
-    // `pyframe.py valuestackdepth`: locals + cells + stack. Pure cellvars
-    // are gated out above; a cellvar that overlaps a varname is that
-    // local's slot.
-    // The semantic `valuestackdepth` is `stack_base() + operand_depth`, where
-    // `operand_depth` is the logical stack height the codewriter's forward
-    // dataflow computes for this pc (`LiveVars::stack_depth_at`). The portal
-    // frame reads the equivalent figure from the encoded vable
-    // `valuestackdepth` scalar (`state.rs`); an inline frame has no such
-    // scalar, so derive it from the bytecode here. An unreachable resume pc
-    // aborts the multi-frame path.
-    let valuestackdepth = nlocals + stack_only;
-
-    // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
-    // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
-    // mirror. `maps.pcdep_entries` is the per-PC `(color, slot)` map (non-empty
-    // — the empty-map decline above returned otherwise): each decoded color is
-    // placed at the semantic slot it denotes at this resume pc, so a borrowed
-    // local on the operand stack lands at its stack slot.
-    let mut registers_r = vec![OpRef::NONE; valuestackdepth];
-    let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
-    for &(bank, color, slot) in &maps.pcdep_entries {
-        if bank != 1 {
-            continue;
-        } // Ref bank only
-        let s = slot as usize;
-        let c = color as usize;
-        if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
-            registers_r[s] = by_color_r[c];
-            concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
-        }
-    }
-
-    // Refill registerless operand-stack constants the color map omits (an
-    // inlined callee has no value-stack resumedata to rematerialize them from).
-    for (slot, raw) in const_ref_slots_from_pc(frame.jitcode_index, frame.pc) {
-        let s = slot as usize;
-        if Some(s) == pending_result_abs_slot {
-            continue;
-        }
-        if s < valuestackdepth {
-            registers_r[s] = ctx.const_ref(raw);
-            concrete_r[s] = value_for_slot(Type::Ref, raw);
-        }
-    }
-
-    // Every operand-stack slot is live (the logical stack is dense). If one is
-    // still unfilled after the color→slot inversion and the constant refill,
-    // the slot holds a value neither path can reconstruct (an int/float operand
-    // constant, or an unsupported shape) — decline to the single-frame bridge
-    // rather than seed a NULL operand the re-executed bridge would deref.
-    // This path rebuilds from resumedata colors exactly as the virtual-array
-    // one above does, so it owes the operands a paused call consumed the same
-    // exemption: no callee ever flushed them and the resume collapses them to
-    // the result `make_result_of_lastop` delivers.
-    for s in nlocals..valuestackdepth {
-        if Some(s) == pending_result_abs_slot
-            || unreconstructable_operand_floor.is_some_and(|floor| s >= floor)
-        {
-            continue;
-        }
-        if registers_r[s] == OpRef::NONE {
-            decline!("MandatoryOperandMissing");
-        }
-    }
-
-    Some(ReconstructRecipe {
-        code_ptr: raw_code as *const (),
-        jitcode_index: frame.jitcode_index,
-        jitcode_pc: frame.pc,
-        nlocals,
-        valuestackdepth,
-        registers_i,
-        registers_r,
-        registers_f,
-        concrete_r,
-        registers_r_color: by_color_r,
-        frame: OpRef::NONE,
-        nargs: frame_nlocals,
-        return_substitute: None,
-        len_tail: false,
-        rebuilt_frame: None,
-        rebuilt_ec: None,
-    })
+    // Without the callee frame red the rebuilt frame cannot read
+    // `get_w_globals` (`debugdata.w_globals` or the code's first namespace),
+    // so the reconstruction cannot know which namespace this activation
+    // ran under.
+    decline!("NoFrameForGlobals");
 }
 
 fn bridge_decode_box(
@@ -16383,21 +16292,6 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
     }
 }
 
-/// Recover the callee module's globals OBJECT for a reconstructed inline frame.
-///
-/// The globals-stamped `PyCode` wrapper is recovered from the raw code pointer
-/// through the `code_ptr → live wrapper` registry. Returns `PY_NULL` when no
-/// live wrapper is registered or it carries no globals yet — the callers
-/// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
-/// null result as "decline the multi-frame path".
-///
-/// Reading the globals off the code object is `PyFrame.get_w_globals`
-/// (pyframe.py): with no `FrameDebugData` override it returns
-/// `jit.promote(self.pycode).w_globals`, the namespace `frame_stores_global`
-/// (pycode.py) recorded first. The override case never reaches here: the
-/// forward inline declines a callee whose function globals differ from that
-/// first-seen namespace (`w_code_frame_stores_global` in `inline_call.rs`),
-/// so every callee a bridge can reconstruct carries the code's own globals.
 /// Recover the callee's `W_Code` OBJECT for a reconstructed inline frame.
 ///
 /// Sibling of [`recover_inline_callee_globals`], reading the same
@@ -16413,6 +16307,18 @@ pub(crate) fn recover_inline_callee_code(code_ptr: *const ()) -> pyre_object::Py
     live
 }
 
+/// Recover the callee module's globals OBJECT for a reconstructed inline frame.
+///
+/// The globals-stamped `PyCode` wrapper is recovered from the raw code pointer
+/// through the `code_ptr → live wrapper` registry. Returns `PY_NULL` when no
+/// live wrapper is registered or it carries no globals yet — the callers
+/// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
+/// null result as "decline the multi-frame path".
+///
+/// This is `pycode.w_globals`, the namespace `frame_stores_global` recorded
+/// first. A reconstructed callee that still has a concrete `PyFrame` (or a
+/// virtual whose constructor `debugdata` is in the heapcache) must go through
+/// [`recover_inline_callee_globals_from_recipe`] so an override is rebuilt.
 pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object::PyObjectRef {
     let live = pyre_interpreter::live_code_wrapper(code_ptr);
     if !live.is_null() {
@@ -16422,6 +16328,67 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
         }
     }
     pyre_object::PY_NULL
+}
+
+/// Globals for a reconstructed inline callee: `PyFrame.get_w_globals` on the
+/// resume-decoded frame when a concrete `PyFrame` is still attached, else the
+/// constructor `debugdata.w_globals` still sitting in that frame red's
+/// heapcache. `pycode.w_globals` is the fallback when those reads do not
+/// answer. A Python callee with no frame red is declined at reconstruct
+/// time (`NoFrameForGlobals`) rather than rebuilt under the first namespace.
+pub(crate) fn recover_inline_callee_globals_from_recipe(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+) -> pyre_object::PyObjectRef {
+    if let Some(g) = recipe_frame_live_w_globals(ctx, recipe) {
+        return g;
+    }
+    recover_inline_callee_globals(recipe.code_ptr)
+}
+
+/// One-shot read of the reconstructed callee's live globals. Nursery frames
+/// are allowed here: the pointer is not held across an allocation.
+fn recipe_frame_live_w_globals(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+) -> Option<pyre_object::PyObjectRef> {
+    if recipe.frame.is_none() {
+        return None;
+    }
+    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
+    if !w_code.is_null()
+        && let Some(majit_ir::Value::Ref(frame_ref)) = ctx.concrete_of_opref(recipe.frame)
+        && !frame_ref.is_null()
+        && frame_ref != majit_ir::GcRef::NO_CONCRETE
+    {
+        let frame = frame_ref.as_usize() as *mut pyre_interpreter::PyFrame;
+        if unsafe { (*frame).pycode == w_code } {
+            let g = unsafe { (*frame).get_w_globals() };
+            if !g.is_null() {
+                return Some(g);
+            }
+        }
+    }
+    // Resume decoded the virtual frame, debugdata included: the constructor
+    // store is still in the heapcache when the frame was not escaped.
+    let debug_idx = crate::descr::pyframe_debugdata_descr().index();
+    let debugdata = ctx.heapcache_getfield_cached(recipe.frame, debug_idx)?;
+    if !frame_debugdata_box_is_known_non_null(ctx, debugdata) {
+        return None;
+    }
+    let g_idx = crate::descr::frame_debug_data_w_globals_descr().index();
+    let g_op = ctx.heapcache_getfield_cached(debugdata, g_idx)?;
+    if let Some(word) = ctx.const_value(g_op)
+        && word != 0
+    {
+        return Some(word as pyre_object::PyObjectRef);
+    }
+    match ctx.box_value(g_op) {
+        Some(majit_ir::Value::Ref(r)) if r.as_usize() != 0 && r != majit_ir::GcRef::NO_CONCRETE => {
+            Some(r.as_usize() as pyre_object::PyObjectRef)
+        }
+        _ => None,
+    }
 }
 
 /// Assemble one decoded inline-callee [`ReconstructRecipe`]
@@ -16436,12 +16403,12 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// callee-frame helper / GUARD_NO_EXCEPTION belong to a LIVE caller making a
 /// call; a reconstructed suspended frame is simply pushed.
 ///
-/// The callee frame's globals come from its OWN pycode (`recipe.code_ptr`),
-/// matching `pyframe.py get_w_globals_storage()` where a frame's globals
-/// derive from its promoted pycode rather than the caller; a cross-module
-/// inlined callee's LOAD_GLOBAL then resolves against the callee module's
-/// namespace. `execution_context` is the per-thread singleton and comes from
-/// the bridge's root concrete frame.
+/// The callee frame's globals come from `PyFrame.get_w_globals` on the
+/// resume-decoded frame when that frame is still concrete (or from its
+/// heapcached `debugdata` override), else from `pycode.w_globals`. A
+/// cross-module inlined callee's LOAD_GLOBAL then resolves against the
+/// callee's own namespace. `execution_context` is the per-thread singleton
+/// and comes from the bridge's root concrete frame.
 ///
 /// `parent_frames` is the OUTER chain (immediate parent first) the drain
 /// builds from the framestack.  The caller result slot travels in this
@@ -16464,15 +16431,11 @@ pub(crate) fn assemble_bridge_inline_pending(
     // preserves the recursion-depth / inline-position identity.
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
 
-    // pyframe.py get_w_globals get_w_globals_storage(): a frame's globals come from its OWN
-    // pycode (`jit.promote(self.pycode).w_globals`), not the caller. Resolve
-    // the callee's globals OBJECT for `recipe.code_ptr` — the same
-    // `pycode.w_globals` the callee module exposes through its function's
-    // `w_func_globals_obj` — so a cross-module inlined callee's LOAD_GLOBAL
-    // sees the callee module's namespace. `reconstruct_inline_recipe` aborts
-    // the multi-frame path when the callee code has no resolved globals
-    // object, so this is non-null here.
-    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    // pyframe.py get_w_globals: the resume-decoded callee frame, when it
+    // still has a concrete `PyFrame` or a heapcached `debugdata` override,
+    // answers with that namespace so `emit_new_pyframe_inline_with_params`
+    // rebuilds the override. `pycode.w_globals` is the fallback.
+    let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
 
     // resume.py rebuild_from_resumedata newframe + reload: the decoded boxes are reloaded
     // into the symbolic frame below. `setup_reconstructed_callee_frame`
@@ -16725,7 +16688,7 @@ fn emit_reconstructed_callee_pyframe(
     let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
     let nlocals = code_ref.varnames.len();
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
-    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
     let pycode_const = ctx.const_ref(w_code as i64);
     let w_globals_const = ctx.const_ref(w_globals as i64);
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
@@ -17020,7 +16983,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
     let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
 
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
-    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     // The resume section's own frame, when it is a block the walk can keep.
     // Building a second frame would split the traceback `f_back` chain.

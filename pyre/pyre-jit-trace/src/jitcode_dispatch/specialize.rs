@@ -20448,15 +20448,24 @@ const GET_W_GLOBALS_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "GET-W-GLOBALS-SUBWALK",
 };
 
+fn walker_debugdata_box_is_known_non_null(ctx: &majit_metainterp::TraceCtx, op: OpRef) -> bool {
+    crate::state::frame_debugdata_box_is_known_non_null(ctx, op)
+}
+
+fn walker_debugdata_box_is_known_null(ctx: &majit_metainterp::TraceCtx, op: OpRef) -> bool {
+    crate::state::frame_debugdata_box_is_known_null(ctx, op)
+}
+
 /// `PyFrame.get_w_globals` for an inlined callee that is not the portal
 /// virtualizable.
 ///
 /// `emit_new_pyframe_inline_with_params` stores PY_NULL into `debugdata`
-/// and stores `pycode` on it. The null-`debugdata` arm is
+/// when the callee's namespace is the code object's first-seen one, and a
+/// New `FrameDebugData` when it is the rare override. The null arm is
 /// `jit.promote(self.pycode).w_globals`: a quasi-immutable `PyCode.w_globals`
 /// read, the operand `globals_read_keeps_recorded_namespace` already accepts.
-/// The pycode is this frame's. A non-null `debugdata` (a namespace override)
-/// stays on the residual, which reads `debugdata.w_globals`.
+/// The pycode is this frame's. A known non-null `debugdata` reads
+/// `debugdata.w_globals` (`pyframe.py get_w_globals`).
 fn inlined_callee_frame_w_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -20464,6 +20473,24 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
+    let debug_descr = crate::descr::pyframe_debugdata_descr();
+    let debug_idx = debug_descr.index();
+    let cached_debug = ctx.trace_ctx.heapcache_getfield_cached(frame_op, debug_idx);
+    if let Some(cached) = cached_debug {
+        if walker_debugdata_box_is_known_non_null(ctx.trace_ctx, cached) {
+            let globals_op = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                cached,
+                crate::descr::frame_debug_data_w_globals_descr(),
+            );
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, globals_op)?;
+            return Ok(Some(()));
+        }
+        if !walker_debugdata_box_is_known_null(ctx.trace_ctx, cached) {
+            return Ok(None);
+        }
+    }
+
     let Some(frame_obj) = walker_concrete_ref_object(ctx, frame_op) else {
         return Ok(None);
     };
@@ -20480,21 +20507,6 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
         return Ok(None);
     }
     let pycode_bits = pycode_obj as i64;
-
-    let debug_descr = crate::descr::pyframe_debugdata_descr();
-    let debug_idx = debug_descr.index();
-    let cached_debug = ctx.trace_ctx.heapcache_getfield_cached(frame_op, debug_idx);
-    if let Some(cached) = cached_debug {
-        if let Some(word) = ctx.trace_ctx.const_value(cached) {
-            if word != 0 {
-                return Ok(None);
-            }
-        } else if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.concrete_of_opref(cached) {
-            if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
-                return Ok(None);
-            }
-        }
-    }
 
     let code_descr = crate::descr::pyframe_code_descr();
     let code_idx = code_descr.index();

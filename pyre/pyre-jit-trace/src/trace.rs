@@ -1641,7 +1641,7 @@ fn record_carrier_crossed_frame_traceback(
     if !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
         return;
     }
-    let w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr);
+    let w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe);
     majit_metainterp::record_inline_application_traceback_for_recording(
         exc_ptr as usize as i64,
         w_code as usize as i64,
@@ -2023,13 +2023,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 return p2_drain_abort();
             }
 
-            let callee_w_globals =
-                crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
             // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
             // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
             // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
             // is known.
             let recipe = &ctx.reconstruct_recipe_with_current_refs(recipe);
+            let callee_w_globals =
+                crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe) as usize;
             let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
             let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
             let local_concretes = &recipe.concrete_r[..nlocals];
@@ -2801,7 +2801,8 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
         return None;
     };
-    let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
+    let middle_w_globals =
+        crate::state::recover_inline_callee_globals_from_recipe(ctx, middle) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
@@ -3175,7 +3176,8 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
         return None;
     };
-    let middle_w_globals = crate::state::recover_inline_callee_globals(middle.code_ptr) as usize;
+    let middle_w_globals =
+        crate::state::recover_inline_callee_globals_from_recipe(ctx, middle) as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];

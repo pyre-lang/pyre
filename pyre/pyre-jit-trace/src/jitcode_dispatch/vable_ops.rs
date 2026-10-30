@@ -863,8 +863,9 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
         // under the parent-struct descr (`vable_static_record_descr`). Twin of
         // `getarrayitem_vable_via_metainterp`'s per-slot OpRef shadow: no GC op,
         // so `last_instr` reads the preceding `setfield_vable_i_imm` and
-        // `debugdata` reads the constructor's PY_NULL. `opimpl_getfield_vable_*`
-        // (`pyjitpl.py`) reaches that heapcache read
+        // `debugdata` reads the constructor store (PY_NULL, or a New
+        // `FrameDebugData` when the callee's namespace is the rare override).
+        // `opimpl_getfield_vable_*` (`pyjitpl.py`) reaches that heapcache read
         // through `_nonstandard_virtualizable`; a miss falls through to
         // `vable_getfield_*_checked`.
         if nonstandard && let Some(cached) = seeded_virtual_frame_getfield(ctx, obj, &descr) {

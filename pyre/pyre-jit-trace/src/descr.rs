@@ -3452,8 +3452,10 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 });
 
 // `pyframe.py FrameDebugData` — the payload behind `self.getorcreatedebug()`.
-// Not a PyObject — no vtable, and the trace never NEWs one: it arrives as
-// the `debugdata` virtualizable field and is only read.
+// Not a PyObject — no vtable. A *loaded* pointer arrives as the `debugdata`
+// virtualizable field and is only read through this group. A payload the
+// trace allocates itself (`OpCode::New`) uses
+// [`frame_debug_data_alloc_size_descr`], which shares these FieldDescrs.
 //
 // Headerless, because `getorcreate_debug_data` falls back to `malloc_raw`
 // whenever the owning frame is not collector-owned, so a loaded pointer may
@@ -3582,6 +3584,57 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
         "pyframe::FrameDebugData",
     )
 });
+
+/// Size index for a trace-allocated `FrameDebugData`. Bit 27 sits inside
+/// the size mask and no struct is 128MB, so it cannot collide with a
+/// size-derived `SIZE_DESCR_TAG | size` index. Field indices stay the
+/// headerless group's: `set_parent_descr` is not called on the shared Arcs.
+const FRAME_DEBUG_DATA_ALLOC_SIZE_INDEX: u32 = SIZE_DESCR_TAG | 0x0800_0001;
+
+/// Headered SizeDescr used ONLY as the `OpCode::New` descr for a
+/// `FrameDebugData` the trace allocates itself. The headerless group above
+/// stays the descr for a *loaded* payload (`malloc_raw` may omit a
+/// `GcHeader`). This descr is the allocation descr for a payload that is a
+/// GC object (`pyframe.py getorcreatedebug` allocates a GC `FrameDebugData`).
+/// Same FieldDescr Arcs as [`FRAME_DEBUG_DATA_DESCR_GROUP`], so `SetfieldGc` /
+/// `GetfieldGc` through `frame_debug_data_*_descr()` apply to it and the
+/// optimizer's virtual-struct fields line up.
+///
+/// Two descrs exist for one STRUCT: a loaded payload may be `malloc_raw`
+/// (no `GcHeader`), while the trace-allocated one is a GC object. This
+/// descr is registered under `path_hash("pyframe::FrameDebugData.gc")` so
+/// `register_keyed_size` does not overwrite the headerless group's
+/// `FrameDebugData` / `pyframe::FrameDebugData` slots. `bh_new` serializes
+/// that `cache_key`; `resolve_gc_tid` maps it to tid 98 the way the
+/// stringbuilder descr's key reaches its tid.
+static FRAME_DEBUG_DATA_ALLOC_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    let fields = FRAME_DEBUG_DATA_DESCR_GROUP
+        .size_descr
+        .all_fielddescrs()
+        .to_vec();
+    // Distinct from the headerless group's STRUCT keys above.
+    let cache_key = majit_ir::descr::path_hash("pyframe::FrameDebugData.gc");
+    let mut sd = majit_ir::descr::SimpleSizeDescr::new(
+        FRAME_DEBUG_DATA_ALLOC_SIZE_INDEX,
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE,
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID,
+    );
+    sd.set_cache_key(cache_key);
+    sd.set_gc_managed(true);
+    sd.set_headerless(false);
+    let sd = sd.with_all_fielddescrs(fields);
+    let descr = Arc::new(sd) as DescrRef;
+    majit_ir::descr_registry::register_keyed_size(
+        majit_ir::descr::LLType::Struct(cache_key),
+        descr.clone(),
+    );
+    descr
+});
+
+/// Size descriptor for an `OpCode::New` of a trace-allocated `FrameDebugData`.
+pub fn frame_debug_data_alloc_size_descr() -> DescrRef {
+    FRAME_DEBUG_DATA_ALLOC_SIZE_DESCR.clone()
+}
 
 // `pypy/objspace/std/sliceobject.py` `W_SliceObject._immutable_fields_ =
 // ['w_start', 'w_stop', 'w_step']` — all three Ref fields are immutable
@@ -7698,6 +7751,60 @@ pub fn frame_debug_data_is_being_profiled_descr() -> DescrRef {
     frame_debug_data_field_descr_at(std::mem::offset_of!(
         pyre_interpreter::pyframe::FrameDebugData,
         is_being_profiled
+    ))
+}
+
+/// `FrameDebugData.is_in_line_tracing` — the Int
+/// `FrameDebugData::init` stores as false on a fresh payload.
+pub fn frame_debug_data_is_in_line_tracing_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        is_in_line_tracing
+    ))
+}
+
+/// `FrameDebugData.f_trace_lines` — the Int
+/// `FrameDebugData::init` stores as true on a fresh payload.
+pub fn frame_debug_data_f_trace_lines_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        f_trace_lines
+    ))
+}
+
+/// `FrameDebugData.f_trace_opcodes` — the Int
+/// `FrameDebugData::init` stores as false on a fresh payload.
+pub fn frame_debug_data_f_trace_opcodes_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        f_trace_opcodes
+    ))
+}
+
+/// `FrameDebugData.instr_prev_plus_one` — the Signed
+/// `FrameDebugData::init` stores as 0 on a fresh payload.
+pub fn frame_debug_data_instr_prev_plus_one_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        instr_prev_plus_one
+    ))
+}
+
+/// `FrameDebugData.f_lineno` — the Signed
+/// `getorcreate_debug_data(-1)` stores as the init lineno of a new frame.
+pub fn frame_debug_data_f_lineno_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        f_lineno
+    ))
+}
+
+/// `FrameDebugData.hidden_operationerr` — the Ref
+/// `FrameDebugData::init` stores as PY_NULL on a fresh payload.
+pub fn frame_debug_data_hidden_operationerr_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(std::mem::offset_of!(
+        pyre_interpreter::pyframe::FrameDebugData,
+        hidden_operationerr
     ))
 }
 
@@ -14992,6 +15099,7 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("pyframe::FrameDebugData", || {
         LazyLock::force(&FRAME_DEBUG_DATA_DESCR_GROUP);
+        LazyLock::force(&FRAME_DEBUG_DATA_ALLOC_SIZE_DESCR);
     }),
     ("pyframe::PyFrame", || {
         LazyLock::force(&PYFRAME_DESCR_GROUP);
@@ -18461,6 +18569,56 @@ mod set_member_lookup_tests {
         );
         assert_eq!(field.field_size(), std::mem::size_of::<usize>());
         assert_eq!(field.field_type(), Type::Ref);
+    }
+
+    #[test]
+    fn frame_debug_data_alloc_size_descr_shares_headerless_fields() {
+        std::sync::LazyLock::force(&FRAME_DEBUG_DATA_DESCR_GROUP);
+        std::sync::LazyLock::force(&FRAME_DEBUG_DATA_ALLOC_SIZE_DESCR);
+        let group_fields = FRAME_DEBUG_DATA_DESCR_GROUP.size_descr.all_fielddescrs();
+        let alloc = frame_debug_data_alloc_size_descr();
+        let alloc_sd = alloc.as_size_descr().expect("headered alloc SizeDescr");
+        assert!(!alloc_sd.headerless());
+        assert_eq!(
+            alloc_sd.type_id(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID
+        );
+        assert_eq!(
+            alloc_sd.size(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE
+        );
+        assert_eq!(alloc_sd.vtable(), 0);
+        assert_eq!(alloc.index(), FRAME_DEBUG_DATA_ALLOC_SIZE_INDEX);
+        assert!(alloc_sd.is_gc_managed());
+        // rewrite.rs handle_new: headerless() would take CallMallocNurseryHeaderless;
+        // this descr is headered so the nursery path stamps type_id() == 98.
+        assert!(!alloc_sd.headerless());
+        let headerless_simple = majit_ir::descr::path_hash("FrameDebugData");
+        let headerless_def = majit_ir::descr::path_hash("pyframe::FrameDebugData");
+        assert_ne!(alloc_sd.cache_key(), 0);
+        assert_ne!(alloc_sd.cache_key(), headerless_simple);
+        assert_ne!(alloc_sd.cache_key(), headerless_def);
+        {
+            let cache = majit_ir::descr::gc_cache().lock();
+            assert_eq!(
+                cache.resolve_struct_tid(alloc_sd.cache_key()),
+                Some(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID)
+            );
+            let headerless = cache
+                ._cache_size
+                .get(&majit_ir::descr::LLType::Struct(headerless_def))
+                .expect("headerless group still owns pyframe::FrameDebugData")
+                .as_size_descr()
+                .expect("size");
+            assert!(headerless.headerless());
+        }
+        assert_eq!(alloc_sd.all_fielddescrs().len(), group_fields.len());
+        for (alloc_field, group_field) in alloc_sd.all_fielddescrs().iter().zip(group_fields) {
+            assert!(
+                std::sync::Arc::ptr_eq(alloc_field, group_field),
+                "alloc SizeDescr must share FieldDescr Arcs with the headerless group"
+            );
+        }
     }
 
     /// The EffectInfo member for the shared header is `pyobject::PyObject.w_class`.
