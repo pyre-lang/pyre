@@ -10160,6 +10160,8 @@ impl<M: Clone> MetaInterp<M> {
                 // carries it on `BridgeTraceInfo.source_descr`
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
+                // Origin still present: leftover compiling
+                // `jitdriver_sd.warmstate` `BaseJitCell.get_procedure_token`.
                 if !self.has_compiled_loop_entry(origin_key) {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
@@ -11277,18 +11279,16 @@ impl<M: Clone> MetaInterp<M> {
                             .collect(),
                     );
                 }
-                if self.has_compiled_loop_entry(green_key) {
-                    // `compile.py send_bridge_to_backend`: the bridge is
-                    // handed to the CPU and nothing is indexed in the
-                    // frontend — its guards answer later failures off
-                    // their own `ResumeGuardDescr`.  Only the per-trace
-                    // `(fail_index, op index)` stamp the pyre readers key
-                    // on is applied here.
-                    compile::stamp_guard_descr_trace_positions(&combined_ops);
-                    // Box identity: see compile_loop site.
-                    let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
-                    self.next_global_opref = self.next_global_opref.max(new_high_water);
-                }
+                // `compile.py send_bridge_to_backend`: the bridge is
+                // handed to the CPU and nothing is indexed in the
+                // frontend — its guards answer later failures off
+                // their own `ResumeGuardDescr`.  Only the per-trace
+                // `(fail_index, op index)` stamp the pyre readers key
+                // on is applied here.
+                compile::stamp_guard_descr_trace_positions(&combined_ops);
+                // Box identity: see compile_loop site.
+                let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
+                self.next_global_opref = self.next_global_opref.max(new_high_water);
                 self.remember_compiled_graph_write();
                 self.staticdata.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
@@ -12580,9 +12580,13 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.swap_remove(&key)
     }
 
+    /// Compile-time "is there a compiled loop for this green key?"
+    /// `warmstate.py BaseJitCell.get_procedure_token` on leftover compiling
+    /// `jitdriver_sd.warmstate`, plus `history.py JitCellToken.has_compiled_code`.
+    /// Not portal slot 0 (`has_compiled_loop` / `entry_procedure_token`).
     pub(crate) fn has_compiled_loop_entry(&self, green_key: u64) -> bool {
-        self.compiled_loops
-            .contains_key(&self.compiled_loop_key(green_key))
+        self.get_procedure_token(green_key)
+            .is_some_and(|t| t.has_compiled_code())
     }
 
     /// Frontend metadata for this driver's cell. Sibling drivers with the
@@ -14978,11 +14982,6 @@ impl<M: Clone> MetaInterp<M> {
         // Entry bridges optimize here. `gctypelayout.py encode_type_shapes_now`
         // closes `type_info_group` at translation; close before that read.
         majit_gc::ensure_type_registry_closed();
-        if !self.has_compiled_loop_entry(green_key) {
-            crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
-            self.jitlog_trace_aborted();
-            return false;
-        }
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         // `compile.py ResumeFromInterpDescr.compile_and_attach` files the
         // token on the interpreter greenkey. Resolve those greens to the
@@ -15500,7 +15499,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the bridge hangs from.  A JUMP target with no compiled loop has no
     /// `target_tokens` to scan, so it degrades to the origin.
     pub(crate) fn bridge_cell_token_key(&self, origin_key: u64, jump_target_key: u64) -> u64 {
-        if jump_target_key != origin_key && self.has_compiled_loop_entry(jump_target_key) {
+        if jump_target_key != origin_key && self.get_procedure_token(jump_target_key).is_some() {
             jump_target_key
         } else {
             origin_key
@@ -15548,10 +15547,6 @@ impl<M: Clone> MetaInterp<M> {
         let fail_descr: &dyn majit_ir::FailDescr = fail_descr_arc
             .as_fail_descr()
             .expect("compile_bridge: the bridge origin descr is a FailDescr");
-        if !self.has_compiled_loop_entry(green_key) {
-            self.jitlog_trace_aborted();
-            return false;
-        }
         let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
 
         // `pyjitpl.py:2921-2923`:
@@ -16191,16 +16186,12 @@ impl<M: Clone> MetaInterp<M> {
                 self.last_quasi_immutable_deps =
                     std::mem::take(&mut optimizer.quasi_immutable_deps);
                 self.record_loop_or_bridge(&source_jct, &optimized_ops, bridge_trace_id);
-                // Mark the bridge as compiled
-                if self.has_compiled_loop_entry(green_key) {
-                    // `compile.py send_bridge_to_backend`: nothing is
-                    // indexed in the frontend for a bridge — see the
-                    // retrace site.
-                    compile::stamp_guard_descr_trace_positions(&optimized_ops);
-                    let new_high_water =
-                        compute_next_global_opref(bridge_inputargs, &optimized_ops);
-                    self.next_global_opref = self.next_global_opref.max(new_high_water);
-                }
+                // `compile.py send_bridge_to_backend`: nothing is
+                // indexed in the frontend for a bridge — see the
+                // retrace site.
+                compile::stamp_guard_descr_trace_positions(&optimized_ops);
+                let new_high_water = compute_next_global_opref(bridge_inputargs, &optimized_ops);
+                self.next_global_opref = self.next_global_opref.max(new_high_water);
                 self.remember_compiled_graph_write();
                 self.staticdata.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
@@ -26782,7 +26773,7 @@ mod metainterp_static_data_tests {
         // `compile.py compile_loop` / `ResumeFromInterpDescr.compile_and_attach`
         // file the cell on the compiling `jitdriver_sd.warmstate`. Extra-driver
         // compile leftover `active_jitdriver_sd` is that driver.
-        // `has_compiled_loop_entry` / `compiled_entry` follow leftover;
+        // `get_procedure_token` / `compiled_entry` follow leftover;
         // portal `maybe_compile_and_run` is `JitDriver::index()` 0.
         let mut meta = MetaInterp::<()>::new(0);
         extern "C" fn portal_runner_helper() -> i64 {
@@ -26821,8 +26812,8 @@ mod metainterp_static_data_tests {
         );
 
         assert!(
-            meta.has_compiled_loop_entry(key.get_uhash()),
-            "compile_trace has_compiled_loop_entry follows leftover compiling jitdriver_sd"
+            meta.get_procedure_token(key.get_uhash()).is_some(),
+            "compile_trace get_procedure_token follows leftover compiling jitdriver_sd"
         );
         assert!(
             meta.compiled_entry(key.get_uhash()).is_some(),
@@ -33488,8 +33479,8 @@ mod tests {
             "extra-driver compile must not land on portal 0"
         );
         assert!(
-            meta.has_compiled_loop_entry(green_key.get_uhash()),
-            "has_compiled_loop_entry follows leftover compiling jitdriver_sd"
+            meta.get_procedure_token(green_key.get_uhash()).is_some(),
+            "get_procedure_token follows leftover compiling jitdriver_sd"
         );
         let (on_entry, _) =
             meta.maybe_compile_and_run_step_on_driver(idx1, green_key.get_uhash(), (0, 0), &[]);
@@ -35375,15 +35366,17 @@ mod tests {
 #[cfg(test)]
 mod bridge_cell_token_tests {
     use super::*;
+    use crate::test_greens::gk_with_uhash;
 
     fn record_loop(meta: &mut MetaInterp<()>, green_key: u64) {
-        meta.insert_compiled_loop(
-            green_key,
-            CompiledEntry {
-                meta: std::sync::Arc::new(()),
-                root_trace_id: green_key,
-            },
-        );
+        let key = gk_with_uhash(green_key, green_key as i64);
+        let token = make_jitcell_token(Some(0));
+        token.set_compiled(Box::new(()));
+        meta.warm_state_for_driver(0)
+            .memory_manager
+            .keep_loop_alive(&token);
+        meta.warm_state_for_driver(0)
+            .attach_procedure_to_interp_for_key(&key, token);
     }
 
     #[test]
@@ -35834,7 +35827,8 @@ mod loop_side_table_tests {
     }
 
     fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
-        meta.has_compiled_loop_entry(green_key)
+        meta.compiled_loops
+            .contains_key(&meta.compiled_loop_key(green_key))
     }
 
     #[test]
@@ -35872,7 +35866,6 @@ mod loop_side_table_tests {
         meta.invalidate_compiled_trace(100);
 
         assert_eq!(meta.compiled_loops.len(), 1);
-        assert!(meta.has_compiled_loop_entry(9));
         assert!(!has_side_tables(&meta, 7));
         assert!(!has_side_tables(&meta, 8));
         assert!(has_side_tables(&meta, 9));
