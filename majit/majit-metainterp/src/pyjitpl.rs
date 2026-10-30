@@ -3364,13 +3364,12 @@ impl<M: Clone> MetaInterp<M> {
     /// (`majit_gc::shadow_stack::walk_extra_roots`).
     ///
     /// Each guard owns a single shared `Arc<ResumeStorage>`
-    /// (compile.py `ResumeGuardDescr`). `StoredExitLayout` is the
-    /// sole carrier on the trace surrogate (T4.4 retired the parallel
-    /// `StoredResumeData` side table), and every downstream reader
-    /// (bridge retrace, blackhole resume, GC root walker) points at
-    /// the same Arc, so walking the `exit_layouts` /
-    /// `terminal_exit_layouts` storage slots once updates the pool for
-    /// every observer.
+    /// (compile.py `ResumeGuardDescr`). The descr is kept on
+    /// `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`,
+    /// `llsupport/assembler.py get_asmmemmgr_gcreftracers`), and every
+    /// downstream reader (bridge retrace, blackhole resume, GC root
+    /// walker) points at the same Arc, so walking those tracers' descrs
+    /// once updates the pool for every observer.
     /// `NUMBERING` payload addresses. A minor moves the array until it is
     /// promoted, so this walk is not gated on the const-pool scan bit.
     pub fn walk_rd_numb_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
@@ -3383,23 +3382,6 @@ impl<M: Clone> MetaInterp<M> {
             == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
         {
             return;
-        }
-        for entry in self.compiled_loops.values_mut() {
-            for trace in entry.traces.values_mut() {
-                for layout in trace
-                    .exit_layouts
-                    .values_mut()
-                    .chain(trace.terminal_exit_layouts.values_mut())
-                {
-                    if let Some(fd) = layout
-                        .descr
-                        .as_ref()
-                        .and_then(|descr| descr.as_fail_descr())
-                    {
-                        fd.visit_rd_numb(&mut visitor);
-                    }
-                }
-            }
         }
         for token in self.live_jitcell_tokens() {
             let Some(clt) = token.compiled_loop_token() else {
@@ -3496,44 +3478,12 @@ impl<M: Clone> MetaInterp<M> {
         let scan_compiled_graph =
             !is_minor || std::mem::take(&mut self.compiled_graph_minor_scan_pending);
         if scan_compiled_graph {
-            for entry in self.compiled_loops.values_mut() {
-                for trace in entry.traces.values_mut() {
-                    // Blackhole replays `trace.ops`. Those `ConstPtr`
-                    // indexes stay live for the loop, same as the guard
-                    // pools below.
-                    for op in &trace.ops {
-                        op.walk_const_ptr_refs_mut(&mut visitor);
-                    }
-                    for constant in trace.constants.values_mut() {
-                        if let majit_ir::Const::Ref(gcref) = constant {
-                            visitor(gcref);
-                        }
-                    }
-                    for layout in trace.exit_layouts.values_mut() {
-                        let descr_pool = layout
-                            .descr
-                            .as_ref()
-                            .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_pool());
-                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
-                    }
-                    for layout in trace.terminal_exit_layouts.values_mut() {
-                        let descr_pool = layout
-                            .descr
-                            .as_ref()
-                            .and_then(|descr| descr.as_fail_descr())
-                            .and_then(|fd| fd.rd_consts_pool());
-                        visit_pool(descr_pool, generation, is_minor, &mut visitor);
-                    }
-                }
-            }
             // `compile.py ResumeGuardDescr._attrs_` traces `rd_consts` on
             // every guard descr, and a bridge's descrs are reachable only
             // through the backend: `assembler.py gcreftracers.append(tracer)`
             // pins them on the loop token's `asmmemmgr_gcreftracers`
-            // (`model.py CompiledLoopToken`).  Walk those tracers so a
-            // bridge guard's pool is a root for the token's lifetime,
-            // the same way the root loop's descrs are reached above.
+            // (`model.py CompiledLoopToken`).  Walk those tracers so root
+            // and bridge guard pools are roots for the token's lifetime.
             // Dynasm registers `FailDescrStore` (shared via
             // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
             // the other tracer kinds (GcTables) are rooted through
@@ -31995,36 +31945,15 @@ mod tests {
             .set_rd_consts(Some(vec![majit_ir::Const::from_gcref(GcRef(
                 0x96_0000_1000,
             ))]));
-        let mut exit_layouts = crate::FxIndexMap::default();
-        exit_layouts.insert(
-            0,
-            StoredExitLayout {
-                source_op_index: None,
-                descr: Some(descr.clone()),
-                op_arg_types_for_jump: None,
-            },
-        );
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            1,
-            CompiledTrace {
-                inputargs: Vec::new(),
-                ops: Vec::new(),
-                constants: majit_ir::ConstMap::default(),
-                exit_layouts,
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
+        let token = Arc::new(JitCellToken::new(7));
+        let clt = token.compiled_loop_token_expect();
+        let mut store = majit_ir::FailDescrStore::with_capacity(1);
+        store.push(descr.clone());
+        clt.asmmemmgr_gcreftracers
+            .lock()
+            .push(Arc::new(store) as Arc<dyn std::any::Any + Send + Sync>);
         let mut meta = MetaInterp::<()>::new(1);
-        meta.insert_compiled_loop(
-            7,
-            CompiledEntry {
-                meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
-                traces,
-                next_global_opref: 0,
-            },
-        );
+        meta.memory_manager.keep_loop_alive(&token);
 
         set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
         meta.compiled_graph_minor_scan_pending = false;
@@ -32253,36 +32182,15 @@ mod tests {
             panic!("from_gcref stored a Ref");
         };
         assert_eq!(gcref, dead);
-        let mut exit_layouts = crate::FxIndexMap::default();
-        exit_layouts.insert(
-            0,
-            StoredExitLayout {
-                source_op_index: None,
-                descr: Some(descr.clone()),
-                op_arg_types_for_jump: None,
-            },
-        );
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            1,
-            CompiledTrace {
-                inputargs: Vec::new(),
-                ops: Vec::new(),
-                constants: majit_ir::ConstMap::default(),
-                exit_layouts,
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
+        let token = Arc::new(JitCellToken::new(7));
+        let clt = token.compiled_loop_token_expect();
+        let mut store = majit_ir::FailDescrStore::with_capacity(1);
+        store.push(descr.clone());
+        clt.asmmemmgr_gcreftracers
+            .lock()
+            .push(Arc::new(store) as Arc<dyn std::any::Any + Send + Sync>);
         let mut meta = MetaInterp::<()>::new(1);
-        meta.insert_compiled_loop(
-            7,
-            CompiledEntry {
-                meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
-                traces,
-                next_global_opref: 0,
-            },
-        );
+        meta.memory_manager.keep_loop_alive(&token);
 
         set_extra_root_walk_kind(ExtraRootWalkKind::Major);
         let _wave = majit_ir::const_ptr_table::Wave::enter();
