@@ -905,15 +905,6 @@ pub struct TerminalExitLayout {
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
     /// Optional backend-origin recovery layout for this terminal exit.
     pub recovery_layout: Option<ExitRecoveryLayout>,
-    /// resume.py:450 — compact resume numbering (terminal exits rarely need
-    /// this, but propagate it for symmetry with `FailDescrLayout`).
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
-    pub rd_consts: Option<Vec<Const>>,
-    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
-    /// Deferred heap writes associated with this terminal exit.
-    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
 }
 
 /// Result of compiling a loop or bridge.

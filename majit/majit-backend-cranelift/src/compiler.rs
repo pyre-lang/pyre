@@ -22012,13 +22012,6 @@ fn collect_terminal_exit_layouts(
                     .and_then(|d| d.as_fail_descr())
                     .is_some_and(|fd| fd.is_exit_frame_with_exception()),
                 recovery_layout,
-                // Terminal exits (FINISH/JUMP) don't carry per-guard resume
-                // data — RPython's jitdriver dispatches them via a separate
-                // path (DoneWithThisFrame / ContinueRunningNormally).
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals: None,
-                rd_pendingfields: None,
             });
         }
 
