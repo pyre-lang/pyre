@@ -6474,14 +6474,14 @@ pub fn existing_driver_pair() -> Option<&'static mut JitDriverPair> {
 }
 
 /// framework.py `root_walker.walk_roots` hook for
-/// `storage.rd_consts` (resume.py:451) across every live compiled
+/// `storage.rd_consts` (`resume.py`) across every live compiled
 /// trace.
 ///
 /// Registered once during `JIT_DRIVER` init (see
 /// `register_thread_root_areas`). Routes into the thread-local
-/// `JitDriver`'s `walk_rd_consts_refs`, which in turn iterates
-/// `MetaInterp::compiled_loops` and visits the Ref-typed entries in
-/// every `StoredExitLayout::rd_consts`.
+/// `JitDriver`'s `walk_rd_consts_refs`, which visits Ref-typed
+/// entries in each fail descr's `rd_consts` pool
+/// (`ResumeGuardDescr.get_resumestorage`).
 unsafe fn rd_consts_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),

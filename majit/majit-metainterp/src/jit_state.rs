@@ -1813,8 +1813,7 @@ pub trait JitState: Sized {
             // present in RPython; a `None` here would mean the
             // optimizer/recorder failed to attach the descr and replaying
             // the write would corrupt memory.  Fail loud rather than
-            // silently skipping (parity with the `expect` at
-            // `compile.rs`'s `build_guard_metadata`).
+            // silently skipping.
             let descr = pending.descr.as_ref().expect(
                 "resume.py `_prepare_pendingfields`: PENDINGFIELDSTRUCT.lldescr must be set",
             );
