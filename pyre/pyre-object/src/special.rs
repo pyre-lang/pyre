@@ -20,8 +20,10 @@ impl crate::lltype::GcType for NotImplemented {
 
 static NOT_IMPLEMENTED_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-/// Get the NotImplemented singleton.
-#[majit_macros::dont_look_inside]
+/// `space.w_NotImplemented`, the prebuilt singleton. The body reads the
+/// static, which the translator resolves to the registered prebuilt address,
+/// so a traced call is that constant, the same shape as [`w_none`].
+#[inline]
 pub fn w_not_implemented() -> PyObjectRef {
     *NOT_IMPLEMENTED_SINGLETON.get_or_init(|| {
         crate::lltype::malloc_typed_immortal(NotImplemented {
@@ -78,6 +80,13 @@ mod tests {
                 assert_eq!((*hdr).type_id(), type_id);
                 assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
             }
+        }
+        let a = w_not_implemented();
+        let b = w_not_implemented();
+        assert!(std::ptr::eq(a, b));
+        unsafe {
+            assert!(is_not_implemented(a));
+            assert!(!is_not_implemented(crate::noneobject::w_none()));
         }
     }
 }
