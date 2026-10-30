@@ -120,6 +120,58 @@ fn seed_deopt_vinfo_ptr(
     }
 }
 
+/// Resume-stream virtualizable identity (`resume.py consume_vable_info`
+/// `virtualizable = self.next_ref()`), before `VrefVableBoxes` exists.
+///
+/// Consume layout is `[vable, statics, array...]`, so the first stream
+/// entry is the object. `seed_bridge_virtualizable_boxes` (jit_interp
+/// consume) compares `TraceCtx::virtualizable_heap_ptr` to this word.
+fn resume_stream_vable_ptr(
+    resume_data: &crate::ResumeDataResult,
+    fail_values: &[i64],
+) -> Option<*const u8> {
+    use majit_ir::resumedata::RebuiltValue;
+    use majit_ir::{Const, Type};
+    let identity = resume_data.virtualizable_boxes.first()?;
+    let rd_consts = resume_data
+        .storage
+        .as_ref()
+        .and_then(|s| s.rd_consts())
+        .unwrap_or(&[]);
+    let addr = match identity {
+        RebuiltValue::Box(n, Type::Ref) => fail_values.get(*n).map(|&bits| bits as usize)?,
+        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+            match identity.const_at_use(rd_consts) {
+                Const::Ref(r) => r.as_usize(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    (addr != 0).then_some(addr as *const u8)
+}
+
+/// Pinned consume identity (`VrefVableBoxes::live_vable(0)`).
+///
+/// `virtualizable.py load_list_of_boxes` appends the vable last for the
+/// seeded shadow (`virtualizable_boxes[-1]`); the consume stream still
+/// stores it at index 0. Re-reads the `OwnerRootGuard`; a copied `Value`
+/// is not a root.
+fn consume_vable_identity_addr(boxes: &crate::VrefVableBoxes) -> Option<usize> {
+    let fallback = boxes
+        .virtualizable_boxes
+        .first()
+        .map(|&(_, v)| v)
+        .unwrap_or(majit_ir::Value::Void);
+    match boxes.live_vable(0, fallback) {
+        majit_ir::Value::Ref(g) => {
+            let addr = g.as_usize();
+            (addr != 0).then_some(addr)
+        }
+        _ => None,
+    }
+}
+
 /// `MAJIT_BH_ENTRY_EXC`: report a `BH_LAST_EXC_VALUE` that survived into a
 /// blackhole drive the caller did not describe as raising.
 ///
@@ -11863,17 +11915,15 @@ impl<S: JitState> JitDriver<S> {
                 .unwrap_or(self.index().unwrap_or(0)),
             green_key,
         );
-        // pyjitpl.py `rebuild_state_after_failure` ends with
-        // `synchronize_virtualizable()` / `check_synchronized_virtualizable()`,
-        // both of which read the LIVE virtualizable.  Resolve it here (the same
-        // `virtualizable_heap_ptr` hook the trace-entry `sync_before` uses) so
-        // the bridge's vable seeding has an authority to check the guard's
-        // decoded identity against.
-        let live_vable = self.meta.virtualizable_info().cloned().and_then(|info| {
-            state
-                .virtualizable_heap_ptr(&trace_meta, &info.name.clone(), &info)
-                .map(|ptr| (info, ptr.cast_const()))
-        });
+        // pyjitpl.py `rebuild_state_after_failure` token reset /
+        // `synchronize_virtualizable` unwrap `virtualizable_boxes[-1]`
+        // (`resume.py consume_vable_info` `next_ref()`). Keep `info` for
+        // `has_vable_token` / `reset_token_gcref`; the pointer is the
+        // consume identity, published after decode. Do not follow the
+        // host red (`state.virtualizable_heap_ptr` / `PyreJitState.frame`):
+        // `start_retrace_from_guard` / `rebuild_from_resumedata` already
+        // allocated, and a reused nursery slot is a different object.
+        let vable_info = self.meta.virtualizable_info().cloned();
         // `start_retrace_from_guard` above sets `self.meta.tracing = Some(..)`
         // on success (pyjitpl.py:9415). Fail loud rather than skipping bridge
         // header_pc / is_bridge_trace / has_compiled_targets_fn wiring
@@ -11897,9 +11947,6 @@ impl<S: JitState> JitDriver<S> {
         // can apply bridge-only behavior without overloading
         // `has_compiled_targets_fn` presence.
         ctx.is_bridge_trace = true;
-        if let Some((_, ptr)) = &live_vable {
-            ctx.set_virtualizable_heap_ptr(*ptr);
-        }
         ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
         ctx.bridge_target_header_pc = parent_header_pc;
         // ResumeAtPosition, has_compiled_targets, compiled_key_for_greens,
@@ -12085,6 +12132,14 @@ impl<S: JitState> JitDriver<S> {
                     .sym
                     .as_mut()
                     .expect("bridge: sym must be live after S::create_sym");
+                // `seed_bridge_virtualizable_boxes` (jit_interp consume)
+                // compares `ctx.virtualizable_heap_ptr()` to
+                // `resume.py consume_vable_info` `next_ref()`. Publish that
+                // identity from the resume stream. `VrefVableBoxes` does not
+                // exist until this call returns.
+                if let Some(ptr) = resume_stream_vable_ptr(bfm, frontend_fail_values) {
+                    ctx.set_virtualizable_heap_ptr(ptr);
+                }
                 // resume.py `rebuild_from_resumedata`:
                 // `consume_vref_and_vable_boxes` before the frame loop.
                 boxes = S::consume_vref_and_vable_boxes(
@@ -12146,6 +12201,14 @@ impl<S: JitState> JitDriver<S> {
                     .tracing
                     .as_mut()
                     .expect("bridge: tracing context must be live");
+                // Consume may have allocated; re-read the pinned identity
+                // (`boxes.live_vable(0)`) onto the heap pointer before
+                // `setup_bridge_sym`. pyre's `setup_bridge_sym` publishes
+                // the same word; jit_interp's seed already used the stream
+                // identity above.
+                if let Some(addr) = consume_vable_identity_addr(&boxes) {
+                    ctx.set_virtualizable_heap_ptr(addr as *const u8);
+                }
                 S::setup_bridge_sym(
                     sym,
                     ctx,
@@ -12157,13 +12220,21 @@ impl<S: JitState> JitDriver<S> {
                     &boxes,
                 );
                 // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail.
-                // Assembler (virtualizable.py case 4) into tracing (case 2).
-                if let Some((info, ptr)) = &live_vable
+                // Assembler (virtualizable.py case 4) into tracing (case 2):
+                // `virtualizable = unwrap_virtualizable_box(virtualizable_boxes[-1])`
+                // then `reset_token_gcref`. `standard_virtualizable_ptr` is
+                // that last box; fall back to the consume-stream identity.
+                if let Some(info) = &vable_info
                     && info.has_vable_token()
                 {
-                    unsafe {
-                        if info.is_token_nonnull_gcref(*ptr) {
-                            info.reset_token_gcref(*ptr as *mut u8);
+                    let ptr = ctx
+                        .standard_virtualizable_ptr()
+                        .or_else(|| consume_vable_identity_addr(&boxes));
+                    if let Some(ptr) = ptr {
+                        unsafe {
+                            if info.is_token_nonnull_gcref(ptr as *const u8) {
+                                info.reset_token_gcref(ptr as *mut u8);
+                            }
                         }
                     }
                 }
