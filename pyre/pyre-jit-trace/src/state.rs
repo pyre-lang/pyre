@@ -12222,7 +12222,7 @@ impl JitState for PyreJitState {
         let restored_top = restored_virtualref_boxes
             .last()
             .map(|&(_, vref_ptr)| vref_ptr)
-            .unwrap_or(sym.concrete_vable_ptr as usize);
+            .unwrap_or(sym.vable_frame_for_array());
         let live_ec = sym.concrete_execution_context as *mut pyre_interpreter::PyExecutionContext;
         if !live_ec.is_null() && restored_top != 0 {
             let published = unsafe { (*live_ec).topframeref };

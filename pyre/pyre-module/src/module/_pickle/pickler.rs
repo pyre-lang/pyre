@@ -1478,6 +1478,8 @@ fn save_global_or_reduce(
         let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         return save_reduce_value(ctx, buf, w_obj, w_rv);
     }
+    // The lookup ran Python; re-read the pinned object.
+    let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
 
     // pickle.py: a class with a custom metaclass and no registered reducer is
     // still a global, but only after the metaclass dispatch-table lookup.
@@ -1490,15 +1492,33 @@ fn save_global_or_reduce(
         Some(reduce_ex) => {
             // A bound method the lookup minted has no other referrer, and
             // boxing the protocol number allocates before the call reaches it.
-            let reduce_ex = pyre_object::gc_roots::pin_root(reduce_ex);
-            call_fn(reduce_ex, &[pyre_object::w_int_new(ctx.proto)])?
+            let _ = pyre_object::gc_roots::pin_root(reduce_ex);
+            let reduce_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            let w_proto = pyre_object::w_int_new(ctx.proto);
+            call_fn(
+                pyre_object::gc_roots::shadow_stack_get(reduce_slot),
+                &[w_proto],
+            )?
         }
         None => match pyre_interpreter::baseobjspace::findattr_result(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "__reduce__",
         )? {
             Some(reduce) => call_fn(reduce, &[])?,
-            None => return Err(pickling_error("Can't pickle object: no __reduce_ex__")),
+            None => {
+                // [3.15-spec] "Can't pickle <fully qualified type> object" ↔ `interp_pickle.py`
+                // `Pickler.save` "Can't pickle %T object: %R"; evidence: v3.15.0
+                // `Modules/_pickle.c` `save` (`"Can't pickle %T object"`), and a measured
+                // 3.15.0 run.
+                let w_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                let name = match pyre_interpreter::typedef::r#type(w_obj) {
+                    Some(tp) => unsafe {
+                        pyre_interpreter::baseobjspace::type_fully_qualified_name(tp.as_ptr())
+                    },
+                    None => rustpython_wtf8::Wtf8Buf::from("object"),
+                };
+                return Err(pickling_error(format!("Can't pickle {} object", name)));
+            }
         },
     };
     save_reduce_value(

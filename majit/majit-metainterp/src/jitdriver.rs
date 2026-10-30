@@ -8332,6 +8332,19 @@ impl<S: JitState> JitDriver<S> {
                     // register file into the live state and resume the
                     // interpreter at the merge point's green pc.
                     crate::jitexc::JitException::ContinueRunningNormally(mut args) => {
+                        // The six lists are the exception's own copies
+                        // (`warmspot.py handle_jitexception` reads them off the
+                        // traced exception object); root the reference ones
+                        // across the restore below, which can collect.
+                        let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+                        unsafe {
+                            majit_gc::shadow_stack::push_resume_ref_roots(
+                                args.green_ref.as_mut_slice(),
+                            );
+                            majit_gc::shadow_stack::push_resume_ref_roots(
+                                args.red_ref.as_mut_slice(),
+                            );
+                        }
                         // PyPy re-enters the portal with the CRN greens
                         // (`warmspot.py` `handle_jitexception`
                         // ContinueRunningNormally), so the interpreter
@@ -8462,6 +8475,7 @@ impl<S: JitState> JitDriver<S> {
                         // the pooled frame that raised the exception
                         // (`recycle_merge_point_args`), as before
                         // `_run_forever` released it.
+                        majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
                         let mut dest = self.meta.take_portal_resume_scratch();
                         std::mem::swap(&mut dest, args.as_mut());
                         staticdata
@@ -8486,20 +8500,35 @@ impl<S: JitState> JitDriver<S> {
                         // Leaving the latch empty re-enters the portal at the
                         // function-entry pc with the virtualizable the residual
                         // already mutated.
-                        match &outcome {
-                            crate::jitexc::JitException::DoneWithThisFrameInt(v) => {
-                                self.meta.back_edge_finish_word = Some(*v);
-                            }
+                        // A Ref result is a bare word until it reaches
+                        // `back_edge_finish_word`; keep it rooted across the
+                        // restore, which can collect.
+                        let mut finish_word: [i64; 1] = [0];
+                        let finish = match &outcome {
+                            crate::jitexc::JitException::DoneWithThisFrameInt(v) => Some(*v),
                             crate::jitexc::JitException::DoneWithThisFrameFloat(v) => {
-                                self.meta.back_edge_finish_word = Some(v.to_bits() as i64);
+                                Some(v.to_bits() as i64)
                             }
                             crate::jitexc::JitException::DoneWithThisFrameRef(v) => {
-                                self.meta.back_edge_finish_word = Some(v.as_usize() as i64);
+                                Some(v.as_usize() as i64)
                             }
-                            _ => {}
+                            _ => None,
+                        };
+                        let finish_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+                        if let crate::jitexc::JitException::DoneWithThisFrameRef(_) = &outcome {
+                            finish_word[0] = finish.unwrap();
+                            unsafe {
+                                majit_gc::shadow_stack::push_resume_ref_roots(&mut finish_word);
+                            }
                         }
                         if let Some(terminal) = terminal.as_ref() {
                             restore_banked3_from_terminal(state, compiled_meta, terminal);
+                        }
+                        majit_gc::shadow_stack::pop_resume_ref_roots_to(finish_root_depth);
+                        if let crate::jitexc::JitException::DoneWithThisFrameRef(_) = &outcome {
+                            self.meta.back_edge_finish_word = Some(finish_word[0]);
+                        } else if let Some(word) = finish {
+                            self.meta.back_edge_finish_word = Some(word);
                         }
                         Some(PortalResume::DoneWithThisFrame(Some(
                             self.banks_from_published_terminal(terminal.as_ref()),

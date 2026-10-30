@@ -16666,6 +16666,12 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared.runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
+        // optimizer.py gives every `Optimizer` its own `ResumeDataLoopMemo`;
+        // `store_final_boxes_in_guard` fills its `rd_consts` with live GCREFs.
+        // Publish it for the rest of this compile, as
+        // `UnrollOptimizer::register_resume_memo` does for loops.
+        self.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map for the optimizer's intrinsic Const
@@ -17483,6 +17489,12 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_runtime_boxes = prepared_runtime_boxes.as_slice();
 
         let mut optimizer = self.make_optimizer();
+        // optimizer.py gives every `Optimizer` its own `ResumeDataLoopMemo`;
+        // `store_final_boxes_in_guard` fills its `rd_consts` with live GCREFs.
+        // Publish it for the rest of this compile, as
+        // `UnrollOptimizer::register_resume_memo` does for loops.
+        self.compile_resume_memos
+            .push(std::rc::Rc::downgrade(&optimizer.resumedata_memo));
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         // history.py:220 box.type parity: promote the legacy `i64` pool
         // to a typed `Value` map.

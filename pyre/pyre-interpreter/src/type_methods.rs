@@ -3932,11 +3932,17 @@ fn format_w_slow(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, c
 /// for instances, else the storage type name.
 /// `_PyArg_BadArgument`'s rendering of a rejected argument: `None` names
 /// itself where every other value names its type.
+/// The name is cut to 50 bytes (`%.50s`).
 pub fn clinic_arg_type_name(obj: PyObjectRef) -> String {
     if unsafe { pyre_object::is_none(obj) } {
         return "None".to_string();
     }
-    arg_type_name(obj)
+    let mut name = arg_type_name(obj);
+    if name.len() > 50 {
+        let end = name.floor_char_boundary(50);
+        name.truncate(end);
+    }
+    name
 }
 
 pub fn arg_type_name(obj: PyObjectRef) -> String {

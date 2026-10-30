@@ -23959,7 +23959,84 @@ fn init_int_type(ns: PyObjectRef) {
                             // `signed` (`PY_NULL` omitted).
                             let bound =
                                 |i: usize| args.get(i).copied().filter(|value| !value.is_null());
-                            let w_self = bound(0);
+                            // `unwrap_spec(length=int, byteorder='text', signed=bool)`
+                            // converts every argument before the body reads `self`; the
+                            // conversions run Python and the bigint allocates, so the
+                            // arguments live in root slots.
+                            let _arg_roots = pyre_object::gc_roots::push_roots();
+                            let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                bound(0).unwrap_or(pyre_object::PY_NULL),
+                            );
+                            let length_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                bound(1).unwrap_or(pyre_object::PY_NULL),
+                            );
+                            let byteorder_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                bound(2).unwrap_or(pyre_object::PY_NULL),
+                            );
+                            let signed_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(
+                                bound(3).unwrap_or(pyre_object::PY_NULL),
+                            );
+                            let w_length = pyre_object::gc_roots::shadow_stack_get(length_slot);
+                            let length_i = if !w_length.is_null() {
+                                crate::builtins::space_index_w(w_length)?
+                            } else {
+                                1
+                            };
+                            // [3.15-spec] A negative length raises
+                            // `ValueError("length cannot be negative")`
+                            // right after the length conversion, before
+                            // `byteorder` is read ↔ `rbigint.py`
+                            // `tobytes_int` has no length check (a negative length yields `b''`);
+                            // evidence: v3.15.0 `Objects/clinic/longobject.c.h` `int_to_bytes`.
+                            if length_i < 0 {
+                                return Err(crate::PyError::value_error(
+                                    "length cannot be negative",
+                                ));
+                            }
+                            let w_byteorder =
+                                pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
+                            let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
+                                None => Some("big"),
+                                Some(o) if unsafe { pyre_object::is_str(o) } => {
+                                    match unsafe { pyre_object::w_str_get_value_opt(o) } {
+                                        Some("little") => Some("little"),
+                                        Some("big") => Some("big"),
+                                        _ => None,
+                                    }
+                                }
+                                // [3.15-spec] `to_bytes() argument 'byteorder'
+                                // must be str, not <type>` ↔
+                                // `baseobjspace.py` `_typed_unwrap_error`
+                                // "expected str, got <type> object";
+                                // evidence: v3.15.0 `Objects/clinic/longobject.c.h` `int_to_bytes`
+                                // (`_PyArg_BadArgument`), and a measured 3.15.0 run.
+                                Some(o) => {
+                                    return Err(crate::PyError::type_error(format!(
+                                        "to_bytes() argument 'byteorder' must be str, not {}",
+                                        crate::type_methods::clinic_arg_type_name(o)
+                                    )));
+                                }
+                            };
+                            let w_signed = pyre_object::gc_roots::shadow_stack_get(signed_slot);
+                            let signed = (!w_signed.is_null())
+                                .then_some(w_signed)
+                                .map(crate::baseobjspace::is_true)
+                                .transpose()?
+                                .unwrap_or(false);
+                            let byteorder = match byteorder {
+                                Some(order) => order,
+                                None => {
+                                    return Err(crate::PyError::value_error(
+                                        "byteorder must be either 'little' or 'big'",
+                                    ));
+                                }
+                            };
+                            let w_self = Some(pyre_object::gc_roots::shadow_stack_get(self_slot))
+                                .filter(|value| !value.is_null());
                             let owned_val;
                             let val = if let Some(o) =
                                 w_self.filter(|&o| unsafe { pyre_object::is_bool(o) })
@@ -23982,54 +24059,7 @@ fn init_int_type(ns: PyObjectRef) {
                                 owned_val = BigInt::from(0);
                                 &owned_val
                             };
-                            // `space_index_w` and `is_true` run Python code, which collects.
                             let val = live_rbigint(val);
-                            let _arg_roots = pyre_object::gc_roots::push_roots();
-                            let byteorder_slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(
-                                bound(2).unwrap_or(pyre_object::PY_NULL),
-                            );
-                            let signed_slot = pyre_object::gc_roots::shadow_stack_len();
-                            let _ = pyre_object::gc_roots::pin_root(
-                                bound(3).unwrap_or(pyre_object::PY_NULL),
-                            );
-                            let length_i = match bound(1) {
-                                Some(o) => crate::builtins::space_index_w(o)?,
-                                None => 1,
-                            };
-                            if length_i < 0 {
-                                return Err(crate::PyError::value_error(
-                                    "length argument must be non-negative",
-                                ));
-                            }
-                            let w_byteorder =
-                                pyre_object::gc_roots::shadow_stack_get(byteorder_slot);
-                            let byteorder = match (!w_byteorder.is_null()).then_some(w_byteorder) {
-                                None => "big",
-                                Some(o) if unsafe { pyre_object::is_str(o) } => {
-                                    match unsafe { pyre_object::w_str_get_value_opt(o) } {
-                                        Some("little") => "little",
-                                        Some("big") => "big",
-                                        _ => {
-                                            return Err(crate::PyError::value_error(
-                                                "byteorder must be either 'little' or 'big'",
-                                            ));
-                                        }
-                                    }
-                                }
-                                Some(o) => {
-                                    return Err(crate::PyError::type_error(format!(
-                                        "expected str, got {} object",
-                                        crate::error::type_name_of(o)
-                                    )));
-                                }
-                            };
-                            let w_signed = pyre_object::gc_roots::shadow_stack_get(signed_slot);
-                            let signed = (!w_signed.is_null())
-                                .then_some(w_signed)
-                                .map(crate::baseobjspace::is_true)
-                                .transpose()?
-                                .unwrap_or(false);
                             // `rbigint.tobytes` skips its final sign-fit check when
                             // `nbytes == 0` (rbigint.py), and `-1` is the one value
                             // whose two's complement emits no bytes at all, so it falls

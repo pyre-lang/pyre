@@ -6958,11 +6958,14 @@ impl OptContext {
         }
     }
 
-    /// `cpu.cls_of_box(runtime_box)` — virtualstate.py:601/608/620,
-    /// model.py:199-201. Reads the runtime box's OWN ref value
-    /// (`getref_base`, resoperation.py — the box's own `_resref` slot,
-    /// never the `_forwarded` chain) via `runtime_value_of`, then returns
-    /// `ptr2int(typeptr)`, the immortal vtable address as a plain integer.
+    /// `cpu.bh_classof(runtime_box.getref_base())` — virtualstate.py
+    /// KnownClass arms, model.py `cls_of_box`. Reads the runtime box's
+    /// OWN ref value (`getref_base`, resoperation.py — the box's own
+    /// `_resref` slot, never the `_forwarded` chain) via
+    /// `runtime_value_of`, then returns `ptr2int(typeptr)`, the immortal
+    /// vtable address as a plain integer. Typeptr is read with
+    /// `cpu.bh_classof`; `cls_of_box` delegates to that hook, so a
+    /// backend override still applies. No synthetic ConstPtr is minted.
     ///
     /// Unlike `cls_of_box(&Operand)` (which walks `get_box_replacement` to
     /// reach a Const terminal), this resolves through the no-forward
@@ -6973,8 +6976,7 @@ impl OptContext {
     pub fn runtime_cls_of(&self, opref: OpRef) -> Option<i64> {
         match self.runtime_value_of(opref)? {
             Value::Ref(gcref) if !gcref.is_null() => {
-                let synth = Operand::const_from_value(Value::Ref(gcref));
-                let typeptr = self.cpu.cls_of_box(&synth);
+                let typeptr = self.cpu.bh_classof(gcref);
                 if typeptr == 0 { None } else { Some(typeptr) }
             }
             _ => None,
@@ -9062,7 +9064,7 @@ impl OptContext {
     /// to the resolved box's per-type mixin slot (`RefOp._resref`,
     /// resoperation.py) when the forwarding chain has no terminal Const
     /// — live `InputArgRef` boxes with a tracer-recorded concrete value
-    /// reach the typeptr deref through a synthetic Const wrapper.
+    /// reach the typeptr via `cpu.bh_classof` on the matched gcref.
     /// Returns `None` when neither path produces a non-null gcref
     /// (`DefaultCpu::cls_of_box` reports both "no Ref" and "null gcref"
     /// as 0).
@@ -9084,9 +9086,9 @@ impl OptContext {
         }
         // resoperation.py `RefOp._resref` fallback — when the
         // forwarding chain has no Const terminal, read the mixin slot
-        // directly off the resolved operand.  Wrap as a synthetic Const so
-        // the typeptr deref goes through the same `cpu.cls_of_box`
-        // path (preserves gcremovetypeptr overrides).
+        // directly off the resolved operand. Typeptr is read with
+        // `cpu.bh_classof`, the hook `cls_of_box` delegates to, so a
+        // backend override still applies.
         let resolved = op.get_box_replacement(false);
         if resolved.const_value().is_some() {
             // Already had a Const terminal; cpu reported 0 because
@@ -9095,12 +9097,12 @@ impl OptContext {
         }
         let value = resolved.get_value()?;
         match value {
-            Value::Ref(gcref) if !gcref.is_null() => {}
-            _ => return None,
+            Value::Ref(gcref) if !gcref.is_null() => {
+                let typeptr = self.cpu.bh_classof(gcref);
+                if typeptr == 0 { None } else { Some(typeptr) }
+            }
+            _ => None,
         }
-        let synth = Operand::const_from_value(value);
-        let typeptr = self.cpu.cls_of_box(&synth);
-        if typeptr == 0 { None } else { Some(typeptr) }
     }
 
     /// info.py `getptrinfo(op).get_known_class(cpu)` parity.
@@ -9990,6 +9992,15 @@ impl OptContext {
         }
         for r in &self.inputargs {
             r.trace_const_ptr(visitor);
+        }
+        // `resoperation.py` `RefOp._resref` is a GC field of the box. The
+        // canonical InputArg boxes live in `inputarg_refs`; a bridge's are
+        // reminted copies no recorder walk visits, so forward `.value` here.
+        for ia in self.inputarg_refs.values() {
+            if let Some(Value::Ref(mut r)) = ia.get_value() {
+                visitor(&mut r);
+                ia.set_value(Value::Ref(r));
+            }
         }
         for entry in &self.exported_const_short_boxes {
             walk_live_op(&entry.op, visitor);

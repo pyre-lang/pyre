@@ -3912,6 +3912,11 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     // The digest arrives as a word. Matching `Option<i64>` is a classdef-less
     // `__pos_0` read, which phase A cannot lower.
     let mut keyhash = hash;
+    // `ll_dict_setitem` keeps `d`, `key` and `value` live across
+    // `d.keyhash(key)`: the probe can run `__hash__` and collect, so the
+    // reentrant step reads the words back from the roots.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, key, value]);
     let probed =
         w_dict_object_setitem_callback_free(obj, key, keyhash, hash_known, value, &mut keyhash);
     if probed < 0 {
@@ -3920,6 +3925,9 @@ unsafe fn w_dict_store_object_strategy_checked_inner(
     if probed == 0 {
         return Ok(());
     }
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let key = crate::gc_roots::shadow_stack_get(obj_slot + 1);
+    let value = crate::gc_roots::shadow_stack_get(obj_slot + 2);
     if w_dict_object_setitem_reentrant(obj, key, keyhash, value) < 0 {
         return Err(DictKeyError);
     }
