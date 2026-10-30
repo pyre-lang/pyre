@@ -7347,6 +7347,16 @@ const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "INT-INVERT-SUBWALK",
 };
 
+/// [`pos`] past its `__pos__` override probe. Exact int is identity
+/// (`_self_unaryop('pos')` / `W_IntObject.int`); bool stays on the
+/// rewrapping arm.
+const POS_INNER_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::pos_inner",
+    commit_label: "pos_inner_commit",
+    call_site_label: "pos_inner_call_site",
+    decline_tag: "POS-INNER-SUBWALK",
+};
+
 pub(crate) fn binary_value_from_tag_jitcode()
 -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
@@ -7381,6 +7391,58 @@ pub(crate) fn jitcode_is_binary_value_from_tag(
         (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
             || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
     })
+}
+
+fn jitcode_body_is_path(sub_body: &super::SubJitCodeBody, path: &str) -> bool {
+    crate::jitcode_runtime::pathed_jitcode_cached(path)
+        .is_some_and(|jc| std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr()))
+}
+
+pub(crate) fn jitcode_name_is_unary_invert(name: &str) -> bool {
+    name == "invert" || name.ends_with("::invert") || name.ends_with("::invert_inner")
+}
+
+/// Portal `inline_call` of `invert` lives in the per-fn descr pool.
+/// `get_jitcode_ref_by_index` of that slot names an unrelated
+/// `ALL_JITCODES` entry (`RawDescrPool::inline_callee_name`).
+pub(crate) fn jitcode_is_unary_invert(
+    pool: super::RawDescrPool<'_>,
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    if pool
+        .inline_callee_name(sub_index)
+        .is_some_and(jitcode_name_is_unary_invert)
+    {
+        return true;
+    }
+    jitcode_body_is_path(
+        sub_body,
+        "pyre_interpreter::objspace::descroperation::invert",
+    ) || jitcode_body_is_path(
+        sub_body,
+        "pyre_interpreter::objspace::descroperation::invert_inner",
+    ) || jitcode_body_is_path(sub_body, INT_INVERT_DESCENT.path)
+}
+
+pub(crate) fn jitcode_name_is_unary_pos(name: &str) -> bool {
+    name == "pos" || name.ends_with("::pos") || name.ends_with("::pos_inner")
+}
+
+/// Same per-fn slot vs `ALL_JITCODES` join as [`jitcode_is_unary_invert`].
+pub(crate) fn jitcode_is_unary_pos(
+    pool: super::RawDescrPool<'_>,
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    if pool
+        .inline_callee_name(sub_index)
+        .is_some_and(jitcode_name_is_unary_pos)
+    {
+        return true;
+    }
+    jitcode_body_is_path(sub_body, "pyre_interpreter::objspace::descroperation::pos")
+        || jitcode_body_is_path(sub_body, POS_INNER_DESCENT.path)
 }
 
 /// Tag for a declined helper walk that is `binary_value_from_tag` or a
@@ -7732,21 +7794,44 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
     )
 }
 
-/// Exact builtin `float`/`int` `UNARY_POSITIVE` stay residual.
-/// `descr_pos` → `descr_float` returns `self` for an exact float;
-/// `_self_unaryop('pos')` returns `self` for exact int. Walking
-/// `_float_pos` would allocate a fresh box.
+/// Exact builtin `int` `UNARY_POSITIVE`: walk `pos_inner`. Bool stays
+/// on the rewrapping arm (`+True` is a plain int). The override probe on
+/// `pos` is `dont_look_inside`; entering `pos_inner` after the exact-int
+/// proof records the identity arm.
 pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    _op_pc: usize,
+    op_pc: usize,
     r_args: &[OpRef],
-    _dst: usize,
+    dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
         return Ok(None);
     }
-    Ok(None)
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let admitted = unsafe {
+        pyre_object::is_exact_builtin_instance(obj)
+            && pyre_object::is_int(obj)
+            && !pyre_object::is_bool(obj)
+    };
+    if !admitted {
+        return Ok(None);
+    }
+    let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let _xa = walker_unbox_int(ctx, op_pc, r_args[0], type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[(r_args[0], obj)],
+        &[],
+        dst,
+        dst_bank,
+        &POS_INNER_DESCENT,
+    )
 }
 
 fn orthodox_list_getitem_body_and_sym<Sym: WalkSym>(

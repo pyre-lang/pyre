@@ -1684,19 +1684,27 @@ pub(crate) fn descent_decline_from_summary(
 ///
 /// `goto_if_not` falls through when the condition is true (GuardTrue) and
 /// jumps when it is false (GuardFalse). The fail arm is the other successor.
-/// `None` when `guard_pc` is not a `goto_if_not*` (scan from `guard_pc`).
+/// Capture records the `-live-` the codewriter emits immediately before the
+/// guard-producing op (`get_list_of_active_boxes` at `orgpc - SIZE_LIVE_OP`);
+/// `generate_guard(resumepc=orgpc)` names the `goto_if_not_*` itself. Step
+/// from that `-live-` to the following op and require a `goto_if_not_*`.
+/// `None` when the coordinate is not a `goto_if_not*` (scan from `guard_pc`).
 pub(crate) fn helper_guard_fail_resume_pc(
     jitcode_index: usize,
     guard_pc: usize,
     guard_true: bool,
 ) -> Option<usize> {
     let jitcode = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index)?;
-    let d = crate::jitcode_runtime::decode_op_at(jitcode.code.as_slice(), guard_pc)?;
+    let code = jitcode.code.as_slice();
+    let mut d = crate::jitcode_runtime::decode_op_at(code, guard_pc)?;
+    if d.opname == "live" {
+        d = crate::jitcode_runtime::decode_op_at(code, d.next_pc)?;
+    }
     if !d.opname.starts_with("goto_if_not") {
         return None;
     }
     let off = label_operand_offset(d.argcodes)?;
-    let label = read_label(jitcode.code.as_slice(), &d, off);
+    let label = read_label(code, &d, off);
     if guard_true {
         Some(label)
     } else {
@@ -1707,20 +1715,25 @@ pub(crate) fn helper_guard_fail_resume_pc(
 /// Whether the blackhole, resuming the helper body `jitcode_index` at `pc`,
 /// can reach a residual or conditional call whose funcbox may be a symbolic
 /// placeholder (`is_symbolic_fnaddr`), an `abort` opcode (`bhimpl_abort`),
-/// an `inline_call_*` callee the blackhole would interpret
-/// (`interpret_unresolved_inline_call`) whose whole-body summary can reach
-/// an `abort`, or a region the scan cannot read.
+/// an interpreted `inline_call_*` callee (`interpret_unresolved_inline_call`)
+/// whose own body can still reach `reject_unresolved_call` or `abort`, or a
+/// region the scan cannot read.
 ///
-/// `reject_unresolved_call` bails at a symbolic placeholder. A runtime
-/// address the static scan does not know is restored by
-/// `ResumeDataDirectReader.consume_one_section` and is not a blocker.
+/// `reject_unresolved_call` bails at a symbolic placeholder. A residual
+/// funcbox the static scan does not know is a runtime address
+/// `ResumeDataDirectReader.consume_one_section` restores and is not a
+/// blocker. A nested `inline_call_*` names a JitCode descr: a callable
+/// `fnaddr` runs `bhimpl_inline_call_*` natively. An uncallable `fnaddr`
+/// is interpreted; that is a blocker only when the interpreted body can
+/// still bail (`abort` / residual `reject_unresolved_call` / unread
+/// region). A Void `BuildHasherDefault::default` interprets and is not.
 /// A helper section has no Python coordinate the interpreter could continue
 /// from, so a guard whose helper sections can reach a blocker cannot be
 /// numbered. The scan runs from the body's entry with the facts the descent
 /// scan proves there (`entry_array_len`, the length of a gateway's argument
 /// array), so an arm those facts exclude on every path to `pc` is not
 /// counted. Callees named by `inline_call_*` past `pc` count with their
-/// whole-body summary.
+/// whole-body summary and with that callee's own `fnaddr`.
 pub(crate) fn helper_resume_reaches_blocker(
     jitcode_index: usize,
     pc: usize,
@@ -1729,40 +1742,14 @@ pub(crate) fn helper_resume_reaches_blocker(
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return true;
     };
-    // Runtime-installed payloads (`install_codeless_jitcode`) live in
-    // `MetaInterpStaticData.jitcodes`, not the build-time `JITCODE_CELLS`
-    // table `get_jitcode_ref_by_index` reads. The payload already in
-    // hand is the body to scan.
-    let payload = std::sync::Arc::clone(&pjc);
+    // Memo is on the runtime payload (`install_codeless_jitcode`), not the
+    // build-time `JITCODE_CELLS` table `get_jitcode_ref_by_index` reads.
     let scan = || {
-        let jitcode = &payload.jitcode;
-        let descrs = crate::jitcode_runtime::descr_ref_table();
-        let entry_array_lengths: Vec<(usize, usize)> =
-            entry_array_len.map(|len| (0, len)).into_iter().collect();
-        let mut tracker = DescentSummaryTracker::new();
-        let summary = summarize_body_blockers_from(
-            Some(pc),
-            jitcode.code.as_slice(),
-            jitcode.num_regs_i(),
-            jitcode.constants_i.as_slice(),
-            |descr_index, _caller_effect, _entry_lens| {
-                descrs
-                    .at(descr_index)
-                    .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
-                    .map(|callee| {
-                        summarize_descent_blockers_with_entry_inner(callee, &mut tracker, &[], None)
-                    })
-            },
-            &mut |_blocker, _effect| true,
-            &mut residual_call_is_effect_free,
-            &mut switch_descr_targets,
-            &entry_array_lengths,
-            &mut jitcode_fnaddr_for_descr,
-            descr_refs_for_jitcode_index(jitcode_index),
-        );
-        summary.body_not_walked
-            || summary.blocker_effect_free.is_some()
-            || summary.blocker_after_effect.is_some()
+        helper_resume_summary_is_blocker(&helper_resume_blocker_summary(
+            jitcode_index,
+            pc,
+            entry_array_len,
+        ))
     };
     // Only the entry without argument-array facts is memoized per pc; a
     // gateway's answer depends on the call site's argument count.
@@ -1778,6 +1765,137 @@ pub(crate) fn helper_resume_reaches_blocker(
         Some(slot) => *slot.get_or_init(scan),
         None => true,
     }
+}
+
+fn helper_resume_blocker_summary(
+    jitcode_index: usize,
+    pc: usize,
+    entry_array_len: Option<usize>,
+) -> DescentBlockerSummary {
+    // Runtime-installed payloads (`install_codeless_jitcode`) live in
+    // `MetaInterpStaticData.jitcodes`, not the build-time `JITCODE_CELLS`
+    // table `get_jitcode_ref_by_index` reads.
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return body_not_walked();
+    };
+    let jitcode = &pjc.jitcode;
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let entry_array_lengths: Vec<(usize, usize)> =
+        entry_array_len.map(|len| (0, len)).into_iter().collect();
+    let mut tracker = DescentSummaryTracker::new();
+    summarize_body_blockers_from(
+        Some(pc),
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |descr_index, _caller_effect, _entry_lens| {
+            descrs
+                .at(descr_index)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+                .map(|callee| {
+                    summarize_descent_blockers_with_entry_inner(callee, &mut tracker, &[], None)
+                })
+        },
+        &mut |_blocker, _effect| true,
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
+        &entry_array_lengths,
+        &mut jitcode_fnaddr_for_descr,
+        descr_refs_for_jitcode_index(jitcode_index),
+    )
+}
+
+fn helper_resume_summary_is_blocker(summary: &DescentBlockerSummary) -> bool {
+    summary.body_not_walked
+        || summary.blocker_effect_free.is_some()
+        || summary.blocker_after_effect.is_some()
+}
+
+/// Own-body summary: nested `inline_call_*` callees are not counted.
+fn helper_own_body_summary(
+    jitcode_index: usize,
+    pc: usize,
+    entry_array_len: Option<usize>,
+) -> DescentBlockerSummary {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return body_not_walked();
+    };
+    let jitcode = &pjc.jitcode;
+    let entry_array_lengths: Vec<(usize, usize)> =
+        entry_array_len.map(|len| (0, len)).into_iter().collect();
+    summarize_body_blockers_from(
+        Some(pc),
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |_descr_index, _caller_effect, _entry_lens| Some(DescentBlockerSummary::default()),
+        &mut |_blocker, _effect| true,
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
+        &entry_array_lengths,
+        &mut jitcode_fnaddr_for_descr,
+        descr_refs_for_jitcode_index(jitcode_index),
+    )
+}
+
+/// `rewrite_op_jit_force_virtualizable` deleted the force, leaving `abort`
+/// and no `*_return` in this body. Nested callees are not counted.
+fn helper_own_body_cannot_finish(
+    jitcode_index: usize,
+    pc: usize,
+    entry_array_len: Option<usize>,
+) -> bool {
+    let summary = helper_own_body_summary(jitcode_index, pc, entry_array_len);
+    summary.has_reachable_abort && !summary.has_reachable_return
+}
+
+/// A direct `inline_call_*` callee of this wrap is interpreted
+/// (`blackhole_interprets_inline_callee`) and that callee's resume from
+/// entry still reaches a blocker. The same property for every wrap: a
+/// callable nested fnaddr runs `bhimpl_inline_call_*` natively, so its
+/// unused-arm `abort` is not this decline.
+fn wrap_nested_callee_cannot_finish(
+    jitcode_index: usize,
+    pc: usize,
+    entry_array_len: Option<usize>,
+) -> bool {
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
+        return true;
+    };
+    let jitcode = &pjc.jitcode;
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let entry_array_lengths: Vec<(usize, usize)> =
+        entry_array_len.map(|len| (0, len)).into_iter().collect();
+    let found = std::cell::Cell::new(false);
+    summarize_body_blockers_from(
+        Some(pc),
+        jitcode.code.as_slice(),
+        jitcode.num_regs_i(),
+        jitcode.constants_i.as_slice(),
+        |descr_index, _caller_effect, _entry_lens| {
+            if let Some(callee) = descrs
+                .at(descr_index)
+                .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
+            {
+                let fnaddr = crate::state::pyjitcode_for_jitcode_index(callee as i32)
+                    .map(|callee_pjc| callee_pjc.jitcode.fnaddr)
+                    .unwrap_or(0);
+                if blackhole_interprets_inline_callee(fnaddr)
+                    && helper_resume_reaches_blocker(callee, 0, None)
+                {
+                    found.set(true);
+                }
+            }
+            Some(DescentBlockerSummary::default())
+        },
+        &mut |_blocker, _effect| true,
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
+        &entry_array_lengths,
+        &mut jitcode_fnaddr_for_descr,
+        descr_refs_for_jitcode_index(jitcode_index),
+    );
+    found.get()
 }
 
 /// Why a descent into a body is refused.
@@ -2999,8 +3117,9 @@ pub(crate) fn summarize_body_blockers_resume(
 /// [`summarize_body_blockers_resume`] with a per-descr callee `fnaddr`.
 ///
 /// `None` is `jitcode.py JitCode.__init__ fnaddr=None`: the blackhole
-/// interprets that callee (`interpret_unresolved_inline_call`). A callable
-/// address is the native `bhimpl_inline_call_*` path.
+/// interprets that callee (`interpret_unresolved_inline_call`), so a
+/// resume scan reports the callee as a blocker. A callable address is
+/// the native `bhimpl_inline_call_*` path.
 #[cfg(test)]
 pub(crate) fn summarize_body_blockers_resume_fnaddr(
     resume_pc: usize,
@@ -3314,23 +3433,34 @@ fn summarize_body_blockers_from(
                     summary.blocker_effect_free.get_or_insert(blocker);
                 }
                 // `bhimpl_abort` cannot finish a helper section. Whole-body
-                // admission does not name that `abort` as a blocker; the
-                // resume scan does only when the blackhole would interpret
-                // the callee (`interpret_unresolved_inline_call`) and reach
-                // it. A callable `jitcode.fnaddr` runs `bhimpl_inline_call_*`
-                // natively, so that abort is not a section the scan walks.
+                // admission does not name that `abort` as a blocker. A
+                // callable `jitcode.fnaddr` runs `bhimpl_inline_call_*`
+                // natively, so neither that abort nor a residual inside the
+                // callee is a section the resume scan walks. An uncallable
+                // `fnaddr` is interpreted (`interpret_unresolved_inline_call`):
+                // an empty / pure body finishes. A residual or `abort` that
+                // helper then reaches bails (`reject_unresolved_call`) and
+                // leaves the pending dest blank, so that interpreted callee
+                // is a resume blocker. The uncallable fnaddr alone is not:
+                // `BuildHasherDefault::default` is Void and interprets.
                 summary.has_reachable_abort |= callee.has_reachable_abort;
-                if resume_pc.is_some() && callee.has_reachable_abort {
+                summary.has_reachable_return |= callee.has_reachable_return;
+                if resume_pc.is_some() {
                     let fnaddr = callee_fnaddr(descr_index)
                         .or_else(|| jitcode_fnaddr_for_descr(descr_index))
                         .unwrap_or(0);
-                    if blackhole_interprets_inline_callee(fnaddr) {
+                    if blackhole_interprets_inline_callee(fnaddr)
+                        && (callee.has_reachable_abort
+                            || callee.blocker_effect_free.is_some()
+                            || callee.blocker_after_effect.is_some()
+                            || callee.body_not_walked)
+                    {
                         let slot = if effect {
                             &mut summary.blocker_after_effect
                         } else {
                             &mut summary.blocker_effect_free
                         };
-                        slot.get_or_insert(0);
+                        slot.get_or_insert(fnaddr);
                     }
                 }
                 if callee.may_execute_effect {
@@ -3475,7 +3605,9 @@ fn summarize_body_blockers_from(
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
         match d.opname {
             // Frame exits: the walk leaves this body here.
-            "ref_return" | "int_return" | "float_return" | "void_return" => {}
+            "ref_return" | "int_return" | "float_return" | "void_return" => {
+                summary.has_reachable_return = true;
+            }
             // `bhimpl_abort` cannot finish a helper section. The whole-body
             // scan records that an `abort` is reachable without naming it as
             // a descent-admission blocker. Capture-time resume
@@ -6385,17 +6517,16 @@ pub(crate) fn cut_declined_subwalk<Sym: WalkSym>(
 ///
 /// Prefer [`DispatchError::residual_executed_resume`] when the error already
 /// carries `AfterResidualCall`. Else the executor census
-/// [`fbw_executed_residual_counts`] (bumped where `execute_varargs` ran) or
-/// a trace-position move since `pre_fold_pos`.
+/// [`fbw_executed_residual_counts`] (bumped where `execute_varargs` ran).
+/// A trace-position move is any recorded op (a guard, `int_add`) and is
+/// not an executed residual: treating it as one wrapped a nested
+/// `GuardResumeCoordinateUnavailable` as `AfterResidualCall` at the
+/// helper's next_pc and latched that coordinate onto the Python CALL.
 fn helper_subwalk_executed_residual(
     error: &DispatchError,
     residuals_before: (u32, u32, u32),
-    pre_fold_pos: majit_metainterp::recorder::TracePosition,
-    now_pos: majit_metainterp::recorder::TracePosition,
 ) -> bool {
-    error.residual_executed_resume().is_some()
-        || fbw_executed_residual_counts() != residuals_before
-        || now_pos != pre_fold_pos
+    error.residual_executed_resume().is_some() || fbw_executed_residual_counts() != residuals_before
 }
 
 /// Whether a declined Regular subwalk has an unbound (0 / symbolic)
@@ -6405,12 +6536,11 @@ fn helper_subwalk_executed_residual(
 /// Used in two ways. A helper that *is* the BINARY_OP still
 /// `cut_declined_subwalk`s and emits BinaryOpDescent: skip-propagate
 /// would claim the abort on the caller (`claim_abort_coordinate`) and
-/// miss the operator. A nested unbound helper whose enclosing walk
-/// already recorded ops must *not* take that arm — residualize fails
-/// (uncallable) and the enclosing helper would re-enter at the
-/// post-store cursor. That case skip-cuts to the enclosing
-/// `run_inline_call_subwalk`, which cuts to its own first-enter
+/// miss the operator. Any other nested unbound helper skip-cuts to the
+/// enclosing `run_inline_call_subwalk`, which cuts to its own first-enter
 /// `pre_fold_pos` (`pyjitpl.py` `history.cut` + `do_residual_call`).
+/// Residualize of the unbound helper itself fails, even when that helper
+/// recorded no ops, so the skip does not wait for enclosing stores.
 fn declined_unbound_regular_recovers_enclosing(error: &DispatchError) -> bool {
     matches!(
         error,
@@ -6452,6 +6582,7 @@ pub(crate) struct SubWalkRewind {
     pre_fold_pos: majit_metainterp::recorder::TracePosition,
     effects_before: usize,
     unjournaled_before: bool,
+    journal_mark: FbwEffectJournalMark,
 }
 
 impl SubWalkRewind {
@@ -6464,6 +6595,7 @@ impl SubWalkRewind {
             pre_fold_pos,
             effects_before,
             unjournaled_before,
+            journal_mark: fbw_effect_journal_mark(),
         }
     }
 
@@ -6475,6 +6607,15 @@ impl SubWalkRewind {
         fbw_executed_effect_count() == self.effects_before
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
+    }
+
+    /// Journals pushed since enter were undone by the nested cut, even if
+    /// the executed-effect odometer still drifted. The wrap CALL can
+    /// residualize once (`do_residual_call`).
+    fn journals_clear(&self) -> bool {
+        !self.unjournaled_before
+            && !fbw_has_unjournaled_effect()
+            && fbw_journaled_effect_delta_since(self.journal_mark) == 0
     }
 
     /// Whether every effect executed since `pos` is one the cut undoes.
@@ -7952,6 +8093,15 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         builtin_inline_decline!("no jitcode for address", fnaddr);
         return Ok(None);
     };
+    // `bhimpl_inline_call_*` calls `jitcode.fnaddr`. A symbolic / 0
+    // wrapper (`__majit_wrap_builtin_locals`) is interpreted and hits
+    // `abort/` / `reject_unresolved_call`, leaving the CALL dest blank.
+    // Residualize the CallFn through the builtin funcptr instead
+    // (`handler_residual_call` / `do_residual_call`).
+    if !majit_jitcode::codewriter::call::is_callable_fnaddr(jitcode.fnaddr) {
+        builtin_inline_decline!("wrapper fnaddr not callable", fnaddr);
+        return Ok(None);
+    }
     let Some(body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode.index()) else {
         builtin_inline_decline!("no sub jitcode body", fnaddr);
         return Ok(None);
@@ -8033,6 +8183,19 @@ fn walker_inline_builtin_call<Sym: WalkSym>(
         && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
     {
         builtin_inline_decline!(decline, fnaddr);
+        return Ok(None);
+    }
+    // Reach-only wrappers (`rewrite_op_jit_force_virtualizable` deletes the
+    // force, leaving `abort` and no return in the wrap or in a reachable
+    // nested callee): residualize the CallFn through the builtin funcptr.
+    // Same gate as `descent_decline` above: an exact-layout `__len__`
+    // receiver walks the wrap despite unused-arm blockers.
+    if !builtin_len_shortcut
+        && !cdata_func_descent
+        && (helper_own_body_cannot_finish(jitcode.index(), 0, Some(wrapper_item_count))
+            || wrap_nested_callee_cannot_finish(jitcode.index(), 0, Some(wrapper_item_count)))
+    {
+        builtin_inline_decline!("wrapper resume reaches a blocker", fnaddr);
         return Ok(None);
     }
     // `typeobject.py descr_call` runs `__init__` after `__new__` returns, so
@@ -8583,6 +8746,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         pre_fold_pos,
         effects_before,
         unjournaled_before,
+        journal_mark: fbw_effect_journal_mark(),
     };
     // A nested helper's byte offset is not a coordinate in the Python
     // jitcode. Keep the outermost CALL so a portal entered from inside
@@ -8681,7 +8845,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
         // to the frame latch, which resumes forward at this opcode losing
         // nothing.
         Err(error)
-            if rewind.nothing_applied()
+            if rewind.journals_clear()
                 && matches!(
                     error,
                     DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
@@ -8707,6 +8871,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
             // concrete function still has the args (`pickle._loads` read).
             // Helper `walk()` may have latched; drop that image so the CALL
             // residualizes instead of converting a mid-helper pc.
+            ctx.session.borrow_mut().pending_helper_level = None;
             discard_staged_abort(ctx.session);
             cut_declined_subwalk(ctx, pre_fold_pos);
             return Ok(None);
@@ -21829,10 +21994,20 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         && global_slot_is_callee)
         || !ctx.fbw_mode.snapshot_sym.is_null();
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // A nested decline pops the helper frame and replays this CALL
+    // (`SubWalkDriver`). That replay captures a later cursor; cutting
+    // there leaves journaled stores in the prefix. The first-enter is
+    // the frame's `entry_pos` (`pyjitpl.py` `history.cut`).
+    let completed_first_enter = peek_completed_subwalk_entry_pos::<Sym>(pc);
+    let first_enter_pos = match completed_first_enter {
+        Some((pos, _)) if pos._count <= pre_fold_pos._count => pos,
+        _ => pre_fold_pos,
+    };
     let rewind = SubWalkRewind {
         pre_fold_pos,
         effects_before: fbw_executed_effect_count(),
         unjournaled_before: fbw_has_unjournaled_effect(),
+        journal_mark: fbw_effect_journal_mark(),
     };
     let saved_subwalk_floor = ctx.fbw_mode.subwalk_floor;
     ctx.fbw_mode.subwalk_floor = Some(pre_fold_pos);
@@ -21848,6 +22023,29 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         .as_ref()
         .and_then(|jc| jc.try_index())
         .unwrap_or(sub_index);
+    let this_callable = callee_jitcode
+        .as_ref()
+        .is_some_and(|jc| majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr));
+    // `rewrite_op_jit_force_virtualizable` left `abort` and no return in
+    // this body. Residualize a callable fnaddr; skip-cut an uncallable
+    // one so the nearest callable ancestor residualizes the CALL.
+    if uses_global_descr_pool && helper_own_body_cannot_finish(helper_index, 0, None) {
+        ctx.fbw_mode.subwalk_floor = saved_subwalk_floor;
+        if this_callable {
+            return residualize_inline_call_or_binop_descent(
+                ctx,
+                code,
+                pc,
+                descr_index,
+                sub_index,
+                int_args,
+                int_arg_concretes,
+                ref_args,
+                float_args,
+            );
+        }
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 });
+    }
     // Number the caller while `transparent_helper_jitcode_index` is still
     // that caller's `MIFrame.jitcode` (`pyjitpl.py` `capture_resumedata`).
     // `run_codewriter_helper_inline_call` switches to `helper_index` after
@@ -21896,7 +22094,8 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         Err(
             error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
             | DispatchError::GuardResumeCoordinateUnavailable { .. }
-            | DispatchError::ResidualCallArgUnbound { .. }),
+            | DispatchError::ResidualCallArgUnbound { .. }
+            | DispatchError::DeclinedResidualCall { .. }),
         ) => {
             // `SwitchToBlackhole` unwinds `_interpret`. A deeper helper
             // already staged its MIFrame; cutting and residualizing this
@@ -21904,13 +22103,14 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             if abort_blackhole_latched() {
                 return Err(error);
             }
-            let now_pos = ctx.trace_ctx.get_trace_position();
             let declined_unbound = declined_unbound_regular_recovers_enclosing(&error);
-            let this_callable = callee_jitcode
-                .as_ref()
-                .is_some_and(|jc| majit_jitcode::codewriter::call::is_callable_fnaddr(jc.fnaddr));
-            if helper_subwalk_executed_residual(&error, residuals_before, pre_fold_pos, now_pos)
+            let residual_declined = matches!(error, DispatchError::DeclinedResidualCall { .. });
+            // `DeclinedResidualCall` is an unexecuted residual (`stop_unexecuted_residual`).
+            // A callable helper that hit one after a nested unbound skip-cut
+            // still cuts to its first-enter and `do_residual_call`s once.
+            if helper_subwalk_executed_residual(&error, residuals_before)
                 && !declined_unbound
+                && !residual_declined
             {
                 return Err(match error {
                     DispatchError::GuardResumeCoordinateUnavailable { .. } => {
@@ -21920,31 +22120,34 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 });
             }
             // Nested unbound helper (symbolic / 0 fnaddr): do not residualize
-            // here and do not re-enter the enclosing callable helper at this
-            // post-store cursor. Skip-cut so that helper's own
-            // `run_inline_call_subwalk` cuts to its first-enter `pre_fold_pos`
-            // (`pyjitpl.py` `history.cut` + `do_residual_call`). BinaryOpDescent
-            // of *this* helper still residualizes after cut.
-            let enclosing_recorded_ops = ctx
-                .fbw_mode
-                .subwalk_floor
-                .is_some_and(|floor| now_pos != floor);
-            if declined_unbound && !this_callable && enclosing_recorded_ops {
-                let would_emit_binop = ref_args.len() == 2
-                    && super::specialize::binary_op_tag_for_helper_index(
-                        ctx.raw_descrs,
-                        sub_index,
-                        int_arg_concretes,
-                    )
-                    .is_some();
-                if !would_emit_binop {
-                    return Err(match error {
-                        DispatchError::GuardResumeCoordinateUnavailable { .. } => {
-                            after_helper_residual_abort(&sub_body.code, error)
-                        }
-                        other => other,
-                    });
+            // here (`bhimpl_inline_call_*` cannot `bh_call_*` it) and do not
+            // re-enter the enclosing callable helper at this post-store
+            // cursor. Skip-cut so that helper's own `run_inline_call_subwalk`
+            // cuts to its first-enter (`pyjitpl.py` `history.cut` +
+            // `do_residual_call`). An intermediate uncallable graph
+            // (`new__spec_*` around `BuildHasherDefault::default`) recorded
+            // no ops of its own; requiring `enclosing_recorded_ops` let it
+            // try `residualize_inline_call_via_fnaddr` and fail, after which
+            // a sibling residual (`get_empty_storage`) declined and the
+            // constructor's items were lost. Skip-cut until a callable
+            // ancestor residualizes the CALL once. A re-entered walk of a
+            // *callable* helper that already journaled stores skip-cuts too:
+            // the wrap rolls back (`journals_clear`) and the Python CALL
+            // residualizes once. Residualizing H on top of those stores
+            // doubles the effect. BinaryOpDescent of *this* helper still
+            // residualizes after cut.
+            let skip_reentry_residual = completed_first_enter
+                .is_some_and(|(_, skip_reentry_residual)| skip_reentry_residual);
+            if (declined_unbound || residual_declined) && !this_callable || skip_reentry_residual {
+                if completed_first_enter.is_some() {
+                    take_completed_nested_subwalk(ctx, pc);
                 }
+                return Err(match error {
+                    DispatchError::GuardResumeCoordinateUnavailable { .. } => {
+                        after_helper_residual_abort(&sub_body.code, error)
+                    }
+                    other => other,
+                });
             }
             // A walk that already applied an effect cannot be handed to the
             // residual call, which would apply it again.  Journaled stores
@@ -21987,65 +22190,93 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 }
                 return Err(error);
             }
-            cut_declined_subwalk(ctx, pre_fold_pos);
-            // A declined helper walk must not become an opaque
-            // `CallMayForce` when the callee is `int_add` / `add` /
-            // `binary_value_from_tag`.  Emit the machine-int body
-            // (`int_add_ovf` + box) the walk would have recorded —
-            // do not re-enter `binary_value_from_tag`, which inlines
-            // `add` and recurses.
-            if ref_args.len() == 2
-                && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(
-                    ctx.raw_descrs,
-                    sub_index,
-                    int_arg_concretes,
-                )
-                && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
-                && dst_bank == 'r'
-            {
-                if fbw_debug_abort_enabled() {
-                    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-                        .map(|jc| jc.name.as_str())
-                        .unwrap_or("<missing>");
-                    eprintln!("[bin-emit] pc={pc} name={name} tag={op_tag}");
-                }
-                if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
-                    super::specialize::try_emit_exact_int_binop(
-                        ctx, pc, op_tag, ref_args, dst, dst_bank,
-                    )
-                })? {
-                    return Ok(outcome.into());
-                }
-                if matches!(
-                    pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
-                    Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
-                ) && let Some(outcome) = spec_gate(SpecFold::Subscr, || {
-                    super::specialize::try_emit_list_int_getitem(ctx, pc, ref_args, dst, dst_bank)
-                })? {
-                    return Ok(outcome.into());
-                }
-            } else if fbw_debug_abort_enabled() {
-                let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-                    .map(|jc| jc.name.as_str())
-                    .unwrap_or("<missing>");
-                eprintln!(
-                    "[bin-emit] miss pc={pc} name={name} i={} r={}",
-                    int_args.len(),
-                    ref_args.len()
-                );
+            // Residualize helper H at H's first-enter, never a re-entry
+            // cursor captured after journaled stores (`pyjitpl.py`
+            // `history.cut` then `do_residual_call`). Consume the completed
+            // first-enter so a later CALL at this pc does not
+            // `take_completed` the stale decline.
+            if completed_first_enter.is_some() {
+                take_completed_nested_subwalk(ctx, pc);
             }
-            residualize_inline_call_via_fnaddr(
+            cut_declined_subwalk(ctx, first_enter_pos);
+            residualize_inline_call_or_binop_descent(
                 ctx,
                 code,
                 pc,
                 descr_index,
+                sub_index,
                 int_args,
+                int_arg_concretes,
                 ref_args,
                 float_args,
             )
         }
         other => other.map(InlineCallOutcome::from),
     }
+}
+
+/// Residualize helper `H` at this CALL (`pyjitpl.py` `do_residual_call`),
+/// or emit the BinaryOpDescent the walk would have recorded for
+/// `int_add` / `add` / `binary_value_from_tag`. Used when the walk is
+/// declined after cut.
+fn residualize_inline_call_or_binop_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    pc: usize,
+    descr_index: usize,
+    sub_index: usize,
+    int_args: &[OpRef],
+    int_arg_concretes: &[ConcreteValue],
+    ref_args: &[OpRef],
+    float_args: &[OpRef],
+) -> Result<InlineCallOutcome, DispatchError> {
+    // A declined helper walk must not become an opaque
+    // `CallMayForce` when the callee is `int_add` / `add` /
+    // `binary_value_from_tag`.  Emit the machine-int body
+    // (`int_add_ovf` + box) the walk would have recorded —
+    // do not re-enter `binary_value_from_tag`, which inlines
+    // `add` and recurses.
+    if ref_args.len() == 2
+        && let Some(op_tag) = super::specialize::binary_op_tag_for_helper_index(
+            ctx.raw_descrs,
+            sub_index,
+            int_arg_concretes,
+        )
+        && let Some((dst_bank, dst, _)) = call_opcode_result_dst(code, pc)
+        && dst_bank == 'r'
+    {
+        if fbw_debug_abort_enabled() {
+            let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+                .map(|jc| jc.name.as_str())
+                .unwrap_or("<missing>");
+            eprintln!("[bin-emit] pc={pc} name={name} tag={op_tag}");
+        }
+        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+            super::specialize::try_emit_exact_int_binop(ctx, pc, op_tag, ref_args, dst, dst_bank)
+        })? {
+            return Ok(outcome.into());
+        }
+        if matches!(
+            pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+            Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
+        ) {
+            if let Some(outcome) = spec_gate(SpecFold::Subscr, || {
+                super::specialize::try_emit_list_int_getitem(ctx, pc, ref_args, dst, dst_bank)
+            })? {
+                return Ok(outcome.into());
+            }
+        }
+    } else if fbw_debug_abort_enabled() {
+        let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+            .map(|jc| jc.name.as_str())
+            .unwrap_or("<missing>");
+        eprintln!(
+            "[bin-emit] miss pc={pc} name={name} i={} r={}",
+            int_args.len(),
+            ref_args.len()
+        );
+    }
+    residualize_inline_call_via_fnaddr(ctx, code, pc, descr_index, int_args, ref_args, float_args)
 }
 
 struct InlineFnaddrCall {
@@ -22726,6 +22957,13 @@ struct CompletedSubWalk {
     caller_pc: usize,
     result: Result<DispatchOutcome, DispatchError>,
     class_of_last_exc_is_const: bool,
+    /// Child's first-enter recorder position (`SubWalkFrame.entry_pos`).
+    /// A replayed CALL residualizes by cutting here, not at the later
+    /// cursor the replay captures (`pyjitpl.py` `history.cut`).
+    entry_pos: majit_metainterp::recorder::TracePosition,
+    /// First enter already journaled stores or executed a residual: the
+    /// replay must not residualize on top (`pyjitpl.py` one residual).
+    skip_reentry_residual: bool,
 }
 
 /// The only state nested `walk()` activations exchange with the outer driver.
@@ -23023,12 +23261,24 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     // movement must not skip the cut to the CALL entry, or
                     // the enclosing helper re-enters at the post-store
                     // cursor and residualizes on top of the stores.
+                    let declined_unbound = match &result {
+                        Err(error) => declined_unbound_regular_recovers_enclosing(error),
+                        Ok(_) => false,
+                    };
+                    let skip_reentry_residual = match &result {
+                        Err(error) => {
+                            error.residual_executed_resume().is_some()
+                                || fbw_journaled_effects_since(&frame.entry_pos) != 0
+                        }
+                        Ok(_) => false,
+                    };
                     let result = match result {
                         Err(error)
-                            if error.residual_executed_resume().is_some()
-                                || (parent.suspend_residual_counts.is_some_and(|before| {
+                            if (error.residual_executed_resume().is_some()
+                                || parent.suspend_residual_counts.is_some_and(|before| {
                                     fbw_executed_residual_counts() != before
-                                }) && !declined_unbound_regular_recovers_enclosing(&error)) =>
+                                }))
+                                && !declined_unbound =>
                         {
                             parent.suspend_trace_position = None;
                             Err(match error {
@@ -23040,10 +23290,20 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         }
                         other => {
                             if other.is_err() {
-                                let position = parent
-                                    .suspend_trace_position
-                                    .take()
-                                    .unwrap_or(frame.entry_pos);
+                                let suspend = parent.suspend_trace_position.take();
+                                // Declined unbound recovers the enclosing
+                                // helper: cut to that helper's first-enter
+                                // (`frame.entry_pos`), not a later nested
+                                // CALL parked in `suspend_trace_position`.
+                                let position = match suspend {
+                                    Some(pos)
+                                        if !declined_unbound
+                                            || pos._count <= frame.entry_pos._count =>
+                                    {
+                                        pos
+                                    }
+                                    _ => frame.entry_pos,
+                                };
                                 trace_ctx.cut_trace_with_snapshots(position);
                                 trace_ctx.heap_cache_mut().reset();
                             }
@@ -23084,6 +23344,8 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         caller_pc,
                         result,
                         class_of_last_exc_is_const: class_state,
+                        entry_pos: frame.entry_pos,
+                        skip_reentry_residual,
                     });
                 }
             }
@@ -23639,6 +23901,30 @@ pub(crate) fn keep_residual_recordings_across_suspend<Sym: WalkSym>() {
     });
 }
 
+/// First-enter recorder position of the helper this CALL already walked.
+///
+/// A nested decline pops that frame and replays the CALL
+/// (`SubWalkDriver`). The replay's `run_inline_call_subwalk` captures a
+/// later `pre_fold_pos`; cutting there leaves journaled stores in the
+/// prefix (`pyjitpl.py` `history.cut` to the helper's own enter).
+fn peek_completed_subwalk_entry_pos<Sym: WalkSym>(
+    pc: usize,
+) -> Option<(majit_metainterp::recorder::TracePosition, bool)> {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: same scoped driver pointer as `take_completed_nested_subwalk`.
+        let exchange = unsafe { &*(pointer as *const SubWalkExchange<'_, Sym>) };
+        let completed = exchange.completed.get(exchange.completed_cursor)?;
+        if completed.parent_id != exchange.active_frame_id || completed.caller_pc != pc {
+            return None;
+        }
+        Some((completed.entry_pos, completed.skip_reentry_residual))
+    })
+}
+
 /// Consume the completed nested helper for `pc`, if this residual opcode is
 /// replaying it. Mirrors the completed-result arm of `run_sub_jitcode_walk_from`.
 pub(crate) fn take_completed_nested_subwalk<Sym: WalkSym>(
@@ -23773,6 +24059,14 @@ mod subwalk_checkpoint_tests {
             caller_pc,
             result: Err(DispatchError::UndecodableOpcode { pc: leaf_pc }),
             class_of_last_exc_is_const: false,
+            entry_pos: majit_metainterp::recorder::TracePosition {
+                _pos: 0,
+                _count: 0,
+                _index: 0,
+                snapshot_data_len: 0,
+                snapshot_array_data_len: 0,
+            },
+            skip_reentry_residual: false,
         };
         let mut exchange = SubWalkExchange::<crate::state::PyreSym> {
             pending: None,
@@ -24455,7 +24749,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 
     let descent_journal_before = fbw_store_journal_len();
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
-    let walk_start_pos = ctx.trace_ctx.get_trace_position();
     let residuals_before = fbw_executed_residual_counts();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
@@ -24488,12 +24781,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // After `do_residual_call` already ran, keep the error so
             // `latch_abort_blackhole_innermost` resumes past that residual
             // (`AfterResidualCall` / helper pc), not a parent-fnaddr residualize.
-            let residual_executed = helper_subwalk_executed_residual(
-                &error,
-                residuals_before,
-                walk_start_pos,
-                ctx.trace_ctx.get_trace_position(),
-            );
+            let residual_executed = helper_subwalk_executed_residual(&error, residuals_before);
             let error = match error {
                 DispatchError::GuardResumeCoordinateUnavailable { pc }
                     if helper_index.is_some() && !residual_executed =>
@@ -24577,12 +24865,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     if dst_bank == 'r'
         && args.len() == 1
-        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
-            jc.code.as_ptr() == sub_body.code.as_ptr()
-                && (jc.name == "invert"
-                    || jc.name.ends_with("::invert")
-                    || jc.name.ends_with("::invert_inner"))
-        })
+        && super::specialize::jitcode_is_unary_invert(ctx.raw_descrs, sub_index, &sub_body)
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
         if let Some(outcome) =
@@ -24594,12 +24877,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
 
     if dst_bank == 'r'
         && args.len() == 1
-        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
-            jc.code.as_ptr() == sub_body.code.as_ptr()
-                && (jc.name == "pos"
-                    || jc.name.ends_with("::pos")
-                    || jc.name.ends_with("::pos_inner"))
-        })
+        && super::specialize::jitcode_is_unary_pos(ctx.raw_descrs, sub_index, &sub_body)
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
         if let Some(outcome) =

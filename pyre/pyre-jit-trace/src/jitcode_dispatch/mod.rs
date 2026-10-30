@@ -5796,6 +5796,10 @@ pub fn walk<Sym: WalkSym>(
                 // A capture refuse already at that `-live-` (`Orthodox` with
                 // `symbolic == 0`) latches there too: `DeclinedResidualCall`
                 // would resume a live marker as an unexecuted residual.
+                // The abort pc must be this frame's `opcode_position`: a
+                // nested uncallable helper's own `-live-` (pickle `tell_pos`
+                // pc=8) is not this frame's residual dest, and wrapping it
+                // skipped the enclosing `history.cut` + `do_residual_call`.
                 // A later unexecuted residual stays itself so blackhole
                 // runs it; wrapping that as `AfterResidualCall` would skip it.
                 let residual_ran_in_helper = helper_convertible
@@ -5811,6 +5815,7 @@ pub fn walk<Sym: WalkSym>(
                     }
                     DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 }
                         if residual_ran_in_helper
+                            && pc == opcode_position
                             && crate::jitcode_runtime::decode_op_at(code, pc)
                                 .is_some_and(|op| op.opname == "live") =>
                     {

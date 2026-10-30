@@ -445,7 +445,10 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// paused Python/portal and helper sections
 /// (`walker_capture_transparent_helper_snapshot` / `capture_resumedata`).
 /// Capture encodes that section from `MIFrame.jitcode` (`jitcode.index`);
-/// the walk stamps it as `transparent_helper_jitcode_index`.
+/// the walk stamps it as `transparent_helper_jitcode_index`. Leftover
+/// Converted helpers (`HelperChain::Collapsed`) go through
+/// `numbered_helper_guard_resume` (runnable Frames, else CALL orgpc or
+/// residualize).
 pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
@@ -608,7 +611,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         if helper_chain == HelperChain::Unresumable {
             return Err(DispatchError::callee_inline_unsupported(op_pc));
         }
-        if helper_chain == HelperChain::Numbered {
+        if helper_chain == HelperChain::Numbered || helper_chain == HelperChain::Collapsed {
+            // Leftover Converted helpers (`HelperChain::Collapsed`) cannot
+            // number a section of their own (`HelperResume::CallEntry`).
+            // Routing them through `numbered_helper_guard_resume` still
+            // records a runnable leftover body as helper-innermost Frames
+            // (the leftover multi-frame snapshot that keeps CALL-boundary
+            // from re-executing an inlined Python CALL) and refuses an
+            // unrunnable leftover (`history.cut` + `do_residual_call`, or
+            // CALL orgpc when the leftover recorded nothing). Unconditional
+            // leftover Python MF retraces exception/iteration CALLs until
+            // abort; unconditional residualize re-opens CALL-boundary extras.
             match numbered_helper_guard_resume(
                 ctx,
                 op_pc,
@@ -652,10 +665,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // not the last op). Overwriting that with `LastOp` attaches the
             // snapshot to a later op and leaves the guard at `resume_pos == -1`.
             //
-            // A transparent helper whose sections cannot be numbered (no
-            // `HelperChain::Numbered` level) resumes at the Python CALL orgpc
-            // (`generate_guard(resumepc=orgpc)`), the carried path below.
-            // Numbered after-residual still takes `Frames` above
+            // A transparent helper whose sections cannot be numbered takes
+            // the Numbered-or-Collapsed arm above. After-residual numbers
+            // Frames only when the remaining section cannot reach a blocker
             // (`capture_resumedata(after_residual_call=True)`).
             let guard_stamp = scope.guard_stamp;
             return walker_capture_multi_frame_inline_snapshot(
@@ -3419,9 +3431,9 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     }
     compute_inline_helper_call_entry_frame(ctx, call_jit_pc).map(|caller| {
         Some(HelperLevel {
-            parents: vec![caller],
+            parents: vec![caller.clone()],
             resume: HelperResume::CallEntry,
-            call_entry: HelperCallEntry::Unavailable,
+            call_entry: HelperCallEntry::Frame(caller),
             entry_array_len: None,
             entry_trace_index: 0,
         })
@@ -3450,8 +3462,9 @@ enum NumberedHelperGuard {
 /// CALL that entered the outermost helper level instead ([`HelperCallEntry`]),
 /// at that CALL's orgpc (`generate_guard(resumepc=orgpc)`), which re-runs
 /// that call. An `after_residual_call` guard already ran that
-/// residual, so it keeps the numbered Frames (`generate_guard` with
-/// `after_residual_call=True`) before `heap_moved` can refuse CALL-entry.
+/// residual; it still numbers Frames only when the remaining section
+/// cannot reach a blocker (`generate_guard` with
+/// `after_residual_call=True`). Otherwise `heap_moved` refuses CALL-entry.
 /// A runnable numbering (`capture_resumedata`) succeeds at any helper depth.
 /// CALL-entry is refused once a heap-writing residual (live heap or a user
 /// frame, or an unjournaled `ForIterNext`) or a journaled live-heap effect
@@ -3501,9 +3514,9 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
                 match helper_guard_fail_resume_pc(frame.jitcode_index as usize, pc, is_true) {
                     Some(fail_pc) => fail_pc,
                     // `generate_guard(resumepc=orgpc)`: the fail arm is the
-                    // other successor of `goto_if_not`. A `-live-` orgpc does
-                    // not name that opcode (`helper_guard_fail_resume_pc`), so
-                    // this section cannot be numbered.
+                    // other successor of `goto_if_not`. `None` when the
+                    // coordinate is not a `goto_if_not_*` and not the
+                    // `-live-` that immediately precedes one.
                     None => return false,
                 }
             }
@@ -3558,13 +3571,17 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     };
     // `generate_guard` (`pyjitpl.py`) + `capture_resumedata(
     // after_residual_call=True)` numbers the helper MIFrame at the live
-    // after the call. `heap_moved` only refuses a CALL-entry re-run.
-    if after_residual_call {
-        return Ok(NumberedHelperGuard::Frames(parent_frames));
-    }
-    // `opimpl_goto_if_not` → `generate_guard` → `capture_resumedata`
-    // numbers every MIFrame; no helper-depth cut (`helper_levels > 1`).
+    // after the call when that section can finish. A nested interpreted
+    // `inline_call_*` that can still reach `reject_unresolved_call` /
+    // `abort` is a blocker; an empty Void callee is not.
+    // `heap_moved` then refuses CALL-entry so the residual is not re-run.
     if runnable {
+        debug_assert!(
+            parent_frames
+                .last()
+                .is_some_and(|frame| matches!(frame.resume_coord, ParentResumeCoord::Backxlat(_))),
+            "numbered helper innermost is a helper section, not a pending CALL dest"
+        );
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
     let refused = DispatchError::OrthodoxSubWalkTraceUnsupported {
@@ -3809,6 +3826,12 @@ fn paused_live_result_color(pjc: &crate::PyJitCode, call_jit_pc: usize) -> Optio
 /// list, not in the `RegisterBank` slots. Those lists are `Rc` shared
 /// with the live MIFrame (`replace_active_box_in_frame`), so a write
 /// here would also clear a nested helper's argument at the same color.
+///
+/// Only a paused CALLER reaches here (`inline_parent_from_paused_live`).
+/// The innermost numbered helper section is collected by
+/// [`collect_helper_section_boxes`] and must not blank dest: a helper
+/// that can reach `reject_unresolved_call` is not numbered
+/// (`helper_resume_reaches_blocker`).
 fn blank_pending_call_dest_in_boxes(
     boxes: &mut [OpRef],
     jitcode_index: i32,
@@ -3986,9 +4009,11 @@ fn innermost_helper_resume_pc(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     }
     // `get_list_of_active_boxes` (`pyjitpl.py`): a plain guard reads
-    // `self.pc - SIZE_LIVE_OP`. A branch guard's `op_pc` is already that
-    // `-live-` (`generate_guard(resumepc=orgpc)`); keep it. A helper
-    // guard that is not itself a `-live-` is not always adjacent
+    // `self.pc - SIZE_LIVE_OP`. A branch guard's capture_pc is already that
+    // `-live-` (`guarded_branch_core` `live_before_jit_pc`); keep it so
+    // the live set decodes. `generate_guard(resumepc=orgpc)` names the
+    // following `goto_if_not_*`; `helper_guard_fail_resume_pc` steps there.
+    // A helper guard that is not itself a `-live-` is not always adjacent
     // (`preceding_live_marker` requires `next_pc == op_pc`): the walk's
     // `live_before_jit_pc` is then the marker. `resume_marker_for_jitcode_pc`
     // can name a later `-live-` (getitem_slot op_pc=74 → marker=80);

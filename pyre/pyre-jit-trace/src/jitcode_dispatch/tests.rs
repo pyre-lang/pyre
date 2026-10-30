@@ -2037,9 +2037,9 @@ fn a_reachable_abort_is_a_resume_blocker() {
 }
 
 /// A continuation `inline_call` uses the callee's whole-body summary. An
-/// `abort` there is invisible to admission. The resume scan treats that
-/// callee as a blocker only when the blackhole would interpret it
-/// (`interpret_unresolved_inline_call`, `fnaddr=None`) and reach the abort.
+/// `abort` there is invisible to admission. The resume scan treats an
+/// interpreted callee (`interpret_unresolved_inline_call`, `fnaddr=None`)
+/// as a blocker, so a reachable abort inside that callee is reported.
 #[test]
 fn a_callees_reachable_abort_is_a_resume_blocker() {
     let real = 0x1234_5678i64;
@@ -2057,9 +2057,14 @@ fn a_callees_reachable_abort_is_a_resume_blocker() {
     assert_eq!(whole.blocker_effect_free, None);
     assert_eq!(whole.blocker_after_effect, None);
 
-    let resume = super::inline_call::summarize_body_blockers_resume(0, &code, 1, &[real], |d| {
-        (d == 7).then_some(callee)
-    });
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[real],
+        |d| (d == 7).then_some(callee),
+        |d| (d == 7).then_some(0),
+    );
     assert_eq!(resume.blocker_effect_free, Some(0));
 }
 
@@ -2086,6 +2091,65 @@ fn a_callable_callees_reachable_abort_is_not_a_resume_blocker() {
     );
     assert_eq!(resume.blocker_effect_free, None);
     assert_eq!(resume.blocker_after_effect, None);
+}
+
+/// A nested `inline_call_*` whose callee `fnaddr` is not callable is
+/// interpreted (`interpret_unresolved_inline_call`). An empty / pure
+/// callee finishes; the uncallable fnaddr alone is not a resume blocker
+/// (`BuildHasherDefault::default`). A residual or `abort` that callee
+/// can reach still is: numbering would let `reject_unresolved_call`
+/// bail with a blank dest. Whole-body admission does not name the
+/// uncallable callee itself as a blocker.
+#[test]
+fn an_uncallable_inline_callee_is_a_resume_blocker() {
+    let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments(["hasher"]);
+    assert!(!majit_jitcode::codewriter::call::is_callable_fnaddr(
+        symbolic
+    ));
+    let empty = majit_jitcode::codewriter::jitcode::DescentBlockerSummary::default();
+    let residual = majit_jitcode::codewriter::jitcode::DescentBlockerSummary {
+        blocker_effect_free: Some(0),
+        ..Default::default()
+    };
+    let mut code = inline_call_with_descr(7);
+    code.extend(void_return());
+
+    let whole = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |d| {
+        (d == 7).then_some(empty)
+    });
+    assert_eq!(whole.blocker_effect_free, None);
+    assert_eq!(whole.blocker_after_effect, None);
+
+    let resume_empty = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[symbolic],
+        |d| (d == 7).then_some(empty),
+        |d| (d == 7).then_some(symbolic),
+    );
+    assert_eq!(resume_empty.blocker_effect_free, None);
+    assert_eq!(resume_empty.blocker_after_effect, None);
+
+    let resume = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[symbolic],
+        |d| (d == 7).then_some(residual),
+        |d| (d == 7).then_some(symbolic),
+    );
+    assert!(resume.blocker_effect_free.is_some());
+
+    let resume_unbound = super::inline_call::summarize_body_blockers_resume_fnaddr(
+        0,
+        &code,
+        1,
+        &[],
+        |d| (d == 7).then_some(residual),
+        |d| (d == 7).then_some(0),
+    );
+    assert!(resume_unbound.blocker_effect_free.is_some());
 }
 
 /// Resume does not treat a residual whose funcbox register is a runtime-only

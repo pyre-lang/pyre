@@ -624,6 +624,9 @@ pub struct DescentBlockerSummary {
     /// the two slots above); the capture-time resume scan does, because
     /// `bhimpl_abort` cannot finish a helper section.
     pub has_reachable_abort: bool,
+    /// Whether a `*_return` opcode is reachable from this body's entry,
+    /// including through `inline_call_*` callees.
+    pub has_reachable_return: bool,
 }
 
 impl DescentBlockerSummary {
@@ -638,6 +641,7 @@ impl DescentBlockerSummary {
             body_not_walked: self.body_not_walked || other.body_not_walked,
             first_effect_pc: self.first_effect_pc.or(other.first_effect_pc),
             has_reachable_abort: self.has_reachable_abort || other.has_reachable_abort,
+            has_reachable_return: self.has_reachable_return || other.has_reachable_return,
         }
     }
 }
