@@ -2203,29 +2203,6 @@ pub(crate) struct CompiledEntry<M> {
     pub(crate) meta: std::sync::Arc<M>,
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
-    /// Loop-header bytecode pc this loop was compiled at. A bridge trace
-    /// (`is_bridge_trace`) closes by jumping to its parent loop, which lives at
-    /// this header pc — not at the bridge's own `resume_pc`.
-    ///
-    /// Held on the entry rather than in a green-key-keyed side table so it
-    /// cannot outlive the artifact it describes: a `u64` side table keyed by
-    /// `get_uhash` is keyed by a *hash*, and nothing makes its retirement
-    /// atomic with the loop's (merge-point PC). Every replace path must carry it forward
-    /// off the old entry — a retrace compiles the same loop at the same header,
-    /// so losing it here silently strands every bridge that closes on it.
-    ///
-    /// The five carry-forwards this needs (`compile_loop`, `compile_retrace`,
-    /// `finish_and_compile`, `compile_simple_loop`, `compile_entry_bridge`) are
-    /// **not covered by any test**, measured rather than assumed: deleting all
-    /// five leaves the whole `majit-metainterp` suite green at 1566/1566. The
-    /// old side table needed no carry-forward because a replace never touched
-    /// it, so this hazard is new with the move and is currently held by review
-    /// alone. Before editing a replace path, note that the compiler cannot help
-    /// you here and neither can the suite.
-    ///
-    /// `None` means no header pc was recorded, which is the normal state for an
-    /// entry installed by any path other than a loop close.
-    pub(crate) loop_header_pc: Option<usize>,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
     pub(crate) traces: crate::FxIndexMap<u64, CompiledTrace>,
     /// Box identity plan Phase E: high-water OpRef at which a bridge
@@ -2251,7 +2228,6 @@ impl<M> CompiledEntry<M> {
     pub(crate) fn carried_fields(&self) -> CarriedFields {
         CarriedFields {
             next_global_opref: self.next_global_opref,
-            loop_header_pc: self.loop_header_pc,
         }
     }
 }
@@ -2259,23 +2235,19 @@ impl<M> CompiledEntry<M> {
 /// The fields **every** `compiled_loops` replace path must carry forward off the
 /// entry it displaces, bundled so they travel with the removal.
 ///
-/// Both are entry-local state that describes the *green key*, not the artifact:
 /// `next_global_opref` keeps a later bridge's OpRefs disjoint from an earlier
-/// one's, and `loop_header_pc` is the header a closing bridge jumps to. A
-/// replacement that drops either strands work aimed at the key — silently, and
-/// see `loop_header_pc`'s own doc for why neither the compiler nor the suite
-/// will tell you.
+/// one's. A replacement that drops it strands work aimed at the key.
 ///
-/// These two are carried at **all five** replace paths. They are deliberately
-/// the *only* members: the label list is `JitCellToken.target_tokens`
+/// This is carried at **all five** replace paths. It is deliberately the
+/// *only* member: the label list is `JitCellToken.target_tokens`
 /// (`history.py`), and a token minted by `make_jitcell_token` starts with
 /// none, so no replace path inherits the displaced loop's labels. Adding a
 /// field here that is not universal re-introduces exactly the
-/// bug this type exists to prevent.
+/// bug this type exists to prevent. A loop's merge-point pc lives on the
+/// cell's greens (`warmstate.py` `BaseJitCell` / `JitCell`), not here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarriedFields {
     pub(crate) next_global_opref: u32,
-    pub(crate) loop_header_pc: Option<usize>,
 }
 
 /// Compute the smallest fresh OpRef strictly above every position
@@ -10078,17 +10050,11 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                // Carried forward because this replaces the entry at the same
-                // green key: the loop still closes at the header it closed at
-                // before, so dropping the pc here would strand every bridge
-                // that aims its closing JUMP at it.
-                let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Box Identity Phase E.2b parity: preserve old entry's
                     // high-water so previously stored bridges' OpRefs stay
                     // disjoint from any future bridge.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    carried_loop_header_pc = carried.loop_header_pc;
                     self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::debug::have_debug_prints() {
@@ -10108,7 +10074,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         // Box identity: record Phase 2's final
                         // OpRef high-water so later bridges can allocate in a
@@ -11605,12 +11570,9 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
 
-                // Carried forward for the same reason as the compile_loop site.
-                let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Box Identity Phase E.2b parity: see compile_loop site.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    carried_loop_header_pc = carried.loop_header_pc;
                     self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 if crate::debug::have_debug_prints() {
@@ -11637,7 +11599,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         // Box identity: Phase 2's final OpRef high-water, as at
                         // the main compile site.
@@ -12695,14 +12656,11 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 {
-                    // Carried forward for the same reason as the compile_loop site.
-                    let mut carried_loop_header_pc = None;
                     if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                         // Box Identity Phase E.2b parity: preserve old entry's
                         // high-water so previously stored bridges' OpRefs stay
                         // disjoint from any future bridge.
                         next_global_opref = next_global_opref.max(carried.next_global_opref);
-                        carried_loop_header_pc = carried.loop_header_pc;
                         self.retire_compiled_entry(green_key, old_entry, &mut traces);
                     }
                     // The retired entry's count does not follow it here. The
@@ -12738,7 +12696,6 @@ impl<M: Clone> MetaInterp<M> {
                         CompiledEntry {
                             meta: Arc::new(meta),
                             root_trace_id: trace_id,
-                            loop_header_pc: carried_loop_header_pc,
                             traces,
                             next_global_opref,
                         },
@@ -13201,12 +13158,9 @@ impl<M: Clone> MetaInterp<M> {
                         terminal_exit_layouts,
                     },
                 );
-                // Carried forward for the same reason as the compile_loop site.
-                let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(green_key) {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    carried_loop_header_pc = carried.loop_header_pc;
                     self.retire_compiled_entry(green_key, old_entry, &mut traces);
                 }
                 let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
@@ -13216,7 +13170,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         next_global_opref,
                     },
@@ -13510,35 +13463,28 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Record the loop-header bytecode pc for a compiled-loop green key, so a
-    /// later bridge whose guard belongs to this loop knows where its parent
-    /// loop header lives (the close target of the bridge JUMP).
+    /// Merge-point pc of the cell `cell_key` on driver `jd_no`.
     ///
-    /// A key with no `compiled_loops` entry is dropped rather than recorded:
-    /// the pc describes a compiled loop, so with no loop there is nothing for
-    /// it to describe and no reader that could act on it. Callers record after
-    /// a compile reports success, at which point the entry exists.
-    pub fn record_loop_header_pc(&mut self, green_key: u64, header_pc: usize) {
-        if let Some(entry) = self.compiled_entry_mut(green_key) {
-            entry.loop_header_pc = Some(header_pc);
+    /// `warmstate.py` `JitCell` / `make_jitcell_subclass` stores the greenargs
+    /// on the cell. `installed_greenkey` rebuilds them with that driver's
+    /// `_green_args_spec`. The merge-point walker already names the pc as the
+    /// first Int green (`mp_green_pc` / `green_int[0]`, `bhimpl_jit_merge_point`
+    /// kind bank) — not declaration-order slot 0, which is a Ref when the
+    /// greens start with a pointer. A driver with no Int green, or a key with
+    /// no cell, has no merge-point pc.
+    pub fn merge_point_pc_for_driver_cell(&self, jd_no: usize, cell_key: u64) -> Option<usize> {
+        let spec = self.staticdata.jitdrivers_sd.get(jd_no)?.green_args_spec();
+        if !spec.iter().any(|tp| *tp == majit_ir::GreenType::Int) {
+            return None;
         }
-    }
-
-    /// Loop-header bytecode pc recorded for a compiled-loop green key.
-    ///
-    /// `None` covers both "no loop is compiled at this key" and "one is, but it
-    /// closed somewhere other than a loop header". Neither is an error: the
-    /// callers use the pc to aim a bridge's closing JUMP, and not having one is
-    /// a reason to decline the bridge, never to assume a pc.
-    pub fn loop_header_pc_for(&self, green_key: u64) -> Option<usize> {
-        self.compiled_entry(green_key)
-            .and_then(|entry| entry.loop_header_pc)
-    }
-
-    /// Runtime LABEL resume pc for that driver's cell.
-    pub fn loop_header_pc_for_driver(&self, jd_no: usize, green_key: u64) -> Option<usize> {
-        self.compiled_entry_on_driver(jd_no, green_key)
-            .and_then(|entry| entry.loop_header_pc)
+        let key = self
+            .warm_state_ref_for_driver(jd_no)?
+            .installed_greenkey(cell_key, &spec)?;
+        key.types
+            .iter()
+            .zip(key.values.iter())
+            .find(|(tp, _)| **tp == majit_ir::GreenType::Int)
+            .and_then(|(_, v)| usize::try_from(*v).ok())
     }
 
     /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
@@ -16416,15 +16362,10 @@ impl<M: Clone> MetaInterp<M> {
                 // the jitcell and keeps the old token alive; it never takes the
                 // loop's own TargetTokens away, and the fresh token's
                 // `target_tokens` stays empty.
-                // Carried forward: the replacement entry inherits the retired
-                // loop's close target, and a key with no header pc is
-                // unreachable to a closing bridge.
-                let mut carried_loop_header_pc = None;
                 if let Some((old_entry, carried)) = self.take_entry_for_replace(original_green_key)
                 {
                     // Box Identity Phase E.2b parity: see finish_and_compile.
                     next_global_opref = next_global_opref.max(carried.next_global_opref);
-                    carried_loop_header_pc = carried.loop_header_pc;
                     self.retire_compiled_entry(original_green_key, old_entry, &mut traces);
                 }
                 // The retrace budget does not carry over. `token`
@@ -16439,7 +16380,6 @@ impl<M: Clone> MetaInterp<M> {
                     CompiledEntry {
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
-                        loop_header_pc: carried_loop_header_pc,
                         traces,
                         next_global_opref,
                     },
@@ -25405,7 +25345,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -27837,7 +27776,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -27898,7 +27836,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -27952,7 +27889,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -28016,7 +27952,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -28131,7 +28066,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -30524,7 +30458,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -30608,7 +30541,6 @@ mod metainterp_static_data_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -32195,7 +32127,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces,
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -32260,7 +32191,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -32306,7 +32236,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -32354,7 +32283,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -32459,7 +32387,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces,
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -32889,7 +32816,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -33037,7 +32963,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -33309,7 +33234,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -34241,7 +34165,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 0,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -34828,7 +34751,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 101,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -34953,7 +34875,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: Some(0),
                 next_global_opref: 0,
             },
         );
@@ -35020,7 +34941,6 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 102,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -36814,7 +36734,6 @@ mod bridge_cell_token_tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: green_key,
                 traces: crate::FxIndexMap::default(),
-                loop_header_pc: None,
                 next_global_opref: 0,
             },
         );
@@ -36864,7 +36783,6 @@ mod loop_side_table_tests {
             meta: std::sync::Arc::new(()),
             root_trace_id,
             traces: crate::FxIndexMap::default(),
-            loop_header_pc: None,
             next_global_opref: 0,
         }
     }
@@ -36922,10 +36840,8 @@ mod loop_side_table_tests {
         ));
     }
 
-    /// Register a loop at `green_key` with its header pc recorded.
     fn record_loop(meta: &mut MetaInterp<()>, green_key: u64, root_trace_id: u64) {
         meta.insert_compiled_loop(green_key, compiled_entry(root_trace_id));
-        meta.record_loop_header_pc(green_key, green_key as usize);
     }
 
     #[test]
@@ -36984,26 +36900,34 @@ mod loop_side_table_tests {
     }
 
     #[test]
-    fn runtime_side_tables_read_the_executing_driver() {
-        // warmspot.py handle_jitexception lives on jitdriver_sd.warmstate.
-        // Leftover active_jitdriver_sd is the last traced driver.
+    fn merge_point_pc_for_driver_cell_reads_the_owning_drivers_cell() {
+        // The first Int green on the owning driver's cell is the merge-point
+        // pc (`mp_green_pc` / `green_int[0]`). Leftover `active_jitdriver_sd`
+        // is a different WarmEnterState (`warmstate.py` `JitCell`).
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
-        let jd0 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
-        let jd1 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
-        let green_key = gk(17);
-        meta.active_jitdriver_sd = Some(jd1);
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
-        meta.record_loop_header_pc(green_key.get_uhash(), 99);
+        let schema =
+            || JitDriverStaticData::new(vec![("code", Type::Ref), ("pc", Type::Int)], vec![]);
+        let jd0 = meta.register_jitdriver_sd(schema());
+        let jd1 = meta.register_jitdriver_sd(schema());
+        let key = majit_ir::GreenKey::with_types(
+            vec![0x1111, 4242],
+            vec![majit_ir::GreenType::Ref, majit_ir::GreenType::Int],
+        );
+        let _ = meta.warm_state_for_driver(jd1).ensure_cell_for_key(&key);
+        let cell_key = meta
+            .warm_state_for_driver(jd1)
+            .cell_key_for(&key)
+            .expect("ensure_cell_for_key installed the source cell");
         meta.active_jitdriver_sd = Some(jd0);
         assert!(
-            meta.loop_header_pc_for(green_key.get_uhash()).is_none(),
-            "ambient loop_header_pc_for follows leftover active_jitdriver_sd"
+            meta.merge_point_pc_for_driver_cell(jd0, cell_key).is_none(),
+            "leftover driver has no cell at this key"
         );
         assert_eq!(
-            meta.loop_header_pc_for_driver(jd1, green_key.get_uhash()),
-            Some(99),
-            "LABEL resume pc must come from the executing driver's compiled_loops row"
+            meta.merge_point_pc_for_driver_cell(jd1, cell_key),
+            Some(4242),
+            "owning cell's first Int green is the merge-point pc, not slot 0"
         );
     }
 
@@ -37265,7 +37189,7 @@ mod loop_side_table_tests {
     }
 
     fn has_side_tables(meta: &MetaInterp<()>, green_key: u64) -> bool {
-        meta.loop_header_pc_for(green_key).is_some()
+        meta.has_compiled_loop_entry(green_key)
     }
 
     #[test]
@@ -37289,8 +37213,8 @@ mod loop_side_table_tests {
         meta.clear_compiled_loops();
 
         assert!(meta.compiled_loops.is_empty());
-        assert!(meta.loop_header_pc_for(7).is_none());
-        assert!(meta.loop_header_pc_for(8).is_none());
+        assert!(!has_side_tables(&meta, 7));
+        assert!(!has_side_tables(&meta, 8));
     }
 
     #[test]
@@ -37309,41 +37233,21 @@ mod loop_side_table_tests {
         assert!(has_side_tables(&meta, 9));
     }
 
-    /// The header pc describes a compiled loop, so a key with no entry has
-    /// nothing to describe. Recording against one is dropped rather than
-    /// stored: the old `u64`-keyed side table accepted such a write and kept
-    /// it forever, since only a loop retirement swept the table and no loop
-    /// was ever there to retire.
-    #[test]
-    fn recording_a_header_pc_for_a_key_with_no_compiled_loop_stores_nothing() {
-        let mut meta = MetaInterp::<()>::new(1);
-
-        meta.record_loop_header_pc(7, 42);
-
-        assert_eq!(
-            meta.loop_header_pc_for(7),
-            None,
-            "no compiled loop at 7, so no header pc is retained"
-        );
-        assert!(meta.compiled_loops.is_empty(), "and no entry is conjured");
-    }
-
     /// `take_entry_for_replace` is the one door onto a `compiled_loops`
     /// replace, and the pair it returns is the mechanism: **the displaced entry
-    /// cannot be obtained without its carried state.** Ablation — drop either
-    /// member of `CarriedFields`, or stop copying one in `carried_fields()` —
-    /// and this goes red.
+    /// cannot be obtained without its carried state.** Ablation — drop
+    /// `CarriedFields.next_global_opref`, or stop copying it in
+    /// `carried_fields()` — and this goes red.
     ///
     /// Passing does **not** mean the five production replace paths are
     /// covered. It pins the helper's contract, not its use. Nothing in this
     /// crate can drive a production compile path, so a site that
     /// simply never calls this is still invisible to the suite.
     #[test]
-    fn take_entry_for_replace_returns_the_entry_with_both_carried_fields() {
+    fn take_entry_for_replace_returns_the_entry_with_the_carried_next_global_opref() {
         let mut meta = MetaInterp::<()>::new(1);
         let mut entry = compiled_entry(101);
         entry.next_global_opref = 37;
-        entry.loop_header_pc = Some(11);
         meta.insert_compiled_loop(7, entry);
 
         let (old_entry, carried) = meta
@@ -37355,9 +37259,8 @@ mod loop_side_table_tests {
             carried,
             CarriedFields {
                 next_global_opref: 37,
-                loop_header_pc: Some(11),
             },
-            "and both carried fields travel with the removal"
+            "the carried high-water travels with the removal"
         );
         assert!(
             !meta.has_compiled_loop_entry(7),
@@ -37366,51 +37269,6 @@ mod loop_side_table_tests {
         assert!(
             meta.take_entry_for_replace(7).is_none(),
             "a key with no entry yields nothing to carry"
-        );
-    }
-
-    /// Pins the hazard every `compiled_loops` replace path has to defend
-    /// against: the pc now lives *on* the entry, so installing a fresh entry
-    /// at a key that already had one destroys the pc unless the caller copies
-    /// it across. `compile_retrace` / `finish_and_compile` /
-    /// `compile_simple_loop` / `compile_entry_bridge` all replace without
-    /// re-recording — only `compile_loop`'s caller records afterwards.
-    ///
-    /// If this test ever fails it means the entry-replacement contract moved.
-    /// If a *production* replace path drops the pc, this test still passes —
-    /// it builds its own entries and never routes through a compile path. That
-    /// blindness is why the carry is being moved behind
-    /// `take_entry_for_replace`, where omitting it is not expressible, rather
-    /// than left as two hand-written lines per site: a test that cannot catch a
-    /// dropped carry is an argument for making the drop unrepresentable, not
-    /// for repeating the carry. All five now go through the helper, so the pc
-    /// arrives at each site whether or not the site remembers to ask for it.
-    #[test]
-    fn installing_a_fresh_entry_at_a_live_key_drops_the_header_pc() {
-        let mut meta = MetaInterp::<()>::new(1);
-        record_loop(&mut meta, 7, 100);
-        assert_eq!(meta.loop_header_pc_for(7), Some(7));
-
-        // A replace that does not carry the pc forward, as the production
-        // paths would if their `carried_loop_header_pc` were dropped.
-        meta.insert_compiled_loop(7, compiled_entry(101));
-
-        assert_eq!(
-            meta.loop_header_pc_for(7),
-            None,
-            "the pc lives on the entry, so a bare replace loses it"
-        );
-
-        // And the carry-forward the production sites perform restores it.
-        let carried = Some(7usize);
-        let mut fresh = compiled_entry(102);
-        fresh.loop_header_pc = carried;
-        meta.insert_compiled_loop(7, fresh);
-
-        assert_eq!(
-            meta.loop_header_pc_for(7),
-            Some(7),
-            "copying old_entry.loop_header_pc across keeps the close target"
         );
     }
 }
