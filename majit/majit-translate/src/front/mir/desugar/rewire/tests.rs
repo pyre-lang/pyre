@@ -161,6 +161,12 @@ fn map_err_capture_requires_the_core_result_callee() {
         assert!(is_core_result_map_err_path(path), "{path}");
     }
     for path in [
+        "result::Result::map_err__spec____TryReserveError_PyError_closure_d34b494764821c2f",
+        "core::result::<Impl>::map_err__spec_u32_TryFromIntError_fn",
+    ] {
+        assert!(is_core_result_map_err_path(path), "{path}");
+    }
+    for path in [
         "map_err",
         "Result::map_err",
         "mycrate::result::<Impl>::map_err",

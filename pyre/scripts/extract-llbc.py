@@ -126,6 +126,8 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::result::_::as_ref",
     "--include",
+    "core::result::_::map_err",
+    "--include",
     "core::option::_::map_or",
     "--include",
     "core::option::_::map",

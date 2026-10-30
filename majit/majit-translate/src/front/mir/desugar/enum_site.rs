@@ -1841,8 +1841,8 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve `Result<T, E>::map_err(result, closure) -> Result<T, F>` into
-    /// the owners and payload types needed by `front::result_map_err`.
+    /// Resolve a dest-is-carrier `map_err` into the owners and payload
+    /// types needed by the LastException rewrite in `front::result_map_err`.
     pub(in crate::front::mir) fn recognize_result_map_err_site(
         &self,
         recv_ty: Option<&TyRef>,
@@ -1871,7 +1871,6 @@ impl<'a> Lowering<'a> {
         );
         let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
         let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;
-        let result_ok_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?;
         let result_err_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?;
         // `map_err(named_fn)` passes a function item, which has no closure
         // ADT. `map_err(|e| …)` passes the closure env.
@@ -1894,7 +1893,6 @@ impl<'a> Lowering<'a> {
             receiver_ok_owner,
             receiver_err_owner,
             result_owner,
-            result_ok_owner,
             result_err_owner,
             call_once_owner,
             ok_ty: if crate::front::result_exc::tyref_result_ok_is_unit(recv_ty, self.llbc)

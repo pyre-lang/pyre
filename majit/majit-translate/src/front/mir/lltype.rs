@@ -10392,21 +10392,82 @@ pub(in crate::front::mir) fn resolve_trait_assoc_type_value<'a>(
     // instantiation, and scanning every impl each time is quadratic in
     // the crate.
     llbc.unique_trait_assoc_value(trait_id, assoc)
+        .or_else(|| assoc_value_for_matching_impl(llbc, traitref, trait_id, assoc))
 }
 
-/// `types[entry].skip_binder.value` of `impl_id` whose `TraitType` kind
-/// selects `assoc`. Same row shape [`Llbc::unique_trait_assoc_value`]
-/// indexes, read off this impl instead of the unique one.
-pub(in crate::front::mir) fn trait_impl_assoc_value<'a>(
+/// When several impls of the trait exist, the projection's own
+/// predicate type arguments pick the impl whose `impl_trait` generics
+/// match. Unique-impl lookup is instantiation-dependent for a
+/// multi-impl trait; the predicate is the declared Self / args of this
+/// use, so the bound associated type is that instantiation's payload
+/// (`getuniqueclassdef`). Zero or several matches stay unresolved.
+fn assoc_value_for_matching_impl<'a>(
     llbc: &'a Llbc,
-    impl_id: u64,
+    traitref: &serde_json::Value,
+    trait_id: u64,
     assoc: &serde_json::Value,
 ) -> Option<&'a serde_json::Value> {
-    let entries = llbc
-        .trait_impls_raw()
-        .get(impl_id as usize)?
-        .get("types")?
-        .as_array()?;
+    let pred = crate::front::clause_spec::trait_decl_pred(traitref_unwrap(traitref, llbc, 0)?)?;
+    let pred_types = pred
+        .get("generics")?
+        .get("types")
+        .and_then(serde_json::Value::as_array)?;
+    if pred_types.is_empty() {
+        return None;
+    }
+    if pred_types
+        .iter()
+        .any(|ty| !type_arg_is_concrete(&charon_type_value_to_ast_string(ty, llbc, 0)))
+    {
+        return None;
+    }
+    let mut found = None;
+    for row in llbc.trait_impls_of(trait_id) {
+        let Some(impl_types) = row
+            .pointer("/impl_trait/generics/types")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        if impl_types.len() != pred_types.len() {
+            continue;
+        }
+        if !impl_types
+            .iter()
+            .zip(pred_types.iter())
+            .all(|(left, right)| tyexpr_same(left, right, llbc))
+        {
+            continue;
+        }
+        let Some(value) = trait_row_assoc_value(row, assoc) else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(value);
+    }
+    found
+}
+
+fn tyexpr_same(left: &serde_json::Value, right: &serde_json::Value, llbc: &Llbc) -> bool {
+    match (ty_dedup_key(left), ty_dedup_key(right)) {
+        (Some(a), Some(b)) if a == b => return true,
+        _ => {}
+    }
+    let left = trait_payload_node(left, llbc).unwrap_or(left);
+    let right = trait_payload_node(right, llbc).unwrap_or(right);
+    match (ty_dedup_key(left), ty_dedup_key(right)) {
+        (Some(a), Some(b)) if a == b => true,
+        _ => left == right,
+    }
+}
+
+fn trait_row_assoc_value<'a>(
+    row: &'a serde_json::Value,
+    assoc: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    let entries = row.get("types")?.as_array()?;
     for entry in entries {
         let Some(kind) = entry
             .get("kind")
@@ -10421,6 +10482,17 @@ pub(in crate::front::mir) fn trait_impl_assoc_value<'a>(
         return entry.get("skip_binder")?.get("value");
     }
     None
+}
+
+/// `types[entry].skip_binder.value` of `impl_id` whose `TraitType` kind
+/// selects `assoc`. Same row shape [`Llbc::unique_trait_assoc_value`]
+/// indexes, read off this impl instead of the unique one.
+pub(in crate::front::mir) fn trait_impl_assoc_value<'a>(
+    llbc: &'a Llbc,
+    impl_id: u64,
+    assoc: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    trait_row_assoc_value(llbc.trait_impls_raw().get(impl_id as usize)?, assoc)
 }
 
 /// Recover the trait decl id a `TraitRef` names —
@@ -11092,6 +11164,22 @@ pub(in crate::front::mir) fn type_arg_is_concrete(arg: &str) -> bool {
     !arg.contains("TypeVar") && !arg.contains("??")
 }
 
+/// Whole-arg unresolved associated-type projection (`??TraitType`).
+/// Nested unresolved (`Option<??scalar>`) contains `??` inside a
+/// constructor and is not this case. An unsubstituted `TypeVar`
+/// (`??TypeVar#0`) is not an instantiation.
+pub(in crate::front::mir) fn type_arg_is_whole_unresolved_projection(arg: &str) -> bool {
+    arg.starts_with("??") && !arg.starts_with("??TypeVar")
+}
+
+/// True when `arg` may appear in an interned `<…>` suffix.
+/// Concrete args intern. A whole-arg unresolved projection sits next
+/// to a splitting concrete payload and intern's that payload's variant
+/// (`getuniqueclassdef`). Nested unresolved and TypeVar stay out.
+fn type_arg_permits_enum_suffix(arg: &str) -> bool {
+    type_arg_is_concrete(arg) || type_arg_is_whole_unresolved_projection(arg)
+}
+
 pub(in crate::front::mir) fn adt_type_args_are_concrete(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
@@ -11130,10 +11218,13 @@ pub(in crate::front::mir) fn enum_instantiation_suffix_from_args(
         || !type_args
             .iter()
             .any(|a| type_arg_splits_per_instantiation(a))
-        // Nested `??` / `TypeVar` (`ControlFlow<Option<??scalar>, i64>`)
-        // is not an instantiation (`type_arg_is_concrete`). Prefix-only
-        // `starts_with("??")` still lets `Option<??scalar>` split.
-        || type_args.iter().any(|a| !type_arg_is_concrete(a))
+        // Nested unresolved (`Option<??scalar>`) is not an instantiation.
+        // Prefix-only `starts_with("??")` still lets that nested form
+        // split, so the suffix gate has to reject it. A whole-arg
+        // unresolved projection (`??TraitType`) is the declared
+        // associated type when unique-impl lookup cannot bind it; the
+        // sibling concrete payload still intern's.
+        || type_args.iter().any(|a| !type_arg_permits_enum_suffix(a))
     {
         return None;
     }

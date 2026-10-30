@@ -447,9 +447,9 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `interp_deque.py` `W_Deque.trimleft` / `popleft`).
     pub(in crate::front::mir) carrier_combinator_sites:
         Vec<crate::front::result_exc::CarrierCombinatorSite>,
-    /// `Result::map_err(result, closure)` sites lowered to an explicit
-    /// Ok/Err closure-select before the exception-link pass consumes the
-    /// newly built result shells.
+    /// Dest-is-carrier `map_err` sites. The rewrite runs after
+    /// `result_exc` hung LastException: Ok forwards T, Err calls the
+    /// mapper and raises. A plain Result dest is the extracted helper.
     pub(in crate::front::mir) result_map_err_sites:
         Vec<crate::front::result_map_err::ResultMapErrSite>,
     pub(in crate::front::mir) result_expect_sites: Vec<crate::front::option_unwrap::UnwrapSite>,

@@ -1150,6 +1150,18 @@ fn register_ref_enum_instantiation_rows(
                     rows.push(crate::front::semantic::FieldRow::named(len, "usize"));
                     continue;
                 }
+                // A sole unresolved associated-type projection is one GC
+                // word (`InstanceRepr`), the same intern Opaque payloads
+                // take. Nested unresolved stays fail-closed.
+                if lltype::type_arg_is_whole_unresolved_projection(trimmed) {
+                    if !single_field {
+                        registrable = false;
+                        break;
+                    }
+                    intern_projection_payload_spelling(trimmed, struct_fields);
+                    rows.push(field_decl_row(i, f, concrete));
+                    continue;
+                }
                 // Register a field only when it is layout-safe for the
                 // translated suffixed owner's textual descr: a GC-managed
                 // value (including RPython tuples, represented by one
@@ -1234,6 +1246,24 @@ fn register_ref_enum_instantiation_rows(
 /// Blocked getattr of `Some.__pos_0` (`rclass.py` `s_getattr`). An empty
 /// registry entry is the same registered-struct arm a Struct TypeDecl
 /// already takes; the payload stays one GC word (`InstanceRepr`).
+/// Empty registry row for a whole-arg unresolved associated-type
+/// projection. `intern_opaque_payload_spelling` looks up an Opaque
+/// TypeDecl and skips `??`; this spelling has none. One GC word
+/// (`InstanceRepr`), same as that Opaque arm.
+fn intern_projection_payload_spelling(
+    spelling: &str,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+) {
+    let spelling = spelling.trim();
+    if !lltype::type_arg_is_whole_unresolved_projection(spelling) {
+        return;
+    }
+    struct_fields
+        .fields
+        .entry(spelling.to_string())
+        .or_insert_with(Vec::new);
+}
+
 fn intern_opaque_payload_spelling(
     llbc: &Llbc,
     spelling: &str,
@@ -2088,7 +2118,11 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+        if result_exc_ok_is_unit(
+            &fd.signature.output,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        ) {
             graph.return_type = Some("()".to_string());
         }
         Some(stamp.apply(graph))
@@ -2298,7 +2332,18 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+        // Local 0 is the return place. A clause-spec body is the FunDecl
+        // with type arguments substituted, so that local is the instantiated
+        // output. The template signature still names the generic Result.
+        let output = spec
+            .body
+            .body
+            .locals
+            .locals
+            .first()
+            .map(|local| &local.ty)
+            .unwrap_or(&fd.signature.output);
+        if result_exc_ok_is_unit(output, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
         }
         spec.header.graph_stamp().apply(graph)
@@ -5864,13 +5909,15 @@ fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// A `Result<(), PyError>` scoped callee returns void after the
 /// exception-link lowering; its returnblock is widened so the call
 /// descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
+/// `output` is the body's declared return type: the FunDecl signature
+/// for a template, local 0 after substitution for a clause spec.
 fn result_exc_ok_is_unit(
-    fd: &FunDecl,
+    output: &TyRef,
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> bool {
-    crate::front::result_exc::tyref_is_result_of_carrier(&fd.signature.output, llbc, error_carrier)
-        && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc)
+    crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, error_carrier)
+        && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc)
 }
 
 fn lower_unstructured_with_static_addrs_and_attrs(
@@ -5920,32 +5967,46 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // sites the body lowering captured.  Both run before
     // `simplify_lowered_graph` so the freed shell ops feed the same
     // dead-op sweep the Abort → RaiseImplicit fold uses.
+    //
+    // Local 0 is the return place. A clause-spec body is the FunDecl
+    // with type arguments substituted, so that local is the instantiated
+    // output. The template signature still names the generic Result.
+    let output = if spec_body {
+        u.locals
+            .locals
+            .first()
+            .map(|local| &local.ty)
+            .unwrap_or(&fd.signature.output)
+    } else {
+        &fd.signature.output
+    };
     let result_exc_callee = crate::front::result_exc::tyref_is_result_of_carrier(
-        &fd.signature.output,
+        output,
         llbc,
         static_addrs.error_carrier,
     );
-    let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
+    let result_exc_ok_is_unit =
+        result_exc_callee && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         lo.emit_pending_vec_frees();
         lo.graph.return_class_root = dont_look_inside_return_class_root(
-            &fd.signature.output,
+            output,
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
         lo.graph.return_can_be_none = dont_look_inside_return_can_be_none(
-            &fd.signature.output,
+            output,
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
         lo.graph.return_is_str =
-            dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
+            dont_look_inside_return_is_str(output, llbc, static_addrs.error_carrier);
         lo.graph.return_container_root = dont_look_inside_return_container_root(
-            &fd.signature.output,
+            output,
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
@@ -6015,15 +6076,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.graph.name, site.call_once_owner
             )));
         }
-        // Before simplify and `result_exc`. Simplify renames the call's
-        // result, and `result_exc` turns `map_err(...)?` into a rewrap
-        // handler that is not the Err shell this rewrite bypasses. The
-        // value-encoded Ok/Err arms are what `result_exc` then lowers,
-        // the same order as an explicit `match`.
-        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
-            &mut lo.graph,
-            &lo.result_map_err_sites,
-        );
+        // Carrier map_err rewrite waits until after result_exc hung
+        // LastException on the dest-is-carrier call. Extra-simplify still
+        // runs first: it may rename the recorded result variable.
+
         // `map(it, f).collect()` denotes a loop. Rewrite it at the
         // construction site — where `f` is a concrete closure ADT —
         // into `Vec::new` + `next` + `call_mut` + `push` BEFORE the extra
@@ -6099,7 +6155,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         // `map`/`and_then` on a carrier Result is an if/else on the receiver
         // (`DiscCombinatorSite::carrier_recv`); build it before the carrier
-        // becomes exception edges, as `result_map_err` does below.
+        // becomes exception edges.
         let (carrier_disc_sites, disc_combinator_sites): (Vec<_>, Vec<_>) = lo
             .disc_combinator_sites
             .iter()
@@ -6151,6 +6207,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
         }
+        // After result_exc: the dest-is-carrier call block now has
+        // LastException. Err calls the mapper and raises; a declined
+        // site stays the extracted helper graph.
+        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
+            &mut lo.graph,
+            &lo.result_map_err_sites,
+        );
         let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
             0
         } else {
@@ -6340,7 +6403,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         let result_try_stats = if lo.result_try_sites.is_empty() {
             ResultTryStats::default()
         } else {
-            let return_owners = lo.resolve_result_return_owners(&fd.signature.output);
+            let return_owners = lo.resolve_result_return_owners(output);
             rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
         };
         // A `?` whose diamond did not match still has `Try::branch`.
@@ -6498,7 +6561,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `exceptiontransform.py` `transform_completely` carries `T` on the
         // normal edge and raises on the error edge.
         let scalar_shell_owners = if result_exc_callee {
-            lo.resolve_result_owners(&fd.signature.output)
+            lo.resolve_result_owners(output)
         } else {
             None
         };

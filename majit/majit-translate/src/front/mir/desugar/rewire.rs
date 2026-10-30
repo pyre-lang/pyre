@@ -2,14 +2,30 @@
 
 use super::*;
 
+/// `FunctionDesc.cachedgraph` copy: `{leaf}__spec_{readable}_{hash}`.
+/// The template path is what the core-callee predicates match.
+fn template_leaf_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let Some((parent, leaf)) = path.rsplit_once("::") else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    match leaf.split_once("__spec_") {
+        Some((head, _)) => std::borrow::Cow::Owned(format!("{parent}::{head}")),
+        None => std::borrow::Cow::Borrowed(path),
+    }
+}
+
 /// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
 ///
 /// The leaf name `map_err` is not enough: an extension trait can publish
 /// the same method on `Result` and Charon still emits `CallTarget::Method`.
 /// Gate on the resolved callee path so a foreign `map_err` stays residual.
+/// A specialized copy keeps that path with a `cachedgraph` leaf.
 pub(in crate::front::mir) fn is_core_result_map_err_path(path: &str) -> bool {
     matches!(
-        path.split("::").collect::<Vec<_>>().as_slice(),
+        template_leaf_path(path)
+            .split("::")
+            .collect::<Vec<_>>()
+            .as_slice(),
         ["core" | "std", "result", "<Impl>" | "Result", "map_err"]
             | ["result", "<Impl>" | "Result", "map_err"]
     )

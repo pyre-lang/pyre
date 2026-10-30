@@ -7990,6 +7990,133 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
     );
 }
 
+/// A plain Result dest stays a regular call of the extracted core body
+/// `match self { Ok(t) => Ok(t), Err(e) => Err(op(e)) }`. The tagged-sum
+/// Result repr is unchanged; only the caller value-diamond rewrite is
+/// gone (`guess_call_kind` regular).
+#[test]
+fn result_map_err_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let caller = super::lower_function(&llbc, "read_code_units").expect("lower read_code_units");
+    let map_err_calls = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "map_err",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("map_err")
+                    && segments.iter().any(|s| s == "result")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        map_err_calls, 1,
+        "caller keeps one regular call to the core map_err body, got {map_err_calls}"
+    );
+
+    let ctx = super::LowerContext::new(&llbc);
+    let mut lowered_core_bodies = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let name_path = fd.item_meta.name_path();
+        if !name_path.ends_with("::result::<Impl>::map_err") {
+            continue;
+        }
+        let graph =
+            super::lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+        let has_disc = graph.blocks.iter().any(|block| {
+            matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                || block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                    )
+                })
+        });
+        assert!(has_disc, "{name_path}: core body matches on the Result tag");
+        let has_op = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "call_once" || name == "call" || name == "call_mut",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    leaf == Some("call_once") || leaf == Some("call") || leaf == Some("call_mut")
+                }
+                _ => false,
+            })
+        });
+        assert!(
+            has_op,
+            "{name_path}: core body calls op(e) as a regular call"
+        );
+        lowered_core_bodies += 1;
+    }
+    assert_eq!(
+        lowered_core_bodies, 1,
+        "extracted map_err FunDecl bodies must lower, got {lowered_core_bodies}"
+    );
+}
+
+/// `Result<(), PyError>` unit-Ok caller (`dict_store_checked`): unit Ok is
+/// `Ok(t)` passthrough inside the extracted body. The caller keeps one
+/// regular `map_err` call.
+#[test]
+fn result_map_err_unit_ok_caller_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let caller =
+        super::lower_function(&llbc, "dict_store_checked").expect("lower dict_store_checked");
+    let map_err_calls = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "map_err",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("map_err")
+                    && segments.iter().any(|s| s == "result")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        map_err_calls, 1,
+        "unit-Ok caller keeps one regular call to the core map_err body, got {map_err_calls}"
+    );
+}
+
 /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the
 /// leaf; `fixture::other::Code` strips to `other::Code`.
 fn duplicate_code_llbc() -> Llbc {

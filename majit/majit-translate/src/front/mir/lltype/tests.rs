@@ -1563,6 +1563,21 @@ fn enum_suffix_keeps_unit_ok_when_err_splits() {
         enum_instantiation_suffix_from_args(&["Result<TypeVar, E>".into()]),
         None
     );
+    // Whole-arg unresolved associated type: the sibling concrete
+    // payload still intern's (`getuniqueclassdef`). Nested unresolved
+    // above stays out.
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["u32".into(), "??TraitType".into()]).as_deref(),
+        Some("<u32,??TraitType>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["??TraitType".into(), "i64".into()]).as_deref(),
+        Some("<??TraitType,i64>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["??TypeVar#0".into(), "i64".into()]),
+        None
+    );
     // A leaked hasher `fn() -> ()` Instantiated arg is concrete (the
     // `{"Tuple": []}` unit, not `??Tuple`).
     assert_eq!(
@@ -2316,6 +2331,140 @@ fn trait_assoc_impl_ref_resolves_its_own_binding() {
     assert_eq!(
         super::resolve_trait_assoc_type_value(&clause, &assoc, &llbc),
         None
+    );
+}
+
+#[test]
+fn trait_assoc_pred_generics_select_among_impls() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let binding = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ty}
+        })
+    };
+    let row = |self_ty: &serde_json::Value, bound: &serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [self_ty]}},
+            "types": [binding(bound)],
+            "implied_trait_refs": []
+        })
+    };
+    let llbc = llbc_with_trait_impls(serde_json::json!([
+        row(&i64_ty, &bool_ty),
+        row(&char_ty, &i64_ty)
+    ]));
+    let assoc = serde_json::json!(0);
+    let clause = |self_ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"Clause": {"Bound": [0, 0]}},
+            "trait_decl_ref": {
+                "skip_binder": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [self_ty],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }
+        })
+    };
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&clause(&i64_ty), &assoc, &llbc),
+        Some(&bool_ty)
+    );
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&clause(&char_ty), &assoc, &llbc),
+        Some(&i64_ty)
+    );
+    let projection = |self_ty: &serde_json::Value| {
+        serde_json::json!({
+            "TraitType": [
+                clause(self_ty),
+                0,
+                {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            ]
+        })
+    };
+    assert_eq!(
+        charon_type_value_to_ast_string(&projection(&i64_ty), &llbc, 0),
+        "bool"
+    );
+    assert_eq!(
+        super::enum_instantiation_suffix_from_args(&[
+            "u32".into(),
+            charon_type_value_to_ast_string(&projection(&i64_ty), &llbc, 0),
+        ])
+        .as_deref(),
+        Some("<u32,bool>")
+    );
+}
+
+#[test]
+fn trait_assoc_pred_generics_ambiguous_or_open_stay_unresolved() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let binding = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ty}
+        })
+    };
+    let row = |self_ty: &serde_json::Value, bound: &serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [self_ty]}},
+            "types": [binding(bound)],
+            "implied_trait_refs": []
+        })
+    };
+    let two_for_i64 = llbc_with_trait_impls(serde_json::json!([
+        row(&i64_ty, &bool_ty),
+        row(&i64_ty, &char_ty)
+    ]));
+    let assoc = serde_json::json!(0);
+    let clause = serde_json::json!({
+        "kind": {"Clause": {"Bound": [0, 0]}},
+        "trait_decl_ref": {
+            "skip_binder": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [i64_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }
+    });
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&clause, &assoc, &two_for_i64),
+        None
+    );
+    let open = serde_json::json!({
+        "kind": {"Clause": {"Bound": [0, 0]}},
+        "trait_decl_ref": {
+            "skip_binder": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }
+    });
+    let one_impl = llbc_with_trait_impls(serde_json::json!([row(&i64_ty, &bool_ty)]));
+    // Unique-impl still answers when the predicate is open: there is
+    // only one impl of the trait.
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&open, &assoc, &one_impl),
+        Some(&bool_ty)
     );
 }
 

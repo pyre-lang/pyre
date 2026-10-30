@@ -8321,10 +8321,10 @@ impl<'a> Lowering<'a> {
                 self.expect_sites.push(site);
             }
         }
-        // `Result::map_err(result, closure)` is a foreign core combinator.
-        // Record the concrete receiver/result instantiations while their MIR
-        // types are available; the post-pass restores the ordinary Ok/Err
-        // diamond before exceptiontransform-style Result lowering runs.
+        // Carrier map_err: dest is Result of the exception carrier. The
+        // post-pass runs after result_exc hung LastException so the Err
+        // arm can call the mapper and raise. A plain Result dest stays a
+        // regular call of the extracted core body.
         let map_err_path = match &op_kind {
             OpKind::Call {
                 target: CallTarget::Method { name, .. },
@@ -8338,11 +8338,27 @@ impl<'a> Lowering<'a> {
             } if args.len() == 2 && segments.last().map(String::as_str) == Some("map_err") => {
                 Some(segments.join("::"))
             }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if args.len() == 2
+                && segments
+                    .last()
+                    .is_some_and(|leaf| leaf.starts_with("map_err__spec_")) =>
+            {
+                Some(segments.join("::"))
+            }
             _ => None,
         };
         if map_err_path
             .as_deref()
             .is_some_and(is_core_result_map_err_path)
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                &call.dest.ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
             && let Some(site) = self.recognize_result_map_err_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
