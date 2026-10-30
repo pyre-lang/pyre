@@ -7642,9 +7642,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
         Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
-        Some(B::And | B::InplaceAnd) => OpCode::IntAnd,
-        Some(B::Or | B::InplaceOr) => OpCode::IntOr,
-        Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
         Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder) => {
             OpCode::CallI
         }
@@ -7675,10 +7672,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
         let is_div = matches!(op, Some(B::FloorDivide | B::InplaceFloorDivide));
         walker_emit_int_py_div_or_mod(ctx, lhs_raw, rhs_raw, la, rb, is_div)
-    } else if matches!(
-        opcode,
-        OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
-    ) {
+    } else {
         let (raw, ovf_flag) = record_int_ovf(ctx, op_pc, opcode, lhs_raw, rhs_raw, Some((la, rb)))?;
         let heap_ovf = match opcode {
             OpCode::IntAddOvf => la.checked_add(rb).is_none(),
@@ -7714,37 +7708,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
             return Ok(None);
         };
         (raw, concrete)
-    } else {
-        let raw = ctx.trace_ctx.record_op(opcode, &[lhs_raw, rhs_raw]);
-        let concrete = match opcode {
-            OpCode::IntAnd => la & rb,
-            OpCode::IntOr => la | rb,
-            OpCode::IntXor => la ^ rb,
-            _ => return Ok(None),
-        };
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Int(concrete));
-        (raw, concrete)
     };
-    let lhs_obj = lhs_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(lhs_obj);
-    let rhs_obj = rhs_pin
-        .as_ref()
-        .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
-        .unwrap_or(rhs_obj);
-    let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
-    if both_bools && matches!(opcode, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor) {
-        let observed = concrete != 0;
-        let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
-            return Ok(None);
-        };
-        let _ = (dst, dst_bank);
-        return Ok(Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }));
-    }
     // `walker_box_int` records `wrapint` and that recording can minor-collect.
     // Allocate the concrete after it and stamp before the next call, the
     // same order as `walker_read_int_mutable_cell`. A `w_int_new` before
