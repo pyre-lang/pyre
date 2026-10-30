@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=13
+# pyre-check: max-pypy-ratio=8
+# Readings 2.3x-5.1x (macos dynasm 2.5x under floor 3.25 against 13, run 40570473141). Floor 2x.
 # gh#495 guard: reflected-add residual mutation feeds the inlined branch result.
 # radd result feeds the branch condition; branch varies each iter -> sub-walk churn
 N = 7200000

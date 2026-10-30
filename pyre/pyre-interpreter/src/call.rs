@@ -4786,6 +4786,10 @@ pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) ->
 /// This is the canonical call path. `call_function_impl_raw` (legacy)
 /// wraps it for callers that expect a bare `PyObjectRef` and stash the
 /// error in `PENDING_CALL_ERROR` instead.
+///
+/// Residual (`look_inside_graph` sees the `args` loop). The word-ABI
+/// trampoline is `getfunctionptr` (`get_jitcode_calldescr`).
+#[majit_macros::getfunctionptr]
 pub fn call_function_impl_result(
     callable: PyObjectRef,
     args: &[PyObjectRef],

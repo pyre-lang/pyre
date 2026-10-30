@@ -62,6 +62,9 @@ fn same_funcptr(
 
 #[test]
 fn link_name_keeps_call_aroundstate_target() {
+    // rffi.py `llexternal`: explicit `releasegil=true` sets
+    // `random_effects_on_gcobjs` on the C functionptr.
+    assert!(std::hint::black_box(_RANDOM_EFFECTS_ON_GCOBJS_c_my_strlen));
     let (funcptr, save_err) = _call_aroundstate_target_ccall_c_my_strlen;
     assert_eq!(save_err, majit_rlib::rffi::RFFI_ERR_NONE);
     same_funcptr(funcptr, __rffi_fp_c_my_strlen);

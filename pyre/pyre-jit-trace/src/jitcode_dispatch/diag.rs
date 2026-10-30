@@ -312,12 +312,14 @@ pub fn skip_python_trivia_forward(code: &pyre_interpreter::CodeObject, mut py_pc
 ///   and no new function (`try_fold_registered_symbolic_residual`).
 /// * **Elision** — the arm recognises a shape and emits *nothing*, so a census
 ///   keyed on "what did this fold emit instead" has nothing to key on.  The
-///   three `fbw_strict_fold_frame_reg` arms in `vable_ops.rs` are this: a
-///   store to the current inline level's own unseeded portal frame is a
-///   virtual-field write, folded away with no `SETFIELD_GC` recorded.  Their
-///   recognisers (`fbw_strict_fold_frame_reg`,
-///   `folded_store_is_observable`) are predicates — they cannot emit,
-///   because the eliding IS the arm.
+///   `fbw_strict_fold_frame_reg` arms of `setfield_vable_via_metainterp` /
+///   `setfield_vable_int_imm` are this: a scalar write (`last_instr`,
+///   `valuestackdepth`) to the current inline level's own unseeded portal
+///   frame is a virtual-field write, folded away with no `SETFIELD_GC`.
+///   Array get/set (`getarrayitem_vable` / `setarrayitem_vable`) are not:
+///   `_opimpl_getarrayitem_vable` / `_opimpl_setarrayitem_vable` record
+///   `getfield_gc_r` + `getarrayitem_gc` / `setarrayitem_gc` for a
+///   non-standard (inlined) frame, and OptVirtualize keeps that virtual.
 ///
 /// Treat a count taken from these rows as a lower bound on the fold
 /// population, not a total.  `site` is `"none"` for a fold with no call site

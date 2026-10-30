@@ -312,7 +312,16 @@ impl Drop for LiveOpPublication {
     }
 }
 
-fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
+/// Forward ConstPtr slots and `QuasiImmutDescr.struct` on one live op.
+///
+/// `quasiimmut.py QuasiImmutDescr.struct` is a GCREF the collector updates.
+/// After `compile_tracing` is taken, `walk_active_trace_refs` no longer sees
+/// the recorder (`pyjitpl.rs` `materialize_into_ops` then `take`), so this
+/// walker is the one that keeps `is_still_valid_for` comparing the same
+/// object `heap.py optimize_QUASIIMMUT_FIELD` folded. `recorder.rs`
+/// `Trace::walk_const_ptr_refs` already visits the wrapper; compile-live
+/// ops have to match.
+pub(crate) fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     op.walk_const_ptr_refs_mut(visitor);
     // compile.py ResumeGuardDescr._attrs_ traces the resume storage through
     // the guard, independently of ResumeDataLoopMemo. The phase-1 optimizer

@@ -363,14 +363,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 
     /// Armed by the bridge tracer (`call_jit::trace_and_compile_from_bridge`)
-    /// before a single-frame, direct-return-capable guard-failure walk.  When
+    /// before a guard-failure walk.  When
     /// set, the `run_perfn_walk` epilogue lets a bridge `Terminate` walk keep
     /// the no-replay shortcut — commit the store journal and keep the
     /// finish-concrete stash — so the caller hands the captured result forward
     /// as `DoneWithThisFrame` instead of rewinding to the guard pc and
     /// re-interpreting the region (which would double every eagerly executed
     /// residual side effect, #177).  Only the bridge tracer sets it, and only
-    /// when the resume is single-frame; the general guard path consumes the
+    /// for that attempt; the general guard path consumes the
     /// kept stash as a terminal `BridgeResolution`, and the CALL_ASSEMBLER
     /// callback hands it to its back-to-back blackhole hook, so a committed
     /// journal never strands into a guard-state re-run.  Cleared after
@@ -574,6 +574,775 @@ pub(crate) fn fbw_store_journal_reset() {
     FBW_GENERATOR_YIELD_TOS.with(|c| c.set(None));
 }
 
+/// Walk-local TLS stacked while a nested `compile_and_run_once` runs.
+/// Owner is the outer MetaInterp attempt; parked on `PARKED_WALK_TLS_STACK`
+/// (a GC root area) and restored after the inner attempt finishes.
+pub struct ParkedWalkTls {
+    store_journal: Vec<[pyre_object::PyObjectRef; 3]>,
+    list_effect_journal: Vec<super::FbwListEffect>,
+    append_promote_journal: Vec<pyre_object::PyObjectRef>,
+    cell_store_journal: Vec<super::FbwCellStore>,
+    namespace_store_journal: Vec<super::FbwNamespaceStore>,
+    namespace_store_rolled_back: bool,
+    sys_exc_journal: Vec<pyre_object::PyObjectRef>,
+    traceback_store_journal: Vec<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
+    foriter_inflight: Vec<super::InflightForiter>,
+    bridge_iter_journal: Vec<super::BridgeIterJournalEntry>,
+    executed_nonpure_residual: bool,
+    unjournaled_value_unavailable: bool,
+    unjournaled_symbolic: bool,
+    executed_residual_void: u32,
+    executed_residual_mayforce: u32,
+    executed_residual_plain: u32,
+    executed_effect_count: usize,
+    heap_writing_effect_count: usize,
+    opcode_entry_effects: Option<(usize, usize)>,
+    qmut_abort_stack: Option<(usize, Vec<OpRef>)>,
+    branch_abort_stack: Option<(usize, Vec<OpRef>)>,
+    structural_abort_opcode_effects: Option<(usize, usize)>,
+    abort_call_resume: Option<super::InlineAbortCarrier>,
+    built_exc: std::collections::HashSet<OpRef>,
+    context_chained: std::collections::HashSet<OpRef>,
+    exc_prev: Vec<(OpRef, pyre_object::PyObjectRef)>,
+    exc_pending_push_set: bool,
+    exit_last_instr_undo: Vec<(usize, isize)>,
+    locals_mirror_undo: Vec<FbwLocalsMirrorUndo>,
+    frame_vsd_undo: Vec<(usize, usize)>,
+    generator_yield_tos: Option<GeneratorStackStore>,
+    finish_is_exception: bool,
+    finish_concrete: Option<FinishConcrete>,
+    // `warmstate.py bound_reached` gives a nested run a fresh MetaInterp;
+    // it cannot disarm the outer `interpret()`'s terminal handoff. Keep this
+    // with the finish concrete it governs, rather than letting the nested
+    // bridge's final disarm force replay of the outer walk's residuals.
+    bridge_noreplay_armed: bool,
+    foriter_inflight_pending: Option<(usize, usize)>,
+    // Nested `compile_and_run_once` (`warmstate.py bound_reached` builds a
+    // fresh MetaInterp). The inner `discard_escape_flush_undo` /
+    // `reset_unflushed_escaped_callee` start that attempt clean; these
+    // three hold the outer capture until `restore_walk_tls`.
+    // Also parks ESCAPE_OPCODE_WINDOW and COMMITTED_FRAME_ESCAPE_PC.
+    escape_flush_undo: Option<super::EscapeFlushUndo>,
+    escape_flush_undo_pending: bool,
+    escape_opcode_window: Option<(usize, bool)>,
+    committed_frame_escape_pc: Option<(usize, super::EscapeResumeKind)>,
+    unflushed_escaped_callee: usize,
+    inline_frame: super::residual_call::ParkedInlineFrameTls,
+    /// Raw pointer to the outer `SubWalkExchange`. Not a GC edge; the
+    /// visitor in `walk_parked_walk_tls_stack` must not follow it.
+    subwalk_driver: *mut (),
+    list_append_suspend_bookmark: Vec<super::ListAppendSuspendBookmark>,
+}
+
+thread_local! {
+    /// Outer-walk journals stacked while a nested `compile_and_run_once` runs.
+    /// `park_walk_tls` moves refs out of the registered FBW_* root areas, so
+    /// this stack is the collector-visible owner until `restore_walk_tls`.
+    /// The extra area captures this cell's address at registration so a
+    /// collecting thread walks the owner's parked entries, not its own TLS.
+    static PARKED_WALK_TLS_STACK: std::cell::RefCell<Vec<ParkedWalkTls>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Address of this mutator's parked-journal stack, captured into the extra
+/// area at registration so a collecting thread walks the owner.
+pub(crate) fn parked_walk_tls_stack_cell_ptr() -> *const std::cell::RefCell<Vec<ParkedWalkTls>> {
+    PARKED_WALK_TLS_STACK.with(|s| s as *const _)
+}
+
+/// Take the current walk's journals and escape-flush undo so a nested
+/// trace starts clean. `fbw_store_journal_reset` / `discard_escape_flush_undo`
+/// would otherwise clear the outer attempt (`warmstate.py bound_reached`
+/// builds a fresh MetaInterp).
+pub fn park_walk_tls() {
+    let parked = ParkedWalkTls {
+        store_journal: super::FBW_STORE_JOURNAL.with(|j| std::mem::take(&mut *j.borrow_mut())),
+        list_effect_journal: super::FBW_LIST_EFFECT_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        append_promote_journal: super::FBW_APPEND_PROMOTE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        cell_store_journal: super::FBW_CELL_STORE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        namespace_store_journal: super::FBW_NAMESPACE_STORE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        namespace_store_rolled_back: super::FBW_NAMESPACE_STORE_ROLLED_BACK
+            .with(|c| c.replace(false)),
+        sys_exc_journal: super::FBW_SYS_EXC_JOURNAL.with(|j| std::mem::take(&mut *j.borrow_mut())),
+        traceback_store_journal: super::FBW_TRACEBACK_STORE_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        foriter_inflight: super::FBW_FORITER_INFLIGHT
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        bridge_iter_journal: super::FBW_BRIDGE_ITER_JOURNAL
+            .with(|j| std::mem::take(&mut *j.borrow_mut())),
+        executed_nonpure_residual: FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.replace(false)),
+        unjournaled_value_unavailable: super::FBW_UNJOURNALED_VALUE_UNAVAILABLE
+            .with(|c| c.replace(false)),
+        unjournaled_symbolic: super::FBW_UNJOURNALED_SYMBOLIC.with(|c| c.replace(false)),
+        executed_residual_void: super::FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.replace(0)),
+        executed_residual_mayforce: super::FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.replace(0)),
+        executed_residual_plain: super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.replace(0)),
+        executed_effect_count: super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.replace(0)),
+        heap_writing_effect_count: super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.replace(0)),
+        opcode_entry_effects: super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.take()),
+        qmut_abort_stack: super::FBW_QMUT_ABORT_STACK.with(|c| c.borrow_mut().take()),
+        branch_abort_stack: super::FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take()),
+        structural_abort_opcode_effects: super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
+            .with(|c| c.take()),
+        abort_call_resume: super::FBW_ABORT_CALL_RESUME.with(|c| c.borrow_mut().take()),
+        built_exc: FBW_BUILT_EXC.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        context_chained: FBW_CONTEXT_CHAINED.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        exc_prev: super::FBW_EXC_PREV.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        exc_pending_push_set: super::FBW_EXC_PENDING_PUSH_SET.with(|c| c.replace(false)),
+        exit_last_instr_undo: FBW_EXIT_LAST_INSTR_UNDO
+            .with(|c| std::mem::take(&mut *c.borrow_mut())),
+        locals_mirror_undo: FBW_LOCALS_MIRROR_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        frame_vsd_undo: FBW_FRAME_VSD_UNDO.with(|c| std::mem::take(&mut *c.borrow_mut())),
+        generator_yield_tos: FBW_GENERATOR_YIELD_TOS.with(|c| c.take()),
+        finish_is_exception: FBW_FINISH_IS_EXCEPTION.with(|c| c.replace(false)),
+        finish_concrete: FBW_FINISH_CONCRETE.with(|c| c.take()),
+        bridge_noreplay_armed: FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.replace(false)),
+        foriter_inflight_pending: FORITER_INFLIGHT_PENDING.with(|c| c.take()),
+        escape_flush_undo: super::ESCAPE_FLUSH_UNDO.with(|c| c.borrow_mut().take()),
+        escape_flush_undo_pending: super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.replace(false)),
+        escape_opcode_window: super::ESCAPE_OPCODE_WINDOW.with(|c| c.replace(None)),
+        committed_frame_escape_pc: super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.take()),
+        unflushed_escaped_callee: super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.replace(0)),
+        inline_frame: super::residual_call::take_inline_frame_tls(),
+        // Nested attempt gets its own sub-walk driver, as `bound_reached`
+        // gives it its own MetaInterp and framestack; the outer `SubWalkDriver`
+        // stays on the outer Rust stack.
+        subwalk_driver: super::take_subwalk_driver(),
+        list_append_suspend_bookmark: super::take_list_append_suspend_bookmark(),
+    };
+    PARKED_WALK_TLS_STACK.with(|s| s.borrow_mut().push(parked));
+}
+
+/// Put the outer attempt's journals and escape-flush undo back after the nested run.
+pub fn restore_walk_tls() {
+    let Some(parked) = PARKED_WALK_TLS_STACK.with(|s| s.borrow_mut().pop()) else {
+        return;
+    };
+    super::FBW_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.store_journal);
+    super::FBW_LIST_EFFECT_JOURNAL.with(|j| *j.borrow_mut() = parked.list_effect_journal);
+    super::FBW_APPEND_PROMOTE_JOURNAL.with(|j| *j.borrow_mut() = parked.append_promote_journal);
+    super::FBW_CELL_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.cell_store_journal);
+    super::FBW_NAMESPACE_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.namespace_store_journal);
+    super::FBW_NAMESPACE_STORE_ROLLED_BACK.with(|c| c.set(parked.namespace_store_rolled_back));
+    super::FBW_SYS_EXC_JOURNAL.with(|j| *j.borrow_mut() = parked.sys_exc_journal);
+    super::FBW_TRACEBACK_STORE_JOURNAL.with(|j| *j.borrow_mut() = parked.traceback_store_journal);
+    super::FBW_FORITER_INFLIGHT.with(|j| *j.borrow_mut() = parked.foriter_inflight);
+    super::FBW_BRIDGE_ITER_JOURNAL.with(|j| *j.borrow_mut() = parked.bridge_iter_journal);
+    FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(parked.executed_nonpure_residual));
+    super::FBW_UNJOURNALED_VALUE_UNAVAILABLE.with(|c| c.set(parked.unjournaled_value_unavailable));
+    super::FBW_UNJOURNALED_SYMBOLIC.with(|c| c.set(parked.unjournaled_symbolic));
+    super::FBW_EXECUTED_RESIDUAL_VOID.with(|c| c.set(parked.executed_residual_void));
+    super::FBW_EXECUTED_RESIDUAL_MAYFORCE.with(|c| c.set(parked.executed_residual_mayforce));
+    super::FBW_EXECUTED_RESIDUAL_PLAIN.with(|c| c.set(parked.executed_residual_plain));
+    super::FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(parked.executed_effect_count));
+    super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(parked.heap_writing_effect_count));
+    super::FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(parked.opcode_entry_effects));
+    super::FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = parked.qmut_abort_stack);
+    super::FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = parked.branch_abort_stack);
+    super::FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS
+        .with(|c| c.set(parked.structural_abort_opcode_effects));
+    super::FBW_ABORT_CALL_RESUME.with(|c| *c.borrow_mut() = parked.abort_call_resume);
+    FBW_BUILT_EXC.with(|s| *s.borrow_mut() = parked.built_exc);
+    FBW_CONTEXT_CHAINED.with(|s| *s.borrow_mut() = parked.context_chained);
+    super::FBW_EXC_PREV.with(|s| *s.borrow_mut() = parked.exc_prev);
+    super::FBW_EXC_PENDING_PUSH_SET.with(|c| c.set(parked.exc_pending_push_set));
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| *c.borrow_mut() = parked.exit_last_instr_undo);
+    FBW_LOCALS_MIRROR_UNDO.with(|c| *c.borrow_mut() = parked.locals_mirror_undo);
+    FBW_FRAME_VSD_UNDO.with(|c| *c.borrow_mut() = parked.frame_vsd_undo);
+    FBW_GENERATOR_YIELD_TOS.with(|c| c.set(parked.generator_yield_tos));
+    FBW_FINISH_IS_EXCEPTION.with(|c| c.set(parked.finish_is_exception));
+    FBW_FINISH_CONCRETE.with(|c| c.set(parked.finish_concrete));
+    FBW_BRIDGE_NOREPLAY_ARMED.with(|c| c.set(parked.bridge_noreplay_armed));
+    FORITER_INFLIGHT_PENDING.with(|c| c.set(parked.foriter_inflight_pending));
+    super::ESCAPE_FLUSH_UNDO.with(|c| *c.borrow_mut() = parked.escape_flush_undo);
+    super::ESCAPE_FLUSH_UNDO_PENDING.with(|c| c.set(parked.escape_flush_undo_pending));
+    super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(parked.escape_opcode_window));
+    super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.set(parked.committed_frame_escape_pc));
+    super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(parked.unflushed_escaped_callee));
+    super::residual_call::restore_inline_frame_tls(parked.inline_frame);
+    super::set_subwalk_driver(parked.subwalk_driver);
+    super::set_list_append_suspend_bookmark(parked.list_append_suspend_bookmark);
+}
+
+fn visit_pyobject_ref(
+    slot: &mut pyre_object::PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if slot.is_null() {
+        return;
+    }
+    visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
+}
+
+pub(crate) fn visit_managed_addr(slot: &mut usize, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    super::residual_call::visit_raw_gc_addr(slot, visitor);
+}
+
+fn walk_parked_abort_resume(
+    carrier: &mut super::InlineAbortCarrier,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let super::InlineAbortCarrier::MidBody(payload) = carrier;
+    visit_pyobject_ref(&mut payload.w_code, visitor);
+    visit_pyobject_ref(&mut payload.w_globals, visitor);
+    visit_pyobject_ref(&mut payload.return_value, visitor);
+    visit_pyobject_ref(&mut payload.constructor_instance, visitor);
+    for slot in payload.live_locals.iter_mut().flatten() {
+        if let ConcreteValue::Ref(value) = slot {
+            visit_pyobject_ref(value, visitor);
+        }
+    }
+    for slot in &mut payload.live_stack {
+        if let ConcreteValue::Ref(value) = slot {
+            visit_pyobject_ref(value, visitor);
+        }
+    }
+}
+
+/// Forward refs in parked outer-walk journals while a nested trace runs.
+///
+/// `parked_stack` is the owner's cell captured into the extra area at
+/// registration. Resolving TLS on the collecting thread would miss a
+/// quiesced mutator's parked journals (`rthread.py` `_trace_tlref`).
+pub(crate) fn walk_parked_walk_tls_stack(
+    parked_stack: *const std::cell::RefCell<Vec<ParkedWalkTls>>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // SAFETY: the owner is either synchronously collecting or STW-quiesced;
+    // the pointer is the one published in `FbwStoreJournalRootArea`.
+    let parked_cell = unsafe { &*parked_stack };
+    let stack = unsafe { &mut *parked_cell.as_ptr() };
+    for parked in stack.iter_mut() {
+        for triple in &mut parked.store_journal {
+            for slot in triple {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        for effect in &mut parked.list_effect_journal {
+            match effect {
+                super::FbwListEffect::Append { list, .. } => {
+                    visit_pyobject_ref(list, visitor);
+                }
+                super::FbwListEffect::PopEnd { list, w_item, .. } => {
+                    visit_pyobject_ref(list, visitor);
+                    visit_pyobject_ref(w_item, visitor);
+                }
+            }
+        }
+        for list in &mut parked.append_promote_journal {
+            visit_pyobject_ref(list, visitor);
+        }
+        for entry in &mut parked.cell_store_journal {
+            match entry {
+                super::FbwCellStore::Int { cell, .. } => visit_pyobject_ref(cell, visitor),
+                super::FbwCellStore::Obj { cell, before } => {
+                    visit_pyobject_ref(cell, visitor);
+                    visit_pyobject_ref(before, visitor);
+                }
+                super::FbwCellStore::Gc {
+                    obj,
+                    before,
+                    managed,
+                    ..
+                } => {
+                    if *managed {
+                        visit_pyobject_ref(obj, visitor);
+                    }
+                    if let Value::Ref(before) = before
+                        && before.0 != 0
+                    {
+                        visitor(before);
+                    }
+                }
+            }
+        }
+        for entry in &mut parked.namespace_store_journal {
+            visit_pyobject_ref(&mut entry.namespace, visitor);
+            visit_pyobject_ref(&mut entry.name, visitor);
+            visit_pyobject_ref(&mut entry.displaced, visitor);
+            // Active walker at `mod.rs` `walk_fbw_store_journal_area`
+            // forwards `written` so a STORE_SUBSCR rollback still
+            // compares by identity after a nested-trace collection
+            // (`history.py` RefFrontendOp).
+            if let Some(written) = entry.written.as_mut() {
+                visit_pyobject_ref(written, visitor);
+            }
+        }
+        for displaced in &mut parked.sys_exc_journal {
+            visit_pyobject_ref(displaced, visitor);
+        }
+        for (exception, node) in &mut parked.traceback_store_journal {
+            visit_pyobject_ref(exception, visitor);
+            visit_pyobject_ref(node, visitor);
+        }
+        for entry in &mut parked.foriter_inflight {
+            visit_pyobject_ref(&mut entry.item, visitor);
+        }
+        for entry in &mut parked.bridge_iter_journal {
+            match entry {
+                super::BridgeIterJournalEntry::Range { iter, .. } => {
+                    visit_pyobject_ref(iter, visitor);
+                }
+                super::BridgeIterJournalEntry::Cursor { iter, pre_seq, .. } => {
+                    visit_pyobject_ref(iter, visitor);
+                    visit_pyobject_ref(pre_seq, visitor);
+                }
+            }
+        }
+        if let Some(carrier) = parked.abort_call_resume.as_mut() {
+            walk_parked_abort_resume(carrier, visitor);
+        }
+        for (op, prev) in &mut parked.exc_prev {
+            op.trace_const_ptr(visitor);
+            visit_pyobject_ref(prev, visitor);
+        }
+        // Frame identities in these undo lists are GC edges
+        // (`executioncontext.py topframeref`). A nested-trace collection
+        // that leaves the raw word unmoved makes rollback write the
+        // abandoned copy.
+        for (frame, _) in &mut parked.exit_last_instr_undo {
+            visit_managed_addr(frame, visitor);
+        }
+        for entry in &mut parked.locals_mirror_undo {
+            visit_managed_addr(&mut entry.frame, visitor);
+            for slot in &mut entry.slots {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        for (frame, _) in &mut parked.frame_vsd_undo {
+            visit_managed_addr(frame, visitor);
+        }
+        if let Some(store) = parked.generator_yield_tos.as_mut() {
+            visit_managed_addr(&mut store.frame, visitor);
+            store.value.trace_const_ptr(visitor);
+        }
+        if let Some(finish) = parked.finish_concrete.as_mut() {
+            let value = match finish {
+                FinishConcrete::Return(value) | FinishConcrete::Raise(value) => value,
+            };
+            if let ConcreteValue::Ref(ptr) = value {
+                visit_pyobject_ref(ptr, visitor);
+            }
+        }
+        if let Some(undo) = parked.escape_flush_undo.as_mut() {
+            for slot in &mut undo.slots {
+                visit_pyobject_ref(slot, visitor);
+            }
+            for slot in &mut undo.flush_image {
+                visit_pyobject_ref(slot, visitor);
+            }
+        }
+        visit_managed_addr(&mut parked.unflushed_escaped_callee, visitor);
+        parked.inline_frame.walk_roots(visitor);
+        // `subwalk_driver` is a raw non-GC pointer to the outer
+        // `SubWalkExchange`; do not visit it.
+    }
+}
+
+#[cfg(test)]
+mod parked_walk_tls_root_tests {
+    use super::*;
+
+    #[test]
+    fn fbw_store_journal_root_area_forwards_a_quiesced_foreign_mutator() {
+        let (area_tx, area_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let parked = 0xBEEF_usize as pyre_object::PyObjectRef;
+            let live = 0xF00D_usize as pyre_object::PyObjectRef;
+            fbw_store_journal_root(parked, std::ptr::null_mut(), std::ptr::null_mut());
+            park_walk_tls();
+            fbw_store_journal_root(live, std::ptr::null_mut(), std::ptr::null_mut());
+            area_tx
+                .send((
+                    capture_fbw_store_journal_root_area() as usize,
+                    live as usize,
+                    parked as usize,
+                ))
+                .unwrap();
+            resume_rx.recv().unwrap();
+            restore_walk_tls();
+            fbw_store_journal_reset();
+        });
+
+        let (area, live, parked) = area_rx.recv().unwrap();
+        let mut seen = Vec::new();
+        unsafe {
+            super::super::fbw_store_journal_root_walker_area(area as *const (), &mut |root| {
+                if root.as_usize() != 0 {
+                    seen.push(root.as_usize());
+                }
+            });
+        }
+        resume_tx.send(()).unwrap();
+        assert_eq!(seen, vec![live, parked]);
+        owner.join().unwrap();
+    }
+
+    #[test]
+    fn park_walk_tls_hides_the_outer_inline_frame() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                super::super::residual_call::PUBLISHED_INLINE_FRAME
+                    .with(|c| c.set(std::ptr::null_mut()));
+                super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.set(None));
+            }
+        }
+        let _restore = RestoreOnDrop;
+
+        let dummy = 0x0000_E5F1_usize as *mut pyre_interpreter::PyFrame;
+        super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(dummy));
+        super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| {
+            c.set(Some(super::super::residual_call::PublishedLastInstr {
+                frame: 1,
+                saved: 2,
+                resume_flushed: false,
+            }));
+        });
+
+        park_walk_tls();
+        assert!(
+            super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.get().is_null()),
+            "parked outer published inline frame must not be visible"
+        );
+        assert!(
+            super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.get().is_none()),
+            "parked outer published last_instr must not be visible"
+        );
+
+        restore_walk_tls();
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.get()),
+            dummy
+        );
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.get()),
+            Some(super::super::residual_call::PublishedLastInstr {
+                frame: 1,
+                saved: 2,
+                resume_flushed: false,
+            })
+        );
+        super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(std::ptr::null_mut()));
+        super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn nested_bridge_disarm_preserves_the_outer_terminal_handoff() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                restore_walk_tls();
+                fbw_bridge_noreplay_arm(false);
+            }
+        }
+        let _restore = RestoreOnDrop;
+        fbw_bridge_noreplay_arm(true);
+        park_walk_tls();
+        assert!(!fbw_bridge_noreplay_armed());
+
+        // A nested bridge can itself reach a hot guard and start another
+        // attempt before returning DoneWithThisFrame to its caller.
+        fbw_bridge_noreplay_arm(true);
+        park_walk_tls();
+        assert!(!fbw_bridge_noreplay_armed());
+        fbw_bridge_noreplay_arm(false);
+        restore_walk_tls();
+        assert!(fbw_bridge_noreplay_armed());
+
+        // trace_and_compile_from_bridge disarms its own terminal handoff.
+        // The completed outer walk must still return its concrete result,
+        // rather than replaying the already-consumed stream from the guard.
+        fbw_bridge_noreplay_arm(false);
+        restore_walk_tls();
+        assert!(fbw_bridge_noreplay_armed());
+    }
+
+    #[test]
+    fn park_walk_tls_restores_the_outer_heap_writing_effect_count() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
+            }
+        }
+        let _restore = RestoreOnDrop;
+        super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(7));
+        park_walk_tls();
+        assert_eq!(
+            fbw_heap_writing_effect_count(),
+            0,
+            "nested walk starts with a fresh heap-writing count"
+        );
+        super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(3));
+        restore_walk_tls();
+        assert_eq!(
+            fbw_heap_writing_effect_count(),
+            7,
+            "outer heap-writing count must survive the nested walk"
+        );
+        super::super::FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
+    }
+
+    #[test]
+    fn park_walk_tls_restores_the_outer_escape_window_and_committed_pc() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(None));
+                super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.set(None));
+            }
+        }
+        let _restore = RestoreOnDrop;
+        super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(Some((11, true))));
+        super::super::COMMITTED_FRAME_ESCAPE_PC
+            .with(|c| c.set(Some((22, EscapeResumeKind::Exact))));
+        park_walk_tls();
+        assert!(
+            super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.get().is_none()),
+            "nested walk starts with an empty escape opcode window"
+        );
+        assert!(
+            super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.get().is_none()),
+            "nested walk starts with no committed frame escape pc"
+        );
+        super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(Some((33, false))));
+        super::super::COMMITTED_FRAME_ESCAPE_PC
+            .with(|c| c.set(Some((44, EscapeResumeKind::RerunsOpcode))));
+        restore_walk_tls();
+        assert_eq!(
+            super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.get()),
+            Some((11, true)),
+            "outer escape opcode window must survive the nested walk"
+        );
+        assert_eq!(
+            super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.get()),
+            Some((22, EscapeResumeKind::Exact)),
+            "outer committed frame escape pc must survive the nested walk"
+        );
+        super::super::ESCAPE_OPCODE_WINDOW.with(|c| c.set(None));
+        super::super::COMMITTED_FRAME_ESCAPE_PC.with(|c| c.set(None));
+    }
+
+    #[test]
+    fn walk_parked_walk_tls_stack_forwards_namespace_written() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                super::super::FBW_NAMESPACE_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+            }
+        }
+        let _restore = RestoreOnDrop;
+        let written = 0x30 as pyre_object::PyObjectRef;
+        fbw_namespace_store_journal_push(
+            0x10 as pyre_object::PyObjectRef,
+            0x20 as pyre_object::PyObjectRef,
+            std::ptr::null_mut(),
+            false,
+            Some(written),
+        );
+        park_walk_tls();
+        let mut seen = Vec::new();
+        walk_parked_walk_tls_stack(parked_walk_tls_stack_cell_ptr(), &mut |slot| {
+            seen.push(slot.0);
+        });
+        assert!(
+            seen.contains(&(written as usize)),
+            "parked namespace `written` must be forwarded like the active walker"
+        );
+        restore_walk_tls();
+        super::super::FBW_NAMESPACE_STORE_JOURNAL.with(|j| j.borrow_mut().clear());
+    }
+
+    #[test]
+    fn walk_parked_walk_tls_stack_forwards_inline_frame_addrs() {
+        struct RestoreOnDrop;
+        impl Drop for RestoreOnDrop {
+            fn drop(&mut self) {
+                restore_walk_tls();
+                super::super::residual_call::PUBLISHED_INLINE_FRAME
+                    .with(|c| c.set(std::ptr::null_mut()));
+                super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.set(None));
+                super::super::residual_call::PUBLISHED_INLINE_SHADOW
+                    .with(|c| *c.borrow_mut() = None);
+                super::super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(0));
+                FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
+                FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
+                FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
+            }
+        }
+        let _restore = RestoreOnDrop;
+
+        let old_frame = 0x0000_E610;
+        let new_frame = 0x0000_E710;
+        let published = old_frame as *mut pyre_interpreter::PyFrame;
+        super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(published));
+        super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| {
+            c.set(Some(super::super::residual_call::PublishedLastInstr {
+                frame: old_frame,
+                saved: 2,
+                resume_flushed: false,
+            }));
+        });
+        super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| {
+            *c.borrow_mut() = Some(super::super::residual_call::PublishedInlineShadow::Written(
+                old_frame,
+            ));
+        });
+        super::super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(old_frame));
+        FBW_LOCALS_MIRROR_UNDO.with(|c| {
+            c.borrow_mut().push(FbwLocalsMirrorUndo {
+                frame: old_frame,
+                slots: vec![],
+            });
+        });
+        FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().push((old_frame, 3)));
+        FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().push((old_frame, 4)));
+
+        let mut forward = |slot: &mut majit_ir::GcRef| {
+            if slot.0 == old_frame {
+                slot.0 = new_frame;
+            }
+        };
+
+        unsafe {
+            super::super::fbw_store_journal_root_walker_area(
+                capture_fbw_store_journal_root_area(),
+                &mut forward,
+            );
+        }
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.get()),
+            new_frame as *mut pyre_interpreter::PyFrame,
+            "live published inline frame must be forwarded"
+        );
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_LAST_INSTR
+                .with(|c| c.get())
+                .map(|published| published.frame),
+            Some(new_frame),
+            "live published last_instr frame must be forwarded"
+        );
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| {
+                match c.borrow().as_ref() {
+                    Some(super::super::residual_call::PublishedInlineShadow::Written(addr)) => {
+                        *addr
+                    }
+                    _ => 0,
+                }
+            }),
+            new_frame,
+            "live published inline shadow Written address must be forwarded"
+        );
+        assert_eq!(
+            super::super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.get()),
+            new_frame,
+            "live unflushed escaped callee must be forwarded"
+        );
+        assert_eq!(
+            FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow()[0].frame),
+            new_frame,
+            "live locals-mirror undo frame must be forwarded"
+        );
+        assert_eq!(
+            FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow()[0].0),
+            new_frame,
+            "live last_instr undo frame must be forwarded"
+        );
+        assert_eq!(
+            FBW_FRAME_VSD_UNDO.with(|c| c.borrow()[0].0),
+            new_frame,
+            "live valuestackdepth undo frame must be forwarded"
+        );
+
+        super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(published));
+        super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| {
+            c.set(Some(super::super::residual_call::PublishedLastInstr {
+                frame: old_frame,
+                saved: 2,
+                resume_flushed: false,
+            }));
+        });
+        super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| {
+            *c.borrow_mut() = Some(super::super::residual_call::PublishedInlineShadow::Written(
+                old_frame,
+            ));
+        });
+        super::super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(old_frame));
+        FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut()[0].frame = old_frame);
+        FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut()[0].0 = old_frame);
+        FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut()[0].0 = old_frame);
+
+        park_walk_tls();
+        walk_parked_walk_tls_stack(parked_walk_tls_stack_cell_ptr(), &mut forward);
+        restore_walk_tls();
+
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.get()),
+            new_frame as *mut pyre_interpreter::PyFrame,
+            "parked published inline frame must be forwarded"
+        );
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_LAST_INSTR
+                .with(|c| c.get())
+                .map(|published| published.frame),
+            Some(new_frame),
+            "parked published last_instr frame must be forwarded"
+        );
+        assert_eq!(
+            super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| {
+                match c.borrow().as_ref() {
+                    Some(super::super::residual_call::PublishedInlineShadow::Written(addr)) => {
+                        *addr
+                    }
+                    _ => 0,
+                }
+            }),
+            new_frame,
+            "parked published inline shadow Written address must be forwarded"
+        );
+        assert_eq!(
+            super::super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.get()),
+            new_frame,
+            "parked unflushed escaped callee must be forwarded"
+        );
+        assert_eq!(
+            FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow()[0].frame),
+            new_frame,
+            "parked locals-mirror undo frame must be forwarded"
+        );
+        assert_eq!(
+            FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow()[0].0),
+            new_frame,
+            "parked last_instr undo frame must be forwarded"
+        );
+        assert_eq!(
+            FBW_FRAME_VSD_UNDO.with(|c| c.borrow()[0].0),
+            new_frame,
+            "parked valuestackdepth undo frame must be forwarded"
+        );
+
+        super::super::residual_call::PUBLISHED_INLINE_FRAME.with(|c| c.set(std::ptr::null_mut()));
+        super::super::residual_call::PUBLISHED_LAST_INSTR.with(|c| c.set(None));
+        super::super::residual_call::PUBLISHED_INLINE_SHADOW.with(|c| *c.borrow_mut() = None);
+        super::super::UNFLUSHED_ESCAPED_CALLEE.with(|c| c.set(0));
+        FBW_LOCALS_MIRROR_UNDO.with(|c| c.borrow_mut().clear());
+        FBW_EXIT_LAST_INSTR_UNDO.with(|c| c.borrow_mut().clear());
+        FBW_FRAME_VSD_UNDO.with(|c| c.borrow_mut().clear());
+    }
+}
+
 /// The address a journalled frame lives at NOW.
 ///
 /// A journal entry names its frame by raw address, and a JIT-created frame can
@@ -643,7 +1412,7 @@ pub(crate) fn fbw_exit_last_instr_commit() {
 /// One frame's pre-fold `locals_cells_stack_w` image.  See
 /// [`FBW_LOCALS_MIRROR_UNDO`].
 pub(crate) struct FbwLocalsMirrorUndo {
-    frame: usize,
+    pub(crate) frame: usize,
     pub(crate) slots: Vec<pyre_object::PyObjectRef>,
 }
 
@@ -850,6 +1619,44 @@ pub(crate) fn fbw_durable_frame_rollback_one(frame: usize) {
 /// [`capture_fbw_store_journal_root_area`]).
 pub(crate) fn locals_mirror_undo_cell_ptr() -> *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>> {
     FBW_LOCALS_MIRROR_UNDO.with(|c| c as *const _)
+}
+
+pub(crate) fn exit_last_instr_undo_cell_ptr() -> *const std::cell::RefCell<Vec<(usize, isize)>> {
+    FBW_EXIT_LAST_INSTR_UNDO.with(|c| c as *const _)
+}
+
+pub(crate) fn frame_vsd_undo_cell_ptr() -> *const std::cell::RefCell<Vec<(usize, usize)>> {
+    FBW_FRAME_VSD_UNDO.with(|c| c as *const _)
+}
+
+pub(crate) fn generator_yield_tos_cell_ptr() -> *const std::cell::Cell<Option<GeneratorStackStore>>
+{
+    FBW_GENERATOR_YIELD_TOS.with(|c| c as *const _)
+}
+
+/// Forward the frame identity of each live undo list. Slot vectors are
+/// walked by [`super::fbw_store_journal_root_walker_area`]; this covers
+/// the raw address keys those lists compare on restore.
+pub(crate) fn walk_live_frame_keyed_undo_cells(
+    exit_last_instr_undo: *const std::cell::RefCell<Vec<(usize, isize)>>,
+    frame_vsd_undo: *const std::cell::RefCell<Vec<(usize, usize)>>,
+    generator_yield_tos: *const std::cell::Cell<Option<GeneratorStackStore>>,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    // SAFETY: the owner is synchronously collecting or STW-quiesced; each
+    // pointer is the cell published in `FbwStoreJournalRootArea`.
+    let exit = unsafe { &mut *(*exit_last_instr_undo).as_ptr() };
+    for (frame, _) in exit.iter_mut() {
+        visit_managed_addr(frame, visitor);
+    }
+    let vsd = unsafe { &mut *(*frame_vsd_undo).as_ptr() };
+    for (frame, _) in vsd.iter_mut() {
+        visit_managed_addr(frame, visitor);
+    }
+    if let Some(store) = unsafe { &mut *(*generator_yield_tos).as_ptr() }.as_mut() {
+        visit_managed_addr(&mut store.frame, visitor);
+        store.value.trace_const_ptr(visitor);
+    }
 }
 
 /// Record the element a walked eager list store displaces, for rollback

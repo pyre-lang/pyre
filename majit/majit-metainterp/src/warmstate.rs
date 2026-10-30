@@ -781,9 +781,9 @@ pub enum FunctionEntryStep {
     /// A runnable procedure token was on the cell. Handed back so the door can
     /// enter it without resolving the cell a second time.
     RunCompiled(Arc<JitCellToken>),
-    /// The gate did not decline: start tracing. Either the counter fired or the
-    /// door never asked it (a trace is already running, or a `DONT_TRACE_HERE`
-    /// cell that has never seen a token is due its immediate retry).
+    /// The gate did not decline: start tracing. Either the counter fired or a
+    /// `DONT_TRACE_HERE` cell that has never seen a token is due its immediate
+    /// retry. A cell that already carries `JC_TRACING` answers [`NotHot`].
     Proceed,
     /// Keep interpreting.
     NotHot,
@@ -5493,7 +5493,7 @@ mod tests {
                     None,
                     || false,
                     false,
-                    &[]
+                    &[],
                 ),
                 FunctionEntryStep::NotHot
             ));

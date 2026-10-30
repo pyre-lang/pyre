@@ -2184,9 +2184,8 @@ fn ca_complete_after_bridge_walk(
     // already executed the resumed region's effects concretely, so a
     // guard-state resume would re-apply them over the advanced heap
     // (double-execution / stale-value return). Complete the callee from its
-    // adopted state via the portal runner instead — the same
-    // portal_ptr(*args) completion the ContinueRunningNormally arm of
-    // handle_blackhole_result performs.
+    // adopted state: enter already ran in compiled code, so dispatch then
+    // `ExecutionContext.leave` — `execute_frame`'s `finally`.
     if ca_adopted_frame != 0 && ca_adopted_frame == callee_frame {
         let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
         return match crate::eval::call_assembler_portal_body_result(frame) {
@@ -4124,6 +4123,12 @@ pub fn trace_and_compile_from_bridge(
         }
     }
 
+    // compile.py `_trace_and_compile_from_bridge` constructs a new
+    // `MetaInterp(metainterp_sd, jitdriver_sd)`. The reused driver parks
+    // the outer attempt for this whole function so `start_bridge_tracing`
+    // and the `is_tracing()` checks below see only the bridge walk.
+    let _nested = crate::eval::NestedTracePark::enter();
+
     let Some((green_key, trace_id, fail_index)) = bridge_compile_preflight(descr_arc) else {
         return BridgeResolution::ResumeBlackhole;
     };
@@ -5604,6 +5609,12 @@ fn jit_ca_handle_guard_failure(
             };
         };
     }
+    // `compile.py _trace_and_compile_from_bridge` constructs a fresh
+    // MetaInterp. pyre's CALL_ASSEMBLER guard callback runs synchronously
+    // from the backend trampoline, so an outer attempt can still occupy
+    // this reused object. Park it (`warmstate.py bound_reached`) so
+    // `start_retrace_from_guard` can open its own profiler TRACING.
+    let _nested = crate::eval::NestedTracePark::enter();
 
     // compile.py _trace_and_compile_from_bridge.  Native CA code
     // crosses the backend boundary with only the raw descr pointer; recover

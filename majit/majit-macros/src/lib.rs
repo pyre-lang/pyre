@@ -18,6 +18,7 @@
 /// - #[jit_may_force]: Mark a helper as a may-force call surface
 /// - #[jit_loop_invariant]: Alias for #[loop_invariant]
 /// - #[jit_module]: Module-level automatic helper discovery
+/// - #[getfunctionptr]: publish a residual trampoline (`lltype.getfunctionptr`); no policy
 /// - virtualizable!: Standalone virtualizable field declaration
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -2611,6 +2612,51 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Publish a word-ABI trampoline for a residual callee.
+///
+/// `call.py` `CallControl.get_jitcode_calldescr` always does
+/// `fnptr = getfunctionptr(graph)` (`lltype.getfunctionptr`) and
+/// `jtransform.py` `handle_residual_call` puts that pointer on the residual.
+/// This attribute is that publication: it emits the same trampoline
+/// `emit_helper_call_target_fn` already builds for a hinted helper,
+/// registers it under the function's `CallPath`, and writes no policy
+/// marker (`_jit_look_inside_`, `_elidable_function_`, `_jit_unroll_safe_`).
+/// The translator therefore harvests no hint (`llbc_hints` `CONST_PREFIX_HINTS`)
+/// and `look_inside_graph` is unchanged; the callee stays residual.
+#[proc_macro_attribute]
+pub fn getfunctionptr(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    if let Some(reason) = trampoline_skip_reason(&func, "getfunctionptr", &[]) {
+        return syn::Error::new_spanned(
+            &func.sig.ident,
+            format!(
+                "getfunctionptr: no word-ABI trampoline ({})",
+                reason.as_str()
+            ),
+        )
+        .to_compile_error()
+        .into();
+    }
+    let call_target_fn =
+        match emit_helper_call_target_fn(&func, true, None, "getfunctionptr", &[], false) {
+            Ok(Some((_, _, tokens))) => tokens,
+            Ok(None) => {
+                return syn::Error::new_spanned(
+                    &func.sig.ident,
+                    "getfunctionptr: no word-ABI trampoline for this signature",
+                )
+                .to_compile_error()
+                .into();
+            }
+            Err(err) => return err.to_compile_error().into(),
+        };
+    quote! {
+        #func
+        #call_target_fn
+    }
+    .into()
 }
 
 /// `#[dont_look_inside_cannot_raise]` — non-elidable opaque helper that
@@ -5278,6 +5324,63 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("__majit_arg_0_len"), "{text}");
+    }
+
+    #[test]
+    fn getfunctionptr_emits_trampoline_without_policy_markers() {
+        assert!(rpython_attribute_markers("getfunctionptr").is_none());
+        let func = parse_fn(
+            "pub unsafe fn get_and_call_function(w_descr: PyObjectRef, w_obj: PyObjectRef, w_type: PyObjectRef, args_w: &[PyObjectRef]) -> PyResult { loop {} }",
+        );
+        assert_eq!(trampoline_skip_reason(&func, "getfunctionptr", &[]), None);
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "getfunctionptr", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target_get_and_call_function (__majit_arg_0 : i64 , __majit_arg_1 : i64 , __majit_arg_2 : i64 , __majit_arg_3 : i64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("as * const () , 4"), "{text}");
+        assert!(
+            text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{text}"
+        );
+        assert!(
+            text.contains(":: majit_ir :: helper_fnaddr :: ResidualError :: publish_residual"),
+            "{text}"
+        );
+        assert!(!text.contains("_jit_look_inside_"), "{text}");
+        assert!(!text.contains("_elidable_function_"), "{text}");
+        assert!(!text.contains("_jit_unroll_safe_"), "{text}");
+        assert!(!text.contains("__majit_call_policy_"), "{text}");
+
+        let impl_fn = parse_fn(
+            "pub fn call_function_impl_result(callable: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> { loop {} }",
+        );
+        assert_eq!(
+            trampoline_skip_reason(&impl_fn, "getfunctionptr", &[]),
+            None
+        );
+        let (_, _, impl_tokens) =
+            emit_helper_call_target_fn(&impl_fn, true, None, "getfunctionptr", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let impl_text = impl_tokens.to_string();
+        assert!(
+            impl_text.contains(
+                "fn __majit_call_target_call_function_impl_result (__majit_arg_0 : i64 , __majit_arg_1 : i64) -> i64"
+            ),
+            "{impl_text}"
+        );
+        assert!(impl_text.contains("as * const () , 2"), "{impl_text}");
+        assert!(
+            impl_text.contains(":: majit_ir :: helper_fnaddr :: object_gcarray_slice"),
+            "{impl_text}"
+        );
     }
 
     #[test]
