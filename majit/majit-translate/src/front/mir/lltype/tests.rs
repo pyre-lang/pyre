@@ -4326,6 +4326,46 @@ fn empty_tuple_tyref_is_void() {
     );
 }
 
+/// `rtuple.py TupleRepr` preserves each item's low-level representation.
+#[test]
+fn shared_byte_window_tuple_keeps_both_words_without_aliasing_a_mutable_list() {
+    let llbc = empty_llbc();
+    let tuple = |borrow| {
+        TyRef::Other(serde_json::json!({"Adt": {
+            "builtin": "Tuple",
+            "generics": {"types": [{"Ref": ["'_", {
+                "Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]
+            }, borrow]}]}
+        }}))
+    };
+    let shared = tyref_positional_aggregate_root(&tuple("Shared"), &llbc).unwrap();
+    let mutable = tyref_positional_aggregate_root(&tuple("Mut"), &llbc).unwrap();
+    assert_ne!(shared, mutable, "window and byte list have distinct reprs");
+    let cc = crate::codewriter::call::CallControl::new();
+    let layout = cc
+        .struct_layout_for(&shared)
+        .expect("shared window tuple layout");
+    let word = crate::layout::target_word_size();
+    assert_eq!(layout.size, 2 * word);
+    assert_eq!(
+        layout
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.offset))
+            .collect::<Vec<_>>(),
+        vec![("__pos_0", 0), ("__pos_0.len", word)]
+    );
+    let mutable_layout = cc
+        .struct_layout_for(&mutable)
+        .expect("mutable byte-list tuple layout");
+    assert!(
+        mutable_layout
+            .fields
+            .iter()
+            .all(|field| field.name != "__pos_0.len")
+    );
+}
+
 fn indexed_rows(rows: Vec<(u64, serde_json::Value)>) -> serde_json::Value {
     let max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
     let mut slots = vec![serde_json::Value::Null; max + 1];

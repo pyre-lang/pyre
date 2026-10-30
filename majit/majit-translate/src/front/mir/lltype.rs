@@ -10187,7 +10187,19 @@ pub(in crate::front::mir) fn render_adt_type_args(
         .and_then(|t| t.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|t| charon_type_value_to_ast_string(t, llbc, depth + 1))
+                .map(|t| {
+                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    // `rtuple.py TupleRepr` keys fields on each item's
+                    // lowleveltype. A shared byte window has data + len;
+                    // erasing its borrow aliases the mutable byte-list repr.
+                    if rendered == "[u8]"
+                        && tyref_is_shared_u8_slice(&TyRef::Other(t.clone()), llbc)
+                    {
+                        "&[u8]".to_string()
+                    } else {
+                        rendered
+                    }
+                })
                 .filter(|s| s != "Global" && s != "RandomState")
                 .collect()
         })

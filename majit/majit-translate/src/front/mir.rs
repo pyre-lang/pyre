@@ -2835,7 +2835,8 @@ pub(crate) fn positional_shape_metadata(
             .iter()
             .map(|ty| {
                 majit_ir::descr::is_shaped_tuple_name(shape)
-                    && spelling_pair_field_kind(ty).is_some()
+                    && (spelling_pair_field_kind(ty).is_some()
+                        || majit_ir::descr::is_shared_u8_slice_spelling(ty))
             })
             .collect();
         let attrs: Vec<(String, ValueType)> = items

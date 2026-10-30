@@ -7034,11 +7034,9 @@ impl<'a> Lowering<'a> {
         let td = self
             .llbc
             .type_by_id(type_decl_ref_adt_id(head.as_object()?)?)?;
-        // Copied fields are for projection. Constructing the import still
-        // builds the opaque aggregate this crate lowered before the copy.
-        if td.published_struct_copy {
-            return None;
-        }
+        // `rclass.py InstanceRepr.new_instance` / `setfield` use the
+        // defining class's fields for initialization as well as projection.
+        // Published fields retain that owner's identity across crates.
         // Charon names a tuple-variant constructor `<Enum>::<Variant>` and a
         // tuple-struct constructor `<Struct>`.
         let variant_idx = match &td.kind {
@@ -7084,9 +7082,6 @@ impl<'a> Lowering<'a> {
         };
         let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64);
         let td = self.llbc.type_by_id(type_id)?;
-        if td.published_struct_copy {
-            return None;
-        }
         let name_path = td.item_meta.name_path();
         let head_adt = head.as_object();
         let type_leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);

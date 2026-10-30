@@ -248,3 +248,38 @@ fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
         "error.kind must be a FieldRead of PyErrorObject.kind, not the error value"
     );
 }
+
+/// `rclass.py InstanceRepr.new_instance` / `setfield`: an imported class
+/// keeps the defining owner's fields when constructing an inline header.
+#[test]
+fn imported_pyobject_header_construction_keeps_the_defining_fields() {
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let fields = harvest_published_structs(&object);
+    drop(object);
+    let mut module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
+    apply_published_structs(&mut module, &fields);
+    assert!(module.iter_type_decls().any(|td| {
+        td.item_meta.name_path() == "pyre_object::pyobject::PyObject" && td.published_struct_copy
+    }));
+    let fd = module
+        .iter_fun_decls()
+        .find(|fd| {
+            let path = fd.item_meta.name_path();
+            path.contains("::_ssl::memory_bio_methods::") && path.ends_with("::__new__")
+        })
+        .expect("MemoryBIO.__new__ declaration");
+    let graph = majit_translate::front::mir::lower_fun_decl(
+        &majit_translate::front::mir::LowerContext::new(&module),
+        fd,
+    )
+    .expect("lower MemoryBIO.__new__ with published PyObject fields");
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        if let OpKind::FieldWrite { field, .. } | OpKind::FieldRead { field, .. } = &op.kind {
+            assert_ne!(
+                field.owner_root.as_deref(),
+                Some("Adt"),
+                "imported PyObject header must not mint an anonymous positional field: {op:?}"
+            );
+        }
+    }
+}
