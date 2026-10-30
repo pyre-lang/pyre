@@ -2515,10 +2515,12 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
 
     A cross-target extraction is only wanted for the struct layouts Charon
     resolved for that target; its function bodies are compiled under
-    different `cfg`s and must not displace the host's. Dropping every
-    declaration list but `type_decls` keeps the artefact a loadable
-    `.ullbc` — the reader needs no special case, and the consumer merges
-    it ahead of the host artefacts so its layouts win.
+    different `cfg`s and must not displace the host's. Keep `type_decls`
+    and the serialized prelude before it, then drop the body declarations.
+    Charon's SerDedup writes a type's first `Value` in that prelude (for
+    example in `item_names`); a field can then contain only `Deduplicated`.
+    Dropping the prelude loses the field's primitive type. The ordinary LLBC
+    reader can consume this self-contained sidecar without a special case.
 
     Only the fields kept are decoded, and only a window of the file around
     each is ever in memory: the artefact is three quarters of a GB of
@@ -2530,7 +2532,7 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
     decoder = json.JSONDecoder()
     keys = {
         name: f'"{name}":'.encode("ascii")
-        for name in ("charon_version", "has_errors", "crate_name", "type_decls")
+        for name in ("charon_version", "has_errors", "crate_name", "translated", "type_decls")
     }
     offsets = scan_for_keys(source, list(keys.values()))
     size = source.stat().st_size
@@ -2580,14 +2582,26 @@ def write_layout_sidecar(source: Path, dest: Path) -> None:
             )
         return value
 
+    type_decls = field("type_decls", want=list)
+    # SerDedup definitions precede their references in serialization order.
+    # Preserve every prelude table, including ones a newer Charon adds, while
+    # still reading no function body into memory.
+    start = offsets[keys["translated"]] + len(keys["translated"])
+    end = offsets[keys["type_decls"]]
+    with source.open("rb") as artefact:
+        artefact.seek(start)
+        prelude = artefact.read(end - start).decode("utf-8").rstrip()
+    if prelude.endswith(","):
+        prelude = prelude[:-1]
+    translated = json.loads(prelude + "}")
+    if not isinstance(translated, dict) or translated.get("crate_name") != field("crate_name", want=str):
+        raise SystemExit(f"extract-llbc.py: {source.name} has an invalid translated prelude")
+    translated["type_decls"] = type_decls
+    translated["fun_decls"] = []
     slim = {
         "charon_version": field("charon_version", want=str),
         "has_errors": field("has_errors", want=bool),
-        "translated": {
-            "crate_name": field("crate_name", want=str),
-            "type_decls": field("type_decls", want=list),
-            "fun_decls": [],
-        },
+        "translated": translated,
     }
     dest.write_text(json.dumps(slim), encoding="utf-8")
 
