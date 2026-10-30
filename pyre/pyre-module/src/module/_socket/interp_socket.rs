@@ -5530,7 +5530,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let n = if n < 0 { 1 } else { n };
                 let next = n - 1;
                 let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(next));
-                socket_set_attr(obj, "_usecount", value);
+                pyre_object::with_roots!(obj => socket_set_attr(obj, "_usecount", value));
                 if next <= 0 {
                     let fd = rffi::socket_from_i64(
                         pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),

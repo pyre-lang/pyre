@@ -1,6 +1,6 @@
 {
   "darwin": {
-    "base": "ffffc4674e96dd763908ffdb0f4c0c9462c3fa0d",
+    "base": "638b5db931560958965747c26587a8bef74c4b0b",
     "brackets_reaching_no_collection": 5,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
@@ -11,7 +11,7 @@
     "stale_pins": 3,
     "tier15_calls": 0,
     "tier15_calls_fns": 0,
-    "tier15_unresolved_calls": 259,
+    "tier15_unresolved_calls": 261,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
     "unbracketed_calls": 0,
@@ -22,8 +22,8 @@
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
     "unread_brackets": 359,
-    "unresolved_collecting_calls": 2899,
-    "unresolved_collecting_calls_fns": 1664
+    "unresolved_collecting_calls": 2915,
+    "unresolved_collecting_calls_fns": 1677
   },
   "linux": {
     "base": "8cd1acd265835a9a61f4e1b98350faa353235252",

@@ -3528,20 +3528,34 @@ pub unsafe fn store_global_value_w(
     w_name: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), PyError> {
-    let w_globals = frame.get_w_globals();
-    if !w_globals.is_null() {
+    // `pyopcode.py STORE_GLOBAL` keeps the name, value and globals in
+    // GC-traced frame/argument slots. Keep the same roots across the dict
+    // strategy store, and reread them for the object-keyed fallback.
+    let roots = pyre_object::gc_roots::push_roots();
+    let name_slot = roots.base();
+    let _ = roots.pin_root(w_name);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(value);
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(frame.get_w_globals());
+    if !roots.get(globals_slot).is_null() {
         // `celldict.py STORE_GLOBAL_cached` jitted arm is
         // `space.setitem_str(self.get_w_globals(), varname, w_newvalue)`.
         // Avoid `is_some_and` so the walker does not record a synthetic
-        // closure ctor (`pyframe.py get_f_trace_opcodes`).  Hash is 0:
+        // closure ctor (`pyframe.py get_f_trace_opcodes`). Hash is 0:
         // `ModuleDictStrategy.setitem_str` discards it, and a non-module
         // mapping hashes the borrowed bytes (`store_name_into_dict`).
-        if let Some(name) = unsafe { pyre_object::unicodeobject::w_str_get_value_opt(w_name) }
-            && store_name_into_dict(w_globals, name, 0, value)
+        if let Some(name) =
+            unsafe { pyre_object::unicodeobject::w_str_get_value_opt(roots.get(name_slot)) }
+            && store_name_into_dict(roots.get(globals_slot), name, 0, roots.get(value_slot))
         {
             return Ok(());
         }
-        crate::baseobjspace::setitem(w_globals, w_name, value)?;
+        crate::baseobjspace::setitem(
+            roots.get(globals_slot),
+            roots.get(name_slot),
+            roots.get(value_slot),
+        )?;
     }
     Ok(())
 }
