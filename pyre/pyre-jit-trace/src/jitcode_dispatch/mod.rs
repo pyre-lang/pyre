@@ -16879,6 +16879,10 @@ fn handle<Sym: WalkSym>(
             // trace-start seed uses (`trace.rs add_merge_point_with_key` /
             // `make_green_key_typed(w_code, start_pc)`) — no jitcode-pc/python-pc
             // mismatch.
+            // `pyjitpl.py MIFrame.opimpl_jit_merge_point` /
+            // `History.any_operation`: snapshot before `debug_merge_point`
+            // records `DEBUG_MERGE_POINT`.
+            let any_operation = ctx.trace_ctx.num_ops() > 0;
             let jdindex = if op.key == "jit_merge_point/iIRFIRF" {
                 let jd_opref = read_int_reg(code, op, 0, ctx)?;
                 match ctx.trace_ctx.concrete_of_opref(jd_opref) {
@@ -17247,7 +17251,7 @@ fn handle<Sym: WalkSym>(
             }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.
-                if ctx.trace_ctx.num_ops() == 0 {
+                if !any_operation {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`

@@ -205,22 +205,24 @@ fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: usize,
     is_being_profiled: super::flow::Variable,
-    pycode_var: super::flow::Variable,
+    pycode: super::flow::FlowValue,
     jitdriver_index: usize,
 ) -> Vec<super::flow::SpaceOperationArg> {
     let (frame, ec) = portal_graph_inputvars_from_startblock(graph);
     // `pypyjit/interp_jit.py` PyPyJitDriver greens =
-    // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is
-    // recovered from the live frame at every merge point via the
-    // `getfield_vable_r frame, PYCODE_FIELD_IDX → pycode_var` dual-
-    // write emitted immediately upstream; `is_being_profiled` is the
-    // Int phi of `pyframe.py PyFrame.get_is_being_profiled` on that
-    // same frame (`interp_jit.py PyFrame.dispatch`): 0 when
-    // `debugdata` is null, else `FrameDebugData.is_being_profiled`.
+    // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is the
+    // `PyFrame.dispatch` argument, a Constant of this per-code jitcode;
+    // `jtransform.py promote_greens` skips Constant greens, so no
+    // `ref_guard_value` is emitted for it.  `getcode()`
+    // (`pyframe.py PyFrame.getcode`) is the `jump_absolute` back-edge's.
+    // `is_being_profiled` is the Int phi of
+    // `pyframe.py PyFrame.get_is_being_profiled` on that same frame
+    // (`interp_jit.py PyFrame.dispatch`): 0 when `debugdata` is null,
+    // else `FrameDebugData.is_being_profiled`.
     let greens = vec![
         super::flow::Constant::signed(next_instr as i64).into(),
         is_being_profiled.into(),
-        pycode_var.into(),
+        pycode,
     ];
     let reds = vec![frame.into(), ec.into()];
     let mut args = vec![super::flow::Constant::signed(jitdriver_index as i64).into()];
@@ -2331,7 +2333,7 @@ const VABLE_DEBUGDATA_FIELD_IDX: u16 = 3;
 /// `jtransform.py rewrite_op_getfield` virtualizable branch: `-live-`
 /// then `getfield_vable_r` of `[v_inst, descr]`. The `-live-` is the
 /// resume point of a guard `pyjitpl.py MIFrame._nonstandard_virtualizable`
-/// records at the read. Shared by the portal merge-point pycode green,
+/// records at the read. Shared by
 /// `pyframe.py PyFrame.get_is_being_profiled` and `PyFrame.getcode` on a
 /// `jump_absolute` back-edge.
 fn emit_vable_getfield_ref(
@@ -2391,11 +2393,11 @@ fn emit_getcode(
 /// must not append exits: `block_closed_by_terminator` is computed
 /// before merge emission and reused as the opcode-dispatch gate.
 /// The diamond closes its source block. The portal-header caller
-/// switches onto the join for pycode's `getfield_vable_r`, the
-/// promote, and `jit_merge_point`. A `jump_absolute` back-edge emits
-/// `getcode` first, then this diamond, then `loop_header` on the join,
-/// and mergeblocks from the join to the loop header, which re-reads
-/// `debugdata`.
+/// switches onto the join for `promote_greens`' `int_guard_value` of
+/// `is_being_profiled` and `jit_merge_point`. A `jump_absolute`
+/// back-edge emits `getcode` first, then this diamond, then
+/// `loop_header` on the join, and mergeblocks from the join to the
+/// loop header, which re-reads `debugdata`.
 fn emit_portal_is_being_profiled_read(
     graph: &mut super::flow::FunctionGraph,
     current_block: &SpamBlockRef,
@@ -9660,32 +9662,30 @@ impl CodeWriter {
                             }
                             needs_fallthrough = true;
                             let jdindex = PYTHON_PORTAL_JD_INDEX;
-                            let scratch_pycode_reg =
-                                ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                            let pycode_var = emit_vable_getfield_ref(
-                                &mut graph,
-                                &current_block.block(),
-                                frame_var,
-                                VABLE_CODE_FIELD_IDX,
-                                py_pc as i64,
-                            );
+                            // `interp_jit.py PyFrame.dispatch` passes the
+                            // `pycode` argument to `jit_merge_point`; that
+                            // argument is constant for the whole call. This
+                            // jitcode is built per CodeObject, so the green
+                            // is this body's `w_code` Constant.
+                            // `jtransform.py promote_greens` skips Constant
+                            // greens (`getcode()` is the back-edge's).
+                            let pycode_green: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             // `jtransform.py promote_greens`: `-live-` then
                             // `{kind}_guard_value` on every Variable green
-                            // (`next_instr` is a Constant), then
+                            // (`next_instr` and `pycode` are Constants), then
                             // `handle_jit_marker__jit_merge_point`'s op3
                             // `-live-` "for inlined short preambles".
-                            for (opname, green) in [
-                                ("int_guard_value", profiled_var),
-                                ("ref_guard_value", pycode_var),
-                            ] {
-                                emit_live_placeholder!(py_pc);
-                                let _ = emit_graph_op_void(
-                                    &current_block.block(),
-                                    opname,
-                                    vec![green.into()],
-                                    py_pc as i64,
-                                );
-                            }
+                            emit_live_placeholder!(py_pc);
+                            let _ = emit_graph_op_void(
+                                &current_block.block(),
+                                "int_guard_value",
+                                vec![profiled_var.into()],
+                                py_pc as i64,
+                            );
                             emit_live_placeholder!(py_pc);
                             let scratch_profiled_reg =
                                 ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
@@ -9693,7 +9693,7 @@ impl CodeWriter {
                                 &graph,
                                 py_pc,
                                 profiled_var,
-                                pycode_var,
+                                pycode_green,
                                 jdindex,
                             );
                             let graph_op = emit_graph_op_void(
@@ -9704,7 +9704,8 @@ impl CodeWriter {
                             );
                             // Ad hoc regallocs for the walk-time serialize of
                             // `jit_merge_point`: Int `is_being_profiled` plus
-                            // the three portal Refs (frame / ec / pycode).
+                            // the two portal red Refs (frame / ec). The pycode
+                            // green is a Constant and has no color.
                             // Canonical `flatten_graph` recolors the same
                             // Variables from the graph; this map exists
                             // because the walker serializes the marker
@@ -9714,7 +9715,6 @@ impl CodeWriter {
                             let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
-                            portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
                             let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_int_coloring,
@@ -9722,7 +9722,7 @@ impl CodeWriter {
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_ref_coloring,
-                                    num_colors: 3,
+                                    num_colors: 2,
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: crate::jit::regalloc::Coloring::default(),
@@ -19374,9 +19374,10 @@ mod tests {
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
         let graph = new_shadow_graph_with_portal_inputs(&code, FrameInputs::Portal);
-        let pycode_var = Variable::new(VariableId(9999), Kind::Ref);
+        let pycode = Constant::new(ConstantValue::Signed(0xBEEF), Some(Kind::Ref));
         let profiled_var = Variable::new(VariableId(10001), Kind::Int);
-        let args = portal_jit_merge_point_graph_args(&graph, 17, profiled_var, pycode_var, 7);
+        let args =
+            portal_jit_merge_point_graph_args(&graph, 17, profiled_var, pycode.clone().into(), 7);
 
         assert_eq!(args.len(), 7);
         match &args[0] {
@@ -19405,11 +19406,11 @@ mod tests {
                 assert_eq!(list.kind, Kind::Ref);
                 assert_eq!(list.content.len(), 1);
                 match &list.content[0] {
-                    FlowValue::Variable(variable) => {
-                        assert_eq!(variable.id, pycode_var.id);
-                        assert_eq!(variable.kind, Some(Kind::Ref));
+                    FlowValue::Constant(constant) => {
+                        assert_eq!(constant, &pycode);
+                        assert_eq!(constant.kind, Some(Kind::Ref));
                     }
-                    other => panic!("expected pycode ref variable, got {other:?}"),
+                    other => panic!("expected pycode ref Constant, got {other:?}"),
                 }
             }
             other => panic!("expected greens ref list, got {other:?}"),
@@ -19481,8 +19482,8 @@ mod tests {
             "non-null arm reads FrameDebugData.is_being_profiled, got {opnames:?}"
         );
         assert!(
-            opnames.contains(&"int_guard_value") && opnames.contains(&"ref_guard_value"),
-            "promote_greens must guard_value the profiled and pycode greens, got {opnames:?}"
+            opnames.contains(&"int_guard_value"),
+            "promote_greens must int_guard_value the profiled green, got {opnames:?}"
         );
         assert!(
             opnames.contains(&"jit_merge_point"),
@@ -19499,6 +19500,10 @@ mod tests {
         assert!(
             guard_pos < merge_pos,
             "promote_greens must precede jit_merge_point, got {opnames:?}"
+        );
+        assert!(
+            !opnames[..merge_pos].contains(&"ref_guard_value"),
+            "promote_greens skips Constant pycode; no ref_guard_value before header jit_merge_point, got {opnames:?}"
         );
     }
 
