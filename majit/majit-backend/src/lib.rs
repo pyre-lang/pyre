@@ -3529,7 +3529,6 @@ pub trait Backend: Send {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Whether a `BackendError::Unsupported` returned by `compile_bridge`
@@ -3908,17 +3907,6 @@ pub trait Backend: Send {
         _trace_id: u64,
     ) -> Option<CompiledTraceInfo> {
         None
-    }
-
-    /// Patch backend-owned recovery metadata for a specific compiled terminal exit.
-    fn update_terminal_exit_recovery_layout(
-        &mut self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _op_index: usize,
-        _recovery_layout: ExitRecoveryLayout,
-    ) -> bool {
-        false
     }
 
     /// Describe the latest exit stored in a deadframe.
