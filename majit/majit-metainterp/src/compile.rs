@@ -21,8 +21,8 @@ use std::sync::{Arc, OnceLock};
 use smallvec::smallvec;
 
 use majit_backend::{
-    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, ExitFrameLayout,
-    ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
+    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, FailDescrLayout,
+    JitCellToken, TerminalExitLayout,
 };
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
@@ -34,10 +34,7 @@ use majit_ir::{
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
-use crate::resume::{
-    ResumeData, ResumeFrameLayoutSummary, ResumeLayoutSummary, ResumeStorage, ResumeValueKind,
-    ResumeValueLayoutSummary,
-};
+use crate::resume::ResumeStorage;
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
 /// `compile.py` `make_jitcell_token(jitdriver_sd)`.
@@ -85,37 +82,17 @@ pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
 
 /// Resolve the type of an OpRef in guard fail_args.
 /// OpRef::NONE is a virtual slot placeholder (null GC ref).
-/// history.py:220/261/307 — the type is intrinsic on the Box itself
+/// history.py Box.type is intrinsic on the Box itself
 /// (`Const{Int,Float,Ptr}.type`, `InputArg{Int,Float,Ref}.type`, and the
 /// `{Int,Float,Ref}Op` mixins), read off the OpRef variant tag
 /// (`OpRef::ty()` in `resoperation.rs`). A fail_arg carries its own type regardless of
 /// trace position, so no position-keyed side table is needed.
+#[cfg(test)]
 fn fail_arg_type(opref: &OpRef) -> Type {
     if *opref == OpRef::NONE {
         return Type::Ref;
     }
     opref.ty().unwrap_or(Type::Ref)
-}
-
-/// Derive slot_types from ExitValueSourceLayout + exit_types.
-/// resume.py decode_box(tagged, kind) parity: a slot's type
-/// is the declared type of the variable, so a constant carries its own
-/// declared type rather than being assumed an integer.
-/// ExitValue(idx) → exit_types[idx]; Constant(_, ty) → ty; others → Ref.
-fn derive_slot_types(
-    slots: &[majit_backend::ExitValueSourceLayout],
-    exit_types: &[Type],
-) -> Vec<Type> {
-    slots
-        .iter()
-        .map(|slot| match slot {
-            majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
-                exit_types.get(*idx).copied().unwrap_or(Type::Ref)
-            }
-            majit_backend::ExitValueSourceLayout::Constant(_, ty) => *ty,
-            _ => Type::Ref,
-        })
-        .collect()
 }
 
 /// Storage for one exit's type list.
@@ -306,13 +283,11 @@ pub struct CompileResult<M> {
     pub is_exit_frame_with_exception: bool,
     /// The failing guard's exit description, and `None` on a FINISH exit.
     ///
-    /// Held behind a pointer for the reason
-    /// [`CompiledExitLayout::recovery_layout`] gives one level down, applied to
-    /// the layout as a whole: this result is returned BY VALUE from every
-    /// compiled entry, so an inline layout is bytes moved on each one. Every
-    /// reader (`jitdriver`'s two run loops and pyre's drain loop) opens the
-    /// layout only past its own FINISH and `fail_index == u32::MAX` arms, so a
-    /// call that returns through either was copying a layout nothing read.
+    /// Held behind a pointer because this result is returned BY VALUE from
+    /// every compiled entry, so an inline layout is bytes moved on each one.
+    /// Every reader (`jitdriver`'s two run loops and pyre's drain loop) opens
+    /// the layout only past its own FINISH and `fail_index == u32::MAX` arms,
+    /// so a call that returns through either was copying a layout nothing read.
     ///
     /// The allocation lands where the layout is built, which the FINISH arm now
     /// returns before reaching. A FINISH exit stores one null word here, so the
@@ -654,137 +629,10 @@ pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T
     }
 }
 
-/// Project a `ResumeLayoutSummary` from `rebuild_from_numbering` frames.
-///
-/// `resume.py ResumeDataVirtualAdder.finish` / `compile.py ResumeGuardDescr`
-/// already stored `rd_numb` on the descr. Consumers walk that stream; they do
-/// not call `ResumeDataLoopMemo.number` a second time. An earlier path
-/// rebuilt a `ResumeData`, numbered it into a fresh memo, then decoded
-/// the encoding — a second numbering RPython does not run.
-fn rebuilt_value_layout(
-    val: &majit_ir::resumedata::RebuiltValue,
-    rd_consts: &[majit_ir::Const],
-) -> ResumeValueLayoutSummary {
-    use majit_ir::resumedata::RebuiltValue;
-    match val {
-        RebuiltValue::Box(idx, _) => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::FailArg,
-            fail_arg_index: *idx,
-            raw_fail_arg_position: Some(*idx),
-            constant: None,
-            constant_type: None,
-            virtual_index: None,
-        },
-        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
-            let c = val.const_at_use(rd_consts);
-            ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Constant,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: Some(c.as_raw_i64()),
-                constant_type: Some(c.get_type()),
-                virtual_index: None,
-            }
-        }
-        RebuiltValue::Virtual(vidx) => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::Virtual,
-            fail_arg_index: 0,
-            raw_fail_arg_position: None,
-            constant: None,
-            constant_type: None,
-            virtual_index: Some(*vidx),
-        },
-        // `ResumeDataVirtualAdder.set_slot_uninitialized` for Unassigned.
-        RebuiltValue::Unassigned => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::Uninitialized,
-            fail_arg_index: 0,
-            raw_fail_arg_position: None,
-            constant: None,
-            constant_type: None,
-            virtual_index: None,
-        },
-    }
-}
-
-fn resume_layout_from_rebuilt_frames(
-    frames: &[majit_ir::resumedata::RebuiltFrame],
-    rd_consts: &[majit_ir::Const],
-) -> ResumeLayoutSummary {
-    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frames
-        .iter()
-        .map(|frame| {
-            let slot_layouts: Vec<ResumeValueLayoutSummary> = frame
-                .values
-                .iter()
-                .map(|val| rebuilt_value_layout(val, rd_consts))
-                .collect();
-            ResumeFrameLayoutSummary {
-                trace_id: None,
-                header_pc: None,
-                source_guard: None,
-                jitcode_index: frame.jitcode_index,
-                pc: frame.pc as u64,
-                // resume.py walks `rd_numb`; these kind/pc/count projections
-                // are unused. A 1-item Vec each was the 8 B / 16 B class on
-                // the regex and/or compile path.
-                slot_sources: Vec::new(),
-                slot_layouts,
-                slot_types: None,
-            }
-        })
-        .collect();
-    ResumeLayoutSummary {
-        num_frames: frame_layouts.len(),
-        frame_pcs: Vec::new(),
-        frame_slot_counts: Vec::new(),
-        frame_layouts,
-        num_virtuals: 0,
-        virtual_kinds: Vec::new(),
-        virtual_layouts: Vec::new(),
-        pending_field_count: 0,
-        pending_field_layouts: Vec::new(),
-        const_pool_size: rd_consts.len(),
-    }
-}
-
-fn resume_layout_identity_frame(pc: u64, num_slots: usize) -> ResumeLayoutSummary {
-    let slot_layouts: Vec<ResumeValueLayoutSummary> = (0..num_slots)
-        .map(|index| ResumeValueLayoutSummary {
-            kind: ResumeValueKind::FailArg,
-            fail_arg_index: index,
-            raw_fail_arg_position: Some(index),
-            constant: None,
-            constant_type: None,
-            virtual_index: None,
-        })
-        .collect();
-    let frame = ResumeFrameLayoutSummary {
-        trace_id: None,
-        header_pc: None,
-        source_guard: None,
-        jitcode_index: 0,
-        pc,
-        slot_sources: Vec::new(),
-        slot_layouts,
-        slot_types: None,
-    };
-    ResumeLayoutSummary {
-        num_frames: 1,
-        frame_pcs: Vec::new(),
-        frame_slot_counts: Vec::new(),
-        frame_layouts: vec![frame],
-        num_virtuals: 0,
-        virtual_kinds: Vec::new(),
-        virtual_layouts: Vec::new(),
-        pending_field_count: 0,
-        pending_field_layouts: Vec::new(),
-        const_pool_size: 0,
-    }
-}
-
 /// history.py Box.type is on the box. Prefer the descr's `fail_arg_types`
 /// slice in place — a `to_vec()` per guard was an 8 B / 16 B class on
 /// the regex and/or timed row (`build_guard_metadata`).
+#[cfg(test)]
 fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     op: &Op,
     is_finish: bool,
@@ -845,36 +693,18 @@ fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
 /// Build guard metadata for a compiled trace.
 ///
 /// The backend numbers every guard and finish in a single exit table, so this
-/// helper mirrors that numbering and records only the guard entries that need
-/// resume data plus the corresponding op index for blackhole fallback.
-///
-/// `frame_value_count_fn` is the compiling driver's
-/// [`crate::jitdriver::JitDriverStaticData::frame_value_count_fn`] override for
-/// the `jitcode.py enumerate_vars` frame box count; `None` falls back to the
-/// process-global callback the host registered.
+/// helper mirrors that numbering and records the source op index plus the
+/// guard's own descr for blackhole fallback. Resume payload stays on the
+/// descr (`ResumeGuardDescr.get_resumestorage`); this map does not copy it.
 pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
-    inputargs: &[A],
+    _inputargs: &[A],
     ops: &[T],
-    pc: u64,
-    frame_value_count_fn: Option<fn(i32, i32) -> usize>,
-) -> (
-    crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary>,
-    crate::FxIndexMap<u32, StoredExitLayout>,
-) {
-    let result: crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary> =
-        crate::FxIndexMap::default();
+    _pc: u64,
+    _frame_value_count_fn: Option<fn(i32, i32) -> usize>,
+) -> crate::FxIndexMap<u32, StoredExitLayout> {
     let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
     let mut fail_index = 0u32;
-    // The driver-scoped override wins: a driver whose frames are numbered
-    // outside the process-global liveness pool must not decode against it (see
-    // `JitDriverStaticData::frame_value_count_fn`).
-    let fvc = frame_value_count_fn.or_else(majit_ir::resumedata::get_frame_value_count_fn);
-    let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-        fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
     stamp_guard_descr_trace_positions(ops);
-    // history.py:220/261/307 — each fail-arg's type is intrinsic on the Box
-    // (the OpRef variant tag, `ty()`); a fail_arg carries its own type
-    // regardless of trace position, so no position-keyed side table is needed.
     for (op_idx, op) in ops.iter().enumerate() {
         let op = op.as_ref();
         let is_guard = op.opcode.is_guard();
@@ -882,452 +712,17 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
         if !is_guard && !is_finish {
             continue;
         }
-
-        // RPython Box.type parity: each fail-arg's type is `livebox.type`,
-        // captured at numbering time inside `store_final_boxes_in_guard`
-        // (resume.py _add_pending_fields, optimizer.py). majit stores that snapshot on
-        // the descr's `fail_arg_types()` (post-numbering, post-virtual-
-        // materialization) and mirrors it to `op.fail_arg_types` for
-        // sharing-path guards (`optimizeopt/mod.rs`'s `emit_guard_operation`).
-        // After the codex #3 fix
-        // (tracer-stage descr=None -- that hash resolves nowhere in
-        // this repository, so the mechanism named here is the
-        // reference), every guard's descr is
-        // minted by `store_final_boxes_in_guard` carrying the
-        // post-numbering type vector, so descr-first priority no longer
-        // exposes stale tracer types. Fall back to `op.fail_arg_types`
-        // and finally the failarg's own variant tag (`opref.ty()`).
-        let exit_types = exit_types_for_guard_or_finish(op, is_finish, inputargs);
-        // Both resume-layout consumers below decode the same guard-owned
-        // `rd_numb`. RPython keeps one numbering stream on the descr and its
-        // consumers walk that shared data; decoding it twice here duplicated
-        // every vable, vref and frame vector solely to project two Rust layout
-        // views. Decode once and let both projections borrow the result.
-        let decoded_numbering = if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
-            (op.resolved_rd_numb(), op.resolved_rd_consts())
-        {
-            let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
-            Some(majit_ir::resumedata::rebuild_from_numbering(
-                &rd_numb_bytes,
-                &rd_consts_data,
-                &exit_types,
-                fvc_ref,
-                num_virtuals,
-            ))
-        } else {
-            None
-        };
-        let resume_layout = if is_guard {
-            // store_final_boxes / ResumeGuardDescr: when rd_numb is present,
-            // fail_args are liveboxes only. Project the frontend
-            // ResumeLayoutSummary from that stream so TAGCONST/TAGINT slots
-            // stay Constant. Do not rebuild a ResumeData and number it
-            // again — RPython walks storage.rd_numb.
-            //
-            // `resolved_rd_*` chases `descr.prev`
-            // (compile.py ResumeGuardCopiedDescr.get_resumestorage) so a
-            // shared guard reads the donor without an owned copy.
-            //
-            // After opencoder.py framestack.reverse(), rd_numb and
-            // ResumeData.frames are outermost-first. vable_array / vref_array
-            // stay their own sections (resume.py); they are not merged into
-            // the innermost frame here.
-            let layout = if let Some((_num_failargs, _vable_values, _vref_values, frames)) =
-                decoded_numbering.as_ref()
-            {
-                let rd_consts_arc = op.resolved_rd_consts();
-                let rd_consts = rd_consts_arc.as_ref().map(|p| p.as_slice()).unwrap_or(&[]);
-                resume_layout_from_rebuilt_frames(frames, rd_consts)
-            } else {
-                // No rd_numb: single frame, 1:1 mapping (fail_args[i] → state[i]).
-                let num_slots = op
-                    .guard_fail_args()
-                    .map(|fa| fa.len())
-                    .unwrap_or(exit_types.len());
-                resume_layout_identity_frame(pc, num_slots)
-            };
-            // One Arc; `enrich_guard_resume_layouts_for_trace` make_muts
-            // it. Cloning the summary here minted a second frame_pcs /
-            // slot_sources / slot_layouts heap per guard.
-            Some(std::sync::Arc::new(layout))
-        } else {
-            None
-        };
-
-        // The `rd_*` payload stays on the guard's descr
-        // (`ResumeGuardDescr.get_resumestorage`); it feeds into
-        // `recovery_layout` below via the guard op's rd_numb / rd_consts.
-        // Sharing-path guards (mod.rs::sharing-guard) own a
-        // ResumeGuardCopiedDescr whose `prev` points at the donor;
-        // the `resolved_rd_*` helpers chase that descr-side pointer
-        // (compile.py get_resumestorage).
-        let recovery_layout = if decoded_numbering.is_some() {
-            // Consumer switchover path: rd_numb contains the full frame encoding.
-            // Build recovery_layout from rd_numb + rd_virtuals.
-            use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
-            let (num_failargs, vable_layout, vref_layout, frames_layout) =
-                if let Some((num_failargs, vable_values, vref_values, frames)) =
-                    decoded_numbering.as_ref()
-                {
-                    use majit_ir::resumedata::RebuiltValue;
-                    debug_assert!(
-                        vref_values.len() & 1 == 0,
-                        "vref_values length must be even, got {}",
-                        vref_values.len(),
-                    );
-                    let rd_consts_arc = op.resolved_rd_consts();
-                    let rd_consts = rd_consts_arc.as_ref().map(|p| p.as_slice()).unwrap_or(&[]);
-                    let to_exit_source = |val: &RebuiltValue| match val {
-                        RebuiltValue::Box(idx, _) => ExitValueSourceLayout::ExitValue(*idx),
-                        RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
-                        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
-                            let c = val.const_at_use(rd_consts);
-                            ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
-                        }
-                        RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
-                    };
-                    (
-                        *num_failargs,
-                        vable_values.iter().map(to_exit_source).collect::<Vec<_>>(),
-                        vref_values.iter().map(to_exit_source).collect::<Vec<_>>(),
-                        frames
-                            .iter()
-                            .map(|frame| {
-                                let mut slots = Vec::new();
-                                slots.extend(frame.values.iter().map(to_exit_source));
-                                let slot_types = derive_slot_types(&slots, &exit_types);
-                                majit_backend::ExitFrameLayout {
-                                    trace_id: None,
-                                    header_pc: Some(frame.pc as u64),
-                                    source_guard: None,
-                                    pc: frame.pc as u64,
-                                    jitcode_index: frame.jitcode_index,
-                                    slots,
-                                    slot_types: Some(slot_types),
-                                }
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    (exit_types.len() as i32, vec![], vec![], vec![])
-                };
-            // Collect slots from ALL frames for virtual target_slot lookup.
-            // RPython resolves virtuals across the entire frame stack, not
-            // just the innermost frame (resume.py load_next_value_of_type).
-            let frame_slots: Vec<ExitValueSourceLayout> = frames_layout
-                .iter()
-                .flat_map(|frame| frame.slots.iter().cloned())
-                .collect();
-            // resume.py AbstractVirtualInfo parity: resolve fieldnums tags for recovery.
-            // Follow `descr.prev` so sharing-path guards see the donor's
-            // const pool (compile.py get_resumestorage).
-            let rd_consts_arc = op.resolved_rd_consts();
-            let rd_consts_ref: &[Const] =
-                rd_consts_arc.as_deref().map_or(&[], |pool| pool.as_slice());
-            let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len()) as i32;
-            let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
-                crate::resume::exit_source_from_tagged(
-                    tagged,
-                    num_failargs,
-                    rd_consts_ref,
-                    num_virtuals,
-                )
-            };
-            let resolve_fieldnums = |fieldnums: &[i16],
-                                     fielddescr_indices: &[u32]|
-             -> Vec<(u32, ExitValueSourceLayout)> {
-                fieldnums
-                    .iter()
-                    .enumerate()
-                    .map(|(fi, &fnum)| {
-                        let fdi = fielddescr_indices.get(fi).copied().unwrap_or(fi as u32);
-                        (fdi, resolve_tagged_source(fnum))
-                    })
-                    .collect()
-            };
-            // Sharing-path follows `descr.prev` to read the donor's
-            // virtual table (compile.py get_resumestorage parity).
-            let virtual_layouts: Vec<majit_backend::ExitVirtualLayout> = op
-                .resolved_rd_virtuals()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .enumerate()
-                        .map(|(vidx, entry_rc)| {
-                            let entry: &majit_ir::RdVirtualInfo = entry_rc.as_ref();
-                            let target_slot = frame_slots.iter().position(
-                                |s| matches!(s, ExitValueSourceLayout::Virtual(v) if *v == vidx),
-                            );
-                            match entry {
-                                majit_ir::RdVirtualInfo::VirtualInfo {
-                                    descr,
-                                    type_id,
-                                    known_class,
-                                    fielddescrs,
-                                    fieldnums,
-                                    descr_size,
-                                } => {
-                                    let idx: Vec<u32> =
-                                        fielddescrs.iter().map(|fd| fd.index).collect();
-                                    majit_backend::ExitVirtualLayout::Object {
-                                        descr: descr.clone(),
-                                        type_id: *type_id,
-                                        known_class: *known_class,
-                                        fields: resolve_fieldnums(fieldnums, &idx),
-                                        target_slot,
-                                        fielddescrs: fielddescrs.clone(),
-                                        descr_size: *descr_size,
-                                    }
-                                }
-                                majit_ir::RdVirtualInfo::VStructInfo {
-                                    typedescr,
-                                    type_id,
-                                    fielddescrs,
-                                    fieldnums,
-                                    descr_size,
-                                } => {
-                                    let idx: Vec<u32> =
-                                        fielddescrs.iter().map(|fd| fd.index).collect();
-                                    majit_backend::ExitVirtualLayout::Struct {
-                                        typedescr: typedescr.clone(),
-                                        type_id: *type_id,
-                                        fields: resolve_fieldnums(fieldnums, &idx),
-                                        target_slot,
-                                        fielddescrs: fielddescrs.clone(),
-                                        descr_size: *descr_size,
-                                    }
-                                }
-                                majit_ir::RdVirtualInfo::VArrayInfoClear {
-                                    arraydescr,
-                                    kind,
-                                    fieldnums,
-                                }
-                                | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                                    arraydescr,
-                                    kind,
-                                    fieldnums,
-                                } => {
-                                    let clear = matches!(
-                                        entry,
-                                        majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
-                                    );
-                                    let items = fieldnums
-                                        .iter()
-                                        .map(|&fnum| resolve_tagged_source(fnum))
-                                        .collect();
-                                    majit_backend::ExitVirtualLayout::Array {
-                                        arraydescr: arraydescr.clone(),
-                                        clear,
-                                        kind: *kind,
-                                        items,
-                                    }
-                                }
-                                majit_ir::RdVirtualInfo::VArrayStructInfo {
-                                    arraydescr,
-                                    fielddescrs,
-                                    size,
-                                    fielddescr_indices,
-                                    fieldnums,
-                                    ..
-                                } => {
-                                    let fpe = fieldnums.len().checked_div(*size).unwrap_or(0);
-                                    let element_fields = (0..*size)
-                                        .map(|ei| {
-                                            let s = ei * fpe;
-                                            let e = (s + fpe).min(fieldnums.len());
-                                            resolve_fieldnums(&fieldnums[s..e], fielddescr_indices)
-                                        })
-                                        .collect();
-                                    majit_backend::ExitVirtualLayout::ArrayStruct {
-                                        arraydescr: arraydescr.clone(),
-                                        fielddescrs: fielddescrs.clone(),
-                                        element_fields,
-                                    }
-                                }
-                                majit_ir::RdVirtualInfo::VRawBufferInfo {
-                                    func,
-                                    size,
-                                    offsets,
-                                    descrs,
-                                    fieldnums,
-                                } => {
-                                    let values = fieldnums
-                                        .iter()
-                                        .map(|&fnum| resolve_tagged_source(fnum))
-                                        .collect();
-                                    majit_backend::ExitVirtualLayout::RawBuffer {
-                                        func: *func,
-                                        size: *size,
-                                        offsets: offsets.clone(),
-                                        descrs: descrs.clone(),
-                                        values,
-                                    }
-                                }
-                                majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
-                                    // resume.py: VRawSliceInfo — base_buffer + offset.
-                                    let base = fieldnums
-                                        .first()
-                                        .map(|&fnum| resolve_tagged_source(fnum))
-                                        .unwrap_or(ExitValueSourceLayout::Constant(0, Type::Int));
-                                    majit_backend::ExitVirtualLayout::RawSlice {
-                                        offset: *offset,
-                                        base,
-                                    }
-                                }
-                                // resume.py VStrPlainInfo /
-                                // resume.py VUniPlainInfo —
-                                // length = len(fieldnums).
-                                majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
-                                    let chars = fieldnums
-                                        .iter()
-                                        .map(|&fnum| resolve_tagged_source(fnum))
-                                        .collect();
-                                    majit_backend::ExitVirtualLayout::StrPlain {
-                                        is_unicode: false,
-                                        chars,
-                                    }
-                                }
-                                majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
-                                    let chars = fieldnums
-                                        .iter()
-                                        .map(|&fnum| resolve_tagged_source(fnum))
-                                        .collect();
-                                    majit_backend::ExitVirtualLayout::StrPlain {
-                                        is_unicode: true,
-                                        chars,
-                                    }
-                                }
-                                // resume.py VStrConcatInfo /
-                                // resume.py VUniConcatInfo —
-                                // decoder.concat_strings(left, right); funcptr
-                                // resolved at materialization via
-                                // `callinfocollection.funcptr_for_oopspec(...)`
-                                // (resume.py / 1494-1495).
-                                majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
-                                | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
-                                    let is_unicode = matches!(
-                                        entry,
-                                        majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
-                                    );
-                                    let left = resolve_tagged_source(fieldnums[0]);
-                                    let right = resolve_tagged_source(fieldnums[1]);
-                                    majit_backend::ExitVirtualLayout::StrConcat {
-                                        is_unicode,
-                                        left,
-                                        right,
-                                    }
-                                }
-                                // resume.py VStrSliceInfo /
-                                // resume.py VUniSliceInfo —
-                                // decoder.slice_string(largerstr, start, length);
-                                // funcptr resolved via callinfocollection at
-                                // materialization (resume.py / 1504-1505).
-                                majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
-                                | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
-                                    let is_unicode = matches!(
-                                        entry,
-                                        majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
-                                    );
-                                    let str_src = resolve_tagged_source(fieldnums[0]);
-                                    let start = resolve_tagged_source(fieldnums[1]);
-                                    let length = resolve_tagged_source(fieldnums[2]);
-                                    majit_backend::ExitVirtualLayout::StrSlice {
-                                        is_unicode,
-                                        str_src,
-                                        start,
-                                        length,
-                                    }
-                                }
-                                // `ResumeDataVirtualAdder._number_virtuals`
-                                // leaves None entries when a shared memo's
-                                // cached virtual number is absent from this
-                                // guard. Preserve the index; the slot is not
-                                // referenced by this guard's numbering.
-                                majit_ir::RdVirtualInfo::Empty => {
-                                    majit_backend::ExitVirtualLayout::Hole
-                                }
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            // resume.py:926,993: rd_pendingfields → pending_field_layouts.
-            // PENDINGFIELDSTRUCT carries (lldescr / num / fieldnum /
-            // itemindex); the layout mirrors that shape and consumers
-            // (`pyre-jit::eval::replay_pending_fields`,
-            // `cranelift::compiler` guard recovery) call descr methods at
-            // dispatch time, matching `resume.py` (setfield) and
-            // `resume.py` (setarrayitem_int / _ref / _float).
-            let pending_field_layouts: Vec<majit_backend::ExitPendingFieldLayout> = op
-                .resolved_rd_pendingfields()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .map(|pf| {
-                            crate::resume::exit_pending_field_layout(
-                                pf,
-                                num_failargs,
-                                rd_consts_ref,
-                                num_virtuals,
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(ExitRecoveryLayout {
-                vable_array: vable_layout,
-                vref_array: vref_layout,
-                frames: frames_layout,
-                virtual_layouts,
-                pending_field_layouts,
-            })
-        } else {
-            // No rd_numb: identity recovery layout.
-            // Every guard has at minimum an identity mapping from
-            // fail_args → frame slots, with exit_types as slot_types.
-            // `jitcode_index: 0` is a placeholder for the no-rd_numb
-            // path — `patch_guard_recovery_layouts_for_trace`
-            // (`compile.rs`) overwrites this with the resume_layout
-            // derived from `Snapshot::single_frame(jitcode_index, pc, ...)`.
-            // The outermost-frame rule in `pyre-jit/src/eval.rs`'s
-            // `rebuild_typed_from_rd_numb` means a
-            // stale `jitcode_index: 0` is never consulted for code lookup
-            // on the sole frame of a single-frame identity layout — code
-            // comes from the vable instead.
-            let slots: Vec<majit_backend::ExitValueSourceLayout> = (0..exit_types.len())
-                .map(majit_backend::ExitValueSourceLayout::ExitValue)
-                .collect();
-            Some(ExitRecoveryLayout {
-                vable_array: vec![],
-                vref_array: vec![],
-                frames: vec![majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: Some(pc),
-                    source_guard: None,
-                    pc,
-                    jitcode_index: 0,
-                    slots,
-                    slot_types: Some(exit_types.to_vec()),
-                }],
-                virtual_layouts: vec![],
-                pending_field_layouts: vec![],
-            })
-        };
-
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(op_idx),
-                recovery_layout: recovery_layout.map(std::sync::Arc::new),
-                resume_layout,
                 descr: op.getdescr(),
                 op_arg_types_for_jump: None,
             },
         );
         fail_index += 1;
     }
-
-    (result, exit_layouts)
+    exit_layouts
 }
 
 pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
@@ -1372,8 +767,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                 .entry(layout.fail_index)
                 .or_insert_with(|| StoredExitLayout {
                     source_op_index: layout.source_op_index,
-                    recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
-                    resume_layout: None,
                     descr: descr_from_op.clone(),
                     op_arg_types_for_jump: None,
                 });
@@ -1385,164 +778,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         if entry.descr.is_none() {
             entry.descr = descr_from_op;
         }
-        // Merge recovery_layout: preserve header_pc from the frontend's
-        // rd_numb-based layout when the backend doesn't provide it.
-        // The frontend populates header_pc from the guard's snapshot
-        // frame.pc; the backend may only have slot layouts.
-        // copy_all_attributes_from parity: reconcile every backend frame,
-        // not only the common prefix. Overlapping frames keep the
-        // frontend's authoritative header_pc/slot_types and back-fill gaps
-        // from the backend; backend frames the frontend layout lacks are
-        // appended so no recovery frame is dropped.
-        if let Some(ref backend_recovery) = layout.recovery_layout {
-            if let Some(existing) = entry.recovery_layout.as_mut().map(std::sync::Arc::make_mut) {
-                for (i, source) in backend_recovery.frames.iter().enumerate() {
-                    if let Some(target) = existing.frames.get_mut(i) {
-                        if target.header_pc.is_none() {
-                            target.header_pc = source.header_pc;
-                        }
-                        if target.slot_types.is_none() {
-                            target.slot_types = source.slot_types.clone();
-                        }
-                    } else {
-                        existing.frames.push(source.clone());
-                    }
-                }
-            } else {
-                entry.recovery_layout = layout.recovery_layout.clone().map(std::sync::Arc::new);
-            }
-        }
-        // Merge backend frame_stack metadata into the stored resume layout.
-        if let Some(frame_stack) = &layout.frame_stack {
-            merge_frame_stack_into_resume_layout(entry, frame_stack);
-        }
-    }
-    validate_exit_layouts(exit_layouts);
-}
-
-/// Validate that guard exit layouts with recovery_layout have complete
-/// metadata. Called after merge_backend_exit_layouts to enforce:
-/// if recovery_layout is present, header_pc and slot_types must be set.
-///
-/// Guards that HAVE recovery_layout (all production guards after backend
-/// merge) must satisfy the full invariant. Guards without (only possible
-/// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(exit_layouts: &crate::FxIndexMap<u32, StoredExitLayout>) {
-    for (&fail_index, layout) in exit_layouts {
-        if layout.resolve_is_finish() {
-            continue;
-        }
-        let Some(ref recovery) = layout.recovery_layout else {
-            // No recovery_layout — backend didn't provide one (test mock).
-            // In production, identity_recovery_layout always creates it.
-            continue;
-        };
-        for (fi, frame) in recovery.frames.iter().enumerate() {
-            // header_pc and slot_types are filled by both
-            // build_guard_metadata (metainterp) and identity_recovery_layout
-            // (backend). After backend merge, both must be present.
-            // Backend-provided layouts always have them
-            // (`compiler.rs`'s `identity_recovery_layout`).
-            // Metainterp-provided layouts always fill them.
-            if frame.header_pc.is_none() || frame.slot_types.is_none() {
-                // Backend test mocks may omit these — not fatal in tests.
-                #[cfg(not(test))]
-                {
-                    debug_assert!(
-                        frame.header_pc.is_some(),
-                        "guard fail_index={fail_index} frame[{fi}] has no header_pc"
-                    );
-                    debug_assert!(
-                        frame.slot_types.is_some(),
-                        "guard fail_index={fail_index} frame[{fi}] has no slot_types"
-                    );
-                }
-                continue;
-            }
-            let st = frame.slot_types.as_ref().unwrap();
-            debug_assert_eq!(
-                st.len(),
-                frame.slots.len(),
-                "guard fail_index={fail_index} frame[{fi}]: slot_types.len()={} != slots.len()={}",
-                st.len(),
-                frame.slots.len(),
-            );
-        }
-    }
-}
-
-/// Merge backend-origin `frame_stack` metadata into a `StoredExitLayout`'s
-/// resume layout, enriching or creating `frame_layouts` entries with slot
-/// types from the backend's `ExitFrameLayout`.
-pub(crate) fn merge_frame_stack_into_resume_layout(
-    entry: &mut StoredExitLayout,
-    frame_stack: &[ExitFrameLayout],
-) {
-    if frame_stack.is_empty() {
-        return;
-    }
-
-    let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
-        .iter()
-        .map(crate::resume::resume_frame_layout_from_exit_frame_layout)
-        .collect();
-
-    if let Some(resume_layout) = entry.resume_layout.as_mut().map(std::sync::Arc::make_mut) {
-        // Merge slot types from frame_stack into existing frame_layouts.
-        let shared = resume_layout.frame_layouts.len().min(frame_layouts.len());
-        for offset in 0..shared {
-            let resume_index = resume_layout.frame_layouts.len() - 1 - offset;
-            let fs_index = frame_layouts.len() - 1 - offset;
-            let target = &mut resume_layout.frame_layouts[resume_index];
-            let source = &frame_layouts[fs_index];
-
-            if target.trace_id.is_none() {
-                target.trace_id = source.trace_id;
-            }
-            if target.header_pc.is_none() {
-                target.header_pc = source.header_pc;
-            }
-            if target.source_guard.is_none() {
-                target.source_guard = source.source_guard;
-            }
-
-            let needs_slot_types = target
-                .slot_types
-                .as_ref()
-                .is_none_or(|types| types.len() != target.slot_layouts.len());
-            if needs_slot_types
-                && source
-                    .slot_types
-                    .as_ref()
-                    .is_some_and(|types| types.len() == target.slot_layouts.len())
-            {
-                target.slot_types = source.slot_types.clone();
-            }
-        }
-
-        // If the frame_stack has more frames than the existing resume layout,
-        // prepend the extra outer frames.
-        if frame_layouts.len() > resume_layout.frame_layouts.len() {
-            let extra_count = frame_layouts.len() - resume_layout.frame_layouts.len();
-            let mut new_frames = frame_layouts[..extra_count].to_vec();
-            new_frames.append(&mut resume_layout.frame_layouts);
-            resume_layout.frame_layouts = new_frames;
-            resume_layout.num_frames = resume_layout.frame_layouts.len();
-        }
-    } else {
-        // No existing resume layout; create one from the frame_stack.
-        entry.resume_layout = Some(std::sync::Arc::new(ResumeLayoutSummary {
-            num_frames: frame_layouts.len(),
-            frame_pcs: Vec::new(),
-            frame_slot_counts: Vec::new(),
-            frame_layouts,
-            num_virtuals: 0,
-            virtual_kinds: Vec::new(),
-            virtual_layouts: Vec::new(),
-            pending_field_count: 0,
-            pending_field_layouts: Vec::new(),
-            const_pool_size: 0,
-        }));
     }
 }
 
@@ -1585,81 +820,16 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
             .entry(layout.op_index)
             .or_insert_with(|| StoredExitLayout {
                 source_op_index: Some(layout.op_index),
-                recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
-                resume_layout: None,
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
             });
         entry.source_op_index = Some(layout.op_index);
-        entry.recovery_layout = layout.recovery_layout.clone().map(std::sync::Arc::new);
         if entry.descr.is_none() {
             entry.descr = descr_from_op;
         }
         if entry.op_arg_types_for_jump.is_none() && is_jump {
             entry.op_arg_types_for_jump = op_arg_types_for_jump;
         }
-    }
-}
-
-pub(crate) fn enrich_resume_layout_with_trace_metadata<A: AsRef<InputArg>>(
-    layout: &mut ResumeLayoutSummary,
-    trace_id: u64,
-    inputargs: &[A],
-    trace_info: Option<&CompiledTraceInfo>,
-    recovery_layout: Option<&ExitRecoveryLayout>,
-) {
-    if layout.frame_layouts.is_empty() {
-        return;
-    }
-
-    if let Some(recovery_layout) = recovery_layout {
-        let shared_frames = layout.frame_layouts.len().min(recovery_layout.frames.len());
-        for offset in 0..shared_frames {
-            let layout_index = layout.frame_layouts.len() - 1 - offset;
-            let recovery_index = recovery_layout.frames.len() - 1 - offset;
-            let recovery_frame = &recovery_layout.frames[recovery_index];
-            let frame = &mut layout.frame_layouts[layout_index];
-            if frame.trace_id.is_none() {
-                frame.trace_id = recovery_frame.trace_id;
-            }
-            if frame.header_pc.is_none() {
-                frame.header_pc = recovery_frame.header_pc;
-            }
-            if frame.source_guard.is_none() {
-                frame.source_guard = recovery_frame.source_guard;
-            }
-            let needs_slot_types = match frame.slot_types.as_ref() {
-                Some(slot_types) => slot_types.len() != frame.slot_layouts.len(),
-                None => true,
-            };
-            if needs_slot_types
-                && recovery_frame
-                    .slot_types
-                    .as_ref()
-                    .is_some_and(|slot_types| slot_types.len() == frame.slot_layouts.len())
-            {
-                frame.slot_types = recovery_frame.slot_types.clone();
-            }
-        }
-    }
-
-    let last_index = layout.frame_layouts.len() - 1;
-    let innermost = &mut layout.frame_layouts[last_index];
-    if innermost.trace_id.is_none() {
-        innermost.trace_id = Some(trace_id);
-    }
-    if innermost.header_pc.is_none() {
-        innermost.header_pc = trace_info.map(|info| info.header_pc);
-    }
-    if innermost.source_guard.is_none() {
-        innermost.source_guard = trace_info.and_then(|info| info.source_guard);
-    }
-    let needs_slot_types = match innermost.slot_types.as_ref() {
-        Some(slot_types) => slot_types.len() != innermost.slot_layouts.len(),
-        None => true,
-    };
-    if needs_slot_types && inputargs.len() == innermost.slot_layouts.len() {
-        innermost.slot_types = Some(inputargs.iter().map(|arg| arg.as_ref().tp.get()).collect());
     }
 }
 
@@ -1752,8 +922,6 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<Input
                 op_index,
                 StoredExitLayout {
                     source_op_index: Some(op_index),
-                    recovery_layout: None,
-                    resume_layout: None,
                     descr: op.getdescr(),
                     op_arg_types_for_jump,
                 },
@@ -2219,80 +1387,6 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
     result
 }
 
-pub(crate) fn enrich_guard_resume_layouts_for_trace<A: AsRef<InputArg>>(
-    _resume_layouts: &mut crate::FxIndexMap<u32, crate::resume::ResumeLayoutSummary>,
-    exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
-    trace_id: u64,
-    inputargs: &[A],
-    trace_info: Option<&CompiledTraceInfo>,
-) {
-    // resume.py keeps one numbering stream on the descr. The previous
-    // clone into a fresh Arc copied every frame_pcs / slot_sources /
-    // slot_layouts Vec per guard. `make_mut` is free while this Arc is
-    // unique (build_guard_metadata no longer clones the summary).
-    for exit_layout in exit_layouts.values_mut() {
-        let recovery_layout = exit_layout.recovery_layout.clone();
-        let Some(layout_arc) = exit_layout.resume_layout.as_mut() else {
-            continue;
-        };
-        enrich_resume_layout_with_trace_metadata(
-            std::sync::Arc::make_mut(layout_arc),
-            trace_id,
-            inputargs,
-            trace_info,
-            recovery_layout.as_deref(),
-        );
-    }
-}
-
-pub(crate) fn patch_guard_recovery_layouts_for_trace(
-    exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
-) {
-    // Backend no longer caches a per-descr recovery layout; the
-    // metainterp's `StoredExitLayout.recovery_layout` cache is the
-    // single canonical store, and `describe_deadframe` consumers fall
-    // back to `trace_layout_ref.recovery_layout`.  This pass keeps
-    // `StoredExitLayout` populated with the resume_layout-derived
-    // recovery so consumers see the patched virtuals/pending_fields.
-    for (_, exit_layout) in exit_layouts.iter_mut() {
-        // `build_guard_metadata` prepopulates `recovery_layout` from
-        // `rd_numb`. `enrich_guard_resume_layouts_for_trace` and
-        // `merge_frame_stack_into_resume_layout` then write trace_id,
-        // header_pc, source_guard, and extra outer frames onto
-        // `resume_layout`. Skip-if-already-Some never copies those
-        // enrichments, so recovery loses per-frame provenance.
-        let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
-            continue;
-        };
-        let recovery_layout = resume_layout
-            .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_deref());
-        exit_layout.recovery_layout = Some(std::sync::Arc::new(recovery_layout));
-    }
-}
-
-pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
-    backend: &mut dyn majit_backend::Backend,
-    token: &majit_backend::JitCellToken,
-    trace_id: u64,
-    terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
-) {
-    for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
-        let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
-            continue;
-        };
-        let recovery_layout = resume_layout
-            .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_deref());
-        if backend.update_terminal_exit_recovery_layout(
-            token,
-            trace_id,
-            op_index,
-            recovery_layout.clone(),
-        ) {
-            exit_layout.recovery_layout = Some(std::sync::Arc::new(recovery_layout));
-        }
-    }
-}
-
 // `rpython/jit/metainterp/compile.py _DoneWithThisFrameDescr` — finish/propagate descrs.
 //
 // These are ported as backend-agnostic `FailDescr` impls in the
@@ -2720,8 +1814,6 @@ mod tests {
     // reads inline-Const directly without the legacy raw-u32 side table.
     #[test]
     fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
-        use majit_backend::ExitValueSourceLayout;
-
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Ref);
@@ -2747,8 +1839,8 @@ mod tests {
         numb_state.writer.patch(1, numb_state.num_boxes);
         let rd_numb = numb_state.create_numbering();
         // An unused extra pool slot: a fresh ResumeDataLoopMemo would
-        // not count it. The layout must report the guard's own
-        // rd_consts length (compile.py storage.rd_consts).
+        // not count it. The descr's own rd_consts length is the pool
+        // (compile.py storage.rd_consts).
         let mut rd_consts = memo.consts().to_vec();
         rd_consts.push(majit_ir::Const::Int(123_456_789));
         let rd_consts_len = rd_consts.len();
@@ -2767,35 +1859,36 @@ mod tests {
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 8, Some(one_box_per_frame));
+        let exit_layouts = build_guard_metadata(&inputargs, &[guard], 8, Some(one_box_per_frame));
         let exit = exit_layouts.get(&0).expect("guard exit layout");
-
-        let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
-        assert_eq!(resume_layout.frame_layouts.len(), 1);
+        let descr = exit.descr.as_ref().expect("descr");
+        let storage = crate::resume::get_resumestorage(descr).expect("get_resumestorage");
+        let rd_numb = storage.rd_numb().expect("rd_numb");
+        let rd_consts = storage.rd_consts().expect("rd_consts");
         assert_eq!(
-            resume_layout.frame_layouts[0]
-                .slot_layouts
-                .iter()
-                .map(|slot| slot.fail_arg_index)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(
-            resume_layout.const_pool_size, rd_consts_len,
-            "layout reads the guard rd_consts pool; it does not re-number into a fresh memo"
+            rd_consts.len(),
+            rd_consts_len,
+            "descr keeps the guard rd_consts pool; it does not re-number into a fresh memo"
         );
 
-        let recovery = exit.recovery_layout.as_ref().expect("recovery_layout");
-        assert_eq!(recovery.frames.len(), 1);
-        assert_eq!(
-            recovery.frames[0].slots,
-            vec![ExitValueSourceLayout::ExitValue(1),]
+        let fvc: fn(i32, i32) -> usize = one_box_per_frame;
+        let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> = Some(&fvc);
+        let (_nfa, _vable, _vref, frames) = majit_ir::resumedata::rebuild_from_numbering(
+            rd_numb,
+            rd_consts,
+            &[Type::Ref, Type::Int],
+            fvc_ref,
+            0,
         );
-        assert_eq!(
-            recovery.frames[0].slot_types.as_ref().unwrap(),
-            &vec![Type::Int]
-        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].values.len(), 1);
+        match &frames[0].values[0] {
+            majit_ir::resumedata::RebuiltValue::Box(idx, ty) => {
+                assert_eq!(*idx, 1);
+                assert_eq!(*ty, Type::Int);
+            }
+            other => panic!("expected Box fail_arg 1, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2822,7 +1915,7 @@ mod tests {
         ]);
         guard.set_fail_arg_types(fail_arg_types);
 
-        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 0, None);
+        let exit_layouts = build_guard_metadata(&inputargs, &[guard], 0, None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(
@@ -2848,9 +1941,8 @@ mod tests {
 
     #[test]
     fn test_build_guard_metadata_does_not_mint_derived_frame_vecs() {
-        // resume.py walks `rd_numb`. Parallel frame_pcs / frame_slot_counts
-        // / slot_sources Vecs are unused projections; a 1-item heap each
-        // was the 8 B / 16 B class on the regex and/or compile path.
+        // resume.py walks `rd_numb` on the descr. StoredExitLayout no longer
+        // projects parallel frame_pcs / frame_slot_counts / slot_sources Vecs.
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Int);
@@ -2880,94 +1972,12 @@ mod tests {
         guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
         guard.set_fail_arg_types(vec![Type::Int]);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 4, Some(one_box_per_frame));
+        let exit_layouts = build_guard_metadata(&inputargs, &[guard], 4, Some(one_box_per_frame));
         let exit = exit_layouts.get(&0).expect("guard exit layout");
-        let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
-        assert!(
-            resume_layout.frame_pcs.is_empty(),
-            "frame_pcs is derived from frame_layouts; do not heap a 1-item Vec"
-        );
-        assert!(
-            resume_layout.frame_slot_counts.is_empty(),
-            "frame_slot_counts is derived from frame_layouts; do not heap a 1-item Vec"
-        );
-        assert!(
-            resume_layout
-                .frame_layouts
-                .iter()
-                .all(|frame| frame.slot_sources.is_empty()),
-            "slot_sources is derived from slot_layouts; do not heap a kind Vec"
-        );
-        assert_eq!(resume_layout.frame_layouts.len(), 1);
-        assert_eq!(resume_layout.frame_layouts[0].slot_layouts.len(), 1);
-    }
-
-    #[test]
-    fn test_patch_copies_enriched_resume_frames_into_recovery() {
-        // `build_guard_metadata` prepopulates recovery_layout, so the
-        // patch pass must still reproject from the later-enriched
-        // resume_layout (source_guard / extra outer frames).
-        let mut memo = ResumeDataLoopMemo::new();
-        let mut env = SimpleBoxEnv::new();
-        env.types.insert(0, Type::Int);
-        let snapshot = Snapshot {
-            vable_array: vec![],
-            vref_array: vec![],
-            framestack: vec![SnapshotFrame {
-                jitcode_index: 0,
-                pc: 4,
-                py_pc: 4,
-                boxes: vec![OpRef::input_arg_int(0).into()],
-            }],
-        };
-        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        numb_state.writer.patch(1, numb_state.num_boxes);
-        let rd_numb = numb_state.create_numbering();
-        let rd_consts = memo.consts().to_vec();
-
-        let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
-        if let Some(fd) = descr.as_fail_descr() {
-            fd.set_rd_numb_arc(Some(rd_numb));
-            fd.set_rd_consts(Some(rd_consts));
-        }
-        guard.setdescr(descr);
-        guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
-        guard.set_fail_arg_types(vec![Type::Int]);
-
-        let (_resume_data, mut exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 4, Some(one_box_per_frame));
-        {
-            let exit = exit_layouts.get_mut(&0).expect("guard exit layout");
-            let resume =
-                std::sync::Arc::make_mut(exit.resume_layout.as_mut().expect("resume_layout"));
-            resume.frame_layouts[0].source_guard = Some((99, 7));
-            resume.frame_layouts[0].trace_id = Some(42);
-            let extra = ResumeFrameLayoutSummary {
-                trace_id: Some(7),
-                header_pc: Some(1),
-                source_guard: None,
-                jitcode_index: 3,
-                pc: 8,
-                slot_sources: Vec::new(),
-                slot_layouts: Vec::new(),
-                slot_types: None,
-            };
-            resume.frame_layouts.insert(0, extra);
-            resume.num_frames = resume.frame_layouts.len();
-        }
-        patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-        let recovery = exit_layouts
-            .get(&0)
-            .and_then(|e| e.recovery_layout.as_ref())
-            .expect("recovery after patch");
-        assert_eq!(recovery.frames.len(), 2);
-        assert_eq!(recovery.frames[0].jitcode_index, 3);
-        assert_eq!(recovery.frames[0].trace_id, Some(7));
-        assert_eq!(recovery.frames[1].source_guard, Some((99, 7)));
-        assert_eq!(recovery.frames[1].trace_id, Some(42));
+        let descr = exit.descr.as_ref().expect("descr");
+        let storage = crate::resume::get_resumestorage(descr).expect("get_resumestorage");
+        assert!(storage.rd_numb().is_some());
+        assert_eq!(exit.source_op_index, Some(0));
     }
 
     #[test]
@@ -2989,8 +1999,7 @@ mod tests {
         guard.setfailargs(smallvec::smallvec![value]);
         guard.set_fail_arg_types(vec![Type::Int]);
 
-        let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[prefix, guard], 0, None);
+        let exit_layouts = build_guard_metadata(&inputargs, &[prefix, guard], 0, None);
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(exit.source_op_index, Some(1));
@@ -5773,10 +4782,9 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     make_compile_loop_version_descr_with_payload(types, payload)
 }
 
-// `StoredExitLayout.resume_layout` is the canonical per-guard
-// `ResumeLayoutSummary`: `build_guard_metadata` derives it from the guard
-// descriptor, and backend exit recovery consumes it. This preserves RPython's
-// single guard-owned `compile.ResumeGuardDescr` container.
+// Guard resume payload stays on the descr (`ResumeGuardDescr.get_resumestorage`).
+// `build_guard_metadata` records source_op_index and that descr; it does not
+// project a parallel resume/recovery layout.
 
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's

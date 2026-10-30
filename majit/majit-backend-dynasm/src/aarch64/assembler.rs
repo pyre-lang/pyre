@@ -5000,10 +5000,9 @@ impl<'a> AssemblerARM64<'a> {
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
         // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
         // via `fd.source_op_index()` so no side-table is needed.
-        // Recovery layouts are owned by the metainterp's
-        // `StoredExitLayout.recovery_layout` (populated by
-        // `patch_guard_recovery_layouts_for_trace`) per
-        // `resume.py:450-488`; the backend keeps no parallel cache.
+        // Production deopt decodes the descr's `rd_numb`
+        // (`ResumeGuardDescr.get_resumestorage`); the backend keeps no
+        // recovery-layout cache.
         if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
             descr_fd.set_source_op_index(op_index);
         }

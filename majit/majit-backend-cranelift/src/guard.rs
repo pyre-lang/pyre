@@ -16,7 +16,7 @@
 // resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py)
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
-use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
+use majit_backend::TerminalExitLayout;
 use majit_ir::{DescrRef, InputArgRc, Op, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -78,8 +78,6 @@ pub struct BridgeData {
     pub header_pc: u64,
     /// Source guard this bridge is attached to.
     pub source_guard: (u64, u32),
-    /// Recovery-layout caller prefix inherited from the source guard.
-    pub caller_prefix_layout: Option<ExitRecoveryLayout>,
     /// Function pointer to the bridge's compiled code.
     /// Same calling convention as a compiled loop:
     ///   fn(inputs_ptr: *const i64, outputs_ptr: *mut i64, roots_ptr: *mut i64) -> i64
@@ -158,7 +156,6 @@ impl std::fmt::Debug for BridgeData {
             .field("input_types", &self.input_types)
             .field("header_pc", &self.header_pc)
             .field("source_guard", &self.source_guard)
-            .field("caller_prefix_layout", &self.caller_prefix_layout)
             .field("code_ptr", &self.code_ptr)
             .field("num_inputs", &self.num_inputs)
             .field("num_ref_roots", &self.num_ref_roots)

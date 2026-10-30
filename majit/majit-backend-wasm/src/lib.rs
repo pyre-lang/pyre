@@ -6052,7 +6052,6 @@ impl majit_backend::Backend for WasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
         majit_gc::ensure_type_registry_closed();
@@ -6063,8 +6062,8 @@ impl majit_backend::Backend for WasmBackend {
         // bridge runs in the SOURCE loop's reused frame: the guard spilled its
         // fail args positionally into `frame[1..]`. `build_function` reads the
         // positional slot `k`, independently of the bridge value id, so no
-        // argument-recovery layout is needed — hence `caller_recovery_layout`
-        // is unused. `descr_owning_jct` names the source loop.
+        // extra recovery layout is needed. `descr_owning_jct` names the
+        // source loop (`compile.py do_compile_bridge` / `assemble_bridge`).
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
             diag_bump(1);
@@ -7891,7 +7890,6 @@ mod tests {
                 &bridge_inputs,
                 &[bridge_advance, bridge_jump],
                 &token,
-                None,
             )
             .expect("bridge compiles");
         let clt = token.compiled_loop_token_expect();
@@ -8075,13 +8073,7 @@ mod tests {
         ));
         bridge_jump.setdescr(label.clone());
         backend
-            .compile_bridge(
-                &fail,
-                &inputargs,
-                &[bridge_advance, bridge_jump],
-                &token,
-                None,
-            )
+            .compile_bridge(&fail, &inputargs, &[bridge_advance, bridge_jump], &token)
             .expect("closing JUMP still resolves the earlier label");
         assert!(failguard::label_target(&label).is_some());
     }

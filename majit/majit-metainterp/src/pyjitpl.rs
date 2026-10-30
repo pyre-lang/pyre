@@ -26,7 +26,7 @@ use std::sync::{
 
 use crate::jitprof::Instant;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
-use majit_backend::{Backend, ExitRecoveryLayout, FailArgSource, JitCellToken};
+use majit_backend::{Backend, FailArgSource, JitCellToken};
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 #[cfg(all(
@@ -170,7 +170,7 @@ use crate::optimizeopt::snapshot_get;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
 use crate::resume::{
     MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
-    ResumeLayoutSummary, ResumeStorage, SnapshotBox,
+    ResumeStorage, SnapshotBox,
 };
 use crate::trace_ctx::{ClearReplaceFrames, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
@@ -636,8 +636,6 @@ pub(crate) struct CompiledTrace {
 #[derive(Debug, Clone)]
 pub(crate) struct StoredExitLayout {
     pub(crate) source_op_index: Option<usize>,
-    pub(crate) recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
-    pub(crate) resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
     /// Source-op `descr` Arc, captured at trace-build time. Production
     /// guards / FINISH carry their `ResumeGuardDescr` /
     /// `_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescrRef`
@@ -9993,7 +9991,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // Build resume data and exit layouts for all guards in the optimized trace.
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                let mut exit_layouts = compile::build_guard_metadata(
                     &inputargs,
                     &compiled_ops,
                     green_key,
@@ -10019,21 +10017,6 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_ops,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                compile::enrich_guard_resume_layouts_for_trace(
-                    &mut resume_data,
-                    &mut exit_layouts,
-                    trace_id,
-                    &inputargs,
-                    trace_info.as_ref(),
-                );
-                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut *self.backend,
-                    token.as_ref(),
-                    trace_id,
-                    &mut terminal_exit_layouts,
-                );
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
@@ -11513,7 +11496,7 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                let mut exit_layouts = compile::build_guard_metadata(
                     &inputargs,
                     &combined_ops,
                     green_key,
@@ -11539,21 +11522,6 @@ impl<M: Clone> MetaInterp<M> {
                         &combined_ops,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                compile::enrich_guard_resume_layouts_for_trace(
-                    &mut resume_data,
-                    &mut exit_layouts,
-                    trace_id,
-                    &inputargs,
-                    trace_info.as_ref(),
-                );
-                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut *self.backend,
-                    token.as_ref(),
-                    trace_id,
-                    &mut terminal_exit_layouts,
-                );
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
@@ -11706,9 +11674,8 @@ impl<M: Clone> MetaInterp<M> {
         // `record_loop_or_bridge`) but files everything else under the
         // caller-supplied `green_key`: `set_next_header_pc`,
         // `descr_owning_jct` / `rd_loop_token.loop_token_wref()`,
-        // `caller_recovery_layout`,
         // `build_guard_metadata`'s key, and the `compiled.traces` insert. Those
-        // five only name the right loop while the two identities agree.
+        // four only name the right loop while the two identities agree.
         //
         // They do agree by construction — the bridge entry derives its key from
         // this very token (`descr_owning_jct(descr)?.green_key()`) before the
@@ -11751,14 +11718,6 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
         self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
 
-        // Read the backend input out of `compiled_loops` before the
-        // `&mut self.backend` borrow; see `compile_bridge` for what it is.
-        let caller_recovery_layout = self
-            .compiled_entry(green_key)
-            .and_then(|compiled| compiled.traces.get(&source_trace_id))
-            .and_then(|tr| tr.exit_layouts.get(&fail_index))
-            .and_then(|sl| sl.recovery_layout.clone());
-
         // compile.py:589-599 `debug_start("jit-backend") +
         // profiler.start_backend() ... try: do_compile_bridge ... finally:
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
@@ -11774,13 +11733,8 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.backend.compile_bridge(
-                    fail_descr,
-                    &inputargs,
-                    &combined_ops,
-                    &source_jct,
-                    caller_recovery_layout.as_deref(),
-                )
+                self.backend
+                    .compile_bridge(fail_descr, &inputargs, &combined_ops, &source_jct)
             }))
         };
         let result = match bridge_result {
@@ -12599,7 +12553,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.keep_compiled_token_alive(&token);
                 // compile.py record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                let mut exit_layouts = compile::build_guard_metadata(
                     &inputargs,
                     &optimized_ops,
                     green_key,
@@ -12625,22 +12579,6 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                let trace_inputargs_view: Vec<InputArgRc> = trace.inputargs_cloned();
-                compile::enrich_guard_resume_layouts_for_trace(
-                    &mut resume_data,
-                    &mut exit_layouts,
-                    trace_id,
-                    &trace_inputargs_view,
-                    trace_info.as_ref(),
-                );
-                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut *self.backend,
-                    token.as_ref(),
-                    trace_id,
-                    &mut terminal_exit_layouts,
-                );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
                 let mut traces = crate::FxIndexMap::default();
@@ -13103,7 +13041,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.keep_compiled_token_alive(&token);
                 // compile.py record_loop_or_bridge.
                 self.record_loop_or_bridge(&token, &compiled_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                let mut exit_layouts = compile::build_guard_metadata(
                     &inputargs,
                     &compiled_ops,
                     green_key,
@@ -13129,22 +13067,6 @@ impl<M: Clone> MetaInterp<M> {
                         &compiled_ops,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                let trace_inputargs_view: Vec<InputArgRc> = trace.inputargs_cloned();
-                compile::enrich_guard_resume_layouts_for_trace(
-                    &mut resume_data,
-                    &mut exit_layouts,
-                    trace_id,
-                    &trace_inputargs_view,
-                    trace_info.as_ref(),
-                );
-                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut *self.backend,
-                    token.as_ref(),
-                    trace_id,
-                    &mut terminal_exit_layouts,
-                );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
                 let mut traces = crate::FxIndexMap::default();
@@ -16251,7 +16173,7 @@ impl<M: Clone> MetaInterp<M> {
                     crate::mc_diag_bump(76);
                 }
                 self.record_loop_or_bridge(&token, &optimized_ops, trace_id);
-                let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+                let mut exit_layouts = compile::build_guard_metadata(
                     &entry_inputargs,
                     &optimized_ops,
                     original_green_key,
@@ -16277,21 +16199,6 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                     );
                 }
-                let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                compile::enrich_guard_resume_layouts_for_trace(
-                    &mut resume_data,
-                    &mut exit_layouts,
-                    trace_id,
-                    &entry_inputargs,
-                    trace_info.as_ref(),
-                );
-                compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-                compile::patch_backend_terminal_recovery_layouts_for_trace(
-                    &mut *self.backend,
-                    token.as_ref(),
-                    trace_id,
-                    &mut terminal_exit_layouts,
-                );
                 let mut next_global_opref =
                     compute_next_global_opref(&entry_inputargs, &optimized_ops);
                 let mut traces = crate::FxIndexMap::default();
@@ -17051,15 +16958,6 @@ impl<M: Clone> MetaInterp<M> {
             // stack and the baked pointer becomes a hot always-fail
             // guard (switch bench `fail_index=4` on the iterator
             // bridge). Refuse the artifact; later fails blackhole.
-            // The source guard's recovery_layout is read from
-            // the metainterp's `StoredExitLayout` cache (per-trace,
-            // keyed by per-trace fail_index) and passed to the backend
-            // so the backend doesn't need a descr-side cache.
-            let caller_recovery_layout = compiled
-                .traces
-                .get(&fail_descr.trace_id())
-                .and_then(|tr| tr.exit_layouts.get(&fail_descr.fail_index_per_trace()))
-                .and_then(|sl| sl.recovery_layout.clone());
             // compile.py:589-599 `debug_start("jit-backend") +
             // profiler.start_backend() ... try: do_compile_bridge ...
             // finally: ... profiler.end_backend() +
@@ -17081,7 +16979,6 @@ impl<M: Clone> MetaInterp<M> {
                         bridge_inputargs,
                         &optimized_ops,
                         &source_jct,
-                        caller_recovery_layout.as_deref(),
                     )
                 }))
             };
@@ -32059,8 +31956,6 @@ mod tests {
             0,
             StoredExitLayout {
                 source_op_index: None,
-                recovery_layout: None,
-                resume_layout: None,
                 descr: Some(descr.clone()),
                 op_arg_types_for_jump: None,
             },
@@ -32319,8 +32214,6 @@ mod tests {
             0,
             StoredExitLayout {
                 source_op_index: None,
-                recovery_layout: None,
-                resume_layout: None,
                 descr: Some(descr.clone()),
                 op_arg_types_for_jump: None,
             },
@@ -32866,8 +32759,6 @@ mod tests {
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(0),
-                recovery_layout: None,
-                resume_layout: None,
                 descr: Some({
                     let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
                     let fd = descr.as_fail_descr().expect("resume guard");
@@ -33114,7 +33005,7 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops_rc, &token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
+        let mut exit_layouts = compile::build_guard_metadata(
             inputargs,
             &ops,
             hash,
@@ -33131,21 +33022,6 @@ mod tests {
                 &ops,
             );
         }
-        let trace_info = meta.backend.compiled_trace_info(&token, trace_id);
-        compile::enrich_guard_resume_layouts_for_trace(
-            &mut resume_data,
-            &mut exit_layouts,
-            trace_id,
-            inputargs,
-            trace_info.as_ref(),
-        );
-        compile::patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-        compile::patch_backend_terminal_recovery_layouts_for_trace(
-            &mut *meta.backend,
-            &token,
-            trace_id,
-            &mut terminal_exit_layouts,
-        );
         let mut traces = crate::FxIndexMap::default();
         traces.insert(
             trace_id,

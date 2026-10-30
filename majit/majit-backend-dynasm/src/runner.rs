@@ -3590,7 +3590,6 @@ impl Backend for DynasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
         majit_gc::ensure_type_registry_closed();
@@ -5844,7 +5843,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         assert_eq!(guard_descr.as_fail_descr().unwrap().adr_jump_offset(), 0);
@@ -5935,7 +5933,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
 
@@ -6036,7 +6033,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
 

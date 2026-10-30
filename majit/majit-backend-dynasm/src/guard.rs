@@ -11,15 +11,11 @@
 // `CompiledLoopToken.asmmemmgr_gcreftracers` (`model.py`).
 
 // RECOVERY_LAYOUT_TABLE removed: `recovery_layout` is not in
-// PyPy `AbstractFailDescr._attrs_` (`history.py`).  Upstream resume
-// code (`resume.py:450-488`) decodes recovery on demand from
-// `rd_numb / rd_consts / rd_virtuals / rd_pendingfields`.  Pyre's
-// metainterp `StoredExitLayout.recovery_layout` (populated by
-// `compile.rs::patch_guard_recovery_layouts_for_trace` from
-// the resume snapshot) is the canonical store; the backend no longer
-// caches.  At deopt, `FailDescrLayout.recovery_layout` is `None` and
-// `pyjitpl.rs` falls back to `trace_layout_ref.recovery_layout`
-// which reads from the metainterp cache.
+// `AbstractFailDescr._attrs_` (`history.py`).  Resume code
+// (`resume.py`) decodes recovery on demand from
+// `rd_numb / rd_consts / rd_virtuals / rd_pendingfields` via
+// `ResumeGuardDescr.get_resumestorage`.  At deopt,
+// `FailDescrLayout.recovery_layout` is `None`.
 
 // FAIL_ARG_LOCS_TABLE removed: duplicates `rd_locs`
 // (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
@@ -85,10 +81,8 @@ pub fn layout_for_fail_descr(
         trace_id,
         source_op_index: fd.source_op_index(),
         frame_stack: None,
-        // Backend no longer caches recovery_layout.  The
-        // metainterp `pyjitpl.rs` falls back to
-        // `trace_layout_ref.recovery_layout` (read from
-        // `StoredExitLayout.recovery_layout`).
+        // Backend does not cache recovery_layout. Production deopt
+        // decodes the descr's `rd_numb` (`ResumeGuardDescr.get_resumestorage`).
         recovery_layout: None,
         trace_info: None,
         descr: Some(descr.clone()),

@@ -14,28 +14,10 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use majit_backend::{
-    ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
-    ExitVirtualLayout, FailArgSource,
+    ExitFrameLayout, ExitPendingFieldLayout, ExitValueSourceLayout, FailArgSource,
 };
 use majit_ir::operand::Operand;
 use majit_ir::{Const, GcRef, OpRef, Type};
-
-/// resume.py:656-670: element kind from arraydescr.
-/// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
-fn array_kind_from_descr(arraydescr: Option<&majit_ir::DescrRef>) -> u8 {
-    arraydescr
-        .and_then(|d| d.as_array_descr())
-        .map(|ad| {
-            if ad.is_array_of_pointers() {
-                0u8
-            } else if ad.is_array_of_floats() {
-                2u8
-            } else {
-                1u8
-            }
-        })
-        .unwrap_or(0)
-}
 
 // RPython resume.py TagOverflow — structural port (i16 tags).
 
@@ -873,9 +855,8 @@ pub struct ResumeLayoutSummary {
 
 // ResumeValueLayoutSummary inherent impls moved to
 // majit-backend::resume_value (Phase C-1 cascade).  The conversion
-// methods (raw_fail_arg_position, to_resume_source, to_exit_source)
-// are available through the ResumeValueLayoutSummaryExt trait
-// re-exported above.
+// methods (raw_fail_arg_position, to_resume_source) are available
+// through the ResumeValueLayoutSummaryExt trait re-exported above.
 
 // ResumeFrameLayoutSummary inherent impls extracted as free functions
 // (cross-crate orphan rule after the type moved to majit-ir::resumedata).
@@ -888,25 +869,6 @@ fn resume_frame_layout_to_frame_info(layout: &ResumeFrameLayoutSummary) -> Frame
             .iter()
             .map(|slot| slot.to_resume_source())
             .collect(),
-    }
-}
-
-fn resume_frame_layout_to_exit_frame_layout(
-    layout: &ResumeFrameLayoutSummary,
-    virtual_offset: usize,
-) -> ExitFrameLayout {
-    ExitFrameLayout {
-        trace_id: layout.trace_id,
-        header_pc: layout.header_pc,
-        source_guard: layout.source_guard,
-        pc: layout.pc,
-        jitcode_index: layout.jitcode_index,
-        slots: layout
-            .slot_layouts
-            .iter()
-            .map(|slot| slot.to_exit_source(virtual_offset))
-            .collect(),
-        slot_types: layout.slot_types.clone(),
     }
 }
 
@@ -1075,163 +1037,6 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
     }
 }
 
-fn resume_virtual_layout_to_exit_virtual_layout(
-    layout: &ResumeVirtualLayoutSummary,
-    virtual_offset: usize,
-) -> ExitVirtualLayout {
-    let s = layout;
-    {
-        match s {
-            ResumeVirtualLayoutSummary::Object {
-                descr,
-                type_id,
-                known_class,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => ExitVirtualLayout::Object {
-                descr: descr.clone(),
-                type_id: *type_id,
-                known_class: *known_class,
-                fields: fields
-                    .iter()
-                    .map(|(fd, src)| (*fd, src.to_exit_source(virtual_offset)))
-                    .collect(),
-                target_slot: None,
-                fielddescrs: fielddescrs.clone(),
-                descr_size: *descr_size,
-            },
-            ResumeVirtualLayoutSummary::Struct {
-                typedescr,
-                type_id,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => ExitVirtualLayout::Struct {
-                typedescr: typedescr.clone(),
-                type_id: *type_id,
-                fields: fields
-                    .iter()
-                    .map(|(field_descr, source)| {
-                        (*field_descr, source.to_exit_source(virtual_offset))
-                    })
-                    .collect(),
-                target_slot: None,
-                fielddescrs: fielddescrs.clone(),
-                descr_size: *descr_size,
-            },
-            ResumeVirtualLayoutSummary::Array {
-                arraydescr,
-                clear,
-                items,
-            } => ExitVirtualLayout::Array {
-                arraydescr: arraydescr.clone(),
-                clear: *clear,
-                // resume.py:656-670: element type from arraydescr
-                kind: array_kind_from_descr(arraydescr.as_ref()),
-                items: items
-                    .iter()
-                    .map(|source| source.to_exit_source(virtual_offset))
-                    .collect(),
-            },
-            ResumeVirtualLayoutSummary::ArrayStruct {
-                arraydescr,
-                fielddescrs,
-                element_fields,
-            } => ExitVirtualLayout::ArrayStruct {
-                arraydescr: arraydescr.clone(),
-                fielddescrs: fielddescrs.clone(),
-                element_fields: element_fields
-                    .iter()
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .map(|(field_descr, source)| {
-                                (*field_descr, source.to_exit_source(virtual_offset))
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            },
-            ResumeVirtualLayoutSummary::RawBuffer {
-                func,
-                size,
-                offsets,
-                descrs,
-                values,
-            } => ExitVirtualLayout::RawBuffer {
-                func: *func,
-                size: *size,
-                offsets: offsets.clone(),
-                descrs: descrs.clone(),
-                values: values
-                    .iter()
-                    .map(|source| source.to_exit_source(virtual_offset))
-                    .collect(),
-            },
-            ResumeVirtualLayoutSummary::RawSlice { offset, parent } => {
-                ExitVirtualLayout::RawSlice {
-                    offset: *offset,
-                    base: parent.to_exit_source(virtual_offset),
-                }
-            }
-            ResumeVirtualLayoutSummary::StrPlain { chars } => ExitVirtualLayout::StrPlain {
-                is_unicode: false,
-                chars: chars
-                    .iter()
-                    .map(|source| source.to_exit_source(virtual_offset))
-                    .collect(),
-            },
-            ResumeVirtualLayoutSummary::UniPlain { chars } => ExitVirtualLayout::StrPlain {
-                is_unicode: true,
-                chars: chars
-                    .iter()
-                    .map(|source| source.to_exit_source(virtual_offset))
-                    .collect(),
-            },
-            // resume.py VStrConcatInfo / resume.py VUniConcatInfo
-            // — funcptr/calldescr resolved at materialization via
-            // `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT /
-            // OS_UNI_CONCAT)` (resume.py / 1494-1495), so the
-            // exit layout carries no funcptr.
-            ResumeVirtualLayoutSummary::StrConcat { left, right } => ExitVirtualLayout::StrConcat {
-                is_unicode: false,
-                left: left.to_exit_source(virtual_offset),
-                right: right.to_exit_source(virtual_offset),
-            },
-            ResumeVirtualLayoutSummary::UniConcat { left, right } => ExitVirtualLayout::StrConcat {
-                is_unicode: true,
-                left: left.to_exit_source(virtual_offset),
-                right: right.to_exit_source(virtual_offset),
-            },
-            // resume.py VStrSliceInfo / resume.py VUniSliceInfo
-            // — funcptr/calldescr resolved via callinfocollection at
-            // materialization (resume.py / 1504-1505).
-            ResumeVirtualLayoutSummary::StrSlice {
-                source,
-                start,
-                length,
-            } => ExitVirtualLayout::StrSlice {
-                is_unicode: false,
-                str_src: source.to_exit_source(virtual_offset),
-                start: start.to_exit_source(virtual_offset),
-                length: length.to_exit_source(virtual_offset),
-            },
-            ResumeVirtualLayoutSummary::UniSlice {
-                source,
-                start,
-                length,
-            } => ExitVirtualLayout::StrSlice {
-                is_unicode: true,
-                str_src: source.to_exit_source(virtual_offset),
-                start: start.to_exit_source(virtual_offset),
-                length: length.to_exit_source(virtual_offset),
-            },
-            ResumeVirtualLayoutSummary::Hole => ExitVirtualLayout::Hole,
-        }
-    }
-}
-
 // PendingFieldLayoutSummary inherent impls extracted as free
 // functions (cross-crate orphan rule after the type moved to
 // majit-ir::resumedata).
@@ -1243,19 +1048,6 @@ fn pending_field_layout_to_pending_field_info(
         target: layout.target.to_resume_source(),
         value: layout.value.to_resume_source(),
         item_index: layout.item_index,
-    }
-}
-
-fn pending_field_layout_to_exit_pending_field_layout(
-    layout: &PendingFieldLayoutSummary,
-    virtual_offset: usize,
-) -> ExitPendingFieldLayout {
-    ExitPendingFieldLayout {
-        descr: layout.descr.clone(),
-        item_index: layout.item_index,
-        is_array_item: layout.is_array_item,
-        target: layout.target.to_exit_source(virtual_offset),
-        value: layout.value.to_exit_source(virtual_offset),
     }
 }
 
@@ -1279,67 +1071,6 @@ impl ResumeLayoutSummary {
                 .iter()
                 .map(pending_field_layout_to_pending_field_info)
                 .collect(),
-        }
-    }
-
-    pub fn to_exit_recovery_layout_with_caller_prefix(
-        &self,
-        caller_prefix: Option<&ExitRecoveryLayout>,
-    ) -> ExitRecoveryLayout {
-        if self.frame_layouts.is_empty() {
-            return caller_prefix.cloned().unwrap_or(ExitRecoveryLayout {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                frames: Vec::new(),
-                virtual_layouts: Vec::new(),
-                pending_field_layouts: Vec::new(),
-            });
-        }
-
-        let prefix_frame_count = caller_prefix
-            .map(|layout| layout.frames.len().saturating_sub(self.frame_layouts.len()))
-            .unwrap_or(0);
-        let preserve_prefix = prefix_frame_count > 0;
-
-        let mut frames = caller_prefix
-            .map(|layout| layout.frames[..prefix_frame_count].to_vec())
-            .unwrap_or_default();
-        // RPython parity: rd_virtuals is stored once on the guard descriptor
-        // and never replaced (compile.py:866, resume.py:492). Always preserve
-        // caller_prefix's virtual_layouts — they originate from
-        // build_guard_metadata and must not be overwritten.
-        let mut virtual_layouts = caller_prefix
-            .map(|layout| layout.virtual_layouts.clone())
-            .unwrap_or_default();
-        let mut pending_field_layouts = if preserve_prefix {
-            caller_prefix
-                .map(|layout| layout.pending_field_layouts.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let virtual_offset = virtual_layouts.len();
-
-        frames.extend(
-            self.frame_layouts
-                .iter()
-                .map(|frame| resume_frame_layout_to_exit_frame_layout(frame, virtual_offset)),
-        );
-        virtual_layouts.extend(
-            self.virtual_layouts
-                .iter()
-                .map(|virt| resume_virtual_layout_to_exit_virtual_layout(virt, virtual_offset)),
-        );
-        pending_field_layouts.extend(self.pending_field_layouts.iter().map(|pending| {
-            pending_field_layout_to_exit_pending_field_layout(pending, virtual_offset)
-        }));
-
-        ExitRecoveryLayout {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames,
-            virtual_layouts,
-            pending_field_layouts,
         }
     }
 
