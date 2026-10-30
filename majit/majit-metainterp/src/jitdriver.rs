@@ -2991,11 +2991,6 @@ impl<S: JitState> JitDriver<S> {
             .clear_tracing_flag(green_key);
     }
 
-    pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
-        self.meta
-            .front_target_inputarg_types_on_driver(self.index().unwrap_or(0), green_key)
-    }
-
     /// Attach a GC allocator to the active backend.
     pub fn set_gc_allocator(&mut self, gc: Box<dyn GcAllocator>) {
         self.meta.backend_mut().set_gc_allocator(gc);

@@ -22,7 +22,7 @@ use smallvec::smallvec;
 
 use majit_backend::{
     Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, FailDescrLayout,
-    JitCellToken, TerminalExitLayout,
+    JitCellToken,
 };
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
@@ -33,7 +33,7 @@ use majit_ir::{
 
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
-use crate::pyjitpl::{CompiledTrace, StoredExitLayout};
+use crate::pyjitpl::StoredExitLayout;
 use crate::resume::ResumeStorage;
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
@@ -596,8 +596,8 @@ impl<'a> UnrolledLoopData<'a> {
 /// Pyre-only: stamp the per-trace `fail_index` and the trace-op index onto
 /// every guard's metainterp `ResumeGuardDescr`, so `(trace_id, fail_index)`
 /// readers resolve through the descr Arc directly.  The counter walks guards
-/// and FINISH in trace order — the numbering `find_fail_index_for_exit_op`
-/// and the assemblers' `fail_descrs` position share.  Readers compare
+/// and FINISH in trace order — the same numbering the assemblers'
+/// `fail_descrs` positions use.  Readers compare
 /// against `fail_index_per_trace()` (this slot), not `fail_index()` (the
 /// global `alloc_fail_index()` id).
 ///
@@ -740,8 +740,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // carrier; mint a fresh `ResumeGuardDescr` (`make_fail_descr_typed`) carrying that vector
         // so descr-side readers stay populated.  Branch on
         // `layout.is_finish` so a backend-only FINISH entry synthesizes
-        // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true)
-        // — matching the terminal path in `merge_backend_terminal_exit_layouts`.
+        // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true).
         // Without the branch, `pyjitpl.rs`'s `resolve_is_finish` reading
         // `descr.is_finish()`
         // returns false on the synthesized guard descr and breaks
@@ -779,156 +778,6 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
             entry.descr = descr_from_op;
         }
     }
-}
-
-pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
-    terminal_exit_layouts: &mut crate::FxIndexMap<usize, StoredExitLayout>,
-    backend_layouts: &[TerminalExitLayout],
-    ops: &[T],
-) {
-    for layout in backend_layouts {
-        // Pre-resolve the source-op `descr` for backend-only entries so
-        // `entry.descr` matches what `build_terminal_exit_layouts` would
-        // have primed had the frontend seen this exit.  Source op
-        // priority: a frontend `op.descr` (LoopTargetDescr for JUMP,
-        // _DoneWithThisFrameDescr* / ExitFrameWithExceptionDescrRef for
-        // FINISH).  Fallback when source op evicted or its descr handle
-        // was dropped: synthesize per the backend layout's own
-        // `is_finish` discriminator — a `_DoneWithThisFrameDescr`-flavored
-        // `make_finish_fail_descr_typed` (is_finish=true) for FINISH; a
-        // guard-flavored `make_fail_descr_typed` (is_finish=false) for
-        // JUMP, since `LoopTargetDescr` (history.py:470) carries no
-        // `fail_arg_types` and a synthetic FINISH descr would silently
-        // mark the exit as terminating.  Both retain `descr=Some` so
-        // downstream readers that probe `entry.descr.is_some_and(...)`
-        // (e.g. `assign_guard_hashes` via the backend layout, exit-type
-        // resolution paths) keep working uniformly.
-        let source_op = ops.get(layout.op_index).map(|op| op.as_ref());
-        let is_jump = match source_op {
-            Some(op) => op.opcode == OpCode::Jump,
-            None => !layout.is_finish,
-        };
-        let descr_from_op = source_op.and_then(|op| op.getdescr()).or_else(|| {
-            Some(if layout.is_finish {
-                make_finish_fail_descr_typed(layout.exit_types.clone(), layout.is_exception_exit)
-            } else {
-                make_fail_descr_typed(layout.exit_types.clone())
-            })
-        });
-        let op_arg_types_for_jump = is_jump.then(|| layout.exit_types.clone());
-        let entry = terminal_exit_layouts
-            .entry(layout.op_index)
-            .or_insert_with(|| StoredExitLayout {
-                source_op_index: Some(layout.op_index),
-                descr: descr_from_op.clone(),
-                op_arg_types_for_jump: op_arg_types_for_jump.clone(),
-            });
-        entry.source_op_index = Some(layout.op_index);
-        if entry.descr.is_none() {
-            entry.descr = descr_from_op;
-        }
-        if entry.op_arg_types_for_jump.is_none() && is_jump {
-            entry.op_arg_types_for_jump = op_arg_types_for_jump;
-        }
-    }
-}
-
-pub(crate) fn find_fail_index_for_exit_op<T: AsRef<majit_ir::Op>>(
-    ops: &[T],
-    op_index: usize,
-) -> Option<u32> {
-    let mut fail_index = 0u32;
-    for (idx, op) in ops.iter().enumerate() {
-        let op = op.as_ref();
-        if op.opcode.is_guard() || op.opcode == OpCode::Finish {
-            if idx == op_index {
-                return Some(fail_index);
-            }
-            fail_index += 1;
-        }
-    }
-    None
-}
-
-pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
-    inputargs: &[A],
-    ops: &[T],
-    owning_key: u64,
-    trace_id: u64,
-    op_index: usize,
-) -> Option<CompiledExitLayout> {
-    let op = ops.get(op_index)?.as_ref();
-    let is_finish = op.opcode == OpCode::Finish;
-    if !is_finish && op.opcode != OpCode::Jump {
-        return None;
-    }
-    let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
-    let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
-    let exit_types: ExitTypes = op
-        .args_slice()
-        .iter()
-        .map(|opref| {
-            // `OpRef::NONE` represents a null-ref placeholder per
-            // `fail_arg_type`; preserve `Type::Ref` so every consumer of this
-            // layout sees the same null-Ref typing the rest of the resume
-            // path uses. The gcmap is not one of them: `compute_gcmap` drops
-            // a `None` failarg before it reads the type at all.
-            if opref.is_none() {
-                return Type::Ref;
-            }
-            type_index
-                .opref_type_at(opref.to_opref(), op_index)
-                .unwrap_or(Type::Int)
-        })
-        .collect();
-    let is_exception_exit = op
-        .getdescr()
-        .as_ref()
-        .and_then(|d| d.as_fail_descr())
-        .is_some_and(|fd| fd.is_exit_frame_with_exception());
-    Some(CompiledExitLayout {
-        rd_loop_token: owning_key, // compile.py:186
-        trace_id,
-        fail_index,
-        source_op_index: Some(op_index),
-        exit_types,
-        is_finish,
-        is_exception_exit,
-        storage: None,
-    })
-}
-
-pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
-    inputargs: &[A],
-    ops: &[T],
-) -> crate::FxIndexMap<usize, StoredExitLayout> {
-    let mut layouts: crate::FxIndexMap<usize, StoredExitLayout> = crate::FxIndexMap::default();
-    for (op_index, op) in ops.iter().enumerate() {
-        let op = op.as_ref();
-        if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
-            continue;
-        }
-        if let Some(layout) = infer_terminal_exit_layout(inputargs, ops, 0, 0, op_index) {
-            // For JUMP exits the descr is `LoopTargetDescr`
-            // (`history.py:470`), which has no `fail_arg_types`.  Cache
-            // the per-arg types so `StoredExitLayout::resolve_exit_types()`
-            // can fall back to them — see the field's docstring.
-            // FINISH carries `_DoneWithThisFrameDescr*` /
-            // `ExitFrameWithExceptionDescrRef`, both of which expose
-            // `fail_arg_types()` directly, so the cache stays `None`.
-            let op_arg_types_for_jump =
-                (op.opcode == OpCode::Jump).then(|| layout.exit_types.to_vec());
-            layouts.insert(
-                op_index,
-                StoredExitLayout {
-                    source_op_index: Some(op_index),
-                    descr: op.getdescr(),
-                    op_arg_types_for_jump,
-                },
-            );
-        }
-    }
-    layouts
 }
 
 pub(crate) fn normalize_closing_jump_args(
@@ -2477,7 +2326,7 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
 }
 
 /// FINISH-flavored variant of [`make_fail_descr_typed`]. Used by the
-/// terminal-exit fallback in `merge_backend_terminal_exit_layouts` when
+/// backend-only FINISH fallback in `merge_backend_exit_layouts` when
 /// the FINISH op has been evicted, and by FINISH-singleton fallbacks in
 /// tests that bypass `MetaInterp::new` (so the resulting descr's
 /// `is_finish()` matches `compile.py ExitFrameWithExceptionDescrRef`
@@ -4976,37 +4825,6 @@ impl TraceCtx {
     /// under the loop's own pc.
     pub fn has_merge_point_at(&self, key: &GreenKey, _header_pc: usize) -> bool {
         self.find_merge_point_same_greenkey(key).is_some()
-    }
-
-    /// pyjitpl.py:2988 + header identity: find merge point by (key, header_pc),
-    /// searching in reverse order (most recent first).
-    /// pyjitpl.py `compile_loop(original_boxes, live_arg_boxes,
-    /// start)`: the closing JUMP's args belong to the label of the loop being
-    /// CLOSED — `original_boxes`, taken from the merge point that matched —
-    /// not to the trace's own inputargs. The two name the same list only when
-    /// the trace closes at its own head; a close at a later-registered header
-    /// (the cross-loop cut, compile.py:269) re-labels the loop from that
-    /// merge point instead.
-    ///
-    /// `header_pc` is the guest pc stored on the merge point
-    /// ([`MergePoint::header_pc`]), not a second identity beside the green
-    /// key. The reverse scan's first hit with that pc is the entry a
-    /// same-greenkey close would have selected when the pc is the loop's
-    /// own green.
-    /// Only entries recorded during the walk (`has_prefix_ops`) answer here.
-    /// The entry at position 0 is the synthetic trace-start seed, whose boxes
-    /// were built from the trace's own `inputarg_types()`; leaving it out lets
-    /// callers keep their existing fallback for a head close and reserves this
-    /// lookup for the case it is meant to fix — closing at a header the walk
-    /// reached later.
-    pub fn merge_point_arg_types_at_header(&self, header_pc: usize) -> Option<Vec<majit_ir::Type>> {
-        self.current_merge_points
-            .iter()
-            .rev()
-            .find(|mp| {
-                mp.header_pc == header_pc && mp.position.has_prefix_ops(self.num_inputargs())
-            })
-            .map(|mp| mp.green_boxes.iter().map(|green| green.ty).collect())
     }
 
     /// `pyjitpl.py same_greenkey(original_boxes, live_arg_boxes,
