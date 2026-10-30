@@ -2036,8 +2036,6 @@ pub(crate) struct CompiledEntry<M> {
     /// Behind an `Arc` the pyre entry path matches that: a warm entry clones a
     /// refcount where it used to clone the whole struct, on every call.
     pub(crate) meta: std::sync::Arc<M>,
-    /// Trace id of the root compiled loop.
-    pub(crate) root_trace_id: u64,
 }
 
 /// Compute the smallest fresh OpRef strictly above every position
@@ -3983,14 +3981,6 @@ impl<M: Clone> MetaInterp<M> {
     /// warm-state abort counts stay on `abort_tracing`.
     fn jitlog_trace_aborted(&mut self) {
         crate::rjitlog::trace_aborted(self.jitlog_trace_id);
-    }
-
-    /// Test-only accessor for the root trace_id of a compiled entry.
-    /// Production code reaches the same value via the resume guard descr's
-    /// `descr.trace_id()` (set at backend compile time) or via
-    /// `bridge_info().trace_id` after `start_retrace_from_guard`.
-    pub fn compiled_root_trace_id(&self, green_key: u64) -> Option<u64> {
-        self.compiled_entry(green_key).map(|c| c.root_trace_id)
     }
 
     /// Create a new MetaInterp with the given compilation threshold.
@@ -9601,7 +9591,6 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         meta: Arc::new(meta),
-                        root_trace_id: trace_id,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -11040,7 +11029,6 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         meta: Arc::new(meta),
-                        root_trace_id: trace_id,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -12059,7 +12047,6 @@ impl<M: Clone> MetaInterp<M> {
                         green_key,
                         CompiledEntry {
                             meta: Arc::new(meta),
-                            root_trace_id: trace_id,
                         },
                     );
                     self.remember_compiled_graph_write();
@@ -12476,7 +12463,6 @@ impl<M: Clone> MetaInterp<M> {
                     green_key,
                     CompiledEntry {
                         meta: Arc::new(meta),
-                        root_trace_id: trace_id,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -12575,6 +12561,7 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.insert((jd_no, green_key), entry)
     }
 
+    #[cfg(test)]
     pub(crate) fn take_compiled_loop(&mut self, green_key: u64) -> Option<CompiledEntry<M>> {
         let key = self.compiled_loop_key(green_key);
         self.compiled_loops.swap_remove(&key)
@@ -13763,19 +13750,6 @@ impl<M: Clone> MetaInterp<M> {
     /// own index rather than the last traced driver's.
     pub fn remove_compiled_loop_on_driver(&mut self, jd_no: usize, green_key: u64) {
         self.compiled_loops.swap_remove(&(jd_no, green_key));
-    }
-
-    /// Drop every compiled loop whose root trace is `trace_id`.
-    pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
-        let stale: Vec<(usize, u64)> = self
-            .compiled_loops
-            .iter()
-            .filter(|(_, entry)| entry.root_trace_id == trace_id)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in stale {
-            self.compiled_loops.swap_remove(&key);
-        }
     }
 
     /// rpython/rlib/rstack.py `stack_almost_full` — delegates to
@@ -15385,7 +15359,6 @@ impl<M: Clone> MetaInterp<M> {
                     original_green_key,
                     CompiledEntry {
                         meta: Arc::new(meta),
-                        root_trace_id: trace_id,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -15621,10 +15594,10 @@ impl<M: Clone> MetaInterp<M> {
             // reaches the same value through the resumekey object's
             // identity (`compile.py:1049 self.resumekey.original_jitcell_token`);
             // pyre carries it as a u64 stamped at backend compile time.
-            // No `0 → root_trace_id` sentinel — the bridge proxy's
-            // `trace_id` was sourced from `bridge_info().trace_id`
-            // (production) or `compiled_root_trace_id(green_key)` (tests),
-            // both of which only ever hold real allocated ids.
+            // No `0 → compiled_loops` sentinel — the bridge proxy's
+            // `trace_id` is `fail_descr.trace_id()`, stamped at
+            // `record_loop_or_bridge`. Tests read the same descr
+            // (`compiled_guard_descr` / `as_fail_descr`).
             let source_trace_id = fail_descr.trace_id();
             debug_assert_ne!(
                 source_trace_id, 0,
@@ -16150,8 +16123,8 @@ impl<M: Clone> MetaInterp<M> {
                     // pyjitpl.py:1049 — fail_descr.trace_id() is the
                     // bridge origin's real allocated id (`alloc_trace_id`
                     // starts at 1).  RPython reaches the same value via
-                    // the resumekey object's identity; no sentinel
-                    // fallback to root_trace_id.
+                    // the resumekey object's identity; no compiled_loops
+                    // map fallback.
                     fail_descr.trace_id()
                 };
                 self.assign_guard_hashes(&optimized_ops);
@@ -17064,7 +17037,6 @@ impl<M: Clone> MetaInterp<M> {
             .as_fail_descr()
             .map(|d| d.trace_id())
             .filter(|&id| id != 0)
-            .or_else(|| self.compiled_root_trace_id(green_key))
             .unwrap_or(0);
         self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, live_values)
             .is_some()
@@ -24269,7 +24241,6 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -26698,7 +26669,6 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -26756,7 +26726,6 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -26807,7 +26776,6 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -26868,7 +26836,6 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -26980,7 +26947,6 @@ mod metainterp_static_data_tests {
             key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -29370,7 +29336,6 @@ mod metainterp_static_data_tests {
             portal_cell_key,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
         let (step, _) = meta.maybe_compile_and_run_step_on_driver(
@@ -29451,7 +29416,6 @@ mod metainterp_static_data_tests {
             portal_cell_key,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -31076,7 +31040,6 @@ mod tests {
             8,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -31119,7 +31082,6 @@ mod tests {
             8,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -31164,7 +31126,6 @@ mod tests {
             8,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -31742,14 +31703,9 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let trace_id = meta
-            .compiled_entry(green_key.get_uhash())
-            .expect("compiled entry")
-            .root_trace_id;
-        let fail_index = descr
-            .as_fail_descr()
-            .expect("resume guard")
-            .fail_index_per_trace();
+        let fail_descr = descr.as_fail_descr().expect("resume guard");
+        let trace_id = fail_descr.trace_id();
+        let fail_index = fail_descr.fail_index_per_trace();
         let old_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("live token");
@@ -31761,12 +31717,11 @@ mod tests {
         writer.append_int(0); // vref_size
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
-        let fd = descr.as_fail_descr().expect("resume guard");
-        fd.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
-        fd.set_rd_numb_arc(Some(rd_numb));
-        fd.set_rd_consts(Some(vec![]));
-        fd.set_rd_virtuals(Some(vec![]));
-        fd.set_rd_pendingfields(Some(vec![]));
+        fail_descr.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
+        fail_descr.set_rd_numb_arc(Some(rd_numb));
+        fail_descr.set_rd_consts(Some(vec![]));
+        fail_descr.set_rd_virtuals(Some(vec![]));
+        fail_descr.set_rd_pendingfields(Some(vec![]));
 
         let _fresh_token_keepalive = {
             let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
@@ -31912,7 +31867,6 @@ mod tests {
             hash,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: trace_id,
             },
         );
     }
@@ -31959,19 +31913,13 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let trace_id = meta
-            .compiled_entry(green_key.get_uhash())
-            .expect("compiled entry")
-            .root_trace_id;
-        let fail_index = descr
-            .as_fail_descr()
-            .expect("resume guard")
-            .fail_index_per_trace();
+        let fail_descr = descr.as_fail_descr().expect("resume guard");
+        let trace_id = fail_descr.trace_id();
+        let fail_index = fail_descr.fail_index_per_trace();
         let old_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("live token");
-        let fd = descr.as_fail_descr().expect("resume guard");
-        fd.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
+        fail_descr.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
         let expected = crate::compile::exit_layout_for_descr(&descr);
 
         let _fresh_token_keepalive = {
@@ -32057,14 +32005,11 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let trace_id = meta
-            .compiled_entry(green_key.get_uhash())
-            .expect("compiled entry")
-            .root_trace_id;
-        let fail_index = descr_arc
+        let fail_descr = descr_arc
             .as_fail_descr()
-            .expect("test fixture guard should carry a ResumeGuardDescr")
-            .fail_index_per_trace();
+            .expect("test fixture guard should carry a ResumeGuardDescr");
+        let trace_id = fail_descr.trace_id();
+        let fail_index = fail_descr.fail_index_per_trace();
         let source_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("live source token");
@@ -32814,7 +32759,6 @@ mod tests {
             green_key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 0,
             },
         );
         let key = gk(777);
@@ -33395,7 +33339,6 @@ mod tests {
             green_key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 101,
             },
         );
         assert!(
@@ -33517,7 +33460,6 @@ mod tests {
             green_key,
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 1,
             },
         );
 
@@ -33581,7 +33523,6 @@ mod tests {
             green_key.get_uhash(),
             CompiledEntry {
                 meta: std::sync::Arc::new(()),
-                root_trace_id: 102,
             },
         );
 
@@ -35418,10 +35359,9 @@ mod loop_side_table_tests {
     use super::*;
     use crate::test_greens::gk;
 
-    fn compiled_entry(root_trace_id: u64) -> CompiledEntry<()> {
+    fn compiled_entry() -> CompiledEntry<()> {
         CompiledEntry {
             meta: std::sync::Arc::new(()),
-            root_trace_id,
         }
     }
 
@@ -35450,7 +35390,7 @@ mod loop_side_table_tests {
             .warm_state_for_driver(0)
             .cell_key_for(&key)
             .expect("the typed cell has a resolved key");
-        meta.insert_compiled_loop(cell_key, compiled_entry(1));
+        meta.insert_compiled_loop(cell_key, compiled_entry());
         (meta, key, hash, cell_key, raw)
     }
 
@@ -35478,8 +35418,8 @@ mod loop_side_table_tests {
         ));
     }
 
-    fn record_loop(meta: &mut MetaInterp<()>, green_key: u64, root_trace_id: u64) {
-        meta.insert_compiled_loop(green_key, compiled_entry(root_trace_id));
+    fn record_loop(meta: &mut MetaInterp<()>, green_key: u64) {
+        meta.insert_compiled_loop(green_key, compiled_entry());
     }
 
     #[test]
@@ -35493,46 +35433,44 @@ mod loop_side_table_tests {
         let jd1 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
         assert_ne!(jd0, jd1);
         let green_key = gk(11);
-        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
+        let meta0 = std::sync::Arc::new(());
+        let meta1 = std::sync::Arc::new(());
+        meta.insert_compiled_loop_on_driver(
+            jd0,
+            green_key.get_uhash(),
+            CompiledEntry {
+                meta: std::sync::Arc::clone(&meta0),
+            },
+        );
+        meta.insert_compiled_loop_on_driver(
+            jd1,
+            green_key.get_uhash(),
+            CompiledEntry {
+                meta: std::sync::Arc::clone(&meta1),
+            },
+        );
         assert!(
             meta.get_compiled_meta_on_driver(jd0, green_key.get_uhash())
-                .is_some()
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &meta0))
         );
-        assert_eq!(
-            meta.compiled_loops
-                .get(&(jd0, green_key.get_uhash()))
-                .unwrap()
-                .root_trace_id,
-            1
-        );
-        assert_eq!(
-            meta.compiled_loops
-                .get(&(jd1, green_key.get_uhash()))
-                .unwrap()
-                .root_trace_id,
-            2
+        assert!(
+            meta.get_compiled_meta_on_driver(jd1, green_key.get_uhash())
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &meta1))
         );
         meta.active_jitdriver_sd = Some(jd0);
-        assert_eq!(
-            meta.compiled_entry(green_key.get_uhash())
-                .unwrap()
-                .root_trace_id,
-            1
+        assert!(
+            meta.get_compiled_meta(green_key.get_uhash())
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &meta0))
         );
         meta.active_jitdriver_sd = Some(jd1);
-        assert_eq!(
-            meta.compiled_entry(green_key.get_uhash())
-                .unwrap()
-                .root_trace_id,
-            2
+        assert!(
+            meta.get_compiled_meta(green_key.get_uhash())
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &meta1))
         );
         meta.active_jitdriver_sd = Some(jd0);
-        assert_eq!(
-            meta.compiled_entry_on_driver(jd1, green_key.get_uhash())
-                .unwrap()
-                .root_trace_id,
-            2,
+        assert!(
+            meta.get_compiled_meta_on_driver(jd1, green_key.get_uhash())
+                .is_some_and(|got| std::sync::Arc::ptr_eq(got, &meta1)),
             "warmstate.py maybe_compile_and_run reads jitdriver_sd.warmstate, not leftover active_jitdriver_sd"
         );
     }
@@ -35587,8 +35525,8 @@ mod loop_side_table_tests {
         let jd1 = meta.register_jitdriver_sd(second);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(91);
-        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
+        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry());
+        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry());
 
         let mut token = majit_backend::JitCellToken::new(91);
         token.outermost_jitdriver_index = Some(jd1);
@@ -35713,8 +35651,8 @@ mod loop_side_table_tests {
         token.set_compiled(Box::new(()));
         token.green_key.set(green_key.get_uhash());
 
-        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
+        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry());
+        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry());
         meta.warm_state_for_driver(jd1)
             .memory_manager
             .keep_loop_alive(&token);
@@ -35757,13 +35695,6 @@ mod loop_side_table_tests {
                 .contains_key(&(jd0, green_key.get_uhash())),
             "same-key jd0 row must stay"
         );
-        assert_eq!(
-            meta.compiled_loops
-                .get(&(jd0, green_key.get_uhash()))
-                .unwrap()
-                .root_trace_id,
-            1
-        );
         let _keep = token;
     }
 
@@ -35791,8 +35722,8 @@ mod loop_side_table_tests {
         token.set_compiled(Box::new(()));
         token.green_key.set(green_key.get_uhash());
 
-        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
+        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry());
+        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry());
 
         meta.warm_state_for_driver(jd1)
             .memory_manager
@@ -35834,8 +35765,8 @@ mod loop_side_table_tests {
     #[test]
     fn remove_compiled_loop_drops_the_side_tables() {
         let mut meta = MetaInterp::<()>::new(1);
-        record_loop(&mut meta, 7, 100);
-        record_loop(&mut meta, 8, 101);
+        record_loop(&mut meta, 7);
+        record_loop(&mut meta, 8);
 
         meta.remove_compiled_loop(7);
 
@@ -35846,29 +35777,14 @@ mod loop_side_table_tests {
     #[test]
     fn clear_compiled_loops_drops_every_side_table() {
         let mut meta = MetaInterp::<()>::new(1);
-        record_loop(&mut meta, 7, 100);
-        record_loop(&mut meta, 8, 101);
+        record_loop(&mut meta, 7);
+        record_loop(&mut meta, 8);
 
         meta.clear_compiled_loops();
 
         assert!(meta.compiled_loops.is_empty());
         assert!(!has_side_tables(&meta, 7));
         assert!(!has_side_tables(&meta, 8));
-    }
-
-    #[test]
-    fn invalidate_compiled_trace_drops_the_side_tables_of_the_matching_loops_only() {
-        let mut meta = MetaInterp::<()>::new(1);
-        record_loop(&mut meta, 7, 100);
-        record_loop(&mut meta, 8, 100);
-        record_loop(&mut meta, 9, 101);
-
-        meta.invalidate_compiled_trace(100);
-
-        assert_eq!(meta.compiled_loops.len(), 1);
-        assert!(!has_side_tables(&meta, 7));
-        assert!(!has_side_tables(&meta, 8));
-        assert!(has_side_tables(&meta, 9));
     }
 }
 

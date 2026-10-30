@@ -13054,12 +13054,9 @@ fn compile_and_run_once(
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
-    if tracing_finished
-        && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some()
-        && let Some(trace_id) = driver.meta_interp().compiled_root_trace_id(compiled_key)
-    {
+    if tracing_finished && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some() {
         eprintln!(
-            "[dynasm-compile] trace={trace_id} key={compiled_key} function={} file={}",
+            "[dynasm-compile] key={compiled_key} function={} file={}",
             code.qualname, code.source_path
         );
     }
