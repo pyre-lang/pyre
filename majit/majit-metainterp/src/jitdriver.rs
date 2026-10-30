@@ -2105,10 +2105,9 @@ pub fn current_state_field_fvc_epoch() -> u64 {
 }
 
 /// Publish the driver's flat jitcode registry + packed liveness for the
-/// stateless global `frame_value_count` decode. Both compile-time decoders
-/// (`compile.rs` build_guard_metadata and the cranelift backend) read the
-/// callback via `get_frame_value_count_fn`, so this single registration
-/// serves both. Registers the callback once (process-global slot), then
+/// stateless global `frame_value_count` decode. The cranelift backend
+/// reads the callback via `get_frame_value_count_fn`. Registers the
+/// callback once (process-global slot), then
 /// refreshes the thread-local payload for the installing driver — but only
 /// when the thread is not already holding that driver's store, so the
 /// trace-entry calls that keep it honest cost one `u64` compare.
@@ -10832,21 +10831,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.starting_green_key()
     }
 
-    /// Check if any guard in the compiled trace has Float-typed fail_args.
-    pub fn compiled_trace_has_float_guards(&self, green_key: u64) -> bool {
-        self.meta.compiled_trace_has_float_guards(green_key)
-    }
-
-    /// Check if the compiled trace is safe for bridge compilation.
-    pub fn compiled_trace_safe_for_bridge(
-        &self,
-        green_key: u64,
-        slot_types: &[majit_ir::Type],
-    ) -> bool {
-        self.meta
-            .compiled_trace_safe_for_bridge(green_key, slot_types)
-    }
-
     /// Remove all compiled code. Used when guard-fail recovery detects
     /// unrecoverable state (e.g., null Ref slots from incomplete
     /// resume data), preventing repeated entry→guard-fail loops.
@@ -12089,6 +12073,21 @@ mod tests {
     use crate::resume::ReconstructedFrame;
     use majit_ir::{GcRef, GreenSlotInt, GreenSlotRef, GreenType, OpCode, OpRef, Type, Value};
     use std::sync::Arc;
+
+    fn compiled_guard_descr(
+        meta: &MetaInterp<()>,
+        green_key: u64,
+        fail_index: u32,
+    ) -> majit_ir::DescrRef {
+        let token = meta.get_procedure_token(green_key).expect("compiled token");
+        meta.backend
+            .compiled_fail_descr_layouts(token.as_ref())
+            .into_iter()
+            .flatten()
+            .find(|layout| layout.fail_index == fail_index && !layout.is_finish)
+            .and_then(|layout| layout.descr)
+            .expect("compiled guard descr")
+    }
 
     fn start_hash_trace(meta: &mut MetaInterp<()>, key: &majit_ir::GreenKey, live: &[i64]) {
         let live_values: Vec<Value> = live.iter().copied().map(Value::Int).collect();
@@ -13837,7 +13836,7 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-                traces: crate::FxIndexMap::default(),
+
                 next_global_opref: 0,
             },
         );
@@ -13920,7 +13919,7 @@ mod tests {
             crate::pyjitpl::CompiledEntry {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
-                traces: crate::FxIndexMap::default(),
+
                 next_global_opref: 0,
             },
         );
@@ -14067,7 +14066,7 @@ mod tests {
         let entry = |meta: Arc<()>, root_trace_id: u64| crate::pyjitpl::CompiledEntry {
             meta,
             root_trace_id,
-            traces: crate::FxIndexMap::default(),
+
             next_global_opref: 0,
         };
         driver.meta.insert_compiled_loop_on_driver(
@@ -15732,11 +15731,16 @@ mod tests {
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         // Identify the fail_index assigned to the first guard in the optimized trace.
-        // build_guard_metadata assigns fail_index sequentially starting from 0.
+        // `stamp_guard_descr_trace_positions` assigns fail_index sequentially starting from 0.
         let fail_index = 0u32;
+        let descr_arc = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index);
 
         // Step 2: Start bridge tracing via start_retrace (simulates guard failure path).
-        assert!(driver.meta.start_retrace(key.get_uhash(), fail_index, &[0]));
+        assert!(
+            driver
+                .meta
+                .start_retrace(descr_arc, key.get_uhash(), fail_index, &[0])
+        );
 
         // Step 3: Record a bridge trace and compile it via close_bridge.
         {
@@ -15837,7 +15841,12 @@ mod tests {
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let fail_index = 0u32;
-        assert!(driver.meta.start_retrace(key.get_uhash(), fail_index, &[0]));
+        let descr_arc = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index);
+        assert!(
+            driver
+                .meta
+                .start_retrace(descr_arc, key.get_uhash(), fail_index, &[0])
+        );
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
             let i0 = OpRef::input_arg_int(0);

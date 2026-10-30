@@ -1,7 +1,7 @@
 //! Trace compilation helpers.
 //!
-//! Mirrors RPython's `compile.py`: guard metadata building, exit layout
-//! management, backend layout merging, trace post-processing (unboxing),
+//! Mirrors RPython's `compile.py`: guard descr stamping
+//! (`stamp_guard_descr_trace_positions`), trace post-processing (unboxing),
 //! and the ResumeGuard-descriptor class hierarchy
 //! (`compile.py AbstractResumeGuardDescr` →
 //! `ResumeGuardDescr` → `{ResumeAtPositionDescr, ResumeGuardForcedDescr,
@@ -12,7 +12,6 @@
 //! through `Arc<dyn Descr>` shared ownership; the only structural
 //! difference vs upstream is the use of cells, not a separate module.
 
-use indexmap::{IndexMap, IndexSet};
 use std::cell::UnsafeCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -21,8 +20,7 @@ use std::sync::{Arc, OnceLock};
 use smallvec::smallvec;
 
 use majit_backend::{
-    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, FailDescrLayout,
-    JitCellToken,
+    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, JitCellToken,
 };
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
@@ -33,7 +31,6 @@ use majit_ir::{
 
 use crate::blackhole::ExceptionState;
 use crate::history::TreeLoop;
-use crate::pyjitpl::StoredExitLayout;
 use crate::resume::ResumeStorage;
 use crate::trace_ctx::{MergePoint, TraceCtx};
 
@@ -631,7 +628,7 @@ pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T
 
 /// history.py Box.type is on the box. Prefer the descr's `fail_arg_types`
 /// slice in place — a `to_vec()` per guard was an 8 B / 16 B class on
-/// the regex and/or timed row (`build_guard_metadata`).
+/// the regex and/or timed row.
 #[cfg(test)]
 fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     op: &Op,
@@ -688,96 +685,6 @@ fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     }
     out.extend(inputargs.iter().map(|arg| arg.as_ref().tp.get()));
     out
-}
-
-/// Build guard metadata for a compiled trace.
-///
-/// The backend numbers every guard and finish in a single exit table, so this
-/// helper mirrors that numbering and records the source op index plus the
-/// guard's own descr for blackhole fallback. Resume payload stays on the
-/// descr (`ResumeGuardDescr.get_resumestorage`); this map does not copy it.
-pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
-    _inputargs: &[A],
-    ops: &[T],
-    _pc: u64,
-    _frame_value_count_fn: Option<fn(i32, i32) -> usize>,
-) -> crate::FxIndexMap<u32, StoredExitLayout> {
-    let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
-    let mut fail_index = 0u32;
-    stamp_guard_descr_trace_positions(ops);
-    for (op_idx, op) in ops.iter().enumerate() {
-        let op = op.as_ref();
-        let is_guard = op.opcode.is_guard();
-        let is_finish = op.opcode == OpCode::Finish;
-        if !is_guard && !is_finish {
-            continue;
-        }
-        exit_layouts.insert(
-            fail_index,
-            StoredExitLayout {
-                source_op_index: Some(op_idx),
-                descr: op.getdescr(),
-                op_arg_types_for_jump: None,
-            },
-        );
-        fail_index += 1;
-    }
-    exit_layouts
-}
-
-pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
-    exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
-    backend_layouts: &[FailDescrLayout],
-    ops: &[T],
-) {
-    for layout in backend_layouts {
-        // Pre-resolve the source-op `descr` for backend-only entries so
-        // `entry.descr` matches what `build_guard_metadata` would have
-        // primed had the frontend seen this exit.  When the source op
-        // is no longer reachable (frontend trace evicted but backend
-        // exit layout persists across previous-token fallback) the
-        // backend's `fail_arg_types` is the canonical typed-data
-        // carrier; mint a fresh `ResumeGuardDescr` (`make_fail_descr_typed`) carrying that vector
-        // so descr-side readers stay populated.  Branch on
-        // `layout.is_finish` so a backend-only FINISH entry synthesizes
-        // a `_DoneWithThisFrameDescr`-flavored handle (is_finish=true).
-        // Without the branch, `pyjitpl.rs`'s `resolve_is_finish` reading
-        // `descr.is_finish()`
-        // returns false on the synthesized guard descr and breaks
-        // PyPy's `DoneWithThisFrameDescr` /
-        // `ExitFrameWithExceptionDescrRef` identity check
-        // (compile.py:658-662 / compile.py:701-784).
-        let descr_from_op = layout
-            .source_op_index
-            .and_then(|idx| ops.get(idx))
-            .and_then(|op| op.as_ref().getdescr())
-            .or_else(|| {
-                Some(if layout.is_finish {
-                    make_finish_fail_descr_typed(
-                        layout.fail_arg_types.clone(),
-                        layout.is_exception_exit,
-                    )
-                } else {
-                    make_fail_descr_typed(layout.fail_arg_types.clone())
-                })
-            });
-        let entry: &mut StoredExitLayout =
-            exit_layouts
-                .entry(layout.fail_index)
-                .or_insert_with(|| StoredExitLayout {
-                    source_op_index: layout.source_op_index,
-                    descr: descr_from_op.clone(),
-                    op_arg_types_for_jump: None,
-                });
-        entry.source_op_index = layout.source_op_index;
-        // Backfill descr if the entry was inserted before `op.descr` was
-        // available (or the op walk produced a fresh handle). Keeps
-        // descr-side identity in sync with `build_guard_metadata`'s
-        // priority-1 source.
-        if entry.descr.is_none() {
-            entry.descr = descr_from_op;
-        }
-    }
 }
 
 pub(crate) fn normalize_closing_jump_args(
@@ -1650,7 +1557,7 @@ mod tests {
         assert!(!layout.is_traced_ref_slot(3));
     }
 
-    /// Frame value count for the `build_guard_metadata` fixtures below, each
+    /// Frame value count for the stamp-guard descr fixtures below, each
     /// of which numbers one box per frame. Passed as the driver-scoped count
     /// so the decode does not fall back to the process-global
     /// `set_frame_value_count_fn`, which a test running in parallel may have
@@ -1662,7 +1569,7 @@ mod tests {
     // history.py ConstInt.value inline — SimpleBoxEnv.get_const
     // reads inline-Const directly without the legacy raw-u32 side table.
     #[test]
-    fn test_build_guard_metadata_keeps_vable_array_out_of_frame_slots() {
+    fn test_stamp_guard_descr_keeps_vable_array_out_of_frame_slots() {
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Ref);
@@ -1694,24 +1601,21 @@ mod tests {
         rd_consts.push(majit_ir::Const::Int(123_456_789));
         let rd_consts_len = rd_consts.len();
 
-        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 1)]);
         let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
         if let Some(fd) = descr.as_fail_descr() {
             fd.set_rd_numb_arc(Some(rd_numb));
             fd.set_rd_consts(Some(rd_consts));
         }
-        guard.setdescr(descr);
+        guard.setdescr(descr.clone());
         guard.setfailargs(smallvec::smallvec![
             rooted_inputarg_operand(Type::Ref, 0),
             rooted_inputarg_operand(Type::Int, 1)
         ]);
         guard.set_fail_arg_types(vec![Type::Ref, Type::Int]);
 
-        let exit_layouts = build_guard_metadata(&inputargs, &[guard], 8, Some(one_box_per_frame));
-        let exit = exit_layouts.get(&0).expect("guard exit layout");
-        let descr = exit.descr.as_ref().expect("descr");
-        let storage = crate::resume::get_resumestorage(descr).expect("get_resumestorage");
+        stamp_guard_descr_trace_positions(&[guard]);
+        let storage = crate::resume::get_resumestorage(&descr).expect("get_resumestorage");
         let rd_numb = storage.rd_numb().expect("rd_numb");
         let rd_consts = storage.rd_consts().expect("rd_consts");
         assert_eq!(
@@ -1741,39 +1645,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_guard_metadata_prefers_explicit_fail_arg_types_over_stale_inputarg_types() {
-        let inputargs = vec![
-            InputArg::new_ref_rc(0),
-            InputArg::new_ref_rc(1),
-            InputArg::new_ref_rc(2),
-            InputArg::new_ref_rc(3),
-        ];
-        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Ref, 0)]);
-        let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
-        let descr = make_fail_descr_with_index(0, fail_arg_types.len());
-        descr
-            .as_fail_descr()
-            .unwrap()
-            .set_fail_arg_types(fail_arg_types.clone());
-        guard.setdescr(descr);
-        guard.setfailargs(smallvec::smallvec![
-            rooted_inputarg_operand(Type::Ref, 0),
-            rooted_inputarg_operand(Type::Ref, 1),
-            rooted_inputarg_operand(Type::Ref, 2),
-            rooted_inputarg_operand(Type::Ref, 3)
-        ]);
-        guard.set_fail_arg_types(fail_arg_types);
-
-        let exit_layouts = build_guard_metadata(&inputargs, &[guard], 0, None);
-        let exit = exit_layouts.get(&0).expect("guard exit layout");
-
-        assert_eq!(
-            exit.resolve_exit_types(),
-            &[Type::Ref, Type::Ref, Type::Int, Type::Int][..]
-        );
-    }
-
-    #[test]
     fn test_exit_types_for_guard_reads_descr_slice() {
         // history.py Box.type lives on the box / descr. A heap `to_vec`
         // per guard was an 8 B / 16 B class on the regex and/or row.
@@ -1789,49 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_guard_metadata_does_not_mint_derived_frame_vecs() {
-        // resume.py walks `rd_numb` on the descr. StoredExitLayout no longer
-        // projects parallel frame_pcs / frame_slot_counts / slot_sources Vecs.
-        let mut memo = ResumeDataLoopMemo::new();
-        let mut env = SimpleBoxEnv::new();
-        env.types.insert(0, Type::Int);
-        let snapshot = Snapshot {
-            vable_array: vec![],
-            vref_array: vec![],
-            framestack: vec![SnapshotFrame {
-                jitcode_index: 0,
-                pc: 4,
-                py_pc: 4,
-                boxes: vec![OpRef::input_arg_int(0).into()],
-            }],
-        };
-        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
-        numb_state.writer.patch(1, numb_state.num_boxes);
-        let rd_numb = numb_state.create_numbering();
-        let rd_consts = memo.consts().to_vec();
-
-        let inputargs = vec![InputArg::new_int(0)];
-        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
-        if let Some(fd) = descr.as_fail_descr() {
-            fd.set_rd_numb_arc(Some(rd_numb));
-            fd.set_rd_consts(Some(rd_consts));
-        }
-        guard.setdescr(descr);
-        guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
-        guard.set_fail_arg_types(vec![Type::Int]);
-
-        let exit_layouts = build_guard_metadata(&inputargs, &[guard], 4, Some(one_box_per_frame));
-        let exit = exit_layouts.get(&0).expect("guard exit layout");
-        let descr = exit.descr.as_ref().expect("descr");
-        let storage = crate::resume::get_resumestorage(descr).expect("get_resumestorage");
-        assert!(storage.rd_numb().is_some());
-        assert_eq!(exit.source_op_index, Some(0));
-    }
-
-    #[test]
-    fn test_build_guard_metadata_restamps_frontend_source_op_index() {
-        let inputargs = vec![InputArg::new_int_rc(0)];
+    fn test_stamp_guard_descr_restamps_frontend_source_op_index() {
         let value = rooted_inputarg_operand(Type::Int, 0);
         let prefix = Op::new(OpCode::SameAsI, std::slice::from_ref(&value));
         let descr = make_fail_descr_with_index(0, 1);
@@ -1848,11 +1677,10 @@ mod tests {
         guard.setfailargs(smallvec::smallvec![value]);
         guard.set_fail_arg_types(vec![Type::Int]);
 
-        let exit_layouts = build_guard_metadata(&inputargs, &[prefix, guard], 0, None);
-        let exit = exit_layouts.get(&0).expect("guard exit layout");
+        stamp_guard_descr_trace_positions(&[prefix, guard]);
 
-        assert_eq!(exit.source_op_index, Some(1));
         assert_eq!(fd.source_op_index(), Some(1));
+        assert_eq!(fd.fail_index_per_trace(), 0);
     }
 
     #[test]
@@ -2325,12 +2153,11 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
     make_resume_guard_descr_typed(types)
 }
 
-/// FINISH-flavored variant of [`make_fail_descr_typed`]. Used by the
-/// backend-only FINISH fallback in `merge_backend_exit_layouts` when
-/// the FINISH op has been evicted, and by FINISH-singleton fallbacks in
-/// tests that bypass `MetaInterp::new` (so the resulting descr's
-/// `is_finish()` matches `compile.py ExitFrameWithExceptionDescrRef`
-/// / `pyjitpl.py compile_done_with_this_frame` semantics).
+/// FINISH-flavored variant of [`make_fail_descr_typed`]. Used by
+/// FINISH-singleton fallbacks in tests that bypass `MetaInterp::new`
+/// (so the resulting descr's `is_finish()` matches
+/// `compile.py ExitFrameWithExceptionDescrRef` /
+/// `pyjitpl.py compile_done_with_this_frame` semantics).
 ///
 /// `compile.py` `_DoneWithThisFrameDescr` family — return the
 /// class-distinct singleton matching the result-type signature.
@@ -3409,7 +3236,7 @@ pub struct ResumeGuardCopiedDescr {
     /// owned by exactly one trace.
     trace_id: AtomicU64,
     /// Pyre-only per-trace fail-index — same role as on
-    /// `ResumeGuardDescr`. Stamped by `build_guard_metadata`.
+    /// `ResumeGuardDescr`. Stamped by `stamp_guard_descr_trace_positions`.
     fail_index_per_trace: AtomicU32,
     /// Pyre-only per-emission slot: codegen-time trace-op index.
     /// Classified per-emission alongside `history.py:132
@@ -4632,8 +4459,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 }
 
 // Guard resume payload stays on the descr (`ResumeGuardDescr.get_resumestorage`).
-// `build_guard_metadata` records source_op_index and that descr; it does not
-// project a parallel resume/recovery layout.
+// `stamp_guard_descr_trace_positions` records `source_op_index` on that descr.
 
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's

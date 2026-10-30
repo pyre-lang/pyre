@@ -566,8 +566,7 @@ pub struct Optimizer {
 
 /// Lower a typed-`Value` constants pool into the dense
 /// `IndexMap<u32, Const>` shape consumed by pyre-side guard metadata
-/// builders, CompiledTrace storage, and the backend's
-/// `set_constants_pool` boundary.
+/// builders and the backend's `set_constants_pool` boundary.
 ///
 /// history.py/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
 /// constant classes — `Value::Void` panics rather than fabricate a

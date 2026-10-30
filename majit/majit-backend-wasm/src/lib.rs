@@ -7066,9 +7066,10 @@ impl majit_backend::Backend for WasmBackend {
     /// of triggering a bridge. Build one layout per exit from the metainterp
     /// `ResumeGuardDescr` the optimizer stamped on the guard (`meta_descr`); the
     /// wasm backend keeps no machine-code recovery metadata (resume runs through
-    /// the frontend `WasmFrameData` path), so the recovery / rd_* / gc-slot
-    /// fields stay empty — `merge_backend_exit_layouts` keeps the frontend's own
-    /// entry (`or_insert_with`) and only consumes `is_finish` + `source_op_index`.
+    /// `exit_layout_for_descr` / `get_resumestorage` on that descr), so the
+    /// recovery / rd_* / gc-slot fields stay empty. Consumers read
+    /// `is_finish` and `source_op_index` from this list and the resume
+    /// payload from the descr Arc.
     fn compiled_fail_descr_layouts(
         &self,
         token: &JitCellToken,
@@ -7108,8 +7109,8 @@ impl majit_backend::Backend for WasmBackend {
     /// `fail_descrs` and records their `(source_fail_index, start, count)` slice
     /// in `bridge_descr_ranges`. Return one layout per descr in that slice.
     /// `fail_index` is the 0-based position within the bridge's own
-    /// exit list (matching the bridge's frontend `exit_layouts` keying and the
-    /// native backends' `compiled_bridge_fail_descr_layouts`); `trace_id` is the
+    /// fail-descr list (matching the native backends'
+    /// `compiled_bridge_fail_descr_layouts`); `trace_id` is the
     /// bridge's own id, stamped on each appended `WasmFailDescr`.
     fn compiled_bridge_fail_descr_layouts(
         &self,
