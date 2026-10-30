@@ -7254,29 +7254,26 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
 }
 
 /// `pyframe.py get_w_globals` for an inlined LOAD_GLOBAL: read `frame.debugdata`,
-/// emit `GuardIsnull` / `GuardNonnull` with the portal arm's helper, then pick
-/// `debugdata.w_globals` or `promote(pycode).w_globals`.
+/// run `_establish_nullity` on that box, then pick `debugdata.w_globals` or
+/// `promote(pycode).w_globals`. `None` when the box's nullity cannot be
+/// established, so the caller leaves the residual namespace standing.
 fn walker_inline_frame_get_w_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     frame: OpRef,
-) -> Result<OpRef, DispatchError> {
+) -> Result<Option<OpRef>, DispatchError> {
     let debugdata = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         frame,
         crate::descr::pyframe_debugdata_descr(),
     );
-    let present = crate::state::frame_debugdata_box_is_known_non_null(ctx.trace_ctx, debugdata);
-    let known_null = crate::state::frame_debugdata_box_is_known_null(ctx.trace_ctx, debugdata);
-    if present || known_null {
-        let opcode = if present {
-            OpCode::GuardNonnull
-        } else {
-            OpCode::GuardIsnull
-        };
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, &[debugdata])?;
+    if establish_nullity_of_box(ctx, op_pc, debugdata)?.is_none() {
+        return Ok(None);
     }
-    Ok(crate::state::frame_get_globals_obj(ctx.trace_ctx, frame))
+    Ok(Some(crate::state::frame_get_globals_obj(
+        ctx.trace_ctx,
+        frame,
+    )))
 }
 
 fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
@@ -7332,12 +7329,13 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
         // `inline_w_globals` is the function's globals, which is the
         // `FrameDebugData` override when `frame_stores_global` held at
         // construction, so the concrete stamp matches the box this returns.
-        let w_globals = walker_inline_frame_get_w_globals(ctx, op_pc, frame)?;
-        ctx.trace_ctx.try_set_opref_concrete(
-            w_globals,
-            Value::Ref(majit_ir::GcRef(ctx.inline_w_globals())),
-        );
-        *ns_box = w_globals;
+        if let Some(w_globals) = walker_inline_frame_get_w_globals(ctx, op_pc, frame)? {
+            ctx.trace_ctx.try_set_opref_concrete(
+                w_globals,
+                Value::Ref(majit_ir::GcRef(ctx.inline_w_globals())),
+            );
+            *ns_box = w_globals;
+        }
         return Ok(());
     }
 
@@ -14289,6 +14287,69 @@ fn establish_nullity<Sym: WalkSym>(
     }
     ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
     Ok(value)
+}
+
+/// `_establish_nullity` (`pyjitpl.py`) for a box the walk already holds,
+/// not a `goto_if_not_ptr_*` operand register. Same guard plus
+/// `heapcache.nullity_now_known` sequence as [`establish_nullity`]: skip
+/// when `heapcache.is_nullity_known`, otherwise record `GUARD_NONNULL` /
+/// `GUARD_ISNULL` from the box's own bits. `None` when those bits are
+/// absent — the caller declines rather than guessing the arm.
+pub(super) fn establish_nullity_of_box<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    boxref: OpRef,
+) -> Result<Option<bool>, DispatchError> {
+    let known = ctx.trace_ctx.heapcache_nullity_known(boxref);
+    if let Some(value) = known {
+        ctx.trace_ctx.profiler().count_ops(
+            OpCode::GuardNonnull,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+        return Ok(Some(value));
+    }
+    if matches!(
+        ctx.trace_ctx.opcode_of(boxref),
+        Some(OpCode::New | OpCode::NewWithVtable)
+    ) {
+        // `heapcache.py new` sets `HF_KNOWN_NULLITY`; a fresh allocation is
+        // non-null even when the flag was not yet stamped on this box.
+        ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
+        return Ok(Some(true));
+    }
+    // `_establish_nullity` reads `box.nonnull()`. The walker knows it only
+    // through the concrete shadow on the box itself.
+    let ptr_bits = match ctx.trace_ctx.box_value(boxref) {
+        Some(majit_ir::Value::Ref(r)) => {
+            let bits = r.as_usize();
+            if r != majit_ir::GcRef::NO_CONCRETE && bits % std::mem::align_of::<usize>() == 0 {
+                Some(bits)
+            } else {
+                None
+            }
+        }
+        _ => match ctx.trace_ctx.concrete_of_opref(boxref) {
+            Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
+                Some(r.as_usize())
+            }
+            _ => None,
+        },
+    };
+    let Some(bits) = ptr_bits else {
+        return Ok(None);
+    };
+    let value = bits != 0;
+    if value {
+        if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[boxref])?;
+        }
+    } else if !boxref.is_constant() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[boxref])?;
+        let promoted = ctx.trace_ctx.const_ref(0);
+        vable_ops::walker_replace_box(ctx, boxref, promoted);
+    }
+    ctx.trace_ctx.heap_cache_mut().nullity_now_known(boxref);
+    Ok(Some(value))
 }
 
 /// The unary members of the fused-goto family. `pyjitpl.py`

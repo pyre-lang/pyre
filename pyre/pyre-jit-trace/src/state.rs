@@ -4992,12 +4992,13 @@ pub(crate) fn trace_float_block_setitem_value(
 /// (the constructor store on a virtual inline frame — `ConstPtr(0)` or a
 /// `New` `FrameDebugData`) returns that box with no op; a miss records
 /// `GetfieldGcR` and stamps the live word via `field_sanity_load`. The
-/// walker caller emits `GuardIsnull` / `GuardNonnull` on that box with
-/// `walker_emit_fold_guard_with_snapshot` (the portal LOAD_GLOBAL arm's
-/// helper) before this function picks the arm. The only product caller is
-/// the inline arm of `replace_movable_load_global_namespace_with_frame_globals`;
-/// the portal arm reads `virtualizable_boxes` itself and does not call here,
-/// so the debugdata null-check is not recorded twice.
+/// walker caller runs `_establish_nullity` (`establish_nullity_of_box`) on
+/// that box before this function picks the arm, so a recording-time pointer
+/// is a `GUARD_NONNULL` / `GUARD_ISNULL` plus `heapcache.nullity_now_known`
+/// rather than a fact. The only product caller is the inline arm of
+/// `replace_movable_load_global_namespace_with_frame_globals`; the portal
+/// arm reads `virtualizable_boxes` itself and does not call here, so the
+/// debugdata null-check is not recorded twice.
 ///
 /// `jtransform.py rewrite_op_getfield` records `record_quasiimmut_field`
 /// with `mutate_w_globals` before the load (`pycode.py` `"w_globals?"`).
@@ -5010,7 +5011,8 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
             crate::descr::frame_debug_data_w_globals_descr(),
         );
     }
-    // Const 0, a recorded null, or an unknown box: published `pycode.w_globals`.
+    // Const 0, a heapcache-known null, or a box the caller could not
+    // establish: published `pycode.w_globals`.
     let code_descr = crate::descr::pyframe_code_descr();
     let pycode = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], code_descr.clone());
     // `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
@@ -5028,31 +5030,36 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     ctx.record_op_with_descr(OpCode::GetfieldGcR, &[pycode], descr)
 }
 
-/// Nullity already decided for a `debugdata` box: a `ConstPtr(0)` or a
-/// stamped null word. A `New` / `NewWithVtable` is never this arm.
+/// Nullity already decided for a `debugdata` box: a `ConstPtr(0)`, or
+/// `heapcache.py is_nullity_known` together with a null concrete
+/// (`TraceCtx::heapcache_nullity_known` → `Some(false)`). A `New` /
+/// `NewWithVtable` is never this arm. A recording-time null without those
+/// facts is not knowledge: `_establish_nullity` (`pyjitpl.py`) records
+/// `GUARD_ISNULL` and then `heapcache.nullity_now_known`.
 pub(crate) fn frame_debugdata_box_is_known_null(ctx: &TraceCtx, op: OpRef) -> bool {
     if ctx.const_value(op) == Some(0) {
         return true;
     }
-    matches!(
-        ctx.concrete_of_opref(op),
-        Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
-    )
+    if matches!(ctx.opcode_of(op), Some(OpCode::New | OpCode::NewWithVtable)) {
+        return false;
+    }
+    ctx.heapcache_nullity_known(op) == Some(false)
 }
 
 /// Non-null already decided for a `debugdata` box: a non-zero constant, a
-/// stamped non-null word, or a `New` / `NewWithVtable` (constructor store).
+/// `New` / `NewWithVtable` (fresh allocation, `heapcache.py new`), or
+/// `heapcache.py is_nullity_known` together with a non-null concrete
+/// (`TraceCtx::heapcache_nullity_known` → `Some(true)`). A recording-time
+/// pointer without those facts is not knowledge: `_establish_nullity`
+/// (`pyjitpl.py`) records `GUARD_NONNULL`.
 pub(crate) fn frame_debugdata_box_is_known_non_null(ctx: &TraceCtx, op: OpRef) -> bool {
     if let Some(word) = ctx.const_value(op) {
         return word != 0;
     }
-    if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
-        && r != majit_ir::GcRef::NO_CONCRETE
-        && r.as_usize() != 0
-    {
+    if matches!(ctx.opcode_of(op), Some(OpCode::New | OpCode::NewWithVtable)) {
         return true;
     }
-    matches!(ctx.opcode_of(op), Some(OpCode::New | OpCode::NewWithVtable))
+    ctx.heapcache_nullity_known(op) == Some(true)
 }
 
 /// `FixedObjectArray.len` sits at payload offset 0. `set_forwarding_address`
@@ -16382,9 +16389,15 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// Globals for a reconstructed inline callee: `PyFrame.get_w_globals` on the
 /// resume-decoded frame when a concrete `PyFrame` is still attached, else the
 /// constructor `debugdata.w_globals` still sitting in that frame red's
-/// heapcache. `pycode.w_globals` is the fallback when those reads do not
-/// answer. A Python callee with no frame red is declined at reconstruct
-/// time (`NoFrameForGlobals`) rather than rebuilt under the first namespace.
+/// heapcache. With a frame red present, `pycode.w_globals` is used only when
+/// that frame's `debugdata` is known null (`heapcache.py is_nullity_known`,
+/// a constructor `ConstPtr(0)`, or a constant 0). An unknown `debugdata`
+/// returns `PY_NULL` so the caller declines (`P2Recipe::NoCalleeGlobals`)
+/// rather than rebuilding under the code's first namespace. A Python callee
+/// with no frame red is declined at reconstruct time (`NoFrameForGlobals`).
+/// Recipes that carry no frame red (transparent helpers, `len_tail`,
+/// `descr_call`'s return substitute) keep the first-namespace fallback;
+/// the portal/root is `resume_data.frames[0]` and is not recovered here.
 pub(crate) fn recover_inline_callee_globals_from_recipe(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
@@ -16392,7 +16405,10 @@ pub(crate) fn recover_inline_callee_globals_from_recipe(
     if let Some(g) = recipe_frame_live_w_globals(ctx, recipe) {
         return g;
     }
-    recover_inline_callee_globals(recipe.code_ptr)
+    if recipe.frame.is_none() || recipe_frame_debugdata_is_known_null(ctx, recipe) {
+        return recover_inline_callee_globals(recipe.code_ptr);
+    }
+    pyre_object::PY_NULL
 }
 
 /// One-shot read of the reconstructed callee's live globals. Nursery frames
@@ -16440,6 +16456,18 @@ fn recipe_frame_live_w_globals(
     }
 }
 
+/// Constructor store of PY_NULL, a constant 0, or heapcache nullity knowledge
+/// plus a null concrete (`pyjitpl.py _establish_nullity` / `heapcache.py
+/// is_nullity_known`). Unknown is false: the first namespace is not the
+/// answer until that question is closed.
+fn recipe_frame_debugdata_is_known_null(ctx: &mut TraceCtx, recipe: &ReconstructRecipe) -> bool {
+    let debug_idx = crate::descr::pyframe_debugdata_descr().index();
+    let Some(debugdata) = ctx.heapcache_getfield_cached(recipe.frame, debug_idx) else {
+        return false;
+    };
+    frame_debugdata_box_is_known_null(ctx, debugdata)
+}
+
 /// Assemble one decoded inline-callee [`ReconstructRecipe`]
 /// into a [`PendingInlineFrame`] (concrete `PyFrame` + symbolic `PyreSym`)
 /// for `trace_bytecode` to push onto the bridge framestack.
@@ -16454,10 +16482,11 @@ fn recipe_frame_live_w_globals(
 ///
 /// The callee frame's globals come from `PyFrame.get_w_globals` on the
 /// resume-decoded frame when that frame is still concrete (or from its
-/// heapcached `debugdata` override), else from `pycode.w_globals`. A
-/// cross-module inlined callee's LOAD_GLOBAL then resolves against the
-/// callee's own namespace. `execution_context` is the per-thread singleton
-/// and comes from the bridge's root concrete frame.
+/// heapcached `debugdata` override), else from `pycode.w_globals` when
+/// `debugdata` is known null. An unknown `debugdata` is `PY_NULL` and the
+/// caller declines. A cross-module inlined callee's LOAD_GLOBAL then
+/// resolves against the callee's own namespace. `execution_context` is the
+/// per-thread singleton and comes from the bridge's root concrete frame.
 ///
 /// `parent_frames` is the OUTER chain (immediate parent first) the drain
 /// builds from the framestack.  The caller result slot travels in this
@@ -16483,7 +16512,9 @@ pub(crate) fn assemble_bridge_inline_pending(
     // pyframe.py get_w_globals: the resume-decoded callee frame, when it
     // still has a concrete `PyFrame` or a heapcached `debugdata` override,
     // answers with that namespace so `emit_new_pyframe_inline_with_params`
-    // rebuilds the override. `pycode.w_globals` is the fallback.
+    // rebuilds the override. `pycode.w_globals` is the fallback when
+    // `debugdata` is known null. PY_NULL here is an unknown `debugdata`:
+    // the caller declines rather than taking the first namespace.
     let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
 
     // resume.py rebuild_from_resumedata newframe + reload: the decoded boxes are reloaded
@@ -16738,6 +16769,9 @@ fn emit_reconstructed_callee_pyframe(
     let nlocals = code_ref.varnames.len();
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
     let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
+    if w_globals.is_null() {
+        return None;
+    }
     let pycode_const = ctx.const_ref(w_code as i64);
     let w_globals_const = ctx.const_ref(w_globals as i64);
     let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
@@ -17061,6 +17095,9 @@ pub(crate) fn setup_reconstructed_callee_frame(
 
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
     let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
+    if w_globals.is_null() {
+        return None;
+    }
     restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
     // The resume section's own frame red (`resume.py consume_boxes`).
     // Building a second frame would split the traceback `f_back` chain.

@@ -795,41 +795,13 @@ fn is_fresh_frame_debugdata_null_goto(
         .is_some_and(descr_is_vable_debugdata)
 }
 
-fn descr_is_debugdata_w_f_trace(descr: &DescrRef) -> bool {
-    if std::sync::Arc::ptr_eq(descr, &crate::descr::frame_debug_data_w_f_trace_descr()) {
-        return true;
-    }
-    descr.as_field_descr().is_some_and(|field| {
-        field.offset() == pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET && {
-            let name = field.field_name();
-            name == "w_f_trace" || name.rsplit(['.', ':']).next() == Some("w_f_trace")
-        }
-    })
-}
-
-/// `goto_if_not_ptr_iszero` of `debugdata.w_f_trace` after a non-null
-/// `debugdata` arm. A constructor payload stores PY_NULL there
-/// (`FrameDebugData::init`).
-fn is_fresh_frame_w_f_trace_null_goto(
-    code: &[u8],
-    op: &DecodedOp,
-    pred: Option<&DecodedOp>,
-    descr_refs: &[DescrRef],
-) -> bool {
-    if !ptr_iszero_goto_of_pred(code, op, pred, "getfield_gc_r") {
-        return false;
-    }
-    let Some(pred) = pred else {
-        return false;
-    };
-    let Some(descr_index) = descr_operand_index(code, pred) else {
-        return false;
-    };
-    body_descr_at(descr_refs, descr_index)
-        .as_ref()
-        .is_some_and(descr_is_debugdata_w_f_trace)
-}
-
+/// Fold the constructor `debugdata` null-test and the LOAD_FAST unbound
+/// check (`pyopcode.py LOAD_FAST` as `emit_load_fast_checked!` flattens it:
+/// `getarrayitem_vable_r` of the local, then `goto_if_not_ptr_nonzero`).
+/// The `w_f_trace` null-test is left to the walker
+/// (`opimpl_goto_if_not_ptr_iszero` / `_establish_nullity` answers it from the
+/// heapcache-known PY_NULL of a fresh `FrameDebugData`). This scan is
+/// admission-only (`decoded_ops_on_fresh_frame_kind`).
 fn fresh_frame_goto_fold(
     code: &[u8],
     op: &DecodedOp,
@@ -842,11 +814,6 @@ fn fresh_frame_goto_fold(
             FreshFrameDebugdata::Null => FreshFrameGotoFold::Fallthrough,
             FreshFrameDebugdata::NonNull => FreshFrameGotoFold::Label,
         };
-    }
-    if debugdata == FreshFrameDebugdata::NonNull
-        && is_fresh_frame_w_f_trace_null_goto(code, op, pred, descr_refs)
-    {
-        return FreshFrameGotoFold::Fallthrough;
     }
     if is_load_fast_unbound_check_goto(code, pred, op) {
         return FreshFrameGotoFold::Fallthrough;
