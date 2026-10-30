@@ -9897,6 +9897,32 @@ fn skip_caches(code: &pyre_interpreter::CodeObject, mut pos: usize) -> usize {
     pos
 }
 
+/// Whether `ll_portal_runner`'s `maybe_compile_and_run(increment_function_threshold)`
+/// should consult warmstate for this green `next_instr`.
+///
+/// `warmspot.py ll_portal_runner` ticks on every portal entry. After
+/// `interp_jit.py PyFrame.dispatch` parks a merge at every instruction, a
+/// recursive blackhole or `compile_tmp_callback` CALL_ASSEMBLER can re-enter
+/// the portal at a mid-body pc (`fib` `PopJumpIfFalse` / the second
+/// `LoadGlobal`). Those merges are tracing jump targets:
+/// `jump_absolute` `can_enter_jit` owns back-edges, and
+/// `should_unroll_one_iteration` owns generator resumes. Starting a
+/// function-entry trace there compiles extra entry-bridges the interpreter
+/// origin never asked for.
+fn function_entry_may_compile(
+    code: &pyre_interpreter::CodeObject,
+    w_code: pyre_object::PyObjectRef,
+    entry_pc: usize,
+) -> bool {
+    if pyre_interpreter::code_flags_make_generator(code.flags) {
+        return true;
+    }
+    if entry_pc == skip_caches(code, 0) {
+        return true;
+    }
+    pyre_interpreter::code_pc_is_loop_header(w_code, entry_pc)
+}
+
 /// The census-key half of the frame-shape gate. The shape itself is cached
 /// on `PyCode.jit_shape` and read by [`cached_unsupported_jit_shape`]; the
 /// key is only consumed on the decline path, so it is computed there.
@@ -13301,6 +13327,9 @@ fn tick_function_entry_from_portal(frame: &mut PyFrame) {
     }
     let code_ptr = frame.pycode;
     let entry_pc = skip_caches(code, frame.next_instr());
+    if !function_entry_may_compile(code, w_code, entry_pc) {
+        return;
+    }
     let is_being_profiled = frame.get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let pair = driver_pair();
@@ -13376,6 +13405,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let entry_pc = skip_caches(code, frame_root.frame().next_instr());
     if entry_pc != frame_root.frame().next_instr() {
         frame_root.frame().set_last_instr_from_next_instr(entry_pc);
+    }
+    // Mid-body portal merges are `jit_merge_point` targets, not
+    // interpreter-origin function entries. Fall through to `portal_ptr`
+    // (`eval_loop_jit`) without ticking `function_threshold`.
+    if !function_entry_may_compile(code, w_code, entry_pc) {
+        return None;
     }
     let is_being_profiled = frame_root.frame().get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);

@@ -1428,6 +1428,7 @@ two-phase-annotate-skipped	pyre_jit::call_jit::store_jit_exception
 two-phase-annotate-skipped	pyre_jit::eval::<Impl>::can_enter_jit__AccessDirect_None
 two-phase-annotate-skipped	pyre_jit::eval::cached_unsupported_jit_shape
 two-phase-annotate-skipped	pyre_jit::eval::cached_unsupported_jit_shape::<Impl>::call_once
+two-phase-annotate-skipped	pyre_jit::eval::call_assembler_portal_body_result
 two-phase-annotate-skipped	pyre_jit::eval::drive_portal_metatrace::<Impl>::call_once
 two-phase-annotate-skipped	pyre_jit::eval::drive_portal_metatrace__AccessDirect_None
 two-phase-annotate-skipped	pyre_jit::eval::eval_loop_jit

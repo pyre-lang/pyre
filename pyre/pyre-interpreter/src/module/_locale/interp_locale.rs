@@ -568,6 +568,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             } else {
                 pyre_object::PY_NULL
             };
+            // `w_locale` is PY_NULL when omitted; it still occupies a live
+            // local across `gateway_int_w`.
             let cat = pyre_object::with_roots!(
                 w_category, w_locale => crate::baseobjspace::gateway_int_w(w_category)
             )? as i32;
@@ -579,7 +581,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         ));
                     }
                     let text = pyre_object::with_roots!(
-                        w_category => crate::baseobjspace::str_utf8_w(w_locale)
+                        w_category, w_locale => crate::baseobjspace::str_utf8_w(w_locale)
                     )?;
                     Some(text.to_string())
                 } else {

@@ -928,11 +928,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     .copied()
                     .filter(|value| !value.is_null())
                     .unwrap_or(pyre_object::PY_NULL);
-                let fd = pyre_object::with_roots!(w_fd, w_warn => crate::baseobjspace::c_int_w(w_fd))?;
+                // `w_warn` is PY_NULL when omitted; it still occupies a live
+                // local across `c_int_w` / `is_true`.
+                let fd = pyre_object::with_roots!(
+                    w_fd, w_warn => crate::baseobjspace::c_int_w(w_fd)
+                )?;
                 let warn_on_full_buffer = if w_warn.is_null() {
                     true
                 } else {
-                    pyre_object::with_roots!(w_fd => crate::baseobjspace::is_true(w_warn))?
+                    pyre_object::with_roots!(
+                        w_fd, w_warn => crate::baseobjspace::is_true(w_warn)
+                    )?
                 };
                 // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
                 // the only place a descriptor is asked whether it is a socket.
@@ -1346,6 +1352,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         pyre_object::PY_NULL
                     };
                     // interp_signal.py `setitimer` `@unwrap_spec(which=int, ...)`.
+                    // `w_interval` is PY_NULL when omitted; it still occupies a
+                    // live local across `gateway_int_w`.
                     let which = pyre_object::with_roots!(
                         w_which, w_seconds, w_interval => crate::baseobjspace::gateway_int_w(w_which)
                     )? as i32;
