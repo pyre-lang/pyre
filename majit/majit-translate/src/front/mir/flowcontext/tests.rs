@@ -19,11 +19,11 @@ use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
     adt_node, boxing_cluster_ctor_new_counts, boxing_cluster_with_nested_header, calls_leaf,
-    code_struct, count_branch_calls, count_method_calls, disc_site, empty_llbc, empty_struct_attrs,
-    fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops, i64_field, ident_path,
-    interior_bb, interior_caller, interior_i64, interior_local, interior_meta, interior_opaque,
-    interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths, llbc_with_types,
-    lower_object_fn, ok_ctor_shape, option_adt_node, option_enum, option_int_arg,
+    code_struct, control_flow_enum, count_branch_calls, count_method_calls, disc_site, empty_llbc,
+    empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops, i64_field,
+    ident_path, interior_bb, interior_caller, interior_i64, interior_local, interior_meta,
+    interior_opaque, interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths,
+    llbc_with_types, lower_object_fn, ok_ctor_shape, option_adt_node, option_enum, option_int_arg,
     option_ok_or_else_site, push_fn_const, replace_struct_ctors, rows, same_as_count,
     some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
     tyref_to_attr_value_type, window_call_leafs, window_empty_generics, window_graph_ops,
@@ -7658,6 +7658,82 @@ fn resolve_aggregate_adt_uses_dest_ty_generics_when_head_is_bare_id() {
     );
 }
 
+/// Recast dest (`resolve_aggregate_adt`) and field intern
+/// (`class_identity_spelling` plus suffix) spell one intern key.
+#[test]
+fn resolve_aggregate_adt_control_flow_continue_matches_field_intern_identity() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![control_flow_enum(0), option_enum(1)],
+        vec![],
+    );
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let kind = serde_json::json!({"Adt": [0, 0]});
+    let dest = TyRef::Other(serde_json::json!({
+        "Value": [7, {
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [
+                        option_adt_node(1, serde_json::json!({"Value": [0, "Never"]})),
+                        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+                    ],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }]
+    }));
+    let (path, ctor, _, _, _, _) = lowering
+        .resolve_aggregate_adt(&kind, Some(&dest))
+        .expect("Continue constructor");
+    let recast = if path.is_empty() {
+        ctor.clone()
+    } else {
+        format!("{}::{ctor}", path.join("::"))
+    };
+    let name_path = "core::ops::control_flow::ControlFlow";
+    let suffix = "<Option<Never>,u8>";
+    let field = format!(
+        "{}{suffix}::{ctor}",
+        crate::front::mir::class_identity_spelling(name_path, &tombstoned)
+    );
+    assert_eq!(recast, field);
+    assert_eq!(
+        recast,
+        "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue"
+    );
+}
+
 fn option_unit_arg() -> serde_json::Value {
     serde_json::json!({"Adt": {
         "id": 0,
@@ -9006,11 +9082,13 @@ fn option_niche_null_cast_shared_u8_slice_is_window() {
         "Option<&[u8]> None is a null window data word"
     );
     assert!(
-        !matches!(
+        matches!(
             lowering.option_niche_null_cast(&option_mut),
-            Some((_, ValueType::Str))
+            Some((root, ValueType::Ref(Some(r))))
+                if r == root && (root == "[u8]" || root.starts_with("Slice<"))
         ),
-        "Option<&mut [u8]> None is not a string root"
+        "Option<&mut [u8]> None is convert_const(None) on ListRepr, got {:?}",
+        lowering.option_niche_null_cast(&option_mut)
     );
 }
 
@@ -10069,7 +10147,7 @@ fn result_map_of_a_constructor_builds_the_variant() {
         .filter(|op| {
             matches!(&op.kind, OpKind::FieldWrite { field, .. }
                     if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some("core::option::Option<i64>::Some"))
+                        && field.owner_root.as_deref() == Some("option::Option<i64>::Some"))
         })
         .count();
     assert_eq!(payload_owner_writes, 1);

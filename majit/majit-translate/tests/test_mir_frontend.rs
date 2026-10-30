@@ -22,9 +22,8 @@ fn load_corpus() -> &'static Llbc {
 }
 
 /// BFS the set of blocks reachable from the graph's startblock. The
-/// `bool_then` / `option_question_mark` rewrites can leave the pre-split
-/// framestate merge block unreachable, so the reachable-only assertions
-/// filter against this set.
+/// `bool_then` rewrite can leave the pre-split framestate merge block
+/// unreachable, so the reachable-only assertions filter against this set.
 fn reachable_blocks(
     graph: &majit_translate::model::FunctionGraph,
 ) -> std::collections::HashSet<majit_translate::model::BlockId> {
@@ -1048,100 +1047,113 @@ fn bool_then_lifts_to_short_circuit_diamond() {
     let _ = lowered_core_bodies;
 }
 
-/// `option_question_mark`'s `let v = opt?` lifts the residual
-/// `Try::branch(opt)` / `ControlFlow` diamond into a direct switch on
-/// `opt.__discriminant`: `Some` extracts `opt.__pos_0` and continues,
-/// `None` builds a normal `None` return value.
-///
-/// The owners are the per-instantiation `Option<i64>` root, not the bare
-/// template: the fixture's own `Some(v + addend)` writes `__pos_0` under the
-/// suffixed root, so a bare read would take the payload off a different
-/// classdef than the one the producer wrote.
+/// `option_question_mark`'s `let v = opt?` is a regular call of
+/// `core::option::<Impl>::branch`, a switch on the ControlFlow
+/// discriminant, and a regular `from_residual` on the Break arm.
+/// The caller-side rewrite that used to consume residual `branch`
+/// (Method count 0, one Option disc switch, a None ctor) is gone:
+/// those counts move into the extracted helper graphs.
 #[test]
 fn option_question_mark_lifts_to_direct_option_switch() {
-    use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
-    const OPTION_ROOT: &str = "core::option::Option<i64>";
-    const SOME_ROOT: &str = "core::option::Option<i64>::Some";
+    use majit_translate::model::{CallTarget, ExitSwitch, FieldDescriptor, OpKind};
     let llbc = load_corpus();
     let graph = lower_function(llbc, "option_question_mark").expect("lowering");
 
     let reachable = reachable_blocks(&graph);
-
-    let mut residual_branch = 0usize;
-    let mut direct_option_switch = 0usize;
-    let mut some_payload_reads = 0usize;
-    let mut none_ctor = 0usize;
+    let mut branch_calls = 0usize;
+    let mut from_residual_calls = 0usize;
+    let mut cf_disc_switches = 0usize;
     for b in &graph.blocks {
         if !reachable.contains(&b.id) {
             continue;
         }
-        let mut last_disc: Option<i64> = None;
-        let mut option_disc_read = None;
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::Method { name, .. },
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root,
+                            ..
+                        },
                     ..
-                } if name == "branch" => residual_branch += 1,
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some(OPTION_ROOT) =>
+                } if name == "branch"
+                    && receiver_root.as_deref().is_some_and(|root| {
+                        majit_ir::descr::strip_instantiation_suffix(
+                            majit_ir::descr::class_root_leaf(root),
+                        ) == "Option"
+                    }) =>
                 {
-                    option_disc_read = op.result.clone();
+                    branch_calls += 1;
                 }
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some(SOME_ROOT) =>
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("branch")
+                    && segments.iter().any(|s| s == "option") =>
                 {
-                    some_payload_reads += 1;
+                    branch_calls += 1;
                 }
-                OpKind::ConstInt(d) => last_disc = Some(*d),
-                OpKind::FieldWrite { field, .. }
-                    if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some(OPTION_ROOT)
-                        && last_disc == Some(0) =>
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root,
+                            ..
+                        },
+                    ..
+                } if name == "from_residual"
+                    && receiver_root.as_deref().is_some_and(|root| {
+                        majit_ir::descr::strip_instantiation_suffix(
+                            majit_ir::descr::class_root_leaf(root),
+                        ) == "Option"
+                    }) =>
                 {
-                    none_ctor += 1;
+                    from_residual_calls += 1;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("from_residual")
+                    && segments.iter().any(|s| s == "option") =>
+                {
+                    from_residual_calls += 1;
                 }
                 _ => {}
             }
         }
-        if let (Some(ExitSwitch::Value(sw)), Some(disc)) = (&b.exitswitch, option_disc_read)
-            && *sw == disc
-        {
-            let mut cases: Vec<i64> = b
-                .exits
-                .iter()
-                .filter_map(|l| match &l.exitcase {
-                    Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::Int(
-                        i,
-                    ))) => Some(*i),
-                    Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::UInt(
-                        i,
-                    ))) => Some(*i as i64),
-                    _ => None,
-                })
-                .collect();
-            cases.sort_unstable();
-            if cases == [0, 1] {
-                direct_option_switch += 1;
+        if let Some(ExitSwitch::Value(sw)) = &b.exitswitch {
+            let on_cf = b.operations.iter().any(|op| {
+                op.result.as_ref() == Some(sw)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead {
+                            field: FieldDescriptor { name, owner_root, .. },
+                            ..
+                        } if name == "__discriminant"
+                            && owner_root
+                                .as_deref()
+                                .is_some_and(|o| o.contains("ControlFlow"))
+                    )
+            });
+            if on_cf {
+                cf_disc_switches += 1;
             }
         }
     }
 
     assert_eq!(
-        residual_branch, 0,
-        "the residual `Try::branch` call must be replaced",
+        branch_calls, 1,
+        "caller keeps one regular call of the extracted Option branch body; was 0 while the rewrite consumed residual Method branch"
     );
     assert_eq!(
-        direct_option_switch, 1,
-        "the rewrite must leave one direct Option discriminant switch",
+        cf_disc_switches, 1,
+        "caller switches on the ControlFlow discriminant; the rewrite used to leave one Option disc switch instead"
     );
-    assert!(
-        some_payload_reads >= 1,
-        "the Some arm extracts the Option payload",
+    assert_eq!(
+        from_residual_calls, 1,
+        "Break arm is a regular from_residual call; the rewrite inlined a None ctor instead"
     );
-    assert_eq!(none_ctor, 1, "the None arm builds the normal None return");
 }
 
 /// A field read through a raw object pointer retains the pointee's declared
@@ -2174,11 +2186,17 @@ fn a_borrowed_primitive_banks_by_its_container() {
 
     assert_eq!(
         payloads("slice_get_tag_dispatch"),
-        vec![(
-            "core::option::Option<u8>::Some".to_string(),
-            ValueType::Unsigned
-        )],
-        "the `?` payload of an `Option<&u8>` is the byte, not a pointer to it",
+        vec![
+            (
+                "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue".to_string(),
+                ValueType::Unsigned
+            ),
+            (
+                "ops::control_flow::ControlFlow<Option<Never>,u8>::Break".to_string(),
+                ValueType::Ref(Some("option::Option<Never>".to_string()))
+            ),
+        ],
+        "Option<&u8> `?` is ControlFlow: Continue payload is the byte (Unsigned), Break is Option<Never>; was Option<u8>::Some while the rewrite inlined the diamond",
     );
     assert_eq!(
         payloads("range_start_index"),

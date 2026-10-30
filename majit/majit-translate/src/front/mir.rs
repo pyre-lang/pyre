@@ -4991,6 +4991,22 @@ pub(crate) fn class_identity_spelling(
     }
 }
 
+/// Instantiated enum class identity: [`class_identity_spelling`] plus a
+/// `<…>` suffix. Harvested `struct_fields` (`derive_program_metadata`
+/// `canon_base`) and recast dest (`resolve_aggregate_adt` variant owner)
+/// share this spelling (`bookkeeper.py` `getuniqueclassdef(cls)`).
+pub(crate) fn enum_ctor_class_identity(
+    name_path: &str,
+    suffix: Option<&str>,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let identity = class_identity_spelling(name_path, tombstoned);
+    match suffix {
+        Some(s) if !s.is_empty() => majit_ir::descr::with_instantiation_suffix(&identity, s),
+        _ => identity,
+    }
+}
+
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
     DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
@@ -6038,7 +6054,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
-            || !lo.option_try_sites.is_empty()
             || !lo.result_try_sites.is_empty()
             || !lo.disc_combinator_sites.is_empty()
             || !lo.slice_index_rangefrom_sites.is_empty()
@@ -6318,38 +6333,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.layout_accessor_sites,
             );
         }
-        // The `Option` `?` rewrite (`front::option_try`) consumes the same
-        // `Try::branch` / `ControlFlow` diamond as `result_exc`, but its break
-        // arm returns a freshly-built `None` to this graph's returnblock.  It
-        // only rewrites inside Option-returning functions; every other shape
-        // declines and leaves the residual `branch` Skip intact.
-        let option_try_stats = if lo.option_try_sites.is_empty() {
-            crate::front::option_try::OptionTryStats::default()
-        } else {
-            // The `?`-None return owner is spelled per-instantiation to match
-            // source constructors reaching the returnblock, including integer
-            // payloads; niche-pointer values have no aggregate owner.
-            let return_owner = lo.resolve_option_return_owner(&fd.signature.output);
-            let return_niche = lo.tyref_is_niche_option_ptr(&fd.signature.output);
-            let return_scalar_niche =
-                !return_niche && tyref_option_nonzero_scalar(&fd.signature.output, lo.llbc);
-            let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
-            let return_niche_null_cast = lo.option_niche_null_cast(&fd.signature.output);
-            let return_int_null = lo.option_niche_int_null(&fd.signature.output);
-            crate::front::option_try::rewire_option_try_call_sites(
-                &mut lo.graph,
-                &lo.option_try_sites,
-                return_owner.as_deref(),
-                return_niche,
-                return_scalar_niche,
-                return_narrow_root.as_deref(),
-                return_niche_null_cast.as_ref(),
-                return_int_null.as_ref(),
-            )
-        };
-        // Non-carrier `Result` `?` is the same ControlFlow diamond as
-        // `option_try`, with Ok/Err polarity and an `Err` return instead of
-        // `None`.  Exception-carrier Results are already rewritten above.
+        // Non-carrier `Result` `?` is the ControlFlow diamond with Ok/Err
+        // polarity and an `Err` return.  Option `?` is a regular call of
+        // the extracted `core::option::<Impl>::branch` body.  Exception-carrier
+        // Results are already rewritten above.
         let result_try_stats = if lo.result_try_sites.is_empty() {
             ResultTryStats::default()
         } else {
@@ -6537,7 +6524,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_call_rewritten > 0
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
-            || option_try_stats.rewritten > 0
             || result_try_stats.rewritten > 0
             || !lo.result_try_sites.is_empty()
             || bool_then_rewritten > 0

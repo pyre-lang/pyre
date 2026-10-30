@@ -33,7 +33,7 @@
 //!     `disc = eq(ovf, 0)`, value = `diff`.
 //!   - branch on `disc`; Some carries `value`, None carries no payload.
 //!
-//! Unlike [`crate::front::checked_arith`] / [`crate::front::option_try`] this
+//! Unlike [`crate::front::checked_arith`] this
 //! does not match a particular consumer diamond: it produces valid variant
 //! instances that downstream `?` / match / let-else consume unchanged.
 //! Ordinary annotation joins them to the enum base; no payload is stored on

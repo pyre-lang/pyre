@@ -385,6 +385,18 @@ impl<'a> Lowering<'a> {
         if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
             return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
         }
+        // `&mut [u8]` / `*mut [u8]` is a nullable list (`tyref_is_u8_list`,
+        // `tyref_niche_option_payload_paint`). Charon stringifies both
+        // `&[u8]` and `&mut [u8]` as `[u8]`; the Mut Ref node is the
+        // gate (`type_node_is_mut_ref`). `None` is `convert_const(None)`
+        // on that `ListRepr` (`rlist.py`). Shared `&[u8]` already
+        // returned as a window above.
+        if tyref_is_u8_list(&TyRef::Other(payload.clone()), self.llbc)
+            || (type_node_is_mut_ref(payload, self.llbc)
+                && (rendered.starts_with('[') || rendered.starts_with("Slice<")))
+        {
+            return Some((rendered.clone(), ValueType::Ref(Some(rendered))));
+        }
         // Shared `&[PyObjectRef]` is one GcArray word; `None` is
         // `convert_const(None)` on that `ListRepr` (`rlist.py`
         // `FixedSizeListRepr`). A mut slice of the same items is the
@@ -460,7 +472,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Resolve the `(option_owner, some_owner, payload_ty)` an `Option`
-    /// *consumer* pass (`option_try` `?`, `expect`) must spell so its
+    /// *consumer* pass (`expect`, checked unsigned arithmetic) must spell so its
     /// `__discriminant` / `__pos_0` reads key the SAME classdef the value's
     /// *producer* wrote.
     ///
@@ -490,27 +502,6 @@ impl<'a> Lowering<'a> {
             return Some((option_owner, some_owner, payload_ty));
         }
         self.resolve_bool_then_option_dest(recv_ty)
-    }
-
-    /// Resolve the enclosing function's return `Option` owner for the
-    /// `?`-None construction ([`crate::front::option_try`]).  It must MATCH the
-    /// spelling of the suffixed producers whose `Some` values reach the same
-    /// returnblock — otherwise a suffixed `Some` and a bare `None` union to the
-    /// bare template, payload-erasing the return.  Reuses
-    /// [`Self::resolve_option_consumer_owners`], so a ref/str/float-payload
-    /// return uses the source constructor identity; only the niche-pointer
-    /// representation has no aggregate owner. `None` when the output is not a
-    /// resolvable `Option` — the `?` rewrite then declines all sites.
-    pub(in crate::front::mir) fn resolve_option_return_owner(
-        &self,
-        output_ty: &TyRef,
-    ) -> Option<String> {
-        if !crate::front::result_exc::tyref_is_option(output_ty, self.llbc) {
-            return None;
-        }
-        let (option_owner, _some_owner, _payload_ty) =
-            self.resolve_option_consumer_owners(output_ty)?;
-        Some(option_owner)
     }
 
     /// Resolve a recognized `bool::then(cond, closure_env)` call into a
@@ -854,17 +845,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `Try::branch(opt)` call where `opt: Option<T>`
-    /// into an [`crate::front::option_try::OptionTrySite`].  `None` leaves the
-    /// residual call untouched when the receiver is not a resolvable `Option`.
     /// Resolve an unsigned `usize::checked_{add,mul}` call whose result is an
     /// `Option<usize>` into a
     /// [`crate::front::checked_arith_uint::CheckedArithUintSite`] — the
     /// `Option` enum root + `Some` variant owners and the payload type, keyed
     /// off the destination `Option<usize>` type.  Mirrors
-    /// [`Self::recognize_option_try_site`]'s owner derivation so the
-    /// virtualized `Option` this pass builds shares field descrs with the
-    /// downstream `?` reads (`front::option_try`).
+    /// [`Self::resolve_option_consumer_owners`] so the virtualized `Option`
+    /// this pass builds shares field descrs with downstream `?` / match reads.
     pub(in crate::front::mir) fn recognize_checked_arith_uint_site(
         &self,
         dest_ty: &TyRef,
@@ -1228,67 +1215,6 @@ impl<'a> Lowering<'a> {
             *option_owner = owner;
             *some_owner = some;
         }
-    }
-
-    pub(in crate::front::mir) fn recognize_option_try_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        result_var: &Variable,
-        opt_var: Option<&Variable>,
-    ) -> Option<crate::front::option_try::OptionTrySite> {
-        let recv_ty = recv_ty?;
-        let recv_ty_owned = self
-            .peel_to_option_or_result(recv_ty)
-            .unwrap_or_else(|| clone_tyref(recv_ty));
-        if !crate::front::result_exc::tyref_is_option(&recv_ty_owned, self.llbc) {
-            return None;
-        }
-        // The branched `__discriminant` / `__pos_0` reads key the SAME classdef
-        // the branched Option's producer wrote — per-instantiation for a
-        // ref/str/float payload, bare for the `Int`/`Unsigned` carve-out.  A
-        // cross-payload `?` (branch `Option<usize>`, return `Option<Layout>`)
-        // is fine: the branched owners here are independent of the enclosing
-        // function's return owner (`front::option_try` reads the Some arm from
-        // these owners and builds the None arm from the return owner).
-        let (mut option_owner, mut some_owner, payload_ty) =
-            self.resolve_option_consumer_owners(&recv_ty_owned)?;
-        let mut niche = self.tyref_is_niche_option_ptr(&recv_ty_owned);
-        // The dest place is often a bare `Option` type_id. The payload
-        // type (FunDecl output, or a `usize` operand of `checked_add`)
-        // still names the instantiation the `Some` constructor and the
-        // `?` getattr must share (`bookkeeper.py` `getuniqueclassdef`).
-        let payload_hint =
-            crate::front::result_exc::tyref_option_payload(&recv_ty_owned, self.llbc);
-        self.instantiate_option_owners_from_payload(
-            &recv_ty_owned,
-            payload_hint.as_ref(),
-            &mut option_owner,
-            &mut some_owner,
-        );
-        // A producer whose dest place lost its generics still recasts the
-        // value onto the FunDecl output's instantiation (or onto the
-        // payload class of a pointer-niche Option). Route the `?` onto
-        // that same ClassDef so getattr `__pos_0` does not hit the
-        // template `Some` whose payload is the typevar. `lower_call`
-        // closes the producer block, so chase a forwarded inputarg.
-        self.recover_option_instantiation(
-            &recv_ty_owned,
-            opt_var,
-            &mut option_owner,
-            &mut some_owner,
-            &mut niche,
-        );
-        let scalar_niche = !niche && tyref_option_nonzero_scalar(&recv_ty_owned, self.llbc);
-        Some(crate::front::option_try::OptionTrySite {
-            branch_result_var: result_var.clone(),
-            option_owner,
-            some_owner,
-            payload_ty,
-            niche,
-            int_null: self.option_niche_int_null(&recv_ty_owned),
-            scalar_niche,
-            niche_null_cast: self.option_niche_null_cast(&recv_ty_owned),
-        })
     }
 
     /// Resolve `Try::branch(res)` where `res: Result<T, E>` and `E` is not the

@@ -5383,25 +5383,25 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     }
 }
 
-/// Instantiation class of a split-eligible core enum used as a `Ref`
+/// Instantiation class of a split-eligible tagged enum used as a `Ref`
 /// parameter (`bookkeeper.py` `getuniqueclassdef(cls)`).
 ///
-/// [`adt_node_class_root_identity`] paints split-eligible `Option` and
-/// `Result` as values so a call result recasts to that class. Binary
-/// `ControlFlow` stays classdef-less as a *value*: painting it recasts
-/// `Try::branch` onto the exception link (`simplify.py` "raising
-/// operation result cannot flow into exception link"). A parameter has
-/// no such recast — the Input `class_root` is the annotator seed
-/// (`derive_subject_inputcells` → `getuniqueclassdef_for_struct_root`)
-/// — and a constructor of the same instantiation already interned that
-/// classdef with `__discriminant` (`rclass.py` `getclsfield`). Without
-/// this seed the formal is `SomeInstance { classdef: None }` and
-/// `getattr __discriminant` walls.
+/// [`adt_node_class_root_identity`] paints split-eligible unary/binary
+/// payload enums as values so a call result recasts to that class.
+/// Binary `Try::branch` ControlFlow stays classdef-less as a *value*:
+/// painting it recasts the call onto the exception link (`simplify.py`
+/// "raising operation result cannot flow into exception link"). A
+/// parameter has no such recast — the Input `class_root` is the
+/// annotator seed (`derive_subject_inputcells` →
+/// `getuniqueclassdef_for_struct_root`) — and a constructor of the same
+/// instantiation already interned that classdef with `__discriminant`
+/// (`rclass.py` `getclsfield`). Without this seed the formal is
+/// `SomeInstance { classdef: None }` and `getattr __discriminant` walls.
 ///
-/// A pointer-niche Option ([`tyref_is_niche_option`]) is the null word
-/// on both the value and the parameter path. Extra Instantiated args
-/// beside Option's payload are not the niche test. Vec/Box stay on
-/// their annotator models (`adt_head_instantiation_suffix` is enum-only).
+/// A pointer-niche enum ([`tyref_is_niche_option`] /
+/// [`tyref_enum_layout_is_pointer_niche`]) is the null word on both the
+/// value and the parameter path. Vec/Box stay on their annotator models
+/// (`adt_head_instantiation_suffix` is enum-only).
 pub(in crate::front::mir) fn tyref_split_core_enum_param_root(
     ty: &TyRef,
     llbc: &Llbc,
@@ -5411,32 +5411,46 @@ pub(in crate::front::mir) fn tyref_split_core_enum_param_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let def_id = adt_node_def_id(node)?;
     let name = llbc.type_by_id(def_id)?.item_meta.name_path();
-    if !matches!(
-        name.split("::").next().unwrap_or(&name),
-        "core" | "std" | "alloc"
-    ) {
+    let as_ty = TyRef::Other(node.clone());
+    // A modeled pointer-niche enum is the null word, not an enum class.
+    // A tagged enum whose payload is a named transparent handle still
+    // intern's (`getattr __discriminant`). Bare pointer/ref payloads
+    // `tyref_is_niche_option` leaves as aggregates (scalar `*mut u8`)
+    // stay classdef-less; Result of a pointer keeps its tag. `ty` here
+    // is already wrapper-stripped (`strip_ty_wrappers` above).
+    if tyref_is_niche_option(&as_ty, llbc) || tyref_enum_layout_is_pointer_niche(&as_ty, llbc) {
         return None;
     }
     let types = type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.get("types"))
-        .and_then(|t| t.as_array())?;
-    // A modeled pointer-niche Option is the null word, not an enum class.
-    // A tagged Option whose payload is a named transparent handle still
-    // intern's (`getattr __discriminant`). Bare pointer/ref *payloads*
-    // the niche recognizer leaves as aggregates stay classdef-less.
-    // Extra Instantiated args are not the payload (`tyref_is_niche_option`
-    // reads `types[0]`). `ty` here is already wrapper-stripped
-    // (`strip_ty_wrappers` above).
-    if tyref_is_niche_option(&TyRef::Other(node.clone()), llbc)
-        || (name.ends_with("::option::Option") && option_bare_pointer_payload(types, llbc))
+        .and_then(|t| t.as_array());
+    if crate::front::result_exc::tyref_is_option(&as_ty, llbc)
+        && types.is_some_and(|t| option_bare_pointer_payload(t, llbc))
     {
         return None;
     }
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
-    let identity = class_identity_spelling(&name, tombstoned);
-    Some(majit_ir::descr::with_instantiation_suffix(
-        &identity, &suffix,
-    ))
+    if !matches!(
+        llbc.type_by_id(def_id).map(|td| &td.kind),
+        Some(TypeDeclKind::Enum(_))
+    ) {
+        return None;
+    }
+    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
+        return Some(enum_ctor_class_identity(&name, Some(&suffix), tombstoned));
+    }
+    // Tagged enum param whose instantiation does not split: a FunDecl
+    // template (`TypeVar` args) or a deferred atom (`()` in
+    // `type_arg_splits_per_instantiation`). Seed the harvested enum
+    // base so getattr `__discriminant` finds the template
+    // (`bookkeeper.py` `getuniqueclassdef`). Value paint stays
+    // classdef-less: recasting a call result onto the template unions
+    // `__pos_0` across instantiations (`adt_node_class_root_identity`).
+    // A payload enum with no type arguments (`Buffer`) is not a
+    // template: `adt_node_class_root_identity` already names it.
+    if types.is_some_and(|t| !t.is_empty()) {
+        return Some(class_identity_spelling(&name, tombstoned));
+    }
+    None
 }
 
 /// `OpKind::Input.class_root` for a `Ref`-typed parameter.
@@ -7163,8 +7177,19 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
     // nullable list (`rlist.py`). `None` is `convert_const(None)` on that
     // `ListRepr` (`option_niche_null_cast`). A `Vec` of one-word items
     // is not this niche (`tyref_is_niche_option` keeps the tag).
+    // `&mut [T]` / `*mut [u8]` is that same list (`tyref_is_u8_list`);
+    // shared `&[u8]` is a window (`tyref_is_u8_window`) and stays out.
     let rendered = tyref_to_ast_string(&payload, llbc);
-    if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
+    if tyref_is_u8_list(&payload, llbc)
+        || rendered.starts_with("Vec<")
+        || rendered.starts_with("VecDeque<")
+    {
+        return Some(ValueType::Ref(Some(rendered)));
+    }
+    if let Some(node) = tyref_node(&payload, llbc)
+        && type_node_is_mut_ref(node, llbc)
+        && (rendered.starts_with('[') || rendered.starts_with("Slice<"))
+    {
         return Some(ValueType::Ref(Some(rendered)));
     }
     // Pointer-niche `Option<&RawStruct>` is the nullable `Ptr(Struct)`

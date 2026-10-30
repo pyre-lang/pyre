@@ -502,10 +502,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `Layout::size` / `Layout::align` field accessors on a virtualized Layout.
     pub(in crate::front::mir) layout_accessor_sites:
         Vec<crate::front::from_size_align::LayoutAccessorSite>,
-    /// `Try::branch(opt)` call sites where `opt: Option<T>`, recorded for
-    /// the `Option` `?` rewiring pass (`front::option_try`) that runs after
-    /// body lowering completes.
-    pub(in crate::front::mir) option_try_sites: Vec<crate::front::option_try::OptionTrySite>,
     /// `bool::then(cond, closure)` call sites recorded for the
     /// short-circuit `Option` diamond the `front::bool_then` post-pass
     /// synthesizes after the body lowering completes.
@@ -577,8 +573,8 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// would have had if the source had been written that way.
     pub(in crate::front::mir) disc_combinator_sites: Vec<DiscCombinatorSite>,
     /// `Try::branch(res)` sites whose receiver is a non-carrier `Result`.
-    /// The Option sibling is [`Lowering::option_try_sites`]; exception-carrier
-    /// Results stay on [`Lowering::result_exc_call_results`].
+    /// Option `?` is a regular call of the extracted `core::option::<Impl>::branch`
+    /// body. Exception-carrier Results stay on [`Lowering::result_exc_call_results`].
     pub(in crate::front::mir) result_try_sites: Vec<ResultTrySite>,
     /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
@@ -1563,7 +1559,6 @@ impl<'a> Lowering<'a> {
             from_size_align_expect_sites: Vec::new(),
             from_size_align_call_sites: Vec::new(),
             layout_accessor_sites: Vec::new(),
-            option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),

@@ -12644,6 +12644,39 @@ pub(in crate::front::mir) fn adt_node(def_id: u64) -> serde_json::Value {
     })
 }
 
+pub(in crate::front::mir) fn control_flow_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["ops", 0]},
+                {"Ident": ["control_flow", 0]},
+                {"Ident": ["ControlFlow", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Continue",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Break",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [1, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
 pub(in crate::front::mir) fn option_enum(def_id: u64) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -13739,6 +13772,132 @@ fn interned_option_char_base_projects_discriminant() {
     assert_eq!(attr_kind, "Integer");
 }
 
+/// Recast dest (`resolve_aggregate_adt` variant owner) and field intern
+/// (`class_identity_spelling` plus suffix) yield one intern key
+/// (`bookkeeper.py` `getuniqueclassdef(cls)`).
+#[test]
+fn recast_dest_and_field_intern_share_control_flow_continue_key() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::front::StructFieldRegistry;
+    use std::rc::Rc;
+
+    let name_path = "core::ops::control_flow::ControlFlow";
+    let suffix = "<Option<Never>,u8>";
+    let tomb = super::no_tombstoned_leaves();
+    let recast_owner = super::enum_ctor_class_identity(name_path, Some(suffix), &tomb);
+    let recast = format!("{recast_owner}::Continue");
+    let field = format!(
+        "{}{suffix}::Continue",
+        super::class_identity_spelling(name_path, &tomb)
+    );
+    assert_eq!(recast, field);
+    assert_eq!(
+        recast,
+        "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue"
+    );
+
+    // Prologue intern of the harvested key parents Continue/Break to the
+    // instantiation (`classdesc.py` `ClassDef.commonbase`). Recast dest
+    // spells that same key, so intern_enum_variant_host reuses it.
+    let bk = Rc::new(Bookkeeper::new());
+    let mut reg = StructFieldRegistry::default();
+    let template = "ops::control_flow::ControlFlow";
+    let inst = "ops::control_flow::ControlFlow<Option<Never>,u8>";
+    reg.fields.insert(
+        template.to_string(),
+        vec![("__discriminant".to_string(), "i64".to_string())],
+    );
+    reg.fields.insert(
+        inst.to_string(),
+        vec![("__discriminant".to_string(), "i64".to_string())],
+    );
+    for variant in ["Continue", "Break"] {
+        reg.fields.insert(
+            format!("{inst}::{variant}"),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+    }
+    bk.set_struct_fields(Rc::new(reg));
+    let first = bk.intern_class_by_qualname(&recast);
+    let from_host = bk.intern_enum_variant_host(inst, "Continue");
+    assert_eq!(
+        first, from_host,
+        "producer key must intern as intern_enum_variant_host"
+    );
+    let continue_cd = bk
+        .getuniqueclassdef_for_enum_variant(inst, "Continue")
+        .expect("Continue classdef");
+    let break_cd = bk
+        .getuniqueclassdef_for_enum_variant(inst, "Break")
+        .expect("Break classdef");
+    let common = ClassDef::commonbase(&continue_cd, &break_cd);
+    assert!(
+        common.is_some(),
+        "Continue and Break must share the instantiation parent"
+    );
+    assert!(
+        common
+            .as_ref()
+            .is_some_and(|cd| cd.borrow().name.contains(inst)),
+        "commonbase must be the instantiation, got {:?}",
+        common.map(|cd| cd.borrow().name.clone())
+    );
+}
+
+/// `Try::branch` of `Option<fn(…) -> *mut GCREFOpaque>` builds
+/// Continue/Break of that ControlFlow instantiation. The prologue
+/// intern_class_by_qualname of the variant key must parent both to
+/// the instantiation (`classdesc.py` `ClassDef.commonbase`).
+#[test]
+fn intern_class_by_qualname_parents_fn_payload_control_flow_variants() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::front::StructFieldRegistry;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    let bk = Rc::new(Bookkeeper::new());
+    let mut reg = StructFieldRegistry::default();
+    let template = "ops::control_flow::ControlFlow";
+    let inst = "ops::control_flow::ControlFlow<Option<Never>,fn(u32,usize) -> *mut GCREFOpaque>";
+    for key in [template, inst] {
+        reg.fields.insert(
+            key.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+    }
+    for variant in ["Continue", "Break"] {
+        for root in [template, inst] {
+            reg.fields.insert(
+                format!("{root}::{variant}"),
+                vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+            );
+        }
+    }
+    bk.set_struct_fields(Rc::new(reg));
+    let mut by_discr = HashMap::new();
+    by_discr.insert(0i64, "Continue".to_string());
+    by_discr.insert(1i64, "Break".to_string());
+    let mut map = HashMap::new();
+    map.insert(template.to_string(), by_discr.clone());
+    map.insert(inst.to_string(), by_discr);
+    bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+    let continue_host = bk.intern_class_by_qualname(&format!("{inst}::Continue"));
+    let break_host = bk.intern_class_by_qualname(&format!("{inst}::Break"));
+    let continue_cd = bk
+        .getuniqueclassdef(&continue_host)
+        .expect("Continue classdef");
+    let break_cd = bk.getuniqueclassdef(&break_host).expect("Break classdef");
+    let common = ClassDef::commonbase(&continue_cd, &break_cd);
+    assert!(
+        common.is_some(),
+        "fn-payload Continue/Break must share a ControlFlow parent, continue={} break={}",
+        continue_cd.borrow().name,
+        break_cd.borrow().name
+    );
+}
+
 /// Tagged `Option<char>` Discriminant recasts the classdef-less receiver
 /// onto the interned BASE class before getattr `__discriminant`
 /// (`rclass.py` `InstanceRepr.getclsfield`).
@@ -14282,173 +14441,159 @@ fn map_or_reference_payload_class_is_narrowed() {
     );
 }
 
-/// Anchor the `?`-operator fold to the real lowered IR of
+fn is_option_core_leaf_call(op: &crate::model::SpaceOperation, leaf: &str) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    match &op.kind {
+        OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    ..
+                },
+            ..
+        } if name == leaf => receiver_root.as_deref().is_some_and(|root| {
+            let leaf =
+                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root));
+            leaf == "Option"
+        }),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            segments.last().map(String::as_str) == Some(leaf)
+                && segments.iter().any(|s| s == "option")
+        }
+        _ => false,
+    }
+}
+
+fn option_core_leaf_call_count(graph: &FunctionGraph, leaf: &str) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| is_option_core_leaf_call(op, leaf))
+        .count()
+}
+
+fn control_flow_disc_switch_count(graph: &FunctionGraph) -> usize {
+    use crate::model::{ExitSwitch, FieldDescriptor, OpKind};
+    graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            let Some(ExitSwitch::Value(sw)) = &block.exitswitch else {
+                return false;
+            };
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(sw)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead {
+                            field: FieldDescriptor { name, owner_root, .. },
+                            ..
+                        } if name == "__discriminant"
+                            && owner_root
+                                .as_deref()
+                                .is_some_and(|o| o.contains("ControlFlow"))
+                    )
+            })
+        })
+        .count()
+}
+
+fn control_flow_pos0_owners(graph: &FunctionGraph) -> (Vec<String>, Vec<String>) {
+    let mut continues = Vec::new();
+    let mut breaks = Vec::new();
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldRead { field, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "__pos_0" {
+            continue;
+        }
+        let owner = field.owner_root.clone().unwrap_or_default();
+        if !owner.contains("ControlFlow") {
+            continue;
+        }
+        if owner.contains("Continue") {
+            continues.push(owner);
+        } else if owner.contains("Break") {
+            breaks.push(owner);
+        }
+    }
+    (continues, breaks)
+}
+
 /// `baseobjspace::lookup` (`let w_type = type(obj)?; lookup_in_type(..)`).
-/// The break arm (`None => return None`) narrows the `from_residual`
-/// result through a `__cast_instance_intrinsic` recast; before the break-arm
-/// purity gate peeled that recast, `option_try` declined and the residual
-/// `Try::branch` Method-call stayed, walling ~50 heads reaching `lookup`.
-/// After: zero residual `branch` Method-call.  Ignored by default (loads
-/// the ~440MB real LLBC); run with `cargo test -p majit-translate --lib
+/// Option `?` is a regular call of `core::option::<Impl>::branch`, a switch
+/// on the `ControlFlow` discriminant, and a regular call of `from_residual`
+/// on the Break arm. The caller-side rewrite that used to consume residual
+/// `branch` (forcing Method `"branch"` count 0, synthesizing a niche `ne`
+/// null-test and a PyObject-narrowed null return) is gone: those counts
+/// move into the extracted helper graphs. Ignored by default (loads the
+/// real LLBC); run with `cargo test -p majit-translate --lib
 /// option_try_recast_break_arm_real -- --ignored`.
 #[test]
 #[ignore]
 fn option_try_recast_break_arm_real_lookup() {
-    use crate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
-    let branch_calls = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
-                    if name == "branch" && args.len() == 1
-            )
-        })
-        .count();
     assert_eq!(
-        branch_calls, 0,
-        "lookup: residual Try::branch Method-call after the recast-break-arm fold"
+        option_core_leaf_call_count(&graph, "branch"),
+        1,
+        "lookup keeps one regular call of the extracted Option branch body; was 0 while the rewrite consumed residual Method branch"
     );
-    // `lookup`'s `r#type(obj)?` is a niche `Option<NonNull>` `?`, rewritten
-    // by `option_try` into a `ne` pointer null-test switch.  Because the
-    // switch value is a `SomeBool` (`ne`), the some/none exits MUST carry
-    // `ExitCase::Bool`, not `ExitCase::Const(Int)` — else rtype rejects the
-    // bool exitswitch against Int cases ("not a bool: Int(1)").
-    let mut niche_try_switches = 0usize;
-    for b in &graph.blocks {
-        let Some(ExitSwitch::Value(sw)) = &b.exitswitch else {
-            continue;
-        };
-        let switches_on_ne = b.operations.iter().any(|op| {
-            op.result.as_ref() == Some(sw)
-                && matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")
-        });
-        if !switches_on_ne {
-            continue;
-        }
-        for l in &b.exits {
-            assert!(
-                matches!(&l.exitcase, Some(ExitCase::Bool(_))),
-                "lookup: niche `?` null-test switch exit must be ExitCase::Bool, got {:?}",
-                l.exitcase
-            );
-        }
-        niche_try_switches += 1;
-    }
-    assert!(
-        niche_try_switches >= 1,
-        "lookup: expected a niche `?` `ne` null-test switch block"
+    assert_eq!(
+        control_flow_disc_switch_count(&graph),
+        1,
+        "lookup switches on the ControlFlow discriminant of branch's result; the rewrite used to replace this with a niche `ne` null-test"
     );
-
-    // The `?` break arm returns the enclosing `Option<PyObjectRef>`'s
-    // `None`.  That type is a nullable PyObject pointer, not a constructed
-    // Rust `Option::None` instance.  Pin both halves of the representation:
-    // no Option None ctor survives, and a null pointer narrowed to
-    // PyObject is forwarded to the return block.
-    assert!(
-        !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor {
-                        name,
-                        owner_path,
-                        ..
-                    },
-                    ..
-                } if name == "None" && owner_path.iter().any(|part| part == "Option")
-            )
-        }),
-        "lookup: niche `?` break arm must not construct Option::None"
-    );
-    let null_results: Vec<_> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments
-                == &[
-                    "core".to_string(),
-                    "ptr".to_string(),
-                    "null_mut".to_string(),
-                ] =>
-            {
-                op.result.clone()
-            }
-            _ => None,
-        })
-        .collect();
-    let narrowed_nulls: Vec<_> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| {
-            let OpKind::Call { args, .. } = &op.kind else {
-                return None;
-            };
-            if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
-                && args
-                    .first()
-                    .and_then(crate::model::LinkArg::as_variable)
-                    .is_some_and(|v| null_results.contains(v))
-            {
-                op.result.clone()
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert!(
-        graph
-            .blocks
-            .iter()
-            .any(|block| block.exits.iter().any(|link| {
-                link.target == graph.returnblock
-                    && link
-                        .args
-                        .iter()
-                        .any(|arg| matches!(arg, LinkArg::Value(v) if narrowed_nulls.contains(v)))
-            })),
-        "lookup: niche `?` break arm must return a PyObject-narrowed null"
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "from_residual"),
+        1,
+        "lookup's Break arm is a regular call of Option from_residual; the rewrite inlined None construction instead"
     );
 }
 
 /// `builtins::kwarg_get` opens with `let dict = kwargs?;` on its
-/// `Option<PyObjectRef>` parameter, so the `Try::branch` sits in the
-/// startblock after the parameters' `Input` ops and no block forwards the
-/// Option into it.  `option_try` splits the startblock before the branch
-/// and rewrites the `?` like any other site: no residual `branch` call.
+/// `Option<PyObjectRef>` parameter, so `Try::branch` sits in the
+/// startblock after the parameters' `Input` ops. The rewrite used to
+/// split the startblock and consume residual `branch` (count 0). The
+/// caller now keeps one regular branch call in the startblock and a
+/// ControlFlow discriminant switch; `from_residual` is the Break arm.
 /// Ignored by default (loads the real LLBC).
 #[test]
 #[ignore]
 fn option_try_on_a_parameter_real_kwarg_get() {
-    use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "kwarg_get").expect("lower kwarg_get");
-    let branch_calls = graph
-        .blocks
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        1,
+        "kwarg_get keeps one regular call of the extracted Option branch body; was 0 while the rewrite consumed residual Method branch"
+    );
+    let start_branch = graph.blocks[graph.startblock.0]
+        .operations
         .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
-                    if name == "branch" && args.len() == 1
-            )
-        })
+        .filter(|op| is_option_core_leaf_call(op, "branch"))
         .count();
     assert_eq!(
-        branch_calls, 0,
-        "kwarg_get: residual Try::branch Method-call on the parameter `?`"
+        start_branch, 1,
+        "kwargs? is in the startblock; the rewrite no longer splits before branch"
+    );
+    assert_eq!(
+        control_flow_disc_switch_count(&graph),
+        1,
+        "kwarg_get switches on the ControlFlow discriminant of branch's result"
+    );
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "from_residual"),
+        1,
+        "kwarg_get's Break arm is a regular call of Option from_residual"
     );
 }
 
@@ -16236,12 +16381,11 @@ fn niche_option_non_niche_payloads_remain_aggregate() {
     }
 }
 
-/// `Option<String>` match is RPython's nullable `SomeString`:
-/// `s is None` (`pairtype(SomeObject, SomeObject).is_`, rtyped by
-/// `rtype_is_` / `ptr_iszero`), and the `Some` payload is the string
-/// itself. The corpus `option_question_mark` `?` is a `Try::branch`
-/// match; injecting `alloc::string::String` as the Option payload
-/// pins that the front does not emit `getattr('__discriminant')`.
+/// `option_question_mark` with a String payload: Option `?` is a regular
+/// call of the extracted `branch` body plus a ControlFlow discriminant
+/// switch. The rewrite used to inline a niche null-test (`null_muts >= 1`,
+/// identity `is_`, zero Option `__discriminant` reads) at the caller;
+/// those counts now live in the helper graphs.
 #[test]
 fn niche_option_string_match_is_none_identity() {
     use crate::model::OpKind;
@@ -16252,28 +16396,22 @@ fn niche_option_string_match_is_none_identity() {
         false,
         true,
     );
-    let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-    assert!(
-        null_muts >= 1,
-        "Option<String> None must lower to a null string pointer, got {null_muts}"
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        1,
+        "caller keeps one regular Option branch call; was consumed by the rewrite"
     );
     assert_eq!(
-        transparent_ctors, 0,
-        "Option<String> Some must be the string identity, with no Option aggregate"
+        control_flow_disc_switch_count(&graph),
+        1,
+        "caller switches on ControlFlow; the rewrite used to emit a niche `is_` null-test instead"
     );
-    let discriminant_reads = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
-            })
-            .count();
     assert_eq!(
-        discriminant_reads, 0,
-        "Option<String> match must not read an aggregate __discriminant"
+        option_core_leaf_call_count(&graph, "from_residual"),
+        1,
+        "Break arm is from_residual; the rewrite inlined a null string pointer"
     );
-    let some_payload_reads = graph
+    let option_disc = graph
         .blocks
         .iter()
         .flat_map(|b| b.operations.iter())
@@ -16281,25 +16419,16 @@ fn niche_option_string_match_is_none_identity() {
             matches!(
                 &op.kind,
                 OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref().is_some_and(|owner| {
-                            owner.contains("Option") && owner.ends_with("::Some")
+                    if field.name == "__discriminant"
+                        && field.owner_root.as_deref().is_some_and(|o| {
+                            o.contains("Option") && !o.contains("ControlFlow")
                         })
             )
         })
         .count();
     assert_eq!(
-        some_payload_reads, 0,
-        "Option<String> Some payload must be the string itself"
-    );
-    let has_is = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"));
-    assert!(
-        has_is,
-        "Option<String> match must contain an identity null-test"
+        option_disc, 0,
+        "Option aggregate disc reads stay in the branch body, not at the caller"
     );
 }
 
@@ -21321,26 +21450,22 @@ fn str_idx_params_unrooted_pos0_owners_are_option_i64() {
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "str_idx_params_unrooted")
         .expect("lower str_idx_params_unrooted");
-    let pos0: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|o| o.contains("Option")) =>
-            {
-                Some(field.owner_root.clone().unwrap_or_default())
-            }
-            _ => None,
-        })
-        .collect();
+    let (continues, breaks) = control_flow_pos0_owners(&graph);
+    assert_eq!(
+        continues.len(),
+        2,
+        "two Option<i64> `?` Continue payloads; was Option<i64>::Some.__pos_0 while the rewrite inlined the diamond, got {continues:?}"
+    );
     assert!(
-        !pos0.is_empty() && pos0.iter().all(|o| o.contains("<i64>")),
-        "expected Option<i64>::Some payload reads, got {pos0:?}"
+        continues.iter().all(|o| o.contains("i64")),
+        "Continue payload stays i64, got {continues:?}"
+    );
+    assert_eq!(breaks.len(), 2, "two Break residuals, got {breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
+        "Break residual is Option<Never>, got {breaks:?}"
     );
 }
 
@@ -21380,9 +21505,8 @@ fn iobase_peek_dict_does_not_getattr_template_option_some() {
 #[test]
 fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
     // `w_list_getitem_inner` does `ll_getitem_index(...)?` on
-    // `Option<usize>`. The payload read must key `Option<usize>::Some`,
-    // the same ClassDef the callee's `Some` constructor interned
-    // (`bookkeeper.py` `getuniqueclassdef(cls)`).
+    // `Option<usize>`. The caller now reads ControlFlow Continue/Break
+    // `__pos_0` (the rewrite used to inline Option<usize>::Some).
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
@@ -21390,26 +21514,22 @@ fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph =
         super::lower_function(&llbc, "w_list_getitem_inner").expect("lower w_list_getitem_inner");
-    let pos0: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|o| o.contains("Option")) =>
-            {
-                Some(field.owner_root.clone().unwrap_or_default())
-            }
-            _ => None,
-        })
-        .collect();
+    let (continues, breaks) = control_flow_pos0_owners(&graph);
+    assert_eq!(
+        continues.len(),
+        7,
+        "seven Option<usize> `?` Continue payloads; was Option<usize>::Some.__pos_0 while the rewrite inlined the diamond, got {continues:?}"
+    );
     assert!(
-        !pos0.is_empty() && pos0.iter().all(|o| o.contains("<usize>")),
-        "expected Option<usize>::Some payload reads, got {pos0:?}"
+        continues.iter().all(|o| o.contains("usize")),
+        "Continue payload stays usize, got {continues:?}"
+    );
+    assert_eq!(breaks.len(), 7, "seven Break residuals, got {breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
+        "Break residual is Option<Never>, got {breaks:?}"
     );
 }
 
@@ -21422,26 +21542,22 @@ fn std_gc_array_size_does_not_getattr_template_option_some() {
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "pyre_object::object_array::std_gc_array_size")
         .expect("lower std_gc_array_size");
-    let pos0: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|o| o.contains("Option")) =>
-            {
-                Some(field.owner_root.clone().unwrap_or_default())
-            }
-            _ => None,
-        })
-        .collect();
+    let (continues, breaks) = control_flow_pos0_owners(&graph);
+    assert_eq!(
+        continues.len(),
+        2,
+        "two usize::checked_add `?` Continue payloads; was Option<usize>::Some.__pos_0, got {continues:?}"
+    );
     assert!(
-        !pos0.is_empty() && pos0.iter().all(|o| o.contains("<usize>")),
-        "expected Option<usize>::Some payload reads, got {pos0:?}"
+        continues.iter().all(|o| o.contains("usize")),
+        "Continue payload stays usize, got {continues:?}"
+    );
+    assert_eq!(breaks.len(), 2, "two Break residuals, got {breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
+        "Break residual is Option<Never>, got {breaks:?}"
     );
     let some_owners: Vec<String> = graph
         .blocks
@@ -23273,8 +23389,9 @@ fn hash_long_has_no_residual_constant_accessors() {
 }
 
 /// `Option<usize>` has no null niche. `cap.checked_mul(..)?` in
-/// `try_typed_items_block_layout` is `Try::branch` on that enum, which
-/// must become a discriminant switch rather than `getattr("branch")`.
+/// `try_typed_items_block_layout` is a regular call of the extracted
+/// `branch` body plus a ControlFlow discriminant switch. Method `"branch"`
+/// count was 0 while the rewrite consumed the residual; it is now 2.
 #[test]
 fn try_typed_items_block_layout_branches_on_usize_discriminant() {
     let path = concat!(
@@ -23284,35 +23401,20 @@ fn try_typed_items_block_layout_branches_on_usize_discriminant() {
     let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
     let graph = super::lower_function(&llbc, "try_typed_items_block_layout")
         .expect("lower try_typed_items_block_layout");
-    let branch = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "branch"
-            )
-        })
-        .count();
-    assert_eq!(branch, 0, "Option<usize> ? left a residual branch call");
-    let discs = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
-            )
-        })
-        .count();
-    assert!(
-        discs >= 1,
-        "non-niche Option<usize> must switch on __discriminant"
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        2,
+        "two Option<usize> `?` keep regular branch calls; was 0 while the rewrite consumed residual Method branch"
+    );
+    assert_eq!(
+        control_flow_disc_switch_count(&graph),
+        2,
+        "each `?` switches on the ControlFlow discriminant"
+    );
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "from_residual"),
+        2,
+        "each Break arm is a regular from_residual call"
     );
 }
 
@@ -25062,13 +25164,13 @@ fn option_filter_repr_switch() {
 pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
     super::AggregateShape::Ctor(super::AggregateCtor {
         target: CallTarget::synthetic_transparent_enum_variant_ctor(
-            vec!["core".into(), "option".into(), "Option<i64>".into()],
+            vec!["option::Option<i64>".into()],
             "Some".to_string(),
             1,
         ),
-        result_owner: "core::option::Option<i64>::Some".into(),
+        result_owner: "option::Option<i64>::Some".into(),
         owner_id: None,
-        owner_path: vec!["core".into(), "option".into(), "Option<i64>".into()],
+        owner_path: vec!["option::Option<i64>".into()],
         ctor_name: "Some".into(),
         fields: vec![super::AggregateField {
             name: "__pos_0".into(),
@@ -25106,14 +25208,14 @@ pub(in crate::front::mir) fn some_ctor_ops(graph: &FunctionGraph) -> (usize, usi
 
 /// `Result::<i64, i64>::Ok` as the constructor shape.
 pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
-    let owner_path: Vec<String> = vec!["core".into(), "result".into(), "Result<i64,i64>".into()];
+    let owner_path: Vec<String> = vec!["result::Result<i64,i64>".into()];
     super::AggregateShape::Ctor(super::AggregateCtor {
         target: CallTarget::synthetic_transparent_enum_variant_ctor(
             owner_path.clone(),
             "Ok".to_string(),
             0,
         ),
-        result_owner: "core::result::Result<i64,i64>::Ok".into(),
+        result_owner: "result::Result<i64,i64>::Ok".into(),
         owner_id: None,
         owner_path,
         ctor_name: "Ok".into(),

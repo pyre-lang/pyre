@@ -439,13 +439,35 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
         format!("{}::{tail}", head.join("::"))
     };
     let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
-    if base != "core::result::Result" {
+    // Recast dest (`resolve_aggregate_adt`) spells the harvested
+    // identity (`class_identity_spelling` of the TypeDecl `name_path`).
+    // `push_shell_ctor` still emits that `name_path`.
+    if base != "core::result::Result" && base != "result::Result" {
         return None;
     }
     match name.as_str() {
         "Ok" => Some(false),
         "Err" => Some(true),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod result_ctor_kind_tests {
+    use super::*;
+
+    #[test]
+    fn identity_spelling_matches_name_path_owner() {
+        let ident = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["result::Result<i64,PyError>".into()],
+            "Ok",
+        );
+        assert_eq!(result_ctor_kind(&ident), Some(false));
+        let ident_err = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["result::Result<(),PyError>".into()],
+            "Err",
+        );
+        assert_eq!(result_ctor_kind(&ident_err), Some(true));
     }
 }
 
@@ -1789,6 +1811,10 @@ fn split_owner_variant(owner: &str) -> Option<(&str, &str)> {
     let mut last = None;
     let mut i = 0usize;
     while i + 1 < bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'>' {
+            i += 2;
+            continue;
+        }
         depth += bracket_depth_delta(bytes[i]);
         if depth == 0 && bytes[i] == b':' && bytes[i + 1] == b':' {
             last = Some(i);
@@ -1836,6 +1862,9 @@ fn matching_closer(ty: &str, open_at: usize, open: u8, close: u8) -> Option<usiz
         if byte == open {
             depth += 1;
         } else if byte == close {
+            if close == b'>' && offset > 0 && bytes[open_at + offset - 1] == b'-' {
+                continue;
+            }
             depth -= 1;
             if depth == 0 {
                 return Some(open_at + offset);
@@ -1851,6 +1880,9 @@ fn split_top_level_args(args: &str) -> Vec<&str> {
     let mut depth = 0i32;
     let mut start = 0usize;
     for (i, byte) in bytes.iter().copied().enumerate() {
+        if byte == b'>' && i > 0 && bytes[i - 1] == b'-' {
+            continue;
+        }
         depth += bracket_depth_delta(byte);
         if byte == b',' && depth == 0 {
             parts.push(args[start..i].trim());
@@ -2993,6 +3025,24 @@ fn is_uninhabited_ok(ty: &str) -> bool {
     matches!(ty, "Infallible" | "!" | "Never" | "??scalar")
 }
 
+/// Declared type with no inhabitants: an uninhabited atom, or a unary
+/// generic of one (`Try::Residual` of a tagged Option is that Option of
+/// the uninhabited ok). `_names_without_voids` (`lltype.py`) drops that
+/// field; a constructor setattr of it is skipped. FieldWrite also skips
+/// via `tyref_is_void_zst` on the declared TyRef.
+pub(crate) fn type_spelling_is_uninhabited(ty: &str) -> bool {
+    let t = ty.trim();
+    if is_uninhabited_ok(t) {
+        return true;
+    }
+    let (_head, args) = split_head_args(t);
+    if args.is_empty() {
+        return false;
+    }
+    let inner = split_top_level(args);
+    inner.len() == 1 && is_uninhabited_ok(&inner[0])
+}
+
 /// Leaf equality after a path prefix, with identical generic arguments.
 pub(crate) fn same_type_spelling(a: &str, b: &str) -> bool {
     if a == b {
@@ -3015,9 +3065,11 @@ fn split_top_level(args: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, ch) in args.char_indices() {
         match ch {
             '<' | '(' => depth += 1,
+            '>' if prev == '-' => {}
             '>' | ')' => depth -= 1,
             ',' if depth == 0 => {
                 out.push(args[start..i].trim().to_string());
@@ -3025,6 +3077,7 @@ fn split_top_level(args: &str) -> Vec<String> {
             }
             _ => {}
         }
+        prev = ch;
     }
     if start < args.len() {
         out.push(args[start..].trim().to_string());
@@ -3263,7 +3316,7 @@ fn residual_payload(
 /// From site: that impl is `Err(From::from(e))`, the raise path
 /// `exceptiontransform.py` `create_exception_handling` uses for
 /// `OperationError`. `FromResidual<Option<Infallible>>` (Option `?`)
-/// returns `None` and is left for [`crate::front::option_try`].
+/// is the extracted `core::option::<Impl>::from_residual` body (`None`).
 pub(crate) fn foreign_from_residual_sites(
     graph: &FunctionGraph,
     spec: crate::ErrorCarrierSpec<'_>,

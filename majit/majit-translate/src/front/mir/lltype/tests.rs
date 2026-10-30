@@ -6627,6 +6627,126 @@ fn option_of_raw_pointer_stays_classdef_less() {
     );
 }
 
+/// FunDecl template `Option<v0>` is a parameter of `Try::branch`. Value
+/// paint stays classdef-less (recasting a call result onto the template
+/// unions `__pos_0`); the Input `class_root` is the harvested enum base
+/// so getattr `__discriminant` finds the template (`bookkeeper.py`
+/// `getuniqueclassdef`).
+#[test]
+fn option_of_type_parameter_param_seeds_enum_template() {
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let tomb = super::no_tombstoned_leaves();
+    let tvar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let node = option_adt_node(0, tvar);
+    assert_eq!(
+        super::adt_node_class_root_identity(&node, &llbc, &tomb),
+        None,
+        "value paint of Option<v0> stays classdef-less"
+    );
+    let ty = TyRef::Other(node.clone());
+    assert_eq!(
+        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "Option<v0> param seeds the harvested Option template"
+    );
+    let borrowed = TyRef::Other(option_shared_ref(node));
+    assert_eq!(
+        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "&Option<v0> param seeds the harvested Option template"
+    );
+}
+
+/// `Option<()>::branch` is a spec copy whose readable leaf is `__`
+/// (`valid_identifier("()")`). `()` does not split, so the param still
+/// seeds the harvested Option template for getattr `__discriminant`.
+#[test]
+fn option_of_unit_param_seeds_enum_template() {
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let tomb = super::no_tombstoned_leaves();
+    let unit = serde_json::json!({"Tuple": []});
+    let node = option_adt_node(0, unit);
+    assert_eq!(
+        super::adt_node_class_root_identity(&node, &llbc, &tomb),
+        None,
+        "value paint of Option<()> stays classdef-less"
+    );
+    let ty = TyRef::Other(node.clone());
+    assert_eq!(
+        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "Option<()> param seeds the harvested Option template"
+    );
+    let borrowed = TyRef::Other(option_shared_ref(node));
+    assert_eq!(
+        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "&Option<()> param seeds the harvested Option template"
+    );
+}
+
+fn local_payload_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["RawEnum", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Empty",
+                "fields": [],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Word",
+                "fields": [{"name": null, "ty": {"Value": [0, {"Literal": "Int"}]}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+/// A payload enum with no type arguments is not a FunDecl template.
+/// `tyref_split_core_enum_param_root` must not seed it; Input class_root
+/// comes from `adt_node_class_root_identity`.
+#[test]
+fn unsuffixed_local_payload_enum_param_is_not_a_template_seed() {
+    let llbc = llbc_with_types("fixture", vec![local_payload_enum(0)], vec![]);
+    let tomb = super::no_tombstoned_leaves();
+    let node = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let ty = TyRef::Other(node.clone());
+    assert_eq!(
+        super::tyref_split_core_enum_param_root(&ty, &llbc, &tomb),
+        None,
+        "Buffer-shaped enum has no type args; do not seed the Option<()> path"
+    );
+    assert_eq!(
+        super::adt_node_class_root_identity(&node, &llbc, &tomb).as_deref(),
+        Some("RawEnum"),
+        "value/param paint still names the harvested identity"
+    );
+}
+
 /// A named word-sized tuple struct is a tagged Option payload, not a
 /// pointer niche. `getattr __discriminant` needs the interned class.
 #[test]

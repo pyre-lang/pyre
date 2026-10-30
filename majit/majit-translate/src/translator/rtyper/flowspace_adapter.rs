@@ -1230,6 +1230,27 @@ fn setattr_instance_field(
             .is_some_and(|reg| reg.is_enum_base(parent))
     });
     if let Some(owner) = variant_owner {
+        // First mint through [`Bookkeeper::getuniqueclassdef_for_enum_variant`]
+        // (`intern_enum_variant_host`), the same order
+        // [`enum_payload_getattr_ops`] uses: intern_class_by_qualname
+        // first-mint-wins would otherwise freeze Continue/Break without
+        // the enum parent (`classdesc.py` `ClassDef.commonbase`).
+        let parts = crate::model::split_qualified_path(owner);
+        if let Some((variant, root_parts)) = parts.split_last()
+            && !root_parts.is_empty()
+        {
+            let enum_root = root_parts.join("::");
+            call_registry
+                .bookkeeper()
+                .getuniqueclassdef_for_enum_variant(&enum_root, variant)
+                .map_err(|err| {
+                    TyperError::message(format!(
+                        "enum payload {owner}.{}: {}",
+                        field.name,
+                        err.msg.unwrap_or_default()
+                    ))
+                })?;
+        }
         let callable_host = HOST_ENV
             .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
             .ok_or_else(|| {
@@ -4205,10 +4226,10 @@ pub fn translate_op(
                         // case above (`owner_path` empty) is unchanged: a
                         // bare variant name like `Ok` is ambiguous across
                         // enums, so it is not interned.
-                        // Probe the QUALIFIED enum-base spelling
-                        // (`owner_path.join("::")` = the enum's full
-                        // `name_path`) before the bare tail.  The qualified
-                        // key survives `harden_duplicate_leaf_metadata`'s
+                        // Probe the enum-base spelling (`owner_path.join("::")`
+                        // = [`enum_ctor_class_identity`], the harvested
+                        // crate-stripped identity) before the bare tail.  The
+                        // qualified key survives `harden_duplicate_leaf_metadata`'s
                         // bare-leaf withdrawal, so a variant ctor of an enum
                         // whose leaf collides across modules
                         // (`StepResult::Continue` vs `JitAction::Continue`)
@@ -5659,6 +5680,14 @@ fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, roo
     if reg.fields.contains_key(root) {
         return true;
     }
+    // A generic enum instantiation whose arguments are type parameters
+    // (`option::Option<v0>`) is the template declaration
+    // (`bookkeeper.py` `getuniqueclassdef`). Concrete suffixed Option
+    // stays out: seeding every Option instantiation as SomeInstance
+    // union-fails closure `call_once`.
+    if enum_type_parameter_instantiation(reg, root) {
+        return true;
+    }
     if reg.field_rows(root).is_none() {
         return false;
     }
@@ -5667,6 +5696,43 @@ fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, roo
     }
     let stripped = majit_ir::descr::strip_instantiation_suffix(root);
     stripped.ends_with("::rordereddict_entries::Entry") || stripped == "Entry"
+}
+
+/// True when `root` is `Enum<template><type-param, …>` of a harvested
+/// discriminant-only enum. Charon FunDecl parameters are `v0`/`v1`;
+/// field rows spell `??TypeVar` / `??TypeVar#N`.
+fn enum_type_parameter_instantiation(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
+    if !instantiation_args_are_type_parameters(root) {
+        return false;
+    }
+    let stripped = majit_ir::descr::strip_generic_args(root);
+    reg.is_enum_base(stripped.as_ref())
+        || reg.is_enum_base(&majit_ir::descr::canonical_struct_name(stripped.as_ref()))
+        || reg.enum_base_registry_key(stripped.as_ref()).is_some()
+}
+
+fn instantiation_args_are_type_parameters(root: &str) -> bool {
+    let Some(span) = majit_ir::descr::generic_args_span(root) else {
+        return false;
+    };
+    let inner = span.trim_start_matches('<').trim_end_matches('>');
+    if inner.is_empty() {
+        return false;
+    }
+    crate::front::mir::split_top_level_type_args(inner)
+        .into_iter()
+        .all(type_arg_is_parameter)
+}
+
+fn type_arg_is_parameter(arg: &str) -> bool {
+    let t = arg.trim();
+    if t == "??TypeVar" || t == "??scalar" || t.starts_with("??TypeVar#") {
+        return true;
+    }
+    let Some(rest) = t.strip_prefix('v') else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `remove_dead_blocks` (`translator/simplify.py`) — the set of blocks
@@ -14720,5 +14786,32 @@ mod tests {
             Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed),
             "legacy Variable cell must stay Int/Signed"
         );
+    }
+
+    #[test]
+    fn type_parameter_enum_instantiation_is_known_for_discriminant() {
+        // Generic `Option<v0>::branch` seeds the Option template so
+        // getattr `__discriminant` is a class field (`rclass.py`
+        // `ClassRepr.getclsfield`). Concrete `Option<PyObject>` stays
+        // unknown here: that seed union-fails closure `call_once`.
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        assert!(reg.is_enum_base("option::Option"));
+        assert!(split_struct_template_rows_known(&reg, "option::Option<v0>"));
+        assert!(split_struct_template_rows_known(
+            &reg,
+            "core::option::Option<v0>"
+        ));
+        assert!(!split_struct_template_rows_known(
+            &reg,
+            "option::Option<PyObject>"
+        ));
+        assert!(!split_struct_template_rows_known(
+            &reg,
+            "option::Option<fn() -> ()>"
+        ));
     }
 }

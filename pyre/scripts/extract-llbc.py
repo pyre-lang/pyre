@@ -137,6 +137,17 @@ CHARON_CORE_INCLUDE = [
     "core::option::_::or_else",
     "--include",
     "core::option::_::is_some_and",
+    # Option `?` is `<Option<T> as Try>::branch` plus Break-arm
+    # `<Option<U> as FromResidual<Option<Infallible>>>::from_residual`.
+    # FunDecl names: `core::option::<Impl>::{branch,from_residual}`.
+    # Do not include `core::result::_::{branch,from_residual}` (carrier
+    # `result_exc` + `result_try_sites`) and do not include
+    # `core::ops::try_trait::_::branch` (that pattern drags Result).
+    # `core::ops::control_flow::ControlFlow` TypeDecl is already Enum.
+    "--include",
+    "core::option::_::branch",
+    "--include",
+    "core::option::_::from_residual",
     # Deref of a refcounted handle is a field read of `data` past the
     # counts; the body must be visible. Pattern shape matches
     # `core::option::_::map_or`. Chain from extracted bodies:

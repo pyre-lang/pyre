@@ -1495,6 +1495,18 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
+        // Thin `Box<T>` is one pointer word to `T` (`type_node_is_thin_box`).
+        // FieldWrite of `Buffer::Sub.parent` must intern the Buffer
+        // pointee (`bookkeeper.py` `getuniqueclassdef`), not a
+        // classdef-less Box wrapper.
+        if type_node_is_thin_box(node, self.llbc) {
+            let pointee = type_node_box_pointee(node, self.llbc)?;
+            return adt_node_class_root_with(
+                strip_ty_wrappers(pointee, self.llbc)?,
+                self.llbc,
+                self.tombstoned_leaves,
+            );
+        }
         if let Some(reference) = node.as_object()?.get("Ref") {
             let pointee = reference.as_array()?.get(1)?;
             return adt_node_class_root_with(
@@ -3477,7 +3489,7 @@ impl<'a> Lowering<'a> {
                 // (`cast_instance_call` of `owner_root`). ControlFlow of a
                 // `?` diamond and a Result match are not that interned
                 // Option class: recasting them inserts a `cast_instance`
-                // the `option_try` / Result-match rewriter does not
+                // the Result-match rewriter does not
                 // attribute to the forwarded scrutinee.
                 if let Some(root) = owner_root.as_ref()
                     && root.contains('<')
@@ -7415,7 +7427,8 @@ impl<'a> Lowering<'a> {
                 .1 == majit_ir::value::Type::Void
                     || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc))
                     || ((result_owner == "Tuple" || result_owner == "Array")
-                        && name.starts_with("__pos_"));
+                        && name.starts_with("__pos_"))
+                    || crate::front::result_exc::type_spelling_is_uninhabited(&field_ty);
                 AggregateField {
                     name,
                     void,
@@ -7510,10 +7523,12 @@ impl<'a> Lowering<'a> {
         let name_path = td.item_meta.name_path();
         let head_adt = head.as_object();
         let type_leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);
-        // Crate prefix in front of the identity, so joining `owner_path` with
-        // the identity (plus suffix) still yields the full declaration path.
-        // A crate-root tombstone keeps the crate in the identity, so the
-        // prefix is empty.
+        // Struct intern keys a dotted `owner_path.join(".")` path
+        // (`flowspace_adapter` struct-ctor arm). Keep the crate segment
+        // so that join still yields the declaration path. A crate-root
+        // tombstone keeps the crate in the identity, so the prefix is
+        // empty. Enum variant intern does not use this prefix: it spells
+        // [`enum_ctor_class_identity`] alone (harvested `canon_base`).
         let owner_path = if name_path == type_leaf {
             Vec::new()
         } else if let Some(prefix) = name_path
@@ -7598,7 +7613,6 @@ impl<'a> Lowering<'a> {
             }
             (TypeDeclKind::Enum(variants), Some(idx)) => {
                 let v = variants.get(idx as usize)?;
-                let mut variant_owner = owner_path;
                 // A reference-payload workspace enum instantiation
                 // constructs into its per-instantiation variant class
                 // (`Result<Tuple>::Ok`), the same spelling the receiver
@@ -7614,14 +7628,18 @@ impl<'a> Lowering<'a> {
                 // that TypeDeclRef when the head has no type arguments,
                 // rather than intern the bare template (`Option::Some`)
                 // and union every payload onto one `__pos_0`.
+                //
+                // Owner identity is [`enum_ctor_class_identity`] — the
+                // harvested `canon_base` / `variant_canon` spelling
+                // (`class_identity_spelling` plus suffix). Do not re-prefix
+                // the crate: that would intern a second class for one
+                // TypeDecl (`bookkeeper.py` `getuniqueclassdef(cls)`).
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
                 let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
-                let leaf = match suffix {
-                    Some(suffix) => majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix),
-                    None => type_leaf,
-                };
-                variant_owner.push(leaf);
+                let leaf =
+                    enum_ctor_class_identity(&name_path, suffix.as_deref(), self.tombstoned_leaves);
+                let variant_owner = vec![leaf];
                 // Same dest/head substitution as the Struct arm: a field
                 // whose declaration is a type variable (`Option<T>::Some`
                 // `__pos_0: T`) has to see `()` / `i64` / … so

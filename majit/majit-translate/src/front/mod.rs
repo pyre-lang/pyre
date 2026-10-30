@@ -87,7 +87,6 @@ pub mod llbc_hints;
 pub mod mir;
 pub(crate) mod option_ctor;
 pub(crate) mod option_expect;
-pub(crate) mod option_try;
 pub(crate) mod option_unwrap;
 pub(crate) mod option_variant;
 pub(crate) mod range_iter;

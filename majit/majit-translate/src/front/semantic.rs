@@ -279,9 +279,11 @@ fn split_comma_args(inner: &str) -> Vec<&str> {
     let mut depth: i32 = 0;
     let mut start: usize = 0;
     let bytes = inner.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
+    for (i, b) in bytes.iter().copied().enumerate() {
         match b {
             b'<' | b'(' | b'[' => depth += 1,
+            // `>` of `->` in a fn type argument is not a closer
+            // (`descr.rs` `is_generic_arg_close`).
             b'>' if i > 0 && bytes[i - 1] == b'-' => {}
             b'>' | b')' | b']' => depth -= 1,
             b',' if depth == 0 => {
@@ -1277,6 +1279,16 @@ mod tests {
             instantiation_type_args("option::Option<fn(*mut u8) -> Result<*mut u8,E>>::Some"),
             ["fn(*mut u8) -> Result<*mut u8,E>"]
         );
+        // `>` of `->` is not a generic closer (`descr.rs` `generic_args_span`).
+        assert_eq!(
+            instantiation_type_args(
+                "ops::control_flow::ControlFlow<Option<Never>,fn(u32,usize) -> *mut T>"
+            ),
+            ["Option<Never>", "fn(u32,usize) -> *mut T"]
+        );
+        assert!(!instantiation_has_scalar_layout_arg(
+            "ops::control_flow::ControlFlow<Option<Never>,fn(u32,usize) -> *mut T>"
+        ));
     }
 
     #[test]

@@ -8077,11 +8077,10 @@ impl<'a> Lowering<'a> {
         {
             self.from_size_align_expect_sites.push(site);
         }
-        // Capture `Try::branch(opt)` sites where the receiver is an
-        // `Option<T>`, the compiler-generated core call behind `opt?`.  The
-        // rewrite validates the surrounding `ControlFlow` diamond and the
-        // enclosing function's Option return before mutating; a miss leaves the
-        // residual `branch` call for the existing Skip fallback.
+        // Capture `Try::branch(res)` sites where the receiver is a
+        // non-carrier `Result`.  Option `?` is a regular call of the
+        // extracted `core::option::<Impl>::branch` body; Result `?` stays
+        // on `result_try_sites` / `result_exc`.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -8090,15 +8089,7 @@ impl<'a> Lowering<'a> {
             && args.len() == 1
             && name == "branch"
         {
-            if let Some(site) = self.recognize_option_try_site(
-                first_arg_ty.as_ref(),
-                &result_var,
-                args[0].as_variable(),
-            ) {
-                self.option_try_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var)
-            {
+            if let Some(site) = self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var) {
                 self.result_try_sites.push(site);
             }
         }
