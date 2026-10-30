@@ -1851,19 +1851,17 @@ impl<'a> Lowering<'a> {
     /// Whether `var` is that header, or a block input copied from one.
     pub(in crate::front::mir) fn var_is_object_vec_header(&self, var: &Variable) -> bool {
         let mut id = var.id();
-        let mut seen = std::collections::HashSet::new();
-        loop {
+        // A chain longer than this, or a cycle, has no header within reach.
+        for _ in 0..65 {
             if self.object_vec_headers.contains(&id) {
                 return true;
-            }
-            if !seen.insert(id) || seen.len() > 64 {
-                return false;
             }
             match self.input_copied_from.get(&id).copied() {
                 Some(next) => id = next,
                 None => return false,
             }
         }
+        false
     }
 
     /// Whether MIR `local` currently holds a [`Self::note_object_vec_header`]

@@ -122,7 +122,7 @@ impl FunDecl {
             self.promoted_inits
                 .as_ref()
                 .is_some_and(|table| table.iter().any(Option::is_some))
-                && body.get().contains("\"Global\"")
+                && memchr::memmem::find(body.get().as_bytes(), b"\"Global\"").is_some()
         });
         if splices && let Some(table) = &self.promoted_inits {
             splice_promoted_reads(&mut u, table);

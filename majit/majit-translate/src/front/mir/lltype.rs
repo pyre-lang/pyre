@@ -466,16 +466,10 @@ pub(in crate::front::mir) fn trait_impl_match_for_receiver(
         .and_then(|pred| pred.pointer("/generics/types"))
         .and_then(serde_json::Value::as_array);
     let mut found = None;
-    for (i, row) in llbc.trait_impls_raw().iter().enumerate() {
-        if row.is_null() {
-            continue;
-        }
+    for (i, row) in llbc.trait_impl_rows_of(trait_id) {
         let Some(impl_trait) = row.get("impl_trait") else {
             continue;
         };
-        if impl_trait.get("id").and_then(serde_json::Value::as_u64) != Some(trait_id) {
-            continue;
-        }
         let impl_id = i as u64;
         let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
             .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))

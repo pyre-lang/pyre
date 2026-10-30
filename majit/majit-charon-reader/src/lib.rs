@@ -842,12 +842,11 @@ impl Llbc {
         &self.file.translated.trait_impls
     }
 
-    /// The `trait_impls` rows whose `impl_trait.id` is `trait_decl_id`, in table order.
-    /// Same rows, in the same order, as filtering [`Llbc::trait_impls_raw`] on that id.
-    pub fn trait_impls_of(
+    /// [`Llbc::trait_impls_of`] with each row's index in [`Llbc::trait_impls_raw`], its impl id.
+    pub fn trait_impl_rows_of(
         &self,
         trait_decl_id: u64,
-    ) -> impl Iterator<Item = &serde_json::Value> + '_ {
+    ) -> impl Iterator<Item = (usize, &serde_json::Value)> + '_ {
         let index = self.trait_impl_rows_by_trait.get_or_init(|| {
             let mut index: Vec<(u64, usize)> = self
                 .file
@@ -867,7 +866,16 @@ impl Llbc {
         let end = index.partition_point(|&(id, _)| id <= trait_decl_id);
         index[start..end]
             .iter()
-            .map(|&(_, row_index)| &self.file.translated.trait_impls[row_index])
+            .map(|&(_, row_index)| (row_index, &self.file.translated.trait_impls[row_index]))
+    }
+
+    /// The `trait_impls` rows whose `impl_trait.id` is `trait_decl_id`, in table order.
+    /// Same rows, in the same order, as filtering [`Llbc::trait_impls_raw`] on that id.
+    pub fn trait_impls_of(
+        &self,
+        trait_decl_id: u64,
+    ) -> impl Iterator<Item = &serde_json::Value> + '_ {
+        self.trait_impl_rows_of(trait_decl_id).map(|(_, row)| row)
     }
 
     /// The translator's derived value for this artefact, computed by `init` on first use.
