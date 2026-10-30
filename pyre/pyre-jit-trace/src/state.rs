@@ -6492,6 +6492,38 @@ pub(crate) fn capture_frame_stack_from_mirror(
     })
 }
 
+/// Build the same carrier from the virtualizable's live operand stack at the
+/// latched jitcode pc.
+///
+/// The virtualizable's scalars are published as they are
+/// (`synchronize_virtualizable`): no liveness or owning-instruction filter.
+pub(crate) fn capture_frame_stack_from_vable(
+    live_frame: usize,
+    stack: &[PyObjectRef],
+    valuestackdepth: usize,
+    last_instr: isize,
+) -> Option<CapturedFrameStack> {
+    let stack_base = concrete_nlocals(live_frame)?;
+    if valuestackdepth != stack_base + stack.len() {
+        return None;
+    }
+    let live_arr = unsafe {
+        *((live_frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *const pyre_object::FixedObjectArray)
+    };
+    if live_arr.is_null() || unsafe { &*live_arr }.as_slice().len() < valuestackdepth {
+        return None;
+    }
+    Some(CapturedFrameStack {
+        stack_base,
+        scalars: FrameScalars {
+            last_instr,
+            valuestackdepth,
+        },
+        roots: stack.iter().map(|&value| value as i64).collect(),
+    })
+}
+
 /// Commit a captured post-step operand stack and its Python-frame coordinate
 /// to the live red frame.  This performs no allocation: once the caller has
 /// published locals and reached this point, the blackhole handoff is

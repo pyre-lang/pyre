@@ -3634,15 +3634,10 @@ fn try_adopt_single_frame_blackhole(
             );
         }
         let captured = if takes_mirror {
-            latched.mirror_stack.as_ref().and_then(|mirror| {
-                crate::state::capture_frame_stack_from_mirror(
-                    vable_frame,
-                    mirror.py_pc,
-                    &mirror.slots,
-                    mirror.valuestackdepth,
-                    mirror.last_instr,
-                )
-            })
+            latched
+                .mirror_stack
+                .as_ref()
+                .and_then(|mirror| mirror.capture_for(vable_frame))
         } else {
             crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
         };
@@ -4285,15 +4280,10 @@ fn try_adopt_multi_frame_blackhole(
         || commit_leg == WalkEndCommitLeg::VableEscape
         || commit_leg == WalkEndCommitLeg::TraceTooLong
     {
-        latched.mirror_stack.as_ref().and_then(|mirror| {
-            crate::state::capture_frame_stack_from_mirror(
-                frame_ptrs[0] as usize,
-                mirror.py_pc,
-                &mirror.slots,
-                mirror.valuestackdepth,
-                mirror.last_instr,
-            )
-        })
+        latched
+            .mirror_stack
+            .as_ref()
+            .and_then(|mirror| mirror.capture_for(frame_ptrs[0] as usize))
     } else {
         crate::state::capture_frame_stack_for_publish(cf_addr, frame_ptrs[0] as usize)
     };
