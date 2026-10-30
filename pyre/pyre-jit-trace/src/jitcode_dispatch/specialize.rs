@@ -20680,7 +20680,8 @@ fn walker_debugdata_box_is_known_null(ctx: &majit_metainterp::TraceCtx, op: OpRe
 /// `jit.promote(self.pycode).w_globals`: a quasi-immutable `PyCode.w_globals`
 /// read, the operand `globals_read_keeps_recorded_namespace` already accepts.
 /// The pycode is this frame's. A known non-null `debugdata` reads
-/// `debugdata.w_globals` (`pyframe.py get_w_globals`).
+/// `debugdata.w_globals` (`pyframe.py get_w_globals`). An unknown box runs
+/// `_establish_nullity` (`establish_nullity_of_box`) before either arm.
 fn inlined_callee_frame_w_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -20692,7 +20693,17 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
     let debug_idx = debug_descr.index();
     let cached_debug = ctx.trace_ctx.heapcache_getfield_cached(frame_op, debug_idx);
     if let Some(cached) = cached_debug {
-        if walker_debugdata_box_is_known_non_null(ctx.trace_ctx, cached) {
+        let present = if walker_debugdata_box_is_known_non_null(ctx.trace_ctx, cached) {
+            true
+        } else if walker_debugdata_box_is_known_null(ctx.trace_ctx, cached) {
+            false
+        } else {
+            match establish_nullity_of_box(ctx, op_pc, cached)? {
+                Some(value) => value,
+                None => return Ok(None),
+            }
+        };
+        if present {
             let globals_op = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 cached,
@@ -20700,9 +20711,6 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
             );
             write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, globals_op)?;
             return Ok(Some(()));
-        }
-        if !walker_debugdata_box_is_known_null(ctx.trace_ctx, cached) {
-            return Ok(None);
         }
     }
 
