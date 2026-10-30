@@ -1561,9 +1561,9 @@ pub(crate) fn fbw_generator_stack_store_at(
 /// The three are otherwise armed separately, each by the site that makes its
 /// own kind of write, because every frame those sites reach was built by the
 /// walk writing it: a decline discards the frame, so only the one field the
-/// caller reads back needs an undo.  A resumed generator's frame is the object
-/// the generator will next be resumed from, so a declined walk owes it back
-/// whole — locals, operand stack, depth and coordinate alike.
+/// caller reads back needs an undo. The portal's live frame and a resumed
+/// generator survive the walk, so a declined walk owes either one back whole
+/// — locals, operand stack, depth and coordinate alike.
 ///
 /// Arming at the store rather than at walk entry keeps the same snapshot: each
 /// note is first-write-per-frame wins, so whichever store gets there first
@@ -1572,9 +1572,9 @@ pub(crate) fn fbw_generator_stack_store_at(
 /// The locals note takes the whole `locals_cells_stack_w` array rather than the
 /// `nlocals` prefix its other caller passes.  That caller excludes the operand
 /// stack deliberately, so a rollback cannot revert a stack slot another
-/// walk-time write owns; here there is no other writer — the frame is suspended
-/// and this walk is the only thing running on it — and the operand stack is
-/// exactly where a resumed generator's yield state lives.
+/// walk-time write owns. Here the walk also mirrors operand-stack writes, so
+/// preserving only the locals would leave popped iterator slots cleared when
+/// the interpreter resumes its pre-walk coordinate.
 pub(crate) fn fbw_arm_durable_frame_undo(frame: usize) {
     if frame == 0 {
         return;

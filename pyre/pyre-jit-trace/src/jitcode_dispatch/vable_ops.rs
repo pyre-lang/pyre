@@ -709,21 +709,32 @@ fn publish_nonfold_slot<Sym: WalkSym>(
     }
 }
 
-/// `frame` when this walk is a generator resume writing its OWN suspended
-/// frame — the one case where a walk-time store lands on a frame the walk did
-/// not create.
+/// A frame that survives a declined walk. The portal's live frame and a
+/// resumed generator both retain their operand stacks after the walk returns.
+/// Inline frames allocated by the walk can instead be discarded on decline.
 ///
-/// Every other frame these stores reach was built by the walk that is writing
-/// it, so a decline discards the frame and only `last_instr` (which the caller
-/// reads back) needs an undo.  A resumed generator's frame is the object the
-/// generator will next be resumed from, so a declined walk has to hand it back
-/// byte for byte.
+/// PyPy converts the current MIFrame banks with `_copy_data_from_miframe`;
+/// until pyre adopts that continuation, its replay must restore the entire
+/// pre-walk frame, including stack slots cleared by `popvalue`.
 fn durable_resume_frame<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     frame: usize,
 ) -> Option<usize> {
-    let resume = ctx.fbw_mode.generator_resume?;
-    (frame != 0 && frame == resume.frame).then_some(frame)
+    if frame == 0 {
+        return None;
+    }
+    if ctx
+        .fbw_mode
+        .generator_resume
+        .is_some_and(|resume| resume.frame == frame)
+    {
+        return Some(frame);
+    }
+    let sym = ctx.fbw_mode.snapshot_sym;
+    if !sym.is_null() && unsafe { (*sym).live_vable_frame_addr() } == frame {
+        return Some(frame);
+    }
+    None
 }
 
 /// A push writes at the current `valuestackdepth`; a pop/clear decrements its
@@ -1788,11 +1799,17 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     {
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
-            fbw_note_generator_stack_store(GeneratorStackStore {
-                frame,
-                slot: index_value as usize,
-                value,
-            });
+            if ctx
+                .fbw_mode
+                .generator_resume
+                .is_some_and(|resume| resume.frame == frame)
+            {
+                fbw_note_generator_stack_store(GeneratorStackStore {
+                    frame,
+                    slot: index_value as usize,
+                    value,
+                });
+            }
         }
         if let Some(nlocals) = crate::state::concrete_nlocals(frame) {
             crate::jitcode_dispatch::fbw_note_locals_mirror_undo(frame, nlocals);
