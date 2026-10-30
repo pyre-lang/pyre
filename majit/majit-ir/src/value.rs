@@ -227,8 +227,10 @@ pub struct SharedConstPool {
     /// `incminimark.py:old_objects_pointing_to_young` for this off-GC
     /// equivalent of `ResumeGuardDescr.rd_consts`.  Upstream's list is a GC
     /// object, so assigning the freshly built pool takes the normal write
-    /// barrier.  Our immutable `Arc` needs the same one-minor remembered bit:
-    /// after that walk, every nursery referent has been promoted to oldgen.
+    /// barrier.  MiniMark re-queues an old object that still points at a
+    /// young one (`collect_pending_gc_tables_to_nursery` for the `GcTable`
+    /// analogue); this bit is that remembered-set membership, not a one-shot
+    /// that stays clear while a `Const::Ref` remains movable.
     minor_scan_pending: std::sync::atomic::AtomicBool,
 }
 
@@ -246,17 +248,66 @@ impl SharedConstPool {
 
     /// Consume the write-barrier state for a minor root walk.
     ///
-    /// `SharedConstPool` is immutable after publication except for GC
-    /// forwarding, so no later store can create another old-to-young edge.
+    /// Re-armed by [`Self::mark_minor_scan_pending`] when a slot still
+    /// points at a movable nursery object after the walk, and by
+    /// [`Self::push_during_optimization`] when a new young edge is stored.
     pub fn take_minor_scan_pending(&self) -> bool {
         self.minor_scan_pending
             .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mirror MiniMark's write barrier after a young store, and the
+    /// `collect_pending_gc_tables_to_nursery` re-queue when a walk left a
+    /// movable child in the nursery.
+    pub fn mark_minor_scan_pending(&self) {
+        self.minor_scan_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mark_visited_generation(&self, generation: u64) -> bool {
         self.visited_generation
             .swap(generation, std::sync::atomic::Ordering::Relaxed)
             != generation
+    }
+
+    /// Trace every `Const::Ref` slot.
+    ///
+    /// MiniMark traces `ResumeGuardDescr.rd_consts` as an ordinary GC list
+    /// (`compile.py ResumeGuardDescr._attrs_`) on every collection while the
+    /// descr is reachable. This pool is off-GC, so the walk itself is that
+    /// trace: a remembered-set skip would leave a nursery slot unscanned,
+    /// the referent would die, and a later walk would copy reused payload.
+    /// Generation still dedups a pool reached through several descrs in one
+    /// walk. The pending bit remains MiniMark's old-to-young membership and
+    /// is re-armed when `keep_pending` is true after the walk, matching
+    /// `collect_pending_gc_tables_to_nursery`.
+    pub fn visit_gc_refs(
+        &self,
+        generation: u64,
+        is_minor: bool,
+        visitor: &mut dyn FnMut(&mut GcRef),
+        keep_pending: impl Fn(GcRef) -> bool,
+    ) {
+        if !self.mark_visited_generation(generation) {
+            return;
+        }
+        if is_minor {
+            let _ = self.take_minor_scan_pending();
+        }
+        // SAFETY: the stop-the-world root walker is the only writer.
+        let consts = unsafe { self.as_mut_vec_for_gc() };
+        let mut still_young = false;
+        for c in consts.iter_mut() {
+            if let Const::Ref(gcref) = c {
+                visitor(gcref);
+                if is_minor && keep_pending(*gcref) {
+                    still_young = true;
+                }
+            }
+        }
+        if still_young {
+            self.mark_minor_scan_pending();
+        }
     }
 
     pub fn as_slice(&self) -> &[Const] {
@@ -1990,6 +2041,38 @@ mod tests {
         // therefore starts with its own remembered young-edge state.
         let replacement = SharedConstPool::new(Vec::new());
         assert!(replacement.take_minor_scan_pending());
+    }
+
+    #[test]
+    fn shared_const_pool_rearms_minor_pending_while_a_ref_can_move() {
+        let pool = SharedConstPool::new(vec![Const::from_gcref(GcRef(0x1234))]);
+        let mut walks = 0;
+        pool.visit_gc_refs(1, true, &mut |_| walks += 1, |_| true);
+        assert_eq!(walks, 1);
+        pool.visit_gc_refs(2, true, &mut |_| walks += 1, |_| true);
+        assert_eq!(
+            walks, 2,
+            "a still-young slot re-arms the remembered set for the next minor"
+        );
+        pool.visit_gc_refs(3, true, &mut |_| walks += 1, |_| false);
+        assert_eq!(walks, 3);
+        pool.visit_gc_refs(4, true, &mut |_| walks += 1, |_| false);
+        assert_eq!(
+            walks, 4,
+            "a reachable Const::Ref is traced every minor, even after it stops moving"
+        );
+    }
+
+    #[test]
+    fn shared_const_pool_generation_skip_preserves_rearm() {
+        let pool = SharedConstPool::new(vec![Const::from_gcref(GcRef(0x1234))]);
+        let mut walks = 0;
+        pool.visit_gc_refs(7, true, &mut |_| walks += 1, |_| true);
+        assert_eq!(walks, 1);
+        pool.visit_gc_refs(7, true, &mut |_| walks += 1, |_| true);
+        assert_eq!(walks, 1, "one walk per generation");
+        pool.visit_gc_refs(8, true, &mut |_| walks += 1, |_| true);
+        assert_eq!(walks, 2, "re-arm survived the same-generation second descr");
     }
 
     #[test]
