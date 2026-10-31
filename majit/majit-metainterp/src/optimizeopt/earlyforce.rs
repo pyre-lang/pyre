@@ -36,45 +36,20 @@ impl OptEarlyForce {
         OptEarlyForce
     }
 
-    /// earlyforce.py propagate_forward: should we force args for this op?
-    /// RPython exempt set: SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW,
-    /// QUASIIMMUT_FIELD, SAME_AS_I/R/F, and raw_free. Note that
-    /// SETFIELD_RAW is NOT exempt in RPython.
-    pub(crate) fn should_force_args(op: &Op) -> bool {
-        !matches!(
-            op.opcode,
-            OpCode::SetfieldGc
-                | OpCode::SetarrayitemGc
-                | OpCode::SetarrayitemRaw
-                | OpCode::QuasiimmutField
-                | OpCode::SameAsI
-                | OpCode::SameAsR
-                | OpCode::SameAsF
-        ) && !is_raw_free(op, op.opcode)
-    }
-}
-
-impl Default for OptEarlyForce {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Optimization for OptEarlyForce {
-    /// earlyforce.py: propagate_forward.
-    /// Force all virtual args of non-exempt operations, then emit.
-    fn propagate_forward(
+    /// earlyforce.py `propagate_forward`: `self.optimizer.force_box(arg, self)`.
+    /// The driver calls `propagate_with_optimizer` so `force_box_impl` reaches
+    /// the owning optimizer (`optforce.optimizer`) and `emit_extra` runs
+    /// immediately. This pass already popped `potential_extra_ops`, so it
+    /// calls `force_box_impl` rather than `Optimizer::force_box` (which would
+    /// pop again). Direct unit tests pass no optimizer and keep the queue.
+    fn propagate_inner(
         &mut self,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: &Op,
         _op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if Self::should_force_args(op) {
-            // earlyforce.py:28: self.optimizer.force_box(arg, self)
-            // In Rust, we can't call Optimizer.force_box (borrow conflict).
-            // Instead, force directly through PtrInfo.force_box_impl,
-            // which uses ctx.current_pass_idx (== earlyforce_idx) for
-            // emit_extra routing. This matches RPython's optforce=self.
             for i in 0..op.num_args() {
                 let arg_opnd = ctx.resolve_operand_operand_opt(&op.arg(i));
                 let arg = arg_opnd
@@ -115,12 +90,64 @@ impl Optimization for OptEarlyForce {
                         .resolve_operand_operand_opt(&op.arg(i))
                         .expect("arg_is_virtual implies a resolved box");
                     let mut info = ctx.take_ptr_info(&arg_op).unwrap();
-                    let _forced = info.force_box(&arg_op, ctx);
+                    let _forced = if let Some(opt) = optimizer.as_deref_mut() {
+                        crate::optimizeopt::info::force_box_impl(&mut info, &arg_op, ctx, opt)
+                    } else {
+                        info.force_box(&arg_op, ctx)
+                    };
                 }
             }
         }
         // earlyforce.py:29: return self.emit(op)
         OptimizationResult::PassOn
+    }
+
+    /// earlyforce.py propagate_forward: should we force args for this op?
+    /// RPython exempt set: SETFIELD_GC, SETARRAYITEM_GC, SETARRAYITEM_RAW,
+    /// QUASIIMMUT_FIELD, SAME_AS_I/R/F, and raw_free. Note that
+    /// SETFIELD_RAW is NOT exempt in RPython.
+    pub(crate) fn should_force_args(op: &Op) -> bool {
+        !matches!(
+            op.opcode,
+            OpCode::SetfieldGc
+                | OpCode::SetarrayitemGc
+                | OpCode::SetarrayitemRaw
+                | OpCode::QuasiimmutField
+                | OpCode::SameAsI
+                | OpCode::SameAsR
+                | OpCode::SameAsF
+        ) && !is_raw_free(op, op.opcode)
+    }
+}
+
+impl Default for OptEarlyForce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `earlyforce.py` `propagate_forward` with `self.optimizer`. `OptEarlyForce`
+/// is a ZST: the boxed pass stays unborrowed and reentry is another stack copy.
+pub(crate) fn propagate_with_optimizer(
+    optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+    op: &Op,
+    op_rc: &majit_ir::OpRc,
+    ctx: &mut OptContext,
+) -> OptimizationResult {
+    let mut pass = OptEarlyForce;
+    pass.propagate_inner(&mut Some(optimizer), op, op_rc, ctx)
+}
+
+impl Optimization for OptEarlyForce {
+    /// earlyforce.py: propagate_forward.
+    /// Force all virtual args of non-exempt operations, then emit.
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.propagate_inner(&mut None, op, op_rc, ctx)
     }
 
     fn name(&self) -> &'static str {

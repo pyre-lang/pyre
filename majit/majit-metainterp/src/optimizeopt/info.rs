@@ -506,12 +506,17 @@ pub trait PtrInfoExt {
         visitor: &mut V,
     ) -> Option<V::VInfo>;
 
-    /// info.py / 222-226: force_box() emits the allocation and
-    /// field writes via emit_extra(), recursively forcing child virtuals.
+    /// info.py `AbstractVirtualPtrInfo.force_box`: emit the allocation with
+    /// `optforce.emit_extra`, then `_force_elements` forces each field via
+    /// `optforce.optimizer.force_box` and emits the store with `emit_extra`.
     /// `op` is the (bound) operand of the virtual being forced — RPython
     /// `force_box(self, op, optforce)` passes the op directly
     /// (info.py), so the make_equal_to / set_forwarded receiver
     /// needs no lookup.
+    ///
+    /// Callers that own an `Optimizer` use `force_box_impl`. This signature
+    /// stays for `force_box_inline` and direct unit tests, which have no
+    /// optimizer and keep the queued `emit_extra` path.
     fn force_box(&mut self, op: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand;
 
     /// info.py: `_is_immutable_and_filled_with_constants`
@@ -1050,16 +1055,13 @@ impl PtrInfoExt for PtrInfo {
         }
     }
 
-    /// info.py / 222-226: force_box() emits the allocation and
-    /// field writes via emit_extra(), recursively forcing child virtuals.
+    /// info.py `force_box` / `_force_elements`: emit the allocation and the
+    /// field stores through `emit_extra`.
     ///
-    /// Generated ops are routed via emit_extra() (RPython
-    /// emit_extra parity) so downstream passes can observe them.
+    /// `force_box_inline` and direct unit tests have no `Optimizer` and keep
+    /// the queued path. Passes that can see the owning optimizer call
+    /// `force_box_impl` (`optforce.optimizer`).
     fn force_box(&mut self, op: &Operand, ctx: &mut crate::optimizeopt::OptContext) -> Operand {
-        // Pass-level callers (earlyforce, vstring, pure, `force_box_inline`)
-        // have no `Optimizer`. Final emission enters `force_box_impl` from
-        // `Optimizer::force_box` with the live optimizer so a parked field
-        // producer can be flushed immediately before its store.
         force_box_emit(self, op, ctx, None)
     }
 
@@ -1187,14 +1189,20 @@ fn force_box_emit(
         };
         if value_is_virtual {
             let vb_op = value_box.expect("recorder-populated");
+            // info.py `_force_elements`: `subbox = optforce.optimizer.force_box(fld)`.
+            // `Optimizer.force_box` defaults `optforce` to itself (`emit_extra`
+            // is `Optimizer.emit_extra`). Do not `take_ptr_info` first:
+            // `force_box` reads the virtual. `force_direct` selects that
+            // direct emit for the child and is restored afterwards.
+            if let Some(opt) = optimizer.as_deref_mut() {
+                let saved = ctx.force_direct;
+                ctx.force_direct = true;
+                let forced = opt.force_box(&vb_op, ctx);
+                ctx.force_direct = saved;
+                return ctx.resolve_operand_operand(&forced);
+            }
             let mut info = ctx.take_ptr_info(&vb_op).unwrap();
-            // Nested virtuals emit their allocation in `force_box_impl`
-            // (`info.py` `force_box` then `_force_elements`) before the
-            // parent store. Pass-level entry has no optimizer.
-            let forced = match optimizer.as_deref_mut() {
-                Some(opt) => force_box_impl(&mut info, &vb_op, ctx, opt),
-                None => force_box_emit(&mut info, &vb_op, ctx, None),
-            };
+            let forced = force_box_emit(&mut info, &vb_op, ctx, None);
             return ctx.resolve_operand_operand(&forced);
         }
         value_box.unwrap_or_else(|| orig.clone())
@@ -1204,7 +1212,9 @@ fn force_box_emit(
     /// store. A non-virtual `fld` whose allocation is still parked in
     /// `extra_pending` / `extra_operations_after` is flushed here, for that
     /// one box, immediately before the store. The container itself was
-    /// already emitted by `emit_forced` and is not flushed.
+    /// already emitted by `emit_forced` and is not flushed. Pass-level
+    /// `force_box` no longer parks its own allocation; the flush remains for
+    /// other `emit_extra` producers.
     fn flush_nonvirtual_field(
         value: &Operand,
         ctx: &mut crate::optimizeopt::OptContext,
@@ -1213,11 +1223,7 @@ fn force_box_emit(
         if ctx.is_virtual(value) {
             return;
         }
-        // Outside final emission the store itself is queued behind the
-        // producer, so the queue keeps the order.
-        if !ctx.in_final_emission {
-            return;
-        }
+        // No optimizer: tests and `force_box_inline` keep the queued order.
         let Some(opt) = optimizer.as_mut() else {
             return;
         };
@@ -1228,40 +1234,62 @@ fn force_box_emit(
         }
     }
 
-    // RPython info.py:148,226: optforce.emit_extra(op)
-    // `optforce` determines where emitted ops enter the pass chain:
-    //   optforce=Optimizer (in_final_emission) → emit directly
-    //   optforce=OptEarlyForce → route from earlyforce.next (= heap)
-    // When called from EarlyForce pass, current_pass_idx == earlyforce_idx
-    // so emit_extra automatically routes from earlyforce.next.
-    // When called from _emit_operation, in_final_emission=true → direct.
-    fn emit_op_rc(ctx: &mut crate::optimizeopt::OptContext, op: majit_ir::OpRc) -> majit_ir::OpRc {
-        if ctx.in_final_emission {
+    // info.py `optforce.emit_extra(op)`.
+    // `force_direct` or `in_final_emission`: `Optimizer.emit_extra` →
+    // `_emit_operation` (force each arg, then append).
+    // Otherwise, with an optimizer: `Optimization.emit_extra` walks from the
+    // next pass immediately (`emit_extra_immediate`), same `OpRc`.
+    // Without an optimizer the op stays on the `emit_extra` queue.
+    fn emit_op_rc(
+        ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: majit_ir::OpRc,
+    ) -> majit_ir::OpRc {
+        let direct = ctx.in_final_emission || ctx.force_direct;
+        if direct {
             // optimizer.py `Optimizer.emit_extra` → `emit` →
             // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
             for i in 0..op.num_args() {
-                let arg = ctx.force_box_inline(&op.arg(i));
+                let arg = if let Some(opt) = optimizer.as_deref_mut() {
+                    opt.force_box(&op.arg(i), ctx)
+                } else {
+                    ctx.force_box_inline(&op.arg(i))
+                };
                 op.setarg(i, arg);
             }
             ctx.emit_rc(op.clone());
+        } else if let Some(opt) = optimizer.as_deref_mut() {
+            if let Err(crate::optimize::InvalidLoop(reason)) =
+                opt.emit_extra_immediate(ctx.current_pass_idx, &op, ctx)
+            {
+                ctx.signal_invalid_loop(reason);
+            }
         } else {
             ctx.emit_extra_rc(ctx.current_pass_idx, op.clone());
         }
         op
     }
-    let emit_op = |ctx: &mut crate::optimizeopt::OptContext, op: Op| -> majit_ir::OpRc {
-        emit_op_rc(ctx, majit_ir::OpRc::new(op))
-    };
+    fn emit_op(
+        ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: Op,
+    ) -> majit_ir::OpRc {
+        emit_op_rc(ctx, optimizer, majit_ir::OpRc::new(op))
+    }
     // info.py `AbstractVirtualPtrInfo.force_box`: `op.set_forwarded(None);
     // optforce.emit_extra(op)` — the allocation is the virtual's own
     // operation, so `newop is op` and no forwarding is needed.
-    let emit_forced = |ctx: &mut crate::optimizeopt::OptContext, op: &Operand| -> majit_ir::OpRc {
+    fn emit_forced(
+        ctx: &mut crate::optimizeopt::OptContext,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: &Operand,
+    ) -> majit_ir::OpRc {
         let newop = op
             .bound_op()
             .expect("a virtual is the result of an operation");
         op.clear_forwarded();
-        emit_op_rc(ctx, newop)
-    };
+        emit_op_rc(ctx, optimizer, newop)
+    }
 
     // Descr-derived view of the full fielddescr slot list, used by both
     // the constant-fold path and the per-field SETFIELD_GC emission in the
@@ -1369,7 +1397,7 @@ fn force_box_emit(
                 fields: CachedFieldList::new(),
                 last_guard_pos: -1,
             });
-            let alloc_rc = emit_forced(ctx, op);
+            let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // info.py `newop.set_forwarded(self)` — unconditional.
             ctx.set_ptr_info(op, preserved);
             if crate::optimizeopt::majit_log_enabled() {
@@ -1400,7 +1428,7 @@ fn force_box_emit(
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
                 set_op.setdescr(descr.clone());
-                emit_op(ctx, set_op);
+                emit_op(ctx, &mut optimizer, set_op);
             }
             if !leftover.is_empty() {
                 panic!(
@@ -1432,7 +1460,7 @@ fn force_box_emit(
                 fields: allocation_fields,
                 last_guard_pos: -1,
             });
-            let alloc_rc = emit_forced(ctx, op);
+            let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // info.py `newop.set_forwarded(self)` — unconditional.
             ctx.set_ptr_info(op, preserved);
             if crate::optimizeopt::majit_log_enabled() {
@@ -1461,7 +1489,7 @@ fn force_box_emit(
                 let mut set_op =
                     Op::new(OpCode::SetfieldGc, &[arg_alloc.clone(), arg_value.clone()]);
                 set_op.setdescr(descr.clone());
-                emit_op(ctx, set_op);
+                emit_op(ctx, &mut optimizer, set_op);
             }
             if !leftover.is_empty() {
                 panic!(
@@ -1491,7 +1519,7 @@ fn force_box_emit(
                 last_guard_pos: -1,
             });
 
-            let alloc_rc = emit_forced(ctx, op);
+            let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // Install before the item stores: a child that points back at
             // this box must see the non-virtual array.
             ctx.set_ptr_info(op, preserved);
@@ -1532,7 +1560,7 @@ fn force_box_emit(
                     &[arg_alloc.clone(), arg_idx.clone(), arg_sub.clone()],
                 );
                 set_op.setdescr(descr.clone());
-                emit_op(ctx, set_op);
+                emit_op(ctx, &mut optimizer, set_op);
             }
             // pure_from_args(ARRAYLEN_GC, [op], ConstInt(len))
             ctx.pure_from_args_arraylen(
@@ -1564,7 +1592,7 @@ fn force_box_emit(
                 last_guard_pos: -1,
             });
 
-            let alloc_rc = emit_forced(ctx, op);
+            let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // Install before the interior stores: a child that points back
             // at this box must see the non-virtual array.
             ctx.set_ptr_info(op, preserved);
@@ -1606,7 +1634,7 @@ fn force_box_emit(
                     if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
                         set_op.setdescr(d);
                     }
-                    emit_op(ctx, set_op);
+                    emit_op(ctx, &mut optimizer, set_op);
                 }
             }
             Operand::from_bound_op(&alloc_rc)
@@ -1617,7 +1645,7 @@ fn force_box_emit(
             let entries = vinfo.buffer.drain_entries();
 
             // info.py `force_box`: emit the raw-malloc CALL_I itself.
-            let alloc_rc = emit_forced(ctx, op);
+            let alloc_rc = emit_forced(ctx, &mut optimizer, op);
 
             // info.py:152/421 set_forwarded(self). RPython keeps the SAME
             // RawBufferPtrInfo on the forced op and flips it non-virtual via
@@ -1642,7 +1670,7 @@ fn force_box_emit(
             // info.py:425: CHECK_MEMORY_ERROR
             let arg_alloc = Operand::from_bound_op(&alloc_rc);
             let check_op = Op::new(OpCode::CheckMemoryError, std::slice::from_ref(&arg_alloc));
-            emit_op(ctx, check_op);
+            emit_op(ctx, &mut optimizer, check_op);
 
             // info.py:429-436: emit RAW_STORE for each buffered write.
             // info.py uses `itembox = buffer.values[i]` DIRECTLY in the
@@ -1662,7 +1690,7 @@ fn force_box_emit(
                     &[arg_alloc.clone(), arg_offset.clone(), arg_value.clone()],
                 );
                 store_op.setdescr(descr);
-                emit_op(ctx, store_op);
+                emit_op(ctx, &mut optimizer, store_op);
             }
 
             Operand::from_bound_op(&alloc_rc)
@@ -1691,7 +1719,7 @@ fn force_box_emit(
             // `get_virtual_fields` / raw-guard path.
             force_child(&slice.parent, ctx, &mut optimizer);
             // info.py `force_box`: emit the slice's INT_ADD itself.
-            let new_rc = emit_forced(ctx, op);
+            let new_rc = emit_forced(ctx, &mut optimizer, op);
             // Preserve raw-slice identity; mark non-virtual via
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
             // info.py `newop.set_forwarded(self)`, unconditional.
@@ -1745,9 +1773,16 @@ fn force_box_emit(
                     .resolve_operand_operand_opt(&info.lgtop)
                     .unwrap_or_else(|| info.lgtop.clone()),
                 VStringVariant::Concat(info) => {
-                    let left_len = ctx.getstrlen_opref(info.vleft.to_opref(), mode);
-                    let right_len = ctx.getstrlen_opref(info.vright.to_opref(), mode);
-                    crate::optimizeopt::vstring::_int_add(&left_len, &right_len, ctx)
+                    let left_len =
+                        ctx.getstrlen_opref_with(&mut optimizer, info.vleft.to_opref(), mode);
+                    let right_len =
+                        ctx.getstrlen_opref_with(&mut optimizer, info.vright.to_opref(), mode);
+                    crate::optimizeopt::vstring::_int_add_with(
+                        &mut optimizer,
+                        &left_len,
+                        &right_len,
+                        ctx,
+                    )
                 }
                 VStringVariant::Ptr => unreachable!(),
             };
@@ -1760,7 +1795,7 @@ fn force_box_emit(
             };
             let arg_length = lengthbox;
             let newstr_op = Op::new(new_opcode, std::slice::from_ref(&arg_length));
-            let newop_rc = emit_op(ctx, newstr_op);
+            let newop_rc = emit_op(ctx, &mut optimizer, newstr_op);
             let newop_box = Operand::from_bound_op(&newop_rc);
 
             // vstring.py:98: newop.set_forwarded(self) — unconditional.
@@ -1807,23 +1842,30 @@ fn force_box_emit(
                                 set_opcode,
                                 &[arg_newop.clone(), arg_offset.clone(), arg_ch.clone()],
                             );
-                            emit_op(ctx, setitem_op);
+                            emit_op(ctx, &mut optimizer, setitem_op);
                         }
-                        offset = crate::optimizeopt::vstring::_int_add(&offset, &one, ctx);
+                        offset = crate::optimizeopt::vstring::_int_add_with(
+                            &mut optimizer,
+                            &offset,
+                            &one,
+                            ctx,
+                        );
                     }
                 }
                 VStringVariant::Concat(info) => {
                     // vstring.py VStringConcatInfo.string_copy_parts
                     let newop_box = Operand::from_bound_op(&newop_rc);
                     let zero_box = zero.clone();
-                    let offset = crate::optimizeopt::vstring::string_copy_parts(
+                    let offset = crate::optimizeopt::vstring::string_copy_parts_with(
+                        &mut optimizer,
                         &info.vleft.clone(),
                         &newop_box,
                         &zero_box,
                         mode,
                         ctx,
                     );
-                    crate::optimizeopt::vstring::string_copy_parts(
+                    crate::optimizeopt::vstring::string_copy_parts_with(
+                        &mut optimizer,
                         &info.vright.clone(),
                         &newop_box,
                         &offset,
@@ -1835,7 +1877,8 @@ fn force_box_emit(
                     // vstring.py VStringSliceInfo.string_copy_parts
                     let newop_box = Operand::from_bound_op(&newop_rc);
                     let zero_box = zero.clone();
-                    crate::optimizeopt::vstring::copy_str_content(
+                    crate::optimizeopt::vstring::copy_str_content_with(
+                        &mut optimizer,
                         ctx,
                         &info.s.clone(),
                         &newop_box,

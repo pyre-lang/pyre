@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -294,6 +295,10 @@ impl RecentPureOps {
 
 pub(crate) type SharedPureOps = Rc<RefCell<RecentPureOpTable>>;
 
+/// `Optimizer.passes` slot for OptPure. Cloned out of the vec before
+/// `propagate_with_optimizer`, so `force_box` can reenter this pass.
+pub type SharedOptPure = Rc<RefCell<OptPureState>>;
+
 /// `OptPure.get_pure_result` against a ring published into `OptContext`.
 ///
 /// `Optimization.get_pure_result` reads `optimizer.optpure`; the pass list
@@ -442,7 +447,7 @@ impl RecentPureOpTable {
 /// - OVF operation postponement (INT_ADD_OVF etc. are deferred until GUARD_NO_OVERFLOW).
 /// - GUARD_NO_EXCEPTION removal after eliminated CALL_PURE.
 /// - RECORD_KNOWN_RESULT for pre-recorded call_pure results.
-pub struct OptPure {
+pub struct OptPureState {
     /// The per-opnum recent-ops ring. Shared with `OptRewrite` through
     /// `OptContext::pure_ops` (one `Rc`, not a copy). `setup` clears the
     /// ring in place; `set_pureop_historylength` replaces it.
@@ -481,9 +486,9 @@ pub struct OptPure {
     call_pure_results: crate::optimizeopt::util::ArgsDict,
 }
 
-impl OptPure {
+impl OptPureState {
     pub fn new() -> Self {
-        OptPure {
+        OptPureState {
             cache: Rc::new(RefCell::new(RecentPureOpTable::new(
                 crate::jit::PARAMETERS.pureop_historylength as usize,
             ))),
@@ -899,390 +904,470 @@ impl Default for OptPure {
     }
 }
 
-impl OptPure {
-    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> Operand {
-        // optimizer.py force_box: `op = get_box_replacement(op)`, then force
-        // the virtual behind it.
-        match ctx.resolve_operand_operand_opt(op) {
-            Some(resolved) if ctx.is_virtual(&resolved) => {
-                let mut info = ctx.take_ptr_info(&resolved).unwrap();
-                let forced = info.force_box(&resolved, ctx);
-                ctx.resolve_operand_operand(&forced)
-            }
-            Some(resolved) => resolved,
-            None => op.clone(),
+struct PureGate<'a> {
+    shared: &'a SharedOptPure,
+    guard: Option<RefMut<'a, OptPureState>>,
+}
+
+impl<'a> PureGate<'a> {
+    fn new(shared: &'a SharedOptPure) -> Self {
+        Self {
+            guard: Some(shared.borrow_mut()),
+            shared,
         }
     }
 
-    /// optimizer.py _can_optimize_call_pure.
-    ///
-    /// RPython: for each arg, `get_constant_box(arg)` returns the constant
-    /// value (ConstInt/ConstPtr/ConstFloat), then uses those values as the
-    /// lookup key in call_pure_results. Value-based equality, not identity.
-    fn lookup_call_pure_result(
+    /// `optimizer.py` `force_box`, reached from `pure.py` while this pass's
+    /// `RefCell` is free. `_force_elements` may reenter OptPure (`_int_add`
+    /// → `send_extra_operation` from pass 0), so the guard is dropped first
+    /// and taken again after `force_box` returns.
+    fn force_virtual(
         &mut self,
-        op: &Op,
-        start_index: usize,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        op: &Operand,
         ctx: &mut OptContext,
-    ) -> Option<Value> {
-        let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
-        for i in start_index..op.num_args() {
-            let forced = self.force_box(&op.arg(i), ctx);
-            let const_value = ctx.get_constant_box(&forced)?;
-            arg_consts.push(const_value);
-        }
-        self.call_pure_results.get(&arg_consts)
+    ) -> Operand {
+        self.guard = None;
+        let forced = force_ptr_if_virtual(optimizer, op, ctx);
+        let shared = self.shared;
+        self.guard = Some(shared.borrow_mut());
+        forced
     }
 }
 
-impl Optimization for OptPure {
-    fn set_pureop_historylength(&mut self, limit: usize) {
-        self.cache = Rc::new(RefCell::new(RecentPureOpTable::new(limit)));
+impl Deref for PureGate<'_> {
+    type Target = OptPureState;
+    fn deref(&self) -> &OptPureState {
+        self.guard.as_ref().expect("pure guard held")
+    }
+}
+
+impl DerefMut for PureGate<'_> {
+    fn deref_mut(&mut self) -> &mut OptPureState {
+        self.guard.as_mut().expect("pure guard held")
+    }
+}
+
+/// `pure.py` `self.optimizer.force_box(box)`.
+///
+/// `info.py` `force_box` emits the allocation with `optforce.emit_extra`,
+/// then `_force_elements` forces each field. Pass-level callers pass the
+/// owning optimizer into `force_box_impl` (the `emit_extra` analogue).
+/// `Optimizer::force_box` is not used here: it would pop `potential_extra_op`
+/// again. No optimizer (direct `propagate_forward` tests): the trait
+/// `force_box` keeps the queued / final-emission path.
+fn force_ptr_if_virtual(
+    optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+    op: &Operand,
+    ctx: &mut OptContext,
+) -> Operand {
+    match ctx.resolve_operand_operand_opt(op) {
+        Some(resolved) if ctx.is_virtual(&resolved) => {
+            let mut info = ctx.take_ptr_info(&resolved).unwrap();
+            let forced = if let Some(opt) = optimizer.as_deref_mut() {
+                crate::optimizeopt::info::force_box_impl(&mut info, &resolved, ctx, opt)
+            } else {
+                info.force_box(&resolved, ctx)
+            };
+            ctx.resolve_operand_operand(&forced)
+        }
+        Some(resolved) => resolved,
+        None => op.clone(),
+    }
+}
+
+/// `optimizer.py` `_can_optimize_call_pure`.
+///
+/// Each arg is `force_box`'d, then `get_constant_box` supplies the
+/// `call_pure_results` key. The guard stays down across `force_box`.
+fn lookup_call_pure_result(
+    gate: &mut PureGate<'_>,
+    optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+    op: &Op,
+    start_index: usize,
+    ctx: &mut OptContext,
+) -> Option<Value> {
+    let mut arg_consts = Vec::with_capacity(op.num_args().saturating_sub(start_index));
+    for i in start_index..op.num_args() {
+        let forced = gate.force_virtual(optimizer, &op.arg(i), ctx);
+        let const_value = ctx.get_constant_box(&forced)?;
+        arg_consts.push(const_value);
+    }
+    gate.call_pure_results.get(&arg_consts)
+}
+
+/// `pure.py` `propagate_forward` with `self.optimizer` (`optforce.optimizer`).
+///
+/// `force_box` emits the allocation through `emit_extra` and then
+/// `_force_elements` forces each field. The `PureGate` drops its
+/// `RefMut` before `force_box`, because `_int_add` reenters from pass 0.
+fn propagate_shared(
+    shared: &SharedOptPure,
+    optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+    op: &Op,
+    op_rc: &majit_ir::OpRc,
+    ctx: &mut OptContext,
+) -> OptimizationResult {
+    let mut this = PureGate::new(shared);
+
+    this.publish_pure_ops(ctx);
+    // optimizer.py: pure_from_args1 parity — consume pending registrations
+    // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
+    // and virtualize pass (ARRAYLEN_GC with array descr keying per
+    // virtualize.py:220).
+    for index in 0..ctx.pending_pure_from_args.len() {
+        let (opcode, arg0, result, descr) = ctx.pending_pure_from_args[index].clone();
+        match descr {
+            Some(d) => this.pure_from_args1_with_descr(opcode, &arg0, &result, d, ctx),
+            None => this.pure_from_args1(opcode, &arg0, &result, ctx),
+        }
+    }
+    ctx.pending_pure_from_args.clear();
+    // INSTANCE_PTR_EQ/NE swapped-args reverse relations.
+    for index in 0..ctx.pending_pure_from_args2.len() {
+        let (opcode, arg0, arg1, result) = ctx.pending_pure_from_args2[index].clone();
+        this.pure_from_args2(opcode, &arg0, &arg1, &result, ctx);
+    }
+    ctx.pending_pure_from_args2.clear();
+
+    // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
+    if op.opcode != OpCode::GuardNoException {
+        this.last_emitted_was_removed = false;
     }
 
-    fn propagate_forward(
-        &mut self,
-        op: &Op,
-        op_rc: &majit_ir::OpRc,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
-        self.publish_pure_ops(ctx);
-        // optimizer.py: pure_from_args1 parity — consume pending registrations
-        // from rewrite pass (CAST_*, CONVERT_* reverse-pure relationships)
-        // and virtualize pass (ARRAYLEN_GC with array descr keying per
-        // virtualize.py:220).
-        for index in 0..ctx.pending_pure_from_args.len() {
-            let (opcode, arg0, result, descr) = ctx.pending_pure_from_args[index].clone();
-            match descr {
-                Some(d) => self.pure_from_args1_with_descr(opcode, &arg0, &result, d, ctx),
-                None => self.pure_from_args1(opcode, &arg0, &result, ctx),
-            }
-        }
-        ctx.pending_pure_from_args.clear();
-        // INSTANCE_PTR_EQ/NE swapped-args reverse relations.
-        for index in 0..ctx.pending_pure_from_args2.len() {
-            let (opcode, arg0, arg1, result) = ctx.pending_pure_from_args2[index].clone();
-            self.pure_from_args2(opcode, &arg0, &arg1, &result, ctx);
-        }
-        ctx.pending_pure_from_args2.clear();
+    // Clear any position arm the previous op left un-consumed, so the
+    // one-shot cannot leak onto this op.
+    //
+    // The arm is armed in `optimize_call_pure` and consumed in
+    // `propagate_postprocess`. Every ordinary exit now consumes it: the op
+    // is collected under its demoted `CallI`/`CallR` opcode, and emission,
+    // a later pass's removal and a restart all run the collected callbacks
+    // (`send_extra_operation`, optimizer.py, ends the walk on a
+    // removal but not the callbacks). What is left un-consumed is the
+    // error exit — a pass reporting `InvalidLoop`, which abandons the
+    // trace — so this reset is defensive rather than load-bearing.
+    //
+    // Consuming it on a removal is what upstream does too: the callback
+    // rides on the result object `emit_result` built (pure.py), and
+    // that object stays in `opt_results` whatever a later pass decides. It
+    // then appends `len(_newoperations) - 1`, which for a removed call
+    // names a different op — an exposure both implementations carry.
+    // Unreachable today: the only removal of a call below this pass is
+    // OptHeap's DICT_LOOKUP dedup, and a dict lookup is registered as a
+    // plain residual call, so it never arrives here demoted from a pure one.
+    this.pending_call_pure_position = false;
 
-        // Don't reset for GUARD_NO_EXCEPTION — it needs the previous state.
-        if op.opcode != OpCode::GuardNoException {
-            self.last_emitted_was_removed = false;
-        }
+    // pure.py: OVF operation postponement.
+    // INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF are deferred until we see
+    // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
+    if op.opcode.is_ovf() {
+        this.postponed_op = Some(op_rc.clone());
+        return OptimizationResult::Remove;
+    }
 
-        // Clear any position arm the previous op left un-consumed, so the
-        // one-shot cannot leak onto this op.
-        //
-        // The arm is armed in `optimize_call_pure` and consumed in
-        // `propagate_postprocess`. Every ordinary exit now consumes it: the op
-        // is collected under its demoted `CallI`/`CallR` opcode, and emission,
-        // a later pass's removal and a restart all run the collected callbacks
-        // (`send_extra_operation`, optimizer.py, ends the walk on a
-        // removal but not the callbacks). What is left un-consumed is the
-        // error exit — a pass reporting `InvalidLoop`, which abandons the
-        // trace — so this reset is defensive rather than load-bearing.
-        //
-        // Consuming it on a removal is what upstream does too: the callback
-        // rides on the result object `emit_result` built (pure.py), and
-        // that object stays in `opt_results` whatever a later pass decides. It
-        // then appends `len(_newoperations) - 1`, which for a removed call
-        // names a different op — an exposure both implementations carry.
-        // Unreachable today: the only removal of a call below this pass is
-        // OptHeap's DICT_LOOKUP dedup, and a dict lookup is registered as a
-        // plain residual call, so it never arrives here demoted from a pure one.
-        self.pending_call_pure_position = false;
-
-        // pure.py: OVF operation postponement.
-        // INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF are deferred until we see
-        // GUARD_NO_OVERFLOW, so we can try CSE on the OVF op + guard pair.
-        if op.opcode.is_ovf() {
-            self.postponed_op = Some(op_rc.clone());
-            return OptimizationResult::Remove;
-        }
-
-        // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
-        if let Some(postponed) = self.postponed_op.take() {
-            let postponed_box = Operand::from_bound_op(&postponed);
-            if op.opcode == OpCode::GuardNoOverflow {
-                // pure.py — only call `constant_fold` when every
-                // arg has resolved to a `Const*` via `get_constant_box`
-                // (the `for...else:` gate).  Without this pre-check,
-                // `constant_fold` would panic on the now-strict
-                // `expect("arg must be Const")` since postponed OVF
-                // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
-                // where p is an inputarg).
-                let all_args_const = (0..postponed.num_args()).all(|i| {
-                    ctx.get_constant_box(&postponed.arg(i).get_box_replacement(false))
-                        .is_some()
-                });
-                if all_args_const && let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
-                    ctx.make_constant_box(&postponed_box, Value::Int(folded));
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove; // guard also removed
-                }
-
-                // pure.py + 162-171 _can_reuse_oldop:
-                // The lookup may surface a non-OVF op of the same shape
-                // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
-                // it only when the cached opnum matches our OVF opnum.
-                if let Some((old_opcode, cached_ref)) = self.lookup_pure(&postponed, ctx)
-                    && Self::_can_reuse_oldop(old_opcode, postponed.opcode, true)
-                {
-                    let b_old = postponed_box.clone();
-                    let b_cached = ctx.resolve_operand_operand(&cached_ref);
-                    ctx.make_equal_to(&b_old, &b_cached);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove; // guard also removed
-                }
-
-                // Resolve the args to their forwarded terminals before the op
-                // is recorded in `self.cache` under its arg identities
-                // (optimizer.py force_box loop).
-                let key = PureOpKey::from_operand_op(&postponed);
-                for i in 0..postponed.num_args() {
-                    let forced = self.force_box(&postponed.arg(i), ctx);
-                    postponed.setarg(i, forced);
-                }
-                // Record and emit both the OVF op and the guard.
-                self.cache.borrow_mut().insert(key, postponed_box.clone());
-                // pure.py:321-322 walks `_newoperations` for is_ovf followed
-                // by GUARD_NO_OVERFLOW; do not keep a parallel candidate list.
-                self.emit_postponed_downstream(postponed, ctx);
-                return OptimizationResult::PassOn; // guard passes through
-            } else {
-                // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
-                for i in 0..postponed.num_args() {
-                    let forced = self.force_box(&postponed.arg(i), ctx);
-                    postponed.setarg(i, forced);
-                }
-                self.emit_postponed_downstream(postponed, ctx);
-            }
-        }
-
-        // pure.py: GUARD_NO_EXCEPTION — remove if last emitted was removed
-        // (CALL_PURE was constant-folded or CSE'd away).
-        if op.opcode == OpCode::GuardNoException {
-            if self.last_emitted_was_removed {
-                return OptimizationResult::Remove;
-            }
-            return OptimizationResult::PassOn;
-        }
-
-        // pure.py: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
-        // pure.py: `self.known_result_call_pure.append(op)`
-        // Lookup compares descr + _same_args(known_op, query_op, 1, start_index).
-        if op.opcode == OpCode::RecordKnownResult {
-            if op.num_args() >= 2 {
-                self.known_result_call_pure.push(KnownResultEntry {
-                    descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
-                    args: op.args_slice()[1..].iter().map(|a| a.to_opref()).collect(),
-                    result: op.arg(0).to_opref(),
-                });
-            }
-            return OptimizationResult::Remove;
-        }
-
-        if op.opcode.is_always_pure() {
-            // pure.py:
-            //     for i in range(op.numargs()):
-            //         if self.get_constant_box(op.getarg(i)) is None:
-            //             break
-            //     else:
-            //         # all constant arguments: constant-fold away
-            //         resbox = self.optimizer.constant_fold(op)
-            //         self.optimizer.make_constant(op, resbox)
-            //         return
-            let all_args_const = (0..op.num_args()).all(|i| {
-                ctx.get_constant_box(&op.arg(i).get_box_replacement(false))
+    // Handle the postponed OVF op when we see GUARD_NO_OVERFLOW.
+    if let Some(postponed) = this.postponed_op.take() {
+        let postponed_box = Operand::from_bound_op(&postponed);
+        if op.opcode == OpCode::GuardNoOverflow {
+            // pure.py — only call `constant_fold` when every
+            // arg has resolved to a `Const*` via `get_constant_box`
+            // (the `for...else:` gate).  Without this pre-check,
+            // `constant_fold` would panic on the now-strict
+            // `expect("arg must be Const")` since postponed OVF
+            // ops can have non-const args (e.g. `IntMulOvf(p, 1)`
+            // where p is an inputarg).
+            let all_args_const = (0..postponed.num_args()).all(|i| {
+                ctx.get_constant_box(&postponed.arg(i).get_box_replacement(false))
                     .is_some()
             });
-            if all_args_const {
-                // Upstream `pure.py for...else:` calls
-                // `optimizer.constant_fold(op)` unconditionally and
-                // feeds the result straight into `make_constant`.
-                // Pyre's `constant_fold` now narrows to two
-                // documented `None` paths only:
-                //   1. `protect_speculative_operation`'s
-                //      `supports_guard_gc_type == false` gate on
-                //      memory-reading folds (mod.rs).  Upstream's
-                //      comment at `optimizer.py` skips
-                //      unrolling in that mode; pyre's
-                //      `constant_fold` runs outside unroll too, so
-                //      the fold itself must decline.
-                //   2. Helper-internal narrow skips on `IntAddOvf` /
-                //      `IntSubOvf` / `IntMulOvf` overflow, shift
-                //      count outside `0..64`, `IntFloorDiv` /
-                //      `IntMod` divide-by-zero, and CAST_FLOAT_TO_INT
-                //      non-finite (`execute_binary_int_const` /
-                //      `execute_cast_const` return `Ok(None)`).
-                //      Upstream `do_int_add_ovf` would `assert
-                //      metainterp is not None` on overflow with
-                //      `metainterp=None` (executor.py:287); pyre
-                //      prefers the softer skip so the op stays in
-                //      the trace and the runtime guard fires.
-                // Every caller-invariant violation (missing box,
-                // descr, wrong Value variant) panics inside
-                // `constant_fold` / `protect_speculative_operation`,
-                // matching upstream's `AttributeError`.  A genuine
-                // speculative-fold failure (ill-typed heap access) is
-                // recorded as a deferred `InvalidLoop` signal on the
-                // context; `constant_fold` then returns `None` and the
-                // driver aborts the trace at its next barrier per
-                // `unroll.py:119-123`.
-                if let Some(folded_value) = ctx.constant_fold(op) {
-                    ctx.make_constant_box(&Operand::from_bound_op(op_rc), folded_value);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove;
-                }
+            if all_args_const && let Some(Value::Int(folded)) = ctx.constant_fold(&postponed) {
+                ctx.make_constant_box(&postponed_box, Value::Int(folded));
+                this.last_emitted_was_removed = true;
+                return OptimizationResult::Remove; // guard also removed
             }
 
-            // CSE: exact same operation already computed?
-            if let Some((_, cached_ref)) = self.lookup_pure(op, ctx) {
-                let b_old = Operand::from_bound_op(op_rc);
+            // pure.py + 162-171 _can_reuse_oldop:
+            // The lookup may surface a non-OVF op of the same shape
+            // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
+            // it only when the cached opnum matches our OVF opnum.
+            if let Some((old_opcode, cached_ref)) = this.lookup_pure(&postponed, ctx)
+                && OptPureState::_can_reuse_oldop(old_opcode, postponed.opcode, true)
+            {
+                let b_old = postponed_box.clone();
                 let b_cached = ctx.resolve_operand_operand(&cached_ref);
                 ctx.make_equal_to(&b_old, &b_cached);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
+                this.last_emitted_was_removed = true;
+                return OptimizationResult::Remove; // guard also removed
             }
 
-            return OptimizationResult::PassOn;
+            // Resolve the args to their forwarded terminals before the op
+            // is recorded in `self.cache` under its arg identities
+            // (optimizer.py force_box loop).
+            let key = PureOpKey::from_operand_op(&postponed);
+            for i in 0..postponed.num_args() {
+                let forced = this.force_virtual(optimizer, &postponed.arg(i), ctx);
+                postponed.setarg(i, forced);
+            }
+            // Record and emit both the OVF op and the guard.
+            this.cache.borrow_mut().insert(key, postponed_box.clone());
+            // pure.py:321-322 walks `_newoperations` for is_ovf followed
+            // by GUARD_NO_OVERFLOW; do not keep a parallel candidate list.
+            this.emit_postponed_downstream(postponed, ctx);
+            return OptimizationResult::PassOn; // guard passes through
+        } else {
+            // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
+            for i in 0..postponed.num_args() {
+                let forced = this.force_virtual(optimizer, &postponed.arg(i), ctx);
+                postponed.setarg(i, forced);
+            }
+            this.emit_postponed_downstream(postponed, ctx);
+        }
+    }
+
+    // pure.py: GUARD_NO_EXCEPTION — remove if last emitted was removed
+    // (CALL_PURE was constant-folded or CSE'd away).
+    if op.opcode == OpCode::GuardNoException {
+        if this.last_emitted_was_removed {
+            return OptimizationResult::Remove;
+        }
+        return OptimizationResult::PassOn;
+    }
+
+    // pure.py: RECORD_KNOWN_RESULT — record for later CALL_PURE lookup.
+    // pure.py: `self.known_result_call_pure.append(op)`
+    // Lookup compares descr + _same_args(known_op, query_op, 1, start_index).
+    if op.opcode == OpCode::RecordKnownResult {
+        if op.num_args() >= 2 {
+            this.known_result_call_pure.push(KnownResultEntry {
+                descr_identity: op.getdescr().as_ref().map(majit_ir::descr::descr_identity),
+                args: op.args_slice()[1..].iter().map(|a| a.to_opref()).collect(),
+                result: op.arg(0).to_opref(),
+            });
+        }
+        return OptimizationResult::Remove;
+    }
+
+    if op.opcode.is_always_pure() {
+        // pure.py:
+        //     for i in range(op.numargs()):
+        //         if self.get_constant_box(op.getarg(i)) is None:
+        //             break
+        //     else:
+        //         # all constant arguments: constant-fold away
+        //         resbox = self.optimizer.constant_fold(op)
+        //         self.optimizer.make_constant(op, resbox)
+        //         return
+        let all_args_const = (0..op.num_args()).all(|i| {
+            ctx.get_constant_box(&op.arg(i).get_box_replacement(false))
+                .is_some()
+        });
+        if all_args_const {
+            // Upstream `pure.py for...else:` calls
+            // `optimizer.constant_fold(op)` unconditionally and
+            // feeds the result straight into `make_constant`.
+            // Pyre's `constant_fold` now narrows to two
+            // documented `None` paths only:
+            //   1. `protect_speculative_operation`'s
+            //      `supports_guard_gc_type == false` gate on
+            //      memory-reading folds (mod.rs).  Upstream's
+            //      comment at `optimizer.py` skips
+            //      unrolling in that mode; pyre's
+            //      `constant_fold` runs outside unroll too, so
+            //      the fold itself must decline.
+            //   2. Helper-internal narrow skips on `IntAddOvf` /
+            //      `IntSubOvf` / `IntMulOvf` overflow, shift
+            //      count outside `0..64`, `IntFloorDiv` /
+            //      `IntMod` divide-by-zero, and CAST_FLOAT_TO_INT
+            //      non-finite (`execute_binary_int_const` /
+            //      `execute_cast_const` return `Ok(None)`).
+            //      Upstream `do_int_add_ovf` would `assert
+            //      metainterp is not None` on overflow with
+            //      `metainterp=None` (executor.py:287); pyre
+            //      prefers the softer skip so the op stays in
+            //      the trace and the runtime guard fires.
+            // Every caller-invariant violation (missing box,
+            // descr, wrong Value variant) panics inside
+            // `constant_fold` / `protect_speculative_operation`,
+            // matching upstream's `AttributeError`.  A genuine
+            // speculative-fold failure (ill-typed heap access) is
+            // recorded as a deferred `InvalidLoop` signal on the
+            // context; `constant_fold` then returns `None` and the
+            // driver aborts the trace at its next barrier per
+            // `unroll.py:119-123`.
+            if let Some(folded_value) = ctx.constant_fold(op) {
+                ctx.make_constant_box(&Operand::from_bound_op(op_rc), folded_value);
+                this.last_emitted_was_removed = true;
+                return OptimizationResult::Remove;
+            }
         }
 
-        // pure.py optimize_call_pure(op, start_index)
-        // pure.py: optimize_CALL_PURE_I/R/F/N → start_index=0
-        // pure.py: optimize_COND_CALL_VALUE_I/R → start_index=1
-        if op.opcode.is_call_pure() || op.opcode.is_cond_call_value() {
-            let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
-            let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
+        // CSE: exact same operation already computed?
+        if let Some((_, cached_ref)) = this.lookup_pure(op, ctx) {
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_cached = ctx.resolve_operand_operand(&cached_ref);
+            ctx.make_equal_to(&b_old, &b_cached);
+            this.last_emitted_was_removed = true;
+            return OptimizationResult::Remove;
+        }
 
-            // pure.py: _can_optimize_call_pure(op, start_index=1).
-            if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                let b = Operand::from_bound_op(op_rc);
-                ctx.make_constant_box(&b, value);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
-            }
+        return OptimizationResult::PassOn;
+    }
 
-            // pure.py: iterate call_pure_positions, try
-            // optimize_call_pure_old with adjusted start_index.
-            for &pos in &self.call_pure_positions {
-                if let Some(old_op) = ctx.new_operations.get(pos) {
-                    let old_descr_identity = old_op
-                        .getdescr()
-                        .as_ref()
-                        .map(majit_ir::descr::descr_identity);
-                    let old_op_args: Vec<OpRef> =
-                        old_op.args_slice().iter().map(|a| a.to_opref()).collect();
-                    if Self::optimize_call_pure_old(
-                        op,
-                        old_op.opcode,
-                        &old_op_args,
-                        old_descr_identity,
-                        op_descr_identity,
-                        start_index,
-                        ctx,
-                    ) {
-                        let cached_src = old_op.pos().get();
-                        let b_old = Operand::from_bound_op(op_rc);
-                        let b_cached = ctx.get_box_replacement_operand(cached_src);
-                        ctx.make_equal_to(&b_old, &b_cached);
-                        self.last_emitted_was_removed = true;
-                        return OptimizationResult::Remove;
-                    }
-                }
-            }
-            // pure.py: iterate extra_call_pure entries.
-            //   if isinstance(old_op, PreambleOp):
-            //       old_op = self.optimizer.force_op_from_preamble(old_op)
-            //       self.extra_call_pure[i] = old_op
-            // Force runs after the match so use_box / potential_extra_ops /
-            // forwarded-info side effects are tied to the actual fuse, and
-            // the entry is rewritten so subsequent matches reuse the forced
-            // result without re-forcing.
-            let mut matched: Option<(usize, Option<PreambleOp>)> = None;
-            for (i, entry) in self.extra_call_pure.iter().enumerate() {
-                let (entry_opcode, entry_args, entry_descr_identity, pop) = match entry {
-                    ExtraCallPureEntry::Direct { key, .. } => {
-                        (key.opcode, &key.args, key.descr_identity, None)
-                    }
-                    ExtraCallPureEntry::Preamble { key, pop } => {
-                        (key.opcode, &key.args, key.descr_identity, Some(pop.clone()))
-                    }
-                };
-                if Self::optimize_call_pure_old(
+    // pure.py optimize_call_pure(op, start_index)
+    // pure.py: optimize_CALL_PURE_I/R/F/N → start_index=0
+    // pure.py: optimize_COND_CALL_VALUE_I/R → start_index=1
+    if op.opcode.is_call_pure() || op.opcode.is_cond_call_value() {
+        let start_index: usize = if op.opcode.is_cond_call_value() { 1 } else { 0 };
+        let op_descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
+
+        // pure.py: _can_optimize_call_pure(op, start_index=1).
+        if let Some(value) = lookup_call_pure_result(&mut this, optimizer, op, start_index, ctx) {
+            let b = Operand::from_bound_op(op_rc);
+            ctx.make_constant_box(&b, value);
+            this.last_emitted_was_removed = true;
+            return OptimizationResult::Remove;
+        }
+
+        // pure.py: iterate call_pure_positions, try
+        // optimize_call_pure_old with adjusted start_index.
+        let call_pure_positions = this.call_pure_positions.clone();
+        for &pos in &call_pure_positions {
+            if let Some(old_op) = ctx.new_operations.get(pos) {
+                let old_descr_identity = old_op
+                    .getdescr()
+                    .as_ref()
+                    .map(majit_ir::descr::descr_identity);
+                let old_op_args: Vec<OpRef> =
+                    old_op.args_slice().iter().map(|a| a.to_opref()).collect();
+                if OptPureState::optimize_call_pure_old(
                     op,
-                    entry_opcode,
-                    entry_args,
-                    entry_descr_identity,
+                    old_op.opcode,
+                    &old_op_args,
+                    old_descr_identity,
                     op_descr_identity,
                     start_index,
                     ctx,
                 ) {
-                    matched = Some((i, pop));
-                    break;
+                    let cached_src = old_op.pos().get();
+                    let b_old = Operand::from_bound_op(op_rc);
+                    let b_cached = ctx.get_box_replacement_operand(cached_src);
+                    ctx.make_equal_to(&b_old, &b_cached);
+                    this.last_emitted_was_removed = true;
+                    return OptimizationResult::Remove;
                 }
             }
-            if let Some((i, pop)) = matched {
-                let entry_result = if let Some(pop) = pop {
-                    let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
-                    let key = match &self.extra_call_pure[i] {
-                        ExtraCallPureEntry::Preamble { key, .. } => key.clone(),
-                        _ => unreachable!("matched index must still hold the Preamble entry"),
-                    };
-                    self.extra_call_pure[i] = ExtraCallPureEntry::Direct {
-                        key,
-                        result: forced,
-                    };
-                    forced
-                } else {
-                    match &self.extra_call_pure[i] {
-                        ExtraCallPureEntry::Direct { result, .. } => *result,
-                        _ => unreachable!("non-preamble matched index must be Direct"),
-                    }
-                };
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement_operand(entry_result);
-                ctx.make_equal_to(&b_old, &b_cached);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
-            }
-            // pure.py: known_result_call_pure.
-            if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_result = ctx.get_box_replacement_operand(result_ref);
-                ctx.make_equal_to(&b_old, &b_result);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
-            }
-
-            // pure.py: `CallPureOptimizationResult.callback()` appends
-            // `len(_newoperations) - 1` AFTER `emit_result` has routed the op
-            // through the remaining optimizations. Recording it here (before
-            // the `Replace` routes through earlyforce/heap) is wrong: OptHeap
-            // flushes a postponed comparison op ahead of this call, so the
-            // pre-emit `len` would index that flushed op, not the call. Arm
-            // the one-shot instead and record the true index in
-            // `propagate_postprocess`, mirroring the callback's post-emit fire.
-            self.pending_call_pure_position = true;
-            // pure.py route the emitted op through `self.emit`, i.e.
-            // the passes downstream of OptPure (earlyforce, heap). Returning
-            // `Replace` continues the op through those remaining passes, so
-            // OptHeap.emit() still runs — flushing any postponed comparison op
-            // ahead of this call. `Emit` would append the op terminally and
-            // skip OptHeap, stranding a postponed comparison whose result this
-            // call consumes past its own definition (regalloc def-after-use).
-            if start_index == 0 {
-                // pure.py: replace CALL_PURE with CALL.
-                let new_op = self.demote_call_pure(op);
-                return OptimizationResult::Replace(new_op);
-            } else {
-                // pure.py: COND_CALL_VALUE is NOT demoted.
-                return OptimizationResult::Replace(op.clone());
+        }
+        // pure.py: iterate extra_call_pure entries.
+        //   if isinstance(old_op, PreambleOp):
+        //       old_op = self.optimizer.force_op_from_preamble(old_op)
+        //       self.extra_call_pure[i] = old_op
+        // Force runs after the match so use_box / potential_extra_ops /
+        // forwarded-info side effects are tied to the actual fuse, and
+        // the entry is rewritten so subsequent matches reuse the forced
+        // result without re-forcing.
+        let mut matched: Option<(usize, Option<PreambleOp>)> = None;
+        // Clone first: `PureGate`'s `DerefMut` must not stay borrowed across
+        // the later `extra_call_pure[i] = ...` write.
+        let extra_call_pure = this.extra_call_pure.clone();
+        for (i, entry) in extra_call_pure.iter().enumerate() {
+            let (entry_opcode, entry_args, entry_descr_identity, pop) = match entry {
+                ExtraCallPureEntry::Direct { key, .. } => {
+                    (key.opcode, &key.args, key.descr_identity, None)
+                }
+                ExtraCallPureEntry::Preamble { key, pop } => {
+                    (key.opcode, &key.args, key.descr_identity, Some(pop.clone()))
+                }
+            };
+            if OptPureState::optimize_call_pure_old(
+                op,
+                entry_opcode,
+                entry_args,
+                entry_descr_identity,
+                op_descr_identity,
+                start_index,
+                ctx,
+            ) {
+                matched = Some((i, pop));
+                break;
             }
         }
+        if let Some((i, pop)) = matched {
+            let entry_result = if let Some(pop) = pop {
+                let forced = ctx.force_op_from_preamble_op(&pop).to_opref();
+                let key = match this.extra_call_pure[i].clone() {
+                    ExtraCallPureEntry::Preamble { key, .. } => key,
+                    _ => unreachable!("matched index must still hold the Preamble entry"),
+                };
+                this.extra_call_pure[i] = ExtraCallPureEntry::Direct {
+                    key,
+                    result: forced,
+                };
+                forced
+            } else {
+                match this.extra_call_pure[i].clone() {
+                    ExtraCallPureEntry::Direct { result, .. } => result,
+                    _ => unreachable!("non-preamble matched index must be Direct"),
+                }
+            };
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_cached = ctx.get_box_replacement_operand(entry_result);
+            ctx.make_equal_to(&b_old, &b_cached);
+            this.last_emitted_was_removed = true;
+            return OptimizationResult::Remove;
+        }
+        // pure.py: known_result_call_pure.
+        if let Some(result_ref) = this.lookup_known_result(op, start_index, ctx) {
+            let b_old = Operand::from_bound_op(op_rc);
+            let b_result = ctx.get_box_replacement_operand(result_ref);
+            ctx.make_equal_to(&b_old, &b_result);
+            this.last_emitted_was_removed = true;
+            return OptimizationResult::Remove;
+        }
 
-        OptimizationResult::PassOn
+        // pure.py: `CallPureOptimizationResult.callback()` appends
+        // `len(_newoperations) - 1` AFTER `emit_result` has routed the op
+        // through the remaining optimizations. Recording it here (before
+        // the `Replace` routes through earlyforce/heap) is wrong: OptHeap
+        // flushes a postponed comparison op ahead of this call, so the
+        // pre-emit `len` would index that flushed op, not the call. Arm
+        // the one-shot instead and record the true index in
+        // `propagate_postprocess`, mirroring the callback's post-emit fire.
+        this.pending_call_pure_position = true;
+        // pure.py route the emitted op through `self.emit`, i.e.
+        // the passes downstream of OptPure (earlyforce, heap). Returning
+        // `Replace` continues the op through those remaining passes, so
+        // OptHeap.emit() still runs — flushing any postponed comparison op
+        // ahead of this call. `Emit` would append the op terminally and
+        // skip OptHeap, stranding a postponed comparison whose result this
+        // call consumes past its own definition (regalloc def-after-use).
+        if start_index == 0 {
+            // pure.py: replace CALL_PURE with CALL.
+            let new_op = this.demote_call_pure(op);
+            return OptimizationResult::Replace(new_op);
+        } else {
+            // pure.py: COND_CALL_VALUE is NOT demoted.
+            return OptimizationResult::Replace(op.clone());
+        }
+    }
+
+    OptimizationResult::PassOn
+}
+
+/// Driver entry. `passes[i]` is not borrowed: `state` was cloned from
+/// `pure_state_handle` first.
+pub(crate) fn propagate_with_optimizer(
+    state: &SharedOptPure,
+    optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
+    op: &Op,
+    op_rc: &majit_ir::OpRc,
+    ctx: &mut OptContext,
+) -> OptimizationResult {
+    propagate_shared(state, &mut Some(optimizer), op, op_rc, ctx)
+}
+
+impl OptPureState {
+    fn set_pureop_historylength(&mut self, limit: usize) {
+        self.cache = Rc::new(RefCell::new(RecentPureOpTable::new(limit)));
     }
 
     fn setup(&mut self) {
@@ -1298,21 +1383,6 @@ impl Optimization for OptPure {
 
     fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
         self.call_pure_results = results.clone();
-    }
-
-    fn name(&self) -> &'static str {
-        "pure"
-    }
-
-    /// pure.py `CallPureOptimizationResult` — the demoted CALL / un-demoted
-    /// COND_CALL_VALUE carry a post-emit callback that records the call's
-    /// position. `DefaultOptimizationResult._callback` also publishes boolean
-    /// bounds even when OptHeap postpones the operation's final emission.
-    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
-        opcode.is_real_call()
-            || opcode.is_cond_call_value()
-            || opcode.returns_bool()
-            || opcode.is_always_pure()
     }
 
     /// pure.py `CallPureOptimizationResult.callback`:
@@ -1429,6 +1499,179 @@ impl Optimization for OptPure {
                 }
             }
         }
+    }
+}
+
+/// Pass object in `Optimizer.passes`. State is shared so the driver can
+/// clone `pure_state_handle` and drop the vec borrow before `force_box`.
+pub struct OptPure {
+    pub(crate) state: SharedOptPure,
+}
+
+impl OptPure {
+    pub fn new() -> Self {
+        Self {
+            state: Rc::new(RefCell::new(OptPureState::new())),
+        }
+    }
+
+    /// Same fields as `OptPureState::new`, with the pure-op ring capped at
+    /// `limit` (`set_pureop_historylength`).
+    pub fn with_history_limit(limit: usize) -> Self {
+        let pass = Self::new();
+        pass.state.borrow_mut().set_pureop_historylength(limit);
+        pass
+    }
+
+    pub fn set_extra_call_pure(&mut self, results: Vec<(Vec<OpRef>, OpRef)>) {
+        self.state.borrow_mut().set_extra_call_pure(results);
+    }
+
+    pub fn pure(&mut self, op: &Op, op_rc: &majit_ir::OpRc) {
+        self.state.borrow_mut().pure(op, op_rc);
+    }
+
+    pub fn pure_from_args(
+        &mut self,
+        opcode: OpCode,
+        args: &[Operand],
+        result: &Operand,
+        ctx: &mut OptContext,
+    ) {
+        self.state
+            .borrow_mut()
+            .pure_from_args(opcode, args, result, ctx);
+    }
+
+    pub fn pure_from_args2(
+        &mut self,
+        opcode: OpCode,
+        arg0: &Operand,
+        arg1: &Operand,
+        result: &Operand,
+        ctx: &mut OptContext,
+    ) {
+        self.state
+            .borrow_mut()
+            .pure_from_args2(opcode, arg0, arg1, result, ctx);
+    }
+
+    pub fn get_pure_result(&mut self, op: &Op, ctx: &mut OptContext) -> Option<Operand> {
+        self.state.borrow_mut().get_pure_result(op, ctx)
+    }
+
+    pub fn lookup1(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        descr_identity: Option<usize>,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
+    ) -> Option<OpRef> {
+        self.state
+            .borrow()
+            .lookup1(opcode, arg0, descr_identity, same_box)
+    }
+
+    pub fn lookup2(
+        &self,
+        opcode: OpCode,
+        arg0: OpRef,
+        arg1: OpRef,
+        descr_identity: Option<usize>,
+        commutative: bool,
+        same_box: impl Fn(OpRef, OpRef) -> bool,
+    ) -> Option<OpRef> {
+        self.state
+            .borrow()
+            .lookup2(opcode, arg0, arg1, descr_identity, commutative, same_box)
+    }
+
+    #[cfg(test)]
+    fn lookup_pure(&mut self, op: &Op, ctx: &mut OptContext) -> Option<(OpCode, Operand)> {
+        self.state.borrow_mut().lookup_pure(op, ctx)
+    }
+
+    #[cfg(test)]
+    fn lookup_known_result(&self, op: &Op, start_index: usize, ctx: &OptContext) -> Option<OpRef> {
+        self.state
+            .borrow()
+            .lookup_known_result(op, start_index, ctx)
+    }
+
+    #[cfg(test)]
+    fn recent_ops_has_preamble(&self, op: &Op, ctx: &OptContext) -> bool {
+        self.state.borrow().recent_ops_has_preamble(op, ctx)
+    }
+
+    fn is_commutative(opcode: OpCode) -> bool {
+        OptPureState::is_commutative(opcode)
+    }
+
+    fn matches_result_type(op: &Op, result: &Operand, ctx: &OptContext) -> bool {
+        OptPureState::matches_result_type(op, result, ctx)
+    }
+}
+
+impl Optimization for OptPure {
+    fn set_pureop_historylength(&mut self, limit: usize) {
+        self.state.borrow_mut().set_pureop_historylength(limit);
+    }
+
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        // Direct unit tests have no `Optimizer`. `force_box` keeps the queue.
+        propagate_shared(&self.state, &mut None, op, op_rc, ctx)
+    }
+
+    fn setup(&mut self) {
+        self.state.borrow_mut().setup();
+    }
+
+    fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
+        self.state.borrow_mut().set_call_pure_results(results);
+    }
+
+    fn name(&self) -> &'static str {
+        "pure"
+    }
+
+    fn pure_state_handle(&self) -> Option<SharedOptPure> {
+        Some(Rc::clone(&self.state))
+    }
+
+    /// pure.py `CallPureOptimizationResult` — the demoted CALL / un-demoted
+    /// COND_CALL_VALUE carry a post-emit callback that records the call's
+    /// position. `DefaultOptimizationResult._callback` also publishes boolean
+    /// bounds even when OptHeap postpones the operation's final emission.
+    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+        opcode.is_real_call()
+            || opcode.is_cond_call_value()
+            || opcode.returns_bool()
+            || opcode.is_always_pure()
+    }
+
+    fn propagate_postprocess(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
+        self.state
+            .borrow_mut()
+            .propagate_postprocess(op, op_rc, ctx);
+    }
+
+    fn install_preamble_pure_ops(&mut self, ctx: &mut OptContext) {
+        self.state.borrow_mut().install_preamble_pure_ops(ctx);
+    }
+
+    fn produce_potential_short_preamble_ops(
+        &self,
+        sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        ctx: &mut OptContext,
+    ) {
+        self.state
+            .borrow()
+            .produce_potential_short_preamble_ops(sb, ctx);
     }
 }
 
@@ -1737,11 +1980,16 @@ mod tests {
             same_as_source: None,
         };
         let mut pass = OptPure::new();
-        pass.cache
-            .borrow_mut()
-            .insert_preamble(PureOpKey::from_operand_op(&query), pop);
         {
-            let mut cache = pass.cache.borrow_mut();
+            let state = pass.state.borrow_mut();
+            state
+                .cache
+                .borrow_mut()
+                .insert_preamble(PureOpKey::from_operand_op(&query), pop);
+        }
+        {
+            let state = pass.state.borrow_mut();
+            let mut cache = state.cache.borrow_mut();
             let bucket = cache.buckets.iter_mut().flatten().next().unwrap();
             if let Some((_, PureRingValue::Preamble { forced, .. })) = &mut bucket.lst[0] {
                 *forced = Some(wrong.clone());
@@ -2057,16 +2305,7 @@ mod tests {
 
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&inputs);
-        opt.add_pass(Box::new(OptPure {
-            cache: Rc::new(RefCell::new(RecentPureOpTable::new(16))),
-            postponed_op: None,
-            call_pure_positions: Vec::new(),
-            pending_call_pure_position: false,
-            last_emitted_was_removed: false,
-            known_result_call_pure: Vec::new(),
-            extra_call_pure: Vec::new(),
-            call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
-        }));
+        opt.add_pass(Box::new(OptPure::with_history_limit(16)));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
@@ -2141,7 +2380,8 @@ mod tests {
         op.pos().set(OpRef::int_op(4));
         pass.pure(&op, &op);
         let stored = {
-            let cache = pass.cache.borrow();
+            let state = pass.state.borrow();
+            let cache = state.cache.borrow();
             cache.bucket(OpCode::IntAdd).unwrap().lst[0]
                 .as_ref()
                 .unwrap()
@@ -2845,13 +3085,16 @@ mod tests {
             descr_identity: None,
         };
         // Verify entries exist in extra_call_pure
-        assert_eq!(pass.extra_call_pure.len(), 1);
-        match &pass.extra_call_pure[0] {
-            super::ExtraCallPureEntry::Direct { key: k, result } => {
-                assert_eq!(k, &key);
-                assert_eq!(*result, OpRef::int_op(50));
+        {
+            let state = pass.state.borrow();
+            assert_eq!(state.extra_call_pure.len(), 1);
+            match &state.extra_call_pure[0] {
+                super::ExtraCallPureEntry::Direct { key: k, result } => {
+                    assert_eq!(k, &key);
+                    assert_eq!(*result, OpRef::int_op(50));
+                }
+                _ => panic!("expected Direct entry"),
             }
-            _ => panic!("expected Direct entry"),
         }
     }
 
@@ -2865,11 +3108,14 @@ mod tests {
         let b999 = ctx.materialize_operand_at(OpRef::int_op(999));
 
         // pure.py: self.known_result_call_pure.append(op)
-        pass.known_result_call_pure.push(super::KnownResultEntry {
-            descr_identity: None,
-            args: vec![OpRef::int_op(100), OpRef::int_op(101)],
-            result: OpRef::int_op(50),
-        });
+        pass.state
+            .borrow_mut()
+            .known_result_call_pure
+            .push(super::KnownResultEntry {
+                descr_identity: None,
+                args: vec![OpRef::int_op(100), OpRef::int_op(101)],
+                result: OpRef::int_op(50),
+            });
 
         // CALL_PURE lookup: start_index=0, descr matches (both None), args match
         let op = Op::new(OpCode::CallPureI, &[b100.clone(), b101.clone()]);
