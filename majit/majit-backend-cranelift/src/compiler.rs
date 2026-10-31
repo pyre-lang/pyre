@@ -284,10 +284,10 @@ fn match_metainterp_finish_descr(
 use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
     BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
-    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, JitframeDescrFacts,
+    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, JitFrameInfo, JitframeDescrFacts,
     check_jitframe_descr, jitframe_facts_at_cpu_init, jitframe_is_gc_object,
     jitframe_write_barrier, malloc_entry_jitframe, malloc_jitframe_no_collect,
-    publish_standalone_jitframe_facts,
+    publish_standalone_jitframe_facts, realloc_frame,
 };
 use majit_backend::llmodel::{
     done_ref_slot0, park_or_free_done_entry_frame, prepare_done_raw_entry_frame,
@@ -4555,8 +4555,43 @@ extern "C" fn gc_alloc_lowlevel_string_shim(
 ///   spills; this helper only needs to copy those words verbatim.
 /// - Must run on the JIT thread that owns the `CRANELIFT_ACTIVE_GC`
 ///   thread-local.
+/// - When `jf_frame_info` is set (`prepare_done_raw_entry_frame` /
+///   `JitFrame::init`), it must stay writable for
+///   `jitframeinfo_update_depth`.
 #[inline(never)]
 pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: usize) -> *mut i64 {
+    let old = old_jf as *mut JitFrame;
+    // llmodel.py `realloc_frame`: if size > frame.jf_frame_info.jfi_frame_depth
+    // then `update_frame_depth` and `JITFRAME.allocate(frame.jf_frame_info)`.
+    // wasm_realloc_frame already does this; without it every later
+    // `execute_token` still mallocs the old depth and reallocs again.
+    let fi = unsafe { (*old).jf_frame_info as *mut JitFrameInfo };
+    if !fi.is_null() {
+        let base_ofs = (JF_FRAME_ITEM0_OFS as usize + GcHeader::SIZE) as isize;
+        let new_jf = unsafe {
+            realloc_frame(
+                old,
+                new_depth as isize,
+                base_ofs,
+                |size_bytes| {
+                    let payload = (size_bytes as usize).saturating_sub(GcHeader::SIZE);
+                    with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, payload))
+                },
+                |new_frame| write_barrier_if_managed(GcRef(new_frame as usize)),
+            )
+        };
+        write_barrier_if_managed(GcRef(old as usize));
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!(
+                    "cranelift realloc-frame old={old_jf:p} new={new_jf:p} new_depth={new_depth}"
+                ),
+            );
+        }
+        return new_jf as *mut i64;
+    }
+
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8;
     let new_total = header_words + new_depth;
     let new_bytes = new_total * 8;
@@ -25420,6 +25455,50 @@ mod tests {
             !tracks_young(old.0),
             "`jf_forward` points at the new frame and must be remembered too"
         );
+    }
+
+    /// `llmodel.py realloc_frame` widens `jf_frame_info` before allocating, so
+    /// a later `execute_token` mallocs the grown depth instead of reallocing
+    /// on every closing-jump.
+    #[test]
+    fn realloc_frame_widens_frame_info_like_llmodel() {
+        let depth = 8usize;
+        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+        let payload_bytes = (header_words + depth) * 8;
+        let base_ofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 64,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let _backend = backend_with_gc(gc);
+
+        let info = JitFrameInfo::default();
+        info.update_frame_depth(base_ofs, depth as i64);
+        assert_eq!(info.depth() as usize, depth);
+
+        let type_id = cranelift_jitframe_type_id().expect("JITFRAME type id must be registered");
+        let old = with_cranelift_gc_required(|gc| {
+            gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
+        });
+        assert_ne!(old.0, 0, "old frame allocation failed");
+        unsafe {
+            JitFrame::init(old.0 as *mut JitFrame, &info, depth);
+        }
+
+        let new_jf = unsafe { cranelift_realloc_frame(old.0 as *mut i64, depth * 2) };
+        assert!(!new_jf.is_null(), "realloc returned no frame");
+        assert!(
+            info.depth() as usize >= depth * 2,
+            "llmodel.py realloc_frame must publish the new depth on jf_frame_info"
+        );
+        unsafe {
+            let new = new_jf as *mut JitFrame;
+            assert_eq!((*new).jf_frame_info as *const JitFrameInfo, &info);
+            assert_eq!(JitFrame::frame_length(new) as usize, depth * 2);
+        }
     }
 
     #[derive(Default)]
