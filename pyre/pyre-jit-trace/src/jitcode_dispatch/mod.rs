@@ -8722,7 +8722,17 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// carries dest's list/iterator as dead-tail slots under the origin vsd
 /// (`lc_nok` N=400: val-loop guard-origin close at inner FOR_ITER 36
 /// jumped with `SameAsI(6)` while dest vsd is 9).
-fn sync_intermediate_merge_point_valuestackdepth(ctx: &mut TraceCtx, vsd: usize) {
+fn sync_intermediate_merge_point_valuestackdepth(
+    ctx: &mut TraceCtx,
+    frame: usize,
+    merge_pc: usize,
+) {
+    if let Some(depth) = crate::state::merge_point_stack_depth_to_recover(frame, merge_pc) {
+        sync_intermediate_merge_point_valuestackdepth_to_depth(ctx, depth);
+    }
+}
+
+fn sync_intermediate_merge_point_valuestackdepth_to_depth(ctx: &mut TraceCtx, vsd: usize) {
     if ctx.standard_virtualizable_box().is_none() {
         return;
     }
@@ -18053,7 +18063,6 @@ fn handle<Sym: WalkSym>(
                     let callee_code = ctx
                         .session
                         .borrow()
-                        .framestack
                         .last_python_inline()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
@@ -18321,7 +18330,7 @@ fn handle<Sym: WalkSym>(
                     },
                 );
             if let Some(vsd) = dead_array_tail_from {
-                sync_intermediate_merge_point_valuestackdepth(ctx.trace_ctx, vsd);
+                sync_intermediate_merge_point_valuestackdepth_to_depth(ctx.trace_ctx, vsd);
             }
             ctx.trace_ctx
                 .fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);

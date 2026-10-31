@@ -1202,6 +1202,15 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // `setup_call` port and don't call init_symbolic; this path
     // handles the root frame push.
     sym.init_symbolic(ctx, cf_addr);
+    if ctx.is_bridge_trace && ctx.has_virtualizable_boxes() {
+        // `resume.py rebuild_from_resumedata` restores the root virtualizable
+        // independently of each MIFrame's resume PC. The interpreter handoff
+        // can publish an innermost PC on the live frame; bind this recording
+        // copy to the decoded root boxes before resuming the caller. Copying
+        // only its resume PC leaves last_instr disagreeing with those boxes.
+        ctx.set_virtualizable_heap_ptr(cf_addr as *const u8);
+        ctx.synchronize_virtualizable();
+    }
     if let Some(ref carrier) = carrier {
         debug_assert_eq!(
             unsafe { (*sym.jitcode()).index as i32 },
@@ -2044,13 +2053,13 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             return p2_drain_abort();
         }
 
-        let callee_w_globals =
-            crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe) as usize;
         // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
         // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
         // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
         // is known.
         let recipe = &ctx.reconstruct_recipe_with_current_refs(recipe);
+        let callee_w_globals =
+            crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe) as usize;
         let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
         let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
         let local_concretes = &recipe.concrete_r[..nlocals];
@@ -2101,6 +2110,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // matches PyPy and `opimpl_jit_merge_point` returns at
         // `if portal_call_depth: return` instead of treating `step` as the portal.
         let _opened = crate::state::note_resume_inline_frames_to_depth(python_recipe_count);
+        let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
         crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
             ctx,
             &session,
@@ -2117,7 +2127,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             local_concretes,
             resumed_stack_oprefs,
             resumed_stack_concretes,
-            crate::state::pending_concrete_frame(ctx, &pending),
+            pending_frame_ptr,
             pending.sym.frame(),
             pending.sym.execution_context(),
             paused_parents,
@@ -5188,11 +5198,9 @@ fn run_perfn_walk<Sym: WalkSym>(
     // the merge point's green-int (`gi` = [next_instr, is_being_profiled]),
     // green-ref (`gr` = [pycode]) and red (`rr` = [frame, ec], portal
     // jitdriver convention) register lists and seed each named color from
-    // the greenkey / live frame. `gi[0]` (`next_instr`) is the trivia-
-    // normalized PC the skipped `int_copy` would have written
-    // (`pyopcode.py dispatch_bytecode`); function-entry `start_pc` is 0
-    // (`RESUME`) while the first instruction start — and `arm_shared`'s
-    // `switch` — is `skip_python_trivia_forward`. `gi[1]` is
+    // the greenkey / live frame. `gi[0]` (`next_instr`) is the logical
+    // instruction start, including RESUME/NOP and EXTENDED_ARG prefixes;
+    // `dispatch_bytecode` normalizes last_instr separately. `gi[1]` is
     // `is_being_profiled`. Both are `const_int` seeds through
     // `argboxes_i`, matching the Ref green (`pycode`) and red (`frame`,
     // `ec`) seeds. `frame` is the
@@ -5206,11 +5214,6 @@ fn run_perfn_walk<Sym: WalkSym>(
     // Bridges keep their own entry coordinate and do not take this seed.
     let ec_box = sym.execution_context();
     let pycode_box = ctx.const_ref(w_code as i64);
-    let static_entry_green_regs = if is_bridge_trace {
-        None
-    } else {
-        static_entry_merge_point_green_regs(pjc.jitcode.code.as_slice(), pjc.loop_scan(), entry)
-    };
     let static_entry_green_int_regs = if is_bridge_trace {
         None
     } else {
@@ -5511,7 +5514,7 @@ fn run_perfn_walk<Sym: WalkSym>(
     // writes `top_regs_i[color] = value`. A non-bridge entry starts at the
     // `pmgN` `-live-` and executes `jit_merge_point` without the
     // instruction-start `int_copy` / `pmg_shared`, so `gi[0]` is the
-    // trivia-normalized `next_instr` that copy would have written and
+    // logical `next_instr` that copy would have written and
     // `gi[1]` is `is_being_profiled`. `dispatch_via_miframe` treats
     // `OpRef::NONE` as unset (`assert_int_bank_box` returns, the slot
     // stays the bank's initial NONE). Other bridges keep an empty list.
@@ -5536,15 +5539,10 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }
             };
             if let Some(&next_instr_color) = gi.first() {
-                let next_instr_pc = if pjc.code_ptr.is_null() {
-                    start_pc
-                } else {
-                    crate::jitcode_dispatch::skip_python_trivia_forward(
-                        unsafe { &*pjc.code_ptr },
-                        start_pc,
-                    )
-                };
-                seed_i(next_instr_color, ctx.const_int(next_instr_pc as i64));
+                // `interp_jit.py PyFrame.dispatch` carries the logical
+                // instruction start as its green. `dispatch_bytecode` stores
+                // the normalized opcode in last_instr separately.
+                seed_i(next_instr_color, ctx.const_int(start_pc as i64));
             }
             if let Some(&profiled_color) = gi.get(1) {
                 seed_i(profiled_color, ctx.const_int(is_being_profiled as i64));
@@ -8180,8 +8178,8 @@ mod tests {
 
         let scan = crate::pyjitcode::LoopScanIndex::build(&code);
         assert_eq!(
-            super::static_entry_merge_point_green_regs(&code, &scan, 0),
-            Some(vec![7, 8])
+            super::static_entry_merge_point_green_ref_regs(&code, &scan, 0),
+            Some(vec![9])
         );
         assert_eq!(
             super::static_entry_merge_point_green_int_regs(&code, &scan, 0),

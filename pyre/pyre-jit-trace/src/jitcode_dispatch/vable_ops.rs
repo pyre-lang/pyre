@@ -1227,13 +1227,13 @@ pub(crate) fn is_shared_pmg_block(code: &[u8], target: usize) -> bool {
 /// own `debugdata` test has the same prefix (`pyframe.py get_w_globals`)
 /// returns or raises instead and is not the copy.
 fn merge_greens_reach_switch(code: &[u8], mut pc: usize) -> bool {
-    let mut int_green = false;
+    let mut int_greens = 0usize;
     let mut ref_green = false;
     while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
         match op.opname {
-            "int_guard_value" => int_green = true,
+            "int_guard_value" => int_greens += 1,
             "ref_guard_value" => ref_green = true,
-            "switch" => return int_green && ref_green,
+            "switch" => return int_greens >= 2 || (int_greens > 0 && ref_green),
             name if name.ends_with("_return") || name == "raise" || name == "reraise" => {
                 return false;
             }
@@ -2945,7 +2945,7 @@ mod tests {
             ("live/", &[0, 0]),
             ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
             ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
             ("int_guard_value/i", &[0]),
             ("ref_guard_value/r", &[0]),
             ("switch/id", &[0, 0, 0]),
@@ -2953,11 +2953,25 @@ mod tests {
         assert!(is_shared_pmg_block(&pmg_shape, 0));
         assert!(!is_shared_arm_block(&pmg_shape, 0));
 
+        // `promote_greens` skips the per-code Constant pycode green.
+        let const_pycode_shape = encode(&[
+            ("live/", &[0, 0]),
+            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
+            ("live/", &[0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
+            ("int_guard_value/i", &[0]),
+            ("live/", &[0, 0]),
+            ("int_guard_value/i", &[1]),
+            ("switch/id", &[0, 0, 0]),
+        ]);
+        assert!(is_shared_pmg_block(&const_pycode_shape, 0));
+        assert!(!is_shared_arm_block(&const_pycode_shape, 0));
+
         let helper_debugdata_diamond = encode(&[
             ("live/", &[0, 0]),
             ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
             ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
             ("ref_return/r", &[0]),
         ]);
         assert!(!is_shared_pmg_block(&helper_debugdata_diamond, 0));
@@ -2972,7 +2986,7 @@ mod tests {
             ("live/", &[0, 0]),
             ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
             ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
         ]);
         assert!(is_shared_arm_block(&arm_shape, 0));
         assert!(!is_shared_pmg_block(&arm_shape, 0));

@@ -5368,10 +5368,11 @@ use self::simplify::*;
 use self::strformat::*;
 use self::views::*;
 
+#[cfg(any(test, feature = "mir-frontend"))]
+pub(crate) use self::consteval::register_ambiguous_impl_foldable_const_lits;
 pub(crate) use self::consteval::{
     attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
-    harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
-    register_foldable_const_lits,
+    harvest_named_const_folds, push_named_const_folds, register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
     discover_eval_hook_graphs, release_declared_vable_array_address,
@@ -5393,14 +5394,16 @@ pub(crate) use self::gcroot::{
 };
 pub(crate) use self::lltype::{
     ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
-    charon_literal_to_ast_string, charon_type_value_to_ast_string,
+    charon_literal_to_ast_string, charon_type_value_to_ast_string, fixed_array_index_identity,
+    fnptr_indirect_enabled, host_rthread_threadlocalref_llop, is_flattened_storage_leaf,
+    is_str_family_class_root, is_str_length_field_class_root, is_str_oopspec_class_root,
+    items_block_accessor_returns_its_block, nonzero_option_zero, output_type_is_objectptr,
+    push_unichr, same_nominal_adt, strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin,
+    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+};
+#[cfg(any(test, feature = "mir-frontend"))]
+pub(crate) use self::lltype::{
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
-    fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_flattened_storage_leaf, is_str_family_class_root, is_str_length_field_class_root,
-    is_str_oopspec_class_root, items_block_accessor_returns_its_block, nonzero_option_zero,
-    output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
-    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
-    unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

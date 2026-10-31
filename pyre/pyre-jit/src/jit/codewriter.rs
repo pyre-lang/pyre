@@ -233,27 +233,10 @@ fn portal_jit_merge_point_graph_args(
     jitdriver_index: usize,
 ) -> Vec<super::flow::SpaceOperationArg> {
     let (frame, ec) = portal_graph_inputvars_from_startblock(graph);
-    // `pypyjit/interp_jit.py` PyPyJitDriver greens =
-    // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is
-    // recovered from the live frame at every merge point via the
-    // `getfield_vable_r frame, PYCODE_FIELD_IDX → pycode_var` dual-
-    // write emitted immediately upstream in the walker; reference
-    // that per-SpaceOp Variable here so the canonical
-    // `flatten_graph` driver sees no unresolved `Opaque(Ref)`
-    // constants.
-    //
-    // `next_instr` is the dest of an `int_copy` of the instruction-start
-    // PC, recorded immediately upstream. A `ConstInt` in this list would
-    // go through `add_const_i` (`assembler.py` ListOfKind never
-    // `allow_short`); a body with more than 256 unique PCs then failed
-    // `try_finish` and latched `ConstEncodingOverflow`. `int_copy/c>i`
-    // or `int_copy/d>i` writes `ConstInt` into a register without a pool
-    // slot, which is what `verify_green_args` asserts at the merge.
-    //
-    // `is_being_profiled` is the Int result of `portal_merge_greens`
-    // (`pyframe.py PyFrame.get_is_being_profiled` on that same frame,
-    // `interp_jit.py PyFrame.dispatch`): 0 when `debugdata` is null,
-    // else `FrameDebugData.is_being_profiled`.
+    // `interp_jit.py PyPyJitDriver`: pycode is the constant argument
+    // of this per-code dispatch; `promote_greens` skips Constant greens.
+    // next_instr is copied into a register to avoid a constant-pool slot
+    // per opcode, and the shared merge block reads is_being_profiled.
     let greens = vec![next_instr.into(), is_being_profiled.into(), pycode];
     let reds = vec![frame.into(), ec.into()];
     let mut args = vec![super::flow::Constant::signed(jitdriver_index as i64).into()];
@@ -301,9 +284,9 @@ fn goto_label_target(
     if op.opname != "goto" {
         return None;
     }
-    let lo = *code.get(op.pc + 1)?;
-    let hi = *code.get(op.pc + 2)?;
-    Some(u16::from_le_bytes([lo, hi]) as usize)
+    let pos = op.pc + 1;
+    code.get(pos..pos + majit_jitcode::jitcode::LABEL_OPERAND_SIZE)?;
+    Some(majit_jitcode::jitcode::read_label_at(code, pos))
 }
 
 /// `pmg_shared` starts with `-live-`, `getfield_vable_r` of debugdata,
@@ -352,10 +335,17 @@ fn is_arm_shared_entry(code: &[u8], pc: usize) -> bool {
 /// `goto arm_shared` is followed by the `bodyN` label (no bytes) then
 /// that body's leading `-live-`. Resume there so the snapshot matches
 /// the body's live-in after the shared `switch`.
-fn live_after_arm_shared_goto(
+fn live_after_arm_shared_prefix(
     code: &[u8],
     op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
 ) -> Option<usize> {
+    let after_copy;
+    let op = if op.opname == "int_copy" {
+        after_copy = pyre_jit_trace::jitcode_runtime::decode_op_at(code, op.next_pc)?;
+        &after_copy
+    } else {
+        op
+    };
     if goto_label_target(code, op).is_some_and(|target| is_arm_shared_entry(code, target)) {
         pyre_jit_trace::jitcode_runtime::decode_op_at(code, op.next_pc)
             .filter(|body| body.opname == "live")
@@ -366,6 +356,18 @@ fn live_after_arm_shared_goto(
 }
 
 fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
+    // A body marker reached after the shared dispatch is already the
+    // guard's resume coordinate. A no-op body (RESUME/NOP) may fall straight
+    // into the next instruction's merge; do not advance across it.
+    let previous = pyre_jit_trace::jitcode_runtime::decoded_ops(code)
+        .take_while(|op| op.pc < marker)
+        .last();
+    if previous.is_some_and(|op| {
+        op.next_pc == marker
+            && goto_label_target(code, &op).is_some_and(|target| is_arm_shared_entry(code, target))
+    }) {
+        return marker;
+    }
     let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, marker) else {
         return marker;
     };
@@ -385,13 +387,13 @@ fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
                 return marker;
             }
             if let Some(after) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, op2.next_pc) {
-                if let Some(body) = live_after_arm_shared_goto(code, &after) {
+                if let Some(body) = live_after_arm_shared_prefix(code, &after) {
                     return body;
                 }
             }
             return op2.pc;
         }
-        if let Some(body) = live_after_arm_shared_goto(code, &op) {
+        if let Some(body) = live_after_arm_shared_prefix(code, &op) {
             return body;
         }
         if !portal_merge_prefix_op(code, &op) {
@@ -2796,8 +2798,8 @@ fn emit_portal_is_being_profiled_read(
 /// `goto arm_shared` and emits the debugdata / `w_f_trace` diamonds and
 /// the MayForce `bytecode_only_trace` residual once per jitcode.
 ///
-/// `last_instr` is stored in that shared block from the `next_instr`
-/// register (`setfield_vable_i/rid`). No `catch_exception`: a raise
+/// `last_instr` is stored from the normalized opcode register, while
+/// the logical `next_instr` selects the return body. No `catch_exception`: a raise
 /// from the residual leaves the jitcode (`warmspot.py
 /// ExitFrameWithExceptionRef`) and `handle_bytecode` /
 /// `handle_operation_error` looks up the table by `last_instr`.
@@ -2808,6 +2810,7 @@ fn record_dispatch_bytecode_jitted_arm(
     ec_var: super::flow::Variable,
     fn_idx: u16,
     flavor: CallFlavor,
+    last_instr_var: super::flow::Variable,
     offset: i64,
 ) {
     let mut args: Vec<super::flow::SpaceOperationArg> = vec![
@@ -2821,6 +2824,7 @@ fn record_dispatch_bytecode_jitted_arm(
         super::flatten::intern_call_descr_stub(effect_info, vec![Kind::Ref, Kind::Ref], None)
             .into(),
     );
+    args.push(last_instr_var.into());
     record_graph_op(
         block,
         OPNAME_DISPATCH_BYTECODE_JITTED_ARM,
@@ -6584,9 +6588,27 @@ fn filter_liveness_in_place(
             // COMPARE / POP_JUMP resumes with an empty stack.
             // `liveness.py compute_liveness` keeps every alive value; this restores
             // the frame-live subset the SSA pass cannot see.
-            for &idx in lv_live.iter() {
-                if !pc_live_r.contains(&idx) {
-                    pc_live_r.push(idx);
+            // `jtransform.py handle_jit_marker__jit_merge_point` op2
+            // carries the portal frame, not copies of its operand-stack
+            // slots. `pyframe.py pushvalue` already stored those values;
+            // each opcode body reloads them from the virtualizable. Adding
+            // pcdep colors here resurrects the preceding opcode's SSA
+            // temporaries even when backward liveness correctly killed them.
+            let follows_merge = ssarepr.insns[..insn_idx]
+                .iter()
+                .rev()
+                .find(|insn| matches!(insn, super::flatten::Insn::Op { .. }))
+                .is_some_and(|insn| {
+                    matches!(
+                        insn,
+                        super::flatten::Insn::Op { opname, .. } if opname == "jit_merge_point"
+                    )
+                });
+            if !follows_merge {
+                for &idx in lv_live.iter() {
+                    if !pc_live_r.contains(&idx) {
+                        pc_live_r.push(idx);
+                    }
                 }
             }
 
@@ -7487,22 +7509,10 @@ impl CodeWriter {
         // killing the cross-arm conflated Variable that previously caused
         // scratch slots to appear "alive" at unrelated `-live-` markers.
         let scratch_ref_base: u16 = portal_ec_reg + 1;
-        // `interp_jit.py` carries `pycode` as a loop green.  Traces start
-        // at function entry and loop headers (`merge_entry_by_green`),
-        // and CloseLoop compares that green at the header.  A getfield
-        // in those merge blocks reloads it from the live frame; body
-        // merges reuse the entry Variable so the extra ops do not push
-        // label targets past `0xFFFF` (`assembler.py`).  Every getfield
-        // result is pinned to one Ref color above the allocator range
-        // (same post-color reservation as `frame`/`ec`) so a local cannot
-        // coalesce with it — otherwise `opimpl_jit_merge_point` records
-        // a live box as the pycode green.
-        let mut portal_pycode_var: Option<super::flow::Variable> = None;
-        let mut portal_pycode_vars: Vec<super::flow::Variable> = Vec::new();
-        let mut portal_pycode_reg: Option<u16> = None;
         let mut portal_next_instr_reg: Option<u16> = None;
         let mut portal_profiled_reg: Option<u16> = None;
         let mut portal_next_instr_vars: Vec<super::flow::Variable> = Vec::new();
+        let mut dispatch_last_instr_vars: Vec<super::flow::Variable> = Vec::new();
         let mut portal_profiled_vars: Vec<super::flow::Variable> = Vec::new();
 
         // regalloc.py: compile-time stack depth counter — tracks which
@@ -10288,17 +10298,7 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    let at_instruction_start = !matches!(
-                        pyre_interpreter::decode_instruction_at(code, py_pc),
-                        None | Some((
-                            Instruction::Cache
-                                | Instruction::ExtendedArg
-                                | Instruction::NotTaken
-                                | Instruction::Resume { .. }
-                                | Instruction::Nop,
-                            _
-                        ))
-                    );
+                    let at_instruction_start = is_python_instruction_start(code, py_pc);
 
                     // Forget the previous instruction's local SSA so this
                     // opcode's PRE snapshot does not name STORE_FAST dests.
@@ -10447,45 +10447,18 @@ impl CodeWriter {
                                     )
                                 ))
                     };
-                    // interp_jit.py PyFrame.dispatch calls jit_merge_point
-                    // at every next_instr, including the PC a FOR_ITER
-                    // exhaust jump lands on (#78). Trivia units are not
-                    // dispatch iterations.
-                    let at_instruction_start = !matches!(
-                        pyre_interpreter::decode_instruction_at(code, py_pc),
-                        None | Some((
-                            Instruction::Cache
-                                | Instruction::ExtendedArg
-                                | Instruction::NotTaken
-                                | Instruction::Resume { .. }
-                                | Instruction::Nop,
-                            _
-                        ))
-                    );
-                    let is_foriter_exhaust = foriter_exhaust_pcs.contains(&py_pc);
-                    let emit_portal_merge = is_true_portal
-                        && !block_closed_by_terminator
-                        && (at_instruction_start || is_foriter_exhaust);
+                    // `interp_jit.py PyFrame.dispatch`: every logical instruction
+                    // starts a dispatch iteration, including drained callees.
+                    let at_instruction_start = is_python_instruction_start(code, py_pc);
+                    let emit_portal_merge = at_instruction_start && !block_closed_by_terminator;
                     let mut instr_next_instr_var: Option<super::flow::Variable> = None;
-                    if emit_portal_merge
-                        || (loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator)
-                    {
+                    if emit_portal_merge {
                         if emit_portal_merge {
                             // Leading `-live-` so `derive_pc_live_indices_from_sparse`
                             // keys this PC's resume marker at-or-before
                             // `int_copy`, not the previous opcode's op2.
                             emit_live_placeholder!(py_pc);
                             let jdindex = PYTHON_PORTAL_JD_INDEX;
-                            // Reload `pycode` at function entry and at each
-                            // loop header so a header-started trace writes
-                            // the green before `jit_merge_point`.  Body
-                            // merges reuse that Variable: they do not close
-                            // (`pyjitpl.py` `if not has_targets: return`).
-                            let reload_pycode =
-                                portal_pycode_var.is_none() || loop_header_pcs.contains(&py_pc);
-                            let scratch_pycode_reg = *portal_pycode_reg.get_or_insert_with(|| {
-                                ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0
-                            });
                             let scratch_next_instr_reg =
                                 *portal_next_instr_reg.get_or_insert_with(|| {
                                     ssarepr.fresh_var(Kind::Int, scratch_int_base).0
@@ -10494,24 +10467,13 @@ impl CodeWriter {
                                 *portal_profiled_reg.get_or_insert_with(|| {
                                     ssarepr.fresh_var(Kind::Int, scratch_int_base).0
                                 });
-                            let pycode_var = if reload_pycode {
-                                let loaded = emit_vable_getfield_ref(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    frame_var,
-                                    VABLE_CODE_FIELD_IDX,
-                                    py_pc as i64,
-                                );
-                                portal_pycode_vars.push(loaded);
-                                if portal_pycode_var.is_none() {
-                                    portal_pycode_var = Some(loaded);
-                                }
-                                loaded
-                            } else {
-                                portal_pycode_var.expect(
-                                    "body merge reuses the entry `pycode` getfield Variable",
-                                )
-                            };
+                            // `PyFrame.dispatch` receives this code object as a
+                            // Constant green; `promote_greens` skips it.
+                            let pycode_green: super::flow::FlowValue = super::flow::Constant::new(
+                                super::flow::ConstantValue::Signed(w_code as i64),
+                                Some(Kind::Ref),
+                            )
+                            .into();
                             // `verify_green_args` requires a Const at the
                             // merge. ListOfKind items always pool
                             // (`assembler.py` `emit_const` without
@@ -10537,7 +10499,11 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 OPNAME_PORTAL_MERGE_GREENS,
-                                vec![frame_var.into(), next_instr_var.into(), pycode_var.into()],
+                                vec![
+                                    frame_var.into(),
+                                    next_instr_var.into(),
+                                    pycode_green.clone().into(),
+                                ],
                                 Kind::Int,
                                 py_pc as i64,
                             );
@@ -10554,9 +10520,9 @@ impl CodeWriter {
                             emit_vsd!(current_state.stack.len(), py_pc);
                             let graph_args = portal_jit_merge_point_graph_args(
                                 &graph,
-                                next_instr_var.into(),
+                                next_instr_var,
                                 profiled_var,
-                                pycode_var,
+                                pycode_green,
                                 jdindex,
                             );
                             let graph_op = emit_graph_op_void(
@@ -10578,7 +10544,6 @@ impl CodeWriter {
                             let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
                             portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
                             portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
-                            portal_ref_coloring.insert(pycode_var.id, scratch_pycode_reg);
                             let mut portal_regallocs = [
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_int_coloring,
@@ -10587,7 +10552,7 @@ impl CodeWriter {
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: portal_ref_coloring,
-                                    num_colors: 3,
+                                    num_colors: 2,
                                 },
                                 super::regalloc::GraphAllocationResult {
                                     coloring: crate::jit::regalloc::Coloring::default(),
@@ -10604,96 +10569,6 @@ impl CodeWriter {
                             emit_live_placeholder!(py_pc);
                         }
                         needs_fallthrough = true;
-                        let jdindex = PYTHON_PORTAL_JD_INDEX;
-                        // `interp_jit.py PyFrame.dispatch` passes the
-                        // `pycode` argument to `jit_merge_point`; that
-                        // argument is constant for the whole call. This
-                        // jitcode is built per CodeObject, so the green
-                        // is this body's `w_code` Constant.
-                        // `jtransform.py promote_greens` skips Constant
-                        // greens (`getcode()` is the back-edge's).
-                        let pycode_green: super::flow::FlowValue = super::flow::Constant::new(
-                            super::flow::ConstantValue::Signed(w_code as i64),
-                            Some(Kind::Ref),
-                        )
-                        .into();
-                        // `jtransform.py promote_greens`: `-live-` then
-                        // `{kind}_guard_value` on every Variable green
-                        // (`next_instr` and `pycode` are Constants), then
-                        // `handle_jit_marker__jit_merge_point`'s op3
-                        // `-live-` "for inlined short preambles".
-                        emit_live_placeholder!(py_pc);
-                        let _ = emit_graph_op_void(
-                            &current_block.block(),
-                            "int_guard_value",
-                            vec![profiled_var.into()],
-                            py_pc as i64,
-                        );
-                        emit_live_placeholder!(py_pc);
-                        let scratch_profiled_reg = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        // The `next_instr` green differs at every
-                        // instruction start.  As a list constant it would
-                        // take one `constants_i` slot per instruction and
-                        // overrun `assembler.py` `check_result`'s 256-wide
-                        // index space; held in a register it is filled by
-                        // the u16-immediate `int_copy/d>i`, the way
-                        // `last_instr` uses `setfield_vable_i_imm`.  Its
-                        // source is the constant, so `promote_greens`
-                        // still has nothing to guard for it.
-                        let scratch_next_instr_reg =
-                            ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        let next_instr_var = emit_graph_op_with_result(
-                            &mut graph,
-                            &current_block.block(),
-                            "int_copy",
-                            vec![super::flow::Constant::signed(py_pc as i64).into()],
-                            Kind::Int,
-                            -1,
-                        );
-                        let graph_args = portal_jit_merge_point_graph_args(
-                            &graph,
-                            next_instr_var,
-                            profiled_var,
-                            pycode_green,
-                            jdindex,
-                        );
-                        let graph_op = emit_graph_op_void(
-                            &current_block.block(),
-                            "jit_merge_point",
-                            graph_args,
-                            py_pc as i64,
-                        );
-                        // Ad hoc regallocs for the walk-time serialize of
-                        // `jit_merge_point`: Int `next_instr` and
-                        // `is_being_profiled` plus the two portal red Refs
-                        // (frame / ec). The pycode green is a Constant and
-                        // has no color.
-                        // Canonical `flatten_graph` recolors the same
-                        // Variables from the graph; this map exists
-                        // because the walker serializes the marker
-                        // outside that pass.
-                        let mut portal_int_coloring = crate::jit::regalloc::Coloring::default();
-                        portal_int_coloring.insert(profiled_var.id, scratch_profiled_reg);
-                        portal_int_coloring.insert(next_instr_var.id, scratch_next_instr_reg);
-                        let mut portal_ref_coloring = crate::jit::regalloc::Coloring::default();
-                        portal_ref_coloring.insert(frame_var.id, portal_frame_reg);
-                        portal_ref_coloring.insert(ec_var.id, portal_ec_reg);
-                        let mut portal_regallocs = [
-                            super::regalloc::GraphAllocationResult {
-                                coloring: portal_int_coloring,
-                                num_colors: scratch_profiled_reg.max(scratch_next_instr_reg) + 1,
-                            },
-                            super::regalloc::GraphAllocationResult {
-                                coloring: portal_ref_coloring,
-                                num_colors: 2,
-                            },
-                            super::regalloc::GraphAllocationResult {
-                                coloring: crate::jit::regalloc::Coloring::default(),
-                                num_colors: 0,
-                            },
-                        ];
-                        GraphFlattener::new(&graph, &mut portal_regallocs, &mut ssarepr)
-                            .serialize_op(&graph_op);
                     }
 
                     if !block_closed_by_terminator {
@@ -10749,12 +10624,16 @@ impl CodeWriter {
                     // opcode, then the jitted arm tests `debugdata.w_f_trace`.
                     // Flatten keeps one copy of that arm per jitcode
                     // (`goto arm_shared`); the store uses the `next_instr`
-                    // register (`setfield_vable_i/rid`). Trivia units
-                    // (`Cache` / `ExtendedArg` / `NotTaken` / `Resume` /
-                    // `Nop`) are not instruction starts. Portal copies
-                    // reuse the merge-green `int_copy`; non-portal
-                    // jitcodes emit their own.
+                    // register (`setfield_vable_i/rid`). The merge green and
+                    // return switch keep the logical instruction start; the
+                    // stored f_lasti names the normalized opcode.
                     if at_instruction_start && current_block.block().borrow().exits.is_empty() {
+                        // `dispatch_bytecode` names the opcode after EXTENDED_ARG
+                        // in f_lasti, while the merge green names the logical start.
+                        let dispatch_pc =
+                            pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
+                                code, py_pc,
+                            );
                         let next_instr_var = match instr_next_instr_var {
                             Some(v) => v,
                             None => {
@@ -10770,6 +10649,15 @@ impl CodeWriter {
                                 v
                             }
                         };
+                        let last_instr_var = emit_graph_op_with_result(
+                            &mut graph,
+                            &current_block.block(),
+                            "int_copy",
+                            vec![super::flow::Constant::signed(dispatch_pc as i64).into()],
+                            Kind::Int,
+                            py_pc as i64,
+                        );
+                        dispatch_last_instr_vars.push(last_instr_var);
                         record_dispatch_bytecode_jitted_arm(
                             &current_block.block(),
                             frame_var,
@@ -10777,6 +10665,7 @@ impl CodeWriter {
                             ec_var,
                             bytecode_only_trace_jitted_fn_idx,
                             bytecode_only_trace_jitted_fn_flavor,
+                            last_instr_var,
                             py_pc as i64,
                         );
                         // Body-leading `-live-` after the arm placeholder.
@@ -16532,15 +16421,7 @@ impl CodeWriter {
                 let ec_color = frame_color + 1;
                 ref_alloc.coloring.insert(frame_var.id, frame_color);
                 ref_alloc.coloring.insert(ec_var.id, ec_color);
-                let mut next_color = ec_color + 1;
-                if !portal_pycode_vars.is_empty() {
-                    let pycode_color = next_color;
-                    for v in &portal_pycode_vars {
-                        ref_alloc.coloring.insert(v.id, pycode_color);
-                    }
-                    next_color += 1;
-                }
-                ref_alloc.num_colors = next_color;
+                ref_alloc.num_colors = ec_color + 1;
             }
             {
                 let int_alloc = &mut splice_regallocs[Kind::Int.index()];
@@ -16555,6 +16436,13 @@ impl CodeWriter {
                 if !portal_profiled_vars.is_empty() {
                     let color = next_color;
                     for v in &portal_profiled_vars {
+                        int_alloc.coloring.insert(v.id, color);
+                    }
+                    next_color += 1;
+                }
+                if !dispatch_last_instr_vars.is_empty() {
+                    let color = next_color;
+                    for v in &dispatch_last_instr_vars {
                         int_alloc.coloring.insert(v.id, color);
                     }
                     next_color += 1;
@@ -17504,11 +17392,6 @@ impl CodeWriter {
                     )
                 })
         };
-        let merge_pcs: Vec<usize> =
-            pyre_jit_trace::jitcode_runtime::decoded_ops(jitcode.code.as_slice())
-                .filter(|op| op.opname == "jit_merge_point")
-                .map(|op| op.pc)
-                .collect();
         let merge_entry_by_green: Vec<(u32, u32)> = trace_entry_pcs
             .into_iter()
             .filter_map(|py_pc| {
@@ -17526,11 +17409,14 @@ impl CodeWriter {
                 if !covered {
                     return None;
                 }
-                let off = resolve_marker(py_pc);
-                off.map(|off| {
-                    let entry = trace_entry_at_portal_merge(jitcode.code.as_slice(), off);
-                    (py_pc as u32, entry as u32)
-                })
+                // `split_before_jit_merge_point` enters before the marker,
+                // not at the guard-resume marker after the shared dispatch.
+                let start = first_jit_pc_by_py_pc
+                    .get(py_pc)
+                    .copied()
+                    .filter(|&pc| pc != usize::MAX)?;
+                let entry = trace_entry_at_portal_merge(jitcode.code.as_slice(), start);
+                Some((py_pc as u32, entry as u32))
             })
             .collect();
         let loop_header_by_green: Vec<(u32, u32)> = merge_entry_by_green
@@ -17722,11 +17608,11 @@ impl CodeWriter {
             // `pmgN` `-live-` before the header merge, so traces start at
             // the portal `jit_merge_point` (`split_before_jit_merge_point`).
             for &(off, py) in &block_head_py_by_jit_pc {
-                let skipped_py =
-                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
+                // RESUME/NOP have their own dispatch bodies. Normalize
+                // f_lasti separately; a guard resumes this logical instruction.
                 let marker = first_jit_pc_by_py_pc
-                    .get(skipped_py)
-                    .and_then(|_| resolve_marker(skipped_py))
+                    .get(py as usize)
+                    .and_then(|_| resolve_marker(py as usize))
                     .map(|m| guard_resume_live_after_portal_merge(jitcode.code.as_slice(), m));
                 resume_marker_marker_by_jit_pc.push((off, marker));
             }
@@ -17735,11 +17621,9 @@ impl CodeWriter {
             // deduped `pred_by_off` so the resume-marker twin matches the other
             // op-start twins entry-for-entry (offset-sorted, no post-sort).
             for (&pos, &py) in pred_by_off.iter() {
-                let skipped_py =
-                    pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
                 let marker = first_jit_pc_by_py_pc
-                    .get(skipped_py)
-                    .and_then(|_| resolve_marker(skipped_py))
+                    .get(py)
+                    .and_then(|_| resolve_marker(py))
                     .map(|m| guard_resume_live_after_portal_merge(jitcode.code.as_slice(), m));
                 resume_marker_pred_by_jit_pc.push((pos, marker));
             }
@@ -17762,8 +17646,9 @@ impl CodeWriter {
                 let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
                 let value = first_jit_pc_by_py_pc
                     .get(ft)
-                    .and_then(|_| resolve_marker(ft))
-                    .map(|m| after_residual_live_before_portal_merge(jitcode.code.as_slice(), m));
+                    .copied()
+                    .filter(|&pc| pc != usize::MAX)
+                    .map(|start| trace_entry_at_portal_merge(jitcode.code.as_slice(), start));
                 after_residual_marker_marker_by_jit_pc.push((off, value));
                 // The retired runtime read took the fallthrough of the RAW
                 // block-head py (no trivia skip); match it exactly so the twin
@@ -17789,10 +17674,9 @@ impl CodeWriter {
                     let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
                     let value = first_jit_pc_by_py_pc
                         .get(ft)
-                        .and_then(|_| resolve_marker(ft))
-                        .map(|m| {
-                            after_residual_live_before_portal_merge(jitcode.code.as_slice(), m)
-                        });
+                        .copied()
+                        .filter(|&pc| pc != usize::MAX)
+                        .map(|start| trace_entry_at_portal_merge(jitcode.code.as_slice(), start));
                     after_residual_marker_pred_by_jit_pc.push((pos, value));
                     let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
                     result_color_after_residual_pred_by_jit_pc
@@ -20582,7 +20466,7 @@ mod tests {
                 ops.get(op3_idx.saturating_sub(1)).map(|op| op.opname)
             );
             let goto = &ops[op3_idx - 1];
-            let target = u16::from_le_bytes([bytes[goto.pc + 1], bytes[goto.pc + 2]]) as usize;
+            let target = majit_jitcode::jitcode::read_label_at(bytes, goto.pc + 1);
             assert!(
                 is_pmg_shared_entry(bytes, target),
                 "goto before op3 must target pmg_shared at {target}"
@@ -20603,12 +20487,16 @@ mod tests {
             .map(|op| op.opname)
             .collect();
         assert!(
-            pmg_names.contains(&"int_guard_value") && pmg_names.contains(&"ref_guard_value"),
-            "pmg_shared must promote_greens before switch, got {pmg_names:?}"
+            pmg_names
+                .iter()
+                .filter(|&&name| name == "int_guard_value")
+                .count()
+                == 2,
+            "pmg_shared must promote the two Int greens before switch, got {pmg_names:?}"
         );
         assert!(
-            !opnames[..merge_pos].contains(&"ref_guard_value"),
-            "promote_greens skips Constant pycode; no ref_guard_value before header jit_merge_point, got {opnames:?}"
+            !pmg_names.contains(&"ref_guard_value"),
+            "promote_greens skips Constant pycode, got {pmg_names:?}"
         );
     }
 
@@ -20702,7 +20590,7 @@ mod tests {
             .iter()
             .filter(|op| op.opname == "goto")
             .filter_map(|op| {
-                let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+                let target = majit_jitcode::jitcode::read_label_at(bytes, op.pc + 1);
                 is_arm_shared_entry(bytes, target).then_some(target)
             })
             .collect();
@@ -20749,6 +20637,16 @@ mod tests {
     }
 
     #[test]
+    fn shared_block_goto_reads_the_full_label_target() {
+        let mut code = vec![majit_jitcode::insns::BC_JUMP];
+        majit_jitcode::jitcode::push_label_placeholder(&mut code);
+        majit_jitcode::jitcode::write_label_at(&mut code, 1, 0x010203);
+        let op = pyre_jit_trace::jitcode_runtime::decode_op_at(&code, 0).unwrap();
+        assert_eq!(goto_label_target(&code, &op), Some(0x010203));
+        assert_eq!(goto_label_target(&code[..3], &op), None);
+    }
+
+    #[test]
     fn trace_entry_at_portal_merge_skips_pmg_shared_onto_body_live() {
         // Floor: `-live-; goto pmg_shared`. Body immediately after:
         // `-live-; jit_merge_point`. pmg_shared: `-live-; getfield_vable_r;
@@ -20757,7 +20655,7 @@ mod tests {
         code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
         let goto_pc = code.len();
         code.push(majit_jitcode::insns::BC_JUMP);
-        code.extend_from_slice(&[0, 0]);
+        majit_jitcode::jitcode::push_label_placeholder(&mut code);
         let body_live = code.len();
         code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
         code.push(majit_jitcode::insns::BC_JIT_MERGE_POINT_C);
@@ -20768,10 +20666,9 @@ mod tests {
         code.extend_from_slice(&[0, 0, 0, 0]);
         code.extend_from_slice(&[majit_jitcode::insns::BC_LIVE, 0, 0]);
         code.push(majit_jitcode::insns::BC_GOTO_IF_NOT_PTR_ISZERO);
-        code.extend_from_slice(&[0, 0, 0]);
-        let target = u16::try_from(pmg_shared).unwrap().to_le_bytes();
-        code[goto_pc + 1] = target[0];
-        code[goto_pc + 2] = target[1];
+        code.push(0); // Ref register
+        majit_jitcode::jitcode::push_label_placeholder(&mut code);
+        majit_jitcode::jitcode::write_label_at(&mut code, goto_pc + 1, pmg_shared);
         assert_eq!(trace_entry_at_portal_merge(&code, 0), body_live);
         assert_eq!(
             trace_entry_at_portal_merge(&code, body_live),
@@ -20800,7 +20697,7 @@ mod tests {
             if i == 0 || ops[i - 1].opname != "int_copy" {
                 continue;
             }
-            let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+            let target = majit_jitcode::jitcode::read_label_at(bytes, op.pc + 1);
             if !is_pmg_shared_entry(bytes, target) {
                 continue;
             }
@@ -20918,7 +20815,7 @@ mod tests {
             if i == 0 || ops[i - 1].opname != "int_copy" {
                 continue;
             }
-            let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+            let target = majit_jitcode::jitcode::read_label_at(bytes, op.pc + 1);
             if !is_pmg_shared_entry(bytes, target) {
                 continue;
             }
@@ -21049,13 +20946,22 @@ class C:
                 // After op2: `goto arm_shared`; Label bodyN (no bytes);
                 // body-leading `-live-`. Guard resume skips the goto onto
                 // that live so the snapshot matches the body's live-in.
-                assert_eq!(ops[i + 2].opname, "goto", "goto arm_shared after op2");
+                assert_eq!(
+                    ops[i + 2].opname,
+                    "int_copy",
+                    "normalized last_instr after op2"
+                );
                 assert_eq!(
                     ops[i + 3].opname,
+                    "goto",
+                    "goto arm_shared after last_instr"
+                );
+                assert_eq!(
+                    ops[i + 4].opname,
                     "live",
                     "bodyN leading -live- after goto arm_shared"
                 );
-                let body_live = ops[i + 3].pc;
+                let body_live = ops[i + 4].pc;
                 assert_eq!(
                     pyjit.resume_marker_for_jitcode_pc(ops[i + 2].pc),
                     Some(body_live),
@@ -21140,19 +21046,7 @@ class C:
                 "no setarrayitem_vable between op3 and jit_merge_point (producer pushvalue is the only stack store)"
             );
             let n_starts = (0..code.instructions.len())
-                .filter(|&py_pc| {
-                    !matches!(
-                        pyre_interpreter::decode_instruction_at(code, py_pc),
-                        None | Some((
-                            Instruction::Cache
-                                | Instruction::ExtendedArg
-                                | Instruction::NotTaken
-                                | Instruction::Resume { .. }
-                                | Instruction::Nop,
-                            _
-                        ))
-                    )
-                })
+                .filter(|&py_pc| is_python_instruction_start(code, py_pc))
                 .count();
             assert!(
                 merge_indices.len() <= n_starts,
@@ -21173,6 +21067,124 @@ class C:
             assert!(
                 header_greens.len() >= 2,
                 "merge_entry_by_green stays function entry plus loop headers, got {header_greens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn true_portal_merge_entry_covers_instruction_start_greens() {
+        // interp_jit.py PyFrame.dispatch: jit_merge_point before every
+        // handle_bytecode. warmstate.py maybe_compile_and_run keys the cell
+        // by next_instr, so a mid-function portal entry is a real green.
+        let code = first_nested_function_code(
+            "def rec(n):\n    if n <= 1:\n        return n\n    return rec(n - 1) + n\n",
+        );
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal rec must produce a jitcode");
+        let greens: Vec<u32> = pyjit
+            .metadata
+            .merge_entry_by_green
+            .iter()
+            .map(|&(py, _)| py)
+            .collect();
+        assert!(
+            greens.contains(&0),
+            "RESUME at pc 0 must be a merge green (interp_jit.py dispatch), got {greens:?}"
+        );
+        let first = pyre_interpreter::decode_instruction_at(&code, 0);
+        assert!(
+            matches!(first, Some((Instruction::Resume { .. }, _))),
+            "fixture prologue must be RESUME, got {first:?}"
+        );
+        assert!(
+            greens.len() > 1,
+            "true-portal instruction starts must be merge greens, got {greens:?}"
+        );
+        for &py in &greens {
+            assert!(
+                pyjit.merge_entry_for(py as usize).is_some(),
+                "merge_entry_for({py}) must resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn first_loop_header_merge_point_is_the_loop_header_not_the_first_insn() {
+        // interp_jit.py PyFrame.dispatch: every instruction start is a
+        // merge green. first_loop_header_merge_point must still key off
+        // find_loop_header_pcs (PyFrame.jump_absolute / can_enter_jit).
+        let code = first_nested_function_code(
+            "def f():\n    x = 1\n    while x < 10: x += 1\n    return x\n",
+        );
+        let headers = pyre_interpreter::find_loop_header_pcs(&code);
+        assert_eq!(
+            headers.len(),
+            1,
+            "fixture must have a unique while-header, got {headers:?}"
+        );
+        let header = *headers.iter().next().expect("unique while-header");
+        let first_nonzero = (1..code.instructions.len())
+            .find(|&py| is_python_instruction_start(&code, py))
+            .expect("body after RESUME");
+        assert_ne!(header, first_nonzero);
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("portal f must produce a jitcode");
+        let header_pys: Vec<u32> = pyjit
+            .metadata
+            .loop_header_by_green
+            .iter()
+            .map(|&(py, _)| py)
+            .collect();
+        assert_eq!(
+            header_pys,
+            vec![header as u32],
+            "loop_header_by_green must be find_loop_header_pcs, got {header_pys:?}"
+        );
+        let header_entry = pyjit
+            .merge_entry_for(header)
+            .expect("loop header must be a merge green");
+        let first_insn_entry = pyjit.merge_entry_for(first_nonzero);
+        assert_ne!(
+            Some(header_entry),
+            first_insn_entry,
+            "loop header entry must not be the first non-zero instruction"
+        );
+        let first_loop = pyjit
+            .first_loop_header_merge_point()
+            .expect("loop header must have a jit_merge_point");
+        assert!(
+            first_loop >= header_entry,
+            "first_loop_header_merge_point must sit at-or-after the header entry \
+             (header_entry={header_entry}, first_loop={first_loop})"
+        );
+        if let Some(first_insn_entry) = first_insn_entry {
+            assert_ne!(
+                first_loop, first_insn_entry,
+                "first_loop_header_merge_point must not be the first instruction green"
             );
         }
     }
@@ -21365,64 +21377,37 @@ def f(xs):
             code.instructions.len() > 256,
             "fixture must have more instruction units than the int-pool ceiling"
         );
-        let headers = pyre_interpreter::find_loop_header_pcs(&code);
-        assert_eq!(
-            headers.len(),
-            1,
-            "fixture must have a unique while-header, got {headers:?}"
-        );
-        let header = *headers.iter().next().expect("unique while-header");
-        let first_nonzero = (1..code.instructions.len())
-            .find(|&py| is_python_instruction_start(&code, py))
-            .expect("body after RESUME");
-        assert_ne!(header, first_nonzero);
-        let w_code = pyre_interpreter::box_code_constant(&code);
-        let code_ptr = unsafe {
-            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
-        };
-        let writer = CodeWriter::new();
-        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
-            portal_graph: code_ptr,
-            mainjitcode: None,
-        });
-        writer.make_jitcodes();
-        let pyjit = writer
-            .callcontrol()
-            .find_compiled_jitcode_arc(code_ptr)
-            .expect("portal f must produce a jitcode");
-        let header_pys: Vec<u32> = pyjit
-            .metadata
-            .loop_header_by_green
-            .iter()
-            .map(|&(py, _)| py)
-            .collect();
-        assert_eq!(
-            header_pys,
-            vec![header as u32],
-            "loop_header_by_green must be find_loop_header_pcs, got {header_pys:?}"
-        );
-        let header_entry = pyjit
-            .merge_entry_for(header)
-            .expect("loop header must be a merge green");
-        let first_insn_entry = pyjit.merge_entry_for(first_nonzero);
-        assert_ne!(
-            Some(header_entry),
-            first_insn_entry,
-            "loop header entry must not be the first non-zero instruction"
-        );
-        let first_loop = pyjit
-            .first_loop_header_merge_point()
-            .expect("loop header must have a jit_merge_point");
+        let pyjit = assemble_portal(&code);
+        let merges = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .filter(|op| op.opname == "jit_merge_point")
+            .count();
         assert!(
-            first_loop >= header_entry,
-            "first_loop_header_merge_point must sit at-or-after the header entry \
-             (header_entry={header_entry}, first_loop={first_loop})"
+            merges > 256,
+            "expected a merge per instruction start, got {merges}"
         );
-        if let Some(first_insn_entry) = first_insn_entry {
-            assert_ne!(
-                first_loop, first_insn_entry,
-                "first_loop_header_merge_point must not be the first instruction green"
-            );
+        let total_i = pyjit.jitcode.num_regs_i() as usize + pyjit.jitcode.constants_i.len();
+        assert!(
+            total_i <= 256,
+            "int register+const pool must stay encodable, got {total_i}"
+        );
+    }
+
+    #[test]
+    fn portal_try_except_many_pcs_still_assembles() {
+        // exception_metadata_jitstress.run is try/except-heavy with 591
+        // unique PCs. The int_copy next_instr green keeps constants_i
+        // under the 256 ceiling; this fixture checks the assembled
+        // stream still fits the three-byte jump-target space.
+        // Eight exception sections, each with a longer try body, matching
+        // exception_metadata_jitstress.run more closely than a 40-try
+        // micro-repeat (that one overflowed u16 code_len at 74998 bytes).
+        let mut body = String::from("def f(n):\n    s = 0\n    i = 0\n    while i < n:\n");
+        for section in 0..8 {
+            body.push_str("        try:\n");
+            for k in 0..12 {
+                body.push_str(&format!("            s = s + {}\n", section * 12 + k));
+            }
+            body.push_str("        except Exception:\n            s = 0\n");
         }
         body.push_str("        i = i + 1\n    return s\n");
         let code = first_nested_function_code(&body);
@@ -21434,7 +21419,9 @@ def f(xs):
         let total_i = pyjit.jitcode.num_regs_i() as usize + pyjit.jitcode.constants_i.len();
         let total_r = pyjit.jitcode.num_regs_r() as usize + pyjit.jitcode.constants_r.len();
         assert!(
-            total_i <= 256 && total_r <= 256 && code_len <= 0xFFFF,
+            total_i <= 256
+                && total_r <= 256
+                && code_len <= majit_jitcode::jitcode::LABEL_TARGET_MAX,
             "try/except portal must assemble: units={} merges={} code_len={} total_i={} total_r={}",
             code.instructions.len(),
             merges,
@@ -21619,7 +21606,7 @@ def f(xs):
             .iter()
             .filter(|op| op.opname == "goto")
             .filter_map(|op| {
-                let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+                let target = majit_jitcode::jitcode::read_label_at(bytes, op.pc + 1);
                 is_arm_shared_entry(bytes, target).then_some(target)
             })
             .collect();
@@ -21697,7 +21684,9 @@ def f(xs):
             code_len
         );
         assert!(
-            total_i <= 256 && total_r <= 256 && code_len <= 0xFFFF,
+            total_i <= 256
+                && total_r <= 256
+                && code_len <= majit_jitcode::jitcode::LABEL_TARGET_MAX,
             "exception_metadata_jitstress.run must assemble: units={} code_len={} total_i={} total_r={}",
             code.instructions.len(),
             code_len,

@@ -38,13 +38,21 @@ fn vable_static_int<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, name: &str) ->
 /// (`hold_uses_vable_last_instr`).  `pmg_shared` does not write
 /// `last_instr`, so a pmg hold leaves orgpc on the entering opcode's
 /// `live_before` py.
-fn shared_hook_next_instr<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+pub(super) fn shared_hook_next_instr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<usize> {
     let session = ctx.session.borrow();
     if !session.hold_opcode_live_before || !session.hold_uses_vable_last_instr {
         return None;
     }
+    // The shared copy has no single Python PC. The active MIFrame's
+    // merge green names its entering instruction, including inlined frames;
+    // the root virtualizable's last_instr belongs only to the root frame.
+    let entering_pc = session.current_debug_merge_point_py_pc();
     drop(session);
-    vable_static_int(ctx, "last_instr").map(|n| n as usize)
+    entering_pc
+        .map(|pc| pc as usize)
+        .or_else(|| vable_static_int(ctx, "last_instr").map(|n| n as usize))
 }
 
 /// Register banks frozen when the walk entered the shared

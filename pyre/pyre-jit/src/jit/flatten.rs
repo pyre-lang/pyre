@@ -1336,11 +1336,9 @@ pub struct GraphFlattener<'a> {
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
-    /// `(frame, next_instr, pycode, profiled)` registers of the one
-    /// out-of-line `get_is_being_profiled` + `promote_greens` block.
-    /// Recorded from the first `portal_merge_greens` copy; later copies
-    /// must resolve to the same four.
-    portal_merge_regs: Option<(Register, Register, Register, Register)>,
+    /// Registers of the shared `get_is_being_profiled` / `promote_greens`
+    /// block. A per-code Constant pycode has no register to promote.
+    portal_merge_regs: Option<(Register, Register, Option<Register>, Register)>,
     /// RED registers of every `jit_merge_point` (Int, Ref, Float lists
     /// in that order). Recorded from the first copy; later copies must
     /// share the same list. Forced alive on `pmg_shared` `-live-`
@@ -1349,11 +1347,11 @@ pub struct GraphFlattener<'a> {
     /// `(next_instr, body_label)` so the shared block can switch back
     /// after promoting the greens.
     portal_merge_bodies: Vec<(i64, String)>,
-    /// `(frame, next_instr, ec)` registers of the one out-of-line
+    /// `(frame, next_instr, ec, last_instr)` registers of the one out-of-line
     /// `dispatch_bytecode` jitted arm. Recorded from the first
     /// `dispatch_bytecode_jitted_arm` copy; later copies must resolve
-    /// to the same three.
-    dispatch_arm_regs: Option<(Register, Register, Register)>,
+    /// to the same four.
+    dispatch_arm_regs: Option<(Register, Register, Register, Register)>,
     /// `bytecode_only_trace` fn_idx from the first copy.
     dispatch_arm_fn_idx: Option<i64>,
     /// Calldescr of that residual (`CallFlavor::MayForce`).
@@ -1620,7 +1618,7 @@ impl<'a> GraphFlattener<'a> {
             None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing next_instr"),
         };
         let pycode = match op.args.get(2) {
-            Some(arg) => self.expect_portal_merge_reg(arg, "pycode"),
+            Some(arg) => self.flatten_arg(arg),
             None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing pycode"),
         };
         let profiled = match &op.result {
@@ -1629,7 +1627,13 @@ impl<'a> GraphFlattener<'a> {
                 "{OPNAME_PORTAL_MERGE_GREENS} result must be the profiled Variable, got {other:?}"
             ),
         };
-        let regs = (frame, next_instr, pycode, profiled);
+        // `jtransform.py promote_greens` skips a Constant pycode.
+        let pycode_reg = match &pycode {
+            Operand::Register(reg) => Some(*reg),
+            Operand::ConstRef(_) => None,
+            other => panic!("portal pycode green must be Ref, got {other:?}"),
+        };
+        let regs = (frame, next_instr, pycode_reg, profiled);
         match self.portal_merge_regs {
             None => self.portal_merge_regs = Some(regs),
             Some(first) => {
@@ -1655,7 +1659,7 @@ impl<'a> GraphFlattener<'a> {
             vec![
                 Operand::Register(frame),
                 Operand::Register(next_instr),
-                Operand::Register(pycode),
+                pycode,
                 Operand::TLabel(TLabel::new(body_name)),
             ],
             profiled,
@@ -1762,11 +1766,14 @@ impl<'a> GraphFlattener<'a> {
             profiled,
         ));
         self.emitline(Insn::Label(Label::new(SHARED_PMG_JOIN_LABEL)));
-        for (opname, green) in [
+        let mut greens = vec![
             ("int_guard_value", Operand::Register(next_instr)),
             ("int_guard_value", Operand::Register(profiled)),
-            ("ref_guard_value", Operand::Register(pycode)),
-        ] {
+        ];
+        if let Some(pycode) = pycode {
+            greens.push(("ref_guard_value", Operand::Register(pycode)));
+        }
+        for (opname, green) in greens {
             self.emitline(Insn::live(live_reds.clone()));
             self.emitline(Insn::op(opname, vec![green]));
         }
@@ -1820,7 +1827,11 @@ impl<'a> GraphFlattener<'a> {
             Some(arg) => self.flatten_arg(arg),
             None => panic!("{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing calldescr"),
         };
-        let regs = (frame, next_instr, ec);
+        let last_instr = match op.args.get(5) {
+            Some(arg) => self.expect_dispatch_arm_reg(arg, "last_instr"),
+            None => panic!("dispatch_bytecode missing last_instr"),
+        };
+        let regs = (frame, next_instr, ec, last_instr);
         match self.dispatch_arm_regs {
             None => {
                 self.dispatch_arm_regs = Some(regs);
@@ -1850,6 +1861,7 @@ impl<'a> GraphFlattener<'a> {
                 Operand::Register(frame),
                 Operand::Register(next_instr),
                 Operand::Register(ec),
+                Operand::Register(last_instr),
                 Operand::TLabel(TLabel::new(body_name)),
             ],
         ));
@@ -1868,7 +1880,7 @@ impl<'a> GraphFlattener<'a> {
 
     /// One `dispatch_bytecode` jitted arm per jitcode that has instruction
     /// starts (`pyopcode.py dispatch_bytecode`). `last_instr` is stored
-    /// from the `next_instr` register (`setfield_vable_i/rid`, the
+    /// from the normalized opcode register (`setfield_vable_i/rid`, the
     /// register form of `jtransform.py` rewrite_op_setfield), then the
     /// debugdata / `w_f_trace` diamonds and the MayForce residual
     /// `bytecode_only_trace`. No `catch_exception`: a raise from the
@@ -1876,7 +1888,7 @@ impl<'a> GraphFlattener<'a> {
     /// ExitFrameWithExceptionRef`) and `handle_bytecode` /
     /// `handle_operation_error` looks up the table by `last_instr`.
     fn emit_shared_dispatch_arm(&mut self) {
-        let Some((frame, next_instr, ec)) = self.dispatch_arm_regs.take() else {
+        let Some((frame, next_instr, ec, last_instr)) = self.dispatch_arm_regs.take() else {
             return;
         };
         let Some(fn_idx) = self.dispatch_arm_fn_idx.take() else {
@@ -1895,18 +1907,20 @@ impl<'a> GraphFlattener<'a> {
             Operand::Register(ec),
             Operand::Register(next_instr),
         ];
+        let mut entry_live = live_reds_and_pc.clone();
+        entry_live.push(Operand::Register(last_instr));
         let debugdata_dst = self.alloc_scratch_reg(Kind::Ref);
         let f_trace_dst = self.alloc_scratch_reg(Kind::Ref);
         self.emitline(Insn::Label(Label::new(SHARED_ARM_LABEL)));
         // `liveness.py` args-on-`-live-`: portal reds plus the
         // `next_instr` green. Operand-stack colors stay in the
         // virtualizable (`interp_jit.py` reds `frame, ec`).
-        self.emitline(Insn::live(live_reds_and_pc.clone()));
+        self.emitline(Insn::live(entry_live));
         self.emitline(Insn::op(
             "setfield_vable_i",
             vec![
                 Operand::Register(frame),
-                Operand::Register(next_instr),
+                Operand::Register(last_instr),
                 Operand::descr_vable_static_field(ARM_LAST_INSTR_FIELD_IDX),
             ],
         ));
@@ -2830,7 +2844,11 @@ impl<'a> GraphFlattener<'a> {
     /// stacking one Rust frame per canraise block.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
-        let mut work = vec![FlattenWork::Block(self.graph.startblock.clone(), false, None)];
+        let mut work = vec![FlattenWork::Block(
+            self.graph.startblock.clone(),
+            false,
+            None,
+        )];
         while let Some(item) = work.pop() {
             match item {
                 FlattenWork::Block(block, handling_ovf, incoming) => {

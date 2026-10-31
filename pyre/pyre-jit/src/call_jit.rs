@@ -335,6 +335,7 @@ mod tests {
         // runs `execute_frame`'s `return_trace` then `leave`. This helper
         // must not emit `leaveframe` or close `topframeref` itself.
         std::thread::spawn(|| {
+            pyre_interpreter::test_hooks::install_hash_hook();
             let mut ec = pyre_interpreter::PyExecutionContext::default();
             pyre_interpreter::call::set_last_exec_ctx(&mut ec);
             let mut child = stack_pyframe();

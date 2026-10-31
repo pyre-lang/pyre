@@ -2024,10 +2024,13 @@ fn store_inline_frame_debugdata(
         InlineFrameDebugdata::Null => ctx.const_ref(0),
         InlineFrameDebugdata::Override => emit_new_frame_debug_data_inline(ctx, pycode, w_globals),
     };
-    let debugdata_descr = crate::descr::pyframe_debugdata_descr();
-    let debugdata_idx = debugdata_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, debugdata], debugdata_descr);
-    ctx.heapcache_setfield_cached(new_frame, debugdata_idx, debugdata);
+    // The inline frame already has a live allocation. `pyjitpl.py`
+    // executes the constructor store as well as recording it.
+    ctx.execute_setfield_gc(
+        new_frame,
+        debugdata,
+        crate::descr::pyframe_debugdata_descr(),
+    );
 }
 
 /// The live `PyFrame` `emit_new_pyframe_inline_*` allocated, if the
@@ -2100,9 +2103,7 @@ pub fn bind_emitted_pyframe_locals_array(
 }
 
 fn store_debugdata_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef, value: OpRef) {
-    let idx = descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], descr);
-    ctx.heapcache_setfield_cached(obj, idx, value);
+    ctx.execute_setfield_gc(obj, value, descr);
 }
 
 /// Trace-allocate a `FrameDebugData` whose fields match `FrameDebugData::init`
@@ -2123,7 +2124,11 @@ pub fn emit_new_frame_debug_data_inline(
         frame_debug_data_w_globals_descr, frame_debug_data_w_locals_descr,
     };
 
-    let new_op = ctx.record_op_with_descr(OpCode::New, &[], frame_debug_data_alloc_size_descr());
+    // `pyjitpl.py execute_new` / `execute_and_record`: keep the live
+    // debugdata object alongside the frame that will read its namespace.
+    let descr = frame_debug_data_alloc_size_descr();
+    let concrete = ctx.execute_new_allocation(&descr, false);
+    let new_op = ctx.execute_and_record(None, OpCode::New, Some(descr), &[], concrete, 0);
     ctx.heap_cache_mut().new_object(new_op);
 
     let null_ref = ctx.const_ref(0);

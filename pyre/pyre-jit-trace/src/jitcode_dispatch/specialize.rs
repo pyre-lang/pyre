@@ -6361,7 +6361,12 @@ fn newbool_fail_resume_from_marker(
     if overlay_fail && !containing_produces_bool {
         return None;
     }
-    let resume_py_u = resume_py as u32;
+    // `interp_jit.py PyFrame.dispatch` keys the merge by the logical
+    // instruction start; `pyopcode.py dispatch_bytecode` consumes its
+    // EXTENDED_ARG prefix inside that step. Trivia skipping above found the
+    // real opcode, whose PC has no separate merge. Keep the prefix coordinate
+    // or a long fail-arm jump falls back to the completed producer's merge.
+    let resume_py_u = pyre_interpreter::pyopcode::instruction_logical_start(code, resume_py) as u32;
     // Prefer the fail-arm opcode's own op3 `-live-`. A loop-exit LOAD
     // after `JUMP_BACKWARD` can miss `py_floor` when that PC is only
     // reached by the jump arm; blackhole can still CRN from the

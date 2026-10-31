@@ -913,6 +913,7 @@ fn descr_refs_for_jitcode_index(jitcode_index: usize) -> &'static [DescrRef] {
 struct SharedDispatchPending {
     arm: bool,
     pmg: bool,
+    int_greens: usize,
 }
 
 impl SharedDispatchPending {
@@ -920,6 +921,7 @@ impl SharedDispatchPending {
         Self {
             arm: false,
             pmg: false,
+            int_greens: 0,
         }
     }
 
@@ -928,14 +930,22 @@ impl SharedDispatchPending {
     /// dispatch. Other ops update the pending flags and return `None`.
     fn on_op(&mut self, d: &DecodedOp) -> Option<bool> {
         if d.opname.starts_with("switch") {
-            let ok = self.arm || self.pmg;
+            let ok = self.arm || self.pmg || self.int_greens >= 2;
             self.arm = false;
             self.pmg = false;
+            self.int_greens = 0;
             return Some(ok);
         }
         if d.opname != "live" {
             if d.opname == "setfield_vable_i" {
                 self.arm = true;
+            }
+            // `jtransform.py promote_greens` skips Constant pycode;
+            // that copy ends in the two Int promotes instead.
+            if d.opname == "int_guard_value" {
+                self.int_greens += 1;
+            } else {
+                self.int_greens = 0;
             }
             self.pmg = d.opname == "ref_guard_value";
         }
@@ -1608,11 +1618,19 @@ pub(crate) fn exception_string_override_straight_line(
         return false;
     };
     let mut pending = SharedDispatchPending::new();
-    ops.iter().enumerate().all(|(idx, d)| match pending.on_op(d) {
-        Some(ok) => ok,
-        None => !d.opname.starts_with("goto_if_not")
-            || is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d),
-    })
+    ops.iter()
+        .enumerate()
+        .all(|(idx, d)| match pending.on_op(d) {
+            Some(ok) => ok,
+            None => {
+                !d.opname.starts_with("goto_if_not")
+                    || is_load_fast_unbound_check_goto(
+                        body_code,
+                        previous_non_live_op(&ops, idx),
+                        d,
+                    )
+            }
+        })
 }
 
 /// The un-lowered helper a descent into this jitcode body can reach on a path
@@ -11605,39 +11623,35 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .get(callee_portal_frame_reg as usize)
                     .expect("ref register in range");
             }
-            {
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                if !try_multiframe {
-                    shadow.fold_frame_reg = callee_portal_frame_reg;
-                }
-                // The fold's premise (`setarrayitem_vable_via_metainterp`) is
-                // that it writes away from an UNSEEDED portal frame — a pure
-                // SSA mirror with no heap array behind it.  The seed block
-                // above may have materialized a real callee `PyFrame`, whose
-                // `NewArrayClear` locals array is stored into only for the
-                // parameters and freevar cells; folding away the in-callee
-                // STORE_FASTs would leave every other local holding the
-                // zero-fill, and a frame reachable afterwards through a
-                // traceback, `f_locals` or `sys._getframe` reads them as
-                // unbound.  Record that here so the store handler demotes just
-                // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
-                // what `_opimpl_setarrayitem_vable` does for a
-                // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
-                // those stores also emits the promote guard in
-                // `vable_getfield_*` (`pyjitpl.py`), whose resume
-                // image must include the paused caller frame
-                // (`opencoder.py capture_resumedata`). Every admitted inline
-                // now carries one, so the remaining question is only whether
-                // the callee's own frame reds were seeded; an unseeded callee
-                // keeps folding.
-                // A `try_multiframe` level seeds the same real `PyFrame`; its
-                // flag arms the post-residual live-array read in
-                // `getarrayitem_vable_via_metainterp`, the nonstandard
-                // `_opimpl_getarrayitem_vable` executing against the frame the
-                // residual wrote (`pyjitpl.py`).
-                shadow.frame_materialized = callee_frame_materialized_has_resume;
+            if !try_multiframe {
+                shadow.fold_frame_reg = callee_portal_frame_reg;
             }
+            // The fold's premise (`setarrayitem_vable_via_metainterp`) is
+            // that it writes away from an UNSEEDED portal frame — a pure
+            // SSA mirror with no heap array behind it.  The seed block
+            // above may have materialized a real callee `PyFrame`, whose
+            // `NewArrayClear` locals array is stored into only for the
+            // parameters and freevar cells; folding away the in-callee
+            // STORE_FASTs would leave every other local holding the
+            // zero-fill, and a frame reachable afterwards through a
+            // traceback, `f_locals` or `sys._getframe` reads them as
+            // unbound.  Record that here so the store handler demotes just
+            // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
+            // what `_opimpl_setarrayitem_vable` does for a
+            // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
+            // those stores also emits the promote guard in
+            // `vable_getfield_*` (`pyjitpl.py`), whose resume
+            // image must include the paused caller frame
+            // (`opencoder.py capture_resumedata`). Every admitted inline
+            // now carries one, so the remaining question is only whether
+            // the callee's own frame reds were seeded; an unseeded callee
+            // keeps folding.
+            // A `try_multiframe` level seeds the same real `PyFrame`; its
+            // flag arms the post-residual live-array read in
+            // `getarrayitem_vable_via_metainterp`, the nonstandard
+            // `_opimpl_getarrayitem_vable` executing against the frame the
+            // residual wrote (`pyjitpl.py`).
+            shadow.frame_materialized = callee_frame_materialized_has_resume;
         }
         for i in 0..seeded_locals {
             let slot = i as i64;
@@ -17588,6 +17602,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         pjc.loop_scan(),
         resume_marker,
     ) && let Some(&pycode_color) = gr.first()
+        && (pycode_color as usize) < pjc.jitcode.num_regs_r() as usize
     {
         let w_code_obj = pyre_object::gc_roots::shadow_stack_get(code_root);
         let pycode_box = ctx.trace_ctx.const_ref(w_code_obj as i64);

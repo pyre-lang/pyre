@@ -816,35 +816,9 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 .vstack_boxes
                 .resize(new_depth, OpRef::NONE);
         }
-        VstackOpClass::MultiResultFromShadow
-        | VstackOpClass::LoadSpecialMethod
-        | VstackOpClass::LoadSuperAttrMethod => {
-            // UNPACK_* pops ONE sequence (at `prev_depth - 1`) and pushes its
-            // elements upward.  Clear only the affected range
-            // `[pop_point .. new_depth)` to NONE so the hole-fill below
-            // sources each pushed element from the shadow (all were written
-            // through `setarrayitem_vable_r`); slots BELOW the popped sequence
-            // keep their mirror-tracked boxes.
-            //
-            // LOAD_SPECIAL has that same shape but its second push is the
-            // call's `self_or_null` slot, a live NULL for the bound method it
-            // just resolved.  The shadow cannot give that slot back:
-            // `reseed_vstack_from_shadow` reads a dense array in which an
-            // absent slot and a written NULL are the same word, so it rejects
-            // NULL and the slot stays a NONE hole `stack_sync` omits.  A
-            // blackhole resuming into the `WITH_EXCEPT_START` that reads it
-            // then sees whatever the slot held before — the bound `__exit__`
-            // this same opcode pushed one slot below — and calls it with the
-            // receiver twice.  Stamp the constant, as the method-form
-            // LOAD_GLOBAL arm above does for the other callable/NULL pair.
-            //
-            // Method-form LOAD_SUPER_ATTR pops three and pushes two (`func`,
-            // `self`); both pushed slots are already in the shadow, so clear
-            // `[new_depth - 2 .. new_depth)` and leave `trailing_null` unset.
-            let trailing_null = match effective_class {
-                VstackOpClass::LoadSpecialMethod => Some(ctx.trace_ctx.const_null()),
-                _ => None,
-            };
+        VstackOpClass::MultiResultFromShadow | VstackOpClass::LoadSuperAttrMethod => {
+            // Method-form LOAD_SUPER_ATTR pops three and pushes two; both
+            // results are read from this frame's virtualizable shadow.
             let pop_point = if matches!(effective_class, VstackOpClass::LoadSuperAttrMethod) {
                 new_depth.saturating_sub(2)
             } else {

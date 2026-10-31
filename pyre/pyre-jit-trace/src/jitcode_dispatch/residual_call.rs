@@ -6061,6 +6061,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 ctx.fbw_mode
                     .inline_caller_py_pc
                     .unwrap_or(ctx.vstack_cur_pypc)
+            } else if shared_hook_next_instr(ctx).is_some() {
+                live_py_pc_from_snapshot(ctx, op_pc).unwrap_or(ctx.vstack_cur_pypc)
             } else {
                 ctx.vstack_cur_pypc
             };
@@ -7431,6 +7433,13 @@ pub(super) fn inline_callee_py_pc<Sym: WalkSym>(
 ) -> Option<u32> {
     let consts = ctx.inline_callee_consts?;
     let pjc = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+    if let Some(py_pc) = shared_hook_next_instr(ctx) {
+        return Some(if pjc.code_ptr.is_null() {
+            py_pc as u32
+        } else {
+            skip_python_trivia_forward(unsafe { &*pjc.code_ptr }, py_pc) as u32
+        });
+    }
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
         &pjc.metadata,
         jit_pc,
@@ -7450,6 +7459,13 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    if let Some(py_pc) = shared_hook_next_instr(ctx) {
+        return Some(if jc.payload.code_ptr.is_null() {
+            py_pc as u32
+        } else {
+            skip_python_trivia_forward(unsafe { &*jc.payload.code_ptr }, py_pc) as u32
+        });
+    }
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
         &jc.payload.metadata,
         jit_pc,
@@ -7478,7 +7494,8 @@ pub(crate) fn maybe_record_inline_callee_last_instr<Sym: WalkSym>(
         return;
     }
 
-    let callee_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
+    let callee_py_pc =
+        inline_callee_py_pc(ctx, jit_pc).expect("inline callee metadata was resolved above");
     let last_instr = ctx.trace_ctx.const_int(callee_py_pc as i64);
     let last_instr_descr = crate::descr::pyframe_next_instr_descr();
     let last_instr_idx = last_instr_descr.index();
@@ -7502,7 +7519,8 @@ pub(super) fn maybe_publish_inline_callee_last_instr_concrete<Sym: WalkSym>(
         return;
     };
     let frame_reg = pjc.metadata.portal_frame_reg as usize;
-    let callee_py_pc = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc);
+    let callee_py_pc =
+        inline_callee_py_pc(ctx, jit_pc).expect("inline callee metadata was resolved above");
     // The walker is the recording-time interpreter.  Keep the concrete
     // MIFrame in step with the emitted store just as
     // `fbw_publish_exit_last_instr` does for the portal frame; otherwise a
@@ -10861,7 +10879,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
             // publish `last_instr` from the last opcode's floor.
             ctx.live_after_jit_pc = resume_after;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+            capture_residual_guard_at(ctx, op.pc, snapshot_pc, false)?;
             flush_pending_residual_locals_adopt(ctx);
         }
         // `metainterp.handle_possible_exception()` —
