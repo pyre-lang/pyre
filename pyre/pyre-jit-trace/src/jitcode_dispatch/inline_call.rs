@@ -16685,10 +16685,12 @@ pub(crate) struct GeneratorResumeCensus {
     /// hook against the ones a straight-line resume would already serve.
     ///
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
-    /// `loop_header` op (`interp_jit.py` `jump_absolute`). Generator
-    /// `merge_entry_by_green` is still `find_loop_header_pcs` plus function
-    /// entry and is built for every code object. True-portal tables also
-    /// list instruction-start greens (`interp_jit.py PyFrame.dispatch`);
+    /// `loop_header` op. Per-fn jitcodes emit that op for every body
+    /// (`interp_jit.py PyFrame.jump_absolute`). The census still uses
+    /// `merge_entry_by_green` (`find_loop_header_pcs` plus function entry)
+    /// because that is the Python-level header, including function entry, not
+    /// the lowered back-edge op. True-portal tables also list
+    /// instruction-start greens (`interp_jit.py PyFrame.dispatch`);
     /// generators do not.
     owns_loop_header: bool,
     /// `n_py_instrs`, so a `NoResumeEntry` naming an out-of-range coordinate is
@@ -17396,13 +17398,18 @@ fn walk_generator_resume<Sym: WalkSym>(
     // compiled resume has to as well, before anything reads the frame back.
     let resumed_depth = unsafe { (*gen_frame).valuestackdepth.saturating_sub(1) };
     publish_generator_slot_null(ctx, gen_frame as usize, frame_box, resumed_depth);
-    ctx.fbw_mode.generator_resume = Some(GeneratorResumeSubwalk {
+    let resume = GeneratorResumeSubwalk {
         frame: gen_frame as usize,
+        w_pycode: shape.w_pycode as usize,
         frame_box,
         yield_marker_jit_pc: yield_marker,
         yield_py_pc: shape.last_instr as u32,
-        unroll_iterations: 1,
-    });
+    };
+    // This walk frame's own pycode (`MIFrame.setup(jitcode)`). Nested
+    // helper / Python-callee frames do not inherit it: they pass 0 or
+    // store their own code on their `WalkFrameStateData`.
+    let inline_w_code = resume.w_pycode;
+    ctx.fbw_mode.generator_resume = Some(resume);
     let ec_box = ctx
         .trace_ctx
         .const_ref(pyre_interpreter::call::getexecutioncontext() as i64);
@@ -17470,6 +17477,7 @@ fn walk_generator_resume<Sym: WalkSym>(
         &[],
         &[],
         &extra_ref_seeds,
+        inline_w_code,
     );
 
     ctx.fbw_mode = saved_fbw_mode;
@@ -20729,6 +20737,7 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         ref_arg_concretes,
         float_args,
         &[],
+        0,
     )
 }
 
@@ -20760,6 +20769,12 @@ fn setup_call_ref_concrete<Sym: WalkSym>(
 /// not at function entry, and needs the portal frame / ec colors plus the
 /// live locals the resume block reads.  `extra_ref_seeds` is `(reg, box,
 /// concrete)` — later entries overwrite earlier ones at the same color.
+///
+/// `inline_w_code` is this walk frame's `W_Code`. `walk_generator_resume`
+/// passes the generator body's pycode so merge points read
+/// `WalkFrameStateData.inline_w_code` (`MIFrame.setup(jitcode)`). Every
+/// other caller passes 0: a Python callee already stores its own code on
+/// its `WalkFrameStateData`, and a helper has none.
 pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     ctx: &mut WalkContext<'frame, 'a, Sym>,
     pc: usize,
@@ -20771,6 +20786,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
     extra_ref_seeds: &[(usize, OpRef, ConcreteValue)],
+    inline_w_code: usize,
 ) -> Result<DispatchOutcome, DispatchError> {
     // A parent frame re-enters its inline_call opcode after the explicit
     // driver popped the callee. Consume that result before allocating or
@@ -20909,6 +20925,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         vstack_boxes: Vec::new(),
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_saved: None,
+        inline_w_code,
         ..Default::default()
     });
     super::vable_ops::push_helper_live(

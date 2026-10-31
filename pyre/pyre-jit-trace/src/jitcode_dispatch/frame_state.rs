@@ -115,9 +115,17 @@ pub struct WalkFrameStateData {
     /// Inlined callee's `Function.w_func_globals_obj`.  Zero outside an
     /// inline sub-walk.  `walk_frame_state_roots` forwards it.
     pub inline_w_globals: usize,
-    /// Inlined callee's `W_Code`.  Zero outside an inline sub-walk.  Same
+    /// This walk frame's `W_Code`. Zero outside an inline sub-walk (and
+    /// outside a generator-resume body). Nested Python inlines store the
+    /// callee's code here; `walk_generator_resume` stores the generator
+    /// body's code so merge points read the current frame
+    /// (`MIFrame.setup(jitcode)`). Nested helpers leave it zero. Same
     /// forwarding contract as [`Self::inline_w_globals`].
     pub inline_w_code: usize,
+    /// pyjitpl.py `MIFrame.unroll_iterations = 1` at `setup`. One counter per
+    /// inlined Python walk frame (`WalkFrameStateData` is created for each
+    /// inlined callee and for generator resume in `run_sub_jitcode_walk_from`).
+    pub unroll_iterations: usize,
 }
 
 impl Default for WalkFrameStateData {
@@ -133,6 +141,7 @@ impl Default for WalkFrameStateData {
             concrete_registers_r: Vec::new(),
             inline_w_globals: 0,
             inline_w_code: 0,
+            unroll_iterations: 1,
         }
     }
 }

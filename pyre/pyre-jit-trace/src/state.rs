@@ -5149,6 +5149,25 @@ pub(crate) fn frame_array_write_barrier(
     }
 }
 
+/// Consume-stream virtualizable identity.
+///
+/// `resume.py consume_vable_info` does `virtualizable = self.next_ref()` and
+/// `virtualizable.py write_from_resume_data_partial` / `write_boxes` write
+/// into that object. The consume layout is `[vable, statics, array...]`
+/// (`consume_vref_and_vable_boxes`), so identity is index 0. Re-reads the
+/// `OwnerRootGuard` consume pinned; a copied `Value` is not a root.
+fn resume_decoded_vable_addr(boxes: &majit_metainterp::VrefVableBoxes) -> usize {
+    let fallback = boxes
+        .virtualizable_boxes
+        .first()
+        .map(|&(_, v)| v)
+        .unwrap_or(majit_ir::Value::Void);
+    match boxes.live_vable(0, fallback) {
+        majit_ir::Value::Ref(g) => g.as_usize(),
+        _ => 0,
+    }
+}
+
 /// Write one decoded Ref back into the live frame's locals_cells_stack_w
 /// (the GC-rooted virtualizable array), re-asserting the resume-decoded
 /// vable image after the guard-failure vsd correction cleared root slots
@@ -11037,21 +11056,16 @@ impl JitState for PyreJitState {
         // `JitDriver::merge_point` sequencing parity: `start_bridge_tracing`
         // calls `create_sym` → `initialize_sym` → `setup_bridge_sym` BEFORE
         // `trace_bytecode` (which is where `init_symbolic` would otherwise
-        // populate `concrete_vable_ptr`). `setup_bridge_sym` reads
-        // `sym.concrete_vable_ptr` to size the vable shadow via
-        // `concrete_frame_array_len`; without this seed the pointer is
-        // null, the helper falls back to `nlocals`, and stack pushes
-        // beyond the first array slot panic at `set_virtualizable_entry_at`
-        // on recursive benchmarks (fib_recursive). Mirror PyreJitState's
-        // live frame pointer so the bridge seed sees the real
-        // `locals_cells_stack_w` length.
-        //
-        // Plant the live-vable owner root before `setup_bridge_sym`
-        // decodes resume boxes (those allocations collect). A raw copy
-        // of `self.frame` is a nursery corpse after a 4 KiB minor
-        // (`store_live_frame_array_slot` then sees a null array).
+        // populate `concrete_vable_ptr`). Loop entry copies the interpreter
+        // red (`#[vable(frame)]`); `trace.rs` publishes the live frame via
+        // `set_live_vable_frame_addr` before `init_symbolic`. Bridge
+        // write-back dest is not this copy: `setup_bridge_sym` sets
+        // `concrete_vable_ptr` / `publish_live_vable_frame` from
+        // `boxes.live_vable(0)` (`resume.py consume_vable_info` `next_ref()`,
+        // consume layout `[vable, statics, array...]`). Do not follow or pin
+        // the copy: after a minor the nursery slot may already hold a new
+        // occupant.
         sym.concrete_vable_ptr = self.frame as *mut u8;
-        sym.set_live_vable_frame_addr(self.frame);
         sym.concrete_execution_context =
             self.execution_context as *const pyre_interpreter::PyExecutionContext;
     }
@@ -11368,6 +11382,19 @@ impl JitState for PyreJitState {
                 vvals.len(),
                 "consume_vref_and_vable_boxes decoded the virtualizable stream"
             );
+            // resume.py `consume_vable_info`: `virtualizable = self.next_ref()`.
+            // pyjitpl.py `synchronize_virtualizable` writes through
+            // `virtualizable_boxes[-1]`; the consume stream is still
+            // `[vable, statics, array...]`, so identity is `live_vable(0)`.
+            // Pin that object (`OwnerRootGuard`) and publish it as the
+            // TraceCtx heap pointer before write-back. Re-read at each use:
+            // a copied `Value` is not a root.
+            let resume_vable = resume_decoded_vable_addr(boxes);
+            if resume_vable != 0 {
+                sym.publish_live_vable_frame(resume_vable);
+                sym.concrete_vable_ptr = resume_vable as *mut u8;
+                ctx.set_virtualizable_heap_ptr(resume_vable as *const u8);
+            }
             for (idx, &(op, val)) in boxes.virtualizable_boxes.iter().enumerate() {
                 // `resume.py` `load_box_from_cpu` / `consume_boxes`: the
                 // decoded GCREF lives in a traced local. `live_vable` re-reads
@@ -11377,7 +11404,7 @@ impl JitState for PyreJitState {
                 let live = boxes.live_vable(idx, ctx.lookup_opref_concrete(op).unwrap_or(val));
                 if idx >= vable_array_start {
                     store_live_frame_array_slot(
-                        sym.vable_frame_for_array(),
+                        resume_decoded_vable_addr(boxes),
                         idx - vable_array_start,
                         live,
                     );
@@ -11386,10 +11413,6 @@ impl JitState for PyreJitState {
                 concrete_values.push(live);
             }
             sym.restore_inputarg_oprefs(&oprefs, first_vable_scalar_idx);
-            let vable_ref_value = concrete_values
-                .first()
-                .copied()
-                .unwrap_or(majit_ir::Value::Void);
             let vable_scalar_values: Vec<majit_ir::Value> = concrete_values
                 .iter()
                 .skip(first_vable_scalar_idx)
@@ -11637,7 +11660,7 @@ impl JitState for PyreJitState {
                 // copy whose `Ref`s a collection has since moved.  See
                 // `live_frame_array_values`.
                 let live_local_values = live_frame_array_values(
-                    sym.vable_frame_for_array(),
+                    resume_decoded_vable_addr(boxes),
                     usize::MAX,
                     &vable_array_values,
                 );
@@ -12002,7 +12025,7 @@ impl JitState for PyreJitState {
                 // size — `metadata.stack_base + metadata.max_stackdepth` is the
                 // same `nlocals + ncells + max_stackdepth` the codewriter
                 // committed to and `PyFrame::__init__` allocates.
-                let bridge_array_len = concrete_frame_array_len(sym.vable_frame_for_array())
+                let bridge_array_len = concrete_frame_array_len(resume_decoded_vable_addr(boxes))
                     .or_else(|| {
                         METAINTERP_SD.with(|r| {
                             let sd = r.borrow();
@@ -12027,18 +12050,17 @@ impl JitState for PyreJitState {
                 // during bridge setup (residual virtual materialization / op recording
                 // allocates) moves the referenced objects but cannot forward the
                 // off-heap decode Vec, leaving dangling pointers that crash the walk's
-                // getarrayitem_vable. The live frame (`sym.concrete_vable_ptr`,
-                // restored by `decode_and_restore_guard_failure`) sits on the
-                // CURRENT_FRAME chain, so `walk_pyframe_roots` forwards its
-                // `locals_cells_stack_w` items on every collection — its slots are
-                // always live. Read them directly, mirroring the root-trace seed
+                // getarrayitem_vable. The dest is the consume identity
+                // (`resume.py consume_vable_info` `next_ref()`,
+                // `boxes.live_vable(0)`), pinned across that collection.
+                // Read its slots directly, mirroring the root-trace seed
                 // (`read_boxes` from the rooted portal frame). Falls back to the
                 // decoded values only when no live pointer is bound (unit-test /
                 // init-before-run). The seed helper pads short arrays with const-NULL
                 // OpRef; match that here by padding concrete values with
                 // Value::Ref(GcRef::NULL) to the same length.
                 let live_array_values = live_frame_array_values(
-                    sym.vable_frame_for_array(),
+                    resume_decoded_vable_addr(boxes),
                     bridge_array_len,
                     &vable_array_values,
                 );
@@ -12079,7 +12101,7 @@ impl JitState for PyreJitState {
                             if !matches!(value, majit_ir::Value::Void) {
                                 bridge_array_values[slot] = value;
                                 store_live_frame_array_slot(
-                                    sym.vable_frame_for_array(),
+                                    resume_decoded_vable_addr(boxes),
                                     slot,
                                     value,
                                 );
@@ -12109,6 +12131,20 @@ impl JitState for PyreJitState {
                     Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
                 concrete_values.extend_from_slice(&vable_scalar_values);
                 concrete_values.extend_from_slice(&bridge_array_values);
+                // virtualizable.py `load_list_of_boxes` appends the vable box
+                // last; pyjitpl.py `synchronize_virtualizable` then writes
+                // through `virtualizable_boxes[-1]`. Heap pointer is the
+                // consume identity (`resume.py consume_vable_info` `next_ref()`),
+                // re-read here. After this seed, readers use
+                // `TraceCtx::standard_virtualizable_ptr()`.
+                let vable_ref_value = boxes.live_vable(
+                    0,
+                    boxes
+                        .virtualizable_boxes
+                        .first()
+                        .map(|&(_, v)| v)
+                        .unwrap_or(majit_ir::Value::Void),
+                );
                 crate::state::seed_virtualizable_boxes(
                     ctx,
                     sym.frame,
@@ -12117,8 +12153,18 @@ impl JitState for PyreJitState {
                     &bridge_array_items,
                     bridge_array_len,
                     &concrete_values,
-                    sym.vable_frame_for_array() as *const u8,
+                    resume_decoded_vable_addr(boxes) as *const u8,
                 );
+                // Seed may allocate; re-read the consume identity onto the
+                // host root and TraceCtx heap pointer. Readers after this
+                // use `virtualizable_boxes[-1]`
+                // (`TraceCtx::standard_virtualizable_ptr`).
+                let resume_vable = resume_decoded_vable_addr(boxes);
+                if resume_vable != 0 {
+                    sym.publish_live_vable_frame(resume_vable);
+                    sym.concrete_vable_ptr = resume_vable as *mut u8;
+                    ctx.set_virtualizable_heap_ptr(resume_vable as *const u8);
+                }
                 // `resume.py` `decode_box`: a slot below the restored depth
                 // that decoded to NULL is `CONST_NULL` (GET_ITER's
                 // index-or-NULL, PUSH_NULL, an unbound local), not an
@@ -12253,7 +12299,7 @@ impl JitState for PyreJitState {
         let restored_top = restored_virtualref_boxes
             .last()
             .map(|&(_, vref_ptr)| vref_ptr)
-            .unwrap_or(sym.vable_frame_for_array());
+            .unwrap_or(resume_decoded_vable_addr(boxes));
         let live_ec = sym.concrete_execution_context as *mut pyre_interpreter::PyExecutionContext;
         if !live_ec.is_null() && restored_top != 0 {
             let published = unsafe { (*live_ec).topframeref };

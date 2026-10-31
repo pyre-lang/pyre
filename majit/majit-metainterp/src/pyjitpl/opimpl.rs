@@ -4550,6 +4550,30 @@ where
                 // the callee's own compiled loop, then
                 // `leave_portal_frame`, then `raise ChangeFrame` to
                 // resume the caller.
+                let green_values: Vec<i64> = mp_green_ints
+                    .iter()
+                    .chain(mp_green_refs.iter())
+                    .chain(mp_green_floats.iter())
+                    .copied()
+                    .collect();
+                // pyjitpl.py opimpl_jit_merge_point:
+                // `jitdriver_sd.warmstate.should_unroll_one_iteration(greenboxes)`
+                // then `return` before finishframe / do_recursive_call.
+                // False when warmstate is not yet installed
+                // (`WarmEnterState.__init__` has not run) or the ptr is None.
+                if ctx
+                    .metainterp_sd()
+                    .jitdrivers_sd
+                    .get(jdindex)
+                    .and_then(|jd| jd.warmstate.as_ref())
+                    .is_some_and(|ws| ws.borrow().should_unroll_one_iteration(&green_values))
+                {
+                    let current = self.frames.current_mut();
+                    if current.unroll_iterations > 0 {
+                        current.unroll_iterations -= 1;
+                        return TraceAction::Continue;
+                    }
+                }
                 //
                 // (1) capture old_frame (the inlined portal callee, top
                 //     of stack) before the pop (pyjitpl.py) so its
@@ -4596,12 +4620,6 @@ where
                 //     CALL_ASSEMBLER recorder. `set_int_reg(result_dst)`
                 //     inside binds the result on the CALLER frame
                 //     (make_result_of_lastop parity, pyjitpl.py).
-                let green_values: Vec<i64> = mp_green_ints
-                    .iter()
-                    .chain(mp_green_refs.iter())
-                    .chain(mp_green_floats.iter())
-                    .copied()
-                    .collect();
                 match self.exec_recursive_call_assembler(
                     ctx,
                     sym,
@@ -4957,14 +4975,12 @@ where
                 // point is registered below and later read by the
                 // segmenting consumers, which install cell flags and
                 // so need a key a chain walk can match, not a bucket.
-                let Some(inner_key_typed) =
-                    ctx.merge_point_green_key(
-                        &mp_green_ints,
-                        &mp_green_refs,
-                        &mp_green_floats,
-                        &mp_green_spec,
-                    )
-                else {
+                let Some(inner_key_typed) = ctx.merge_point_green_key(
+                    &mp_green_ints,
+                    &mp_green_refs,
+                    &mp_green_floats,
+                    &mp_green_spec,
+                ) else {
                     return TraceAction::Continue;
                 };
                 let inner_key = inner_key_typed.get_uhash();

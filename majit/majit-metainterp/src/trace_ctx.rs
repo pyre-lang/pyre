@@ -5417,7 +5417,7 @@ impl TraceCtx {
                 return;
             }
         }
-        let cell = self.virtualizable_heap_ptr;
+        let cell = self.virtualizable_heap_ptr();
         match cell {
             Some(ptr) if !ptr.is_null() && Some(ptr as usize) != identity_before => {
                 let mut target = majit_ir::GcRef(ptr as usize);

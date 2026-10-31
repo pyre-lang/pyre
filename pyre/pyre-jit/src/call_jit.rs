@@ -103,6 +103,25 @@ impl Drop for FrameRoot {
     }
 }
 
+/// Host-side `PyreJitState.frame` after bridge resume decode.
+///
+/// `setup_bridge_sym` publishes the consume identity (`resume.py`
+/// `consume_vable_info` `next_ref()`, `virtualizable_boxes[-1]`) onto
+/// `TraceCtx`. Copy that rooted word so later host readers
+/// (`set_valuestackdepth`) see the live frame. `FrameRoot` is the CA
+/// failarg 0 root, used only when the ctx has no identity yet.
+fn refresh_host_vable_frame(
+    jit_state: &mut pyre_jit_trace::state::PyreJitState,
+    bridge_frame_root: &mut FrameRoot,
+) {
+    let (driver, _) = crate::eval::driver_pair();
+    jit_state.frame = driver
+        .meta_interp_mut()
+        .trace_ctx()
+        .and_then(|c| c.standard_virtualizable_ptr())
+        .unwrap_or_else(|| bridge_frame_root.frame() as *const PyFrame as usize);
+}
+
 // warmspot.py:449 portal result_type == REF: FINISH always boxes via
 // wrapint, so the force/resume paths always receive a boxed Ref.
 // FinishProtocol and normalize_direct_finish_result removed — they
@@ -4236,6 +4255,12 @@ pub fn trace_and_compile_from_bridge(
         return BridgeResolution::ResumeBlackhole;
     }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
+    // `build_meta` reads nlocals / valuestackdepth / slot types off this
+    // host word. It is not the bridge write-back dest: `setup_bridge_sym`
+    // uses `boxes.live_vable(0)` (`resume.py consume_vable_info`
+    // `next_ref()`). Re-read `FrameRoot` after `decode_and_restore`
+    // allocations so those field reads see a live object.
+    jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
     let started = {
         let (driver, _) = crate::eval::driver_pair();
         driver.start_bridge_tracing(
@@ -4262,6 +4287,10 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
+    // `setup_bridge_sym` published the consume identity. Copy it onto the
+    // host state word so later readers during this function see the live
+    // frame, not the pre-`start_bridge_tracing` snapshot.
+    refresh_host_vable_frame(&mut jit_state, &mut bridge_frame_root);
     // resume.py `rebuild_from_resumedata` ran once, inside
     // `start_bridge_tracing` (`rebuild_state_after_failure`); the portal's
     // `jd.mainjitcode` seats the frames (`call.py grab_initial_jitcodes`).
@@ -4383,7 +4412,7 @@ pub fn trace_and_compile_from_bridge(
 
     // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
     // allocate. `set_valuestackdepth` writes through `jit_state.frame`.
-    jit_state.frame = bridge_frame_root.frame() as *const PyFrame as usize;
+    refresh_host_vable_frame(&mut jit_state, &mut bridge_frame_root);
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
