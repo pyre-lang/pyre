@@ -11,11 +11,11 @@
 # already recorded a different first globals used to residualize every
 # call as opaque bh_call_fn; the inline / CALL_ASSEMBLER frame now
 # carries FrameDebugData.w_globals the way PyFrame.__init__ does.
-# `function_entry_may_compile` rejects mid-body portal re-entry after
-# CALL_ASSEMBLER: only the real function entry and loop headers can start
-# entry traces. The shared baseline therefore has one loop and nine bridges,
-# rather than counting the two spurious mid-body entries. PyPy also records
-# one loop for these two namespaces (five bridges in the measured oracle).
+# `ll_portal_runner` consults warmstate at every portal entry, including
+# mid-body greens after CALL_ASSEMBLER. ubuntu/macOS/windows dynasm,
+# cranelift and wasm then record three loops, 17 bridges and 3993 guard
+# failures. PyPy records one loop for these two namespaces (five bridges
+# in the measured oracle).
 import types
 
 SRC = """
