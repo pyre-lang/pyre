@@ -2216,6 +2216,16 @@ pub struct MetaInterp<M: Clone> {
     /// warmspot.py `WarmRunnerDesc.memory_manager`, shared by every
     /// `jitdriver_sd.warmstate` (`warmstate.py set_param_retrace_limit`).
     pub memory_manager: crate::memmgr::MemoryManager,
+    /// The `loop_token` stack locals of the `warmstate.py execute_assembler`
+    /// frames that are currently inside `func_execute_token`, innermost last;
+    /// the GC root walk seeds from them as MiniMark does from those stack
+    /// locals. Not a side table: it is pushed and popped strictly around each
+    /// execute call. Boxed because a residual call inside
+    /// `func_execute_token` re-enters a nested `execute_assembler` on this
+    /// same `MetaInterp` while the outer frame still holds `&mut self`; held
+    /// inline, the outer pop reused the length and buffer it read before the
+    /// call and freed a stale slot.
+    executing_tokens: Box<std::cell::RefCell<Vec<Arc<JitCellToken>>>>,
     /// warmspot.py creates one `cpu` and hands the same object to
     /// `codewriter` / `metainterp_sd`. Boxed so the `BackendImpl` heap
     /// address stays stable across `MetaInterp` moves (`JitDriver { meta }`);
@@ -3141,13 +3151,33 @@ impl<M: Clone> MetaInterp<M> {
         &self.staticdata.virtualref_info
     }
 
-    /// MiniMark traces `MemoryManager.alive_loops` dict values and,
-    /// from each live `JitCellToken`, `_keepalive_jitcell_tokens`.
+    /// Push `token` as the innermost `warmstate.py execute_assembler`
+    /// `loop_token` stack local.
+    fn enter_execute(&mut self, token: &Arc<JitCellToken>) {
+        self.executing_tokens.borrow_mut().push(Arc::clone(token));
+    }
+
+    /// Pop the innermost executing token; it must be `token`.
+    fn leave_execute(&mut self, token: &Arc<JitCellToken>) {
+        let popped = self.executing_tokens.borrow_mut().pop().unwrap();
+        debug_assert!(Arc::ptr_eq(&popped, token));
+    }
+
+    /// MiniMark traces `alive_loops`, every `execute_assembler` frame's
+    /// `loop_token` stack local, and from each `_keepalive_jitcell_tokens`.
     fn live_jitcell_tokens(&self) -> Vec<Arc<JitCellToken>> {
         let mut tokens = Vec::new();
         self.memory_manager.for_each_alive(|token| {
             tokens.push(Arc::clone(token));
         });
+        // `warmstate.py execute_assembler` holds `loop_token` as a stack
+        // local through `func_execute_token`. MiniMark traces that local;
+        // `executing_tokens` is the same root.
+        for token in self.executing_tokens.borrow().iter() {
+            if !tokens.iter().any(|seen| Arc::ptr_eq(seen, token)) {
+                tokens.push(Arc::clone(token));
+            }
+        }
         // `history.py JitCellToken.record_jump_to` keeps the JUMP
         // target alive through `_keepalive_jitcell_tokens` even after
         // its own cell row is gone; follow that set to a fixed point.
@@ -3987,6 +4017,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             jitcounter: crate::warmstate::new_runner_jitcounter(),
             memory_manager: crate::warmstate::new_runner_memory_manager(),
+            executing_tokens: Box::default(),
             backend: Box::new(BackendImpl::new()),
             next_global_opref: 0,
             compiled_graph_minor_scan_pending: true,
@@ -12753,7 +12784,9 @@ impl<M: Clone> MetaInterp<M> {
         let token = self.get_procedure_token_on_driver(0, green_key)?;
 
         Self::prepare_compiled_run_io();
+        self.enter_execute(&token);
         let result = self.backend.execute_token_raw(&token, live_values);
+        self.leave_execute(&token);
         Self::finish_compiled_run_io();
 
         let fail_index = result.fail_index;
@@ -12840,7 +12873,9 @@ impl<M: Clone> MetaInterp<M> {
         let token = self.get_procedure_token_on_driver(0, green_key)?;
 
         Self::prepare_compiled_run_io();
+        self.enter_execute(&token);
         let frame = self.backend.execute_token_ints(&token, live_values);
+        self.leave_execute(&token);
 
         let descr_arc = self.backend.get_latest_descr_arc(&frame);
         let descr: &dyn majit_ir::FailDescr = descr_arc
@@ -12983,23 +13018,19 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// [`Self::run_compiled_detailed_with_values_on_driver`] for a caller
-    /// that already read the cell's token and the metadata it runs under:
+    /// that already read the cell's token:
     /// `warmstate.py maybe_compile_and_run` hands the token it read to
     /// `execute_assembler` without consulting the cell again.
     pub fn run_compiled_detailed_with_token_on_driver(
         &mut self,
         jd_no: usize,
         green_key: u64,
-        token: &JitCellToken,
+        token: &Arc<JitCellToken>,
         live_values: &[Value],
         dispatch_key: u32,
     ) -> CompileResult {
-        let mut result = self.execute_assembler_at_dispatch_key(
-            token,
-            green_key,
-            live_values,
-            dispatch_key,
-        );
+        let mut result =
+            self.execute_assembler_at_dispatch_key(token, green_key, live_values, dispatch_key);
         if let Some(descr_arc) = &result.descr_arc
             && !Self::is_jump_exit(result.is_finish, result.fail_index)
         {
@@ -13107,7 +13138,7 @@ impl<M: Clone> MetaInterp<M> {
     #[inline(never)]
     pub fn execute_assembler_at_dispatch_key(
         &mut self,
-        procedure_token: &JitCellToken,
+        procedure_token: &Arc<JitCellToken>,
         green_key: u64,
         live_values: &[Value],
         dispatch_key: u32,
@@ -13142,11 +13173,13 @@ impl<M: Clone> MetaInterp<M> {
         // leaking into the amplified stages above.
         #[cfg(feature = "__execute-stage-probe")]
         let call_started = (stage_repeats.call_shot != 0).then(std::time::Instant::now);
+        self.enter_execute(procedure_token);
         let frame = self.backend.execute_token_with_dispatch_key(
             procedure_token,
             live_values,
             dispatch_key,
         );
+        self.leave_execute(procedure_token);
         #[cfg(feature = "__execute-stage-probe")]
         if let Some(started) = call_started {
             CALL_SHOT_NS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -13391,10 +13424,12 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Result<i64, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
-        match self
+        self.enter_execute(procedure_token);
+        let outcome = self
             .backend
-            .execute_token_done_int(procedure_token, live_values)
-        {
+            .execute_token_done_int(procedure_token, live_values);
+        self.leave_execute(procedure_token);
+        match outcome {
             Ok(value) => {
                 self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
@@ -13419,10 +13454,12 @@ impl<M: Clone> MetaInterp<M> {
         raw_reds: &[i64],
     ) -> Result<i64, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
-        match self
+        self.enter_execute(procedure_token);
+        let outcome = self
             .backend
-            .execute_token_done_int_raw(procedure_token, raw_reds)
-        {
+            .execute_token_done_int_raw(procedure_token, raw_reds);
+        self.leave_execute(procedure_token);
+        match outcome {
             Ok(value) => {
                 self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
@@ -13450,10 +13487,12 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
     ) -> Result<usize, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
-        match self
+        self.enter_execute(procedure_token);
+        let outcome = self
             .backend
-            .execute_token_done_ref(procedure_token, live_values)
-        {
+            .execute_token_done_ref(procedure_token, live_values);
+        self.leave_execute(procedure_token);
+        match outcome {
             Ok(value) => {
                 self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
@@ -13475,10 +13514,12 @@ impl<M: Clone> MetaInterp<M> {
         raw_reds: &[i64],
     ) -> Result<usize, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
-        match self
+        self.enter_execute(procedure_token);
+        let outcome = self
             .backend
-            .execute_token_done_ref_raw(procedure_token, raw_reds)
-        {
+            .execute_token_done_ref_raw(procedure_token, raw_reds);
+        self.leave_execute(procedure_token);
+        match outcome {
             Ok(value) => {
                 self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
@@ -30589,6 +30630,49 @@ mod tests {
             vec![0x94_0000_4000],
             "a JUMP target kept only through keepalive_tokens is a root \
              the same way an alive_loops token is"
+        );
+    }
+
+    /// `warmstate.py execute_assembler` holds `loop_token` as a stack local
+    /// through `func_execute_token`. MiniMark traces that local even after
+    /// `MemoryManager.next_generation` has dropped the token from
+    /// `alive_loops`; `executing_tokens` is that stack local. After
+    /// `leave_execute` the token is only a Rust `Arc` the collector does
+    /// not see.
+    #[test]
+    fn compiled_graph_root_walk_follows_the_executing_token() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let _serial = majit_ir::const_ptr_table::test_serial();
+        let exec_tt = crate::history::TargetToken::new_loop(15);
+        let mut sp = crate::optimizeopt::shortpreamble::ShortPreamble::empty();
+        sp.constants
+            .insert(0, majit_ir::Const::from_gcref(GcRef(0x93_0000_A000)));
+        exec_tt.attrs().short_preamble = Some(sp);
+
+        let token = std::sync::Arc::new(JitCellToken::new(15));
+        token.set_target_tokens(vec![exec_tt.as_jump_target_descr()]);
+
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.enter_execute(&token);
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut seen = Vec::new();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert_eq!(
+            seen,
+            vec![0x93_0000_A000],
+            "an executing token evicted from alive_loops is a root \
+             the same way an alive_loops token is"
+        );
+
+        meta.leave_execute(&token);
+        seen.clear();
+        meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
+        assert!(
+            seen.is_empty(),
+            "a token held only by a Rust Arc after leave_execute is not a root"
         );
     }
 
