@@ -2550,14 +2550,13 @@ impl AllVirtuals {
 /// `handle_async_forcing` (compile.py) can call back into resume
 /// during a residual call.
 ///
-/// PYRE-ADAPTATION: pyre's forced-guard handling currently routes
-/// through opcode checks (`pyjitpl.rs` GUARD_NOT_FORCED chain),
-/// not the descr's `handle_fail`, so this subtype is tag-only.
-/// `is_guard_forced()` returns true so descr-keyed dispatch can
-/// migrate later without reshaping the optimizer call site.
+/// Stores `jitdriver_sd` as `_init` does; `handle_async_forcing`
+/// reads it. `is_guard_forced()` returns true so descr-keyed
+/// dispatch can identify the subtype.
 #[derive(Debug)]
 pub struct ResumeGuardForcedDescr {
     inner: ResumeGuardDescr,
+    jitdriver_sd: usize,
 }
 
 unsafe impl Send for ResumeGuardForcedDescr {}
@@ -2593,12 +2592,18 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
 }
 
 impl ResumeGuardForcedDescr {
+    /// compile.py `ResumeGuardForcedDescr._init` — the compiling
+    /// `jitdriver_sd`. `handle_async_forcing` reads this.
+    pub fn jitdriver_sd(&self) -> usize {
+        self.jitdriver_sd
+    }
+
     /// compile.py `ResumeGuardForcedDescr.force_now(cpu, token)`.
     ///
     /// Upstream wraps `cpu.force` + `handle_async_forcing` in
     /// `_stack_criticalcode_start/stop`. The body is supplied by the
     /// caller (`MetaInterp::force_virtualizable_token_with_allocator`)
-    /// because this descr does not own `metainterp_sd` / `jitdriver_sd`.
+    /// because this descr does not own `metainterp_sd`.
     pub fn force_now(body: impl FnOnce()) {
         let _cc = crate::CriticalCodeGuard::enter();
         body();
@@ -2791,8 +2796,8 @@ impl FailDescr for ResumeGuardForcedDescr {
 }
 
 /// Create a ResumeGuardForcedDescr with auto-assigned fail_index, the
-/// supplied `types`, and empty resume data.
-pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
+/// supplied `types`, empty resume data, and `jitdriver_sd` (`_init`).
+pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>, jitdriver_sd: usize) -> DescrRef {
     Arc::new(ResumeGuardForcedDescr {
         inner: ResumeGuardDescr {
             fail_index: alloc_fail_index(),
@@ -2812,6 +2817,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
+        jitdriver_sd,
     })
 }
 
@@ -4700,7 +4706,7 @@ mod fail_descr_tests {
 
     #[test]
     fn resume_guard_descr_unwraps_forced_and_exc_wrappers() {
-        let forced = make_resume_guard_forced_descr_typed(vec![Type::Int]);
+        let forced = make_resume_guard_forced_descr_typed(vec![Type::Int], 0);
         let forced_inner =
             resume_guard_descr(&forced).expect("Forced as_any is the wrapper, not the base");
         assert_eq!(forced_inner.fail_arg_types(), &[Type::Int]);
@@ -4907,7 +4913,7 @@ mod fail_descr_tests {
 
         // ResumeGuardForcedDescr — `is_guard_forced()` survives
         // `set_fail_arg_types`, identity preserved.
-        let forced = make_resume_guard_forced_descr_typed(vec![Type::Int]);
+        let forced = make_resume_guard_forced_descr_typed(vec![Type::Int], 0);
         let forced_fi = forced.index();
         let forced_ptr = Arc::as_ptr(&forced);
         assert!(forced.is_guard_forced());

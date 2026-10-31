@@ -5782,9 +5782,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `ConstPtrInfo.getstrlen1` / vstring read off that cpu.
     /// `default_pipeline()` leaves those slots empty.
     fn pin_optimizer_host_state(&mut self, opt: &mut Optimizer) {
-        opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
-        opt.cpu = self.cpu.clone();
         let jd = self.active_jitdriver_sd.unwrap_or(0);
+        opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
+        opt.jitdriver_sd = jd;
+        opt.cpu = self.cpu.clone();
         let historylength = self
             .warm_state_ref_for_driver(jd)
             .expect("make_enter_function has not run for the active jitdriver_sd")
@@ -8722,6 +8723,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.enable_opts = enable_opts.clone();
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
+        unroll_opt.jitdriver_sd = compiling_jd;
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_live_op_roots_slot = Some(
@@ -10608,6 +10610,7 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.enable_opts = enable_opts;
         unroll_opt.supports_efficient_uint_mul_high =
             self.backend.supports_efficient_uint_mul_high();
+        unroll_opt.jitdriver_sd = compiling_jd;
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
         unroll_opt.compile_live_op_roots_slot = Some(
@@ -14301,21 +14304,6 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
-    /// `rd_loop_token.outermost_jitdriver_sd` for `handle_async_forcing`.
-    /// `compile.py make_jitcell_token` always sets that field; a missing
-    /// token is the portal driver.
-    pub(crate) fn jitdriver_index_for_failed_token(
-        &self,
-        token: Option<&majit_backend::JitCellToken>,
-    ) -> usize {
-        match token {
-            Some(token) => token
-                .outermost_jitdriver_index
-                .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd"),
-            None => 0,
-        }
-    }
-
     /// Integer key `must_compile` mixes into the GUARD_VALUE jitcounter hash
     /// for a TY_REF fail value.
     ///
@@ -16214,7 +16202,7 @@ impl<M: Clone> MetaInterp<M> {
         )
     }
 
-    /// `descr` is the forced guard's own `ResumeGuardDescr`
+    /// `descr` is the forced guard's own `ResumeGuardForcedDescr`
     /// (`compile.py ResumeGuardForcedDescr.handle_async_forcing` reads
     /// `self`). Resume payload is `get_resumestorage`; the cell token is
     /// not consulted.
@@ -16281,13 +16269,12 @@ impl<M: Clone> MetaInterp<M> {
         // lookup of the same guard can only lose them.
         // compile.py ResumeGuardForcedDescr.handle_async_forcing:
         // vinfo = self.jitdriver_sd.virtualizable_info
-        // (`self.jitdriver_sd` is the failed descr's
-        // `rd_loop_token.outermost_jitdriver_sd`).
         let vinfo = {
-            let owning = descr
-                .as_fail_descr()
-                .and_then(majit_backend::descr_owning_jct);
-            let jd_no = self.jitdriver_index_for_failed_token(owning.as_deref());
+            let jd_no = descr
+                .as_any()
+                .and_then(|a| a.downcast_ref::<crate::compile::ResumeGuardForcedDescr>())
+                .expect("handle_async_forcing runs on a ResumeGuardForcedDescr")
+                .jitdriver_sd();
             self.staticdata
                 .jitdrivers_sd
                 .get(jd_no)
@@ -31219,7 +31206,7 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
+        let descr = crate::compile::make_resume_guard_forced_descr_typed(vec![], 0);
         let fd = descr.as_fail_descr().expect("resume guard");
         fd.set_rd_numb_arc(Some(rd_numb));
         fd.set_rd_consts(Some(vec![]));
@@ -31247,7 +31234,7 @@ mod tests {
         meta.active_jitdriver_sd = Some(0);
         let green_key = gk(30);
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        let descr = crate::compile::make_resume_guard_forced_descr_typed(vec![Type::Int], 0);
         let mut guard = mk_op_with_descr(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -33771,24 +33758,19 @@ mod tests {
 
         let mut token = majit_backend::JitCellToken::new(91);
         token.outermost_jitdriver_index = Some(idx0);
+        let jd_no = token
+            .outermost_jitdriver_index
+            .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
         assert_eq!(
-            meta.jitdriver_index_for_failed_token(Some(&token)),
-            idx0,
+            jd_no, idx0,
             "failed token's outermost driver wins over leftover active_jitdriver_sd"
         );
 
         let hash = meta.warm_state_for_driver(idx0).fetch_next_hash();
-        let jd_no = meta.jitdriver_index_for_failed_token(Some(&token));
         assert_eq!(jd_no, idx0);
         assert!(
             !meta.warm_state_for_driver(jd_no).tick_guard_failure(hash),
             "must_compile ticks the failed token's driver timetable"
-        );
-
-        assert_eq!(
-            meta.jitdriver_index_for_failed_token(None),
-            0,
-            "a missing owning token ticks the portal"
         );
     }
 
@@ -34828,9 +34810,9 @@ mod loop_side_table_tests {
     }
 
     #[test]
-    fn handle_async_forcing_reads_failed_token_driver() {
-        // compile.py handle_async_forcing is a method on the failed
-        // ResumeGuardDescr; the loop token is that descr's.
+    fn handle_async_forcing_reads_the_forced_descr_driver() {
+        // compile.py handle_async_forcing reads self.jitdriver_sd from the
+        // failed ResumeGuardForcedDescr (`_init`), not the owning token.
         let mut meta = MetaInterp::<()>::new(1);
         extern "C" fn portal_runner_helper() -> i64 {
             0
@@ -34841,18 +34823,12 @@ mod loop_side_table_tests {
         second.portal_runner_adr = portal_runner_helper as *const () as i64;
         let jd0 = meta.register_jitdriver_sd(first);
         let jd1 = meta.register_jitdriver_sd(second);
+        assert_eq!(jd0, 0);
+        assert_eq!(jd1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(91);
         let trace_id = 31;
         let fail_index = 7;
-
-        let mut token = majit_backend::JitCellToken::new(91);
-        token.outermost_jitdriver_index = Some(jd1);
-        token.green_key.set(green_key.get_uhash());
-        let token = std::sync::Arc::new(token);
-        token
-            .compiled_loop_token_expect()
-            .set_loop_token_wref(std::sync::Arc::downgrade(&token));
 
         let mut writer = crate::resumecode::Writer::new(4);
         writer.append_int(0); // items_resume_section (patched below)
@@ -34861,9 +34837,9 @@ mod loop_side_table_tests {
         writer.append_int(0); // vref_size
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![majit_ir::Type::Int]);
+        let descr =
+            crate::compile::make_resume_guard_forced_descr_typed(vec![majit_ir::Type::Int], 1);
         let fd = descr.as_fail_descr().expect("resume guard");
-        fd.set_rd_loop_token_clt(token.compiled_loop_token_expect());
         fd.set_rd_numb_arc(Some(rd_numb));
         fd.set_rd_consts(Some(vec![]));
         fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
@@ -34875,6 +34851,10 @@ mod loop_side_table_tests {
                 fieldnums: vec![],
             },
         )]));
+        assert!(
+            majit_backend::descr_owning_jct(fd).is_none(),
+            "forced descr has no owning token; driver comes from _init"
+        );
 
         meta.active_jitdriver_sd = Some(jd0);
         let (ptrs, ints) = meta
@@ -34891,7 +34871,6 @@ mod loop_side_table_tests {
             );
         assert_eq!(ptrs, vec![0]);
         assert_eq!(ints, vec![0]);
-        let _keep = token;
     }
 }
 
