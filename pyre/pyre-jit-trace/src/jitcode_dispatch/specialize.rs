@@ -10716,18 +10716,20 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         );
     // The store the body recorded, for a walk that could not execute it.
     let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
-    // A kept store has no undo entry, so the cursor snapshot is the only way
-    // back for a walk that aborts with its delivery refused; it is taken from
-    // the pre-walk pair whichever side moved the cursor.  A root walk needs it
-    // as much as a bridge: its non-commit epilogue leaves the snapshot to the
-    // delivery site, whose header refusal restores it so the resume
-    // re-consumes the item.  Without it that refusal restores nothing and the
-    // iteration is lost.  A root walk has no delivery for an exhausting step,
-    // so it snapshots only a consume.
+    // A kept store has no undo entry.  A bridge walk snapshots the pre-walk
+    // cursor, whichever side moved it, so a bridge that aborts with its
+    // delivery refused can put the cursor back.  A root walk does not roll
+    // the iterator back: the consume is an executed effect, so the walk
+    // cannot decline into an entry replay that would call `__next__` again,
+    // and its abort continues forward from the latched image
+    // (`convert_and_run_from_pyjitpl`).
     let cursor_moved = !cursor_unchanged || (replay && (item.is_some() || exhausted));
-    let journaled = cursor_moved && (ctx.trace_ctx.is_bridge_trace || item.is_some());
+    let journaled = cursor_moved && ctx.trace_ctx.is_bridge_trace;
     if journaled {
         fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
+    }
+    if cursor_moved && !journaled {
+        fbw_bump_executed_effect("list-iter-root-consume");
     }
     if let Some(item) = item {
         if replay {

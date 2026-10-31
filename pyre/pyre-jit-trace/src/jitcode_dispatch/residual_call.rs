@@ -624,6 +624,34 @@ pub(crate) struct MirrorStackImage {
     /// so a callee reading `f_lasti` must see them.  `None` publishes the entry
     /// coordinate.
     pub(crate) last_instr: Option<isize>,
+    /// True when `slots` are the virtualizable's live operand stack at the
+    /// latched jitcode pc (`valuestackdepth == nlocals + slots.len()`).  False
+    /// when they are the on-entry stack of the opcode at `py_pc`.
+    pub(crate) synchronized: bool,
+}
+
+impl MirrorStackImage {
+    pub(crate) fn capture_for(
+        &self,
+        live_frame: usize,
+    ) -> Option<crate::state::CapturedFrameStack> {
+        if self.synchronized {
+            crate::state::capture_frame_stack_from_vable(
+                live_frame,
+                &self.slots,
+                self.valuestackdepth?,
+                self.last_instr?,
+            )
+        } else {
+            crate::state::capture_frame_stack_from_mirror(
+                live_frame,
+                self.py_pc,
+                &self.slots,
+                self.valuestackdepth,
+                self.last_instr,
+            )
+        }
+    }
 }
 
 pub(crate) struct LatchedSingleFrameBlackhole {
@@ -631,12 +659,10 @@ pub(crate) struct LatchedSingleFrameBlackhole {
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
     /// The walker's resolved operand-stack image, captured by whichever latch
-    /// stops the walk.  The adopter uses it for legs that stop INSIDE an opcode
-    /// (`WalkAbort` and `VableEscape`) and uses the frame's own snapshot array
-    /// for `ABORT_TOO_LONG`, whose post-step coordinate is an opcode boundary
-    /// the array does describe.
+    /// stops the walk.  The adopter publishes this image for every leg.  The
+    /// single-frame portal latch fills it from the virtualizable's boxes.
     ///
-    /// `None` means the walk had no resolvable mirror, and the adopt then
+    /// `None` means the walk had no resolvable image, and the adopt then
     /// declines rather than publishing a partial stack.
     pub(crate) mirror_stack: Option<MirrorStackImage>,
     /// Which latch published this image.  Every latch supplies the resume
@@ -691,15 +717,7 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
             .miframe
             .ref_value_for_blackhole(frame_reg as usize)
             .unwrap_or(0) as usize;
-        vable_frame != 0
-            && crate::state::capture_frame_stack_from_mirror(
-                vable_frame,
-                mirror.py_pc,
-                &mirror.slots,
-                mirror.valuestackdepth,
-                mirror.last_instr,
-            )
-            .is_some()
+        vable_frame != 0 && mirror.capture_for(vable_frame).is_some()
     })
 }
 
@@ -889,6 +907,55 @@ fn capture_vstack_mirror_image<Sym: WalkSym>(
         slots,
         valuestackdepth,
         last_instr,
+        synchronized: false,
+    })
+}
+
+/// The operand stack of the frame at the latched jitcode pc as the
+/// virtualizable holds it.  `synchronize_virtualizable` (`pyjitpl.py`) writes
+/// these boxes to the frame before `convert_and_run_from_pyjitpl` copies the
+/// registers, so slots the opcode already popped are gone and nothing is
+/// reconstructed from Python pcs.
+fn capture_vable_shadow_stack_image<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    vable_frame: usize,
+    origin: &'static str,
+) -> Option<MirrorStackImage> {
+    let (Some(valuestackdepth), Some(last_instr)) = latched_vable_scalars(ctx) else {
+        latchdbg!("origin={origin} shadow-scalars-unresolved");
+        return None;
+    };
+    let Some(nlocals) = crate::state::concrete_nlocals(vable_frame) else {
+        latchdbg!("origin={origin} shadow-nlocals");
+        return None;
+    };
+    let base = ctx.trace_ctx.virtualizable_info()?.num_static_extra_boxes;
+    if valuestackdepth < nlocals {
+        latchdbg!("origin={origin} shadow-depth-below-nlocals");
+        return None;
+    }
+    let mut slots = Vec::with_capacity(valuestackdepth - nlocals);
+    for abs in nlocals..valuestackdepth {
+        let opref = ctx.trace_ctx.virtualizable_box_at(base + abs)?;
+        match ctx.trace_ctx.concrete_of_opref(opref) {
+            Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
+                slots.push(value.as_usize() as pyre_object::PyObjectRef);
+            }
+            other => {
+                latchdbg!(
+                    "origin={origin} shadow-slot {abs} unresolved opref={opref:?} \
+                     concrete={other:?}"
+                );
+                return None;
+            }
+        }
+    }
+    Some(MirrorStackImage {
+        py_pc: ctx.vstack_cur_pypc as usize,
+        slots,
+        valuestackdepth: Some(valuestackdepth),
+        last_instr: Some(last_instr),
+        synchronized: true,
     })
 }
 
@@ -1044,6 +1111,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
         slots,
         valuestackdepth: None,
         last_instr: None,
+        synchronized: false,
     })
 }
 
@@ -1112,6 +1180,7 @@ fn capture_paused_portal_mirror_stack<Sym: WalkSym>(
         slots,
         valuestackdepth,
         last_instr,
+        synchronized: false,
     })
 }
 
@@ -1308,15 +1377,13 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // to the matching live frame before driving the blackhole. Replacing
         // the register with the snapshot address would collapse those two
         // identities and fail the live-root check.
-        // `ctx` IS the root walk on this arm (`framestack.is_empty() &&
-        // !inline_subwalk`), so its mirror describes the very frame whose
-        // operand stack the adopter publishes.  A root walk never refreshes
-        // the virtualizable snapshot array; `_copy_data_from_miframe` copies
-        // the live MIFrame banks, which is this mirror.  `ABORT_TOO_LONG`
-        // reconciles the mirror to the next instruction first (`walk`), so
-        // the captured slots are the post-step stack.  A capability-gap
-        // abort stops mid-opcode and needs the same source.
-        let mirror_stack = capture_vstack_mirror_image(ctx, origin);
+        // `ctx` IS the root walk on this arm, so the virtualizable's boxes describe
+        // the very frame whose operand stack the adopter publishes.  The MIFrame
+        // resumes at a jitcode pc that may sit inside a Python opcode, after that
+        // opcode's pops; `synchronize_virtualizable` (`pyjitpl.py`) hands the
+        // blackhole the virtualizable as it stands there, so the stack comes from
+        // those boxes, not from an opcode-entry reconstruction.
+        let mirror_stack = capture_vable_shadow_stack_image(ctx, vable_frame, origin);
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[latch-accept] origin={origin} single-frame pc={} jitcode={:?} index={:?}",
