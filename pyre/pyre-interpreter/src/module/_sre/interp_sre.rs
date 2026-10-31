@@ -20,6 +20,23 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::{StrDrive, StringCursor};
 
+/// interp_sre.py `w_ascii_iscased` / `w_unicode_iscased` / `w_ascii_tolower` /
+/// `w_unicode_tolower` `@unwrap_spec(character=int)`.
+fn sre_character_arg(args: &[PyObjectRef], name: &'static str) -> Result<i64, crate::PyError> {
+    let mut w_ch = args
+        .first()
+        .copied()
+        .filter(|o| !o.is_null())
+        .ok_or_else(|| {
+            crate::PyError::type_error(format!(
+                "{name}() missing required argument 'character' (pos 1)"
+            ))
+        })?;
+    pyre_object::with_roots!(
+        w_ch => crate::baseobjspace::gateway_int_w(w_ch)
+    )
+}
+
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -83,10 +100,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         make_module_builtin_function_with_arity(
             "ascii_iscased",
             |args| {
-                if args.is_empty() {
-                    return Ok(w_bool_from(false));
-                }
-                let ch = unsafe { w_int_get_value(args[0]) } as u32;
+                let ch = sre_character_arg(args, "ascii_iscased")? as u32;
                 Ok(w_bool_from(ch < 128 && (ch as u8).is_ascii_alphabetic()))
             },
             1,
@@ -98,10 +112,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         make_module_builtin_function_with_arity(
             "unicode_iscased",
             |args| {
-                if args.is_empty() {
-                    return Ok(w_bool_from(false));
-                }
-                let ch = char::from_u32(unsafe { w_int_get_value(args[0]) } as u32).unwrap_or('\0');
+                let ch = char::from_u32(sre_character_arg(args, "unicode_iscased")? as u32)
+                    .unwrap_or('\0');
                 Ok(w_bool_from(ch.is_alphabetic()))
             },
             1,
@@ -113,10 +125,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         make_module_builtin_function_with_arity(
             "ascii_tolower",
             |args| {
-                if args.is_empty() {
-                    return Ok(w_int_new(0));
-                }
-                let ch = unsafe { w_int_get_value(args[0]) };
+                let ch = sre_character_arg(args, "ascii_tolower")?;
                 Ok(w_int_new(if (0..128).contains(&ch) {
                     (ch as u8).to_ascii_lowercase() as i64
                 } else {
@@ -132,10 +141,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         make_module_builtin_function_with_arity(
             "unicode_tolower",
             |args| {
-                if args.is_empty() {
-                    return Ok(w_int_new(0));
-                }
-                let c = char::from_u32(unsafe { w_int_get_value(args[0]) } as u32).unwrap_or('\0');
+                let c = char::from_u32(sre_character_arg(args, "unicode_tolower")? as u32)
+                    .unwrap_or('\0');
                 Ok(w_int_new(c.to_lowercase().next().unwrap_or(c) as i64))
             },
             1,
