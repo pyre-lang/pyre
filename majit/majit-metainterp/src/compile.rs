@@ -350,31 +350,6 @@ pub struct RawCompileResult<M> {
     pub guard_value_operand: Option<i64>,
 }
 
-/// Terminal exit layout for a FINISH or JUMP op.
-#[derive(Debug, Clone)]
-pub struct CompiledTerminalExitLayout {
-    pub op_index: usize,
-    pub exit_layout: CompiledExitLayout,
-}
-
-/// Full trace compilation layout with all exits.
-#[derive(Debug, Clone)]
-pub struct CompiledTraceLayout {
-    pub trace_id: u64,
-    pub exit_layouts: Vec<CompiledExitLayout>,
-    pub terminal_exit_layouts: Vec<CompiledTerminalExitLayout>,
-}
-
-/// Artifacts extracted from a backend DeadFrame.
-#[derive(Debug, Clone)]
-pub struct DeadFrameArtifacts {
-    pub values: Vec<i64>,
-    pub typed_values: Vec<Value>,
-    pub exit_layout: CompiledExitLayout,
-    pub savedata: Option<GcRef>,
-    pub exception: ExceptionState,
-}
-
 /// `compile.py` `class CompileData(object)`.
 ///
 /// `optimize_trace` is the compile.py method: write `MARK_TRACE`, run

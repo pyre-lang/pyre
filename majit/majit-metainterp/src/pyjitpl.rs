@@ -160,8 +160,7 @@ use crate::blackhole::ExceptionState;
 use crate::compile;
 use crate::compile::make_jitcell_token;
 pub use crate::compile::{
-    CompileResult, CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout,
-    DeadFrameArtifacts, ExitRawValues, ExitTypes, ExitValues, RawCompileResult,
+    CompileResult, CompiledExitLayout, ExitRawValues, ExitTypes, ExitValues, RawCompileResult,
 };
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;

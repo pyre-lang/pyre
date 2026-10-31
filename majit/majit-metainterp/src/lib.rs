@@ -250,12 +250,11 @@ pub use pyjitpl::dispatch::{
 };
 pub use pyjitpl::{
     BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
-    ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
-    CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
-    JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
-    MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey,
-    PrepareResumeFromFailure, RawCompileResult, SharedBlackholeInterpPool, SharedLiveness,
-    StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
+    ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, DetailedDriverRunOutcome,
+    InlineDecision, JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame,
+    MIFrameStack, MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData,
+    PortalGreenKey, PrepareResumeFromFailure, RawCompileResult, SharedBlackholeInterpPool,
+    SharedLiveness, StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
     build_state_field_snapshot, call_int_function, call_int_function_typed, call_ref_function,
     call_ref_function_typed, call_void_function, call_void_function_typed, counters,
     decode_jit_merge_point_banks, record_application_traceback_for_recording,
