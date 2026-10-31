@@ -23019,7 +23019,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
-                    exit_layout: None,
                     savedata,
                     exception_value,
                     fail_index: descr.fail_index(),
@@ -23112,7 +23111,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
-                    exit_layout: None,
                     savedata,
                     exception_value: exception,
                     fail_index,
@@ -23173,7 +23171,6 @@ impl majit_backend::Backend for CraneliftBackend {
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
-                exit_layout: None,
                 savedata,
                 exception_value: exception,
                 fail_index,
@@ -30405,7 +30402,6 @@ mod tests {
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
         assert!(!raw.exception_value.is_null());
         assert_eq!(unsafe { *(raw.exception_value.0 as *const i64) }, 0x1111);
-        assert!(raw.exit_layout.is_none());
         let fd = raw
             .descr_arc
             .as_fail_descr()
@@ -33089,7 +33085,6 @@ mod tests {
         assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
         assert_eq!(raw.savedata, Some(GcRef(0xDADA)));
         assert_eq!(raw.exception_value, GcRef::NULL);
-        assert!(raw.exit_layout.is_none());
         let fd = raw
             .descr_arc
             .as_fail_descr()

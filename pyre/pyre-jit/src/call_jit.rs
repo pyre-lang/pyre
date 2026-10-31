@@ -5724,6 +5724,7 @@ fn jit_ca_handle_guard_failure(
         // The copy is not a JITFRAME: `jitframe_trace` cannot update it.
         // Root Ref slots for the same window `handle_fail` already covers
         // (`DeadFrameRefRoots` / `compute_gcmap`).
+        // Same `compute_gcmap` rule as `handle_fail`.
         let _deadframe_roots = unsafe {
             majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
                 if no_vinfo {
@@ -5733,7 +5734,7 @@ fn jit_ca_handle_guard_failure(
                     // object even when `fail_arg_types` has not yet classified
                     // it; a CA bridge walk that forces `f_locals` reads it
                     // as `live_vable_frame_addr`.
-                    index == 0 || majit_metainterp::is_traced_ref_slot(fail_types, index)
+                    index == 0 || fail_types.get(index) == Some(&majit_ir::Type::Ref)
                 }
             })
         };
@@ -5964,7 +5965,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
         FinishedException(i64),
         Deopt {
             descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
-            green_key: u64,
             raw_values: Vec<i64>,
             guard_value_operand: Option<i64>,
             guard_exc: i64,
@@ -6003,9 +6003,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // the ExitFrameWithException arm does.
             Outcome::FinishedException(value)
         } else {
-            let green_key = majit_backend::descr_owning_jct(descr)
-                .map(|jct| jct.green_key())
-                .unwrap_or(0);
             // compile.py `AbstractResumeGuardDescr.must_compile` reads a
             // GUARD_VALUE's actual operand directly from the deadframe before
             // hashing `(descr, value)`.  It need not be one of the guard's
@@ -6032,7 +6029,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             let savedata = backend.get_savedata_ref(&frame);
             Outcome::Deopt {
                 descr_arc,
-                green_key,
                 raw_values,
                 guard_value_operand,
                 guard_exc,
@@ -6055,7 +6051,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
         }
         Outcome::Deopt {
             descr_arc,
-            green_key: _,
             mut raw_values,
             guard_value_operand,
             mut guard_exc,
@@ -6072,9 +6067,10 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 .as_fail_descr()
                 .map(|fd| fd.fail_arg_types().to_vec())
                 .unwrap_or_default();
+            // Same `compute_gcmap` rule as `handle_fail`.
             let _deadframe_roots = unsafe {
                 majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
-                    majit_metainterp::is_traced_ref_slot(&fail_types, index)
+                    fail_types.get(index) == Some(&majit_ir::Type::Ref)
                 })
             };
             // compile.py ResumeGuardForcedDescr.handle_fail reads
@@ -6136,7 +6132,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             };
             let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
             guard_exc = _parked_guard_exc.get();
-            let bh = crate::eval::resume_in_blackhole_from_exit_layout(
+            let bh = crate::eval::resume_in_blackhole(
                 &mut raw_values,
                 &descr_arc,
                 guard_exc,

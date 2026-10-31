@@ -1134,8 +1134,9 @@ pub trait JitCodeRuntime {
     /// by the green values (the portal green key, pyjitpl.py
     /// `get_assembler_token(greenargs)`).  The runtime hashes the greens
     /// to that key and resolves the production `Arc<JitCellToken>` — used
-    /// both for the recorded descr's token identity (compile.py:187 via
-    /// `call_assembler_int_arc_typed_with_value`) and to drive the concrete loop
+    /// both for the recorded descr's token identity
+    /// (`compile.py record_loop_or_bridge` (`isinstance(descr, JitCellToken)`)
+    /// via `call_assembler_int_arc_typed_with_value`) and to drive the concrete loop
     /// through [`Self::execute_recursive_assembler_int`].  The `u64` is the
     /// resolved green key (compile.py:186 `rd_loop_token`), returned so the
     /// concrete leg keys the same loop the descr names.  Returns `None` for

@@ -184,7 +184,7 @@ pub use call_descr::{
     nursery_alloc_effect_info, str_concat_effect_info,
 };
 pub use compile::{
-    AllVirtuals, guard_resume_pc, is_traced_ref_slot, make_fail_descr, make_fail_descr_typed,
+    AllVirtuals, guard_resume_pc, make_fail_descr, make_fail_descr_typed,
     make_finish_fail_descr_typed, raw_exit_values, resume_guard_descr, set_all_virtuals_gc_type_id,
 };
 pub use io_buffer::{
