@@ -645,12 +645,12 @@ pub fn new_resume_storage(
 /// the deadframe.  Derived on demand from the guard-owned payload, so
 /// nothing is kept per guard for it.
 pub fn exit_pending_field_layouts(
-    storage: &ResumeStorage,
+    descr: &dyn majit_ir::FailDescr,
     num_failargs: i32,
 ) -> Vec<ExitPendingFieldLayout> {
-    let rd_consts = storage.rd_consts().unwrap_or(&[]);
-    let num_virtuals = storage.rd_virtuals().map_or(0, <[_]>::len) as i32;
-    storage
+    let rd_consts = descr.rd_consts().unwrap_or(&[]);
+    let num_virtuals = descr.rd_virtuals().map_or(0, <[_]>::len) as i32;
+    descr
         .rd_pendingfields()
         .unwrap_or(&[])
         .iter()
