@@ -269,6 +269,11 @@ pub struct MergePoint {
     /// `virtualizable_heap_ptr` tracks the walk and names a different frame
     /// once the trace is cut to a header the walk reached later
     /// (compile.py:269).
+    ///
+    /// `walk_active_trace_refs` forwards this address while the merge point
+    /// is reachable. It is `RefFrontendOp._resref` of
+    /// `original_boxes[index_of_virtualizable]`; `send_loop_to_backend`
+    /// reads it with `getref_base()`.
     pub vable_ptr: usize,
 }
 
