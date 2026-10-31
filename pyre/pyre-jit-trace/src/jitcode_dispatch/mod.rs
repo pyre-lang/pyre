@@ -17753,26 +17753,9 @@ fn handle<Sym: WalkSym>(
                         // a trace rooted at a *loop header* falls back to
                         // the plain bridge shape.
                         None => match driver.compile_trace_entry_data() {
-                            Some((original_green_key, mut entry_meta)) => {
-                                // `compile_trace_entry_data` clones the active
-                                // trace metadata, whose `namespace_dependent` is
-                                // only finalized by `finish_trace_namespace_dependency`
-                                // after the walk returns. An entry bridge is
-                                // compiled mid-walk, before that finalize, so a
-                                // trace that has already read a module global
-                                // would otherwise install the bridge with a stale
-                                // `namespace_dependent = false` and let it be
-                                // re-entered after later namespace growth. Fold in
-                                // the live per-trace flag so the bridge keeps the
-                                // conservative namespace gate.
-                                entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
-                                driver.meta_interp_mut().compile_trace_from_interp(
-                                    key,
-                                    &live_args,
-                                    original_green_key,
-                                    entry_meta,
-                                )
-                            }
+                            Some(original_green_key) => driver
+                                .meta_interp_mut()
+                                .compile_trace_from_interp(key, &live_args, original_green_key),
                             // compile.py compile_trace — an interp-origin close is a
                             // `ResumeFromInterpDescr` entry bridge, and with no
                             // entry data there is no original green key to attach

@@ -3934,14 +3934,9 @@ impl<M: Clone> MetaInterp<M> {
     fn run_result_for_jump_exit(
         fail_index: u32,
         values: Vec<i64>,
-        meta: Option<std::sync::Arc<M>>,
         savedata: Option<GcRef>,
-    ) -> Option<RunResult<M>> {
-        (fail_index == u32::MAX).then_some(RunResult::Jump {
-            values,
-            meta,
-            savedata,
-        })
+    ) -> Option<RunResult> {
+        (fail_index == u32::MAX).then_some(RunResult::Jump { values, savedata })
     }
 
     fn alloc_trace_id(&mut self) -> u64 {
@@ -7870,8 +7865,8 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// RPython-compatible helper name from compile.py.
-    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
-        self.compile_loop(jump_args, meta)
+    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
+        self.compile_loop(jump_args)
     }
 
     /// compile.py `send_loop_to_backend`:
@@ -8160,7 +8155,6 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `jump_args` are the symbolic values (OpRefs) at the end of the loop,
     /// in the same order as the InputArgs registered during `on_back_edge`.
-    /// `meta` is interpreter-specific metadata to store alongside the compiled loop.
     /// pyjitpl.py `reached_loop_header` → `compile_loop` dispatch.
     ///
     /// This public entry wraps `Self::compile_loop_body` so every exit
@@ -8174,13 +8168,13 @@ impl<M: Clone> MetaInterp<M> {
     /// inner path consumed `self.tracing`. If so, the session envelope
     /// is dropped alongside it; if not (early-Cancelled paths), both
     /// halves stay live for continued tracing.
-    pub fn compile_loop(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+    pub fn compile_loop(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
         // `gctypelayout.py encode_type_shapes_now` closes `type_info_group`
         // at translation. Close before the optimizer reads it. A trace that
         // did not enter through `force_start_tracing` still reaches here.
         majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
-        let outcome = self.compile_loop_body(jump_args, meta);
+        let outcome = self.compile_loop_body(jump_args);
         self.compile_snapshot_refs.clear();
         // pyjitpl.py:3015-3032 parity: once the body has taken the trace
         // ctx (tracing=None), drop the matching frontend session so the
@@ -8195,7 +8189,7 @@ impl<M: Clone> MetaInterp<M> {
         outcome
     }
 
-    fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
+    fn compile_loop_body(&mut self, jump_args: &[OpRef]) -> CompileOutcome {
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -8288,7 +8282,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_retrace` consumes `self.tracing`, so capture the
                 // key the abort path needs before it is gone.
                 let retrace_green_key = self.tracing.as_ref().map(|ctx| ctx.green_key);
-                let ok = self.compile_retrace(jump_args, meta.clone());
+                let ok = self.compile_retrace(jump_args);
                 if ok {
                     self.cancel_count = 0;
                     return CompileOutcome::Compiled {
@@ -9592,9 +9586,6 @@ impl<M: Clone> MetaInterp<M> {
                 // `ResumeFromInterpDescr.compile_and_attach` file the cell
                 // on the compiling `jitdriver_sd.warmstate`. Extra-driver
                 // compile leftover `active_jitdriver_sd` is that driver.
-                // `warmstate.py execute_assembler` unspecializes live reds;
-                // no frontend Meta snapshot is stored.
-                let _ = meta;
                 self.remember_compiled_graph_write();
                 self.staticdata.log_compile(
                     green_key,
@@ -9887,7 +9878,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         finish_args: &[OpRef],
         original_green_key: u64,
-        entry_meta: M,
     ) -> CompileOutcome {
         // ResumeFromInterpDescr.get_resumestorage() is None — an interp-origin
         // entry bridge has no source-guard fail_args. Clear any pending
@@ -9897,13 +9887,7 @@ impl<M: Clone> MetaInterp<M> {
         // assertion against the entry bridge's own inputargs.
         self.pending_frontend_boxes = None;
         self.pending_frontend_box_types = None;
-        self.compile_trace_inner(
-            green_key,
-            finish_args,
-            None,
-            None,
-            Some((original_green_key, entry_meta)),
-        )
+        self.compile_trace_inner(green_key, finish_args, None, None, Some(original_green_key))
     }
 
     /// compile_trace with ends_with_jump=false (FINISH).
@@ -9930,15 +9914,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
-        entry_meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
-        self.finish_and_compile(
-            finish_args,
-            finish_arg_types,
-            entry_meta,
-            exit_with_exception,
-        )
+        self.finish_and_compile(finish_args, finish_arg_types, exit_with_exception)
     }
 
     fn compile_trace_inner(
@@ -9947,7 +9925,7 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
         bridge_origin: Option<(u64, u32)>,
         finish_descr: Option<majit_ir::DescrRef>,
-        entry_bridge: Option<(u64, M)>,
+        entry_bridge: Option<u64>,
     ) -> CompileOutcome {
         self.remember_compiled_graph_write();
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
@@ -9966,7 +9944,7 @@ impl<M: Clone> MetaInterp<M> {
         let descr_id = self
             .bridge_info()
             .map(|b| std::sync::Arc::as_ptr(&b.source_descr) as *const () as u64)
-            .or_else(|| entry_bridge.as_ref().map(|(key, _)| *key))
+            .or(entry_bridge)
             .unwrap_or(green_key);
         // compile.py compile_trace: jd_name=jitdriver_sd.jitdriver.name.
         // Capture before `ctx` so the later field write stays disjoint.
@@ -10221,7 +10199,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py — ResumeFromInterpDescr path:
                 // compile a fresh entry bridge and attach it to the
                 // original interpreter green key.
-                let Some((original_green_key, entry_meta)) = entry_bridge else {
+                let Some(original_green_key) = entry_bridge else {
                     if crate::closedbg_enabled() {
                         eprintln!("@@@CANCEL-SITE line={}", line!());
                     }
@@ -10236,7 +10214,6 @@ impl<M: Clone> MetaInterp<M> {
                 let success = self.compile_entry_bridge(
                     green_key,
                     original_green_key,
-                    entry_meta,
                     entry_driver_descriptor,
                     &bridge_ops,
                     &bridge_inputargs,
@@ -10306,7 +10283,7 @@ impl<M: Clone> MetaInterp<M> {
     /// concatenates with partial_trace ops.
     ///
     /// Returns true if compilation succeeded.
-    pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
+    pub fn compile_retrace(&mut self, jump_args: &[OpRef]) -> bool {
         self.remember_compiled_graph_write();
         // compile.py compile_retrace: jitlog.start_new_trace(faildescr=resumekey).
         let descr_id = self
@@ -11015,7 +10992,6 @@ impl<M: Clone> MetaInterp<M> {
                 // the previous `TargetToken`; it does not re-emit that
                 // LABEL.
                 token.set_retraced_count(unroll_opt.retraced_count);
-                let _ = meta;
                 self.remember_compiled_graph_write();
                 self.staticdata.log_compile(
                     green_key,
@@ -11536,7 +11512,6 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         finish_args: &[OpRef],
         finish_arg_types: Vec<Type>,
-        meta: M,
         exit_with_exception: bool,
     ) -> Result<(), SwitchToBlackhole> {
         // Root FINISH optimizes here. `gctypelayout.py encode_type_shapes_now`
@@ -12026,7 +12001,6 @@ impl<M: Clone> MetaInterp<M> {
                     // real `ll_loop_code`; synthesising a code-less one here let
                     // a later guard-failure bridge close with a JUMP whose
                     // backend target is `ll_loop_code == 0` (`br 0` → PC=0).
-                    let _ = meta;
                     self.remember_compiled_graph_write();
                 }
                 self.staticdata.log_compile(
@@ -12091,7 +12065,7 @@ impl<M: Clone> MetaInterp<M> {
     /// (`compile.py` returns `target_token`; the caller reads
     /// `target_token.targeting_jitcell_token` and passes it to
     /// `attach_procedure_to_interp`). None on failure.
-    pub fn compile_simple_loop(&mut self, meta: M) -> Option<(u64, Arc<JitCellToken>)> {
+    pub fn compile_simple_loop(&mut self) -> Option<(u64, Arc<JitCellToken>)> {
         // Segmented loops optimize here without `compile_loop`.
         // `gctypelayout.py encode_type_shapes_now` closes at translation.
         majit_gc::ensure_type_registry_closed();
@@ -12435,7 +12409,6 @@ impl<M: Clone> MetaInterp<M> {
                 self.next_global_opref = self
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
-                let _ = meta;
                 self.remember_compiled_graph_write();
                 self.staticdata.log_compile(
                     green_key,
@@ -12786,7 +12759,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         live_values: &[Value],
-    ) -> Option<RawCompileResult<M>> {
+    ) -> Option<RawCompileResult> {
         // `warmstate.py` `maybe_compile_and_run` reads
         // `procedure_token = cell.get_procedure_token()` and enters on THAT:
         // execution must use the cell's current, invalidation-filtered token.
@@ -12853,7 +12826,6 @@ impl<M: Clone> MetaInterp<M> {
             // spelling adopts the buffers rather than re-decoding into them.
             values: ExitRawValues::from_vec(result.outputs),
             typed_values: ExitValues::from_vec(result.typed_outputs),
-            meta: None,
             fail_index,
             trace_id,
             descr_arc,
@@ -12875,11 +12847,11 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         live_values: &[i64],
-    ) -> Option<CompileResult<M>> {
+    ) -> Option<CompileResult> {
         // `warmstate.py` `maybe_compile_and_run`: the JitCell is the
         // canonical current-token owner and `get_procedure_token` filters
         // invalidated predecessors. `execute_assembler` unspecializes live
-        // reds and keeps no frontend Meta snapshot.
+        // reds.
         // warmstate.py maybe_compile_and_run: production portal entry is
         // driver 0, not leftover active_jitdriver_sd.
         let token = self.get_procedure_token_on_driver(0, green_key)?;
@@ -12910,7 +12882,6 @@ impl<M: Clone> MetaInterp<M> {
             Self::finish_compiled_run_io();
             return Some(CompileResult {
                 typed_values: ExitValues::from_vec(vec![Value::Ref(GcRef(exc as usize))]),
-                meta: None,
                 fail_index,
                 trace_id,
                 descr_arc: Some(descr_arc),
@@ -12966,7 +12937,6 @@ impl<M: Clone> MetaInterp<M> {
 
         Some(CompileResult {
             typed_values,
-            meta: None,
             fail_index,
             trace_id,
             descr_arc: (!is_finish).then_some(descr_arc),
@@ -12986,7 +12956,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         live_values: &[Value],
-    ) -> Option<CompileResult<M>> {
+    ) -> Option<CompileResult> {
         self.run_compiled_detailed_with_values_on_driver(0, green_key, live_values, 0)
     }
 
@@ -13000,7 +12970,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> Option<CompileResult<M>> {
+    ) -> Option<CompileResult> {
         self.run_compiled_detailed_with_values_on_driver(0, green_key, live_values, dispatch_key)
     }
 
@@ -13011,7 +12981,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> Option<CompileResult<M>> {
+    ) -> Option<CompileResult> {
         // `warmstate.py` `maybe_compile_and_run`: execute the token returned
         // by the JitCell, not the compiled-metadata index's possibly retired
         // predecessor.
@@ -13020,13 +12990,8 @@ impl<M: Clone> MetaInterp<M> {
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
         let token = self.get_procedure_token_on_driver(jd_no, green_key)?;
-        let mut result = self.execute_assembler_at_dispatch_key(
-            &token,
-            green_key,
-            None,
-            live_values,
-            dispatch_key,
-        );
+        let mut result =
+            self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key);
         if let Some(descr_arc) = &result.descr_arc
             && !Self::is_jump_exit(result.is_finish, result.fail_index)
         {
@@ -13136,10 +13101,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         procedure_token: &JitCellToken,
         green_key: u64,
-        meta: Option<std::sync::Arc<M>>,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> CompileResult<M> {
+    ) -> CompileResult {
         // Read once per run, ahead of every stage, so no stage's difference
         // carries it. See [`ExecuteStageRepeats`]; a default build has neither
         // this load nor the loops it feeds.
@@ -13182,7 +13146,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
-        self.consume_executed_frame(green_key, meta, frame)
+        self.consume_executed_frame(green_key, frame)
     }
 
     /// `warmstate.py execute_assembler` after `func_execute_token` returns.
@@ -13194,9 +13158,8 @@ impl<M: Clone> MetaInterp<M> {
     pub(crate) fn consume_executed_frame(
         &mut self,
         green_key: u64,
-        meta: Option<std::sync::Arc<M>>,
         frame: majit_backend::DeadFrame,
-    ) -> CompileResult<M> {
+    ) -> CompileResult {
         // Borrowed off the frame, not shared: a final descr is read here and
         // returned, so the entry that runs one compiled body to completion
         // pays no reference count for it. The guard arm below takes the
@@ -13264,7 +13227,6 @@ impl<M: Clone> MetaInterp<M> {
             Self::finish_compiled_run_io();
             return CompileResult {
                 typed_values: ExitValues::from_vec(vec![Value::Ref(GcRef(exc as usize))]),
-                meta,
                 fail_index,
                 trace_id,
                 descr_arc: Some(descr_arc),
@@ -13294,7 +13256,6 @@ impl<M: Clone> MetaInterp<M> {
             // (`handle_fail` / blackhole) never see this arm.
             return CompileResult {
                 typed_values,
-                meta,
                 fail_index,
                 trace_id,
                 descr_arc: None,
@@ -13393,7 +13354,6 @@ impl<M: Clone> MetaInterp<M> {
 
         CompileResult {
             typed_values,
-            meta,
             fail_index,
             trace_id,
             descr_arc: Some(descr_arc),
@@ -14635,7 +14595,6 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         original_green_key: u64,
-        meta: M,
         driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
@@ -15049,7 +15008,6 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_loop`. The count read at the top of this function is
                 // the one `unroll.py optimize_bridge` charges, and it stays on the
                 // token it was read from.
-                let _ = meta;
                 self.remember_compiled_graph_write();
                 self.staticdata.log_compile(
                     original_green_key,
@@ -16575,7 +16533,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// This is a convenience wrapper around `run_compiled_detailed` +
     /// `handle_guard_failure`.
-    pub fn run_and_recover(&mut self, green_key: u64, live_values: &[i64]) -> Option<RunResult<M>> {
+    pub fn run_and_recover(&mut self, green_key: u64, live_values: &[i64]) -> Option<RunResult> {
         let result = self.run_compiled_detailed(green_key, live_values)?;
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
@@ -16584,21 +16542,13 @@ impl<M: Clone> MetaInterp<M> {
         let typed_values = result.typed_values.clone();
         let savedata = result.savedata;
         let exception = result.exception.clone();
-        // `warmstate.py execute_assembler` keeps no frontend snapshot.
-        let meta = result.meta.clone();
 
         if is_finish {
             // Normal finish (not a guard failure)
-            return Some(RunResult::Finished {
-                values,
-                meta,
-                savedata,
-            });
+            return Some(RunResult::Finished { values, savedata });
         }
 
-        if let Some(jump) =
-            Self::run_result_for_jump_exit(fail_index, values.clone(), meta.clone(), savedata)
-        {
+        if let Some(jump) = Self::run_result_for_jump_exit(fail_index, values.clone(), savedata) {
             return Some(jump);
         }
 
@@ -16616,7 +16566,6 @@ impl<M: Clone> MetaInterp<M> {
 
         Some(RunResult::GuardFailure {
             values,
-            meta,
             trace_id,
             fail_index,
             savedata,
@@ -18948,7 +18897,7 @@ impl<M: Clone> MetaInterp<M> {
     /// - `bridge.is_some()` → `compile_trace_finish(bridge_key, ...,
     ///   bridge_origin, finish_descr)` records the trailing FINISH via
     ///   `recorder.finish()` and drives the bridge compile.
-    /// - `bridge.is_none()` → `finish_and_compile(..., trace_meta)` —
+    /// - `bridge.is_none()` → `finish_and_compile(...)` —
     ///   the root-trace equivalent.
     ///
     /// Returns `Err(SwitchToBlackhole::giveup())` if the compile
@@ -19044,13 +18993,11 @@ impl<M: Clone> MetaInterp<M> {
         // Root branch: compile.py compile_trace with ResumeFromInterpDescr.
         // `finish_and_compile` is that resumekey's compile_and_attach for a
         // FINISH-only entry procedure (no target loop to JUMP into).
-        let meta = self
-            .take_trace_meta()
+        self.take_trace_meta()
             .expect("compile_finish_from_active_session: session must be present");
         let result = self.compile_trace_finish_from_interp(
             finish_args,
             finish_arg_types,
-            meta,
             exit_with_exception,
         );
         // pyjitpl.py:2897 `finally: profiler.end_tracing()` — close the
@@ -20620,23 +20567,20 @@ pub struct GuardRecovery {
 
 /// Result of running compiled code with automatic recovery.
 #[derive(Debug, Clone)]
-pub enum RunResult<M> {
+pub enum RunResult {
     /// The loop finished normally.
     Finished {
         values: Vec<i64>,
-        meta: Option<std::sync::Arc<M>>,
         savedata: Option<GcRef>,
     },
     /// The trace exited via a normal back-edge jump.
     Jump {
         values: Vec<i64>,
-        meta: Option<std::sync::Arc<M>>,
         savedata: Option<GcRef>,
     },
     /// A guard failed.
     GuardFailure {
         values: Vec<i64>,
-        meta: Option<std::sync::Arc<M>>,
         trace_id: u64,
         fail_index: u32,
         savedata: Option<GcRef>,
@@ -32555,14 +32499,11 @@ mod tests {
         meta.set_on_compile_loop(move |_, _, _, opcodes| {
             *captured.lock() = opcodes.to_vec();
         });
-        meta.compile_loop(
-            &[
-                OpRef::input_arg_ref(0),
-                OpRef::input_arg_int(1),
-                OpRef::input_arg_int(2),
-            ],
-            (),
-        );
+        meta.compile_loop(&[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+        ]);
 
         let opcodes = compiled_opcodes.lock();
         assert!(
@@ -32681,7 +32622,7 @@ mod tests {
             "no front target tokens, so this key is one compile_loop proceeds from"
         );
 
-        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        meta.compile_loop(&[OpRef::input_arg_int(0)]);
 
         let fresh = meta
             .get_procedure_token(green_key.get_uhash())
@@ -32740,7 +32681,7 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
         }
 
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(
             matches!(outcome, CompileOutcome::Compiled { .. }),
             "compile_loop must install a loop, got {outcome:?}"
@@ -32838,7 +32779,7 @@ mod tests {
             "the sentinel arms bridge segmenting, which is what must not travel"
         );
 
-        let _ = meta.finish_and_compile(&[OpRef::input_arg_int(0)], vec![Type::Int], (), false);
+        let _ = meta.finish_and_compile(&[OpRef::input_arg_int(0)], vec![Type::Int], false);
 
         let fresh = meta
             .get_procedure_token(green_key.get_uhash())
@@ -32877,7 +32818,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        meta.compile_loop(&[OpRef::input_arg_int(0)]);
 
         // Charge the live token. `history.py JitCellToken.target_tokens` is
         // the label list `unroll.py optimize_bridge` scans; a hollow
@@ -32918,7 +32859,6 @@ mod tests {
         assert!(meta.compile_entry_bridge(
             green_key.get_uhash(),
             original_green_key.get_uhash(),
-            (),
             None,
             &bridge_ops,
             &bridge_inputargs,
@@ -32974,7 +32914,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        meta.compile_loop(&[OpRef::input_arg_int(0)]);
 
         let events = compile_events.lock();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
@@ -32998,7 +32938,7 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
-            let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+            let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
             let CompileOutcome::Compiled { green_key: key, .. } = outcome else {
                 panic!("compile_loop must produce a loop, got {outcome:?}");
             };
@@ -33876,7 +33816,7 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
         }
 
-        let outcome = meta.finish_and_compile(&[sum], vec![Type::Int], (), false);
+        let outcome = meta.finish_and_compile(&[sum], vec![Type::Int], false);
         assert!(
             outcome.is_err(),
             "GUARD_OVERFLOW behind IntAdd must reach the optimizer's InvalidLoop"
@@ -33950,7 +33890,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
             ctx.set_fail_args(g, &[sum]);
         }
-        meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert_eq!(
             *compile_count.lock(),
             1,
@@ -33990,7 +33930,7 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum2, i1], 0, 0);
                 ctx.set_fail_args(g, &[sum2, i1]);
             }
-            meta.compile_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)], ());
+            meta.compile_loop(&[OpRef::input_arg_int(0), OpRef::input_arg_int(1)]);
         }
 
         let events = events.lock();
@@ -34119,26 +34059,15 @@ mod tests {
 
     #[test]
     fn test_run_result_for_jump_exit_returns_jump() {
-        let result = MetaInterp::<()>::run_result_for_jump_exit(
-            u32::MAX,
-            vec![42],
-            Some(std::sync::Arc::new(())),
-            None,
-        )
-        .expect("jump exit should produce a direct Jump result");
+        let result = MetaInterp::<()>::run_result_for_jump_exit(u32::MAX, vec![42], None)
+            .expect("jump exit should produce a direct Jump result");
         match result {
             RunResult::Jump { values, .. } => assert_eq!(values, vec![42]),
             other => panic!("expected Jump result, got {other:?}"),
         }
 
         assert!(
-            MetaInterp::<()>::run_result_for_jump_exit(
-                3,
-                vec![42],
-                Some(std::sync::Arc::new(())),
-                None
-            )
-            .is_none(),
+            MetaInterp::<()>::run_result_for_jump_exit(3, vec![42], None).is_none(),
             "guard failure exits must keep using recovery paths"
         );
     }
@@ -34291,7 +34220,7 @@ mod tests {
         });
         meta.retracing_from = Some(start);
         let before = meta.trace_ctx().unwrap().current_merge_points.len();
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(
             matches!(outcome, CompileOutcome::Cancelled),
             "retrace cancel must keep tracing, got {outcome:?}"
@@ -34369,7 +34298,7 @@ mod tests {
             Vec::new(),
         ));
         let loops_before = meta.stats.loops_aborted;
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(
             matches!(outcome, CompileOutcome::Aborted),
             "tag overflow must abort, got {outcome:?}"
@@ -34463,7 +34392,7 @@ mod tests {
             inputargs: Vec::new(),
         });
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(matches!(outcome, CompileOutcome::Cancelled));
         let stored = meta
             .trace_ctx()
@@ -34548,7 +34477,7 @@ mod tests {
             inputargs: Vec::new(),
         });
         meta.retracing_from = Some(meta.trace_ctx().unwrap().current_merge_points[0].position);
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(
             matches!(outcome, CompileOutcome::Cancelled),
             "compile_loop retrace cancel: {outcome:?}"

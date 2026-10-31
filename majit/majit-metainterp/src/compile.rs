@@ -152,7 +152,7 @@ pub fn guard_resume_pc(descr: &dyn majit_ir::FailDescr) -> Option<u64> {
 }
 
 /// Typed result from running compiled code.
-pub struct CompileResult<M> {
+pub struct CompileResult {
     /// The exit slots this run left through.
     ///
     /// Populated on a FINISH and on a back-edge JUMP (`fail_index ==
@@ -161,23 +161,6 @@ pub struct CompileResult<M> {
     /// `resume.py ResumeDataDirectReader.decode_int` reads named slots via
     /// `self.cpu.get_int_value(self.deadframe, num)`.
     pub typed_values: ExitValues,
-    /// Optional frontend snapshot taken *before* `execute_token`. Warm entry
-    /// and restore rebuild from live state (`JitState::build_meta`); this
-    /// field is `None` on that path. A re-lookup after the run would read
-    /// whatever the compiled-loop index holds by then, and compiled code
-    /// re-enters the driver through residual calls, so the entry can be
-    /// recompiled or dropped mid-run.
-    ///
-    /// The hold is a shared reference, not a copy: upstream keeps the
-    /// `loop_token` object itself alive across `execute_assembler`, and an
-    /// `Arc` gives the same "this exact metadata, for the whole run" guarantee
-    /// without paying a struct copy per entry.
-    ///
-    /// Carried only for the caller that asked for it. The detailed runs read
-    /// it back off the result; the warm entry in `jitdriver` already holds
-    /// the same snapshot across the run and never reads this field, so it
-    /// hands in `None` and pays no refcount pair for the round trip.
-    pub meta: Option<std::sync::Arc<M>>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
@@ -227,13 +210,9 @@ pub struct CompileResult<M> {
 }
 
 /// Raw (lightweight) result from running compiled code.
-pub struct RawCompileResult<M> {
+pub struct RawCompileResult {
     pub values: ExitRawValues,
     pub typed_values: ExitValues,
-    /// Pre-run metadata snapshot — see `CompileResult::meta`.
-    /// `None` when the run entered on the procedure token; restore
-    /// rebuilds from live state.
-    pub meta: Option<std::sync::Arc<M>>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
