@@ -1829,7 +1829,7 @@ fn expand_pyre_class(
                 #[repr(C)]
                 pub struct #user_struct_name {
                     pub base: #st_name,
-                    pub map: usize,
+                    pub map: ::pyre_object::mapdict::MapRef,
                     pub storage: *mut ::pyre_object::object_array::ItemsBlock,
                 }
 
@@ -1837,7 +1837,7 @@ fn expand_pyre_class(
                     assert!(
                         ::std::mem::offset_of!(#user_struct_name, storage)
                             == ::std::mem::offset_of!(#user_struct_name, map)
-                                + ::std::mem::size_of::<usize>()
+                                + ::std::mem::size_of::<::pyre_object::mapdict::MapRef>()
                     );
                 };
 
@@ -1934,7 +1934,7 @@ fn expand_pyre_class(
                             },
                             ..payload
                         },
-                        map: 0,
+                        map: ::std::ptr::null(),
                         storage: ::std::ptr::null_mut(),
                     };
                     let obj = if raw.is_null() {

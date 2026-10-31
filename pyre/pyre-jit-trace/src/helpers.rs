@@ -814,7 +814,13 @@ pub fn emit_exception_new_inline(
             } else {
                 &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE
             };
-        let stamped = unsafe { pyre_object::layout_header_class(layout, std::ptr::null_mut(), 1) };
+        let stamped = unsafe {
+            pyre_object::layout_header_class(
+                layout,
+                std::ptr::null_mut(),
+                1 as pyre_object::mapdict::MapRef,
+            )
+        };
         if stamped.is_null() {
             w_class
         } else {

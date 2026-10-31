@@ -23,14 +23,15 @@ pub struct W_IntObject {
 #[repr(C)]
 pub struct W_IntObjectUser {
     pub base: W_IntObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_IntObjectUser, storage)
-            == std::mem::offset_of!(W_IntObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_IntObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -289,7 +290,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
             },
             intval: value,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(

@@ -555,14 +555,15 @@ impl W_SetObject {
 #[repr(C)]
 pub struct W_SetObjectUser {
     pub base: W_SetObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_SetObjectUser, storage)
-            == std::mem::offset_of!(W_SetObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_SetObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -2811,7 +2812,7 @@ pub fn w_set_user_new_empty(w_class: PyObjectRef, frozen: bool) -> PyObjectRef {
             content_gen: crate::object_array::length_cell(0),
             lifeline: PY_NULL,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     if !raw.is_null() {

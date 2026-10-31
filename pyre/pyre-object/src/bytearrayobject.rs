@@ -66,14 +66,15 @@ pub struct W_BytearrayObject {
 #[repr(C)]
 pub struct W_BytearrayObjectUser {
     pub base: W_BytearrayObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_BytearrayObjectUser, storage)
-            == std::mem::offset_of!(W_BytearrayObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_BytearrayObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -289,7 +290,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
             logical_offset: 0,
             exports: 0,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {

@@ -1,5 +1,12 @@
 # pyre-check: spec-folds=len_user_dunder
 # pyre-check: trace-shape=hot_plain:absent=CallMayForceR
+# pyre-check: jitstats-band=guard_failures=125
+# dynasm guard_failures reads 2026 default / 8M, 2055 at PYPY_GC_NURSERY=64K, 2119-2151 at 256K,
+# 2126 at 1M on one macOS arm64 binary; CI 2102 (cranelift ubuntu + macOS), 2132 (dynasm windows).
+# A map transition in the hot loop allocates the new map young; the failing GUARD_VALUE keys
+# its jitcounter on the raw pointer (`compile.py` `ResumeGuardDescr.must_compile` `cast_ptr_to_int(refval)`),
+# so a minor collection inside the failure burst promotes the map and splits the counter.
+# The count follows nursery traffic; loops and bridges stay exact. The width is the 2026 -> 2151 distance.
 # `len(obj)` whose receiver resolves `__len__` to a Python function.  Covers
 # the two receiver shapes `descroperation.py _len` dispatches a method for -- a
 # user instance and a builtin subclass overriding `__len__` -- plus the ways

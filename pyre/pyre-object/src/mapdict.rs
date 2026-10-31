@@ -6,6 +6,7 @@
 //! layer; this crate owns the node layout so `w_instance_get_type` can read
 //! the class where the data lives.
 
+use crate::lltype::{GcType, TypeIdCell};
 use crate::pyobject::PyObjectRef;
 use crate::quasiimmut::{QuasiImmut, QuasiImmutLock};
 use parking_lot::Mutex;
@@ -14,7 +15,10 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicPtr;
 
-/// A shared, interned, immortal map node (mapdict.py AbstractAttribute).
+/// A shared, interned map node (`mapdict.py` `AbstractAttribute`).
+///
+/// GC pointer to a managed [`MapNode`]. Identity compare (`ptr::eq`) remains
+/// valid after a moving collection because both sides are forwarded.
 pub type MapRef = *const MapNode;
 
 /// mapdict.py/376/382 — the three Terminator subclasses.
@@ -53,9 +57,8 @@ pub struct Terminator {
     /// Hidden `mutate_allow_unboxing` field (`quasiimmut.py
     /// get_mutate_field_name` of pyre `allow_unboxing`; `mapdict.py
     /// Terminator._immutable_fields_ = ['w_cls', 'allow_unboxing?']`). The
-    /// owner is a `Box::into_raw` leak that is never freed, so
-    /// [`QuasiImmutField`]'s `Drop` is unreachable and its inner box is
-    /// reclaimed only through [`QuasiImmutField::invalidate`].
+    /// owner is a GC [`MapNode`]. An `AtomicPtr` plus a lock, no GC
+    /// pointers, reclaimed by [`map_node_destructor`].
     pub mutate_allow_unboxing: std::sync::atomic::AtomicPtr<QuasiImmut>,
     pub mutate_allow_unboxing_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
     /// Which Terminator subclass this is.
@@ -224,9 +227,8 @@ pub struct PlainAttribute {
     /// Hidden `mutate_ever_mutated` field (`quasiimmut.py
     /// get_mutate_field_name` of pyre `ever_mutated`; `mapdict.py
     /// PlainAttribute._immutable_fields_` `ever_mutated?`). The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
+    /// GC [`MapNode`]. An `AtomicPtr` plus a lock, no GC pointers,
+    /// reclaimed by [`map_node_destructor`].
     pub mutate_ever_mutated: std::sync::atomic::AtomicPtr<QuasiImmut>,
     pub mutate_ever_mutated_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
     /// mapdict.py:431 `order`.
@@ -325,20 +327,26 @@ pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAtt
     unsafe { (*attribute).force_ever_mutated_qmut() };
 }
 
-/// Map nodes are `lltype::malloc_raw` allocations that are never freed,
-/// never GC objects.
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub const _alloc_flavor_MapNode: &str = "raw";
+/// GC tid for [`MapNode`], assigned at `register_type` (`ItemsBlock`
+/// / `TypeIdCell::auto()`).
+pub static MAP_NODE_GC_TYPE_ID: TypeIdCell = TypeIdCell::auto();
 
 /// mapdict.py `AbstractAttribute` plus its two concrete subclasses.
 ///
 /// `repr(C)` pins the enum tag then the variant payload so
 /// `AbstractAttribute.terminator` is one offset on both variants.
+/// A moving GC instance (`mapdict.py` `AbstractAttribute`).
 #[repr(C)]
 pub enum MapNode {
     Terminator(Terminator),
     Plain(PlainAttribute),
+}
+
+impl GcType for MapNode {
+    fn type_id() -> u32 {
+        MAP_NODE_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = std::mem::size_of::<Self>();
 }
 
 impl MapNode {
@@ -350,11 +358,27 @@ impl MapNode {
         }
     }
 
+    /// Borrow the inner Terminator mutably (panics on PlainAttribute).
+    pub fn as_terminator_mut(&mut self) -> &mut Terminator {
+        match self {
+            MapNode::Terminator(t) => t,
+            MapNode::Plain(_) => panic!("as_terminator_mut on PlainAttribute"),
+        }
+    }
+
     /// Borrow the inner PlainAttribute (panics on Terminator).
     pub fn as_plain(&self) -> &PlainAttribute {
         match self {
             MapNode::Plain(p) => p,
             MapNode::Terminator(_) => panic!("as_plain on Terminator"),
+        }
+    }
+
+    /// Borrow the inner PlainAttribute mutably (panics on Terminator).
+    pub fn as_plain_mut(&mut self) -> &mut PlainAttribute {
+        match self {
+            MapNode::Plain(p) => p,
+            MapNode::Terminator(_) => panic!("as_plain_mut on Terminator"),
         }
     }
 
@@ -404,7 +428,7 @@ impl MapNode {
 
 /// mapdict.py `CachedAttributeHolder` — caches the child map produced
 /// by adding `(name, attrkind)` to a parent map, so transitions are shared.
-/// Interned/immortal like the map nodes it holds.
+/// A moving GC instance (`mapdict.py` `CachedAttributeHolder`).
 ///
 /// `repr(C)` pins field offsets to declaration order so the JIT descr
 /// group's `offset_of!` matches the walker arg0 (the holder itself).
@@ -420,9 +444,9 @@ pub struct CachedAttributeHolder {
     pub attr: Cell<MapRef>,
     /// Hidden `mutate_attr` field (`quasiimmut.py get_mutate_field_name` of
     /// pyre `attr`; `mapdict.py CachedAttributeHolder._immutable_fields_ =
-    /// ['attr?', 'typ?']`). The owner is a `Box::into_raw` leak that is
-    /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
-    /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
+    /// ['attr?', 'typ?']`). The owner is a GC [`CachedAttributeHolder`].
+    /// An `AtomicPtr` plus a lock, no GC pointers, reclaimed by
+    /// [`cached_attribute_holder_destructor`].
     pub mutate_attr: std::sync::atomic::AtomicPtr<QuasiImmut>,
     pub mutate_attr_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
     /// mapdict.py:669 `_immutable_fields_` declares `typ?`; mapdict.py:676
@@ -431,9 +455,9 @@ pub struct CachedAttributeHolder {
     pub typ: Cell<Option<UnboxType>>,
     /// Hidden `mutate_typ` field (`quasiimmut.py get_mutate_field_name` of
     /// pyre `typ`; `mapdict.py CachedAttributeHolder._immutable_fields_ =
-    /// ['attr?', 'typ?']`). The owner is a `Box::into_raw` leak that is
-    /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
-    /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
+    /// ['attr?', 'typ?']`). The owner is a GC [`CachedAttributeHolder`].
+    /// An `AtomicPtr` plus a lock, no GC pointers, reclaimed by
+    /// [`cached_attribute_holder_destructor`].
     pub mutate_typ: std::sync::atomic::AtomicPtr<QuasiImmut>,
     pub mutate_typ_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
 }
@@ -471,7 +495,17 @@ impl CachedAttributeHolder {
         if self.mutate_attr().is_installed() {
             unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_attr) };
         }
-        self.attr.set(a);
+        // `rgc.ll_writebarrier` on the holder before storing `attr`
+        // (`mapdict.py CachedAttributeHolder.attr`).
+        let _roots = crate::gc_roots::push_roots();
+        let base =
+            crate::gc_roots::pin_roots(&[self as *const Self as PyObjectRef, a as PyObjectRef]);
+        crate::gc_hook::try_gc_write_barrier(
+            crate::gc_roots::shadow_stack_get(base) as crate::gc_hook::GCREF
+        );
+        let owner = crate::gc_roots::shadow_stack_get(base) as *const Self;
+        let a = crate::gc_roots::shadow_stack_get(base + 1) as MapRef;
+        unsafe { (*owner).attr.set(a) };
     }
 
     /// Change mapdict.py:676 `typ` using the ordering, fast path, and
@@ -509,6 +543,16 @@ impl CachedAttributeHolder {
     pub fn force_typ_qmut(&self) {
         self.mutate_typ().invalidate();
     }
+}
+
+/// GC tid for [`CachedAttributeHolder`], assigned at `register_type`.
+pub static CACHED_ATTRIBUTE_HOLDER_GC_TYPE_ID: TypeIdCell = TypeIdCell::auto();
+
+impl GcType for CachedAttributeHolder {
+    fn type_id() -> u32 {
+        CACHED_ATTRIBUTE_HOLDER_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = std::mem::size_of::<Self>();
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for a CachedAttributeHolder's `attr?` field.
@@ -604,18 +648,25 @@ struct MapNodeTerminatorView {
     w_cls: PyObjectRef,
 }
 
-/// Both overlays view a raw [`MapNode`], so they share its flavor.
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub const _alloc_flavor_MapNodeAbstractAttribute: &str = "raw";
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub const _alloc_flavor_MapNodeTerminatorView: &str = "raw";
+/// `#[repr(C)]` enum tag then variant payload. First variant is 0.
+/// Payload offsets use the overlay structs rather than `offset_of!(MapNode,
+/// Terminator)` / `Plain`: rustc's `offset_of!` on enum variants is
+/// experimental (`#120141`).
+pub const MAP_NODE_TAG_OFFSET: usize = 0;
+pub const MAP_NODE_TERMINATOR_OFFSET: usize =
+    std::mem::offset_of!(MapNodeAbstractAttribute, terminator);
+pub const MAP_NODE_PLAIN_OFFSET: usize = std::mem::offset_of!(MapNodeAbstractAttribute, terminator);
+/// `#[repr(C)]` first variant discriminant.
+pub const MAP_NODE_TERMINATOR_TAG: isize = 0;
+/// `#[repr(C)]` second variant discriminant.
+pub const MAP_NODE_PLAIN_TAG: isize = 1;
 
 const _: () = {
     assert!(std::mem::offset_of!(Terminator, terminator) == 0);
     assert!(std::mem::offset_of!(Terminator, w_cls) == std::mem::size_of::<MapRef>());
     assert!(std::mem::offset_of!(PlainAttribute, terminator) == 0);
+    assert!(MAP_NODE_TERMINATOR_OFFSET == std::mem::size_of::<isize>());
+    assert!(MAP_NODE_PLAIN_OFFSET == std::mem::size_of::<isize>());
     assert!(
         std::mem::offset_of!(MapNodeAbstractAttribute, terminator) == std::mem::size_of::<isize>()
     );
@@ -648,7 +699,7 @@ const _: () = {
 /// and the walker hitting it aborts the trace.
 ///
 /// # Safety
-/// `map` must be a live interned [`MapNode`].
+/// `map` must be a live GC [`MapNode`].
 #[inline]
 pub unsafe fn map_terminator_w_cls(map: MapRef) -> PyObjectRef {
     // Live interned nodes have a non-null terminator (`new_terminator`
@@ -664,7 +715,7 @@ pub unsafe fn map_terminator_w_cls(map: MapRef) -> PyObjectRef {
 /// names the builtin the generated class extends. Exact `object()` is
 /// `INSTANCE_TYPE` (`user_base` null) and uses `W_Root.getclass` /
 /// `gettypefor(typeptr)` — the header word. A `_getusercls` carrier with
-/// a non-null map reads the terminator; a still-zero map falls back to
+/// a non-null map reads the terminator; a still-null map falls back to
 /// the header until `user_setup` copies `w_subtype.terminator`.
 ///
 /// # Safety
@@ -692,8 +743,8 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
     // `W_ObjectObjectUserDictWeakrefable` payload is `W_ObjectObject` at
     // offset 0, so the typed field is that word. Generated `_getusercls`
     // payloads put `map` after the builtin prefix; `mapdict_offset` is
-    // that mixin word. The layout stores the interned node as `usize`
-    // (`W_ObjectObject.map`); `_mapdict_init_empty` is the zero word.
+    // that mixin word. The layout stores a GC [`MapRef`];
+    // `_mapdict_init_empty` is a null pointer.
     let map_word = if std::ptr::eq(tp, &crate::pyobject::INSTANCE_USER_TYPE) {
         unsafe { (*(obj as *const crate::objectobject::W_ObjectObject)).map }
     } else {
@@ -701,21 +752,112 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
         if off == 0 {
             return unsafe { (*obj).w_class };
         }
-        unsafe { majit_ir::llop::gc_load_indexed::<usize, _>(obj, off, 1, 0) }
+        unsafe { majit_ir::llop::gc_load_indexed::<MapRef, _>(obj, off, 1, 0) }
     };
-    if map_word == 0 {
+    if map_word.is_null() {
         return unsafe { (*obj).w_class };
     }
     // MapdictStorageMixin._get_mapdict_map: `return jit.promote(self.map)`.
     // getclass is that word then `terminator.w_cls`; without the promote the
     // class stays a red load and every `type()` / `is_exact_type` inlines a
     // fat residual.
-    let map = majit_ir::jit::promote(map_word as MapRef);
+    let map = majit_ir::jit::promote(map_word);
     let w_cls = unsafe { map_terminator_w_cls(map) };
     if !w_cls.is_null() {
         return w_cls;
     }
     unsafe { (*obj).w_class }
+}
+
+/// `mapdict.py` `AbstractAttribute.cache_attrs` table type.
+pub type CacheAttrsTable = Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>;
+
+fn visit_map_ref_slot(slot: *mut MapRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
+    f(slot as *mut PyObjectRef);
+}
+
+unsafe fn walk_cache_attrs_table(
+    slot: &AtomicPtr<CacheAttrsTable>,
+    f: &mut dyn FnMut(*mut PyObjectRef),
+) {
+    let ptr = slot.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    let table = unsafe { &*ptr };
+    let mut guard = table.lock();
+    for holder in guard.values_mut() {
+        f(holder as *mut *const CachedAttributeHolder as *mut PyObjectRef);
+    }
+}
+
+/// `rgc.register_custom_trace_hook` for [`MapNode`].
+///
+/// Reads the `#[repr(C)]` variant tag at [`MAP_NODE_TAG_OFFSET`] and the
+/// payload at [`MAP_NODE_TERMINATOR_OFFSET`] / [`MAP_NODE_PLAIN_OFFSET`].
+///
+/// # Safety
+/// `obj_addr` must point at a live [`MapNode`].
+pub unsafe fn map_node_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut PyObjectRef)) {
+    let tag = unsafe { *(obj_addr as *const isize) };
+    if tag == MAP_NODE_TERMINATOR_TAG {
+        let t = unsafe {
+            &mut *((obj_addr as *mut u8).add(MAP_NODE_TERMINATOR_OFFSET) as *mut Terminator)
+        };
+        visit_map_ref_slot(std::ptr::addr_of_mut!(t.terminator), f);
+        f(std::ptr::addr_of_mut!(t.w_cls));
+        visit_map_ref_slot(t.devolved_dict_terminator.as_ptr(), f);
+        unsafe { walk_cache_attrs_table(&t.cache_attrs, f) };
+    } else {
+        debug_assert_eq!(tag, MAP_NODE_PLAIN_TAG);
+        let p = unsafe {
+            &mut *((obj_addr as *mut u8).add(MAP_NODE_PLAIN_OFFSET) as *mut PlainAttribute)
+        };
+        visit_map_ref_slot(std::ptr::addr_of_mut!(p.terminator), f);
+        visit_map_ref_slot(std::ptr::addr_of_mut!(p.back), f);
+        unsafe { walk_cache_attrs_table(&p.cache_attrs, f) };
+    }
+}
+
+unsafe fn drop_cache_attrs_table(slot: &AtomicPtr<CacheAttrsTable>) {
+    let ptr = slot.swap(std::ptr::null_mut(), std::sync::atomic::Ordering::AcqRel);
+    if !ptr.is_null() {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+}
+
+/// Sweep destructor for [`MapNode`]: reclaim `QuasiImmutField`, drop
+/// `cache_attrs` and `PlainAttribute.name`. Map/Python refs are GC-owned.
+///
+/// # Safety
+/// `obj_addr` must point at a swept [`MapNode`].
+pub unsafe fn map_node_destructor(obj_addr: usize) {
+    let node = obj_addr as *mut MapNode;
+    match unsafe { &mut *node } {
+        MapNode::Terminator(t) => unsafe { drop_cache_attrs_table(&t.cache_attrs) },
+        MapNode::Plain(p) => unsafe { drop_cache_attrs_table(&p.cache_attrs) },
+    }
+    unsafe { std::ptr::drop_in_place(node) };
+}
+
+/// `rgc.register_custom_trace_hook` for [`CachedAttributeHolder`].
+///
+/// # Safety
+/// `obj_addr` must point at a live [`CachedAttributeHolder`].
+pub unsafe fn cached_attribute_holder_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut PyObjectRef),
+) {
+    let h = unsafe { &mut *(obj_addr as *mut CachedAttributeHolder) };
+    visit_map_ref_slot(h.attr.as_ptr(), f);
+}
+
+/// Sweep destructor for [`CachedAttributeHolder`].
+///
+/// # Safety
+/// `obj_addr` must point at a swept [`CachedAttributeHolder`].
+pub unsafe fn cached_attribute_holder_destructor(obj_addr: usize) {
+    unsafe { std::ptr::drop_in_place(obj_addr as *mut CachedAttributeHolder) };
 }
 
 #[cfg(test)]
@@ -734,6 +876,35 @@ mod prefix_overlay_tests {
             devolved_dict_terminator: Cell::new(std::ptr::null()),
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    #[test]
+    fn map_node_repr_c_tag_is_terminator_then_plain() {
+        let mut term = MapNode::Terminator(dummy_terminator(0x2000 as PyObjectRef));
+        let mut plain = MapNode::Plain(PlainAttribute {
+            terminator: std::ptr::null(),
+            name: Wtf8Buf::from("x"),
+            attrkind: 0,
+            storageindex: 0,
+            num_attributes: 1,
+            back: std::ptr::null(),
+            ever_mutated: Cell::new(false),
+            mutate_ever_mutated: null_mutate_word(),
+            mutate_ever_mutated_lock: null_mutate_lock(),
+            order: 0,
+            cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
+            unboxed: None,
+        });
+        assert_eq!(
+            unsafe { *(&term as *const MapNode as *const isize) },
+            MAP_NODE_TERMINATOR_TAG
+        );
+        assert_eq!(
+            unsafe { *(&plain as *const MapNode as *const isize) },
+            MAP_NODE_PLAIN_TAG
+        );
+        let _ = &mut term;
+        let _ = &mut plain;
     }
 
     #[test]
