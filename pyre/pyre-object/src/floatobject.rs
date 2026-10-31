@@ -18,14 +18,15 @@ pub struct W_FloatObject {
 #[repr(C)]
 pub struct W_FloatObjectUser {
     pub base: W_FloatObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_FloatObjectUser, storage)
-            == std::mem::offset_of!(W_FloatObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_FloatObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -171,7 +172,7 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
             },
             floatval: value,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(

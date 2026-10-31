@@ -2833,15 +2833,13 @@ unsafe fn walker_classify_shadow_guard(
     unsafe {
         if pyre_object::is_instance(concrete_obj) {
             let map = (*(concrete_obj as *const pyre_object::W_ObjectObject)).map;
-            if map == 0 {
+            if map.is_null() {
                 return None;
             }
             // A devolved instance holds its attributes in a dictionary and
             // keeps the same map across a later `e.<name> = ...`, so pinning
             // the map would not observe the shadow the assignment installs.
-            // `W_ObjectObject.map` is stored as a raw word; the map layer
-            // owns the node type.
-            if pyre_interpreter::objspace::std::mapdict::map_is_devolved(map as *const _) {
+            if pyre_interpreter::objspace::std::mapdict::map_is_devolved(map) {
                 return None;
             }
             Some(ShadowGuard::InstanceMap(map as *const u8))

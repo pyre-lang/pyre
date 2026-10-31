@@ -273,14 +273,15 @@ impl W_BytesObject {
 #[repr(C)]
 pub struct W_BytesObjectUser {
     pub base: W_BytesObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_BytesObjectUser, storage)
-            == std::mem::offset_of!(W_BytesObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_BytesObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -470,7 +471,7 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
             len: bytes.len(),
             ctypes_keepalive_refs: 0,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {

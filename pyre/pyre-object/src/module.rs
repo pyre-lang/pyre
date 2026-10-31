@@ -154,14 +154,15 @@ pub fn w_module_new_managed(name: &str) -> PyObjectRef {
 #[repr(C)]
 pub struct ModuleUser {
     pub base: Module,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(ModuleUser, storage)
-            == std::mem::offset_of!(ModuleUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(ModuleUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -195,7 +196,7 @@ pub fn w_module_user_new(w_class: PyObjectRef) -> PyObjectRef {
     };
     crate::lltype::malloc_typed_stable(ModuleUser {
         base: value,
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     }) as PyObjectRef
 }

@@ -48,14 +48,15 @@ pub struct W_Array {
 #[repr(C)]
 pub struct W_ArrayUser {
     pub base: W_Array,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ArrayUser, storage)
-            == std::mem::offset_of!(W_ArrayUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ArrayUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -217,7 +218,7 @@ pub fn w_array_user_new(typecode: u8, itemsize: u8, w_class: PyObjectRef) -> PyO
             exports: 0,
             w_weakreflifeline: PY_NULL,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {

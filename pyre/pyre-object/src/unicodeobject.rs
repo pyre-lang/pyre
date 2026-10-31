@@ -260,14 +260,15 @@ impl W_UnicodeObject {
 #[repr(C)]
 pub struct W_UnicodeObjectUser {
     pub base: W_UnicodeObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut crate::object_array::ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_UnicodeObjectUser, storage)
-            == std::mem::offset_of!(W_UnicodeObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_UnicodeObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -830,7 +831,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
             index_storage: std::ptr::null_mut(),
             hash: 0,
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {

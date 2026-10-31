@@ -719,14 +719,13 @@ pub struct PyCode {
     /// len(co_names_w)`.
     ///
     /// Per-name slot for the `LOAD_ATTR_caching` / `STORE_ATTR_caching` inline
-    /// attribute cache (`mapdict.py/1574`).  A `None` slot is PyPy's
-    /// `INVALID_CACHE_ENTRY` (mapdict.py); a `Some` holds the immortal map
-    /// node + attribute node + `version_tag` last resolved for this slot, so a
-    /// monomorphic re-read skips the type lookup + map walk.  The
-    /// LOAD_METHOD fill additionally stores a movable `w_method`
-    /// reference (mapdict.py), forwarded during collection by
-    /// `walk_mapdict_method_cache_gc`; the other fields are immortal
-    /// node pointers and need no walking.
+    /// attribute cache (`mapdict.py`).  A `None` slot is PyPy's
+    /// `INVALID_CACHE_ENTRY` (`mapdict.py`); a `Some` holds `weakref.ref`
+    /// of the map and attr (`mapdict.py CacheEntry` / `_fill_cache`) plus
+    /// `version_tag`. A monomorphic re-read skips the type lookup + map
+    /// walk. LOAD_METHOD fill additionally stores `w_method`.
+    /// `walk_mapdict_method_cache_gc` strong-traces the WEAKREF structs
+    /// and `w_method`.
     ///
     /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
     /// never resized; `null` when `code_ptr` is null or unaligned.
@@ -5565,12 +5564,10 @@ pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRe
     }
 }
 
-/// Forward every filled `entry.w_method` slot during collection — the
-/// faithful equivalent of the GC tracing PyPy's `CacheEntry.w_method`
-/// (mapdict.py) gets through its GC-managed holder.  The cached
-/// map/attr node pointers are immortal interned nodes and the
-/// `version_tag` is a `u64`, so `w_method` is the entry's only movable
-/// reference.
+/// Forward every filled CacheEntry GC edge during collection
+/// (`mapdict.py CacheEntry`): the WEAKREF structs (`map_wref` /
+/// `attr_wref`) and `w_method`. A dead weakref is a cache miss
+/// (`_is_valid_for_map`).
 ///
 /// Process-global for the same reason as
 /// [`walk_w_globals_stamped_code_roots`]: the holder is immortal and outlives
@@ -5585,10 +5582,20 @@ pub fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
         }
         let vec = unsafe { &mut *code.mapdict_caches };
         for slot in vec.iter_mut() {
-            if let Some(entry) = slot.as_mut()
-                && !entry.w_method.is_null()
-            {
-                forward(&mut entry.w_method);
+            if let Some(entry) = slot.as_mut() {
+                if !entry.map_wref.is_null() {
+                    forward(unsafe {
+                        &mut *(std::ptr::addr_of_mut!(entry.map_wref) as *mut PyObjectRef)
+                    });
+                }
+                if !entry.attr_wref.is_null() {
+                    forward(unsafe {
+                        &mut *(std::ptr::addr_of_mut!(entry.attr_wref) as *mut PyObjectRef)
+                    });
+                }
+                if !entry.w_method.is_null() {
+                    forward(&mut entry.w_method);
+                }
             }
         }
     }

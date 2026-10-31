@@ -250,14 +250,15 @@ pub struct W_ListObject {
 #[repr(C)]
 pub struct W_ListObjectUser {
     pub base: W_ListObject,
-    pub map: usize,
+    pub map: crate::mapdict::MapRef,
     pub storage: *mut ItemsBlock,
 }
 
 const _: () = {
     assert!(
         std::mem::offset_of!(W_ListObjectUser, storage)
-            == std::mem::offset_of!(W_ListObjectUser, map) + std::mem::size_of::<usize>()
+            == std::mem::offset_of!(W_ListObjectUser, map)
+                + std::mem::size_of::<crate::mapdict::MapRef>()
     );
 };
 
@@ -2076,7 +2077,7 @@ pub fn w_list_user_new_empty(w_class: PyObjectRef) -> PyObjectRef {
             bytes_items: BytesArray::empty(),
             ascii_items: UnicodeArray::empty(),
         },
-        map: 0,
+        map: std::ptr::null(),
         storage: std::ptr::null_mut(),
     };
     if raw.is_null() {
