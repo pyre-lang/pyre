@@ -13765,7 +13765,7 @@ impl<M: Clone> MetaInterp<M> {
     /// descr by upstream type:
     ///
     /// 1. `compile.py ResumeDescr` — `descr.rd_loop_token = clt`.
-    /// 2. `compile.py:187-191 JitCellToken` (CALL_ASSEMBLER) — record
+    /// 2. `compile.py record_loop_or_bridge` (`isinstance(descr, JitCellToken)`) (CALL_ASSEMBLER) — record
     ///    keepalive on `original` and clear the descr reference.
     /// 3. `compile.py:192-203 TargetToken` (JUMP) — walk to the target's
     ///    owning JitCellToken, record keepalive, clear the descr.
@@ -15908,12 +15908,12 @@ impl<M: Clone> MetaInterp<M> {
         //   ...
         //   self.staticdata.try_to_free_some_loops()
         //   self.create_history(...)
-        // compile.py `_trace_and_compile_from_bridge`:
-        // `loop_token = self.rd_loop_token.loop_token_wref()`; `giveup`
+        // compile.py AbstractResumeGuardDescr._trace_and_compile_from_bridge:
+        // the gate is the descr's `rd_loop_token.loop_token_wref()`; `giveup`
         // when that weakref is dead. `pyjitpl.py handle_guard_failure`
-        // keeps tracing while the same wref is live. A sibling driver
-        // can overwrite a numeric key, and a memmgr prune can drop the
-        // cell token while the descr still names a live token.
+        // keeps tracing while the same wref is live. A memmgr prune of
+        // `alive_loops` that drops the token makes that weakref dead, which
+        // gives up.
         // `handle_guard_failure` runs on a fresh `MetaInterp` after
         // `execute_token` unwinds. A residual guard while the recorder is
         // parked must not call `enter_profiler_tracing`.
@@ -19520,7 +19520,8 @@ impl<M: Clone> MetaInterp<M> {
                 crate::green_key_hash_typed(&green_values, &green_types),
                 || typed.clone(),
             );
-        // `compile.py:187` parity: `op.getdescr()` IS a `JitCellToken`.  Carry
+        // `compile.py record_loop_or_bridge` (`isinstance(descr, JitCellToken)`)
+        // parity: `op.getdescr()` IS a `JitCellToken`.  Carry
         // the *same* Arc that the warm cell owns through to the
         // descr so `record_loop_or_bridge` can downcast and push it directly,
         // skipping the number-keyed `jitcell_token_by_number` recovery.

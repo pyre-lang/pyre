@@ -198,11 +198,6 @@ pub struct RawExecResult {
     pub outputs: Vec<i64>,
     /// Typed output values decoded from the exit slots.
     pub typed_outputs: Vec<Value>,
-    /// Execute leaves this empty: slot types are `descr.fail_arg_types()`
-    /// (`llmodel.py get_int_value` / `get_ref_value` / `get_float_value`).
-    /// Inspection APIs (`compiled_fail_descr_layouts`) still fill a
-    /// `FailDescrLayout`.
-    pub exit_layout: Option<FailDescrLayout>,
     /// Output slots that carry opaque force tokens instead of GC refs.
     /// Optional saved-data GC ref captured by this exit.
     pub savedata: Option<GcRef>,
@@ -3784,7 +3779,6 @@ pub trait Backend: Send {
         RawExecResult {
             outputs,
             typed_outputs,
-            exit_layout: None,
             savedata,
             exception_value,
             fail_index: descr.fail_index(),

@@ -4046,7 +4046,6 @@ impl Backend for DynasmBackend {
         majit_backend::RawExecResult {
             outputs,
             typed_outputs,
-            exit_layout: None,
             savedata: (!savedata.is_null()).then_some(savedata),
             exception_value,
             fail_index: descr_fd.fail_index_per_trace(),

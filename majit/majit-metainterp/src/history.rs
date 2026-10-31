@@ -5130,7 +5130,8 @@ impl TraceCtx {
 
     /// Variant of `call_assembler_typed_by_number` that
     /// uses a pre-resolved `Arc<JitCellToken>` so the recorded descr
-    /// carries production token identity (compile.py:187 parity).
+    /// carries production token identity (`compile.py record_loop_or_bridge`
+    /// (`isinstance(descr, JitCellToken)`)).
     /// Skips the synth-Arc + `jitcell_token_by_number` keepalive fallback
     /// that the number-only path relies on in `record_loop_or_bridge`.
     fn call_assembler_typed_arc(
@@ -5263,7 +5264,8 @@ impl TraceCtx {
 
     /// Records a red-args-only CALL_ASSEMBLER against a resolved
     /// `JitCellToken`. RPython records the target token object directly on
-    /// CALL_ASSEMBLER ops (`compile.py:187`), so production walker paths use
+    /// CALL_ASSEMBLER ops (`compile.py record_loop_or_bridge`
+    /// (`isinstance(descr, JitCellToken)`)), so production walker paths use
     /// this once they have resolved or synthesized the token object.
     ///
     /// The `target_number`-taking form, `call_assembler_red_only_ref`, is

@@ -7,7 +7,7 @@
 //! This is the RPython equivalent of `rpython/jit/metainterp/blackhole.py`.
 //!
 //! The `resume_in_blackhole` entry itself lives with its caller, as
-//! `pyre_jit::eval::resume_in_blackhole_from_exit_layout`: it needs the
+//! `pyre_jit::eval::resume_in_blackhole`: it needs the
 //! failing descr plus the driver's `vinfo`/`vrefinfo`/`ginfo`, none of
 //! which this crate can name.  What this module owns is everything it
 //! calls into — `blackhole_from_resumedata`, `prepare_resume_from_failure`

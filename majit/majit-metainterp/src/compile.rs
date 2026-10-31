@@ -140,22 +140,6 @@ pub fn raw_exit_values(typed: &[Value]) -> ExitRawValues {
     typed.iter().map(Value::as_raw_i64).collect()
 }
 
-/// Whether the collector traces fail-arg slot `slot`.
-///
-/// `llsupport/assembler.py compute_gcmap` skips the hole a virtual leaves
-/// (`if arg is None: continue`), marks every remaining `REF`-typed failarg,
-/// and narrows nothing else. A force token is marked like any other, because
-/// `resoperation.py FORCE_TOKEN/0/r` is REF — it returns the jitframe, itself
-/// a GC object that moves — and both emitted gcmaps
-/// (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
-///
-/// The skip has nothing to do here: every fail arg is bound, so the type
-/// test is the whole rule. Do not narrow it by force-token position: that
-/// would stop rooting a live jitframe pointer.
-pub fn is_traced_ref_slot(fail_arg_types: &[Type], slot: usize) -> bool {
-    fail_arg_types.get(slot) == Some(&Type::Ref)
-}
-
 /// The pc the outermost frame of `descr`'s resume data resumes at.
 /// `resume.py ResumeDataVirtualAdder.number` writes each frame as
 /// `jitcode_index, pc, values...` after the vable and vref sections, and
@@ -1429,24 +1413,6 @@ mod tests {
             jump_args(&same_index_distinct),
             vec![OpRef::ref_op(50), OpRef::ref_op(51), OpRef::ref_op(52)]
         );
-    }
-
-    /// The deadframe rooting in `handle_fail` reads `descr.fail_arg_types()`.
-    /// A force-token slot is traced like any other ref — `compute_gcmap`
-    /// marks every REF failarg it does not skip, and it skips only the hole a
-    /// virtual leaves.
-    #[test]
-    fn fail_arg_types_trace_every_ref_slot_including_force_tokens() {
-        let descr = make_resume_guard_descr_typed(vec![Type::Ref, Type::Int, Type::Ref]);
-        let types = descr
-            .as_fail_descr()
-            .expect("resume guard")
-            .fail_arg_types();
-
-        assert!(is_traced_ref_slot(types, 0));
-        assert!(!is_traced_ref_slot(types, 1));
-        assert!(is_traced_ref_slot(types, 2));
-        assert!(!is_traced_ref_slot(types, 3));
     }
 
     /// Frame value count for the stamp-guard descr fixtures below, each

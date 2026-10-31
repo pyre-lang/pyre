@@ -8808,7 +8808,7 @@ fn run_compiled_generatorentry(
         // A non-StopIteration guard exit still has to run the portal
         // jitcode's `catch_exception` / `finally` (`blackhole.py`
         // `resume_in_blackhole`) so `running` and the EC link are cleared.
-        let bh = resume_in_blackhole_from_exit_layout(
+        let bh = resume_in_blackhole(
             &mut values,
             descr_arc
                 .as_ref()
@@ -9017,7 +9017,7 @@ fn drive_unpack_iterable_trace(
     // dropped; `ContinueRunningNormally` re-enters the compiled loop, and the
     // drain ends at the StopIteration guard exit. The interp `ln` loop then
     // exits on its own next `next()` (StopIteration). Uses the values-based
-    // runner + the frameless `resume_in_blackhole_from_exit_layout` because jd1
+    // runner + the frameless `resume_in_blackhole` because jd1
     // is novable with raw `(w_iterator, items)` reds, not a PyFrame the
     // frame-projecting `execute_assembler`/`handle_fail` path expects.
     if matches!(action, BackEdgeAction::RunCompiled) && jd1_enter_enabled() {
@@ -9100,7 +9100,7 @@ fn drive_unpack_iterable_trace(
             }
             // compile.py:710-716 resume_in_blackhole: complete the in-flight
             // `next()`/`append` and run forward to the next merge point.
-            let bh = resume_in_blackhole_from_exit_layout(
+            let bh = resume_in_blackhole(
                 &mut values,
                 descr_arc
                     .as_ref()
@@ -12036,15 +12036,23 @@ fn handle_fail(
     // The exit values are a host copy of the JITFRAME slots; the JITFRAME's
     // own gcmap rooting ended when `execute_token` returned. Bridge tracing
     // below allocates, so root the traced Ref slots for this whole call
-    // (`DeadFrameRefRoots`), the set `compute_gcmap` marks — force tokens
-    // included, since one is a jitframe pointer and the jitframe moves.
+    // (`DeadFrameRefRoots`).
+    // `llsupport/assembler.py compute_gcmap` skips the hole a virtual leaves
+    // (`if arg is None: continue`), marks every remaining `REF`-typed failarg,
+    // and narrows nothing else. A force token is marked like any other, because
+    // `resoperation.py FORCE_TOKEN/0/r` is REF — it returns the jitframe, itself
+    // a GC object that moves — and both emitted gcmaps
+    // (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
+    // The skip has nothing to do here: every fail arg is bound, so the type
+    // test is the whole rule. Do not narrow it by force-token position: that
+    // would stop rooting a live jitframe pointer.
     let fail_arg_types = descr_arc
         .as_fail_descr()
         .map(|fd| fd.fail_arg_types())
         .unwrap_or(&[]);
     let _deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
-            majit_metainterp::is_traced_ref_slot(fail_arg_types, index)
+            fail_arg_types.get(index) == Some(&majit_ir::Type::Ref)
         })
     };
 
@@ -12257,13 +12265,8 @@ fn dispatch_handle_fail(
         }
         (HandleFailOutcome::ResumeInBlackhole, savedata) => {
             // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-            let bh_result = resume_in_blackhole_from_exit_layout(
-                raw_values,
-                descr_arc,
-                guard_exc_root.get(),
-                false,
-                savedata,
-            );
+            let bh_result =
+                resume_in_blackhole(raw_values, descr_arc, guard_exc_root.get(), false, savedata);
             match &bh_result {
                 crate::call_jit::BlackholeResult::ContinueRunningNormally { green_int, .. } => {
                     apply_blackhole_crn_handoff(frame_root.frame(), green_int);
@@ -12343,14 +12346,15 @@ pub(crate) fn savedata_from_jitframe(
     (ptr != 0).then_some(majit_ir::GcRef(ptr))
 }
 
-/// compile.py:710-716 resume_in_blackhole parity.
+/// `blackhole.py resume_in_blackhole` /
+/// `compile.py AbstractResumeGuardDescr.handle_fail`.
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
 /// consume_one_section → _run_forever → raises.
 ///
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
-pub(crate) fn resume_in_blackhole_from_exit_layout(
+pub(crate) fn resume_in_blackhole(
     raw_values: &mut [i64],
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     guard_exc: i64,
@@ -12387,9 +12391,10 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         .as_fail_descr()
         .expect("a guard blackhole resume carries a FailDescr");
     let fail_arg_types = fd.fail_arg_types();
+    // Same `compute_gcmap` rule as `handle_fail`.
     let deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
-            majit_metainterp::is_traced_ref_slot(fail_arg_types, index)
+            fail_arg_types.get(index) == Some(&majit_ir::Type::Ref)
         })
     };
     if majit_metainterp::majit_log_enabled() {
@@ -12456,7 +12461,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // ever did, there would be no resume data to decode — fail loudly
     // rather than silently mis-resume.
     panic!(
-        "resume_in_blackhole_from_exit_layout: get_resumestorage missing \
+        "resume_in_blackhole: get_resumestorage missing \
          (index={})",
         descr_arc.index(),
     );
