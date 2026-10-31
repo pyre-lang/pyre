@@ -4292,7 +4292,6 @@ impl Optimizer {
         retraced_count: &mut u32,
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
-        _loop_num_inputs: Option<usize>,
         // Disjoint OpRef namespace for bridge inputargs. RPython `opencoder.py TraceIterator
         // TraceIterator.__init__` allocates fresh `InputArg` Python
         // objects per iteration so bridges carry Python `is` identity
