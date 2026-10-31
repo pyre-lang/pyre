@@ -3850,11 +3850,7 @@ impl<S: JitState> JitDriver<S> {
     /// success stashes the just-compiled key for the single-pass direct-entry
     /// hook. The loop's merge-point pc is the cell's greens
     /// (`warmstate.py` `BaseJitCell`), not a field written here.
-    fn compile_and_record_loop(
-        &mut self,
-        jump_args: &[OpRef],
-        meta: S::Meta,
-    ) -> crate::CompileOutcome {
+    fn compile_and_record_loop(&mut self, jump_args: &[OpRef]) -> crate::CompileOutcome {
         let (loop_header_pc, loop_green_key, start_cell_key) = match self.meta.trace_ctx() {
             Some(ctx) => (
                 Some(ctx.header_pc),
@@ -3871,7 +3867,7 @@ impl<S: JitState> JitDriver<S> {
                 jump_args.len()
             );
         }
-        let outcome = self.meta.compile_loop(jump_args, meta);
+        let outcome = self.meta.compile_loop(jump_args);
         // warmstate.py `bound_reached` holds the starting `cell` across
         // `compile_and_run_once` and `finally: cell.flags &= ~JC_TRACING`.
         // `root_green_key` is that cell's `BaseJitCell::cell_key`, resolved
@@ -3923,10 +3919,12 @@ impl<S: JitState> JitDriver<S> {
     /// no function-entry versus loop-header distinction; whether the trace came
     /// from the interpreter at all is already decided by the absent bridge
     /// origin at the caller.
-    pub fn compile_trace_entry_data(&mut self) -> Option<(u64, S::Meta)> {
+    pub fn compile_trace_entry_data(&mut self) -> Option<u64> {
         let original_green_key = self.meta.trace_ctx().map(|ctx| ctx.root_green_key())?;
-        let trace_meta = self.meta.trace_meta()?.clone();
-        Some((original_green_key, trace_meta))
+        if self.meta.trace_meta().is_none() {
+            return None;
+        }
+        Some(original_green_key)
     }
 
     /// pyjitpl.py `_create_segmented_trace_and_blackhole` loop arm:
@@ -3942,8 +3940,8 @@ impl<S: JitState> JitDriver<S> {
     /// Split out of the `TraceAction::SegmentedLoop` arm so the arm can host
     /// the bridge else-arm (pyjitpl.py) beside it without the two
     /// compiles pushing the shared handoff and blackhole tail apart.
-    fn compile_segmented_loop(&mut self, meta: S::Meta) {
-        let Some((green_key, install_token)) = self.meta.compile_simple_loop(meta) else {
+    fn compile_segmented_loop(&mut self) {
+        let Some((green_key, install_token)) = self.meta.compile_simple_loop() else {
             return;
         };
         // pyjitpl.py `_create_segmented_trace_and_blackhole` reads the greenkey
@@ -4324,12 +4322,11 @@ impl<S: JitState> JitDriver<S> {
                                     &live_arg_boxes,
                                 ),
                                 None => match self.compile_trace_entry_data() {
-                                    Some((original_green_key, entry_meta)) => {
+                                    Some(original_green_key) => {
                                         let outcome = self.meta.compile_trace_from_interp(
                                             target_key,
                                             &live_arg_boxes,
                                             original_green_key,
-                                            entry_meta,
                                         );
                                         self.meta.classify_compile_outcome(outcome)
                                     }
@@ -4667,12 +4664,9 @@ impl<S: JitState> JitDriver<S> {
                         // `current_merge_points.append` both read the one
                         // `live_arg_boxes` built at the top of this arm.
                         let jump_args = live_arg_boxes;
-                        // pyjitpl.py parity: compile_loop borrows the
-                        // frontend meta the same way `self.history` is a shared
-                        // mutable object on the RPython MetaInterp — the caller
-                        // does not drain it. Read via `trace_meta().cloned()` so
-                        // the `active_trace_session` envelope stays live for the
-                        // duration of the compile. `compile_loop` itself owns
+                        // Read via `trace_meta().cloned()` so the
+                        // `active_trace_session` envelope stays live for
+                        // `close_loop_live_values`. `compile_loop` owns
                         // the post-exit invariant that session lifetime tracks
                         // `self.tracing` (see `compile_loop` wrapper).
                         let provisional_meta = self.meta.trace_meta().cloned().unwrap();
@@ -4690,7 +4684,7 @@ impl<S: JitState> JitDriver<S> {
                             .meta
                             .trace_ctx()
                             .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                        let outcome = self.compile_and_record_loop(&jump_args, meta);
+                        let outcome = self.compile_and_record_loop(&jump_args);
                         match outcome {
                             crate::CompileOutcome::Compiled { .. } => {
                                 // pyjitpl.py raise_if_successful →
@@ -4904,10 +4898,9 @@ impl<S: JitState> JitDriver<S> {
                         return;
                     };
                     if S::validate_close_with_jump_args(sym, &trace_meta, &jump_args) {
-                        // pyjitpl.py:2993-3036 parity: keep `active_trace_session`
-                        // alive across compile_loop — the session envelope mirrors
-                        // RPython's `self.history` which compile_loop borrows
-                        // without consuming.
+                        // Keep `active_trace_session` alive across compile_loop
+                        // — the session envelope mirrors RPython's
+                        // `self.history`. Clone for `close_loop_live_values`.
                         let provisional_meta = self.meta.trace_meta().cloned().unwrap();
                         let meta = {
                             if let Some((cut_pc, ref cut_boxes)) = self.meta.cross_loop_cut_info() {
@@ -4920,7 +4913,7 @@ impl<S: JitState> JitDriver<S> {
                             .meta
                             .trace_ctx()
                             .and_then(|ctx| S::close_loop_live_values(ctx, sym, &meta, &jump_args));
-                        let outcome = self.compile_and_record_loop(&jump_args, meta);
+                        let outcome = self.compile_and_record_loop(&jump_args);
                         match outcome {
                             crate::CompileOutcome::Compiled { .. } => {
                                 // pyjitpl.py raise_if_successful →
@@ -5203,8 +5196,8 @@ impl<S: JitState> JitDriver<S> {
                             }
                         }
                         None => {
-                            let meta = self.meta.take_trace_meta().unwrap();
-                            self.compile_segmented_loop(meta);
+                            self.meta.take_trace_meta().unwrap();
+                            self.compile_segmented_loop();
                             crate::counters::ABORT_SEGMENTED_TRACE
                         }
                     };
@@ -7131,7 +7124,7 @@ impl<S: JitState> JitDriver<S> {
                 portal_rca,
             );
         }
-        let mut result = self.meta.consume_executed_frame(green_key, None, frame);
+        let mut result = self.meta.consume_executed_frame(green_key, frame);
         self.consume_compiled_entry_result(
             green_key,
             target_pc,
@@ -7290,7 +7283,7 @@ impl<S: JitState> JitDriver<S> {
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
-        result: &mut crate::pyjitpl::CompileResult<S::Meta>,
+        result: &mut crate::pyjitpl::CompileResult,
         compiled_meta: &S::Meta,
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
@@ -7374,9 +7367,6 @@ impl<S: JitState> JitDriver<S> {
             // in `result` have no reader past this point.
             self.meta.back_edge_finish_word = None;
             self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
-            // The meta the run was handed, not a second handle to it:
-            // cloning `result.meta` here bought a refcount pair for a value
-            // already in scope.
             let run_meta = &compiled_meta;
             // The FINISH arguments are NOT the loop-carried state, so they
             // are not written back into it. `warmstate.py:405-419
@@ -9054,12 +9044,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// RPython-compatible wrapper used by compile.py.
-    pub fn send_loop_to_backend(
-        &mut self,
-        jump_args: &[OpRef],
-        meta: S::Meta,
-    ) -> crate::pyjitpl::CompileOutcome {
-        self.meta.compile_loop(jump_args, meta)
+    pub fn send_loop_to_backend(&mut self, jump_args: &[OpRef]) -> crate::pyjitpl::CompileOutcome {
+        self.meta.compile_loop(jump_args)
     }
 
     /// RPython-compatible wrapper used by compile.py for bridges.
@@ -9374,7 +9360,6 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        let _ = result.meta.take();
         // JUMP already decoded on its own arm. A guard-failure through this
         // runner still `restore_values`; re-derive the list from the deadframe.
         let typed_values = if result.fail_index == u32::MAX {
@@ -9567,7 +9552,6 @@ impl<S: JitState> JitDriver<S> {
 
         let is_finish = result.is_finish;
         let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
-        let _ = result.meta.take();
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         // Carried past the finish arm below, which is the one that has none.
@@ -12384,7 +12368,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(driver.has_compiled_loop(hash));
         let state = TypedRestoreState {
             live_values: vec![1],
@@ -12525,7 +12509,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(guard, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(driver.has_compiled_loop(hash));
         (driver, hash, key)
     }
@@ -14110,14 +14094,11 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
             ctx.set_fail_args(g, &[i0, r1, f2]);
         };
-        driver.meta.compile_loop(
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::input_arg_ref(1),
-                OpRef::input_arg_float(2),
-            ],
-            (),
-        );
+        driver.meta.compile_loop(&[
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_float(2),
+        ]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let mut state = TypedInputState {
@@ -14174,14 +14155,11 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0, r1, f2], 0, 0);
             ctx.set_fail_args(g, &[i0, r1, f2]);
         }
-        driver.meta.compile_loop(
-            &[
-                OpRef::input_arg_int(0),
-                OpRef::input_arg_ref(1),
-                OpRef::input_arg_float(2),
-            ],
-            (),
-        );
+        driver.meta.compile_loop(&[
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_float(2),
+        ]);
         let token = driver
             .meta
             .get_procedure_token_on_driver(0, key.get_uhash())
@@ -14385,7 +14363,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
             ctx.set_fail_args(g, &[i0]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let stats = driver.get_stats();
@@ -15297,7 +15275,7 @@ mod tests {
         };
 
         // Close: JUMP args must match body inputargs after preamble peeling.
-        driver.meta.compile_loop(&[sum], ());
+        driver.meta.compile_loop(&[sum]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let events = compile_events.lock();
@@ -15333,7 +15311,7 @@ mod tests {
     ) {
         start_hash_trace(&mut driver.meta, key, &[0]);
         let sum = record_trace_of(driver, n_adds);
-        driver.meta.compile_loop(&[sum], ());
+        driver.meta.compile_loop(&[sum]);
     }
 
     /// Compile twice at one green key and hand back both MetaInterp high-waters.
@@ -15483,7 +15461,7 @@ mod tests {
                 ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
                 ctx.set_fail_args(g, &[sum]);
             }
-            driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+            driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
             assert!(driver.has_compiled_loop(key.get_uhash()));
         }
 
@@ -15527,7 +15505,7 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        driver.meta.compile_loop(&[sum], ());
+        driver.meta.compile_loop(&[sum]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         // Identify the fail_index assigned to the first guard in the optimized trace.
@@ -15636,7 +15614,7 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        driver.meta.compile_loop(&[sum], ());
+        driver.meta.compile_loop(&[sum]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         let fail_index = 0u32;
@@ -15700,7 +15678,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(g, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(driver.has_compiled_loop(green_key.get_uhash()));
         let failure = driver
             .meta
@@ -15793,7 +15771,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         // warmstate.py maybe_compile_and_run reads the compiling
         // jitdriver_sd.warmstate cell, not leftover portal 0.
         let failure = driver
@@ -15910,7 +15888,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         let failure = driver
             .meta
             .run_compiled_detailed_with_values_on_driver(
@@ -16009,7 +15987,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         let failure = driver
             .meta
             .run_compiled_detailed_with_values_on_driver(
@@ -16103,7 +16081,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         let cell_key = driver
             .meta
             .warm_state_for_driver(source_driver)
@@ -16289,7 +16267,7 @@ mod tests {
             ctx.capture_snapshot_for_last_guard(&[], 0, 0);
             ctx.set_fail_args(guard, &[]);
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         let failure = driver
             .meta
             .run_compiled_detailed(green_key.get_uhash(), &[0])
@@ -16396,7 +16374,7 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
             sum
         };
-        driver.meta.compile_loop(&[sum], ());
+        driver.meta.compile_loop(&[sum]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
         // "func_b" can see the compiled loop via the same green_key.
@@ -16947,7 +16925,7 @@ mod cross_loop_cut_close_tests {
                 ctx.cut_inner_green_key = Some(typed.clone());
             }
         }
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
         assert!(driver.has_compiled_loop(key), "inner loop must compile");
     }
 

@@ -8528,9 +8528,7 @@ fn drive_generatorentry_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let trace_meta = pyre_jit_trace::genentry_state::GenEntryJitState { pycode }
-            .build_meta(header_pc, &pyre_jit_trace::state::PyreEnv);
-        let outcome = meta.compile_loop(&jump_args, trace_meta);
+        let outcome = meta.compile_loop(&jump_args);
         if dbg {
             eprintln!("[jd2] compile_loop outcome={outcome:?}");
         }
@@ -9278,11 +9276,7 @@ fn drive_unpack_iterable_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let trace_meta = pyre_jit_trace::unpack_state::UnpackJitState {
-            greenkey: greenkey_raw,
-        }
-        .build_meta(header_pc, &pyre_jit_trace::state::PyreEnv);
-        let outcome = meta.compile_loop(&jump_args, trace_meta);
+        let outcome = meta.compile_loop(&jump_args);
         if dbg {
             eprintln!("[jd1] compile_loop outcome={outcome:?}");
         }
@@ -9334,9 +9328,8 @@ fn drive_unpack_iterable_trace(
         // envelope (only `JitDriver::force_start_tracing` calls
         // `begin_trace_session`).
         //
-        // Opening the session here (the meta is fully static for the novable
-        // driver, so it is the value the back-edge arm above builds) is what
-        // would compile the trace; the defect that used to block it — the
+        // Opening the session here is what would compile the trace; the
+        // defect that used to block it — the
         // parked error resurfacing at an unrelated later unpack, which
         // `synth/unpack_drain_star_raise` case 4 catches — was the backend
         // `_store_exception` leak drained just above, not the park itself.
