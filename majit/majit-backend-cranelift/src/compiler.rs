@@ -8270,8 +8270,8 @@ fn overlay_rd_locs_on_dense(frame: &[i64], rd_locs: &[u16], dense_len: usize) ->
 /// `GuardNotForced2`'s force spill, and `spill_ref_roots` inside
 /// `emit_collecting_gc_call` plus the malloc / call_assembler / call_release_gil
 /// slow paths. Guard exits, FINISH and the closing-JUMP publish leave the
-/// function and are not listed. A demoted home is stored at
-/// `ref_root_base_ofs` or `nonref_home_base_ofs`, both past
+/// function and are not listed. A demoted home is stored in the scanned
+/// tail at `ref_root_base_ofs` (same region as ref-roots), past
 /// `max_output_slots`, so it does not end residency of slots `[0, arity)`.
 fn op_writes_jitframe_output_slot(op: &Op) -> bool {
     matches!(
@@ -12187,17 +12187,20 @@ impl CraneliftBackend {
         let mut loop_phi_keep_by_label = compute_loop_phi_keep(ops, &label_indices);
         // Two home regions carry a demoted arg:
         //
-        //  * GC ref (non-inputarg) → its ref-root slot in `[max_output_slots ..
-        //    max_output_slots + ref_root_slots.len())`, forwarded in place by the
-        //    collector.  A ref INPUTARG keeps its SSA param: the slot is
-        //    entry-synced and spill/reloaded, and keeping the param avoids a
-        //    once-seeded carried slot going stale when an enclosing loop re-enters
-        //    with a different input value.
+        //  * GC ref (non-inputarg) → a packed ref-root slot in
+        //    `[max_output_slots .. max_output_slots + reserved_tail)`, forwarded
+        //    in place by the collector. `reserved_tail` is the span of
+        //    concurrent homes (`FrameManager.get_new_loc`), not the union of
+        //    every Ref the trace ever produced. A ref INPUTARG keeps its SSA
+        //    param: the slot is entry-synced and spill/reloaded, and keeping the
+        //    param avoids a once-seeded carried slot going stale when an
+        //    enclosing loop re-enters with a different input value.
         //
-        //  * non-ref i64 → a dedicated home in the region AFTER the ref roots
-        //    (`nonref_home_base_ofs`), disjoint from the dense `[0,
-        //    max_output_slots)` scratch that guard failargs and before-call spills
-        //    overwrite by index.  That disjoint home is why non-refs (incl.
+        //  * non-ref i64 → a home in the same scanned tail as the ref roots
+        //    (`nonref_home_base_ofs` == `ref_root_base_ofs`), disjoint from the
+        //    dense `[0, max_output_slots)` scratch that guard failargs and
+        //    before-call spills overwrite by index.  That disjoint home is why
+        //    non-refs (incl.
         //    inputargs) are safe to demote: the ref-inputarg staleness argument
         //    does not apply because the home is re-seeded on every LABEL entry
         //    edge (preamble fall-through and loader re-entry). Floats and SIMD
@@ -12287,19 +12290,61 @@ impl CraneliftBackend {
             bridge_var_slots = var_slots;
             demoted
         } else {
-            demoted_home_index_map(&loop_phi_keep_by_label, ops, &ref_root_slots, None, 0)
+            let demoted =
+                demoted_home_index_map(&loop_phi_keep_by_label, ops, &ref_root_slots, None, 0);
+            let mut home_vars: IndexSet<u32> =
+                ref_root_slots.iter().map(|&(var_idx, _)| var_idx).collect();
+            home_vars.extend(demoted.keys().copied());
+            if home_vars.is_empty() {
+                demoted
+            } else {
+                let intervals = compute_bridge_home_intervals(inputargs, ops, &home_vars);
+                let ref_vars: IndexSet<u32> =
+                    ref_root_slots.iter().map(|&(var_idx, _)| var_idx).collect();
+                let demoted_vars: IndexSet<u32> = demoted.keys().copied().collect();
+                let empty_bind = IndexMap::new();
+                let (var_slots, _) = assign_bridge_homes_linear_scan(
+                    &intervals,
+                    &empty_bind,
+                    &ref_vars,
+                    &demoted_vars,
+                    0,
+                );
+                for (var_idx, slot) in ref_root_slots.iter_mut() {
+                    if let Some(&home) = var_slots.get(var_idx) {
+                        *slot = home;
+                    }
+                }
+                let mut packed = IndexMap::new();
+                for raw in demoted.keys().copied() {
+                    if let Some(&home) = var_slots.get(&raw) {
+                        packed.insert(raw, home);
+                    }
+                }
+                packed
+            }
         };
-        let num_nonref_homes: usize = loop_phi_keep_by_label
-            .iter()
-            .map(|(&li, keep)| nonref_demoted_positions(li, keep, ops, &ref_root_slots).len())
-            .sum();
-        // Bridges fold ref-roots and demoted homes into the same slot
-        // space as the bind set (`FrameManager.get_new_loc`). Loops keep
-        // a tail past the dense value area.
+        // Bridges fold ref-roots and demoted homes into the bind set
+        // (`FrameManager.get_new_loc`). Loops keep a tail past the dense
+        // value area, scanned the same way: one home per box
+        // (`RegisterManager.loc`), reused when longevity says the previous
+        // occupant is dead. Union length would count every Ref the trace
+        // ever produced; `jfi_frame_depth` is the span of concurrent homes.
         let reserved_tail = if absolute_homes {
             0
         } else {
-            ref_root_slots.len() + num_nonref_homes
+            let ref_span = ref_root_slots
+                .iter()
+                .map(|(_, slot)| *slot + 1)
+                .max()
+                .unwrap_or(0);
+            let demoted_span = demoted_home_index
+                .values()
+                .copied()
+                .max()
+                .map(|s| s + 1)
+                .unwrap_or(0);
+            ref_span.max(demoted_span)
         };
         let fail_arg_homes = FailArgHomes {
             ref_root_slots: &ref_root_slots,
@@ -12865,25 +12910,24 @@ impl CraneliftBackend {
                     (label_idx, positions)
                 })
                 .collect();
-        // Demoted non-ref (i64) args. Loops: home in the region AFTER the
-        // ref-root slots, disjoint from the dense scratch. Bridges: lowest
+        // Demoted non-ref (i64) args. Loops: home in the same scanned tail as
+        // the ref-roots, disjoint from the dense scratch. Bridges: lowest
         // free slot (`_find_frame_location`), must not alias a bind home.
         // Re-seeded on every LABEL entry edge. Not a GC root.
-        let nonref_home_base_ofs = ref_root_base_ofs + (ref_root_slots.len() as i32) * 8;
-        let mut next_nonref_home = 0usize;
+        // Packed into the same tail as ref-roots (`assign_bridge_homes_linear_scan`).
+        let nonref_home_base_ofs = ref_root_base_ofs;
         let demoted_nonref_positions_by_label: IndexMap<usize, Vec<(usize, u32, i32)>> = {
             let mut m: IndexMap<usize, Vec<(usize, u32, i32)>> = IndexMap::new();
             for (&label_idx, keep) in &loop_phi_keep_by_label {
                 let mut positions = Vec::new();
                 for (i, raw) in nonref_demoted_positions(label_idx, keep, ops, &ref_root_slots) {
+                    let slot = *demoted_home_index.get(&raw).expect("demoted home");
                     let offset = if absolute_homes {
-                        let slot = *demoted_home_index.get(&raw).expect("demoted home");
                         JF_FRAME_ITEM0_OFS + (slot as i32) * 8
                     } else {
-                        nonref_home_base_ofs + (next_nonref_home as i32) * 8
+                        nonref_home_base_ofs + (slot as i32) * 8
                     };
                     positions.push((i, raw, offset));
-                    next_nonref_home += 1;
                 }
                 if !positions.is_empty() {
                     m.insert(label_idx, positions);
@@ -12891,7 +12935,6 @@ impl CraneliftBackend {
             }
             m
         };
-        debug_assert_eq!(next_nonref_home, num_nonref_homes);
         // This map is intentionally local to `do_compile` and grows only when
         // code emission reaches a LABEL whose fall-through path has seeded the
         // root slot. Guard emission receives it explicitly; nested compilation
@@ -13163,8 +13206,8 @@ impl CraneliftBackend {
         // A guard gcmap names a ref-root slot only when `rd_locs` redirects
         // that fail arg onto a home that already holds the value: a demoted
         // ref seeded at its LABEL, or a stale root spilled before the guard.
-        // That home's frame index is `max_output_slots + root_slot` (a demoted
-        // non-ref home sits past the ref roots). Every other ref fail arg
+        // That home's frame index is `max_output_slots + root_slot` (demoted
+        // non-ref homes share that scanned tail). Every other ref fail arg
         // stays at its dense index, below `max_output_slots` and so below
         // `ref_root_base_ofs`. At this entry neither home exists — demotion
         // requires a LABEL, and `stale_ref_vars` has no insertion yet — so an
@@ -20253,8 +20296,19 @@ impl CraneliftBackend {
                 })
                 .collect();
             eprintln!(
-                "[jit][compile-loop] trace_id={} header_pc={} entry={:p} body={:p} fail_descrs={:?}",
-                trace_id, header_pc, code_ptr, body_ptr, fail_descr_preview
+                "[jit][compile-loop] trace_id={} header_pc={} entry={:p} body={:p} \
+                 max_output_slots={} reserved_tail={} ref_roots={} demoted_unique={} \
+                 guaranteed_frame_depth={} fail_descrs={:?}",
+                trace_id,
+                header_pc,
+                code_ptr,
+                body_ptr,
+                max_output_slots,
+                reserved_tail,
+                ref_root_slots.len(),
+                demoted_home_index.len(),
+                guaranteed_frame_depth,
+                fail_descr_preview
             );
         }
 
@@ -20876,6 +20930,9 @@ fn demoted_home_index_map(
     let mut next = 0usize;
     for (&label_idx, keep) in loop_phi_keep_by_label {
         for (_i, raw) in nonref_demoted_positions(label_idx, keep, ops, ref_root_slots) {
+            if map.contains_key(&raw) {
+                continue;
+            }
             let idx = if let Some(occ) = occupied.as_mut() {
                 let slot = find_frame_location(occ, start);
                 occ.insert(slot);
@@ -20896,7 +20953,7 @@ fn resolve_fail_locs_and_stamp(
     ops: &[Op],
     fail_descrs: &[DescrRef],
     max_output_slots: usize,
-    num_ref_roots: usize,
+    _num_ref_roots: usize,
     preserve_descrs: bool,
 ) {
     for info in guard_infos.iter_mut() {
@@ -20906,7 +20963,7 @@ fn resolve_fail_locs_and_stamp(
                 continue;
             }
             if *loc & FAIL_LOC_DEMOTED != 0 {
-                *loc = max_output_slots + num_ref_roots + (*loc & FAIL_LOC_PAYLOAD);
+                *loc = max_output_slots + (*loc & FAIL_LOC_PAYLOAD);
             } else if *loc & FAIL_LOC_REF_ROOT != 0 {
                 *loc = max_output_slots + (*loc & FAIL_LOC_PAYLOAD);
             }
@@ -35918,6 +35975,57 @@ mod tests {
         let (locs, span) = pack_fail_locs(&[i0, i1], false, 0, &bridge_homes, &empty_occ);
         assert_eq!(locs, vec![2, 0]);
         assert_eq!(span, 1);
+    }
+
+    #[test]
+    fn demoted_home_index_map_one_slot_per_box_across_labels() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let ops: Vec<Op> = vec![
+            mk_op(OpCode::Label, &[i0, i1], 0),
+            mk_op(OpCode::Label, &[i0, i1], 1),
+        ]
+        .into_iter()
+        .map(|o| o.as_ref().clone())
+        .collect();
+        let mut keep = IndexMap::new();
+        keep.insert(0, vec![false, false]);
+        keep.insert(1, vec![false, false]);
+        let map = demoted_home_index_map(&keep, &ops, &[], None, 0);
+        assert_eq!(map.len(), 2, "two boxes share one home each across LABELs");
+        assert_eq!(map.get(&i0.raw()), Some(&0));
+        assert_eq!(map.get(&i1.raw()), Some(&1));
+    }
+
+    #[test]
+    fn loop_ref_root_tail_reuses_nonoverlapping_homes() {
+        // Two nursery mallocs whose last uses do not overlap: FrameManager
+        // reuses the tail slot (`assign_bridge_homes_linear_scan`). Union
+        // length would still be 2.
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 1),
+            mk_op(OpCode::PtrEq, &[OpRef::ref_op(1), OpRef::ref_op(1)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 3),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
+        ];
+        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let mut home_vars = IndexSet::new();
+        home_vars.insert(1);
+        home_vars.insert(3);
+        let intervals = compute_bridge_home_intervals(&inputargs, &ops, &home_vars);
+        let mut refs = IndexSet::new();
+        refs.insert(1);
+        refs.insert(3);
+        let demoted = IndexSet::new();
+        let empty_bind = IndexMap::new();
+        let (slots, _) =
+            assign_bridge_homes_linear_scan(&intervals, &empty_bind, &refs, &demoted, 0);
+        let span = slots.values().copied().max().map(|s| s + 1).unwrap_or(0);
+        assert_eq!(slots.len(), 2);
+        assert_eq!(span, 1, "second malloc reuses the first's dead tail slot");
+        assert_eq!(slots.get(&1), Some(&0));
+        assert_eq!(slots.get(&3), Some(&0));
     }
 
     #[test]

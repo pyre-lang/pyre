@@ -14,7 +14,15 @@
 #
 # Shapes: explicit `raise` two frames down, a builtin ZeroDivisionError two
 # frames down, and an explicit `raise` three frames down.
-N = 145455
+#
+# N is 0.95x the earlier 145455.  At that count cranelift's survey loop spent
+# the `GuardValue(Function.code)` guard's 200 `trace_eagerness` failures
+# across one of the decay generations `invoke_after_minor_collection` starts
+# every 32 minor collections, so `guard_failures` read 803 or 806 depending on
+# startup allocation alone (hash seed, length of argv[0]).  Measured from 0.80x
+# to 0.95x and from 1.05x to 1.20x, both native backends read 803 under every
+# hash seed, environment size and argv[0] tried; keep N clear of 1.00x.
+N = 138182
 
 
 def frame_names(traceback):
