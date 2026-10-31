@@ -4167,7 +4167,7 @@ pub fn trace_and_compile_from_bridge(
     // pyjitpl.py handle_guard_failure / compile.py _trace_and_compile_from_bridge:
     // `initialize_state_from_guard_failure(resumedescr, deadframe)` calls
     // `rebuild_from_resumedata` (resume.py). Restore uses the live frame's
-    // jit state (`JitState::build_meta`), not a compiled_loops snapshot.
+    // jit state (`JitState::build_meta`).
     // This restores the complete frame stack INSIDE the bridge function.
     let mut jit_state_local = build_jit_state(bridge_frame_root.frame(), &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:

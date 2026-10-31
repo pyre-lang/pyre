@@ -69,8 +69,8 @@ pub fn make_jitcell_token(jd_index: Option<usize>) -> Arc<JitCellToken> {
 /// (`green_key`, `inputarg_types`, `compiled`, `compiled_loop_token`) are
 /// interior-mutable, so `configure_loop_token_for_driver` and the backend's
 /// `compile_loop` operate through `&JitCellToken`; call this once those
-/// writes have settled, before the token is published into `compiled_loops`
-/// / `attach_procedure_with_redirect`.
+/// writes have settled, before the token is published via
+/// `attach_procedure_with_redirect`.
 pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
     if let Some(clt) = token.compiled_loop_token() {
         clt.set_loop_token_wref(Arc::downgrade(token));
@@ -323,8 +323,8 @@ pub struct RawCompileResult<M> {
     pub values: ExitRawValues,
     pub typed_values: ExitValues,
     /// Pre-run metadata snapshot — see `CompileResult::meta`.
-    /// `None` when the run entered on the procedure token without a
-    /// `compiled_loops` row; restore rebuilds from live state.
+    /// `None` when the run entered on the procedure token; restore
+    /// rebuilds from live state.
     pub meta: Option<std::sync::Arc<M>>,
     pub fail_index: u32,
     pub trace_id: u64,
@@ -1442,8 +1442,8 @@ pub fn compile_tmp_callback(
     //
     // `compile.py:1150` `return jitcell_token`.
     // `compile.py` record_loop_or_bridge: the tmp-callback loop is a
-    // real compiled loop even though MetaInterp never inserts it into
-    // compiled_loops. Register it with the backend so `find_descr_by_ptr`
+    // real compiled loop even though MetaInterp never attaches it as the
+    // cell's procedure token. Register it with the backend so `find_descr_by_ptr`
     // can still walk its fail_descrs on cross-token guard resolution.
     backend.track_compiled_token(Arc::clone(&jitcell_token));
     Ok(jitcell_token)

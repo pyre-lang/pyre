@@ -1135,26 +1135,21 @@ fn generate_state_fields_jit_state(
         } else {
             quote! {}
         };
-    // `is_compatible` does not read meta, so the steady entry does not probe
-    // `compiled_loops`.
-    let steady_entry_without_meta =
-        num_ref_scalars > 0 || has_vable_identity || num_float_scalars > 0 || num_arrays > 0;
-    let fill_entry_reds_without_meta_override: TokenStream = if steady_entry_without_meta {
-        quote! {
-            fn fill_entry_reds_without_meta(
-                &mut self,
-                out: &mut ::std::vec::Vec<majit_ir::Value>,
-            ) -> bool {
-                #(#extract_live_value_scalar_parts)*
-                #(#extract_live_value_array_parts)*
-                #extract_live_value_vable_identity_part
-                #(#extract_live_value_ref_scalar_parts)*
-                #(#extract_live_value_float_scalar_parts)*
-                true
-            }
+    // `warmstate.py execute_assembler` unspecializes live reds. Every generated
+    // portal fills them from the live fields, including int-only states
+    // (`extract_live_value_scalar_parts`). `is_compatible` does not read meta.
+    let fill_entry_reds_without_meta_override: TokenStream = quote! {
+        fn fill_entry_reds_without_meta(
+            &mut self,
+            out: &mut ::std::vec::Vec<majit_ir::Value>,
+        ) -> bool {
+            #(#extract_live_value_scalar_parts)*
+            #(#extract_live_value_array_parts)*
+            #extract_live_value_vable_identity_part
+            #(#extract_live_value_ref_scalar_parts)*
+            #(#extract_live_value_float_scalar_parts)*
+            true
         }
-    } else {
-        quote! {}
     };
     // Same words as `fill_entry_reds_without_meta`, as `unspecialize_value`
     // results: Int is the value, Ref is the address, Float is `to_bits()`.
@@ -1196,53 +1191,51 @@ fn generate_state_fields_jit_state(
             quote! { (self.#fname as f64).to_bits() as i64 }
         })
         .collect();
-    let fill_entry_raw_reds_override: TokenStream = if steady_entry_without_meta {
-        // A separate `extend_from_slice` of a fixed word list lowers to a
-        // handful of stores when this function is outlined. Inlined into
-        // `enter_compiled_function_entry` that call becomes
-        // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
-        // arm as stores so the inline form keeps the outlined fast path.
-        let raw_vable_expr: TokenStream = if has_vable_identity {
-            quote! { self as *mut Self as i64 }
-        } else {
-            quote! {}
-        };
-        let raw_words: Vec<TokenStream> = raw_int_words
-            .iter()
-            .cloned()
-            .chain(raw_array_words.iter().cloned())
-            .chain(has_vable_identity.then_some(raw_vable_expr))
-            .chain(raw_ref_words.iter().cloned())
-            .chain(raw_float_words.iter().cloned())
-            .collect();
-        let raw_count = raw_words.len();
-        let raw_writes: Vec<TokenStream> = raw_words
-            .iter()
-            .enumerate()
-            .map(|(index, word)| {
-                quote! { __dst.add(#index).write(#word); }
-            })
-            .collect();
-        quote! {
-            #[inline]
-            fn fill_entry_raw_reds(&mut self, out: &mut ::std::vec::Vec<i64>) -> bool {
-                let __len = out.len();
-                if out.capacity().wrapping_sub(__len) >= #raw_count {
-                    unsafe {
-                        let __dst = out.as_mut_ptr().add(__len);
-                        #(#raw_writes)*
-                        out.set_len(__len + #raw_count);
-                    }
-                } else {
-                    out.extend_from_slice(&[
-                        #(#raw_words),*
-                    ]);
-                }
-                true
-            }
-        }
+    // Always emitted so int-only generated portals take the raw
+    // `execute_assembler` path.
+    let raw_vable_expr: TokenStream = if has_vable_identity {
+        quote! { self as *mut Self as i64 }
     } else {
         quote! {}
+    };
+    let raw_words: Vec<TokenStream> = raw_int_words
+        .iter()
+        .cloned()
+        .chain(raw_array_words.iter().cloned())
+        .chain(has_vable_identity.then_some(raw_vable_expr))
+        .chain(raw_ref_words.iter().cloned())
+        .chain(raw_float_words.iter().cloned())
+        .collect();
+    let raw_count = raw_words.len();
+    // A separate `extend_from_slice` of a fixed word list lowers to a
+    // handful of stores when this function is outlined. Inlined into
+    // `enter_compiled_function_entry` that call becomes
+    // `Vec::extend_from_slice`'s memmove. Spell the spare-capacity
+    // arm as stores so the inline form keeps the outlined fast path.
+    let raw_writes: Vec<TokenStream> = raw_words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| {
+            quote! { __dst.add(#index).write(#word); }
+        })
+        .collect();
+    let fill_entry_raw_reds_override: TokenStream = quote! {
+        #[inline]
+        fn fill_entry_raw_reds(&mut self, out: &mut ::std::vec::Vec<i64>) -> bool {
+            let __len = out.len();
+            if out.capacity().wrapping_sub(__len) >= #raw_count {
+                unsafe {
+                    let __dst = out.as_mut_ptr().add(__len);
+                    #(#raw_writes)*
+                    out.set_len(__len + #raw_count);
+                }
+            } else {
+                out.extend_from_slice(&[
+                    #(#raw_words),*
+                ]);
+            }
+            true
+        }
     };
     let portal_result_type: TokenStream = match super::finish_return_for(&func.sig.output) {
         Some(finish) => {

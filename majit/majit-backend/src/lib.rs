@@ -1138,9 +1138,9 @@ impl CompiledLoopToken {
     /// `compile.py` `clt.loop_token_wref = wref` setter. Called
     /// immediately after the owning `Arc<JitCellToken>` becomes the
     /// stable identity (i.e., once `make_jitcell_token` has stamped its
-    /// generation and the token is the soon-to-be `compiled_loops[gk]`
-    /// entry's `.token` field). The weak ref ages out automatically when
-    /// memmgr drops the owning Arc. Also stamps `owning_green_key` from
+    /// generation and the token is attached on the cell). The weak ref
+    /// ages out automatically when memmgr drops the owning Arc. Also
+    /// stamps `owning_green_key` from
     /// the upgraded token so [`descr_owning_green_key`] can read it
     /// without locking.
     pub fn set_loop_token_wref(&self, wref: std::sync::Weak<JitCellToken>) {

@@ -79,8 +79,7 @@ pub struct BaseJitCell {
     /// (`warmstate.py`) able to expire a cell at all.
     ///
     /// `MemoryManager::alive_loops` is therefore the sole long-lived strong
-    /// owner (`memmgr.py`), matching `memmgr.rs`'s own header; the other
-    /// weak handle on the same token is `CompiledEntry::token`.  Every writer
+    /// owner (`memmgr.py`), matching `memmgr.rs`'s own header. Every writer
     /// of this field must have registered its token with the memory manager
     /// first, or the token dies before first entry and this cell answers
     /// "never compiled" — see `compile.rs`'s `compile_tmp_callback`
@@ -106,8 +105,7 @@ pub struct BaseJitCell {
     pub jitdriver_sd: usize,
     /// This cell's own u64 identity — what every hash-form entry point on
     /// [`WarmEnterState`] names it by, and what flows on through
-    /// `MetaInterp::compiled_loops`, `JitCellToken::green_key` and
-    /// `rd_loop_token`.
+    /// `JitCellToken::green_key` and `rd_loop_token`.
     ///
     /// Upstream needs no such field: `maybe_compile_and_run`
     /// (warmstate.py) resolves greens + `comparekey` + `get_uhash`
@@ -648,8 +646,8 @@ pub struct JitStats {
 /// reader that can disagree with the first. Pyre restores that property by
 /// resolving once, at the hash producer ([`WarmEnterState::cell_key_for`] /
 /// [`WarmEnterState::ensure_cell_key`] / [`WarmEnterState::sole_cell_key`]),
-/// and carrying the resolved cell key onward — through `MetaInterp`'s
-/// `compiled_loops`, `JitCellToken::green_key` and `rd_loop_token` alike.
+/// and carrying the resolved cell key onward — through
+/// `JitCellToken::green_key` and `rd_loop_token` alike.
 ///
 /// The counter is the deliberate exception: `jitcounter.tick(hash, ...)`
 /// (warmstate.py) is indexed by the raw hash upstream, so colliding keys
@@ -1394,7 +1392,7 @@ impl WarmEnterState {
         let hash = key.get_uhash();
         let cell = self.lookup_chain_with_key(key);
         let is_runnable = cell.as_ref().is_some_and(|c| {
-            // `compiled_loops` is filed under this cell's assigned key.
+            // The procedure token is filed under this cell's assigned key.
             // `install_new_cell` mints `BaseJitCell::cell_key` when
             // `get_uhash` is already taken, and `maybe_compile_and_run_step`
             // resolves that same number with `cell_key_for` after
@@ -1716,8 +1714,7 @@ impl WarmEnterState {
     ///
     /// `warmstate.py maybe_compile_and_run` reads `JC_TEMPORARY` before it
     /// considers the token executable at a warm entry. Keep this on the cell,
-    /// where upstream owns it; a token body or pyre's retained
-    /// `compiled_loops` metadata cannot answer the same question.
+    /// where upstream owns it; a token body cannot answer the same question.
     pub(crate) fn procedure_token_is_temporary(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)
             .is_some_and(|cell| cell.flags.get().contains(JcFlags::JC_TEMPORARY))
@@ -2813,7 +2810,7 @@ impl WarmEnterState {
     /// This is what every hash-form entry point resolves through. Upstream's
     /// equivalent is not a lookup at all: `maybe_compile_and_run` already
     /// holds the cell object it matched (warmstate.py). Pyre's u64 is
-    /// carried across crate boundaries (`compiled_loops`,
+    /// carried across crate boundaries (
     /// `JitCellToken::green_key`, `rd_loop_token`), so it resolves back to the
     /// cell here — and it resolves to exactly one, which is the property that
     /// bucket-head reading did not have.
@@ -3245,8 +3242,7 @@ impl WarmEnterState {
     /// walk happens ONCE, at the hash producer, and the cell key it yields is
     /// what `counter_tick`, `maybe_compile`,
     /// `finish_tracing`, `abort_tracing`, `get_cell` and the rest are handed —
-    /// along with `MetaInterp`'s `compiled_loops`, which is indexed by the same
-    /// key and so describes the same cell. That is the
+    /// the same cell the token is filed on. That is the
     /// property the `u64` currency previously lacked: it named a bucket, and a
     /// bucket is not a cell.
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {
@@ -7188,12 +7184,11 @@ mod tests {
     /// through the same cell.
     /// ```
     ///
-    /// The old pin's stated blocker — `MetaInterp::compiled_loops` is an
-    /// `IndexMap<u64, CompiledEntry<M>>` with one slot per hash, so two
-    /// colliding keys cannot both file a meta — is what the migration
-    /// dissolves rather than works around: the u64 those tables are keyed by
-    /// became cell-unique, so two colliding green keys file two entries and
-    /// nothing had to move onto the cell.
+    /// The old pin's stated blocker — a u64-keyed artifact table with one
+    /// slot per hash, so two colliding keys cannot both file — is what the
+    /// migration dissolves rather than works around: the u64 those tables
+    /// are keyed by became cell-unique, so two colliding green keys file
+    /// two entries and nothing had to move onto the cell.
     ///
     /// **Measured again after the migration, by substitution.** Replacing
     /// `carried` with `bucket` on the `executed` line below — the only
@@ -7303,9 +7298,9 @@ mod tests {
     /// Two typed keys share `get_uhash()`. The second cell's compiled token
     /// is reachable only through the key `install_new_cell` minted for it.
     /// `maybe_compile_and_run_step` asks `has_compiled_meta` with that key
-    /// (`compiled_loops.contains_key`) and then reads it back with
-    /// `cell_key_for`. A decision that hands the raw hash to the callback
-    /// misses the token and falls through to the counter.
+    /// and then reads it back with `cell_key_for`. A decision that hands
+    /// the raw hash to the callback misses the token and falls through to
+    /// the counter.
     #[test]
     fn maybe_compile_decision_with_key_runs_the_colliding_cell_under_its_minted_key() {
         let mut ws = WarmEnterState::new(100);
@@ -7814,21 +7809,14 @@ mod tests {
         );
     }
 
-    /// Two colliding green keys file two entries in a `u64`-keyed artifact
-    /// table — the precondition `MetaInterp::compiled_loops` and
-    /// `MemoryManager` eviction both need, and the one the old pin named as
-    /// its blocker.
+    /// Two colliding green keys get distinct cell keys from
+    /// [`WarmEnterState::ensure_cell_key`].
     ///
-    /// `compiled_loops` is an `IndexMap<u64, CompiledEntry<M>>` and
-    /// `try_to_free_some_loops` reaches an entry by
-    /// `token.green_key()` (`JitCellToken::green_key: Cell<u64>`). While that
-    /// u64 was a bucket hash, two colliding keys shared ONE slot: the second
-    /// compile overwrote the first, and the loser's token could not reach its
-    /// own entry to be freed. The stand-in table below is that shape — the
-    /// subject is the keys, not the payload, so the payload is the token
-    /// number.
+    /// `get_uhash` names a bucket, not a cell. The first occupant keeps the
+    /// raw hash and the second is minted one, so each key has a u64 of its
+    /// own.
     #[test]
-    fn two_colliding_keys_file_two_entries_in_a_u64_keyed_artifact_table() {
+    fn two_colliding_keys_get_distinct_cell_keys() {
         let mut ws = WarmEnterState::new(100);
         let key_a = GreenKey::new(vec![3100, 3200]);
         let key_b = GreenKey::new(vec![3300, colliding_last_green(&key_a, 3300)]);
@@ -7842,40 +7830,8 @@ mod tests {
         let cell_b = ws.ensure_cell_key(&key_b);
         assert_ne!(
             cell_a, cell_b,
-            "colliding keys must be told apart by the u64 the artifact tables \
-             are indexed by, or one of them has no reachable entry at all",
-        );
-
-        // The two tokens each stamp their own cell key, which is what
-        // `compile.rs`'s `compile_tmp_callback`
-        // (`jitcell_token.green_key.set(green_key)`) writes and
-        // what `try_to_free_some_loops` reads back.
-        let token_a = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
-        let token_b = Arc::new(JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
-        token_a.green_key.set(cell_a);
-        token_b.green_key.set(cell_b);
-
-        let mut compiled_loops: indexmap::IndexMap<u64, i64> = indexmap::IndexMap::new();
-        compiled_loops.insert(token_a.green_key(), token_a.number());
-        compiled_loops.insert(token_b.green_key(), token_b.number());
-        assert_eq!(
-            compiled_loops.len(),
-            2,
-            "both compiles must file; a shared slot means the second erased \
-             the first",
-        );
-
-        // Eviction of B reaches B's entry and leaves A's alone.
-        assert_eq!(
-            compiled_loops.swap_remove(&token_b.green_key()),
-            Some(token_b.number()),
-            "the evicted token's own key must name its own entry",
-        );
-        let token_a_number = token_a.number();
-        assert_eq!(
-            compiled_loops.get(&token_a.green_key()),
-            Some(&token_a_number),
-            "and the colliding sibling's artifact must survive it",
+            "colliding keys must get distinct cell keys, or one of them has \
+             no identity of its own",
         );
     }
 

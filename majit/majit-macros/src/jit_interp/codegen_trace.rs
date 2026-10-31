@@ -384,7 +384,7 @@ pub fn generate_trace_fn(
     // `generate_merge_wrapper` and passed into `__trace_*` as a
     // `ClosureRuntimeWithResolver`.  The recursive-call seams live at
     // the merge wrapper layer because they borrow
-    // `MetaInterp::compiled_loops` / `warm_state` via the
+    // `MetaInterp::warm_state` via the
     // `with_trace_ctx_and_token_resolver` split-borrow helper.
     // (Legacy identity closure `|pc| pc` retained at the
     // call site there.)

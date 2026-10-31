@@ -6625,9 +6625,8 @@ unsafe fn compile_snapshot_root_walker_area(
 ///   1. this walker stops forming a `&mut` (or `&`) to the pair;
 ///   2. `driver_pair()` stops returning `&'static mut` — the exclusivity is
 ///      minted there, and that is what invalidates every other access;
-///   3. the GC-visible root fields (`compiled_loops` / `partial_trace` /
-///      `exported_state` / `framestack` / `tracing`) move behind interior
-///      mutability.
+///   3. the GC-visible root fields (`partial_trace` / `exported_state` /
+///      `framestack` / `tracing`) move behind interior mutability.
 ///
 /// Wrapping the fields alone does NOT help: `UnsafeCell` only opts out of the
 /// immutability of `&T`, while a `&mut T` retag is `Unique` over the whole
@@ -11788,8 +11787,7 @@ fn maybe_compile_and_run(
     // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token
     // (`JC_TEMPORARY`) falls through to the counter tick below instead of
     // entering `execute_assembler`. The tmp cell then re-ticks until the
-    // real loop compiles. `get_compiled_meta` is leftover frontend metadata,
-    // not the enter predicate.
+    // real loop compiles. The enter predicate is the cell's procedure token.
     // Why a compiled loop for this green key is or is not enterable, per
     // back-edge.  `has_runnable_compiled_loop` is the cell's non-temporary
     // procedure token compiled for this driver. A pruned cell reads
@@ -11800,7 +11798,6 @@ fn maybe_compile_and_run(
     if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
         let runnable = driver.has_runnable_compiled_loop(green_key);
-        let meta = driver.get_compiled_meta(green_key).is_some();
         let last = driver.last_compiled_key();
         let ws = driver
             .meta_interp_mut()
@@ -11815,12 +11812,11 @@ fn maybe_compile_and_run(
             None => (false, false, false),
         };
         eprintln!(
-            "[gen-entry] code={} pc={} key={} runnable={} meta={} last_compiled={:?} cell_present={} state={:?} seen_token={} has_token={}",
+            "[gen-entry] code={} pc={} key={} runnable={} last_compiled={:?} cell_present={} state={:?} seen_token={} has_token={}",
             code.obj_name.as_str(),
             loop_header_pc,
             green_key,
             runnable,
-            meta,
             last,
             present,
             state,
@@ -15113,7 +15109,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     };
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     // `has_virtualizable` / extra reds are driver-static; build them from the
-    // live frame (`JitState::build_meta`) rather than a compiled_loops snapshot.
+    // live frame (`JitState::build_meta`).
     let meta = jit_state.build_meta(0, &PyreEnv);
     let restored =
         jit_state.restore_guard_failure_values(&meta, &typed, &ExceptionState::default());

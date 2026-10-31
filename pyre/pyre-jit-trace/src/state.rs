@@ -5311,14 +5311,12 @@ pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
 
 /// Derive `(num_locals, num_locals + max_stackdepth)` from a `CodeObject`.
 ///
-/// Mirrors the `(callee_nlocals, callee_vsd)` pair the trace-side reads
-/// from `driver.get_compiled_meta(callee_key)` for CALL_ASSEMBLER
-/// emission (`trace_opcode.rs`). The second value is sized to
-/// match `PyFrame::__init__` (`alloc_fixed_array_with_header(num_locals +
-/// num_cells + max_stack, ...)`) — i.e. heap capacity rather than live
-/// depth. Used as the fallback shape when no `compiled_meta` exists yet
-/// (e.g. tmp_callback target where `compile_tmp_callback` produced a
-/// JCT but no compiled-loop metadata).
+/// The `(callee_nlocals, callee_vsd)` pair CALL_ASSEMBLER emission
+/// (`trace_opcode.rs`) uses for the callee frame. The second value is
+/// sized to match `PyFrame::__init__` (`alloc_fixed_array_with_header(
+/// num_locals + num_cells + max_stack, ...)`) — heap capacity rather
+/// than live depth. Used when the callee has a JCT but no live frame
+/// yet (e.g. a `compile_tmp_callback` target).
 #[allow(dead_code)]
 pub(crate) fn callee_layout_for_call_assembler(
     code: &pyre_interpreter::CodeObject,
