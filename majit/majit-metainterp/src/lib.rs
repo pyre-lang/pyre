@@ -1640,7 +1640,7 @@ pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 /// compile_bridge retrace_requested return, 11 = retired (compile.py
 /// compile_trace has no JUMP/LABEL arity giveup), 12 = start_bridge_tracing entered,
 /// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = retired
-/// (compiled_loops meta is not the loop_token_wref gate), 16 = sbt early: !can_trace, 17 = sbt early:
+/// (retired: meta is not the loop_token_wref gate), 16 = sbt early: !can_trace, 17 = sbt early:
 /// fail_values too short, 18 = compile_and_run_once entered from a back edge,
 /// 19 = compile_and_run_once entered from a function entry, 20 =
 /// compile_and_run_once early-out: portal jitcode unavailable, 21 =

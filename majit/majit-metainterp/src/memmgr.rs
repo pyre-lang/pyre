@@ -16,10 +16,10 @@
 //! `CompiledLoopToken::free_loop_and_bridges` (`llmodel.py`) and the
 //! CLT `Drop` bumps `total_freed_*` (`model.py` `CompiledLoopToken.__del__`).
 //!
-//! Both long-lived handles on a compiled token are now weak —
-//! `BaseJitCell::loop_token` (`warmstate.py`) and
-//! `CompiledEntry::token` — so `alive_loops` is the sole long-lived strong
-//! owner and removing an entry here is what actually frees the token.
+//! The long-lived cell handle on a compiled token is weak —
+//! `BaseJitCell::loop_token` (`warmstate.py`) — so `alive_loops` is the
+//! sole long-lived strong owner and removing an entry here is what
+//! actually frees the token.
 //!
 //! The corollary every producer owes: a token must be registered HERE before
 //! any cell or table is given a handle to it, or it dies with the producer's
@@ -207,19 +207,8 @@ impl MemoryManagerInner {
     /// `LoopToken.__del__` (`memmgr.py`) lets the CLT run
     /// `cpu.free_loop_and_bridges` once `alive_loops` drops the token.
     /// Pyre does the same in `JitCellToken::drop` /
-    /// `CompiledLoopToken::drop`. The list lets
-    /// `pyjitpl::try_to_free_some_loops` retire the matching
-    /// `compiled_loops` entries, whose metadata cannot live on the
-    /// token (crate split).
-    ///
-    /// The return value is a `Vec<Arc<JitCellToken>>` rather than
-    /// `Vec<u64>` (green_keys) so the caller can match by **token-object
-    /// identity** (`Arc::ptr_eq`) — mirroring `memmgr.py`'s
-    /// `del self.alive_loops[looptoken]`, which keys on the looptoken
-    /// itself.  Returning green_keys would let an evicted stale
-    /// looptoken kick out the *current* compiled token at the same
-    /// green_key (the recompile case where `compiled_loops[gk].token`
-    /// has already been replaced).
+    /// `CompiledLoopToken::drop`. Callers discard the Vec; eviction is
+    /// the drop of these Arcs.
     pub fn next_generation(&mut self) -> Vec<Arc<JitCellToken>> {
         self.current_generation += 1;
         if self.current_generation == self.next_check {
@@ -266,7 +255,7 @@ impl MemoryManagerInner {
         // looptoken.invalidated): del self.alive_loops[looptoken]`.
         // Pyre returns the looptoken Arcs themselves so the caller can
         // match by Arc identity (cf. RPython's `del` keying on the
-        // looptoken object) when dropping `compiled_loops` entries.
+        // looptoken object). `try_to_free_some_loops` discards them.
         let mut evicted_tokens = Vec::new();
         self.alive_loops.retain(|_key, token| {
             let token_gen = token.generation.get();
