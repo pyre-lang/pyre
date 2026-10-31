@@ -21,9 +21,9 @@ fn load_corpus() -> &'static Llbc {
     LLBC.get_or_init(|| Llbc::load(CORPUS).expect("load corpus.ullbc"))
 }
 
-/// BFS the set of blocks reachable from the graph's startblock. The
-/// `bool_then` rewrite can leave the pre-split framestate merge block
-/// unreachable, so the reachable-only assertions filter against this set.
+/// BFS the set of blocks reachable from the graph's startblock. Count
+/// assertions walk this set so leftover merge blocks after a combinator
+/// body is extracted do not inflate the totals.
 fn reachable_blocks(
     graph: &majit_translate::model::FunctionGraph,
 ) -> std::collections::HashSet<majit_translate::model::BlockId> {
@@ -905,11 +905,12 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
     );
 }
 
-/// `bool::then_some` stays an ordinary call to the extracted core body;
-/// the Some/None diamond lives in that graph. `bool::then` still rewrites
-/// at the caller: its closure `call_once` is not a function-item unpack.
+/// `bool::then` / `bool::then_some` stay ordinary calls of the extracted
+/// core bodies (`if self { Some(f()) } else { None }` /
+/// `if self { Some(t) } else { None }`). The Some/None diamond and
+/// `then`'s `FnOnce::call_once` live in those graphs, not in the caller.
 #[test]
-fn bool_then_lifts_to_short_circuit_diamond() {
+fn bool_then_keeps_regular_call_to_core_body() {
     use majit_translate::front::mir::{LowerContext, lower_fun_decl};
     use majit_translate::model::{CallTarget, ExitSwitch, FunctionGraph, OpKind};
 
@@ -979,20 +980,22 @@ fn bool_then_lifts_to_short_circuit_diamond() {
     let llbc = load_corpus();
 
     let then_graph = lower_function(llbc, "bool_then_closure").expect("lowering");
-    let (call_once, bool_branches, _some_ctor, _none_ctor) = diamond_counts(&then_graph);
+    let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&then_graph);
     assert_eq!(
         residual_bool_calls(&then_graph, "then"),
-        0,
-        "then: the caller rewrite consumes the residual call"
+        1,
+        "then: caller keeps a regular call to the core body"
     );
-    assert!(
-        call_once >= 1,
-        "then: the rewrite arm invokes the closure (call_once={call_once})"
+    assert_eq!(
+        call_once, 0,
+        "then: call_once lives in the core body, not the caller (call_once={call_once})"
     );
-    assert!(
-        bool_branches >= 1,
-        "then: the caller hosts the short-circuit branch (branches={bool_branches})"
+    assert_eq!(
+        bool_branches, 0,
+        "then: the caller does not host the Some/None diamond (branches={bool_branches})"
     );
+    assert_eq!(some_ctor, 0, "then: Some is built in the core body");
+    assert_eq!(none_ctor, 0, "then: None is built in the core body");
 
     let some_graph = lower_function(llbc, "bool_then_some").expect("lowering");
     let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&some_graph);
@@ -1009,42 +1012,60 @@ fn bool_then_lifts_to_short_circuit_diamond() {
     assert_eq!(some_ctor, 0, "then_some: Some is built in the core body");
     assert_eq!(none_ctor, 0, "then_some: None is built in the core body");
 
-    let mut lowered_core_bodies = 0usize;
-    for artefact in [llbc, load_llbc(INTERPRETER_LLBC)] {
-        let ctx = LowerContext::new(artefact);
-        for fd in artefact.iter_fun_decls() {
-            if !fd.has_unstructured_body() {
-                continue;
-            }
-            let path = fd.item_meta.name_path();
-            if !path.ends_with("::bool::<Impl>::then_some") {
-                continue;
-            }
-            let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
-            let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let ctx = LowerContext::new(interpreter);
+    let mut lowered_then = 0usize;
+    let mut lowered_then_some = 0usize;
+    for fd in interpreter.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let path = fd.item_meta.name_path();
+        let is_then = path.ends_with("::bool::<Impl>::then");
+        let is_then_some = path.ends_with("::bool::<Impl>::then_some");
+        if !is_then && !is_then_some {
+            continue;
+        }
+        let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+        let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
+        assert!(
+            bool_branches >= 1,
+            "{path}: core body branches on self (call_once={call_once}, \
+             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+        );
+        assert!(
+            some_ctor >= 1,
+            "{path}: then arm builds Some (call_once={call_once}, \
+             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+        );
+        assert!(
+            none_ctor >= 1,
+            "{path}: else arm builds None (call_once={call_once}, \
+             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+        );
+        if is_then {
             assert!(
-                bool_branches >= 1,
-                "{path}: core body branches on self (call_once={call_once}, \
+                call_once >= 1,
+                "{path}: then arm invokes f() as call_once (call_once={call_once}, \
                  branches={bool_branches}, some={some_ctor}, none={none_ctor})"
             );
-            assert!(
-                some_ctor >= 1,
-                "{path}: then arm builds Some (call_once={call_once}, \
-                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-            );
-            assert!(
-                none_ctor >= 1,
-                "{path}: else arm builds None (call_once={call_once}, \
-                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-            );
+            lowered_then += 1;
+        } else {
             assert_eq!(
                 call_once, 0,
                 "{path}: then_some wraps the value, no call_once"
             );
-            lowered_core_bodies += 1;
+            lowered_then_some += 1;
         }
     }
-    let _ = lowered_core_bodies;
+    assert_eq!(
+        lowered_then, 1,
+        "extracted then FunDecl bodies must lower, got {lowered_then}"
+    );
+    assert_eq!(
+        lowered_then_some, 1,
+        "extracted then_some FunDecl bodies must lower, got {lowered_then_some}"
+    );
 }
 
 /// `option_question_mark`'s `let v = opt?` is a regular call of

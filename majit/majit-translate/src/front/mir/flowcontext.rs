@@ -501,10 +501,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `Layout::size` / `Layout::align` field accessors on a virtualized Layout.
     pub(in crate::front::mir) layout_accessor_sites:
         Vec<crate::front::from_size_align::LayoutAccessorSite>,
-    /// `bool::then(cond, closure)` call sites recorded for the
-    /// short-circuit `Option` diamond the `front::bool_then` post-pass
-    /// synthesizes after the body lowering completes.
-    pub(in crate::front::mir) bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
     /// `<[T]>::first(slice)` call sites recorded for the length-checked
     /// `Option<&T>` diamond the `front::slice_first` post-pass synthesizes
     /// after the body lowering completes (see
@@ -1548,7 +1544,6 @@ impl<'a> Lowering<'a> {
             from_size_align_expect_sites: Vec::new(),
             from_size_align_call_sites: Vec::new(),
             layout_accessor_sites: Vec::new(),
-            bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
             slice_is_ascii_sites: Vec::new(),

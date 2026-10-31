@@ -4360,7 +4360,7 @@ impl<'a> Lowering<'a> {
         let tagged_owners = if niche {
             None
         } else {
-            match self.resolve_bool_then_option_dest(dest_ty) {
+            match self.resolve_option_dest_owners(dest_ty) {
                 Some(owners) => Some(owners),
                 None => return Ok(false),
             }
@@ -5350,8 +5350,7 @@ impl<'a> Lowering<'a> {
         let Some(byte) = self.const_eq_u8_of_predicate(pred_ty) else {
             return Ok(false);
         };
-        let Some((option_owner, some_owner, payload_ty)) =
-            self.resolve_bool_then_option_dest(dest_ty)
+        let Some((option_owner, some_owner, payload_ty)) = self.resolve_option_dest_owners(dest_ty)
         else {
             return Ok(false);
         };

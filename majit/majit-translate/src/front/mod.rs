@@ -69,7 +69,6 @@
 //! treated as opaque ops.
 
 pub(crate) mod bigint_binop;
-pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod checked_arith_uint;
 pub(crate) mod clause_spec;

@@ -10790,8 +10790,10 @@ fn intern_fieldless_enum_int_ty(int_ty: &str) -> String {
 /// a substituted `__pos_0` hits a registry key that survives
 /// `harden_duplicate_leaf_metadata`: a fieldless enum is its discriminant
 /// integer, a transparent handle is `*mut` of its `Deref::Target`, a
-/// monomorphic named ADT is `strip_crate_prefix` of the TypeDecl path,
-/// and a generic instantiation keeps the CAST leaf render.
+/// pointer-niche Option is `*mut` of the payload pointee ([`charon_type_value_to_ast_string`]
+/// strips `&`, so `Option<&T>` would otherwise intern as the tagged
+/// `Option<T>` class), a monomorphic named ADT is `strip_crate_prefix` of
+/// the TypeDecl path, and a generic instantiation keeps the CAST leaf render.
 fn intern_type_arg_payload_spelling(
     t: &serde_json::Value,
     llbc: &Llbc,
@@ -10799,6 +10801,12 @@ fn intern_type_arg_payload_spelling(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    // Call generics hash-cons the argument (`{"Value": [id, ty]}` /
+    // `{"Deduplicated": id}`). CAST already peels those wrappers
+    // ([`charon_type_value_to_ast_string`]); intern ROW must too, or
+    // [`tyref_is_option`] / [`intern_adt_type_decl_identity`] see the
+    // wrapper node and the ROW falls through to the CAST leaf.
+    let t = strip_ty_indirections(t, llbc).unwrap_or(t);
     let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
     if rendered == "Global" || rendered == "RandomState" {
         return None;
@@ -10818,10 +10826,97 @@ fn intern_type_arg_payload_spelling(
     ) {
         return Some(spelling);
     }
+    if let Some(spelling) = intern_niche_option_payload_spelling(
+        &ty,
+        llbc,
+        depth,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return Some(spelling);
+    }
     if let Some(identity) = intern_adt_type_decl_identity(&ty, llbc, depth) {
         return Some(identity);
     }
     Some(rendered)
+}
+
+/// Intern ROW of a pointer-niche `Option<P>` used as a tagged enum payload.
+///
+/// Intern harvest skips the niche Option as a class
+/// ([`tyref_is_niche_option`]). CAST of the same type argument
+/// strips `&` ([`charon_type_value_to_ast_string`]), so the leaf render
+/// of `Option<&T>` is `Option<T>` — a tagged enum class whose
+/// `__pos_0` is `Instance`, while the value is the nullable pointer.
+/// The ROW is that pointer: `*mut` of the payload pointee, matching
+/// [`one_level_pointer_pointee`] / a thin Arc/Rc, or the payload's own
+/// intern spelling when it is already a pointer word.
+fn intern_niche_option_payload_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    depth: usize,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !tyref_is_niche_option(ty, llbc) {
+        return None;
+    }
+    if let Some(kind) = option_nonzero_word_kind(ty, llbc) {
+        return intern_scalar_value_type_row(kind);
+    }
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
+    if tyref_option_payload_is_fn_ptr(ty, llbc) || tyref_is_option_of_string_value(ty, llbc) {
+        let node = tyref_node(&payload, llbc)?;
+        return intern_type_arg_payload_spelling(
+            node,
+            llbc,
+            depth,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+    }
+    if let Some(ValueType::Ref(Some(root))) =
+        tyref_niche_option_payload_paint(ty, llbc, no_tombstoned_leaves())
+    {
+        return Some(root);
+    }
+    let node = tyref_node(&payload, llbc)?;
+    let pointee = one_level_pointer_pointee(node, llbc)
+        .or_else(|| type_node_thin_arc_or_rc_pointee(node, llbc))
+        .unwrap_or(node);
+    let inner = intern_type_arg_payload_spelling(
+        pointee,
+        llbc,
+        depth,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )?;
+    Some(intern_pointer_payload_row(inner))
+}
+
+fn intern_pointer_payload_row(inner: String) -> String {
+    let t = inner.trim();
+    if t.starts_with('*') || t.starts_with('&') {
+        t.to_string()
+    } else {
+        format!("*mut {t}")
+    }
+}
+
+fn intern_scalar_value_type_row(kind: ValueType) -> Option<String> {
+    Some(
+        match kind {
+            ValueType::Bool => "bool",
+            ValueType::Int => "i64",
+            ValueType::Unsigned => "u64",
+            ValueType::Int128 => "i128",
+            ValueType::UInt128 => "u128",
+            ValueType::Float => "f64",
+            ValueType::SingleFloat => "f32",
+            _ => return None,
+        }
+        .to_string(),
+    )
 }
 
 /// Crate-stripped TypeDecl identity of a monomorphic named ADT.

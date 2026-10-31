@@ -247,7 +247,7 @@ impl<'a> Lowering<'a> {
     /// `__discriminant` off a bare pointer and panics.  Minting the SAME
     /// root a constructed `Some(..)`/`None` of this instantiation mints
     /// (`Option`'s `name_path` + the destination `<X>` suffix, exactly as
-    /// [`Self::resolve_bool_then_option_dest`] / the tagged-pair ctor derive it)
+    /// [`Self::resolve_option_dest_owners`] / the tagged-pair ctor derive it)
     /// lets the narrowed result share the constructed Option's ClassDef, so
     /// the residual and constructed Options unify at a phi merge and the
     /// discriminant / payload reads resolve.
@@ -452,7 +452,7 @@ impl<'a> Lowering<'a> {
     /// payload_ty)` — the enum root ctor owner, the `Some` variant
     /// payload-field owner, and the payload `ValueType`.  `None` when the
     /// destination is not a resolvable `Option`.
-    pub(in crate::front::mir) fn resolve_bool_then_option_dest(
+    pub(in crate::front::mir) fn resolve_option_dest_owners(
         &self,
         dest_ty: &TyRef,
     ) -> Option<(String, String, ValueType)> {
@@ -479,7 +479,7 @@ impl<'a> Lowering<'a> {
     /// Agreement is by construction: the suffixed producers (`slice_first`,
     /// `from_size_align`) mint a
     /// per-instantiation `Option<X>` root through
-    /// [`Self::resolve_bool_then_option_dest`], so the consumer reuses that
+    /// [`Self::resolve_option_dest_owners`], so the consumer reuses that
     /// exact derivation, including checked unsigned arithmetic. Its generated
     /// Some/None constructors must identify the same existing classes as a
     /// source-level Some(value), not create a separate bare Option payload.
@@ -487,7 +487,7 @@ impl<'a> Lowering<'a> {
     /// one-word niche `Option` has no aggregate
     /// `__discriminant` / `__pos_0` (the arms use a pointer null-test and an
     /// identity payload), so its owners are never read — keep them bare, which
-    /// also mirrors [`Self::resolve_bool_then_option_dest`]'s own aggregate
+    /// also mirrors [`Self::resolve_option_dest_owners`]'s own aggregate
     /// applicability.
     pub(in crate::front::mir) fn resolve_option_consumer_owners(
         &self,
@@ -501,44 +501,7 @@ impl<'a> Lowering<'a> {
             let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
             return Some((option_owner, some_owner, payload_ty));
         }
-        self.resolve_bool_then_option_dest(recv_ty)
-    }
-
-    /// Resolve a recognized `bool::then(cond, closure_env)` call into a
-    /// [`crate::front::bool_then::BoolThenSite`]. `None` (leaving the
-    /// residual call) when the destination is not a resolvable `Option` or
-    /// the closure env type does not resolve to an ADT.
-    pub(in crate::front::mir) fn recognize_bool_then_site(
-        &self,
-        dest_ty: &TyRef,
-        env_ty: Option<&TyRef>,
-        result_var: &Variable,
-    ) -> Option<crate::front::bool_then::BoolThenSite> {
-        let (option_owner, some_owner, mut payload_ty) =
-            self.resolve_bool_then_option_dest(dest_ty)?;
-        let niche = self.tyref_is_niche_option_ptr(dest_ty);
-        let scalar_kind = option_nonzero_word_kind(dest_ty, self.llbc);
-        let scalar_niche = scalar_kind.is_some();
-        if let Some(kind) = scalar_kind {
-            payload_ty = kind;
-        }
-        let payload_narrow_root = niche
-            .then(|| self.option_niche_payload_class_root(dest_ty))
-            .flatten();
-        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = closure_env_call_once_owner(env_td);
-        Some(crate::front::bool_then::BoolThenSite {
-            result_var: result_var.clone(),
-            call_once_owner,
-            option_owner,
-            some_owner,
-            payload_ty,
-            niche,
-            scalar_niche,
-            niche_null_cast: self.option_niche_null_cast(dest_ty),
-            payload_narrow_root,
-        })
+        self.resolve_option_dest_owners(recv_ty)
     }
 
     /// Resolve a recognized `<[T]>::first(slice)` call into a
@@ -761,7 +724,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let (mut option_owner, mut some_owner, payload_ty) =
-            self.resolve_bool_then_option_dest(dest_ty)?;
+            self.resolve_option_dest_owners(dest_ty)?;
         // The dest place is often a bare `Option` type_id. The payload
         // type (FunDecl output, or a `usize` operand of `checked_add`)
         // still names the instantiation the `Some` constructor and the
@@ -787,7 +750,7 @@ impl<'a> Lowering<'a> {
     /// type.  Gated on the payload being `core::alloc::layout::Layout` so only
     /// the `from_size_align(..).ok()` shape is recorded; the post-pass validates
     /// the preceding `from_size_align` residual.  The `Option` root is
-    /// **instantiation-suffixed** (`resolve_bool_then_option_dest`):
+    /// **instantiation-suffixed** (`resolve_option_dest_owners`):
     /// the enclosing `try_typed_items_block_layout` also builds
     /// `checked_{mul,add}` `Option<usize>` values, and a bare `Option` root
     /// would share one `core.option.Option::Some::__pos_0` field with them,
@@ -801,7 +764,7 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
             return None;
         }
-        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let (option_owner, some_owner, payload_ty) = self.resolve_option_dest_owners(dest_ty)?;
         // The `Some` payload must be the opaque `core::alloc::layout::Layout`
         // ADT — this gates recording to the `from_size_align(..).ok()` shape.
         let payload_ty_ref = self.tyref_adt_type_arg(dest_ty, 0)?;
@@ -903,7 +866,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Dest type of a bare `Option` place with the payload as its type
-    /// argument. [`Self::resolve_bool_then_option_dest`] then reads the
+    /// argument. [`Self::resolve_option_dest_owners`] then reads the
     /// dest type's generic args and [`Self::tagged_pair_payload_owner`]
     /// (`v.name`) for the `Some` owner.
     pub(in crate::front::mir) fn option_dest_with_payload(
@@ -928,7 +891,7 @@ impl<'a> Lowering<'a> {
 
     /// When the dest place dropped its generics, rebuild the dest type
     /// from the payload `TyRef` and intern owners through
-    /// [`Self::resolve_bool_then_option_dest`].
+    /// [`Self::resolve_option_dest_owners`].
     pub(in crate::front::mir) fn instantiate_option_owners_from_payload(
         &self,
         dest_ty: &TyRef,
@@ -951,7 +914,7 @@ impl<'a> Lowering<'a> {
         if tyref_enum_instantiation_suffix(&inst, self.llbc).is_empty() {
             return;
         }
-        if let Some((owner, some, _)) = self.resolve_bool_then_option_dest(&inst) {
+        if let Some((owner, some, _)) = self.resolve_option_dest_owners(&inst) {
             *option_owner = owner;
             *some_owner = some;
         }

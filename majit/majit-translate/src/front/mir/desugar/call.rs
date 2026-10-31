@@ -8087,21 +8087,6 @@ impl<'a> Lowering<'a> {
                 self.result_try_sites.push(site);
             }
         }
-        // Capture `bool::then(cond, closure_env)` sites for the
-        // short-circuit `Option` diamond `front::bool_then` synthesizes.
-        // `then_some` is a regular call to the extracted core body.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["bool", "<Impl>", "then"])
-            && let Some(site) =
-                self.recognize_bool_then_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
-        {
-            self.bool_then_sites.push(site);
-        }
         // Capture `<[T]>::first(slice)` sites for the length-checked
         // `Option<&T>` diamond `front::slice_first` synthesizes.  `first` is a
         // foreign leaf (its `Self` is the primitive slice `[T]`, so `lower_call`
@@ -9342,6 +9327,28 @@ impl<'a> Lowering<'a> {
                     )
                     .is_some()
                 }) {
+                    return None;
+                }
+                // A `repr(transparent)` GC handle intern's as a subclass
+                // of `Deref::Target` (`error::PyError` under
+                // `error::PyErrorObject`). `CallTarget::Method` getattr
+                // looks at the payload class after `MutRef.value` / `.0`
+                // unwrap, and that classdict has no method source — the
+                // blocked `getattr(recv, leaf)` wall. The `&mut self`
+                // MutRef decline above does not cover `&self` methods
+                // (`resolved_w_type`) called from a MutRef cell. Route
+                // as FunctionPath so the FunDecl graph is a RegularCall
+                // (`call.py` `guess_call_kind` when `graphs_from` is set).
+                let owner_ty = type_decl_adt_tyref(adt_def_id);
+                if transparent_deref_target_class(
+                    &owner_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .is_some()
+                {
                     return None;
                 }
                 // The ADT id above is still the wrapper. The name the

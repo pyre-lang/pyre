@@ -120,6 +120,8 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::bool::_::then_some",
     "--include",
+    "core::bool::_::then",
+    "--include",
     "core::option::_::is_none_or",
     "--include",
     "core::result::_::ok",

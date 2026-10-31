@@ -726,7 +726,12 @@ fn ref_enum_instantiation_of_adt(
     }
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
-    // `Deref::Target` class so the payload attr and the cast agree.
+    // `Deref::Target` class so the payload attr and the cast agree. A
+    // pointer-niche Option payload is `*mut` of the pointee: CAST
+    // strips `&`, and intern of `Option<&T>` as `Option<T>` would
+    // getattr a tagged class over a pointer word. Type-arg nodes from
+    // call generics are hash-consed (`Value` / `Deduplicated`); intern
+    // ROW peels those wrappers so the niche test sees the Option ADT.
     let args = render_adt_payload_type_args(
         adt,
         llbc,
@@ -6559,16 +6564,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `same_as`. Anything left is the match: read the discriminant
         // and build `Continue` / `Break`.
         lower_result_branch_to_control_flow(&mut lo.graph);
-        // The `bool::then` short-circuit rewrite splits the residual `then`
-        // call block into a `Some`/`None` diamond. `then_some` is translated
-        // from its core body; only `then` stays on this rewrite because its
-        // closure `call_once` is not a function-item unpack. Gate the
-        // reachability sweep on an actual rewrite.
-        let bool_then_rewritten = if lo.bool_then_sites.is_empty() {
-            0
-        } else {
-            crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
-        };
         // The `<[T]>::first(slice)` length-checked `Option<&T>` diamond rewrite
         // (`front::slice_first`) splits the residual `first` call block into a
         // guarded `Some`/`None` diamond (`if len(slice) > 0`). It runs on the
@@ -6719,7 +6714,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_expect_rewritten > 0
             || result_try_stats.rewritten > 0
             || !lo.result_try_sites.is_empty()
-            || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
             || slice_is_ascii_rewritten > 0

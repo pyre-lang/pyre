@@ -13961,6 +13961,96 @@ fn interned_result_tuple_ok_fieldless_err_payload_is_discriminant_int() {
     );
 }
 
+/// Intern of tagged `Option<Option<&MappedObj>>` spells `Some.__pos_0` as
+/// the inner niche pointer (`*mut` of the TypeDecl identity). CAST of
+/// `Option<&MappedObj>` strips `&`, so the leaf render is `Option<MappedObj>`
+/// — a tagged class whose getattr of `__pos_0` is `Instance`. The value is
+/// the nullable pointer. CAST intern suffix stays `<Option<MappedObj>>`.
+#[test]
+fn interned_tagged_option_of_niche_option_payload_is_pointer() {
+    let mapped = interior_struct(
+        1,
+        &["pyre_module", "module", "mmap", "interp_mmap", "MappedObj"],
+        &[(
+            "ptr",
+            serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let inner = option_adt_node(0, option_shared_ref(adt_node(1)));
+    let i64_ty = interior_i64();
+    let llbc = intern_option_from_map_call_llbc(vec![inner, i64_ty], vec![mapped]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option of niche Option<&MappedObj>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "intern ROW is the niche pointer, CAST suffix stays <Option<MappedObj>>; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Production `bool::then` call generics hash-cons `T`
+/// (`{"Value": [id, Option<&MappedObj>]}`). Intern ROW peels that
+/// wrapper so the payload is still the niche pointer, not CAST's
+/// `Option<MappedObj>` leaf.
+#[test]
+fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
+    let mapped = interior_struct(
+        1,
+        &["pyre_module", "module", "mmap", "interp_mmap", "MappedObj"],
+        &[(
+            "ptr",
+            serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let inner = option_adt_node(0, option_shared_ref(adt_node(1)));
+    let wrapped = serde_json::json!({"Value": [90001, inner]});
+    let i64_ty = interior_i64();
+    let llbc = intern_option_from_map_call_llbc(vec![wrapped, i64_ty], vec![mapped]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option of hash-consed Option<&MappedObj>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "intern ROW peels Value wrapper; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "crate-stripped intern KEY matches CAST owner after Value peel; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
 /// Intern of `Result<G<u8>, PyError>` keeps the CAST leaf render
 /// (`G<u8>`) as `Ok.__pos_0`. Identity-with-args (`g::G<u8>`) would be a
 /// different `struct_fields` key than CAST's `<G<u8>>` suffix.
@@ -19030,6 +19120,25 @@ fn clear_references_niche_bool_then_has_no_option_aggregate() {
     );
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "clear_references").expect("lower clear_references");
+    let then_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("then")
+                    && segments.iter().any(|s| s == "bool")
+            )
+        })
+        .count();
+    assert_eq!(
+        then_calls, 1,
+        "clear_references keeps one regular call to the core bool::then body"
+    );
     let option_aggregate_ops = graph
         .blocks
         .iter()
@@ -19051,46 +19160,8 @@ fn clear_references_niche_bool_then_has_no_option_aggregate() {
         .count();
     assert_eq!(
         option_aggregate_ops, 0,
-        "bool::then producing Option<PyObjectRef> must use RPython's nullable-pointer \
-             representation (Some(ptr)=ptr, None=null), not an Option aggregate"
-    );
-    let is_instance_narrow = |op: &crate::model::SpaceOperation| {
-        crate::model::cast_instance_root(&op.kind) == Some("PyObject")
-    };
-    let join = graph.blocks.iter().find_map(|block| {
-        let has_call_once = block.operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "call_once"
-            )
-        });
-        (has_call_once && block.operations.iter().any(is_instance_narrow))
-            .then(|| block.exits.first().map(|link| link.target))
-            .flatten()
-    });
-    assert!(
-        join.is_some(),
-        "the niche Some payload must retain PyObject/W_Root class identity across call_once"
-    );
-    let narrowed_none = graph.blocks.iter().any(|block| {
-        block.exits.first().map(|link| link.target) == join
-            && block.operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments == &["core", "ptr", "null_mut"]
-                )
-            })
-            && block.operations.iter().any(is_instance_narrow)
-    });
-    assert!(
-        narrowed_none,
-        "the niche None arm must be the same nullable PyObject/W_Root repr as the Some arm"
+        "bool::then producing Option<PyObjectRef> is a regular call of the core body; \
+             the caller must not mint an Option aggregate around that niche pointer"
     );
 }
 
