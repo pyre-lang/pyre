@@ -7100,7 +7100,10 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         &[],
     );
     let (walk_outcome, _walk_start) = match walk {
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] {} pc={pc}", descent.decline_tag);
             }
@@ -7897,7 +7900,10 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         &[],
     );
     match walk {
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-GETITEM-SUBWALK pc={pc}");
             }
@@ -8232,7 +8238,10 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
         // so nothing is committed -- cut the tentative IR, with its
         // snapshots, and let the residual (or the fold behind this descent)
         // serve the operator.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] {} pc={pc}", descent.decline_tag);
             }
@@ -10219,7 +10228,10 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     );
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] STR-GETITEM-SUBWALK pc={pc}");
             }
@@ -10331,7 +10343,10 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
     );
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] BYTES-GETITEM-SUBWALK pc={pc}");
             }
@@ -10456,7 +10471,10 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     );
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
         }
         Err(error) => return Err(error),
@@ -10683,7 +10701,10 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     );
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-ITER-DESCR-NEXT pc={pc}");
             }
@@ -15769,6 +15790,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
 /// records the append as a residual call instead of baking the hash as a code
 /// address and branching to garbage.
 fn list_append_resume_declines(error: &DispatchError) -> bool {
+    if abort_blackhole_latched() {
+        return false;
+    }
     matches!(
         error,
         DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
@@ -17148,7 +17172,10 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         ctx, op, sym, &sub_body, self_ref, inner_self, len_before, popped, dst,
     ) {
         Ok(()) => Ok(Some(())),
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-POP-SUBWALK pc={pc}");
             }
@@ -19391,7 +19418,10 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         &[],
     );
     let walk_outcome = match walk {
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-SETITEM-SUBWALK pc={pc}");
             }
@@ -19902,7 +19932,10 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     };
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+        Err(error @ DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             if let Some(iter_obj) = iter_now {
                 unsafe {
                     pyre_object::functional::w_range_iter_set_cursor(

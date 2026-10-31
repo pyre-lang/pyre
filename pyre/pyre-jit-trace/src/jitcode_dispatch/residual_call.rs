@@ -1436,9 +1436,10 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
                 .iter()
                 .map(|frame| frame.jitcode.name())
                 .collect();
+            let pcs: Vec<usize> = framestack.frames.iter().map(|frame| frame.pc).collect();
             eprintln!(
                 "[latch-accept] origin={origin} multi-frame depth={} helper={} \
-                 pc={} names={names:?}",
+                 pc={} names={names:?} pcs={pcs:?}",
                 framestack.frames.len(),
                 ctx.fbw_mode.transparent_helper_subwalk,
                 resume_pc,
@@ -1522,28 +1523,202 @@ pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
 /// Python-code level cannot reach such a body: the flattener emits
 /// `inline_call_*` only for a fully bound callee (`fully_bound_callee_body`).
 /// A transparent helper frame is entered through the indirect call instead and
-/// was never vetted, so its body is read here, from the positions the level can
-/// resume at: `pc`, or the operation in flight when the abort came from inside
-/// it. An `OperatorTail` opens with an `inline_call_*` that only names the
+/// was never vetted, so its body is read here from the positions
+/// `_copy_data_from_miframe` / `setposition` actually resume at: `pc`.
+/// `last_opcode_position` is added only when it is still in flight (the
+/// blackhole would dispatch it). A CALL whose next instruction is already
+/// `pc` has run; `run` starts at `pc` and `handle_exception_in_frame` reads
+/// the `catch_exception` sitting there, so that CALL is not a start.
+/// `bhimpl_catch_exception` is a no-op on the `run` path. Its `L` target is
+/// followed when a reachable instruction in this frame is that catch's
+/// predecessor, and, for a non-innermost level, when
+/// `in_flight_callee_may_raise` so `_resume_mainloop` can deliver the
+/// callee's exception to the landing catch (`_run_forever`).
+/// An `OperatorTail` opens with an `inline_call_*` that only names the
 /// return register and never runs.
-pub(crate) fn codeless_level_may_stop_blackhole(frame: &majit_metainterp::MIFrame) -> bool {
+pub(crate) fn codeless_level_may_stop_blackhole(
+    frame: &majit_metainterp::MIFrame,
+    in_flight_callee_may_raise: bool,
+) -> bool {
+    let mut any_switch = false;
+    let mut may_stop = false;
+    fold_resume_facts(frame, in_flight_callee_may_raise, |facts| {
+        if facts.switch_or_undecodable {
+            any_switch = true;
+        } else if facts.may_stop {
+            may_stop = true;
+        }
+    });
+    if any_switch {
+        frame.jitcode.blackhole_may_reject_unresolved_call()
+    } else {
+        may_stop
+    }
+}
+
+/// Ancestor helpers, outermost first, may stop the blackhole. The already
+/// latched innermost level is the in-flight callee of the last helper.
+pub(crate) fn spliced_helpers_may_stop_blackhole(helpers: &[majit_metainterp::MIFrame]) -> bool {
+    if helpers.is_empty() {
+        return false;
+    }
+    let mut deeper_may_raise = FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|latched| latched.framestack.frames.last())
+            .map(|frame| level_may_raise(frame, false))
+            .unwrap_or(true)
+    });
+    for frame in helpers.iter().rev() {
+        if codeless_level_may_stop_blackhole(frame, deeper_may_raise) {
+            return true;
+        }
+        deeper_may_raise = level_may_raise(frame, deeper_may_raise);
+    }
+    false
+}
+
+fn blackhole_scan_root_pcs(frame: &majit_metainterp::MIFrame) -> Vec<usize> {
+    let pc = frame.pc;
+    let lastop = frame.last_opcode_position;
+    if lastop == pc {
+        return vec![pc];
+    }
+    // `_copy_data_from_miframe` `setposition`s `miframe.pc`. A CALL already
+    // sitting behind that pc is not re-dispatched.
+    if decode_op_at(&frame.jitcode.code, lastop).is_some_and(|op| {
+        (op.opname.starts_with("inline_call") || op.opname.starts_with("residual_call"))
+            && op.next_pc == pc
+    }) {
+        return vec![pc];
+    }
+    vec![lastop, pc]
+}
+
+fn blackhole_level_starts(
+    frame: &majit_metainterp::MIFrame,
+    in_flight_callee_may_raise: bool,
+) -> Option<Vec<usize>> {
     let code = &frame.jitcode.code;
-    let starts = [frame.last_opcode_position, frame.pc]
+    blackhole_scan_root_pcs(frame)
         .into_iter()
-        .map(|pc| crate::jitcode_runtime::reachable_starts_from(code, pc))
+        .map(|start| {
+            let follow_callee = in_flight_callee_may_raise && start == frame.pc;
+            crate::jitcode_runtime::blackhole_resume_reachable_starts(code, start, follow_callee)
+        })
         .try_fold(Vec::new(), |mut all, starts| {
             all.extend(starts?);
             Some(all)
-        });
-    match starts {
-        Some(mut starts) => {
+        })
+        .map(|mut starts| {
             starts.sort_unstable();
             starts.dedup();
-            frame
-                .jitcode
-                .blackhole_may_reject_unresolved_call_at(&starts)
+            starts
+        })
+}
+
+/// Remaining body from this level's resume pc may raise in
+/// `BlackholeInterpreter`. Conservative: a `switch`, an undecodable
+/// instruction, an uncaught in-flight callee, or any reachable op whose
+/// `bhimpl_*` is not on the cannot-raise allow-list. Call ops consult
+/// the descr EffectInfo (`call.py CallControl.getcalldescr`,
+/// `effectinfo.py EffectInfo.check_can_raise`).
+fn level_may_raise(frame: &majit_metainterp::MIFrame, in_flight_callee_may_raise: bool) -> bool {
+    if in_flight_callee_may_raise
+        && crate::jitcode_runtime::landing_catch_pc(&frame.jitcode.code, frame.pc).is_none()
+    {
+        return true;
+    }
+    let mut may_raise = false;
+    fold_resume_facts(frame, in_flight_callee_may_raise, |facts| {
+        if facts.switch_or_undecodable || facts.may_raise {
+            may_raise = true;
         }
-        None => frame.jitcode.blackhole_may_reject_unresolved_call(),
+    });
+    may_raise
+}
+
+/// Per-root-pc remaining-body facts, memoized on the jitcode when the
+/// frame's body is in `MetaInterpStaticData.jitcodes`.
+fn fold_resume_facts(
+    frame: &majit_metainterp::MIFrame,
+    in_flight_callee_may_raise: bool,
+    mut visit: impl FnMut(crate::pyjitcode::BlackholeResumeFacts),
+) {
+    let pjc = frame
+        .jitcode
+        .try_index()
+        .and_then(|index| i32::try_from(index).ok())
+        .and_then(crate::state::pyjitcode_for_jitcode_index);
+    for start in blackhole_scan_root_pcs(frame) {
+        let follow_callee = in_flight_callee_may_raise && start == frame.pc;
+        let facts = match pjc.as_ref() {
+            Some(pjc) => pjc.blackhole_resume_facts(start, follow_callee),
+            None => crate::pyjitcode::compute_blackhole_resume_facts(
+                frame.jitcode.as_ref(),
+                start,
+                follow_callee,
+            ),
+        };
+        visit(facts);
+    }
+}
+
+fn first_raising_opname(
+    frame: &majit_metainterp::MIFrame,
+    in_flight_callee_may_raise: bool,
+) -> Option<&'static str> {
+    if in_flight_callee_may_raise
+        && crate::jitcode_runtime::landing_catch_pc(&frame.jitcode.code, frame.pc).is_none()
+    {
+        return Some("<uncaught-callee>");
+    }
+    match blackhole_level_starts(frame, in_flight_callee_may_raise) {
+        None => Some("<switch-or-undecodable>"),
+        Some(starts) => {
+            for &pc in &starts {
+                match decode_op_at(&frame.jitcode.code, pc) {
+                    None => return Some("<undecodable>"),
+                    Some(op)
+                        if !crate::jitcode_runtime::blackhole_decoded_op_cannot_raise(
+                            &frame.jitcode.code,
+                            &op,
+                            Some(frame.jitcode.as_ref()),
+                        ) =>
+                    {
+                        return Some(op.opname);
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
+fn reachable_op_labels(
+    frame: &majit_metainterp::MIFrame,
+    in_flight_callee_may_raise: bool,
+) -> Vec<String> {
+    match blackhole_level_starts(frame, in_flight_callee_may_raise) {
+        None => vec!["<switch-or-undecodable>".to_string()],
+        Some(starts) => starts
+            .iter()
+            .filter_map(|&pc| {
+                decode_op_at(&frame.jitcode.code, pc).map(|op| {
+                    if crate::jitcode_runtime::blackhole_op_is_call(op.opname) {
+                        let info = crate::jitcode_runtime::call_op_effect_debug(
+                            &frame.jitcode.code,
+                            &op,
+                            Some(frame.jitcode.as_ref()),
+                        );
+                        format!("{}@{} {info}", op.opname, pc)
+                    } else {
+                        format!("{}@{}", op.opname, pc)
+                    }
+                })
+            })
+            .collect(),
     }
 }
 
@@ -1605,23 +1780,8 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             // MIFrame so `_setup_return_value_r` (`blackhole.py`) lands the
             // callee return in this level. `convert_and_run_from_pyjitpl`
             // copies every framestack level, including one without a
-            // virtualizable.
-            //
-            // The blackhole must also be able to finish this level.
-            // Declining leaves `helper_too_long_decision` to latch at the
-            // enclosing CALL or to keep executing.
-            if codeless_level_may_stop_blackhole(frame) {
-                latchdbg!(
-                    "origin={origin} pf-codeless-symbolic-residual index={index} jitcode={}",
-                    frame.jitcode.name()
-                );
-                return false;
-            }
-            latchdbg!(
-                "origin={origin} pf-codeless-continuation index={index} jitcode={} pc={}",
-                frame.jitcode.name(),
-                frame.pc
-            );
+            // virtualizable. The remaining-body scan runs innermost-first
+            // below, once every Python level has been checked.
             continue;
         }
         let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
@@ -1659,6 +1819,51 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     if seen.is_empty() {
         latchdbg!("origin={origin} pf-all-codeless");
         return false;
+    }
+
+    // Innermost first: every non-innermost level has an in-flight callee in
+    // this image. `_resume_mainloop` can deliver that callee's exception to
+    // the landing `catch_exception`.
+    let mut deeper_may_raise = false;
+    for (index, frame) in framestack.frames.iter().enumerate().rev() {
+        let Ok(jitcode_index) = i32::try_from(frame.jitcode.index()) else {
+            latchdbg!("origin={origin} pf-jitcode-index");
+            return false;
+        };
+        let frame_reg = crate::state::portal_red_regs_at(jitcode_index).0;
+        let in_flight = deeper_may_raise;
+        if frame_reg == u16::MAX {
+            // The blackhole must be able to finish this level. Declining
+            // leaves `helper_too_long_decision` to latch at the enclosing CALL
+            // or to keep executing. After an executed residual neither
+            // fallback is valid: `SwitchToBlackhole` unwinds, and the
+            // enclosing CALL would run the residual again.
+            if fbw_debug_abort_enabled() {
+                let ops = reachable_op_labels(frame, in_flight);
+                let raising = first_raising_opname(frame, in_flight);
+                eprintln!(
+                    "[codeless-scan] jitcode={} pc={} inflight={} may_raise={} raising={raising:?} ops={ops:?}",
+                    frame.jitcode.name(),
+                    frame.pc,
+                    in_flight,
+                    raising.is_some(),
+                );
+            }
+            if codeless_level_may_stop_blackhole(frame, in_flight) {
+                latchdbg!(
+                    "origin={origin} pf-codeless-symbolic-residual index={index} jitcode={} raising={:?}",
+                    frame.jitcode.name(),
+                    first_raising_opname(frame, in_flight)
+                );
+                return false;
+            }
+            latchdbg!(
+                "origin={origin} pf-codeless-continuation index={index} jitcode={} pc={}",
+                frame.jitcode.name(),
+                frame.pc
+            );
+        }
+        deeper_may_raise = level_may_raise(frame, in_flight);
     }
     true
 }
@@ -9223,6 +9428,7 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
     let walk_outcome = match walk {
         Ok(outcome) => outcome,
+        Err(error) if abort_blackhole_latched() => return Err(error),
         Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
             // Resume has no coordinate for this subwalk, so the call
             // stays residual (`do_residual_call`).
@@ -9631,6 +9837,12 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
                     );
                     count_recorded_residual(ctx, call_opcode, profiled_call, rec);
                 }
+                // The concrete call already ran. Leave the next-instruction
+                // pc on this context through the walk Err arm
+                // (`helper_capability_gap_resume_pc`).
+                if hook_state.ran {
+                    ctx.live_after_jit_pc = next_pc;
+                }
                 return Err(error);
             }
         }
@@ -9692,6 +9904,12 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
             is_list_wb,
         )?;
     }
+
+    // Trailing `-live-` after this residual (`pyjitpl.py` residual-call
+    // resume at `self.pc`). Leave it on the context until the step ends so
+    // a later `handle_possible_exception` snapshot failure can still resume
+    // past the executed call (`helper_capability_gap_resume_pc`).
+    ctx.live_after_jit_pc = next_pc;
 
     Ok(RecordedResidual {
         recorded,
@@ -10937,14 +11155,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // path's heap-token bracket already detects a vable escape and
         // surfaces `VableEscapedDuringResidualCall` before this guard is
         // emitted.
+        // #73: maintain the `-live-` AFTER anchor.  A
+        // residual-call guard reads its resume point at `self.pc` (the
+        // `-live-` trailing the call, `pyjitpl.py`).  `op.next_pc` is
+        // the first byte after the residual_call opcode, which the
+        // `[funcptr, Call, -live-]` layout (jitcode.rs) makes the
+        // trailing `-live-` byte.  Set it for the rest of this step,
+        // including `GUARD_NO_EXCEPTION` when `!emit_guard_not_forced`.
+        ctx.live_after_jit_pc = op.next_pc;
         if emit_guard_not_forced {
-            // #73: maintain the `-live-` AFTER anchor.  A
-            // residual-call guard reads its resume point at `self.pc` (the
-            // `-live-` trailing the call, `pyjitpl.py`).  `op.next_pc` is
-            // the first byte after the residual_call opcode, which the
-            // `[funcptr, Call, -live-]` layout (jitcode.rs) makes the
-            // trailing `-live-` byte.  Side-data only.
-            ctx.live_after_jit_pc = op.next_pc;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             flush_pending_residual_locals_adopt(ctx);

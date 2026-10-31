@@ -2352,6 +2352,11 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 && abort_blackhole_latched()
             {
                 false
+            } else if abort_blackhole_latched() && error.leaves_complete_image() {
+                // A deeper helper already staged its MIFrame. Replacing that
+                // image with a carrier-rooted latch would resume the CALL
+                // whose body already ran (`SwitchToBlackhole` just unwinds).
+                false
             } else {
                 latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361")
             };
