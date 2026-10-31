@@ -5402,10 +5402,19 @@ pub fn walk<Sym: WalkSym>(
                             ..
                         } | DispatchError::AbortPermanentMarkerReached { .. }
                     );
+                // `fbw_binop_rewind_refuse_commit` reuses
+                // `callee_inline_unsupported`, but the refuse is a clean
+                // decline of the speculative dunder, not
+                // `run_blackhole_interp_to_cancel_tracing`. The enclosing
+                // rewind entry residualizes the operator; latching here
+                // would keep a seeded-inline image that a later abort then
+                // adopts past the BINARY_OP.
+                let rewind_refused = ctx.session.borrow().binop_rewind_refused;
                 let abort_image_latchable = (error.leaves_complete_image()
                     || (frames_materialized && error.can_convert_seeded_inline()))
                     && !carrier_owned
-                    && !abort_blackhole_latched();
+                    && !abort_blackhole_latched()
+                    && !rewind_refused;
                 // A transparent helper is its own MIFrame (`pyjitpl.py
                 // MIFrame._get_opimpl_method` sets `self.pc = position` before
                 // the opimpl). `blackhole.py convert_and_run_from_pyjitpl`

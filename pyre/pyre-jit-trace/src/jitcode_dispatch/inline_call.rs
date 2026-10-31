@@ -18196,6 +18196,9 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
+    let rewind_outermost = rewind_guard
+        .as_ref()
+        .is_some_and(BinopRewindInlineGuard::is_outermost);
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|guard| guard.refused());
     drop(rewind_guard);
     if refused_a_commit {
@@ -18204,6 +18207,21 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
+        // A nested refuse belongs to the enclosing rewind region.
+        // Residualizing this BINARY_OP would apply the commit, and the
+        // outermost cut would then residualize the operator and apply it
+        // again. Propagate so the outermost entry residualizes once.
+        if !rewind_outermost {
+            return match descent {
+                Err(err) => Err(err),
+                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
+            };
+        }
+        // A declined inlined callee may have latched a blackhole image and
+        // claimed the abort coordinate. This recovery continues the walk, so
+        // neither the image nor the claim may answer for a later abort
+        // (`abort_blackhole_latched`, `claim_abort_coordinate`).
+        discard_staged_abort(ctx.session);
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -18212,6 +18230,12 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let Some(inlined) = (match descent {
         Ok(inlined) => inlined,
         Err(err) => {
+            // `list_append_resume_declines`: a staged complete image is
+            // `SwitchToBlackhole`; residualizing the dunder would apply the
+            // executed body a second time.
+            if abort_blackhole_latched() {
+                return Err(err);
+            }
             fbw_effect_journal_rollback_since(journal_mark);
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
@@ -18454,6 +18478,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
+    let rewind_outermost = rewind_guard.is_outermost();
     let refused_a_commit = rewind_guard.refused();
     drop(rewind_guard);
     if refused_a_commit {
@@ -18462,6 +18487,13 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
+        if !rewind_outermost {
+            return match descent {
+                Err(err) => Err(err),
+                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
+            };
+        }
+        discard_staged_abort(ctx.session);
         return Ok(None);
     }
     let Some(inlined) = descent? else {
