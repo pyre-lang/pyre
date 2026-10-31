@@ -18986,6 +18986,31 @@ fn splice_success_keeps_the_staged_image() {
     reset_single_frame_blackhole();
 }
 
+/// A nested rewind refuse stays on the outermost entry: residualizing the
+/// inner BINARY_OP would apply the commit, and the outer cut would apply it
+/// again. Only the outermost `refused()` consumes the flag.
+#[test]
+fn nested_binop_rewind_refuse_stays_on_the_outermost_entry() {
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let outer = BinopRewindInlineGuard::enter(&session, 0);
+    let inner = BinopRewindInlineGuard::enter(&session, 1);
+    assert!(outer.is_outermost());
+    assert!(!inner.is_outermost());
+    session.borrow_mut().binop_rewind_refused = true;
+    assert!(inner.refused());
+    assert!(
+        session.borrow().binop_rewind_refused,
+        "nested refused() keeps the flag for the enclosing entry"
+    );
+    assert!(outer.refused());
+    assert!(
+        !session.borrow().binop_rewind_refused,
+        "outermost refused() consumes the flag"
+    );
+    drop(inner);
+    drop(outer);
+}
+
 #[test]
 fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     // codewriter shape contract says `R-list.len() <=

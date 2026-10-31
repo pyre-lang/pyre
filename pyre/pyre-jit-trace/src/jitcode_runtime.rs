@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, LazyLock, Once, OnceLock};
 
-use majit_ir::DescrRef;
+use majit_ir::{CallDescr, Descr, DescrRef, ExtraEffect, JitCodeDescr};
 use majit_jitcode::artifacts::CompiledJitDriver;
 use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
@@ -3351,58 +3351,470 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
 /// Instruction starts the blackhole can dispatch from `pc` on: the
 /// fallthrough of every instruction that does not end its block, plus every
 /// `L` label operand (`blackhole.py` `bhimpl_goto*` return the label or the
-/// next position). `None` when a reached instruction cannot be decoded or
-/// branches through a descr (`switch/id`), so the caller reads the whole body.
+/// next position). `catch_exception` `L` is followed like any other label.
+/// `None` when a reached instruction cannot be decoded or branches through a
+/// descr (`switch/id`), so the caller reads the whole body.
 pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
+    reachable_starts_from_catch(code, pc, |_, _| true)
+}
+
+/// [`reachable_starts_from`] with a catch-handler policy.
+///
+/// `bhimpl_catch_exception` is a no-op on `run()`; `handle_exception_in_frame`
+/// takes the `L` target. `follow_catch(catch_pc, &seen)` is asked after the
+/// `run()` successors from `pc` have been recorded, and again each time a
+/// newly followed handler reaches another catch. Existing callers pass
+/// `|_, _| true` so every `L` is still followed.
+pub fn reachable_starts_from_catch(
+    code: &[u8],
+    pc: usize,
+    follow_catch: impl Fn(usize, &std::collections::BTreeSet<usize>) -> bool,
+) -> Option<Vec<usize>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut work = vec![pc];
-    while let Some(pc) = work.pop() {
-        if pc >= code.len() || !seen.insert(pc) {
-            continue;
-        }
-        let op = decode_op_at(code, pc)?;
-        if op.opname == "switch" {
-            return None;
-        }
-        let mut cursor = pc + 1;
-        if op.opname != "live" {
-            let mut chars = op.argcodes.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    'L' => {
-                        let _ =
-                            *code.get(cursor + majit_jitcode::jitcode::LABEL_OPERAND_SIZE - 1)?;
-                        work.push(majit_jitcode::jitcode::read_label_at(code, cursor));
-                        cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
+    let mut catch_handlers = Vec::new();
+    loop {
+        while let Some(pc) = work.pop() {
+            if pc >= code.len() || !seen.insert(pc) {
+                continue;
+            }
+            let op = decode_op_at(code, pc)?;
+            if op.opname == "switch" {
+                return None;
+            }
+            let mut cursor = pc + 1;
+            if op.opname != "live" {
+                let mut chars = op.argcodes.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        'L' => {
+                            let _ = *code
+                                .get(cursor + majit_jitcode::jitcode::LABEL_OPERAND_SIZE - 1)?;
+                            let target = majit_jitcode::jitcode::read_label_at(code, cursor);
+                            cursor += majit_jitcode::jitcode::LABEL_OPERAND_SIZE;
+                            if op.opname == "catch_exception" {
+                                catch_handlers.push((pc, target));
+                            } else {
+                                work.push(target);
+                            }
+                        }
+                        'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'd' | 'j' => cursor += 2,
+                        'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
+                        '>' => {
+                            chars.next();
+                            cursor += 1;
+                        }
+                        _ => break,
                     }
-                    'i' | 'c' | 'r' | 'f' => cursor += 1,
-                    'd' | 'j' => cursor += 2,
-                    'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
-                    '>' => {
-                        chars.next();
-                        cursor += 1;
-                    }
-                    _ => break,
                 }
             }
+            let ends_block = matches!(
+                op.opname,
+                "goto"
+                    | "int_return"
+                    | "ref_return"
+                    | "float_return"
+                    | "void_return"
+                    | "raise"
+                    | "reraise"
+                    | "abort"
+                    | "abort_permanent"
+            );
+            if !ends_block {
+                work.push(op.next_pc);
+            }
         }
-        let ends_block = matches!(
-            op.opname,
-            "goto"
-                | "int_return"
-                | "ref_return"
-                | "float_return"
-                | "void_return"
-                | "raise"
-                | "reraise"
-                | "abort"
-                | "abort_permanent"
-        );
-        if !ends_block {
-            work.push(op.next_pc);
+        let mut added = false;
+        for &(catch_pc, handler) in &catch_handlers {
+            if handler >= code.len() || seen.contains(&handler) {
+                continue;
+            }
+            if follow_catch(catch_pc, &seen) {
+                work.push(handler);
+                added = true;
+            }
+        }
+        if !added {
+            break;
         }
     }
     Some(seen.into_iter().collect())
+}
+
+/// Instruction starts `BlackholeInterpreter.run` can dispatch from `pc`.
+///
+/// A `catch_exception` handler is followed when a reachable instruction in
+/// this frame is that catch's predecessor (`handle_exception_in_frame` skips
+/// a leading `live`). When `in_flight_callee_may_raise`, `_run_forever` /
+/// `_resume_mainloop` can also deliver the callee's exception to the catch
+/// sitting at this resume pc, so that landing handler is followed too.
+pub fn blackhole_resume_reachable_starts(
+    code: &[u8],
+    pc: usize,
+    in_flight_callee_may_raise: bool,
+) -> Option<Vec<usize>> {
+    reachable_starts_from_catch(code, pc, |catch_pc, seen| {
+        catch_predecessor_is_reachable(code, catch_pc, seen)
+            || (in_flight_callee_may_raise && catch_at_landing_pc(code, pc, catch_pc))
+    })
+}
+
+/// `handle_exception_in_frame` skips a leading `live` and then reads
+/// `catch_exception`. The raising instruction is the CALL (or `raise`) in
+/// front of that pair, not the `live` itself.
+pub(crate) fn catch_predecessor_is_reachable(
+    code: &[u8],
+    catch_pc: usize,
+    seen: &std::collections::BTreeSet<usize>,
+) -> bool {
+    for &pc in seen {
+        if pc == catch_pc {
+            continue;
+        }
+        let Some(op) = decode_op_at(code, pc) else {
+            continue;
+        };
+        if op.opname == "live" || op.opname == "catch_exception" {
+            continue;
+        }
+        let mut landing = op.next_pc;
+        while let Some(next) = decode_op_at(code, landing) {
+            if next.opname != "live" {
+                break;
+            }
+            landing = next.next_pc;
+        }
+        if landing == catch_pc {
+            return true;
+        }
+    }
+    false
+}
+
+/// Pc of the `catch_exception` `handle_exception_in_frame` would read after
+/// skipping leading `live`s from `resume_pc`.
+pub(crate) fn landing_catch_pc(code: &[u8], resume_pc: usize) -> Option<usize> {
+    let mut landing = resume_pc;
+    while let Some(op) = decode_op_at(code, landing) {
+        if op.opname != "live" {
+            return (op.opname == "catch_exception").then_some(landing);
+        }
+        landing = op.next_pc;
+    }
+    None
+}
+
+pub(crate) fn catch_at_landing_pc(code: &[u8], resume_pc: usize, catch_pc: usize) -> bool {
+    landing_catch_pc(code, resume_pc) == Some(catch_pc)
+}
+
+/// Opnames whose `bhimpl_*` body cannot raise in `BlackholeInterpreter`.
+/// Built from those bodies in `blackhole.py`; any other name is may-raise
+/// (`bhimpl_raise`, `bhimpl_reraise`, `bhimpl_int_*_jump_if_ovf`,
+/// `*_guard_value`, `abort*`). Call ops (`residual_call_*`, `inline_call_*`,
+/// `conditional_call*`) are classified by [`blackhole_decoded_op_cannot_raise`]
+/// from the descr's EffectInfo (`call.py CallControl.getcalldescr`,
+/// `effectinfo.py EffectInfo.check_can_raise`), not from this list.
+pub(crate) fn blackhole_op_cannot_raise(opname: &str) -> bool {
+    matches!(
+        opname,
+        "live"
+            | "catch_exception"
+            | "goto"
+            | "goto_if_not"
+            | "goto_if_not_int_lt"
+            | "goto_if_not_int_le"
+            | "goto_if_not_int_eq"
+            | "goto_if_not_int_ne"
+            | "goto_if_not_int_gt"
+            | "goto_if_not_int_ge"
+            | "goto_if_not_int_is_zero"
+            | "goto_if_not_ptr_eq"
+            | "goto_if_not_ptr_ne"
+            | "goto_if_not_ptr_iszero"
+            | "goto_if_not_ptr_nonzero"
+            | "goto_if_not_float_lt"
+            | "goto_if_not_float_le"
+            | "goto_if_not_float_eq"
+            | "goto_if_not_float_ne"
+            | "goto_if_not_float_gt"
+            | "goto_if_not_float_ge"
+            | "int_return"
+            | "ref_return"
+            | "float_return"
+            | "void_return"
+            | "int_copy"
+            | "ref_copy"
+            | "float_copy"
+            | "int_push"
+            | "ref_push"
+            | "float_push"
+            | "int_pop"
+            | "ref_pop"
+            | "float_pop"
+            | "int_same_as"
+            | "int_add"
+            | "int_sub"
+            | "int_mul"
+            | "uint_mul_high"
+            | "int_and"
+            | "int_or"
+            | "int_xor"
+            | "int_neg"
+            | "int_invert"
+            | "int_lt"
+            | "int_le"
+            | "int_eq"
+            | "int_ne"
+            | "int_gt"
+            | "int_ge"
+            | "int_is_zero"
+            | "int_is_true"
+            | "int_between"
+            | "int_force_ge_zero"
+            | "uint_lt"
+            | "uint_le"
+            | "uint_gt"
+            | "uint_ge"
+            | "ptr_eq"
+            | "ptr_ne"
+            | "ptr_iszero"
+            | "ptr_nonzero"
+            | "instance_ptr_eq"
+            | "instance_ptr_ne"
+            | "record_exact_class"
+            | "record_known_result_i_ir_v"
+            | "record_known_result_r_ir_v"
+            | "record_exact_value_r"
+            | "record_exact_value_i"
+            | "jit_debug"
+            | "jit_enter_portal_frame"
+            | "jit_leave_portal_frame"
+            | "int_assert_green"
+            | "ref_assert_green"
+            | "float_assert_green"
+            | "current_trace_length"
+            | "int_isconstant"
+            | "float_isconstant"
+            | "ref_isconstant"
+            | "ref_isvirtual"
+            | "loop_header"
+            | "virtual_ref"
+            | "virtual_ref_finish"
+            | "float_neg"
+            | "float_abs"
+            | "float_add"
+            | "float_sub"
+            | "float_mul"
+            | "float_truediv"
+            | "float_lt"
+            | "float_le"
+            | "float_eq"
+            | "float_ne"
+            | "float_gt"
+            | "float_ge"
+            | "cast_int_to_float"
+            | "convert_float_bytes_to_longlong"
+            | "convert_longlong_bytes_to_float"
+    )
+}
+
+/// Ops whose `bhimpl_*` actually performs a call (`blackhole.py`
+/// `bhimpl_residual_call_*` / `bhimpl_inline_call_*` /
+/// `bhimpl_conditional_call*` / `bhimpl_call_assembler_*`).
+pub(crate) fn blackhole_op_is_call(opname: &str) -> bool {
+    opname.starts_with("residual_call")
+        || opname.starts_with("inline_call")
+        || opname.starts_with("conditional_call")
+        || opname.starts_with("cond_call")
+        || opname.starts_with("recursive_call")
+        || opname.starts_with("call_assembler")
+}
+
+/// First `d`/`j` operand (`blackhole.py` argcodes). Call ops carry the
+/// calldescr or callee JitCode there.
+pub(crate) fn decoded_op_descr_index(code: &[u8], op: &DecodedOp) -> Option<u16> {
+    let mut cursor = op.pc + 1;
+    let mut chars = op.argcodes.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'L' => cursor += 2,
+            'd' | 'j' => {
+                let lo = *code.get(cursor)?;
+                let hi = *code.get(cursor + 1)?;
+                return Some(u16::from_le_bytes([lo, hi]));
+            }
+            'I' | 'R' | 'F' => {
+                let list_len = *code.get(cursor)? as usize;
+                cursor += 1 + list_len;
+            }
+            '>' => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `effectinfo.py EffectInfo.check_can_raise(False)`: `extraeffect >
+/// EF_CANNOT_RAISE`. Missing info is may-raise.
+pub(crate) fn extraeffect_cannot_raise(extraeffect: Option<ExtraEffect>) -> bool {
+    extraeffect.is_some_and(|ee| ee <= ExtraEffect::CannotRaise)
+}
+
+fn extraeffect_from_bh(bh: &BhDescr) -> Option<ExtraEffect> {
+    match bh {
+        BhDescr::Call { calldescr } => Some(calldescr.extra_info.extraeffect),
+        BhDescr::JitCode {
+            calldescr,
+            jitcode_index,
+            ..
+        } => Some(
+            get_runtime_jitcode_by_index(*jitcode_index)
+                .map(|callee| callee.calldescr().extra_info.extraeffect)
+                .unwrap_or(calldescr.extra_info.extraeffect),
+        ),
+        _ => None,
+    }
+}
+
+/// Extraeffect on a call op's descr.
+///
+/// Residual: `d` calldescr (`call.py CallControl.getcalldescr`, the
+/// walker-side `descr_ref_table` / `as_call_descr` / `get_extra_info`
+/// accessor). Inline: target `JitCode.calldescr` (`call.py
+/// get_jitcode_calldescr` / `JitCode.calldescr`). Missing descr or
+/// EffectInfo → `None` (may-raise).
+pub(crate) fn call_op_extraeffect(
+    code: &[u8],
+    op: &DecodedOp,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
+) -> Option<ExtraEffect> {
+    if !blackhole_op_is_call(op.opname) {
+        return None;
+    }
+    let idx = decoded_op_descr_index(code, op)? as usize;
+    if let Some(descr) = descr_ref_table().at(idx) {
+        if let Some(call) = descr.as_call_descr() {
+            return Some(call.get_extra_info().extraeffect);
+        }
+        if let Some(jc) = descr.as_jitcode_descr() {
+            if let Some(callee) = get_runtime_jitcode_by_index(jc.jitcode_index()) {
+                return Some(callee.calldescr().extra_info.extraeffect);
+            }
+        }
+    }
+    if let Some(frame_jc) = jitcode {
+        if let Some(descr) = frame_jc.descr_at(idx) {
+            if let Some(call) = descr.as_call() {
+                return Some(
+                    majit_metainterp::effect_info_for_slot(call.effect_info_slot).extraeffect,
+                );
+            }
+            if let Some(callee) = descr.as_jitcode_exec() {
+                return Some(callee.calldescr().extra_info.extraeffect);
+            }
+            if let Some(ee) = descr.as_bh_descr().and_then(extraeffect_from_bh) {
+                return Some(ee);
+            }
+            if let Some(opt) = descr.as_optimizer_descr() {
+                if let Some(call) = opt.as_call_descr() {
+                    return Some(call.get_extra_info().extraeffect);
+                }
+            }
+        }
+    }
+    get_descr_by_index(idx).and_then(extraeffect_from_bh)
+}
+
+fn call_op_callee_name(
+    code: &[u8],
+    op: &DecodedOp,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
+) -> Option<String> {
+    let idx = decoded_op_descr_index(code, op)? as usize;
+    if let Some(descr) = descr_ref_table().at(idx) {
+        if let Some(jc) = descr.as_jitcode_descr() {
+            if let Some(callee) = get_jitcode_by_index(jc.jitcode_index()) {
+                return Some(callee.name.clone());
+            }
+        }
+    }
+    if let Some(frame_jc) = jitcode {
+        if let Some(descr) = frame_jc.descr_at(idx) {
+            if let Some(callee) = descr.as_jitcode_exec() {
+                return Some(callee.name().to_string());
+            }
+        }
+    }
+    match get_descr_by_index(idx) {
+        Some(BhDescr::JitCode { jitcode_index, .. }) => {
+            get_jitcode_by_index(*jitcode_index).map(|callee| callee.name.clone())
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn call_op_effect_debug(
+    code: &[u8],
+    op: &DecodedOp,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
+) -> String {
+    let d = decoded_op_descr_index(code, op);
+    let ee = call_op_extraeffect(code, op, jitcode);
+    let callee = call_op_callee_name(code, op, jitcode);
+    format!("d={d:?} extraeffect={ee:?} callee={callee:?}")
+}
+
+/// Call ops may raise unless the descr EffectInfo says they cannot
+/// (`effectinfo.py EffectInfo.check_can_raise(False)`). Other ops use
+/// [`blackhole_op_cannot_raise`].
+pub(crate) fn blackhole_decoded_op_cannot_raise(
+    code: &[u8],
+    op: &DecodedOp,
+    jitcode: Option<&majit_metainterp::jitcode::JitCode>,
+) -> bool {
+    if blackhole_op_is_call(op.opname) {
+        extraeffect_cannot_raise(call_op_extraeffect(code, op, jitcode))
+    } else {
+        blackhole_op_cannot_raise(op.opname)
+    }
+}
+
+/// Remaining-body first raising opname from `pc`, with injected call
+/// extraeffect. Production uses [`blackhole_decoded_op_cannot_raise`].
+#[cfg(test)]
+pub(crate) fn blackhole_first_raising_opname_in(
+    code: &[u8],
+    pc: usize,
+    in_flight_callee_may_raise: bool,
+    call_extraeffect: impl Fn(&DecodedOp) -> Option<ExtraEffect>,
+) -> Option<&'static str> {
+    if in_flight_callee_may_raise && landing_catch_pc(code, pc).is_none() {
+        return Some("<uncaught-callee>");
+    }
+    match blackhole_resume_reachable_starts(code, pc, in_flight_callee_may_raise) {
+        None => Some("<switch-or-undecodable>"),
+        Some(starts) => {
+            for &start in &starts {
+                match decode_op_at(code, start) {
+                    None => return Some("<undecodable>"),
+                    Some(op) => {
+                        let cannot = if blackhole_op_is_call(op.opname) {
+                            extraeffect_cannot_raise(call_extraeffect(&op))
+                        } else {
+                            blackhole_op_cannot_raise(op.opname)
+                        };
+                        if !cannot {
+                            return Some(op.opname);
+                        }
+                    }
+                }
+            }
+            None
+        }
+    }
 }
 
 fn split_key(key: &str) -> (&str, &str) {
@@ -4898,6 +5310,112 @@ mod tests {
         ];
         assert_eq!(reachable_starts_from(&code, 0), Some(vec![0, 8, 13, 15]));
         assert_eq!(reachable_starts_from(&code, 4), Some(vec![4, 8, 13, 15]));
+    }
+
+    fn catch_scan_fixture() -> Vec<u8> {
+        let byte = |key: &str| {
+            *insns_opname_to_byte()
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be in insns table"))
+        };
+        // 0: raise (unreachable from 11)
+        // 2: live / 5: catch L=22 / 9: void_return
+        // 11: live (resume) / 14: catch L=22 / 18: void_return
+        // 22: int_add (handler)
+        vec![
+            byte("raise/r"),
+            0,
+            byte("live/"),
+            0,
+            0,
+            byte("catch_exception/L"),
+            22,
+            0,
+            0,
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("live/"),
+            0,
+            0,
+            byte("catch_exception/L"),
+            22,
+            0,
+            0,
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("int_add/ii>i"),
+            0,
+            0,
+            0,
+        ]
+    }
+
+    #[test]
+    fn reachable_starts_from_follows_every_catch_label() {
+        let code = catch_scan_fixture();
+        assert_eq!(reachable_starts_from(&code, 11), Some(vec![11, 14, 18, 22]),);
+    }
+
+    #[test]
+    fn blackhole_resume_innermost_does_not_follow_unreachable_catch() {
+        let code = catch_scan_fixture();
+        assert_eq!(
+            blackhole_resume_reachable_starts(&code, 11, false),
+            Some(vec![11, 14, 18]),
+        );
+    }
+
+    #[test]
+    fn blackhole_resume_non_innermost_follows_landing_catch_when_callee_may_raise() {
+        let code = catch_scan_fixture();
+        assert_eq!(
+            blackhole_resume_reachable_starts(&code, 11, true),
+            Some(vec![11, 14, 18, 22]),
+        );
+    }
+
+    #[test]
+    fn blackhole_resume_non_innermost_skips_landing_catch_when_callee_cannot_raise() {
+        let code = catch_scan_fixture();
+        assert_eq!(
+            blackhole_resume_reachable_starts(&code, 11, false),
+            Some(vec![11, 14, 18]),
+        );
+    }
+
+    #[test]
+    fn blackhole_resume_non_innermost_skips_landing_catch_when_callee_call_cannot_raise() {
+        let byte = |key: &str| {
+            *insns_opname_to_byte()
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be in insns table"))
+        };
+        // Callee remaining body: a residual_call whose descr is
+        // EF_CANNOT_RAISE (`effectinfo.py EffectInfo.check_can_raise`),
+        // then void_return.
+        let callee = [
+            byte("residual_call_r_v/iRd"),
+            0,
+            0,
+            1,
+            0,
+            byte("void_return/"),
+        ];
+        let callee_may_raise = blackhole_first_raising_opname_in(&callee, 0, false, |_| {
+            Some(ExtraEffect::CannotRaise)
+        })
+        .is_some();
+        assert!(
+            !callee_may_raise,
+            "a call whose descr is EF_CANNOT_RAISE must not be treated as may-raise"
+        );
+        let parent = catch_scan_fixture();
+        assert_eq!(
+            blackhole_resume_reachable_starts(&parent, 11, callee_may_raise),
+            Some(vec![11, 14, 18]),
+        );
     }
 
     #[test]

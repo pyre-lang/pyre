@@ -7949,6 +7949,12 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
+        // `SwitchToBlackhole` unwinds. A deeper helper already staged its
+        // MIFrame; rolling this CALL back to the ordinary residual would
+        // apply the executed body a second time.
+        Err(error) if abort_blackhole_latched() && error.leaves_complete_image() => {
+            return Err(error);
+        }
         // `try_execute_residual_call_via_executor_inner` declines an un-lowered
         // in-body helper (a tagged symbolic fnaddr) while inlining a
         // sub-jitcode, so the descent aborts instead of baking the hash as a
@@ -8474,6 +8480,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
+        Err(error) if abort_blackhole_latched() && error.leaves_complete_image() => {
+            return Err(error);
+        }
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
             cut_declined_subwalk(ctx, rewind.pre_fold_pos);
             return Ok(None);
@@ -18248,6 +18257,9 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
+    let rewind_outermost = rewind_guard
+        .as_ref()
+        .is_some_and(BinopRewindInlineGuard::is_outermost);
     let refused_a_commit = rewind_guard.as_ref().is_some_and(|guard| guard.refused());
     drop(rewind_guard);
     if refused_a_commit {
@@ -18256,6 +18268,21 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
+        // A nested refuse belongs to the enclosing rewind region.
+        // Residualizing this BINARY_OP would apply the commit, and the
+        // outermost cut would then residualize the operator and apply it
+        // again. Propagate so the outermost entry residualizes once.
+        if !rewind_outermost {
+            return match descent {
+                Err(err) => Err(err),
+                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
+            };
+        }
+        // A declined inlined callee may have latched a blackhole image and
+        // claimed the abort coordinate. This recovery continues the walk, so
+        // neither the image nor the claim may answer for a later abort
+        // (`abort_blackhole_latched`, `claim_abort_coordinate`).
+        discard_staged_abort(ctx.session);
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -18264,6 +18291,12 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let Some(inlined) = (match descent {
         Ok(inlined) => inlined,
         Err(err) => {
+            // `list_append_resume_declines`: a staged complete image is
+            // `SwitchToBlackhole`; residualizing the dunder would apply the
+            // executed body a second time.
+            if abort_blackhole_latched() {
+                return Err(err);
+            }
             fbw_effect_journal_rollback_since(journal_mark);
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
@@ -18506,6 +18539,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         Err(error @ DispatchError::TraceTooLong { .. }) => return Err(error),
         other => other,
     };
+    let rewind_outermost = rewind_guard.is_outermost();
     let refused_a_commit = rewind_guard.refused();
     drop(rewind_guard);
     if refused_a_commit {
@@ -18514,6 +18548,13 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
+        if !rewind_outermost {
+            return match descent {
+                Err(err) => Err(err),
+                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
+            };
+        }
+        discard_staged_abort(ctx.session);
         return Ok(None);
     }
     let Some(inlined) = descent? else {
@@ -19341,6 +19382,12 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
             | DispatchError::GuardResumeCoordinateUnavailable { .. }),
         ) => {
+            // `SwitchToBlackhole` unwinds `_interpret`. A deeper helper
+            // already staged its MIFrame; cutting and residualizing this
+            // CALL would apply the executed residual a second time.
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             // A walk that already applied an effect cannot be handed to the
             // residual call, which would apply it again.  Journaled stores
             // are undone by the cut and do not block.  The abort
@@ -20285,6 +20332,17 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         .expect("SubWalkSuspended without a pending callee frame");
                     self.push_frame(child);
                 }
+                // `SwitchToBlackhole` unwinds `_interpret` without any frame
+                // on the way out re-running its CALL. A deeper helper already
+                // staged the abort image; replaying this CALL would apply the
+                // residual a second time.
+                Err(error) if abort_blackhole_latched() => {
+                    self.exchange.completed.clear();
+                    while !self.frames.is_empty() {
+                        let _ = self.pop_frame();
+                    }
+                    return Err(error);
+                }
                 result => {
                     self.exchange.completed.clear();
                     let frame = self.pop_frame();
@@ -20544,12 +20602,13 @@ fn splice_ancestor_helper_slice<Sym: WalkSym>(
         ) else {
             return false;
         };
-        // Same capability `multi_frame_blackhole_preflight` asks of the
-        // levels it saw; a refusal fails the splice.
-        if super::residual_call::codeless_level_may_stop_blackhole(&miframe) {
-            return false;
-        }
         helpers.push(miframe);
+    }
+    // Same capability `multi_frame_blackhole_preflight` asks of the
+    // levels it saw; a refusal fails the splice. Innermost-first so a
+    // parent follows its landing catch only when the child may raise.
+    if super::residual_call::spliced_helpers_may_stop_blackhole(&helpers) {
+        return false;
     }
     splice_helper_frames_before_innermost(helpers)
 }

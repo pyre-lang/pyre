@@ -3820,6 +3820,12 @@ impl<'s> BinopRewindInlineGuard<'s> {
         Self { session, outermost }
     }
 
+    /// The entry that raised the region residualizes the operator; a nested
+    /// one must unwind to it so the commit is not applied twice.
+    pub(crate) fn is_outermost(&self) -> bool {
+        self.outermost
+    }
+
     /// Whether a commit was refused while this guard was in force.
     ///
     /// A guard nested inside another region does NOT clear the flag: the
