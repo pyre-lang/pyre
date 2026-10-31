@@ -4031,11 +4031,6 @@ impl Backend for DynasmBackend {
             });
         }
         let descr_arc = descr.to_arc();
-        let exit_layout = Some(crate::guard::layout_for_fail_descr(
-            &descr_arc,
-            descr_fd.fail_index_per_trace(),
-            descr_fd.trace_id(),
-        ));
 
         // grab_exc_value (llmodel.py): read jf_guard_exc off the deadframe
         // tip before the libc jitframe chain is freed (same as execute_token).
@@ -4051,7 +4046,7 @@ impl Backend for DynasmBackend {
         majit_backend::RawExecResult {
             outputs,
             typed_outputs,
-            exit_layout,
+            exit_layout: None,
             savedata: (!savedata.is_null()).then_some(savedata),
             exception_value,
             fail_index: descr_fd.fail_index_per_trace(),

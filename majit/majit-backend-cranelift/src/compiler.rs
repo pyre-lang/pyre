@@ -22986,7 +22986,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 let descr: &dyn FailDescr = descr_arc
                     .as_fail_descr()
                     .expect("get_latest_descr_arc returned a non-FailDescr Descr");
-                let exit_layout = self.describe_deadframe(&frame);
                 let savedata = self.get_savedata_ref(&frame);
                 let exception_value = self.grab_exc_value(&frame);
                 let exit_arity = descr.fail_arg_types().len();
@@ -23020,7 +23019,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
-                    exit_layout,
+                    exit_layout: None,
                     savedata,
                     exception_value,
                     fail_index: descr.fail_index(),
@@ -23109,12 +23108,11 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
-                let fail_descr_ref: DescrRef = fail_descr.to_arc();
                 let trace_id = fail_descr_fd.trace_id();
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
-                    exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
+                    exit_layout: None,
                     savedata,
                     exception_value: exception,
                     fail_index,
@@ -23171,12 +23169,11 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
-            let fail_descr_ref: DescrRef = fail_descr.to_arc();
             let trace_id = fail_descr_fd.trace_id();
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
-                exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
+                exit_layout: None,
                 savedata,
                 exception_value: exception,
                 fail_index,
@@ -29620,6 +29617,17 @@ mod tests {
             "per-fail-descr recovery_layout is metainterp-owned"
         );
         assert_eq!(layout.fail_arg_types, vec![Type::Ref, Type::Int]);
+        let descr = layout
+            .descr
+            .as_ref()
+            .expect("compiled fail-descr layout carries the descr Arc");
+        assert_eq!(
+            descr
+                .as_fail_descr()
+                .expect("layout descr is a FailDescr")
+                .fail_arg_types(),
+            layout.fail_arg_types.as_slice()
+        );
     }
 
     #[test]
@@ -30397,13 +30405,13 @@ mod tests {
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
         assert!(!raw.exception_value.is_null());
         assert_eq!(unsafe { *(raw.exception_value.0 as *const i64) }, 0x1111);
-        let layout = raw
-            .exit_layout
-            .expect("raw exit should expose backend layout");
-        assert_eq!(layout.fail_index, 0);
-        assert_eq!(layout.source_op_index, Some(2));
-        // Per-fail-descr recovery_layout is metainterp-owned.
-        assert!(layout.recovery_layout.is_none());
+        assert!(raw.exit_layout.is_none());
+        let fd = raw
+            .descr_arc
+            .as_fail_descr()
+            .expect("raw exit carries a FailDescr");
+        assert_eq!(fd.fail_index(), 0);
+        assert_eq!(fd.source_op_index(), Some(2));
         assert!(!jit_exc_is_pending());
     }
 
@@ -33081,13 +33089,13 @@ mod tests {
         assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
         assert_eq!(raw.savedata, Some(GcRef(0xDADA)));
         assert_eq!(raw.exception_value, GcRef::NULL);
-        let layout = raw
-            .exit_layout
-            .expect("raw exit should expose backend layout");
-        assert_eq!(layout.fail_index, 0);
-        assert_eq!(layout.source_op_index, Some(3));
-        // Per-fail-descr recovery_layout is metainterp-owned.
-        assert!(layout.recovery_layout.is_none());
+        assert!(raw.exit_layout.is_none());
+        let fd = raw
+            .descr_arc
+            .as_fail_descr()
+            .expect("raw exit carries a FailDescr");
+        assert_eq!(fd.fail_index(), 0);
+        assert_eq!(fd.source_op_index(), Some(3));
         assert_eq!(*may_force_void_values().lock(), vec![0, 1, 10]);
     }
 

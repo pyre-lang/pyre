@@ -198,7 +198,10 @@ pub struct RawExecResult {
     pub outputs: Vec<i64>,
     /// Typed output values decoded from the exit slots.
     pub typed_outputs: Vec<Value>,
-    /// Backend-origin static metadata for this exit, when available.
+    /// Execute leaves this empty: slot types are `descr.fail_arg_types()`
+    /// (`llmodel.py get_int_value` / `get_ref_value` / `get_float_value`).
+    /// Inspection APIs (`compiled_fail_descr_layouts`) still fill a
+    /// `FailDescrLayout`.
     pub exit_layout: Option<FailDescrLayout>,
     /// Output slots that carry opaque force tokens instead of GC refs.
     /// Optional saved-data GC ref captured by this exit.
@@ -3748,7 +3751,6 @@ pub trait Backend: Send {
         let descr: &dyn FailDescr = descr_arc
             .as_fail_descr()
             .expect("get_latest_descr_arc must return a FailDescr");
-        let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
         let guard_value_operand =
@@ -3782,7 +3784,7 @@ pub trait Backend: Send {
         RawExecResult {
             outputs,
             typed_outputs,
-            exit_layout,
+            exit_layout: None,
             savedata,
             exception_value,
             fail_index: descr.fail_index(),

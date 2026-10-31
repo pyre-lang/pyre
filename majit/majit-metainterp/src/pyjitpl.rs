@@ -12770,8 +12770,10 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Typed-input raw fast-path runner.  Avoids explicit deadframe decoding
-    /// in the caller while preserving typed exits, backend exit layout,
-    /// savedata, and exception state.
+    /// in the caller while preserving typed exits, savedata, and exception
+    /// state. The exit layout is `exit_layout_for_descr` on the descr the
+    /// deadframe named (`compile.py ResumeGuardDescr.get_resumestorage`
+    /// returns self).
     pub fn run_compiled_raw_detailed_with_values(
         &mut self,
         green_key: u64,
@@ -12794,33 +12796,9 @@ impl<M: Clone> MetaInterp<M> {
         let trace_id = result.trace_id;
 
         // `compile.py AbstractResumeGuardDescr.handle_fail` reads `self`.
-        // A backend `FailDescrLayout` still supplies slot types when present;
-        // resume storage is always the descr (`ResumeGuardDescr.get_resumestorage`).
-        let exit_layout = result
-            .exit_layout
-            .clone()
-            .map(|layout| {
-                let fd = result.descr_arc.as_fail_descr();
-                let exit_types = ExitTypes::from_vec(if layout.fail_arg_types.is_empty() {
-                    fd.map(|fd| fd.fail_arg_types().to_vec())
-                        .unwrap_or_default()
-                } else {
-                    layout.fail_arg_types
-                });
-                CompiledExitLayout {
-                    rd_loop_token: green_key, // compile.py record_loop_or_bridge
-                    trace_id,
-                    fail_index: layout.fail_index,
-                    source_op_index: layout
-                        .source_op_index
-                        .or_else(|| fd.and_then(|fd| fd.source_op_index())),
-                    exit_types,
-                    is_finish: layout.is_finish,
-                    is_exception_exit: layout.is_exception_exit,
-                    storage: crate::resume::get_resumestorage(&result.descr_arc),
-                }
-            })
-            .unwrap_or_else(|| compile::exit_layout_for_descr(&result.descr_arc));
+        // Slot types are `descr.fail_arg_types()`; resume storage is the
+        // descr (`ResumeGuardDescr.get_resumestorage`).
+        let exit_layout = compile::exit_layout_for_descr(&result.descr_arc);
         let effective_is_finish = result.is_finish || exit_layout.is_finish;
         if crate::majit_log_enabled() {
             eprintln!(
