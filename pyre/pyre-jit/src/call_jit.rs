@@ -2318,8 +2318,7 @@ fn jit_blackhole_resume_from_guard(
     // `fail_arg_types` for the deadframe slot types
     // (`ResumeDeadframeRoots`). Both come off the one descr so the
     // storage and the types cannot describe different deadframes.
-    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
-    if let Some(storage) = exit_layout.storage.clone() {
+    if let Some(storage) = majit_metainterp::resume::get_resumestorage(&descr_arc) {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
@@ -4005,27 +4004,6 @@ fn bridge_bail_stage() -> u32 {
     })
 }
 
-/// Frontend compiled-loop metadata for the loop a failing guard belongs to.
-///
-/// `pyjitpl.py handle_guard_failure` / `compile.py _trace_and_compile_from_bridge`
-/// read `rd_loop_token.outermost_jitdriver_sd`. `get_compiled_meta` keys
-/// `compiled_loops` by leftover `active_jitdriver_sd`.
-pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
-    meta_interp: &majit_metainterp::MetaInterp<M>,
-    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    green_key: u64,
-) -> Option<std::sync::Arc<M>> {
-    let token = descr_arc
-        .as_fail_descr()
-        .and_then(majit_backend::descr_owning_jct)?;
-    let jd_no = token
-        .outermost_jitdriver_index
-        .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
-    meta_interp
-        .get_compiled_meta_on_driver(jd_no, green_key)
-        .cloned()
-}
-
 /// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -4082,7 +4060,6 @@ pub fn trace_and_compile_from_bridge(
     // (`resume.py consume_vref_and_vable_boxes`).
     frame: Option<&mut PyFrame>,
     raw_values: &[i64],
-    exit_layout: &majit_metainterp::CompiledExitLayout,
     // `cpu.grab_exc_value(deadframe)` (llmodel.py): the pending
     // exception this guard failure carries, or 0. Threaded so the bridge
     // tracer can decline a pending-exception resume at a non-exception
@@ -4166,15 +4143,10 @@ pub fn trace_and_compile_from_bridge(
     let mut bridge_frame_root = FrameRoot::new(frame);
 
     // pyjitpl.py handle_guard_failure / compile.py _trace_and_compile_from_bridge:
-    // frontend meta is the compiled_loops row on
-    // `rd_loop_token.outermost_jitdriver_sd`, not leftover `active_jitdriver_sd`.
-    // RPython then calls initialize_state_from_guard_failure(resumedescr, deadframe)
-    // which internally calls rebuild_from_resumedata (resume.py).
+    // `initialize_state_from_guard_failure(resumedescr, deadframe)` calls
+    // `rebuild_from_resumedata` (resume.py). Restore uses the live frame's
+    // jit state (`JitState::build_meta`).
     // This restores the complete frame stack INSIDE the bridge function.
-    let meta = {
-        let (driver, _) = crate::eval::driver_pair();
-        compiled_meta_for_bridge_source(driver.meta_interp(), descr_arc, green_key)
-    };
     let mut jit_state_local = build_jit_state(bridge_frame_root.frame(), &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
     // the guard fired inside a callee inlined into the trace, so the resume
@@ -4182,14 +4154,13 @@ pub fn trace_and_compile_from_bridge(
     // live (outer) frame `eval_loop_jit` runs. Such a resume cannot be
     // completed by interpreting the live frame forward — see the
     // blackhole routing at the handoff below.
-    let decoded_resume = meta.as_ref().and_then(|meta| {
-        crate::eval::decode_and_restore_guard_failure(
-            &mut jit_state_local,
-            meta,
-            raw_values,
-            exit_layout,
-        )
-    });
+    let decoded_resume = crate::eval::decode_and_restore_guard_failure(
+        &mut jit_state_local,
+        raw_values,
+        descr_arc
+            .as_fail_descr()
+            .expect("a bridge resume carries a FailDescr"),
+    );
     if bridge_bail_stage() == 2 {
         return BridgeResolution::ResumeBlackhole;
     }
@@ -5735,10 +5706,6 @@ fn jit_ca_handle_guard_failure(
         );
     }
 
-    // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
-    // descr's own; a bridge guard has no frontend record.
-    let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
-
     // compile.py try/finally: `start_compiling()` before
     // bridge, `done_compiling()` on every unwind path.  RAII guard
     // dispatches both via `descr.as_fail_descr()` (instance-method
@@ -5759,16 +5726,17 @@ fn jit_ca_handle_guard_failure(
         // The copy is not a JITFRAME: `jitframe_trace` cannot update it.
         // Root Ref slots for the same window `handle_fail` already covers
         // (`DeadFrameRefRoots` / `compute_gcmap`).
+        // Same `compute_gcmap` rule as `handle_fail`.
         let _deadframe_roots = unsafe {
             majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
                 if no_vinfo {
                     fail_types.get(index) == Some(&majit_ir::Type::Ref)
                 } else {
                     // Slot 0 is the virtualizable (PyFrame). It is a GC
-                    // object even when `exit_types` has not yet classified
+                    // object even when `fail_arg_types` has not yet classified
                     // it; a CA bridge walk that forces `f_locals` reads it
                     // as `live_vable_frame_addr`.
-                    index == 0 || exit_layout.is_traced_ref_slot(index)
+                    index == 0 || fail_types.get(index) == Some(&majit_ir::Type::Ref)
                 }
             })
         };
@@ -5776,7 +5744,6 @@ fn jit_ca_handle_guard_failure(
             &descr_arc,
             frame_root.as_mut().map(|root| root.frame()),
             &raw_values,
-            &exit_layout,
             _guard_exc_root.get(),
             false,
         )
@@ -5903,21 +5870,11 @@ fn try_compile_ca_bridge(
         return None;
     }
     let no_vinfo = guard_driver_has_no_vable(descr_arc);
-    // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
-    // descr's own; a bridge guard has no frontend record.
-    let exit_layout = majit_metainterp::exit_layout_for_descr(descr_arc);
     let guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(*guard_exc);
     let resolution = {
         let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
         if no_vinfo {
-            trace_and_compile_from_bridge(
-                descr_arc,
-                None,
-                raw_values,
-                &exit_layout,
-                guard_exc_root.get(),
-                false,
-            )
+            trace_and_compile_from_bridge(descr_arc, None, raw_values, guard_exc_root.get(), false)
         } else {
             let frame_ptr = raw_values.first().copied().unwrap_or(0) as *mut PyFrame;
             if frame_ptr.is_null() {
@@ -5929,7 +5886,6 @@ fn try_compile_ca_bridge(
                 descr_arc,
                 Some(frame),
                 raw_values,
-                &exit_layout,
                 guard_exc_root.get(),
                 false,
             )
@@ -6011,8 +5967,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
         FinishedException(i64),
         Deopt {
             descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
-            green_key: u64,
-            exit_layout: majit_metainterp::CompiledExitLayout,
             raw_values: Vec<i64>,
             guard_value_operand: Option<i64>,
             guard_exc: i64,
@@ -6051,10 +6005,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // the ExitFrameWithException arm does.
             Outcome::FinishedException(value)
         } else {
-            let green_key = majit_backend::descr_owning_jct(descr)
-                .map(|jct| jct.green_key())
-                .unwrap_or(0);
-            let exit_layout = majit_metainterp::exit_layout_for_descr(&descr_arc);
             // compile.py `AbstractResumeGuardDescr.must_compile` reads a
             // GUARD_VALUE's actual operand directly from the deadframe before
             // hashing `(descr, value)`.  It need not be one of the guard's
@@ -6081,8 +6031,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             let savedata = backend.get_savedata_ref(&frame);
             Outcome::Deopt {
                 descr_arc,
-                green_key,
-                exit_layout,
                 raw_values,
                 guard_value_operand,
                 guard_exc,
@@ -6105,8 +6053,6 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
         }
         Outcome::Deopt {
             descr_arc,
-            green_key,
-            exit_layout,
             mut raw_values,
             guard_value_operand,
             mut guard_exc,
@@ -6123,13 +6069,10 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 .as_fail_descr()
                 .map(|fd| fd.fail_arg_types().to_vec())
                 .unwrap_or_default();
+            // Same `compute_gcmap` rule as `handle_fail`.
             let _deadframe_roots = unsafe {
                 majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
-                    if no_vinfo {
-                        fail_types.get(index) == Some(&majit_ir::Type::Ref)
-                    } else {
-                        exit_layout.is_traced_ref_slot(index)
-                    }
+                    fail_types.get(index) == Some(&majit_ir::Type::Ref)
                 })
             };
             // compile.py ResumeGuardForcedDescr.handle_fail reads
@@ -6191,9 +6134,9 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             };
             let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
             guard_exc = _parked_guard_exc.get();
-            let bh = crate::eval::resume_in_blackhole_from_exit_layout(
+            let bh = crate::eval::resume_in_blackhole(
                 &mut raw_values,
-                &exit_layout,
+                &descr_arc,
                 guard_exc,
                 guard_driver_has_no_vable(&descr_arc),
                 savedata,

@@ -198,8 +198,6 @@ pub struct RawExecResult {
     pub outputs: Vec<i64>,
     /// Typed output values decoded from the exit slots.
     pub typed_outputs: Vec<Value>,
-    /// Backend-origin static metadata for this exit, when available.
-    pub exit_layout: Option<FailDescrLayout>,
     /// Output slots that carry opaque force tokens instead of GC refs.
     /// Optional saved-data GC ref captured by this exit.
     pub savedata: Option<GcRef>,
@@ -879,43 +877,6 @@ pub struct FailDescrLayout {
     pub descr: Option<majit_ir::DescrRef>,
 }
 
-/// Static layout metadata for a terminal exit within a compiled trace.
-///
-/// Unlike [`FailDescrLayout`], terminal exits are keyed by the trace op index
-/// rather than a backend fail descriptor, because `JUMP` exits do not
-/// necessarily correspond to a deadframe-producing guard site.
-#[derive(Debug, Clone)]
-pub struct TerminalExitLayout {
-    /// Trace op index of the terminal `FINISH`/`JUMP`.
-    pub op_index: usize,
-    /// Compiled trace identifier that owns this exit.
-    pub trace_id: u64,
-    /// Backend-owned metadata for the trace that owns this exit.
-    pub trace_info: Option<CompiledTraceInfo>,
-    /// Backend fail-index if this terminal exit is also a fail descriptor.
-    pub fail_index: u32,
-    /// Typed layout of the exit slots.
-    pub exit_types: Vec<Type>,
-    /// Whether this exit is a `FINISH` rather than a `JUMP`.
-    pub is_finish: bool,
-    /// `compile.py ExitFrameWithExceptionDescrRef` discriminator;
-    /// see `FailDescrLayout::is_exception_exit`.
-    pub is_exception_exit: bool,
-    /// Exit slot indices that hold rooted GC references.
-    /// Exit slot indices that carry opaque FORCE_TOKEN handles.
-    /// Optional backend-origin recovery layout for this terminal exit.
-    pub recovery_layout: Option<ExitRecoveryLayout>,
-    /// resume.py:450 — compact resume numbering (terminal exits rarely need
-    /// this, but propagate it for symmetry with `FailDescrLayout`).
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
-    pub rd_consts: Option<Vec<Const>>,
-    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
-    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
-    /// Deferred heap writes associated with this terminal exit.
-    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
-}
-
 /// Result of compiling a loop or bridge.
 #[derive(Debug)]
 pub struct AsmInfo {
@@ -1147,9 +1108,9 @@ impl CompiledLoopToken {
     /// `compile.py` `clt.loop_token_wref = wref` setter. Called
     /// immediately after the owning `Arc<JitCellToken>` becomes the
     /// stable identity (i.e., once `make_jitcell_token` has stamped its
-    /// generation and the token is the soon-to-be `compiled_loops[gk]`
-    /// entry's `.token` field). The weak ref ages out automatically when
-    /// memmgr drops the owning Arc. Also stamps `owning_green_key` from
+    /// generation and the token is attached on the cell). The weak ref
+    /// ages out automatically when memmgr drops the owning Arc. Also
+    /// stamps `owning_green_key` from
     /// the upgraded token so [`descr_owning_green_key`] can read it
     /// without locking.
     pub fn set_loop_token_wref(&self, wref: std::sync::Weak<JitCellToken>) {
@@ -1386,9 +1347,10 @@ pub struct JitCellToken {
     /// and bridge-link paths (`compiler.rs:2362/2468/2720/3998/4027`,
     /// `runner.rs:1281`) touch the target token without access to the
     /// trace ops, so this field caches the typed signature for them.
-    /// Front-end (tracer) code MUST NOT read this; use
-    /// `MetaInterp::front_target_inputarg_types` instead, which derives
-    /// types from the LABEL op + `TreeLoop.inputargs` per RPython.
+    /// Front-end (tracer) code MUST NOT read this. JUMP-arg types are
+    /// each box's `OpRef::ty()` (`history.py AbstractValue.type`);
+    /// `unroll.py optimize_bridge` / `jump_to_existing_trace` match the
+    /// JUMP against the target's virtual state.
     ///
     /// `OnceLock` because the backend's `compile_loop` writes it exactly
     /// once through `&JitCellToken` (the token may already have `Arc`
@@ -1460,7 +1422,7 @@ pub struct JitCellToken {
     /// (`history.py _keepalive_jitcell_tokens = {}` keyed on the
     /// token object itself, with `:457 record_jump_to` writing
     /// `self._keepalive_jitcell_tokens[target] = None`).  Pyre keeps the
-    /// same shape: an `Arc<JitCellToken>` set keyed on token number.
+    /// same shape: an `Arc<JitCellToken>` Vec keyed on object identity.
     ///
     /// Wrapped in `Mutex` so `record_jump_to` can push through
     /// `&JitCellToken` once the token has been shared via
@@ -2137,23 +2099,6 @@ pub struct LoopInvalidation {
     sites: Arc<parking_lot::Mutex<InvalidateSites>>,
 }
 
-/// How many loop invalidations this process has performed, over every
-/// backend and every driver.
-///
-/// One input of `MetaInterp::runnable_generation`: an invalidated token is
-/// one `get_procedure_token` stops returning, so a reader caching a
-/// runnable-or-not answer across calls has to learn of it. Invalidation
-/// funnels through [`LoopInvalidation::invalidate`], which is where the count
-/// moves, and it moves from whichever thread performs the invalidation, so it
-/// lives here as a process-wide atomic rather than on a driver.
-static TOKEN_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
-
-/// The current value of the process-wide invalidation count.
-#[inline]
-pub fn token_invalidation_generation() -> u64 {
-    TOKEN_INVALIDATIONS.load(Ordering::Acquire)
-}
-
 impl LoopInvalidation {
     /// quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
     /// followed by `cpu.invalidate_loop(looptoken)`.  Both happen here: the
@@ -2203,12 +2148,6 @@ impl LoopInvalidation {
             sites.positions.clear();
             break;
         }
-        // After the flags, not before: a reader that keys a cache on the
-        // generation pairs the value it read with the answer it computed, so
-        // the new value must not be observable while the flags still say the
-        // token is live. Read with acquire, this orders the flag stores ahead
-        // of any computation keyed on the new generation.
-        TOKEN_INVALIDATIONS.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -3552,7 +3491,6 @@ pub trait Backend: Send {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Whether a `BackendError::Unsupported` returned by `compile_bridge`
@@ -3808,7 +3746,6 @@ pub trait Backend: Send {
         let descr: &dyn FailDescr = descr_arc
             .as_fail_descr()
             .expect("get_latest_descr_arc must return a FailDescr");
-        let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
         let guard_value_operand =
@@ -3842,7 +3779,6 @@ pub trait Backend: Send {
         RawExecResult {
             outputs,
             typed_outputs,
-            exit_layout,
             savedata,
             exception_value,
             fail_index: descr.fail_index(),
@@ -3897,33 +3833,6 @@ pub trait Backend: Send {
         None
     }
 
-    /// Inspect static terminal-exit layouts for a compiled loop token.
-    fn compiled_terminal_exit_layouts(
-        &self,
-        _token: &JitCellToken,
-    ) -> Option<Vec<TerminalExitLayout>> {
-        None
-    }
-
-    /// Inspect static terminal-exit layouts for a bridge attached to a source guard.
-    fn compiled_bridge_terminal_exit_layouts(
-        &self,
-        _original_token: &JitCellToken,
-        _source_trace_id: u64,
-        _source_fail_index: u32,
-    ) -> Option<Vec<TerminalExitLayout>> {
-        None
-    }
-
-    /// Inspect static terminal-exit layouts for any compiled trace owned by this token.
-    fn compiled_trace_terminal_exit_layouts(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-    ) -> Option<Vec<TerminalExitLayout>> {
-        None
-    }
-
     /// Inspect static metadata for any compiled trace owned by this token.
     fn compiled_trace_info(
         &self,
@@ -3931,17 +3840,6 @@ pub trait Backend: Send {
         _trace_id: u64,
     ) -> Option<CompiledTraceInfo> {
         None
-    }
-
-    /// Patch backend-owned recovery metadata for a specific compiled terminal exit.
-    fn update_terminal_exit_recovery_layout(
-        &mut self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-        _op_index: usize,
-        _recovery_layout: ExitRecoveryLayout,
-    ) -> bool {
-        false
     }
 
     /// Describe the latest exit stored in a deadframe.

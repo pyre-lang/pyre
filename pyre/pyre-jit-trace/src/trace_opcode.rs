@@ -2241,38 +2241,11 @@ impl MIFrame {
             !self.sym().is_active_vable_owner || self.sym().vable_array_base.is_some(),
             "an active vable owner must have a seeded vable_array_base before close_loop_args_at"
         );
-        // RPython close_loop_args parity: JUMP args must match the target
-        // label's types (inputarg_types). materialize_loop_carried_value
-        // boxes values to match (e.g. Int → Ref for virtualizable locals).
-        //
-        // For bridge traces, ctx.inputarg_types() returns the bridge's
-        // guard fail_arg types, NOT the root loop's label types. The JUMP
-        // targets the root loop label, so resolve the root loop's LABEL/
-        // inputargs types via `front_target_inputarg_types` (peeled-entry
-        // LABEL when unrolled, root TreeLoop.inputargs otherwise — see
-        // `MetaInterp::front_target_inputarg_types` doc).
-        //
-        // A close reached through the walk targets the merge point that matched
-        // (`original_boxes`, pyjitpl.py), whichever kind of trace is
-        // recording: `reached_loop_header` scans `current_merge_points` first
-        // and only falls through to the previously compiled loop when nothing
-        // matched. So the merge point recorded at the closing header answers
-        // ahead of the bridge's front target; a bridge that walked into a loop
-        // header it had itself passed closes at THAT label, not at the loop its
-        // guard came from. With no such merge point the close targets the root
-        // loop's LABEL/inputargs, which `front_target_inputarg_types` resolves
-        // (a bridge's own `inputarg_types()` are its guard fail_arg types).
-        let inputarg_types = target_pc
-            .and_then(|pc| ctx.merge_point_arg_types_at_header(pc))
-            .or_else(|| {
-                let (driver, _) = crate::driver::driver_pair();
-                driver
-                    .is_bridge_tracing()
-                    .then(|| driver.current_trace_green_key())
-                    .flatten()
-                    .and_then(|gk| driver.front_target_inputarg_types(gk))
-            })
-            .unwrap_or_else(|| ctx.inputarg_types());
+        // pyjitpl.py MetaInterp.compile_trace records
+        // JUMP(live_arg_boxes[num_green_args:], descr=ptoken); each live
+        // box already carries box.type. unroll.py optimize_bridge /
+        // jump_to_existing_trace match that JUMP against the target's
+        // virtual state. Do not look up a compiled LABEL type list here.
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         // `extra_reds` reflects the canonical ec/red layout (NUM_EXTRA_REDS).
         // Drives the conditional ec push at args[1] and the dedup-side
@@ -2435,10 +2408,7 @@ impl MIFrame {
         } else {
             args.extend_from_slice(&[next_instr, code, stack_depth, debugdata]);
             for (idx, value) in locals.into_iter().enumerate() {
-                let target_type = inputarg_types
-                    .get(num_scalars + idx)
-                    .copied()
-                    .unwrap_or(Type::Ref);
+                let target_type = self.value_type(value);
                 // Materialize NONE slots from concrete frame before boxing.
                 // RPython's live_arg_boxes never contains holes at loop closure
                 // because MIFrame.run_one_step always updates all live registers.
@@ -2462,10 +2432,11 @@ impl MIFrame {
             // base, so no `get_const_info_mut` null-base abort.
             let live_stack_len = concrete_vsd.saturating_sub(nlocals);
             for (stack_idx, value) in stack.into_iter().enumerate() {
-                let target_type = inputarg_types
-                    .get(num_scalars + nlocals + stack_idx)
-                    .copied()
-                    .unwrap_or(Type::Ref);
+                let target_type = if stack_idx >= live_stack_len {
+                    Type::Ref
+                } else {
+                    self.value_type(value)
+                };
                 let value = if stack_idx >= live_stack_len {
                     let typed_null = extract_concrete_typed_value(target_type, PY_NULL);
                     fail_arg_opref_for_typed_value(ctx, typed_null)
@@ -2522,6 +2493,13 @@ impl MIFrame {
         // `remove_consts_and_duplicates` additionally mutates
         // `self.virtualizable_boxes` in place so subsequent reads see the
         // SameAs-wrapped identities).
+        // Void-producer holes have no Box.type (`OpRef::NONE` / Void).
+        // Take `arg.ty()` when it is a non-Void box type; else the
+        // declared vable layout (`virt_live_value_types`: scalar kinds
+        // then `array_item_type`). Frame slot 0 recovers the vable
+        // identity.
+        let declared_live_types =
+            crate::virtualizable_gen::virt_live_value_types(target_array_capacity);
         for (i, arg) in args.iter_mut().enumerate() {
             if !ctx.opref_is_void_producer(*arg) {
                 continue;
@@ -2531,10 +2509,10 @@ impl MIFrame {
                     .filter(|id| !ctx.opref_is_void_producer(*id))
                     .unwrap_or(*arg)
             } else {
-                let tp = inputarg_types
-                    .get(i)
-                    .copied()
+                let tp = arg
+                    .ty()
                     .filter(|t| *t != Type::Void)
+                    .or_else(|| declared_live_types.get(i).copied())
                     .unwrap_or(Type::Ref);
                 let typed_null = extract_concrete_typed_value(tp, PY_NULL);
                 fail_arg_opref_for_typed_value(ctx, typed_null)

@@ -16,9 +16,7 @@
 // resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py)
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
-use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
 use majit_ir::{DescrRef, InputArgRc, Op, Type};
-use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 /// Inputs a later merged recompile (`assembler.py patch_jump_for_descr`)
@@ -78,8 +76,6 @@ pub struct BridgeData {
     pub header_pc: u64,
     /// Source guard this bridge is attached to.
     pub source_guard: (u64, u32),
-    /// Recovery-layout caller prefix inherited from the source guard.
-    pub caller_prefix_layout: Option<ExitRecoveryLayout>,
     /// Function pointer to the bridge's compiled code.
     /// Same calling convention as a compiled loop:
     ///   fn(inputs_ptr: *const i64, outputs_ptr: *mut i64, roots_ptr: *mut i64) -> i64
@@ -110,10 +106,6 @@ pub struct BridgeData {
     pub max_output_slots: usize,
     /// `guaranteed_frame_depth`: `max(bind+1, own needs, baked JUMP target)`.
     pub frame_depth: usize,
-    /// Static terminal-exit layouts within the bridge trace.
-    /// Write-once during bridge compilation, read-only after.
-    /// No lock needed — RPython ResumeGuardDescr has no lock (GIL).
-    pub terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     /// When true, a bridge Finish with matching arity should re-enter
     /// the parent loop instead of returning to the interpreter.
     /// Set for bridges that reach the loop's merge_point.
@@ -139,18 +131,6 @@ pub struct BridgeData {
 unsafe impl Send for BridgeData {}
 unsafe impl Sync for BridgeData {}
 
-impl BridgeData {
-    #[inline]
-    pub fn terminal_exit_layouts_ref(&self) -> &Vec<TerminalExitLayout> {
-        unsafe { &*self.terminal_exit_layouts.get() }
-    }
-
-    #[inline]
-    pub fn terminal_exit_layouts_mut(&self) -> &mut Vec<TerminalExitLayout> {
-        unsafe { &mut *self.terminal_exit_layouts.get() }
-    }
-}
-
 impl std::fmt::Debug for BridgeData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeData")
@@ -158,13 +138,9 @@ impl std::fmt::Debug for BridgeData {
             .field("input_types", &self.input_types)
             .field("header_pc", &self.header_pc)
             .field("source_guard", &self.source_guard)
-            .field("caller_prefix_layout", &self.caller_prefix_layout)
             .field("code_ptr", &self.code_ptr)
             .field("num_inputs", &self.num_inputs)
             .field("num_ref_roots", &self.num_ref_roots)
-            .field("terminal_exit_layouts", unsafe {
-                &*self.terminal_exit_layouts.get()
-            })
             .finish()
     }
 }

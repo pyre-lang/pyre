@@ -662,7 +662,6 @@ fn compile_bridge_terminal_decline_invalidates_ca_callers() {
             &[InputArg::from_type_rc(Type::Int, 40)],
             &host_bridge_ops(&label_descr),
             &token,
-            None,
         )
         .expect_err("arity mismatch is a terminal decline");
     assert!(
@@ -5894,8 +5893,7 @@ fn test_single_label_peeled_loop_validates() {
 
 /// Key 0 runs the preamble. Key `label ordinal + 1` enters that LABEL's
 /// resume loader and reads the args from `FRAME_SLOT_BASE`, skipping the
-/// preamble. `build_function`'s `br_table` and `front_target_dispatch_key`
-/// share that numbering.
+/// preamble. `build_function`'s `br_table` uses that numbering.
 #[test]
 fn peeled_loop_dispatch_key_enters_the_label_not_the_preamble() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
@@ -7559,13 +7557,8 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
     // A merge is only considered once there is a callback to act on the
     // entry-count trip; the guest publishes the real one.
     majit_backend_wasm::set_inline_trip_helper_slot(1);
-    let compiled = backend.compile_bridge(
-        &fail_descr,
-        &host_bridge_inputargs(),
-        &bridge_ops,
-        &token,
-        None,
-    );
+    let compiled =
+        backend.compile_bridge(&fail_descr, &host_bridge_inputargs(), &bridge_ops, &token);
     majit_backend_wasm::set_inline_trip_helper_slot(0);
     compiled.unwrap_or_else(|_| panic!("case {case}: the loop-closing bridge compiles"));
 
@@ -7646,7 +7639,6 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
             &host_bridge_inputargs(),
             &host_gni_bridge_ops(&label_descr),
             &token,
-            None,
         )
         .expect("the GNI bridge still compiles out of line");
     majit_backend_wasm::set_inline_trip_helper_slot(0);
@@ -7708,7 +7700,6 @@ fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
             &host_bridge_inputargs(),
             &host_bridge_ops(&label_descr),
             &token,
-            None,
         )
         .expect("the loop-closing bridge compiles out of line");
 

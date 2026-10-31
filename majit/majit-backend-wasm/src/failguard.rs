@@ -1438,11 +1438,11 @@ pub struct CompiledWasmLoop {
     /// in the eager path.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) pending_wasm_bytes: RefCell<Option<Vec<u8>>>,
-    /// The owning token metadata receives the guard-descriptor tracer only
-    /// after the host accepts this module. Deferred root traces keep this
-    /// handle until `materialize_func_handle` crosses that acceptance point.
+    /// Owning `CompiledLoopToken`. `register_descrs_once` pins this loop's
+    /// fail descrs on `asmmemmgr_gcreftracers` at `compile_loop`
+    /// (`assembler.py assemble_loop` / `get_asmmemmgr_gcreftracers`).
     pub(crate) compiled_loop_token: Arc<majit_backend::CompiledLoopToken>,
-    /// Serializes the eager and lazy acceptance paths. The wasm runtime is
+    /// Once-guard for `register_descrs_once`. The wasm runtime is
     /// single-threaded, matching the surrounding `Cell`/`RefCell` fields.
     pub(crate) descrs_registered: Cell<bool>,
     /// This loop's own guard/finish exit descriptors (positions `[0,
@@ -1575,7 +1575,10 @@ impl CompiledWasmLoop {
         self.func_handle.get()
     }
 
-    /// Publish the descriptors only for a module the host can execute.
+    /// Publish this loop's fail descrs onto `CLT.asmmemmgr_gcreftracers` at
+    /// `compile_loop`, matching `assemble_loop` /
+    /// `get_asmmemmgr_gcreftracers`. Host materialization of a deferred
+    /// module does not wait to root them.
     pub(crate) fn register_descrs_once(&self) {
         if self.descrs_registered.replace(true) {
             return;
@@ -1618,7 +1621,6 @@ impl CompiledWasmLoop {
                     "wasm host rejected the lazily compiled trace module".into(),
                 ));
             }
-            self.register_descrs_once();
             self.func_handle.set(handle);
             if self
                 .resume_entry

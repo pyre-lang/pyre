@@ -60,8 +60,7 @@ pub fn get_const_ptr_for_unicode(
 /// and short preamble needed for bridge entry. Multiple TargetTokens can exist
 /// per loop (from retracing with different virtual states).
 /// `history.py TargetToken` attributes the optimizer writes after the token
-/// is minted (`virtual_state`, `short_preamble`) and pyre's LABEL/JUMP
-/// vable contract (`label_source_positions`). Behind one lock because the
+/// is minted (`virtual_state`, `short_preamble`). Behind one lock because the
 /// token is shared through `JitCellToken.target_tokens` and mutated by
 /// `unroll.py` passes.
 #[derive(Debug, Default)]
@@ -70,13 +69,6 @@ pub struct TargetTokenAttrs {
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
     pub label_tail_unrebuildable: bool,
-    /// Compact LABEL source-position map for the cranelift host entry.
-    /// `history.py TargetToken._ll_loop_code` is the per-token backend sink;
-    /// `compile.py compile_loop` `jitcell_token.target_tokens = [start_descr]`
-    /// is the list compile-time selection scans; `warmstate.py
-    /// execute_assembler` consumes the selected token stored on the
-    /// compiled-loop record.
-    pub label_source_positions: Option<Vec<usize>>,
     minor_scan_pending: bool,
 }
 
@@ -5138,7 +5130,8 @@ impl TraceCtx {
 
     /// Variant of `call_assembler_typed_by_number` that
     /// uses a pre-resolved `Arc<JitCellToken>` so the recorded descr
-    /// carries production token identity (compile.py:187 parity).
+    /// carries production token identity (`compile.py record_loop_or_bridge`
+    /// (`isinstance(descr, JitCellToken)`)).
     /// Skips the synth-Arc + `jitcell_token_by_number` keepalive fallback
     /// that the number-only path relies on in `record_loop_or_bridge`.
     fn call_assembler_typed_arc(
@@ -5271,7 +5264,8 @@ impl TraceCtx {
 
     /// Records a red-args-only CALL_ASSEMBLER against a resolved
     /// `JitCellToken`. RPython records the target token object directly on
-    /// CALL_ASSEMBLER ops (`compile.py:187`), so production walker paths use
+    /// CALL_ASSEMBLER ops (`compile.py record_loop_or_bridge`
+    /// (`isinstance(descr, JitCellToken)`)), so production walker paths use
     /// this once they have resolved or synthesized the token object.
     ///
     /// The `target_number`-taking form, `call_assembler_red_only_ref`, is

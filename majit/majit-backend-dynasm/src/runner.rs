@@ -3590,7 +3590,6 @@ impl Backend for DynasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
         majit_gc::ensure_type_registry_closed();
@@ -4032,11 +4031,6 @@ impl Backend for DynasmBackend {
             });
         }
         let descr_arc = descr.to_arc();
-        let exit_layout = Some(crate::guard::layout_for_fail_descr(
-            &descr_arc,
-            descr_fd.fail_index_per_trace(),
-            descr_fd.trace_id(),
-        ));
 
         // grab_exc_value (llmodel.py): read jf_guard_exc off the deadframe
         // tip before the libc jitframe chain is freed (same as execute_token).
@@ -4052,7 +4046,6 @@ impl Backend for DynasmBackend {
         majit_backend::RawExecResult {
             outputs,
             typed_outputs,
-            exit_layout,
             savedata: (!savedata.is_null()).then_some(savedata),
             exception_value,
             fail_index: descr_fd.fail_index_per_trace(),
@@ -5844,7 +5837,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         assert_eq!(guard_descr.as_fail_descr().unwrap().adr_jump_offset(), 0);
@@ -5935,7 +5927,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
 
@@ -6036,7 +6027,6 @@ mod tests {
                 &inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
 

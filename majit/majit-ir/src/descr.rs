@@ -6558,7 +6558,8 @@ pub trait LoopTokenDescr: Descr {
         None
     }
 
-    /// `compile.py:187 original.record_jump_to(descr)` parity hook.
+    /// `compile.py record_loop_or_bridge` (`isinstance(descr, JitCellToken)`
+    /// `original.record_jump_to(descr)`) parity hook.
     ///
     /// Upstream `op.getdescr()` IS a `JitCellToken` object — `record_jump_to`
     /// receives it directly without any number-to-object lookup. majit's

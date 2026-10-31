@@ -5920,12 +5920,7 @@ impl majit_backend::Backend for WasmBackend {
             .get()
             .and_then(|compiled| compiled.downcast_ref::<CompiledWasmLoop>())
             .expect("newly compiled wasm loop is missing");
-        // Native builds accept the encoded module as a test artifact. On the
-        // real wasm host, eager compilation crossed the acceptance check
-        // above; a deferred trace registers from `materialize_func_handle`.
-        if !defer_host_compile || cfg!(not(target_arch = "wasm32")) {
-            compiled.register_descrs_once();
-        }
+        compiled.register_descrs_once();
         compiled
             .resume_entry
             .slot
@@ -6052,7 +6047,6 @@ impl majit_backend::Backend for WasmBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge codegen reads `type_info_group`.
         majit_gc::ensure_type_registry_closed();
@@ -6063,8 +6057,8 @@ impl majit_backend::Backend for WasmBackend {
         // bridge runs in the SOURCE loop's reused frame: the guard spilled its
         // fail args positionally into `frame[1..]`. `build_function` reads the
         // positional slot `k`, independently of the bridge value id, so no
-        // argument-recovery layout is needed — hence `caller_recovery_layout`
-        // and `previous_tokens` are unused.
+        // extra recovery layout is needed. `descr_owning_jct` names the
+        // source loop (`compile.py do_compile_bridge` / `assemble_bridge`).
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
             diag_bump(1);
@@ -7072,9 +7066,10 @@ impl majit_backend::Backend for WasmBackend {
     /// of triggering a bridge. Build one layout per exit from the metainterp
     /// `ResumeGuardDescr` the optimizer stamped on the guard (`meta_descr`); the
     /// wasm backend keeps no machine-code recovery metadata (resume runs through
-    /// the frontend `WasmFrameData` path), so the recovery / rd_* / gc-slot
-    /// fields stay empty — `merge_backend_exit_layouts` keeps the frontend's own
-    /// entry (`or_insert_with`) and only consumes `is_finish` + `source_op_index`.
+    /// `get_resumestorage` on that descr), so the
+    /// recovery / rd_* / gc-slot fields stay empty. Consumers read
+    /// `is_finish` and `source_op_index` from this list and the resume
+    /// payload from the descr Arc.
     fn compiled_fail_descr_layouts(
         &self,
         token: &JitCellToken,
@@ -7114,8 +7109,8 @@ impl majit_backend::Backend for WasmBackend {
     /// `fail_descrs` and records their `(source_fail_index, start, count)` slice
     /// in `bridge_descr_ranges`. Return one layout per descr in that slice.
     /// `fail_index` is the 0-based position within the bridge's own
-    /// exit list (matching the bridge's frontend `exit_layouts` keying and the
-    /// native backends' `compiled_bridge_fail_descr_layouts`); `trace_id` is the
+    /// fail-descr list (matching the native backends'
+    /// `compiled_bridge_fail_descr_layouts`); `trace_id` is the
     /// bridge's own id, stamped on each appended `WasmFailDescr`.
     fn compiled_bridge_fail_descr_layouts(
         &self,
@@ -7891,7 +7886,6 @@ mod tests {
                 &bridge_inputs,
                 &[bridge_advance, bridge_jump],
                 &token,
-                None,
             )
             .expect("bridge compiles");
         let clt = token.compiled_loop_token_expect();
@@ -8075,13 +8069,7 @@ mod tests {
         ));
         bridge_jump.setdescr(label.clone());
         backend
-            .compile_bridge(
-                &fail,
-                &inputargs,
-                &[bridge_advance, bridge_jump],
-                &token,
-                None,
-            )
+            .compile_bridge(&fail, &inputargs, &[bridge_advance, bridge_jump], &token)
             .expect("closing JUMP still resolves the earlier label");
         assert!(failguard::label_target(&label).is_some());
     }
