@@ -3113,6 +3113,26 @@ struct InitializeVirtualizableState {
     has_expanded_tail: bool,
 }
 
+/// `compile.py propagate_original_jitcell_token` walks LABEL descrs only.
+fn label_minted_target_tokens(
+    target_tokens: &[Arc<crate::history::TargetToken>],
+    ops: &[majit_ir::OpRc],
+) -> Vec<Arc<crate::history::TargetToken>> {
+    target_tokens
+        .iter()
+        .filter(|target_token| {
+            let descr = target_token.as_jump_target_descr();
+            ops.iter().any(|op| {
+                op.opcode == majit_ir::OpCode::Label
+                    && op
+                        .getdescr()
+                        .is_some_and(|candidate| std::sync::Arc::ptr_eq(&candidate, &descr))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 impl<M: Clone> MetaInterp<M> {
     /// resume.py:1314 parity: `metainterp_sd.virtualref_info` shared
     /// `VirtualRefInfo` handed to `blackhole_from_resumedata` /
@@ -10951,20 +10971,8 @@ impl<M: Clone> MetaInterp<M> {
                 // rebinding those would drop their owner, and
                 // `record_loop_or_bridge` would then not `record_jump_to`
                 // the token whose machine code the JUMP still enters.
-                let minted_label_tokens: Vec<_> = unroll_opt
-                    .target_tokens
-                    .iter()
-                    .filter(|target_token| {
-                        let descr = target_token.as_jump_target_descr();
-                        combined_ops.iter().any(|op| {
-                            op.opcode == majit_ir::OpCode::Label
-                                && op.getdescr().is_some_and(|candidate| {
-                                    std::sync::Arc::ptr_eq(&candidate, &descr)
-                                })
-                        })
-                    })
-                    .cloned()
-                    .collect();
+                let minted_label_tokens =
+                    label_minted_target_tokens(&unroll_opt.target_tokens, &combined_ops);
                 for target_token in &minted_label_tokens {
                     target_token.set_original_jitcell_token(&token);
                     token.record_target_token(target_token.as_jump_target_descr());
@@ -11189,15 +11197,15 @@ impl<M: Clone> MetaInterp<M> {
                 self.last_compiled_artifact_token = Some(source_jct.clone());
                 // compile.py `store_hash` for bridge guards.
                 self.assign_guard_hashes(&combined_ops);
-                // `compile.py propagate_original_jitcell_token` — every
-                // LABEL's TargetToken in the finished trace is rebound to
-                // `new_loop.original_jitcell_token`, which
-                // `compile_and_attach` just set to the SOURCE loop's token.
-                // `unroll.py:290-297` separately appended the freshly minted
-                // one to `loop_jitcell_token.target_tokens`
-                // (`compile.py`'s `get_procedure_token(greenkey)`), which
-                // is what `pyjitpl.py has_compiled_targets` reads.
-                for target_token in &unroll_opt.target_tokens {
+                // `compile.py` `propagate_original_jitcell_token` walks LABEL
+                // descrs only. The seeded `target_tokens` also hold the
+                // previous loop's labels, which this trace may JUMP to;
+                // rebinding those would drop their owner, and
+                // `record_loop_or_bridge` would then not `record_jump_to`
+                // the token whose machine code the JUMP still enters.
+                let minted_label_tokens =
+                    label_minted_target_tokens(&unroll_opt.target_tokens, &combined_ops);
+                for target_token in &minted_label_tokens {
                     target_token.set_original_jitcell_token(&source_jct);
                     loop_jitcell_token.record_target_token(target_token.as_jump_target_descr());
                 }
@@ -34284,6 +34292,18 @@ mod tests {
             meta.cancelled_too_many_times(),
             "driver 0 reads the same warmrunnerdesc.memory_manager"
         );
+    }
+
+    #[test]
+    fn retrace_attach_rebinds_only_label_minted_target_tokens() {
+        let label_token = crate::history::TargetToken::new_loop(1);
+        let jump_dest = crate::history::TargetToken::new_loop(2);
+        let label = mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw());
+        label.setdescr(label_token.as_jump_target_descr());
+        let ops = vec![OpRc::new(label)];
+        let minted = label_minted_target_tokens(&[label_token.clone(), jump_dest.clone()], &ops);
+        assert_eq!(minted.len(), 1);
+        assert!(Arc::ptr_eq(&minted[0], &label_token));
     }
 
     #[test]
