@@ -2229,7 +2229,6 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![value.clone()],
         OpKind::GuardClass { base } => vec![base.clone()],
-        OpKind::VtableMethodPtr { receiver, .. } => vec![receiver.clone()],
         OpKind::IsInstance {
             obj, class_carrier, ..
         } => vec![obj.clone(), class_carrier.clone()],
@@ -12008,8 +12007,7 @@ fn concrete_type_of_producer(kind: &OpKind) -> Option<crate::model::ConcreteType
         | OpKind::ConstUInt128(_)
         | OpKind::ConstSingleFloat(_)
         | OpKind::ArrayLen { .. }
-        | OpKind::VableArrayLen { .. }
-        | OpKind::VtableMethodPtr { .. } => crate::model::ConcreteType::Signed,
+        | OpKind::VableArrayLen { .. } => crate::model::ConcreteType::Signed,
         OpKind::ConstFloat(_) => crate::model::ConcreteType::Float,
         OpKind::ConstNone => crate::model::ConcreteType::Void,
         OpKind::ConstStr(_)

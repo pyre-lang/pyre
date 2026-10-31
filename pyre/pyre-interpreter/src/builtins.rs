@@ -20351,8 +20351,22 @@ pub fn exec_or_eval(
     let current_globals = frame.get_w_globals();
     let keeps_existing_builtin = unsafe {
         pyre_object::is_dict(current_globals)
-            && pyre_object::w_dict_getitem_str(current_globals, "__builtins__")
-                .is_some_and(|w_builtin| std::ptr::eq(w_builtin, frame.w_builtin))
+            && pyre_object::w_dict_getitem_str(current_globals, "__builtins__").is_some_and(
+                |w_g_builtin| {
+                    if std::ptr::eq(w_g_builtin, frame.w_builtin) {
+                        true
+                    } else if frame.w_builtin.is_null() {
+                        let space_builtin = crate::importing::space_builtin();
+                        std::ptr::eq(w_g_builtin, space_builtin)
+                            || std::ptr::eq(
+                                w_g_builtin,
+                                pyre_object::w_module_get_w_dict(space_builtin),
+                            )
+                    } else {
+                        false
+                    }
+                },
+            )
     };
     if !keeps_existing_builtin {
         // `pick_builtin_obj_checked` can invoke a dict-subclass `__getitem__`
@@ -31327,5 +31341,27 @@ mod tests {
             err.message_text(),
             "type.__new__() argument 3 must be dict or frozendict, not mappingproxy"
         );
+    }
+
+    #[test]
+    fn exec_empty_builtins_dict_raises_nameerror() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
+        crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+        let roots = pyre_object::gc_roots::push_roots();
+        let source_slot = roots.pin_roots(&[pyre_object::w_str_new("x = len")]);
+        let globals_slot = roots.pin_roots(&[pyre_object::w_dict_new()]);
+        let empty_slot = roots.pin_roots(&[pyre_object::w_dict_new()]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(globals_slot),
+                "__builtins__",
+                roots.get(empty_slot),
+            );
+        }
+        let err = builtin_exec(&[roots.get(source_slot), roots.get(globals_slot)])
+            .expect_err("exec with empty __builtins__ must miss len");
+        assert_eq!(err.kind, crate::PyErrorKind::NameError);
     }
 }

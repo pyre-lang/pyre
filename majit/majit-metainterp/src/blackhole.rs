@@ -4023,6 +4023,72 @@ mod tests {
         assert!(bh.registers_i.is_empty() || bh.registers_i.iter().all(|&v| v == 0));
     }
 
+    /// Process-global `HOST_HOOKS` is one slot; save and restore it under a
+    /// lock so these tests cannot overwrite each other or a sibling.
+    static FORCE_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn with_force_hook<T>(
+        hook: crate::quasiimmut::ForceQuasiImmutable,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = FORCE_HOOK_TEST_LOCK.lock();
+        let saved = crate::host_hooks();
+        crate::publish_host_hooks(crate::HostHooks {
+            force_quasi_immutable: Some(hook),
+            ..crate::HostHooks::default()
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        crate::publish_host_hooks(saved);
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn mutate_field_descr(offset: usize) -> BhDescr {
+        BhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: true,
+            index_in_parent: Some(1),
+            parent: None,
+            name: "mutate_value".into(),
+            owner: "RawOwner".into(),
+            load_is_acquire: false,
+        }
+    }
+
+    /// `/id` reads the owner from `registers_i` and forces through
+    /// `quasiimmut.py do_force_quasi_immutable` at `struct + offset`.
+    #[test]
+    fn handler_jit_force_quasi_immutable_id_forces_raw_owner() {
+        static FORCE_ADDR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        FORCE_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+        extern "C" fn force_hook(field_addr: i64) {
+            FORCE_ADDR.store(field_addr, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let descrs: &'static [BhDescr; 1] = Box::leak(Box::new([mutate_field_descr(8)]));
+        let mut bh = BlackholeInterpreter::default();
+        bh.descrs = descrs;
+        let struct_ptr = 0x1000i64;
+        bh.registers_i = vec![struct_ptr];
+        // Operand layout `id`: 1B int-reg + 2B descr-index 0.
+        let code = [0u8, 0, 0];
+        let next = with_force_hook(force_hook, || {
+            handler_jit_force_quasi_immutable_i(&mut bh, &code, 0).unwrap()
+        });
+        assert_eq!(next, 3);
+        assert_eq!(
+            FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            struct_ptr.wrapping_add(8),
+        );
+    }
+
     // ── Executor opcode tests (bhimpl_* runtime coverage) ──
     //
     // Systematic correctness tests for each opcode category, driven directly
@@ -4854,17 +4920,11 @@ mod tests {
         }
 
         #[test]
-        fn unresolved_call_and_vtable_bail_set_abort_permanent_bail() {
+        fn unresolved_call_sets_abort_permanent_bail() {
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             let err = super::super::reject_unresolved_call(&mut bh, 0);
             assert!(matches!(err, DispatchError::LeaveFrame));
-            assert!(bh.aborted && bh.abort_permanent_bail);
-
-            bh.aborted = false;
-            bh.abort_permanent_bail = false;
-            let err = super::super::handler_vtable_method_ptr_bail(&mut bh, &[], 0);
-            assert!(matches!(err, Err(DispatchError::LeaveFrame)));
             assert!(bh.aborted && bh.abort_permanent_bail);
         }
 
@@ -5443,19 +5503,6 @@ mod tests {
             let mut bh = builder.acquire_interp();
             bh.exception_last_value = 0;
             let _ = super::handler_reraise(&mut bh, &[], 0);
-        }
-
-        #[test]
-        fn obsolete_vtable_method_opcode_bails_instead_of_panicking() {
-            let mut builder = super::build_inline_call_only_bh_builder(&[(
-                "recursive_call_v/iIRFIRF",
-                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
-            )]);
-            let mut bh = builder.acquire_interp();
-            let err = super::handler_vtable_method_ptr_bail(&mut bh, &[], 0)
-                .expect_err("unsupported named vtable lookup must leave blackhole");
-            assert!(matches!(err, super::DispatchError::LeaveFrame));
-            assert!(bh.aborted);
         }
 
         /// A pooled interp must not carry the previous run's frame identity.
@@ -11307,14 +11354,6 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "abort_permanent/".to_string(),
         majit_jitcode::insns::BC_ABORT_PERMANENT,
     );
-    // The canonical MIR dyn-call path is now a concrete vtable FieldRead plus
-    // IndirectCall (`ClassRepr.getclsfield` / `FunctionReprBase.call`).  Keep
-    // the old pyre-only byte registered for frozen/abstract-trait fallback
-    // jitcodes; its handler safely bails to the source interpreter.
-    insns.insert(
-        "vtable_method_ptr/rd>i".to_string(),
-        majit_jitcode::insns::BC_VTABLE_METHOD_PTR,
-    );
     // blackhole.py bhimpl_switch. `handler_switch` is wired in
     // `wire_bhimpl_handlers` but the byte was absent from this builder's
     // insns map, so a deopt through a `switch/id` op landed on the
@@ -11894,11 +11933,18 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             majit_jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD,
         ),
         // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
-        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`;
-        // `bhimpl_jit_force_quasi_immutable` is already wired below.
+        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`
+        // for a GC owner and `id` for a raw address (`getkind` of
+        // Signed / a non-GC ptr). `bhimpl_jit_force_quasi_immutable`
+        // is already wired below; the `/id` handler reads the owner
+        // from `registers_i`.
         (
             "jit_force_quasi_immutable/rd",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
+        ),
+        (
+            "jit_force_quasi_immutable/id",
+            majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -12383,11 +12429,13 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "record_quasiimmut_field/idd",
         handler_record_quasiimmut_field,
     );
-    // Compatibility fallback for the obsolete name-based vtable opcode.
-    builder.wire_handler("vtable_method_ptr/rd>i", handler_vtable_method_ptr_bail);
     builder.wire_handler(
         "jit_force_quasi_immutable/rd",
         handler_jit_force_quasi_immutable,
+    );
+    builder.wire_handler(
+        "jit_force_quasi_immutable/id",
+        handler_jit_force_quasi_immutable_i,
     );
     builder.wire_handler(
         "record_known_result_i_ir_v/iiIRd",
@@ -12701,24 +12749,6 @@ fn handler_guard_class_r(
     bh.registers_r[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
-/// Fallback for the obsolete pyre-only named vtable lookup.
-///
-/// PyPy's `ClassRepr.getclsfield` emits an ordinary field read; it never tries
-/// to resolve `(trait, method)` strings in the blackhole.  If an old frozen
-/// graph or the still-conservative abstract-trait path reaches this opcode, no
-/// faithful pointer can be manufactured from its descriptor.
-/// `convert_and_run_from_pyjitpl` resumes from one abort, and the resume
-/// consumers require `abort_permanent_bail` (`bhimpl_abort_permanent`).
-fn handler_vtable_method_ptr_bail(
-    bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    _p: usize,
-) -> Result<usize, DispatchError> {
-    bh.aborted = true;
-    bh.abort_permanent_bail = true;
-    Err(DispatchError::LeaveFrame)
-}
-
 fn handler_record_quasiimmut_field(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -12743,13 +12773,35 @@ fn handler_record_quasiimmut_field(
 /// ```
 /// Skipping past the operands without running the force left every loop that
 /// folded a read of the field valid across the write that invalidates it.
+///
+/// `/rd` reads the owner from `registers_r`; `/id` from `registers_i`
+/// (a raw address). `quasiimmut.py do_force_quasi_immutable` then
+/// takes that address plus the mutate field descr — pyre's port adds
+/// the descr offset and calls the host hook, which is valid for a raw
+/// struct as well as a GC one.
 fn handler_jit_force_quasi_immutable(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (mutatefielddescr, p) = read_descr(bh, code, p + 1);
+    force_quasi_immutable_at(bh, code, p + 1, struct_ptr)
+}
+fn handler_jit_force_quasi_immutable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
+    force_quasi_immutable_at(bh, code, p + 1, struct_ptr)
+}
+fn force_quasi_immutable_at(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+    struct_ptr: i64,
+) -> Result<usize, DispatchError> {
+    let (mutatefielddescr, p) = read_descr(bh, code, p);
     crate::quasiimmut::do_force_quasi_immutable(struct_ptr, mutatefielddescr);
     Ok(p)
 }
@@ -12996,19 +13048,28 @@ fn handler_debug_fatalerror(
     panic!("{}", String::from_utf8_lossy(&bytes));
 }
 /// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
-/// (the tagging arithmetic lives at the erase site, never here); the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `ll_assert` remains a translated runtime assertion.
+/// (the tagging arithmetic lives at the erase site, never here).
+/// `ll_assert((i & 1) == 1)` is `rtyper/debug.py` `ll_assert` → genop
+/// `debug_assert` → `RPyAssert`. `warmspot.py` `prejit_optimizations`
+/// translates the JIT with `remove_asserts=True` /
+/// `really_remove_asserts=True`, and `translator/c/src/support.h`
+/// compiles `RPyAssert` out unless `RPY_ASSERT`. `jtransform.py`
+/// `rewrite_op_cast_ptr_to_int` keeps the opcode for GC pointers;
+/// `rtagged.py` `ll_unboxed_getclass` does `cast_ptr_to_int(instance) & 1`
+/// on even boxed objects. Nested `interpret_unresolved_inline_call`
+/// stands in for `bhimpl_inline_call_*`'s `cpu.bh_call_*` (native
+/// `_genop_same_as`); `ll_stringslice_startstop` and the tag test both
+/// CAST even GC pointers. `debug_assert!` is the `ll_assert` port.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
+    debug_assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
-/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast; the
-/// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
-/// before it is reinterpreted as a `GCREF`.
+/// blackhole.py `bhimpl_cast_int_to_ptr(i)`. Identity cast.
+/// Same `ll_assert` → `debug_assert` / `RPyAssert` as
+/// `bhimpl_cast_ptr_to_int`; the product profile compiles it out.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
+    debug_assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 

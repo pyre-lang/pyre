@@ -55,6 +55,25 @@ impl CellFamily {
         }
     }
 
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_ever_mutated" => {
+                if !self.mutate_ever_mutated.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+
     /// Change `CellFamily.__init__`'s `ever_mutated` (`nestedscope.py`) using
     /// the ordering, fast path, and repeated-value guard
     /// `PlainAttribute::set_ever_mutated` documents.
@@ -62,9 +81,7 @@ impl CellFamily {
         if self.ever_mutated.get() == v {
             return;
         }
-        if self.mutate_ever_mutated.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
-        }
+        self.jit_force_quasi_immutable("mutate_ever_mutated");
         self.ever_mutated.set(v);
     }
 

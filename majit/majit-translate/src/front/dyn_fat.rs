@@ -13,7 +13,9 @@
 //! (`inline::splice_direct_call`), then retarget each `method_*` read so
 //! its base is the metadata word (`FatMeta`) of the fat field. The data
 //! word stays the call's receiver. `dont_look_inside` and a splice cycle
-//! stay residual. A cross-crate fat return has no body here and is left
+//! stay residual. A cross-crate fat return is spliced when the callee
+//! body lives in a crate already lowered (whole-program graph visibility
+//! the per-crate extraction splits apart); otherwise it is left
 //! unchanged. A size cutoff is not a substitute: the one-word return
 //! would still drop the vtable, and the later `method_*` read would load
 //! the slot from the data pointer.
@@ -32,10 +34,21 @@ use crate::model::{
 };
 
 thread_local! {
-    static SPLICE_STACK: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    // Charon `def_id`s restart per LLBC, so the key is
+    // (`llbc as *const Llbc as usize`, def_id) of the LLBC that owns the decl.
+    static SPLICE_STACK: std::cell::RefCell<Vec<(usize, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-struct SpliceGuard(u64);
+fn llbc_identity(llbc: &Llbc) -> usize {
+    llbc as *const Llbc as usize
+}
+
+fn splice_key(llbc: &Llbc, def_id: u64) -> (usize, u64) {
+    (llbc_identity(llbc), def_id)
+}
+
+struct SpliceGuard((usize, u64));
 
 impl Drop for SpliceGuard {
     fn drop(&mut self) {
@@ -48,16 +61,18 @@ impl Drop for SpliceGuard {
     }
 }
 
-pub(crate) fn splice_in_progress(def_id: u64) -> bool {
-    SPLICE_STACK.with(|stack| stack.borrow().contains(&def_id))
+pub(crate) fn splice_in_progress(llbc: &Llbc, def_id: u64) -> bool {
+    let key = splice_key(llbc, def_id);
+    SPLICE_STACK.with(|stack| stack.borrow().contains(&key))
 }
 
-fn enter_splice(def_id: u64) -> Option<SpliceGuard> {
-    if splice_in_progress(def_id) {
+fn enter_splice(llbc: &Llbc, def_id: u64) -> Option<SpliceGuard> {
+    if splice_in_progress(llbc, def_id) {
         return None;
     }
-    SPLICE_STACK.with(|stack| stack.borrow_mut().push(def_id));
-    Some(SpliceGuard(def_id))
+    let key = splice_key(llbc, def_id);
+    SPLICE_STACK.with(|stack| stack.borrow_mut().push(key));
+    Some(SpliceGuard(key))
 }
 
 struct DynCallSite {
@@ -82,13 +97,13 @@ pub(crate) fn splice_fat_dyn_returns(
     if dyn_results.is_empty() && !graph_has_vtable_method(graph) {
         return;
     }
-    let Some(_guard) = enter_splice(fun_id) else {
+    let Some(_guard) = enter_splice(llbc, fun_id) else {
         return;
     };
     let sites = fat_dyn_call_sites(graph, dyn_results);
     let mut prepared = Vec::new();
     for site in &sites {
-        if splice_in_progress(site.def_id) {
+        if splice_in_progress(llbc, site.def_id) {
             continue;
         }
         if let Some(callee) = lower_callee(site.def_id) {

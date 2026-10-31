@@ -319,14 +319,9 @@ const PYRE_ONLY: &[&str] = &[
 /// Keys the encoding names that neither tracer walks.
 ///
 /// Measured once, so that a key ARRIVING here is the thing to look at rather
-/// than the list itself: thirteen of these are never assembled at all — the
-/// registration-gap snapshot in `jitcode_runtime.rs` pins most of them
-/// against `build_emitted_insns()`, the opnames the build actually emitted.
-/// The two the build does emit are both accounted for. And
-/// `vtable_method_ptr/rd>i` is the pyre-only `dyn Trait` method-pointer
-/// reification quarantined in `extension_insns()`, whose blackhole handler
-/// is `handler_vtable_method_ptr_bail` — a deliberate refusal, with walking
-/// it left to the backend epic that owns the key.
+/// than the list itself: the registration-gap snapshot in
+/// `jitcode_runtime.rs` pins most of them against `build_emitted_insns()`,
+/// the opnames the build actually emitted.
 ///
 /// An unhandled key is a clean `DispatchError::UnsupportedOpname` decline,
 /// so a new arrival costs compilation rather than correctness.
@@ -338,7 +333,6 @@ const NEITHER: &[&str] = &[
     "getlistitem_gc_r/ridd>r",
     "newlist/idddd>r",
     "newlist_hint/idddd>r",
-    "vtable_method_ptr/rd>i",
 ];
 
 fn expected(list: &[&str]) -> BTreeSet<String> {

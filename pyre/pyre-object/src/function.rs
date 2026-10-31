@@ -247,6 +247,27 @@ pub struct StaticMethod {
     pub mutate_w_function: crate::quasiimmut::QuasiImmutField,
 }
 
+impl StaticMethod {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_w_function" => {
+                if !self.mutate_w_function.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_w_function) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+}
+
 /// Field offsets of the inline `PyObjectRef` slots within `StaticMethod`,
 /// consumed by `pyre-jit-trace/src/descr.rs` on the same footing as the
 /// `METHOD_*` consts above.
@@ -314,17 +335,8 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // slot with the value it already holds invalidates as well.  Nothing
         // else revokes a fold over this wrapper: re-initialising an installed
         // descriptor changes no type's version tag, which is the only other pin
-        // the folds that unwrap `w_function` hold.  The `is_installed` test is
-        // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
-        // pays one load.
-        if (*(obj as *const StaticMethod))
-            .mutate_w_function
-            .is_installed()
-        {
-            crate::quasiimmut::sweep_quasi_immut_field(
-                &(*(obj as *const StaticMethod)).mutate_w_function,
-            );
-        }
+        // the folds that unwrap `w_function` hold.
+        (*(obj as *const StaticMethod)).jit_force_quasi_immutable("mutate_w_function");
         (*(obj as *mut StaticMethod)).w_function = func;
         crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }
@@ -443,6 +455,27 @@ pub struct ClassMethod {
     pub mutate_w_function: crate::quasiimmut::QuasiImmutField,
 }
 
+impl ClassMethod {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_w_function" => {
+                if !self.mutate_w_function.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_w_function) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+}
+
 /// Field offsets of the inline `PyObjectRef` slots within `ClassMethod`, the
 /// `classmethod` twin of the `STATICMETHOD_*` consts above.
 pub const CLASSMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(ClassMethod, w_function);
@@ -509,17 +542,8 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // slot with the value it already holds invalidates as well.  Nothing
         // else revokes a fold over this wrapper: re-initialising an installed
         // descriptor changes no type's version tag, which is the only other pin
-        // the folds that unwrap `w_function` hold.  The `is_installed` test is
-        // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
-        // pays one load.
-        if (*(obj as *const ClassMethod))
-            .mutate_w_function
-            .is_installed()
-        {
-            crate::quasiimmut::sweep_quasi_immut_field(
-                &(*(obj as *const ClassMethod)).mutate_w_function,
-            );
-        }
+        // the folds that unwrap `w_function` hold.
+        (*(obj as *const ClassMethod)).jit_force_quasi_immutable("mutate_w_function");
         (*(obj as *mut ClassMethod)).w_function = func;
         crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
     }

@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=_rlistdir
+# pyre-check: selfcheck-compiles=entry-bridge:_rlistdir
 # The inner `_rlistdir` next is a residual StopIteration from
 # `ll_generatorentry_portal_runner_shim` (several_yields portal). `join`'s
 # ForIter then fails a non-exception guard inside the compiled `loop _rlistdir`.

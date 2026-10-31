@@ -471,9 +471,7 @@ pub(in crate::front::mir) fn trait_impl_match_for_receiver(
             continue;
         };
         let impl_id = i as u64;
-        let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
-            .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
-        else {
+        let Some(fn_id) = impl_or_default_method_fn_id(llbc, impl_id, method_idx) else {
             continue;
         };
         let Some(fd) = llbc.fn_by_id(fn_id) else {
@@ -516,13 +514,31 @@ pub(in crate::front::mir) fn trait_method_on_known_receiver(
 ) -> Option<(u64, Vec<String>, serde_json::Value)> {
     let ty = first_arg_ty?;
     let (_, fn_id, impl_generics) = trait_impl_match_for_receiver(ty, payload, llbc)?;
+    let (fn_id, segments) = fun_decl_call_segments(llbc, fn_id)?;
+    Some((fn_id, segments, impl_generics))
+}
+
+/// `spec_segments` path of an impl (or inherited default) FunDecl, the
+/// same `CallTarget::FunctionPath` the concrete-receiver path emits.
+pub(in crate::front::mir) fn impl_method_call_segments(
+    llbc: &Llbc,
+    impl_id: u64,
+    method_idx: u64,
+) -> Option<(u64, Vec<String>)> {
+    fun_decl_call_segments(
+        llbc,
+        impl_or_default_method_fn_id(llbc, impl_id, method_idx)?,
+    )
+}
+
+fn fun_decl_call_segments(llbc: &Llbc, fn_id: u64) -> Option<(u64, Vec<String>)> {
     let fd = llbc.fn_by_id(fn_id)?;
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         return None;
     }
     let path = fd.item_meta.name_path();
     let leaf = path.rsplit("::").next().unwrap_or("fn");
-    Some((fn_id, spec_segments(llbc, fd, leaf), impl_generics))
+    Some((fn_id, spec_segments(llbc, fd, leaf)))
 }
 
 /// The std alias an inherent `impl Atomic<T>` block's methods are spelled
@@ -1491,15 +1507,19 @@ pub(in crate::front::mir) fn trait_impl_trait_path_for_fundecl(
         .get("id")?
         .as_u64()?;
     let td = llbc.trait_by_id(trait_id)?;
-    // Only source-local traits participate: std/core trait impls
-    // (`FnOnce` closure shims, `Destruct`/`Drop` glue, `PartialEq`, …)
-    // are host machinery, not translated-program classes, and keep
-    // their inherent classification.
-    if !td.item_meta.is_local {
-        return None;
-    }
+    // Host traits (`core` / `alloc` / `std` `Drop` / `FnOnce` /
+    // `PartialEq`, …) stay inherent. Charon `item_meta.is_local` is
+    // this artefact's crate, not "translated-program trait": a TraitDecl
+    // imported into a later artefact is `is_local = false` while still a
+    // translated-crate class. `rpbc.py FunctionReprBase.call` /
+    // `row_of_graphs.values()` puts every implementation in the family;
+    // the crate a trait was declared in is an extraction boundary.
     let trait_path = td.item_meta.name_path();
     if trait_path.is_empty() {
+        return None;
+    }
+    let crate_root = trait_path.split("::").next().unwrap_or("");
+    if !td.item_meta.is_local && !crate::local_crates::is_local_crate_root(crate_root) {
         return None;
     }
     Some(trait_path)
@@ -1535,7 +1555,7 @@ pub(in crate::front::mir) fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u
 /// (`CallControl.getcalldescr`). A GC strategy stays a GC root
 /// (`walk_bh_regs` / `drag_out_root`). By-value ZST (`From::from`) stays
 /// `Void`. Core/std impls stay peeled
-/// (`trait_impl_trait_path_for_fundecl` is `None` for non-local traits).
+/// (`trait_impl_trait_path_for_fundecl` is `None` for host traits).
 pub(in crate::front::mir) fn fundecl_keeps_zst_self(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -2075,6 +2095,8 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
 
 /// The ADT's fields are raw words: scalars, nested raw structs, or one
 /// address pointing at those. A `Vec` / `String` / other GC field is not.
+/// Compiler ADTs (`Tuple` / `Box` / `str`) are GC storage (`rtuple.py`
+/// `GcStruct`): their items may be scalars, but the allocation is `new`.
 pub(in crate::front::mir) fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
@@ -2091,6 +2113,14 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
+    // Tuple / Box / str are compiler ADTs with no `GcType` impl, but
+    // `rtuple.py` lays each tuple out as a `GcStruct` and `new` allocates
+    // them as GC. Walking their scalar items would stamp the tuple — and
+    // every Option/enum that boxes one — Raw, which `rewrite_op_setfield`
+    // then replaces with Abort.
+    if type_decl_is_builtin_adt(td) {
+        return false;
+    }
     if struct_id_is_declared_gc(
         gc_struct_ids,
         struct_id_for_type_decl(td),
@@ -10119,8 +10149,9 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
 /// …) off the two-phase rtyper.
 
 /// Route inline-Field `dyn Trait` virtual calls through the faithful
-/// `CallTarget::Indirect` vtable pipeline instead of the synthetic
-/// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
+/// `{vtable}.method_*` FieldRead plus `IndirectCall { family_key }`
+/// instead of the synthetic `__dyn_call` residual (see the
+/// `(CallClass::Dynamic, ..)` arm).
 ///
 /// `__dyn_call` is not a lowering, it is a placeholder: an unregistered
 /// synthetic path that stops whatever graph reaches it.  Routing through
@@ -10166,7 +10197,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
 /// of its members.  **The `on` column has not been re-measured since**; the
 /// `off` column is unaffected by construction, since this arm emits nothing
 /// with the switch off.  Nothing else moved in the original census: the
-/// vtable-slot calls already on `CallTarget::Indirect` held at 47 / 24, and
+/// vtable-slot calls already on `IndirectCall { family_key }` held at 47 / 24, and
 /// `pyre-interpreter`'s 203 `BuiltinCodeFn` sites kept the `Some([])`
 /// marker in both states.
 ///
@@ -11004,6 +11035,17 @@ pub(in crate::front::mir) fn trait_payload_path_and_method(
         .to_string();
     let trait_path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
     Some((trait_path, method_leaf))
+}
+
+/// Fully-qualified trait declaration path from a `CallKind::Trait` payload.
+/// Sibling of [`trait_payload_owner`]: that helper returns only the leaf.
+pub(in crate::front::mir) fn trait_payload_decl_path(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<String> {
+    let arr = v.as_array()?;
+    let decl_id = trait_ref_decl_id(arr.first()?, llbc)?;
+    Some(llbc.trait_by_id(decl_id)?.item_meta.name_path())
 }
 
 /// `Vec<T>` as trait `Clone::clone` → the `list` builtin

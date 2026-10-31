@@ -28,9 +28,9 @@ pub fn register_pkg(ns: pyre_object::PyObjectRef) {
                 // spelling; `str_utf8_w` would raise UnicodeEncodeError
                 // before the import could miss.
                 let name_wtf8 = pyre_object::w_str_get_wtf8(name);
-                // `load_source_module` reads `execution_context.builtins_module`
-                // to seed a fresh module namespace, so it must be the live EC,
-                // not null — pass the thread's current context.
+                // `load_source_module` seeds a fresh module namespace from
+                // `space.builtin`, so it must be the live EC, not null —
+                // pass the thread's current context.
                 crate::importing::importhook(
                     name_wtf8,
                     pyre_object::w_none(),

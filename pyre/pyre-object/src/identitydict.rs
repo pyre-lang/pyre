@@ -353,7 +353,14 @@ impl DictStrategy for IdentityDictStrategy {
     /// `dictmultiobject.py setitem_str` — IdentityDictStrategy
     /// promotes to Object on str setitem_str (str has its own
     /// non-identity `__eq__` / `__hash__`, so OVERRIDES_EQ_CMP_OR_HASH).
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
+    unsafe fn setitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut crate::unicodeobject::Utf8Str,
+        w_value: PyObjectRef,
+    ) {
+        let key_bytes = unsafe { crate::unicodeobject::utf8_payload_bytes(key) };
+        let key = unsafe { std::str::from_utf8_unchecked(key_bytes) };
         self.switch_to_object_strategy(w_dict);
         crate::dictmultiobject::w_dict_setitem_str(w_dict, key, w_value);
     }

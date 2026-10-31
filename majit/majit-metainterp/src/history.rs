@@ -2599,6 +2599,30 @@ impl TraceCtx {
             .record_op_with_descr_value(opcode, args, descr, value)
     }
 
+    /// pyjitpl.py `MetaInterp.execute_new_array_clear`:
+    /// `execute_and_record(rop.NEW_ARRAY_CLEAR, descr, lengthbox)` then
+    /// `heapcache.new_array(resbox, lengthbox)`. `value` is the allocated
+    /// array (`history.py History._make_op`); `None` is record-only.
+    pub fn execute_new_array_clear(
+        &mut self,
+        descr: DescrRef,
+        length: OpRef,
+        value: Option<Value>,
+    ) -> OpRef {
+        let resbox = self.recorder.record_op_with_descr_value(
+            OpCode::NewArrayClear,
+            &[length],
+            descr,
+            value,
+        );
+        self.heap_cache_mut()
+            .new_array(resbox, length, length.is_constant());
+        if let Some(v) = value {
+            let _ = self.try_set_opref_concrete(resbox, v);
+        }
+        resbox
+    }
+
     /// pyjitpl.py `MetaInterp.execute_new_with_vtable`:
     /// `execute_and_record(rop.NEW_WITH_VTABLE, descr)` then
     /// `heapcache.new(resbox)` and `heapcache.class_now_known(resbox)`.
@@ -2612,6 +2636,9 @@ impl TraceCtx {
         self.heap_cache_mut().new_object(resbox);
         if known_class.is_some() {
             self.heap_cache_mut().class_now_known(resbox);
+        }
+        if let Some(v) = value {
+            let _ = self.try_set_opref_concrete(resbox, v);
         }
         resbox
     }

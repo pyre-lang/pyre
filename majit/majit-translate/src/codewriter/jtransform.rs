@@ -476,18 +476,13 @@ pub struct GraphTransformResult {
 ///
 /// This wrapper does NOT run `lower_indirect_calls` (the
 /// rtyper-equivalent pass lives in
-/// `translator/rtyper/rpbc.rs`).  Callers that can produce
-/// `CallTarget::Indirect` must go through
-/// `codewriter::transform_graph_to_jitcode` instead, which threads
-/// `&CallControl` and runs the lowering pass before jtransform.
-/// This debug-assertion catches missed lowering sites at the
-/// remaining entries (test fixtures).
+/// `translator/rtyper/rpbc.rs`). Dyn-trait sites arrive as
+/// `OpKind::IndirectCall` with a `{vtable}.method_*` FieldRead
+/// funcptr (`ClassRepr.getclsfield` / `FunctionReprBase.call`).
 pub fn transform_graph(
     graph: &FunctionGraph,
     config: &GraphTransformConfig,
 ) -> GraphTransformResult {
-    #[cfg(debug_assertions)]
-    crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
     let mut transformer = Transformer::new(config);
     transformer.transform(graph)
 }
@@ -4767,13 +4762,13 @@ impl<'a> Transformer<'a> {
                 self.rewrite_op_direct_call(op, target, &args, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
-            // RPython jtransform.py. Pyre's rtyper-equivalent
-            // (`translator/rtyper/rpbc.rs`) lowers
-            // `OpKind::Call { target: CallTarget::Indirect, .. }` into
-            // `OpKind::IndirectCall { funcptr, args, graphs, .. }`
-            // before jtransform runs, so by this point the funcptr is
-            // already a regular Variable and `args` still carry the full
-            // call argument list, including the receiver.
+            // RPython jtransform.py. The MIR frontend emits
+            // `{vtable}.method_*` FieldRead plus `OpKind::IndirectCall`
+            // (`ClassRepr.getclsfield` / `FunctionReprBase.call`);
+            // `rpbc::lower_indirect_calls` fills `graphs` before
+            // jtransform runs. The funcptr is a regular Variable and
+            // `args` still carry the full call argument list, including
+            // the receiver.
             OpKind::IndirectCall {
                 funcptr,
                 args,
@@ -8378,6 +8373,47 @@ impl<'a> Transformer<'a> {
                 }]);
             }
         }
+        // `jtransform.py rewrite_op_getfield`:
+        //     if argname != 'gc':
+        //         assert argname == 'raw'
+        //         if (kind, pure) == ('r', ''):
+        //             raise Exception("getfield_raw_r (without _pure) not supported")
+        //         pure = ''
+        // A pure raw-ref load is kept (class attributes that are GC
+        // objects). A mutable one is untranslatable: RPython raises
+        // and fails that graph; pyre replaces the read with Abort so
+        // the rest of prepass can continue (`handler_abort_marker`).
+        let result_kind = match &typed_ty {
+            ValueType::Ref(_) => 'r',
+            ValueType::Float => 'f',
+            ValueType::Void => 'v',
+            _ => 'i',
+        };
+        let pure = match &op.kind {
+            OpKind::FieldRead { pure, .. } => *pure,
+            _ => false,
+        };
+        if !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+            && result_kind == 'r'
+            && !pure
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: getfield({}.{}) → abort (getfield_raw_r without _pure)",
+                    field.owner_root.as_deref().unwrap_or("<?>"),
+                    field.name,
+                ),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            }]);
+        }
         if &typed_ty != ty {
             let OpKind::FieldRead { base, pure, .. } = &op.kind else {
                 return RewriteResult::Keep;
@@ -8584,6 +8620,35 @@ impl<'a> Transformer<'a> {
                     },
                 },
             ]);
+        }
+        // `jtransform.py rewrite_op_setfield`:
+        //     if argname == 'raw' and kind == 'r':
+        //         raise Exception("setfield_raw_r not supported")
+        let value_kind = match &typed_ty {
+            ValueType::Ref(_) => 'r',
+            ValueType::Float => 'f',
+            ValueType::Void => 'v',
+            _ => 'i',
+        };
+        if !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+            && value_kind == 'r'
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!(
+                    "rewrite: setfield({}.{}) → abort (setfield_raw_r)",
+                    field.owner_root.as_deref().unwrap_or("<?>"),
+                    field.name,
+                ),
+            });
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            }]);
         }
         if &typed_ty != ty {
             let base_var = match &op.kind {
@@ -9058,17 +9123,11 @@ impl<'a> Transformer<'a> {
         //   def rewrite_op_direct_call(op): ... handle_%s_call
         //
         // The indirect path (`jtransform.py rewrite_op_indirect_call`)
-        // is reached via `OpKind::IndirectCall` which the rtyper-equivalent
-        // layer (`translator/rtyper/rpbc.rs::lower_indirect_calls`) emits
-        // before jtransform runs, dispatched from `rewrite_operation` to
-        // `lower_indirect_call_op`. By this point, no `CallTarget::Indirect`
-        // can survive — that invariant is asserted in debug builds by
-        // `assert_no_indirect_call_targets`.
-        debug_assert!(
-            !matches!(target, CallTarget::Indirect { .. }),
-            "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
-             before reaching rewrite_op_direct_call",
-        );
+        // is reached via `OpKind::IndirectCall` which the MIR frontend
+        // emits (`ClassRepr.getclsfield` + `FunctionReprBase.call`) and
+        // `rpbc::lower_indirect_calls` fills with `c_graphs` before
+        // jtransform runs, dispatched from `rewrite_operation` to
+        // `lower_indirect_call_op`.
         // A function item used as a *value* (`DecodedConst::FnPath`) is a
         // synthetic 0-arg Call with a `__fn_const` head. Its value is the
         // function's address (`rtyper.getcallable` / `getfunctionptr`), not
@@ -15102,17 +15161,6 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             segs.push(name.as_str());
             crate::parse::CallPath::from_segments(segs)
         }
-        // RPython: an indirect_call has no single jitcode-lookup path —
-        // the family is handled via the op-based `graphs_from(op)` +
-        // `IndirectCallTargets` sidecar.  This fallback returns a stub
-        // path only reached by callers that don't distinguish; the real
-        // consumer (`handle_regular_indirect_call`) uses the family path
-        // directly.
-        CallTarget::Indirect {
-            trait_root,
-            method_name,
-            ..
-        } => crate::parse::CallPath::from_segments([trait_root.as_str(), method_name.as_str()]),
         CallTarget::UnsupportedExpr => crate::parse::CallPath::from_segments(["<unsupported>"]),
     }
 }
@@ -15569,15 +15617,6 @@ fn remap_op(
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
             value: remap_value(value, aliases),
             kind_char: *kind_char,
-        },
-        OpKind::VtableMethodPtr {
-            receiver,
-            trait_root,
-            method_name,
-        } => OpKind::VtableMethodPtr {
-            receiver: remap_value(receiver, aliases),
-            trait_root: trait_root.clone(),
-            method_name: method_name.clone(),
         },
         OpKind::VableForce { base } => OpKind::VableForce {
             base: remap_value(base, aliases),
@@ -20412,8 +20451,8 @@ mod tests {
     }
 
     #[test]
-    fn transform_graph_remaps_vtable_method_receiver_after_same_as_identity() {
-        let mut graph = FunctionGraph::new("same_as_then_vtable_method");
+    fn transform_graph_remaps_vtable_method_slot_base_after_same_as_identity() {
+        let mut graph = FunctionGraph::new("same_as_then_vtable_slot");
         let receiver_var = graph
             .push_op_var(
                 graph.startblock,
@@ -20438,30 +20477,31 @@ mod tests {
             .unwrap();
         graph.push_op_var(
             graph.startblock,
-            OpKind::VtableMethodPtr {
-                receiver: alias_var,
-                trait_root: "Handler".into(),
-                method_name: "run".into(),
+            OpKind::FieldRead {
+                base: alias_var,
+                field: FieldDescriptor::new("method_run", Some("Handler::{vtable}".to_string())),
+                ty: ValueType::Int,
+                pure: true,
             },
             true,
         );
         graph.set_return(graph.startblock, None);
 
         let transformed = transform_graph(&graph, &GraphTransformConfig::default());
-        let vtable_receiver = transformed
+        let field_base = transformed
             .graph
             .block(transformed.graph.startblock)
             .operations
             .iter()
             .find_map(|op| match &op.kind {
-                OpKind::VtableMethodPtr { receiver, .. } => Some(receiver),
+                OpKind::FieldRead { base, field, .. } if field.name == "method_run" => Some(base),
                 _ => None,
             })
-            .expect("VtableMethodPtr must survive the transform");
+            .expect("method_run FieldRead must survive the transform");
 
         assert_eq!(
-            vtable_receiver, &receiver_var,
-            "VtableMethodPtr.receiver must follow _do_renaming through same_as"
+            field_base, &receiver_var,
+            "FieldRead.base must follow _do_renaming through same_as"
         );
     }
 
@@ -34978,11 +35018,449 @@ mod tests {
         }));
     }
 
+    /// `jtransform.py rewrite_op_getfield`: a mutable raw-ref load is
+    /// `getfield_raw_r (without _pure) not supported`. The assembler panic
+    /// is that Exception arriving too late; rewrite must Abort first.
+    #[test]
+    fn rewrite_op_getfield_raw_r_without_pure_is_aborted() {
+        let mut graph = FunctionGraph::new("raw_ref_load");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let field =
+            crate::model::FieldDescriptor::new("w_inputvalue", Some("FrameResumeArgs".into()))
+                .with_owner_declared_gc(Some(false));
+        let result = graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        graph.set_return(bb, Some(result));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "mutable getfield_raw_r must abort"
+        );
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldRead { .. }))
+            }),
+            "mutable getfield_raw_r must not stay a FieldRead for the assembler"
+        );
+    }
+
+    /// A pure raw-ref load is the supported class-attribute case
+    /// (`jtransform.py`: `(kind, pure) == ('r', '_pure')` does not raise).
+    #[test]
+    fn rewrite_op_getfield_raw_r_pure_is_kept() {
+        let mut graph = FunctionGraph::new("raw_ref_load_pure");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let field = crate::model::FieldDescriptor::new("w_class_attr", Some("RawClass".into()))
+            .with_owner_declared_gc(Some(false));
+        let result = graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base,
+                    field,
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        graph.set_return(bb, Some(result));
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::FieldRead { pure: true, .. }))
+            }),
+            "pure getfield_raw_r must stay a FieldRead"
+        );
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "pure getfield_raw_r must not abort"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_setfield`: a raw-ref store is
+    /// `setfield_raw_r not supported`.
+    #[test]
+    fn rewrite_op_setfield_raw_r_is_aborted() {
+        let mut graph = FunctionGraph::new("raw_ref_store");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let value =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(value.clone());
+        let field =
+            crate::model::FieldDescriptor::new("w_inputvalue", Some("FrameResumeArgs".into()))
+                .with_owner_declared_gc(Some(false));
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "setfield_raw_r must abort"
+        );
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::FieldWrite { .. }))
+            }),
+            "setfield_raw_r must not stay a FieldWrite for the assembler"
+        );
+    }
+
+    /// A GC tuple that holds a Ref item (`rtuple.py` `GcStruct`) lowers
+    /// to `setfield_gc_r`, even though `from_type_strings` used to stamp
+    /// every positional layout Raw.
+    #[test]
+    fn rewrite_op_setfield_gc_tuple_ref_is_kept() {
+        use crate::call::CallControl;
+
+        let owner = "Tuple<*mut PyObject,i64>";
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("tuple_store");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let value =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(value.clone());
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "a GC tuple Ref store must not abort: {:?}",
+            transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .map(|op| op.kind.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, ty: ValueType::Ref(_), .. }
+                            if field.name == "__pos_0"
+                    )
+                })
+            }),
+            "a GC tuple Ref store must stay a FieldWrite"
+        );
+    }
+
+    /// Same owner as `rewrite_op_setfield_gc_tuple_ref_is_kept`: a mutable
+    /// Ref load is `getfield_gc_r`, not `getfield_raw_r`.
+    #[test]
+    fn rewrite_op_getfield_gc_tuple_ref_is_kept() {
+        use crate::call::CallControl;
+
+        let owner = "Tuple<*mut PyObject,i64>";
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("tuple_load");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let result = graph
+            .push_op_var(
+                bb,
+                OpKind::FieldRead {
+                    base,
+                    field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        graph.set_return(bb, Some(result));
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "a GC tuple Ref load must not abort"
+        );
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, ty: ValueType::Ref(_), pure: false, .. }
+                            if field.name == "__pos_0"
+                    )
+                })
+            }),
+            "a GC tuple Ref load must stay a FieldRead"
+        );
+    }
+
+    /// An enum variant that holds a Ref payload is a GC owner even when
+    /// the registered layout still says Raw (no `GcType` impl).
+    #[test]
+    fn rewrite_op_setfield_gc_variant_ref_is_kept() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+
+        let owner = "cellwrite_fixture::CellWrite::InPlaceObject";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "__pos_0".to_string(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let mut graph = FunctionGraph::new("variant_store");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let value =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(value.clone());
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("__pos_0", Some(owner.into())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().all(|block| {
+                block
+                    .operations
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "a GC variant Ref store must not abort: {:?}",
+            transformed
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .map(|op| op.kind.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A scalar-only raw layout that is asked to store a Ref is still
+    /// `setfield_raw_r` (`jtransform.py`).
+    #[test]
+    fn rewrite_op_setfield_raw_scalar_owner_ref_is_aborted() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+
+        let owner = "raw_buffer::RawBuf";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        let word = crate::layout::target_word_size();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "word".to_string(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Unsigned,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let mut graph = FunctionGraph::new("raw_buf_store");
+        let bb = graph.startblock;
+        let base =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.block_mut(bb).inputargs.push(base.clone());
+        let value =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::GcRef);
+        graph.block_mut(bb).inputargs.push(value.clone());
+        graph.push_op_var(
+            bb,
+            OpKind::FieldWrite {
+                base,
+                field: crate::model::FieldDescriptor::new("slot", Some(owner.into())),
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        assert!(
+            transformed.graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::Abort { .. }))
+            }),
+            "a genuinely raw owner storing a Ref must abort"
+        );
+    }
+
+    fn push_vtable_slot_indirect_call(
+        graph: &mut FunctionGraph,
+        receiver: crate::flowspace::model::Variable,
+        extra_args: Vec<crate::flowspace::model::Variable>,
+        trait_root: &str,
+        method_name: &str,
+        result_ty: ValueType,
+        has_result: bool,
+    ) {
+        let funcptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: receiver.clone(),
+                    field: FieldDescriptor::new(
+                        format!("method_{method_name}"),
+                        Some(format!("{trait_root}::{{vtable}}")),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let mut args = vec![receiver];
+        args.extend(extra_args);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs: None,
+                family_key: Some((trait_root.to_string(), method_name.to_string())),
+                result_ty,
+            },
+            has_result,
+        );
+    }
+
     /// Build a graph that calls `receiver.run()` on a `dyn Handler`
     /// receiver with two registered impls, run the rtyper-equivalent
     /// `lower_indirect_calls` pass and then `Transformer::transform`,
     /// and assert the post-jtransform sequence is exactly
-    /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
+    /// `[FieldRead method_*, Live, GuardValue{kind='i'},
     ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
     /// RPython `jtransform.py + 538-553` orthodox port parity.
     #[test]
@@ -35019,13 +35497,13 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args(vec![receiver_var]),
-                result_ty: ValueType::Void,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Void,
             true,
         );
         graph.set_return(graph.startblock, None);
@@ -35041,8 +35519,11 @@ mod tests {
         let ops = &result.graph.block(graph.startblock).operations;
         let post_input = &ops[1..];
         assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
+            matches!(
+                &post_input[0].kind,
+                OpKind::FieldRead { field, .. } if field.name == "method_run"
+            ),
+            "expected FieldRead method_run first, got {:?}",
             post_input[0].kind
         );
         assert!(
@@ -35113,13 +35594,13 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args(vec![receiver_var]),
-                result_ty: ValueType::Void,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Void,
             true,
         );
         graph.set_return(graph.startblock, None);
@@ -35171,7 +35652,7 @@ mod tests {
     /// Runs the full rtyper-equivalent + jtransform pipeline for a
     /// `receiver.m(extras...)` dyn-Trait call and asserts the emitted
     /// op sequence is exactly
-    /// `[VtableMethodPtr, Live, GuardValue{'i'}, CallResidual, Live]`,
+    /// `[FieldRead method_*, Live, GuardValue{'i'}, CallResidual, Live]`,
     /// with the CallResidual's arg-kind distribution matching `expect`
     /// and `result_kind` matching `expect_res_kind`.  Two impls are
     /// registered so `CallKind::Regular` is selected.
@@ -35258,9 +35739,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut args_vars: Vec<crate::flowspace::model::Variable> = vec![receiver_var];
+        let mut extras_vars: Vec<crate::flowspace::model::Variable> = Vec::new();
         for (i, ty) in extras.iter().enumerate() {
-            args_vars.push(
+            extras_vars.push(
                 graph
                     .push_op_var(
                         graph.startblock,
@@ -35275,13 +35756,13 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("T", "m"),
-                args: crate::model::call_args(args_vars),
-                result_ty,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            extras_vars,
+            "T",
+            "m",
+            result_ty,
             has_result,
         );
         graph.set_return(graph.startblock, None);
@@ -35301,8 +35782,11 @@ mod tests {
             .collect();
 
         assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
+            matches!(
+                &post_input[0].kind,
+                OpKind::FieldRead { field, .. } if field.name == "method_m"
+            ),
+            "expected FieldRead method_m first, got {:?}",
             post_input[0].kind,
         );
         assert!(
@@ -35393,16 +35877,14 @@ mod tests {
     // `handle_residual_indirect_call` is an alias for the regular
     // residual-call path (`jtransform.py`): no `int_guard_value` guard
     // and no `IndirectCallTargets` sidecar; only `[residual_call_*, -live-]`.
-    // On the pyre side we additionally retain the `VtableMethodPtr` op
-    // emitted by `lower_indirect_calls` — the rtyper-equivalent layer runs
-    // unconditionally and provides the runtime funcptr `Variable` consumed
-    // by the `CallResidual.funcptr` `CallFuncPtr::Value` operand.
+    // The `{vtable}.method_*` FieldRead is the `ClassRepr.getclsfield`
+    // funcptr consumed by `CallResidual.funcptr` `CallFuncPtr::Value`.
 
     /// Same skeleton as `check_indirect_regular_call_kind` but drops
     /// `find_all_graphs_for_tests`, so `candidate_graphs` stays empty
     /// and `guess_call_kind(op)` falls through to `CallKind::Residual`
     /// via the `graphs_from(op)` call.py fall-through.
-    /// Emit is `[VtableMethodPtr, CallResidual{indirect_targets: None},
+    /// Emit is `[FieldRead method_*, CallResidual{indirect_targets: None},
     /// Live?]` — the trailing `-live-` appears only when the descriptor's
     /// `can_raise` is true, which is the default for non-elidable
     /// family calls.
@@ -35487,9 +35969,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut args_vars: Vec<crate::flowspace::model::Variable> = vec![receiver_var];
+        let mut extras_vars: Vec<crate::flowspace::model::Variable> = Vec::new();
         for (i, ty) in extras.iter().enumerate() {
-            args_vars.push(
+            extras_vars.push(
                 graph
                     .push_op_var(
                         graph.startblock,
@@ -35504,13 +35986,13 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("T", "m"),
-                args: crate::model::call_args(args_vars),
-                result_ty,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            extras_vars,
+            "T",
+            "m",
+            result_ty,
             has_result,
         );
         graph.set_return(graph.startblock, None);
@@ -35530,8 +36012,11 @@ mod tests {
             .collect();
 
         assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
+            matches!(
+                &post_input[0].kind,
+                OpKind::FieldRead { field, .. } if field.name == "method_m"
+            ),
+            "expected FieldRead method_m first, got {:?}",
             post_input[0].kind,
         );
         // Residual path must NOT emit the [Live, GuardValue] prefix —

@@ -1239,6 +1239,11 @@ impl<'a> Lowering<'a> {
         self.guard_word_vars = guard_word.into_iter().map(|v| rewrite(&v)).collect();
         let pointer_arrays = std::mem::take(&mut self.pointer_word_arrays);
         self.pointer_word_arrays = pointer_arrays.into_iter().map(|v| rewrite(&v)).collect();
+        let unsize = std::mem::take(&mut self.unsize_vtable_impl);
+        self.unsize_vtable_impl = unsize
+            .into_iter()
+            .map(|(id, impl_id)| (remap.get(&id).map(Variable::id).unwrap_or(id), impl_id))
+            .collect();
         let niche = std::mem::take(&mut self.niche_disc_vars);
         self.niche_disc_vars = niche
             .into_iter()
@@ -5624,6 +5629,21 @@ pub(in crate::front::mir) fn json_mentions_any_local(
 /// Whether `op` is an `Unsize` cast payload.
 pub(in crate::front::mir) fn cast_kind_is_unsize(op: &serde_json::Value) -> bool {
     op.get("Cast").and_then(|cast| cast.get("Unsize")).is_some() || op.get("Unsize").is_some()
+}
+
+/// TraitImpl id of dest-only Unsize metadata `VTable(TraitRef, ConstExpr)`.
+/// Legacy 3-element `[src, dest, meta]` forms use the last element too.
+pub(in crate::front::mir) fn unsize_cast_vtable_impl_id(
+    cast: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<u64> {
+    let payload = cast
+        .get("Cast")
+        .and_then(|inner| inner.get("Unsize"))
+        .or_else(|| cast.get("Unsize"))?;
+    let meta = payload.as_array()?.last()?;
+    let vtable = meta.get("VTable")?.as_array()?;
+    traitref_impl_id(vtable.first()?, llbc, 0)
 }
 
 /// The raw-buffer array roles of `body`'s locals.

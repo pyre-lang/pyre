@@ -3305,46 +3305,77 @@ impl NamespaceOpcodeHandler for PyFrame {
                 return crate::lazyimport::maybe_reify_str(value, name, w_globals);
             }
         }
-        // `_load_global_fallback` → `_load_global` (`pyopcode.py`):
-        // `space.finditem_str(self.get_w_globals(), varname)`.  finditem_str
-        // takes a borrowed-string fast path for real W_DictObject /
-        // W_ModuleDictObject layouts and dispatches a dict subclass through
-        // the general mapping object, so a raising key `__eq__` propagates
-        // instead of being swallowed as a miss.  A cached miss lands here too
-        // and finds nothing again before the `NameError`.
-        if !w_globals.is_null()
-            && let Some(value) = pyre_object::with_roots!(w_builtin, w_globals =>
-                crate::baseobjspace::finditem_str_named(
-                    w_globals,
-                    name,
-                    self.pycode as PyObjectRef,
-                    nameindex,
-                )
-            )?
-        {
-            return crate::lazyimport::maybe_reify_str(value, name, w_globals);
-        }
-        // `self.get_builtin().getdictvalue(space, varname)`.
-        if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
-            let mut w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
-            if !w_dict.is_null()
-                && let Some(value) = pyre_object::with_roots!(w_dict =>
-                    crate::baseobjspace::finditem_str(w_dict, name)
-                )?
-            {
-                return crate::lazyimport::maybe_reify_str(value, name, w_dict);
-            }
-        }
-        // `pyopcode.py _load_global_failed`: NameError.
-        Err(PyError::oefmt_name_error_text(
-            format!("name '{name}' is not defined"),
-            name,
-        ))
+        _load_global(self, name, self.pycode as PyObjectRef, nameindex)
     }
 
     fn null_value(&mut self) -> Result<Self::Value, PyError> {
         Ok(PY_NULL)
     }
+}
+
+/// `pyopcode.py _load_global`: `space.finditem_str(self.get_w_globals(),
+/// varname)`, then `self.get_builtin().getdictvalue(space, varname)`, then
+/// `_load_global_failed`.
+/// `(pycode, nameindex)` name the `co_names_w` slot the generic
+/// arm wraps lazily; `PY_NULL` / 0 names none (`finditem_str`).
+#[inline]
+pub(crate) fn _load_global(
+    frame: &PyFrame,
+    name: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+) -> Result<PyObjectRef, PyError> {
+    let mut w_globals = frame.get_w_globals();
+    // `_load_global_fallback` → `_load_global` (`pyopcode.py`):
+    // `space.finditem_str(self.get_w_globals(), varname)`.  finditem_str
+    // takes a borrowed-string fast path for real W_DictObject /
+    // W_ModuleDictObject layouts and dispatches a dict subclass through
+    // the general mapping object, so a raising key `__eq__` propagates
+    // instead of being swallowed as a miss.  A cached miss lands here too
+    // and finds nothing again before the `NameError`.
+    // The builtin is read only after this misses, as upstream does.
+    if !w_globals.is_null()
+        && let Some(value) = pyre_object::with_roots!(w_globals =>
+            crate::baseobjspace::finditem_str_named(
+                w_globals,
+                name,
+                pycode,
+                nameindex,
+            )
+        )?
+    {
+        return crate::lazyimport::maybe_reify_str(value, name, w_globals);
+    }
+    let w_builtin = frame.get_builtin();
+    // `self.get_builtin().getdictvalue(space, varname)`.
+    if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
+        let mut w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
+        if !w_dict.is_null()
+            && let Some(value) = pyre_object::with_roots!(w_dict =>
+                crate::baseobjspace::finditem_str(w_dict, name)
+            )?
+        {
+            return crate::lazyimport::maybe_reify_str(value, name, w_dict);
+        }
+    }
+    // `pyopcode.py _load_global_failed`: NameError.
+    Err(PyError::oefmt_name_error_text(
+        format!("name '{name}' is not defined"),
+        name,
+    ))
+}
+
+/// `celldict.py _load_global_fallback(self, varname)` (`@objectmodel.dont_inline`):
+/// the look-inside graph a jitted `LOAD_GLOBAL` calls (`jtransform.py
+/// handle_regular_call` → `inline_call_r_r`).  `varname` is the opcode's
+/// `getname_u(nameindex)`, a constant on the trace.
+///
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph.
+#[inline(never)]
+pub fn _load_global_fallback(frame: PyObjectRef, varname: &str) -> Result<PyObjectRef, PyError> {
+    let frame = unsafe { &*(frame as *const PyFrame) };
+    _load_global(frame, varname, PY_NULL, 0)
 }
 
 impl StackOpcodeHandler for PyFrame {

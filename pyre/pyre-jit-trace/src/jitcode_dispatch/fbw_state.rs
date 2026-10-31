@@ -543,7 +543,6 @@ pub(crate) fn fbw_store_journal_reset() {
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
     FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
-    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
     FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));
@@ -1249,8 +1248,11 @@ fn store_subscr_current_if_callback_free(
             }
             let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
             return Some(
-                pyre_object::w_module_dict_getitem_str(namespace, key_text)
-                    .unwrap_or(std::ptr::null_mut()),
+                pyre_object::w_module_dict_getitem_str(
+                    namespace,
+                    pyre_object::unicodeobject::prebuilt_str_storage(key_text),
+                )
+                .unwrap_or(std::ptr::null_mut()),
             );
         }
         if pyre_object::w_dict_is_empty_strategy(namespace) {
@@ -1983,23 +1985,24 @@ pub fn fbw_foriter_inflight_take(
     let namespace_rolled_back = fbw_namespace_store_rolled_back();
     let committed_effect = body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0;
     if committed_effect || namespace_rolled_back {
-        // Same cursor restore as `fbw_foriter_report_refused_header`, and only
-        // on the half that has committed nothing.  A root walk's non-commit
-        // epilogue leaves the journal in place so a delivery can push the
-        // consumed item; refusing here without putting the cursor back loses
-        // that iteration (`fbw_foriter_item_dropped`).  That is the shape the
-        // rollback was added for: a `GotoIfNotValueNotConcrete` abort on the
-        // first body opcode, whose only standing signal is a namespace binding
-        // that was itself rolled back, so re-consuming replays a body that has
-        // run to none of its stores.
-        //
-        // `committed_effect` is the opposite case and keeps drop-on-abort: an
-        // effect already stands on the live heap for this iteration, and a
-        // rewound cursor would re-run the body and double it.
-        if !committed_effect {
-            fbw_bridge_iter_journal_rollback();
+        // Delivery still refuses: a standing body effect must not also be
+        // pushed onto the header stack (that would yield the item twice).
+        // The live frame is parked at the FOR_ITER header
+        // (`fbw_exit_last_instr_rollback`), so a journaled cursor has to
+        // go back with it — `fbw_foriter_report_refused_header` already
+        // restores unconditionally. Leaving the cursor advanced here is
+        // what drops a `range()` item after BuiltinRange retired
+        // (`attr_instance_shadows_class` / `dict_hash_protocol`: one
+        // `GotoIfNotValueNotConcrete` abort, `fbw_foriter_item_dropped`).
+        // `pyjitpl.py` abort continues `interpret()` from the current
+        // opcode; FBW rewinds, and the cursor restore is that rewind's
+        // compensation. The interpreter's FOR_ITER then re-yields the
+        // restored item once. An unjournaled consume has nothing to put
+        // back, so that item stays dropped.
+        fbw_bridge_iter_journal_rollback();
+        if !stash.consume_journaled {
+            crate::trace::fbw_diag::record_foriter_item_dropped();
         }
-        crate::trace::fbw_diag::record_foriter_item_dropped();
         if let Some((code_ptr, body_pc)) = key {
             super::census_record_foriter_inflight(
                 code_ptr,
@@ -2013,8 +2016,8 @@ pub fn fbw_foriter_inflight_take(
                  body_effect={body_effect} store_journal_len={store_len} \
                  append_journal_len={append_len} unjournaled={unjournaled} \
                  namespace_rolled_back={namespace_rolled_back} \
-                 — restored the iterator cursor so resume re-consumes",
-                body_pc
+                 consume_journaled={} — cursor restored, item not delivered",
+                body_pc, stash.consume_journaled
             );
         }
         return None;
@@ -2109,6 +2112,7 @@ mod foriter_delivery_tests {
     }
 
     fn loop_frame() -> LoopFrame {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code =
             function_code("def f(xs):\n    for x in xs:\n        for y in x:\n            pass\n");
         let units = foriter_units(&code);
@@ -3078,24 +3082,6 @@ pub(crate) fn fbw_branch_abort_stack_take() -> Option<(usize, Vec<OpRef>)> {
     FBW_BRANCH_ABORT_STACK.with(|c| c.borrow_mut().take())
 }
 
-/// Record the executed-effect odometer as the walk enters Python opcode
-/// `py_pc` (see [`FBW_OPCODE_ENTRY_EFFECTS`]).
-pub(crate) fn fbw_note_opcode_entry_effects(py_pc: usize) {
-    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(Some((py_pc, fbw_executed_effect_count()))));
-}
-
-/// The odometer sampled on entry to `py_pc`, for a leg that resumes the
-/// interpreter there.  `None` — no sample, or one taken at a different opcode —
-/// leaves the rewind unproven, which [`walk_end_resume_provable`] declines.
-///
-/// [`walk_end_resume_provable`]: crate::trace::walk_end_resume_provable
-pub(crate) fn fbw_opcode_entry_effects_at(py_pc: usize) -> Option<usize> {
-    FBW_OPCODE_ENTRY_EFFECTS.with(|c| match c.get() {
-        Some((sampled_py_pc, effects)) if sampled_py_pc == py_pc => Some(effects),
-        _ => None,
-    })
-}
-
 /// gh#467 bump the executed-effect odometer (see [`FBW_EXECUTED_EFFECT_COUNT`]).
 ///
 /// `site` names the bumping journal or fold.  The forward-flush gate reads only
@@ -3425,7 +3411,10 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
     };
     let _ = op_pc;
     let boxed = match ty {
-        Type::Int => crate::state::wrapint(ctx.trace_ctx, value),
+        Type::Int => {
+            assert_int_bank_box(value, "walker_box_int");
+            crate::state::wrapint(ctx.trace_ctx, value)
+        }
         Type::Float => crate::state::wrapfloat(ctx.trace_ctx, value),
         Type::Ref | Type::Void => value,
     };

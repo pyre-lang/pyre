@@ -11,6 +11,81 @@
 
 use super::*;
 
+/// Concrete int currently in a standard-virtualizable static box.
+///
+/// `pyjitpl.py` `_opimpl_setfield_vable` writes `virtualizable_boxes[index]
+/// = valuebox`; `emit_vsd!` / `setfield_vable_i` keep `valuestackdepth`
+/// there.  Resume copies that box (`resume.py` `ResumeDataVirtualAdder`).
+fn vable_static_int<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, name: &str) -> Option<i64> {
+    let idx = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .and_then(|info| info.static_field_index_by_name(name))?;
+    match ctx
+        .trace_ctx
+        .virtualizable_box_at(idx)
+        .and_then(|b| ctx.trace_ctx.concrete_of_opref(b))
+    {
+        Some(Value::Int(n)) if n >= 0 => Some(n),
+        _ => None,
+    }
+}
+
+/// `dispatch_bytecode` stored `self.last_instr = next_instr` at the
+/// shared arm (`setfield_vable_i` from the `next_instr` register).
+/// That next_instr is the Python opcode whose `goto` entered the copy;
+/// use it as orgpc when the walk is still inside that copy
+/// (`hold_uses_vable_last_instr`).  `pmg_shared` does not write
+/// `last_instr`, so a pmg hold leaves orgpc on the entering opcode's
+/// `live_before` py.
+pub(super) fn shared_hook_next_instr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<usize> {
+    let session = ctx.session.borrow();
+    if !session.hold_opcode_live_before || !session.hold_uses_vable_last_instr {
+        return None;
+    }
+    // The shared copy has no single Python PC. The active MIFrame's
+    // merge green names its entering instruction, including inlined frames;
+    // the root virtualizable's last_instr belongs only to the root frame.
+    let entering_pc = session.current_debug_merge_point_py_pc();
+    drop(session);
+    entering_pc
+        .map(|pc| pc as usize)
+        .or_else(|| vable_static_int(ctx, "last_instr").map(|n| n as usize))
+}
+
+/// Register banks frozen when the walk entered the shared
+/// `dispatch_bytecode` copy. Frozen banks are the entering opcode's
+/// image and pair only with a resume coordinate before the copy; a
+/// coordinate inside the copy reads the live banks
+/// (`get_list_of_active_boxes`). `None` outside the copy or if the hold
+/// rose before the banks were snapshotted.
+struct HeldHookBanks {
+    i: Vec<OpRef>,
+    r: Vec<OpRef>,
+    f: Vec<OpRef>,
+}
+
+fn held_hook_banks<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    resume_jit_pc: usize,
+) -> Option<HeldHookBanks> {
+    let session = ctx.session.borrow();
+    if session.hold_opcode_live_before
+        && session.held_registers_valid
+        && resume_jit_pc < session.held_entry_jit_pc
+    {
+        Some(HeldHookBanks {
+            i: session.held_registers_i.clone(),
+            r: session.held_registers_r.clone(),
+            f: session.held_registers_f.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 /// The JitCode `op_pc` is an offset into — the body currently being walked.
 ///
 /// `fbw_mode.snapshot_sym.jitcode()` is the eval-loop portal. Pairing that
@@ -18,7 +93,7 @@ use super::*;
 /// `can_decode_live_vars` rejects (`resume.py` `jitcodes[jitcode_pos]`).
 /// Inline callees already name their body through [`InlineCalleeConsts`]; a
 /// top-level per-function walk stamps [`WalkSession::recording_jitcode_index`].
-fn walked_snapshot_jitcode<Sym: WalkSym>(
+pub(crate) fn walked_snapshot_jitcode<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<crate::state::JitCode> {
     let index = if let Some(consts) = ctx.inline_callee_consts {
@@ -58,6 +133,26 @@ fn trailing_live_marker(payload: &crate::PyJitCode, call_pc: usize) -> Option<us
     let marker =
         crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), call.next_pc)?;
     (marker.opname == "live").then_some(marker.pc)
+}
+
+/// op2 `-live-` immediately after a `jit_merge_point`.
+///
+/// `pyjitpl.py` `MIFrame.run_once` assigns `self.pc = position` after
+/// decoding operands and before `opimpl_jit_merge_point`. That position is
+/// op2 (`jtransform.py` `ops + [op3, op1, op2]`). A guard synthesized in
+/// the merge handler (`record_portal_tracefunc_guard` GuardIsnull, a
+/// pending `GUARD_NOT_INVALIDATED` flush) is generated while the walk
+/// cursor is still the merge offset; bind the same post-decode live.
+pub(crate) fn jit_merge_point_op2_live(payload: &crate::PyJitCode, op_pc: usize) -> Option<usize> {
+    let op = crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), op_pc)?;
+    if op.opname != "jit_merge_point" {
+        return None;
+    }
+    trailing_live_marker(payload, op_pc).filter(|&pc| {
+        payload
+            .jitcode
+            .can_decode_live_vars(pc, crate::state::op_live())
+    })
 }
 
 /// The `-live-` directly before `op_pc`: the liveness a plain guard reads
@@ -139,6 +234,28 @@ pub(crate) fn after_residual_guard_marker(
     })
 }
 
+/// `GUARD_NOT_FORCED` blackhole must start at the `-live-` immediately after
+/// the residual (`pyjitpl.py` `get_list_of_active_boxes(after_residual_call=True)`
+/// `pc = self.pc`).  The next jitcode insn is then `setarrayitem_vable` of
+/// dest (`push_and_bump!` after `emit_frontend_simple_call`).
+///
+/// `after_residual_call_resume_for_jitcode_pc` names the NEXT Python opcode's
+/// start live, which sits *past* that store.  Blackhole then CRNs into the
+/// interpreter with dest never pushed (`type_name_of` / `popvalue` of NULL).
+fn gnf_after_residual_live_marker(
+    payload: &crate::PyJitCode,
+    op_pc: usize,
+    live_after_jit_pc: usize,
+) -> Option<usize> {
+    trailing_live_marker(payload, op_pc).or_else(|| {
+        (live_after_jit_pc != usize::MAX
+            && payload
+                .jitcode
+                .can_decode_live_vars(live_after_jit_pc, crate::state::op_live()))
+        .then_some(live_after_jit_pc)
+    })
+}
+
 /// Read the Python PC paired with a native resume word.  The codewriter builds
 /// this table from Python-PC keys, including the same forward trivia skip as
 /// `trivia_normalized_py_pc_for_jitcode_pc`; capture deliberately never derives
@@ -167,6 +284,109 @@ pub(crate) fn vstack_box_for_snapshot(value: OpRef) -> Option<OpRef> {
     (value != OpRef::NONE).then_some(value)
 }
 
+/// True when the vable stack slot is empty or ConstPtr(NULL).
+///
+/// Helper-collapse `popvalue` stores NULL into those slots; a jump's
+/// `opimpl_goto_if_not` pop also stores NULL but its published vsd no
+/// longer names the slot, so a NULL-slot overlay is empty there.
+fn vable_stack_slot_is_null<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, idx: usize) -> bool {
+    let Some(box_) = ctx.trace_ctx.virtualizable_box_at(idx) else {
+        return true;
+    };
+    if box_ == OpRef::NONE {
+        return true;
+    }
+    matches!(
+        ctx.trace_ctx.concrete_of_opref(box_),
+        Some(Value::Ref(majit_ir::GcRef::NULL))
+    )
+}
+
+/// `MIFrame.make_result_of_lastop` writes dest to the call's `>r` byte.
+/// After-residual resume skips the current opcode's `pushvalue`, so dest
+/// must occupy TOS in the vable section. F4 shares a register color across
+/// depths; projecting every live Ref through pcdep writes leftover
+/// callable into that slot. A 0 twin is the pre-push count: do not
+/// invent a TOS, or leftover callable is published as dest.
+fn residual_dest_on_post_call_tos<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    walked: &crate::state::JitCode,
+    op_pc: usize,
+    nlocals: usize,
+    nvs: usize,
+) -> Option<(usize, OpRef)> {
+    let code = walked.payload.jitcode.code.as_slice();
+    let call = decode_op_at(code, op_pc)?;
+    if call.result_argcode() != 'r' {
+        return None;
+    }
+    let dest_color = usize::from(*code.get(call.next_pc.checked_sub(1)?)?);
+    let dest = ctx.registers_r.get(dest_color)?;
+    if dest == OpRef::NONE || dest.ty() != Some(majit_ir::Type::Ref) {
+        return None;
+    }
+    // A 0 twin is the pre-push count at the CALL (`depth_after_residual`
+    // after pops, before `pushvalue`). After-residual resume skips that
+    // `pushvalue`, so dest is TOS (`make_result_of_lastop`).
+    let post_call_depth = walked
+        .payload
+        .depth_after_residual_for_jitcode_pc(op_pc)
+        .map(usize::from)?
+        .max(1);
+    let tos = post_call_depth - 1;
+    let semantic_slot = nlocals.checked_add(tos)?;
+    Some((nvs + semantic_slot, dest))
+}
+
+/// Capture-only overlay of the walk vstack onto the portal virtualizable.
+///
+/// Helper-collapse guards resume at the Python opcode start and re-pop.
+/// `emit_popvalue_ref!` already stored NULL in those slots; the vstack
+/// mirror still holds the opcode-entry boxes. Skip when an inlined
+/// Python callee owns the mirror — those boxes are not portal slots.
+fn overlay_vstack_on_portal_vable_for_arm_capture<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Vec<(usize, Option<OpRef>)> {
+    if !ctx.vstack_valid {
+        return Vec::new();
+    }
+    if ctx.session.borrow().inline_depth() > 0 {
+        return Vec::new();
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Vec::new();
+    }
+    let sym = unsafe { &*sym_ptr };
+    if !sym.owns_virtualizable_shadow() {
+        return Vec::new();
+    }
+    let nlocals = sym.nlocals();
+    // `capture_vstack` is the containing opcode's entry mirror
+    // (`WalkFrameStateData::capture_vstack`). `ctx.vstack_depth` is the
+    // walk-current depth, already 0 after `emit_popvalue` SET none, and a
+    // transparent helper's `SubWalkFrame` used to start at depth 0 with an
+    // empty mirror. Iterating the entry image restores the operands
+    // helper-collapse re-pops (`COMPARE_OP` depth 2, `BINARY_OP` ditto).
+    let vstack_boxes = ctx.frame_state.borrow().capture_vstack();
+    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let mut saved = Vec::new();
+    for s in 0..vstack_boxes.len() {
+        let v = vstack_boxes[s];
+        let Some(v) = vstack_box_for_snapshot(v) else {
+            continue;
+        };
+        let idx = nvs + nlocals + s;
+        let old = ctx.trace_ctx.virtualizable_box_at(idx);
+        // Portal helper-collapse: write this frame's opcode-entry mirror
+        // into the portal store so re-pop sees the push. An inlined
+        // callee already returned above (`inline_depth() > 0`).
+        saved.push((idx, old));
+        ctx.trace_ctx.set_virtualizable_box_at(idx, v);
+    }
+    saved
+}
+
 /// `generate_guard` (`pyjitpl.py`) keys `after_residual_call`
 /// on the guard opcode itself: `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION` /
 /// `GUARD_NOT_FORCED` / `GUARD_ALWAYS_FAILS` resume *after* the residual
@@ -185,8 +405,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 
 /// `jit_merge_point` inside the Python-opcode floor that contains `jit_pc`.
 ///
-/// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
-/// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
+/// Loop-header py_pcs lower `portal_merge_greens` (`goto pmg_shared`) at
+/// the floor and `jit_merge_point` later in the same `py_floor_by_jit_pc`
+/// region. A guard inside `pmg_shared` resumes at its own `-live-`.
 pub(super) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
@@ -332,17 +553,35 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_scoped<Sym: WalkSym>(
     op_pc: usize,
     scope: GuardCaptureScope,
 ) -> Result<(), DispatchError> {
-    let after_residual_call = matches!(
-        ctx.trace_ctx.last_guard_opcode(),
-        Some(
-            OpCode::GuardException
-                | OpCode::GuardNoException
-                | OpCode::GuardNotForced
-                | OpCode::GuardAlwaysFails
+    // `pyjitpl.py generate_guard` keys `after_residual_call` on the
+    // opcode (`GUARD_EXCEPTION` included). Shared `dispatch_bytecode`
+    // residuals capture at the `goto L_shared` instead, and that
+    // startpoint must not take the after-residual advance
+    // (`GuardCaptureScope::preserve_vable_last_instr`).
+    let after_residual_call = if scope.preserve_vable_last_instr {
+        false
+    } else {
+        matches!(
+            ctx.trace_ctx.last_guard_opcode(),
+            Some(
+                OpCode::GuardException
+                    | OpCode::GuardNoException
+                    | OpCode::GuardNotForced
+                    | OpCode::GuardAlwaysFails
+            )
         )
-    );
+    };
+    // Shared `dispatch_bytecode` already stored `last_instr = next_instr`
+    // (`setfield_vable_i`).  `py_pc - 1` would replace that box — the
+    // same OpRef the dispatch switch still reads — with a non-key, so
+    // `opimpl_switch` records the miss path (`GuardFalse` per case) and
+    // the compiled loop is thousands of ops that deopt immediately.
+    // `GuardCaptureScope.preserve_vable_last_instr` is this skip.
+    let preserve_vable_last_instr =
+        scope.preserve_vable_last_instr || ctx.session.borrow().hold_opcode_live_before;
     let scope = GuardCaptureScope {
         residual_call_catch_resume: scope.residual_call_catch_resume || after_residual_call,
+        preserve_vable_last_instr,
         ..scope
     };
     walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, after_residual_call, scope)
@@ -365,12 +604,21 @@ pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
     let session = ctx.session.borrow();
+    // Helper levels (`w_code == 0`) sit on `framestack` so capture can
+    // append their sections, but they are not Python `MIFrame`s. Counting
+    // them in `inline_depth()` desyncs the parent-chain predicate against
+    // paused Python callers (`capture_resumedata` over Python frames).
     let n_parents = session
         .framestack
         .iter()
-        .filter(|frame| !frame.parents.is_empty())
+        .filter(|frame| !frame.is_portal && frame.w_code != 0 && !frame.parents.is_empty())
         .count();
-    inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
+    let n_callees = session
+        .framestack
+        .iter()
+        .filter(|frame| !frame.is_portal && frame.w_code != 0)
+        .count();
+    inline_snapshot_has_complete_parent_chain(n_parents, n_callees)
 }
 
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
@@ -416,6 +664,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // `after_residual_guard_marker`). Deopt runs the helper from the
     // guard to its return; nothing before the guard runs twice.
     //
+    // A helper sub-walk with paused Python parents takes
+    // `walker_capture_transparent_helper_snapshot`, which encodes those
+    // parents at CALL `next_pc` dest-cleared and appends one section per
+    // live helper (`collect_live_helper_guard_sections`); parents that
+    // are images of those live helpers are dropped. A helper
+    // entered without a paused caller (Root GET_ITER) still collapses to
+    // the containing Python opcode.
+    //
     // `opencoder.py create_top_snapshot` writes vable_array +
     // vref_array on the top snapshot. Feed the trace-time vable/vref
     // shadow through. Empty when no virtualizable / virtualref is live,
@@ -435,6 +691,33 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
     if let Some(result) = scope.finished_callee_result {
         return walker_capture_finished_callee_snapshot(ctx, op_pc, result);
+    }
+    // A guard inside a translated helper (`run_sub_jitcode_walk_from`)
+    // resumes in that helper (`MetaInterp.capture_resumedata` over the
+    // whole `framestack`, helper `MIFrame` included). Do not wait for
+    // `walker_inline_guard_resumes_in_callee`: a Root helper at the
+    // portal has no Python inline depth, and `inline_depth()` counting
+    // `w_code==0` would desync the parent-chain predicate.
+    if ctx.fbw_mode.transparent_helper_subwalk {
+        let parent_frames = {
+            let session = ctx.session.borrow();
+            session
+                .framestack
+                .iter()
+                .flat_map(|frame| frame.parents.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        if !parent_frames.is_empty() {
+            return walker_capture_transparent_helper_snapshot(
+                ctx,
+                op_pc,
+                after_residual_call,
+                parent_frames,
+                scope.guard_stamp,
+            );
+        }
+        // Root helper with no paused caller (a non-CALL entry such as
+        // GET_ITER): fall through to the containing-opcode collapse.
     }
     // Inline sub-walk: the guard's `op_pc` is a *callee* coordinate that
     // does not exist in the outer (`full_body_sym`) jitcode's py_pc→jitcode
@@ -470,6 +753,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         // Numbered helper levels number their callers plus the helper
         // sections (`capture_resumedata`). The Python levels below them take
         // the same full-chain rule (`numbered_helper_guard_resume`).
+        // GuardNoOverflow / GuardOverflow collapses to the caller's CALL
+        // (`fibpair` `return (b, a + b)`) with a post-pop image.
         let helper_chain = if ctx.fbw_mode.transparent_helper_subwalk {
             ctx.session.borrow().helper_chain()
         } else {
@@ -490,14 +775,30 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     return walker_capture_transparent_helper_snapshot(
                         ctx,
                         op_pc,
+                        after_residual_call,
                         frames,
                         scope.guard_stamp,
                     );
                 }
-                // Fall through to the root portal's CALL boundary below.
-                NumberedHelperGuard::CallerBoundary => {}
+                // capture_resumedata / get_list_of_active_boxes: the helper
+                // committed nothing, so the portal resumes at the CALL op
+                // itself (orgpc = that instruction). The -live- at
+                // orgpc - SIZE_LIVE_OP is the live register window.
+                // Without that `-live-` the guard falls
+                // through to the opcode-entry image below.
+                NumberedHelperGuard::CallerBoundary => {
+                    if walker_capture_caller_call_snapshot(ctx, op_pc, scope.guard_stamp).is_some()
+                    {
+                        return Ok(());
+                    }
+                }
             }
-        } else if walker_inline_guard_resumes_in_callee(ctx) {
+        } else if walker_inline_guard_resumes_in_callee(ctx)
+            || matches!(
+                ctx.trace_ctx.last_guard_opcode(),
+                Some(OpCode::GuardNoOverflow | OpCode::GuardOverflow)
+            )
+        {
             // A STRICT straight-line callee (gh#420) whose own frame is not
             // MF-snapshot-able (a kept operand-stack temp the sub-walk does not
             // mirror) propagates the `Unsupported` error the same as the branch
@@ -539,6 +840,20 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // a try-block (its per-CodeObject jitcode emitted a post-call
             // catch); the JitCode resume coordinate then selects that catch.
             let mut marker_call_jit_pc: Option<usize> = None;
+            // `generate_guard(..., resumepc=orgpc)`: a guard inside the
+            // shared `dispatch_bytecode` copy (`_establish_nullity` on
+            // `debugdata` / `w_f_trace`, the `GUARD_VALUE` on the
+            // reloaded `last_instr`, any residual in the hook) belongs
+            // to the Python opcode whose `goto` entered that copy.
+            // Hold keeps that opcode's `-live-` as `live_before_jit_pc`.
+            // A hook residual is not a Python CALL: do not advance
+            // past the entering opcode.
+            let in_shared_hook = ctx.session.borrow().hold_opcode_live_before;
+            let map_pc = if in_shared_hook && ctx.live_before_jit_pc != usize::MAX {
+                ctx.live_before_jit_pc
+            } else {
+                op_pc
+            };
             let (py_pc, jitcode_index, num_instrs) = unsafe {
                 let jc = &walked_owned;
                 // Forward py twin first (#73 phase-3): equals the containing
@@ -546,16 +861,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // containing lookup survives for the empty-twin class.
                 let mut py = jc
                     .payload
-                    .forward_py_pc_for_jitcode_pc(op_pc)
+                    .forward_py_pc_for_jitcode_pc(map_pc)
                     .unwrap_or_else(|| {
                         crate::py_coord::note_empty_twin_fallback(
                             "capture_seam",
                             jc.index,
-                            op_pc as i32,
+                            map_pc as i32,
                         );
                         crate::py_coord::containing_py_pc_for_jitcode_pc(
                             &jc.payload.metadata,
-                            op_pc,
+                            map_pc,
                         )
                     });
                 // A resolved py must be a real opcode, never Python trivia
@@ -572,6 +887,17 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 if !jc.payload.code_ptr.is_null() {
                     let code = &*jc.payload.code_ptr;
                     py = skip_python_trivia_forward(code, py as usize) as u32;
+                    // Shared-head `setfield last_instr` already wrote the
+                    // merge-green next_instr (`dispatch_bytecode`).  That
+                    // value is this opcode's start; mapping the shared
+                    // copy's jitcode pc would pick a switch-union twin.
+                    // Residual calls in the hook (run_trace_func) keep
+                    // the same entering opcode.
+                    if in_shared_hook {
+                        if let Some(next) = shared_hook_next_instr(ctx) {
+                            py = skip_python_trivia_forward(code, next) as u32;
+                        }
+                    }
                     // Entry-resume capture: the carried coordinate is the
                     // authority; take its forward-py twin (the same pairing
                     // the decoder resolves) instead of the inversion above,
@@ -605,7 +931,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // carry the CALL jitcode offset so the blackhole resumes at
                     // the call's OWN catch and routes the raise to the enclosing
                     // handler instead of escaping the frame.
-                    if after_residual_call {
+                    if after_residual_call && !in_shared_hook {
                         let call_py_pc = py;
                         let exact_after_marker = jc
                             .payload
@@ -615,8 +941,20 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         py = exact_after_marker
                             .and_then(|marker| jc.payload.forward_py_pc_for_jitcode_pc(marker))
                             .unwrap_or_else(|| {
-                                crate::pyjitpl::semantic_fallthrough_pc(code, py as usize) as u32
+                                crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc as usize)
+                                    as u32
                             });
+                        // GuardException only: a `-live-` still tagged with
+                        // the residual's own Python pc (getitem inside
+                        // BINARY_OP) must not keep `last_instr` on that
+                        // opcode. Unrestricted fallthrough broke pickle
+                        // GNF (`GuardNotForced` is also after-residual).
+                        if py == call_py_pc
+                            && ctx.trace_ctx.last_guard_opcode() == Some(OpCode::GuardException)
+                        {
+                            py = crate::pyjitpl::semantic_fallthrough_pc(code, call_py_pc as usize)
+                                as u32;
+                        }
                         let call_pc_has_catch = pyre_interpreter::pycode::lookup_exceptiontable(
                             &code.exceptiontable,
                             call_py_pc * 2,
@@ -642,18 +980,74 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // #67/#124: synthetic loop-close guard pc overshoots past the last
             // Python opcode → resume at the trace's entry py (loop header).
             let loop_close_overshoot = py_pc as usize >= num_instrs;
-            let py_pc = if loop_close_overshoot {
+            let mut py_pc = if loop_close_overshoot {
                 ctx.entry_py_pc()
             } else {
                 py_pc
             };
+            // `pyjitpl.py flush_guard_not_invalidated` snapshots at the
+            // QuasiimmutField's orgpc (the current opcode). Flatten can
+            // make `forward_py_pc_for_jitcode_pc` of a carried header
+            // marker inherit a later opcode; keep the merge-point green.
+            if ctx.trace_ctx.last_guard_opcode() == Some(OpCode::GuardNotInvalidated) {
+                if let Some(dmp) = ctx.session.borrow().current_debug_merge_point_py_pc() {
+                    py_pc = dmp;
+                }
+            }
+            // `pyjitpl.py generate_guard(resumepc=orgpc)` → `capture_resumedata`
+            // → `get_list_of_active_boxes` at the liveness of orgpc
+            // (`jitcode.py get_live_vars_info` backs up to the preceding
+            // `-live-`). A walker-emitted GuardClass at an `inline_call`
+            // pc is a startpoint whose previous instruction is not
+            // `-live-`; `can_decode_live_vars(op_pc)` is then false.
+            // Falling through rewrites `last_instr` to the containing
+            // opcode entry and leftover-fill re-runs FOR_ITER. The
+            // `-live-` `generate_guard` actually reads is
+            // `live_before_jit_pc` / the immediately preceding marker.
+            let op_live = crate::state::op_live();
+            let orgpc_live_pc = if walked_owned
+                .payload
+                .jitcode
+                .can_decode_live_vars(op_pc, op_live)
+            {
+                Some(op_pc)
+            } else if ctx.live_before_jit_pc != usize::MAX
+                && walked_owned
+                    .payload
+                    .jitcode
+                    .can_decode_live_vars(ctx.live_before_jit_pc, op_live)
+            {
+                Some(ctx.live_before_jit_pc)
+            } else {
+                preceding_live_marker(&walked_owned.payload, op_pc).filter(|&pc| {
+                    walked_owned
+                        .payload
+                        .jitcode
+                        .can_decode_live_vars(pc, op_live)
+                })
+            };
+            let orgpc_resume = scope.orgpc_resume
+                && !after_residual_call
+                && !in_shared_hook
+                && scope.carried_resume_jit_pc.is_none()
+                && scope.liveness_jit_pc.is_none()
+                && !loop_close_overshoot
+                && orgpc_live_pc.is_some();
+            if scope.orgpc_resume && !orgpc_resume && fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[orgpc-fallback] pc={op_pc} guard={:?} decodable={}",
+                    ctx.trace_ctx.last_guard_opcode(),
+                    walked_owned
+                        .payload
+                        .jitcode
+                        .can_decode_live_vars(op_pc, op_live),
+                );
+            }
             // The three resume-depth consumers below (vstack reconcile,
             // valuestackdepth publication, and vable stack sync) share one
-            // JitCode-PC twin. Plain guards key their trivia twin at `op_pc`;
-            // after-residual guards key the same family at their post-call
-            // marker. A loop-close overshoot falls back to entry_py_pc and has
-            // no corresponding op_pc-derived twin, so it retains the legacy
-            // Python-PC lookup below.
+            // depth. After-residual guards key the post-call marker twin;
+            // plain guards use `depth_at_py_pc[py_pc]` (interpreter
+            // restart). A loop-close overshoot falls back to entry_py_pc.
             let resume_depth_twin: Option<u16> = unsafe {
                 let jc = &walked_owned;
                 if loop_close_overshoot {
@@ -669,14 +1063,24 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // liveness at the resume py (the forward twin above),
                     // exactly what the decode derives.
                     None
-                } else if after_residual_call {
+                } else if after_residual_call && !in_shared_hook {
                     jc.payload
                         .after_residual_marker_for_jitcode_pc(op_pc)
                         .or_else(|| jc.payload.after_residual_call_resume_for_jitcode_pc(op_pc))
                         .or_else(|| trailing_live_marker(&jc.payload, op_pc))
                         .and_then(|marker| jc.payload.depth_trivia_for_jitcode_pc(marker))
                 } else {
-                    jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+                    // Interpreter resume restarts the Python opcode
+                    // (`last_instr + 1`).  `valuestackdepth` is that
+                    // opcode's entry depth (`depth_at_py_pc[py_pc]`),
+                    // the same number `collect_outer_active_boxes`
+                    // uses for `valid_stack_only`.  The jitcode-pc
+                    // trivia twin at a shared `dispatch_bytecode`
+                    // copy is the switch-union peak (`liveness.py`
+                    // `SwitchDictDescr.follow_label`); publishing it
+                    // made `PyFrame::push` index past
+                    // `locals_cells_stack_w`.
+                    None
                 }
             };
             // `capture_resumedata(after_residual_call=True)` snapshots the
@@ -700,7 +1104,18 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // idempotent: a `SWAP` applied twice is the identity, so the two
             // slots it exchanged keep their pre-swap order for the rest of the
             // walk and every later guard snapshot publishes them crossed.
-            if after_residual_call && ctx.vstack_valid && py_pc != ctx.vstack_cur_pypc {
+            // After-residual already advanced `py_pc` to the next opcode;
+            // opcode-start resume (`GuardClass` on COMPARE_OP, overflow
+            // on BINARY_OP) may still have `vstack_cur_pypc` on the
+            // predecessor (`LOAD_CONST` / `LOAD_FAST`) because
+            // `step_vstack_mirror` only moves at a walked jitcode
+            // boundary.  Capture then overlayed `depth_at_py_pc[py_pc]`
+            // slots onto a shorter mirror and the extra slot stayed
+            // NULL (`comparison on null operand`).  The same transition
+            // the next `step_vstack_mirror` would make: apply it here
+            // so the snapshot sees the resume opcode's entry stack.
+            if !orgpc_resume && !in_shared_hook && ctx.vstack_valid && py_pc != ctx.vstack_cur_pypc
+            {
                 let jc = &walked_owned;
                 let code_ptr = jc.payload.code_ptr;
                 if !code_ptr.is_null() {
@@ -743,76 +1158,89 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 saved_vable_scalars = Some(crate::trace_opcode::save_vable_resume_scalars(
                     ctx.trace_ctx,
                 ));
-                let last_instr_value = py_pc as i64 - 1;
-                let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                    ctx.trace_ctx,
-                    "last_instr",
-                    last_instr_op,
-                    Value::Int(last_instr_value),
-                );
-                // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
-                // virtualizable section WHILE the residual is running. Its
-                // result belongs to the MIFrame's post-call registers, but
-                // the interpreter has not pushed it yet. Preserve the stack
-                // before the post-call depth/operand overlay below, otherwise
-                // forcing reads an unwritten result home as a GC Ref.
-                // Do publish last_instr first: the walker does not maintain
-                // that scalar at each opcode, and callers inspecting this
-                // frame must see the current call, not the last merge point.
-                let guard_opcode = ctx.trace_ctx.last_op_opcode();
-                // Publish `valuestackdepth` for THIS guard's resume
-                // coordinate the same way `last_instr` is published above.
-                // `sym.valuestackdepth` is NOT usable: the walker never
-                // crosses `set_orgpc`, so that scalar keeps the loop-entry
-                // inputarg the trace was seeded with (a loop-invariant the
-                // optimizer folds to a constant = the loop-header depth).  A
-                // guard that resumes at a different depth — the `while`
-                // condition branch, or a may-force call whose
-                // `semantic_fallthrough_pc` lands on an opcode that keeps an
-                // operand-stack temp (`#124`) — then carries the wrong depth
-                // into its snapshot.  The resume reader writes this scalar
-                // into `frame.valuestackdepth`; an under-count hides the kept
-                // operand (the interpreter resumes thinking the stack is
-                // shallower than it is), and `setup_bridge_sym` derives
-                // `stack_only = valuestackdepth - nlocals` from it
-                // (`state.rs` Part 1), so a wrong count desyncs the bridge's
-                // operand-stack slots.  Compute the depth at the resume py_pc
-                // the SAME way the encoder (`collect_outer_active_boxes`)
-                // derives `valid_stack_only` — `nlocals +
-                // depth_at_py_pc[py_pc]` — so the published scalar stays
-                // symmetric with the active-box layout.  Fall back to
-                // `sym.valuestackdepth` only when liveness is unavailable.
-                // The publish is snapshot-only like `last_instr`.
-                let vsd_value = unsafe {
-                    let jc = &walked_owned;
-                    if jc.payload.code_ptr.is_null() {
-                        sym.valuestackdepth() as i64
-                    } else {
-                        match resume_depth_twin {
-                            Some(d) => (sym.nlocals() + d as usize) as i64,
-                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .map(|d| (sym.nlocals() + d as usize) as i64)
-                                .unwrap_or(sym.valuestackdepth() as i64),
-                        }
+                if !orgpc_resume && !scope.preserve_vable_last_instr {
+                    let last_instr_value = py_pc as i64 - 1;
+                    let last_instr_op = ctx.trace_ctx.const_int(last_instr_value);
+                    crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+                        ctx.trace_ctx,
+                        "last_instr",
+                        last_instr_op,
+                        Value::Int(last_instr_value),
+                    );
+                }
+                // Walk-current last_instr / valuestackdepth already sit in
+                // the boxes (`setfield_vable` at orgpc). Skip the opcode-entry
+                // rewrite for jitcode-native orgpc resume.
+                if !orgpc_resume {
+                    // `ResumeGuardForcedDescr.handle_async_forcing` consumes the
+                    // virtualizable section WHILE the residual is running. Its
+                    // result belongs to the MIFrame's post-call registers, but
+                    // the interpreter has not pushed it yet. Preserve the stack
+                    // before the post-call depth/operand overlay below, otherwise
+                    // forcing reads an unwritten result home as a GC Ref.
+                    // Do publish last_instr first: the walker does not maintain
+                    // that scalar at each opcode, and callers inspecting this
+                    // frame must see the current call, not the last merge point.
+                    let guard_opcode = ctx.trace_ctx.last_guard_opcode();
+                    // Publish `valuestackdepth` for THIS guard's resume
+                    // coordinate the same way `last_instr` is published above.
+                    // `emit_vsd!` already stored the walk's *current* depth
+                    // (`pyframe.py` `popvalue` decrements before the helper
+                    // that emits GuardNoOverflow / GuardClass).  Opcode-start
+                    // resume (`last_instr + 1`) re-executes those pops, so the
+                    // snapshot must carry `nlocals + depth_at_py_pc[py_pc]` —
+                    // the same number `collect_outer_active_boxes` uses for
+                    // `valid_stack_only`.  After-residual guards key
+                    // `resume_depth_twin` at the post-call marker.  The
+                    // jitcode-pc trivia twin at a shared `dispatch_bytecode`
+                    // copy is the switch-union peak; `resume_depth_twin` is
+                    // `None` on that path and this falls back to the Python-PC
+                    // table, which is the entering opcode's entry depth.
+                    //
+                    // `GUARD_NOT_FORCED` is the exception.  `resume.py`
+                    // `force_from_resumedata` + `handling_async_forcing` consume
+                    // the vable WHILE the residual is running: dest of
+                    // CallMayForce lives in FRAME fail_args (`make_result_of_lastop`
+                    // before `generate_guard`) and `setarrayitem` has not run.
+                    // `resume_depth_twin` / `depth_at_py_pc[next]` is the next
+                    // opcode's *entry* depth (POST-push, dest slot live).  Publishing
+                    // that scalar against the still-pre-push array makes the dest
+                    // slot a live TOS holding leftover.  `PyreSym.valuestackdepth()`
+                    // can still be the opcode-entry count, so do not rewrite
+                    // the boxes: keep `emit_vsd!` after the pops.
+                    if !matches!(guard_opcode, Some(OpCode::GuardNotForced)) {
+                        let vsd_value = unsafe {
+                            let jc = &walked_owned;
+                            if jc.payload.code_ptr.is_null() {
+                                sym.valuestackdepth() as i64
+                            } else {
+                                match resume_depth_twin {
+                                    Some(d) => (sym.nlocals() + d as usize) as i64,
+                                    None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                        .depth_at_py_pc()
+                                        .get(py_pc as usize)
+                                        .copied()
+                                        .map(|d| (sym.nlocals() + d as usize) as i64)
+                                        .unwrap_or(sym.valuestackdepth() as i64),
+                                }
+                            }
+                        };
+                        let vsd_op = ctx.trace_ctx.const_int(vsd_value);
+                        crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+                            ctx.trace_ctx,
+                            "valuestackdepth",
+                            vsd_op,
+                            Value::Int(vsd_value),
+                        );
                     }
-                };
-                let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-                crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-                    ctx.trace_ctx,
-                    "valuestackdepth",
-                    vsd_op,
-                    Value::Int(vsd_value),
-                );
-                // Capture the force image AFTER last_instr and vsd so a
-                // GUARD_NOT_FORCED residual that resumes past the CALL does
-                // not carry CALL-entry vsd (args still on the stack).
-                if matches!(guard_opcode, Some(OpCode::GuardNotForced)) {
-                    async_force_vable_boxes =
-                        Some(ctx.trace_ctx.build_snapshot_vable_vref_boxes().0);
+                    // Capture the force image AFTER last_instr, BEFORE
+                    // the post-call dest overlay below.  Dest is in FRAME, not
+                    // in the vable; overlaying it here would write an unwritten
+                    // result home as a GC Ref.
+                    if matches!(guard_opcode, Some(OpCode::GuardNotForced)) {
+                        async_force_vable_boxes =
+                            Some(ctx.trace_ctx.build_snapshot_vable_vref_boxes().0);
+                    }
                 }
             }
             // Sync the live operand-stack registers into the vable shadow for
@@ -830,60 +1258,94 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // dereferences a null operand.  Overlay the live operands, build
             // the snapshot, then restore the shadow so this transient write
             // never leaks into a later op or merge-point sync.
-            let mut stack_sync: Vec<(usize, OpRef)> = if sym.owns_virtualizable_shadow() {
-                let depth = unsafe {
-                    let jc = &walked_owned;
-                    if jc.payload.code_ptr.is_null() {
-                        0usize
-                    } else {
-                        match resume_depth_twin {
-                            Some(depth) => depth as usize,
-                            None => crate::liveness::liveness_for(jc.payload.code_ptr)
-                                .depth_at_py_pc()
-                                .get(py_pc as usize)
-                                .copied()
-                                .unwrap_or(0) as usize,
-                        }
-                    }
-                };
-                let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                let nlocals = sym.nlocals();
-                // #73: the walk-level operand-stack box mirror
-                // (`ctx.vstack_boxes[s]`, maintained per-op by
-                // `step_vstack_mirror`) is the analog of PyPy
-                // `MIFrame.registers_r` and the sole kept-stack source at a
-                // branch guard.  The retired flat `stack_slot_color_map` read
-                // (`registers_r[color]` plus the #420 edge-move recovery) was
-                // unreliable in loop traces: loop-carried slots are renamed to
-                // inputarg colors and chordal coloring reuses colors, so a
-                // static-color read returned a stale / reused box (the #424
-                // merge-color staleness).  Dropping it was proven redundant —
-                // force-off byte-identical on 37/169 corpus benches on both
-                // backends — so a slot the mirror does not cover (invalid
-                // mirror, slot beyond the mirror, or an Int-bank temp the
-                // Ref-only mirror leaves NONE) is simply omitted; resume
-                // re-materializes it rather than reading the flat color. A
-                // ConstPtr(NULL) is not a hole: it is CALL's live
-                // `self_or_null` operand and must overwrite a stale shadow
-                // slot in the capture-only overlay.
-                (0..depth)
-                    .filter_map(|s| {
-                        let v = if ctx.vstack_valid {
-                            ctx.frame_state
-                                .borrow()
-                                .vstack_boxes
-                                .get(s)
-                                .copied()
-                                .unwrap_or(OpRef::NONE)
+            //
+            // `pyjitpl.py` `opimpl_goto_if_not` snapshots
+            // `virtualizable_boxes` as the traced `popvalue` left them
+            // (`setarrayitem_vable` NULL + `setfield_vable valuestackdepth`).
+            // A jump's own `-live-` is after that pop, so its `orgpc_resume`
+            // image keeps the tracing vsd and does not grow the stack.
+            //
+            // Helper-collapse / residual `generate_guard(resumepc=orgpc)`
+            // (`specialize.rs` zero-divisor `GuardTrue`) resumes at the
+            // containing opcode's op2 `-live-` and re-pops. `emit_popvalue`
+            // already stored NULL; `valuestackdepth` can still be the
+            // opcode-entry count (merge `emit_vsd!`). Overlay the opcode-entry
+            // mirror into those live NULL slots
+            // (`overlay_vstack_on_portal_vable_for_arm_capture`).
+            let mut stack_sync: Vec<(usize, OpRef)> =
+                if matches!(ctx.trace_ctx.last_op_opcode(), Some(OpCode::GuardNotForced)) {
+                    // `make_result_of_lastop` puts dest in FRAME fail_args.
+                    // Overlaying live colors into the vable would publish the
+                    // unwritten result home (`handle_async_forcing`).
+                    Vec::new()
+                } else if sym.owns_virtualizable_shadow() {
+                    // Same depth as the published `valuestackdepth` above.
+                    // `step_vstack_mirror` only advances at a Python-opcode
+                    // boundary, so the mirror still holds the opcode-entry
+                    // boxes a mid-opcode guard's opcode-start resume will pop.
+                    // Current `emit_vsd!` depth is the post-pop count and
+                    // would omit those slots.
+                    let depth = unsafe {
+                        let jc = &walked_owned;
+                        if jc.payload.code_ptr.is_null() {
+                            0usize
                         } else {
-                            OpRef::NONE
-                        };
-                        vstack_box_for_snapshot(v).map(|v| (nvs + nlocals + s, v))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                            match resume_depth_twin {
+                                Some(depth) => depth as usize,
+                                None => crate::liveness::liveness_for(jc.payload.code_ptr)
+                                    .depth_at_py_pc()
+                                    .get(py_pc as usize)
+                                    .copied()
+                                    .unwrap_or(0) as usize,
+                            }
+                        }
+                    };
+                    let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+                    let nlocals = sym.nlocals();
+                    // #73: the walk-level operand-stack box mirror
+                    // (`ctx.vstack_boxes[s]`, maintained per-op by
+                    // `step_vstack_mirror`) is the analog of PyPy
+                    // `MIFrame.registers_r` and the sole kept-stack source at a
+                    // branch guard.  The retired flat `stack_slot_color_map` read
+                    // (`registers_r[color]` plus the #420 edge-move recovery) was
+                    // unreliable in loop traces: loop-carried slots are renamed to
+                    // inputarg colors and chordal coloring reuses colors, so a
+                    // static-color read returned a stale / reused box (the #424
+                    // merge-color staleness).  Dropping it was proven redundant —
+                    // force-off byte-identical on 37/169 corpus benches on both
+                    // backends — so a slot the mirror does not cover (invalid
+                    // mirror, slot beyond the mirror, or an Int-bank temp the
+                    // Ref-only mirror leaves NONE) is simply omitted; resume
+                    // re-materializes it rather than reading the flat color. A
+                    // ConstPtr(NULL) is not a hole: it is CALL's live
+                    // `self_or_null` operand and must overwrite a stale shadow
+                    // slot in the capture-only overlay.
+                    let vstack_capture = if ctx.vstack_valid {
+                        ctx.frame_state.borrow().capture_vstack()
+                    } else {
+                        Vec::new()
+                    };
+                    let overlay: Vec<(usize, OpRef)> = (0..depth)
+                        .filter_map(|s| {
+                            let v = vstack_capture.get(s).copied().unwrap_or(OpRef::NONE);
+                            vstack_box_for_snapshot(v).map(|v| (nvs + nlocals + s, v))
+                        })
+                        .collect();
+                    if orgpc_resume {
+                        // Jump resume (`opimpl_goto_if_not`): vsd already excludes
+                        // the popped condition, so a live-NULL scan is empty.
+                        // Opcode-start re-pop: vsd still names the entry slots
+                        // that `popvalue` stored as ConstPtr(NULL).
+                        overlay
+                            .into_iter()
+                            .filter(|(idx, _)| vable_stack_slot_is_null(ctx, *idx))
+                            .collect()
+                    } else {
+                        overlay
+                    }
+                } else {
+                    Vec::new()
+                };
             // `MetaInterp.capture_resumedata` (`pyjitpl.py`) temporarily sets
             // `MIFrame.pc` to `resumepc` before `get_list_of_active_boxes`
             // and restores the tracing pc afterwards. A branch guard's
@@ -892,7 +1354,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // condition. Specialization and after-residual guards keep the
             // marker construction below so encoder banks and decoder
             // liveness stay on one coordinate.
-            let guard_jitcode_pc: i32 = if let Some(carried) = scope.carried_resume_jit_pc {
+            let guard_jitcode_pc: i32 = if orgpc_resume {
+                orgpc_live_pc.unwrap_or(op_pc) as i32
+            } else if let Some(carried) = scope.carried_resume_jit_pc {
                 // Bridge-entry flavor guard: re-carry the source guard's own
                 // resume word verbatim (see `GuardCaptureScope`).  It is a
                 // decodable `-live-` startpoint by construction — the runtime
@@ -948,6 +1412,26 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 } else {
                     plain_guard_resume_jitcode_pc(&walked_owned.payload, op_pc)
                 }
+            } else if in_shared_hook
+                && ctx.live_before_jit_pc != usize::MAX
+                && unsafe {
+                    walked_owned
+                        .payload
+                        .jitcode
+                        .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
+                }
+            {
+                // Every guard recorded while walking the shared
+                // `dispatch_bytecode` copy (`_establish_nullity` on
+                // `debugdata`, the switch `GUARD_VALUE` on the reloaded
+                // `last_instr`, any residual in the hook) encodes the
+                // opcode that entered the copy.  Residual in the hook
+                // (`run_trace_func`) is not a Python CALL.  The
+                // GuardValue/Class/True/False allow-list above already
+                // carries `live_before` for those opcodes; this arm is
+                // the remaining hook guards (GuardIsnull) without adding
+                // them to that list.
+                ctx.live_before_jit_pc as i32
             } else if after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
                 // guard family (`GuardException`/`GuardNoException`/
@@ -984,7 +1468,29 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // liveness includes both the normal continuation and the
                     // handler; a Python-PC fallthrough twin may instead name a
                     // later normal-path marker and lose handler-only locals.
-                    after_residual_guard_marker(&jc.payload, op_pc, marker_call_jit_pc)
+                    //
+                    // Same live-after fallback as the callee path: the
+                    // residual already published `ctx.live_after_jit_pc`
+                    // (`pyjitpl.py` `self.pc` after the call).  A map miss
+                    // must not emit `NO_JITCODE_PC` when that cursor is a
+                    // decodable `-live-`.
+                    if matches!(
+                        ctx.trace_ctx.last_guard_opcode(),
+                        Some(OpCode::GuardNotForced)
+                    ) {
+                        gnf_after_residual_live_marker(&jc.payload, op_pc, ctx.live_after_jit_pc)
+                    } else {
+                        after_residual_guard_marker(&jc.payload, op_pc, marker_call_jit_pc).or_else(
+                            || {
+                                (ctx.live_after_jit_pc != usize::MAX
+                                    && jc.payload.jitcode.can_decode_live_vars(
+                                        ctx.live_after_jit_pc,
+                                        crate::state::op_live(),
+                                    ))
+                                .then_some(ctx.live_after_jit_pc)
+                            },
+                        )
+                    }
                 };
                 match marker {
                     Some(jp) => jp as i32,
@@ -994,20 +1500,38 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // The remaining nonbranch guards (outside the
                 // arm-2 allow-list, not after-residual) carry the same
                 // block-head marker as arm-2, sourced from the jitcode-keyed
-                // twin at the guard's own `op_pc`.
-                // A guard recorded before its opcode's `jit_merge_point` (the
-                // `is_being_profiled` diamond, `promote_greens`, the merge
-                // itself) has a block-head marker AFTER it: the op2 `-live-`
-                // the opcode body resumes from.  Resuming there would skip the
-                // merge point, so `bhimpl_jit_merge_point` would never hand
-                // the opcode back to the interpreter.  Such a guard resumes at
-                // the `-live-` before it, `generate_guard(resumepc=orgpc)`
-                // (`pyjitpl.py`).
-                let payload = unsafe { &(&walked_owned).payload };
-                match payload.resume_marker_for_jitcode_pc(op_pc) {
-                    Some(jp) if merge_point_between(payload, op_pc, jp) => {
-                        live_marker_at_or_before(payload, op_pc).map_or(jp as i32, |m| m as i32)
+                // twin at the guard's own `op_pc`. A mid-opcode GETFIELD
+                // (GuardIsnull of `tb_next`) is a startpoint whose preceding
+                // `-live-` is not a resume-marker table key; fall through to
+                // the containing opcode's entry marker so the blackhole
+                // re-executes that opcode (`orgpc` parity).
+                //
+                // A pin recorded inside `opimpl_jit_merge_point` is the
+                // exception: `self.pc` has already advanced onto op2, and
+                // `resume_marker_for_jitcode_pc` predecessor-scans a
+                // flatten-late merge offset into a later opcode (or onto
+                // the `int_copy` between op3 and the merge). Sit on a
+                // `-live-` if the cursor is already one; otherwise bind
+                // the merge's own op2.
+                let twin = unsafe {
+                    let jc = &walked_owned;
+                    let op_live = crate::state::op_live();
+                    if jc.payload.jitcode.can_decode_live_vars(op_pc, op_live) {
+                        Some(op_pc)
+                    } else {
+                        jit_merge_point_op2_live(&jc.payload, op_pc).or_else(|| {
+                            jc.payload.resume_marker_for_jitcode_pc(op_pc).or_else(|| {
+                                crate::py_coord::first_floor_boundary_for_py(
+                                    &jc.payload.metadata,
+                                    py_pc,
+                                )
+                                .and_then(|(off, _)| jc.payload.resume_marker_for_jitcode_pc(off))
+                                .or_else(|| jc.payload.portal_merge_op3_live_for_py_pc(py_pc))
+                            })
+                        })
                     }
+                };
+                match twin {
                     Some(jp) => jp as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 }
@@ -1015,7 +1539,31 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             let liveness_py_pc = py_pc;
             let payload = &walked_owned.payload;
             let resolved = payload
-                .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live());
+                .resolve_resume_pc_with_jitcode_pc(guard_jitcode_pc, crate::state::op_live())
+                .or_else(|| {
+                    if after_residual_call
+                        && ctx.live_after_jit_pc != usize::MAX
+                        && payload
+                            .jitcode
+                            .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live())
+                    {
+                        payload.resolve_resume_pc_with_jitcode_pc(
+                            ctx.live_after_jit_pc as i32,
+                            crate::state::op_live(),
+                        )
+                    } else if after_residual_call || orgpc_resume {
+                        None
+                    } else {
+                        payload
+                            .portal_merge_op3_live_for_py_pc(py_pc)
+                            .and_then(|jp| {
+                                payload.resolve_resume_pc_with_jitcode_pc(
+                                    jp as i32,
+                                    crate::state::op_live(),
+                                )
+                            })
+                    }
+                });
             let Some(resolved_offset) = resolved else {
                 if let Some(saved) = saved_vable_scalars.take() {
                     crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
@@ -1024,55 +1572,36 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             };
             // A residual result is installed in the active register bank before
             // the exception guard captures resume data
-            // (`rpython/jit/metainterp/pyjitpl.py`).  Project every
-            // live Ref register of the owning frame through the resume
-            // position's color-to-slot map so the separately encoded
-            // virtualizable array read by `virtualizable.py` carries the
-            // same locals and operand-stack values as the frame section.  Inner
-            // frames have no ownership of this shadow and are handled by the
-            // multi-frame path above.
-            if after_residual_call && sym.owns_virtualizable_shadow() {
-                let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(
-                    jitcode_index as i32,
-                    Some(liveness_py_pc as i32),
-                    guard_jitcode_pc,
-                );
-                let banks = crate::state::frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
-                    jitcode_index as i32,
-                    guard_jitcode_pc,
-                );
-                let semantic_limit = sym.nlocals() + maps.stack_depth_at_pc;
-                let nlocals = sym.nlocals();
-                // The residual call's result lands on the operand stack, so
-                // only stack slots need reconciling here.  A local's slot is
-                // maintained in lockstep by the shadow, while the per-PC
-                // color-to-slot map is a per-program-point label rather than a
-                // binding: the register allocator can reuse a local's color
-                // for unrelated SSA temps, so projecting a register into a
-                // local's slot can publish an unrelated value.
+            // (`rpython/jit/metainterp/pyjitpl.py` `make_result_of_lastop`).
+            // `GUARD_NOT_FORCED` consumes that image WHILE the residual is
+            // running: dest is in FRAME fail_args, `setarrayitem` has not
+            // run. Do not project dest onto the vable stack.
+            //
+            // `GUARD_NO_EXCEPTION` / `GUARD_EXCEPTION` resume at the NEXT
+            // opcode (`after_residual_call`), so the current opcode's
+            // `pushvalue` is skipped. Dest must sit on TOS. Project only
+            // that slot from the residual dest color. F4 shares color 0
+            // across depths; projecting every live Ref through pcdep writes
+            // leftover callable into TOS (`function * int`).
+            if after_residual_call
+                && sym.owns_virtualizable_shadow()
+                && !matches!(
+                    ctx.trace_ctx.last_guard_opcode(),
+                    Some(OpCode::GuardNotForced)
+                )
+            {
                 let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
-                for &(bank, color, slot) in &maps.pcdep_entries {
-                    if bank != 1
-                        || (slot as usize) < nlocals
-                        || slot as usize >= semantic_limit
-                        || !banks.ref_.contains(&(color as u32))
-                    {
-                        continue;
-                    }
-                    let Some(value) = ctx.registers_r.get(color as usize) else {
-                        continue;
-                    };
-                    if value == OpRef::NONE || value.ty() != Some(majit_ir::Type::Ref) {
-                        continue;
-                    }
-                    let vable_index = nvs + slot as usize;
+                let nlocals = sym.nlocals();
+                if let Some((vable_index, dest)) =
+                    residual_dest_on_post_call_tos(ctx, &walked_owned, op_pc, nlocals, nvs)
+                {
                     if let Some((_, current)) = stack_sync
                         .iter_mut()
                         .find(|(index, _)| *index == vable_index)
                     {
-                        *current = value;
+                        *current = dest;
                     } else {
-                        stack_sync.push((vable_index, value));
+                        stack_sync.push((vable_index, dest));
                     }
                 }
             }
@@ -1093,9 +1622,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ctx.trace_ctx.set_virtualizable_box_at(idx, old);
                 }
             }
-            let (entry_jitcode_pc, entry_twin, entry_caller) = if let Some(live_pc) =
-                scope.liveness_jit_pc
-            {
+            let (entry_jitcode_pc, entry_twin, entry_caller) = if orgpc_resume {
+                (
+                    resolved_offset as i32,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_orgpc",
+                )
+            } else if let Some(live_pc) = scope.liveness_jit_pc {
                 // Resume and liveness share this later `-live-`.  The opcode
                 // floor would snapshot the landing, whose live set omits the
                 // caught exception a PUSH_EXC_INFO prev-nullity guard must
@@ -1146,19 +1679,51 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ),
                 }
             };
-            let active = collect_outer_active_boxes(
-                sym,
-                ctx.trace_ctx,
-                ctx.registers_i,
-                ctx.registers_r,
-                ctx.registers_f,
-                jitcode_index,
-                guard_jitcode_pc,
-                entry_jitcode_pc,
-                entry_twin,
-                entry_caller,
-                None,
-            );
+            // Shared-hook collection uses the frozen entering banks only when
+            // the resume coordinate is the entering opcode's; a coordinate
+            // inside the copy reads the live banks (`pyjitpl.py
+            // implement_guard_value` / `get_list_of_active_boxes`).
+            let held = held_hook_banks(ctx, resolved_offset);
+            let active = if orgpc_resume {
+                collect_orgpc_active_boxes(
+                    sym,
+                    ctx.trace_ctx,
+                    ctx.registers_i,
+                    ctx.registers_r,
+                    ctx.registers_f,
+                    jitcode_index,
+                    resolved_offset,
+                )?
+            } else {
+                match held.as_ref() {
+                    Some(held) => collect_outer_active_boxes(
+                        sym,
+                        ctx.trace_ctx,
+                        &held.i,
+                        &held.r,
+                        &held.f,
+                        jitcode_index,
+                        guard_jitcode_pc,
+                        entry_jitcode_pc,
+                        entry_twin,
+                        entry_caller,
+                        None,
+                    )?,
+                    None => collect_outer_active_boxes(
+                        sym,
+                        ctx.trace_ctx,
+                        ctx.registers_i,
+                        ctx.registers_r,
+                        ctx.registers_f,
+                        jitcode_index,
+                        guard_jitcode_pc,
+                        entry_jitcode_pc,
+                        entry_twin,
+                        entry_caller,
+                        None,
+                    )?,
+                }
+            };
             let pc_word = resolved_offset as u32;
             let forward_py_pc = forward_snapshot_py_pc(jitcode_index, pc_word)?;
             publish_single_frame_snapshot(
@@ -1186,7 +1751,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // that is the op2 `-live-` after `jit_merge_point` (`jtransform.py
     // handle_jit_marker__jit_merge_point`). Active boxes were collected
     // at that same pc.
+    // Capture-only: copy opcode-entry vstack boxes onto the portal
+    // virtualizable so a helper-collapse GuardClass / GuardNoOverflow
+    // still re-pops BINARY/COMPARE operands. An inlined Python callee's
+    // vstack is not the portal array.
+    let arm_vstack_saved = overlay_vstack_on_portal_vable_for_arm_capture(ctx);
+
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    let restore_arm_vstack = |ctx: &mut WalkContext<'_, '_, Sym>| {
+        for (idx, old) in &arm_vstack_saved {
+            ctx.trace_ctx
+                .set_virtualizable_box_at(*idx, old.unwrap_or(OpRef::NONE));
+        }
+    };
     let arm_word = ctx
         .outer_resume_marker_jit_pc
         .map(|m| m as i32)
@@ -1200,10 +1777,49 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             })
             .map(|offset| offset as u32)
     else {
+        restore_arm_vstack(ctx);
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
-    let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
+    let arm_py_pc = match forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word) {
+        Ok(pc) => pc,
+        Err(err) => {
+            restore_arm_vstack(ctx);
+            return Err(err);
+        }
+    };
+    let vstack_boxes = ctx.frame_state.borrow().capture_vstack();
+    let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
+    let active = {
+        let sym_ptr = ctx.fbw_mode.snapshot_sym;
+        // Inside a helper sub-walk `ctx.registers_*` hold the helper's colors;
+        // the portal image was collected from the portal banks at descent
+        // start (`run_orthodox_helper_subwalk`) and is reused, as
+        // `get_list_of_active_boxes` reads the portal frame's own registers
+        // (`pyjitpl.py` `generate_guard`).
+        if !sym_ptr.is_null() && ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk {
+            let sym = unsafe { &*sym_ptr };
+            collect_outer_active_boxes(
+                sym,
+                ctx.trace_ctx,
+                ctx.registers_i,
+                ctx.registers_r,
+                ctx.registers_f,
+                ctx.outer_jitcode_index,
+                arm_word,
+                arm_word,
+                OuterActiveBoxesEntryTwin::Plain,
+                "arm_vstack_capture",
+                vstack,
+            )
+        } else {
+            Ok(std::mem::take(
+                &mut ctx.frame_state.borrow_mut().outer_active_boxes,
+            ))
+        }
+    };
+    restore_arm_vstack(ctx);
+    let active = active?;
+
     publish_single_frame_snapshot(
         ctx,
         scope.guard_stamp,
@@ -1256,8 +1872,9 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
         };
         eprintln!(
             "[guard-pc] {origin} {opcode:?} op_pc={op_pc} jc={jitcode_index} \
-             jit_pc={pc} py_pc={py_pc} active={}",
+             jit_pc={pc} py_pc={py_pc} active={} vable={}",
             active.len(),
+            vable_boxes.len(),
         );
     }
     match guard_stamp {
@@ -1272,6 +1889,104 @@ fn publish_single_frame_snapshot<Sym: WalkSym>(
                 vref_boxes,
             ),
     }
+}
+
+/// Portal snapshot for [`NumberedHelperGuard::CallerBoundary`]: one section
+/// at the outermost helper's CALL op (`capture_resumedata` with
+/// `generate_guard(resumepc=orgpc)`; `get_list_of_active_boxes` reads the
+/// `-live-` at `orgpc - SIZE_LIVE_OP`).
+/// Returns `None` without publishing when the caller CALL
+/// has no decodable preceding `-live-`; the guard then keeps the opcode-entry image.
+fn walker_capture_caller_call_snapshot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    guard_stamp: GuardStampTarget,
+) -> Option<()> {
+    let (call_pc, jitcode_index, registers_i, registers_r, registers_f) = {
+        let session = ctx.session.borrow();
+        let helper_levels = session
+            .framestack
+            .iter()
+            .rev()
+            .take_while(|frame| frame.is_helper_level())
+            .count();
+        let outer_index = session.framestack.len().checked_sub(helper_levels)?;
+        let outer = session.framestack.get(outer_index)?;
+        let parent = outer.parents.first()?;
+        let call_pc = parent.call_jitcode_pc?;
+        let jitcode_index = parent.jitcode_index;
+        let from_parent = match (
+            parent.registers_i.clone(),
+            parent.registers_r.clone(),
+            parent.registers_f.clone(),
+        ) {
+            (Some(i), Some(r), Some(f)) => Some((i, r, f)),
+            _ => None,
+        };
+        let (registers_i, registers_r, registers_f) = match from_parent {
+            Some(banks) => banks,
+            None => {
+                let live = session
+                    .framestack
+                    .first()
+                    .and_then(|frame| frame.paused_live())?;
+                (live.registers_i, live.registers_r, live.registers_f)
+            }
+        };
+        (
+            call_pc,
+            jitcode_index,
+            registers_i,
+            registers_r,
+            registers_f,
+        )
+    };
+    let payload = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
+    let live_pc = preceding_live_marker(&payload, call_pc)?;
+    let op_live = crate::state::op_live();
+    if !payload.jitcode.can_decode_live_vars(live_pc, op_live)
+        || !payload.jitcode.can_decode_live_vars(call_pc, op_live)
+    {
+        return None;
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `snapshot_sym` is set for the lifetime of the full-body walk.
+    let sym = unsafe { &*sym_ptr };
+    if sym.jitcode().is_null() || unsafe { (*sym.jitcode()).index as u32 } != jitcode_index {
+        return None;
+    }
+    let active = collect_outer_active_boxes(
+        sym,
+        ctx.trace_ctx,
+        &registers_i,
+        &registers_r,
+        &registers_f,
+        jitcode_index,
+        live_pc as i32,
+        live_pc as i32,
+        OuterActiveBoxesEntryTwin::Plain,
+        "caller_call",
+        None,
+    )
+    .ok()?;
+    let py_pc = forward_snapshot_py_pc(jitcode_index, call_pc as u32).ok()?;
+    let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
+    publish_single_frame_snapshot(
+        ctx,
+        guard_stamp,
+        &active,
+        jitcode_index,
+        call_pc as u32,
+        py_pc,
+        &vable_boxes,
+        &vref_boxes,
+        "caller_call",
+        op_pc,
+    );
+    Some(())
 }
 
 /// Build the paused caller frame for a multi-frame inline snapshot (#68),
@@ -1545,15 +2260,15 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
         return Ok(Vec::new());
     }
     let mut overrides = Vec::new();
-    if ctx.vstack_valid
-        && ctx.vstack_depth == depth
-        && ctx.frame_state.borrow().vstack_boxes.len() >= depth
-    {
+    let mut vstack_own_null = Vec::new();
+    let vstack_capture = ctx.frame_state.borrow().capture_vstack();
+    if ctx.vstack_valid && ctx.vstack_depth == depth && vstack_capture.len() >= depth {
         for d in 0..depth {
             let slot = nlocals + d;
-            if let Some(value) =
-                concrete_ref_for_opref(ctx, ctx.frame_state.borrow().vstack_boxes[d])
-            {
+            if let Some(value) = concrete_ref_for_opref(ctx, vstack_capture[d]) {
+                if value.is_null() {
+                    vstack_own_null.push(slot);
+                }
                 overrides.push((slot, value));
             }
         }
@@ -1577,7 +2292,11 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
                     // not the opcode-entry owner `pcdep_slot_var_resume`
                     // recorded, and `CallStack::ProofSlotUnresolved` declines
                     // `load_attr_fn` on `Attrs.cm(i)` when the hole wins.
-                    note_stack_override(&mut overrides, slot, value, true);
+                    // A typed vstack CONST_NULL is the slot's own box
+                    // (`PUSH_NULL` / LOAD_ATTR-method `null_or_self`);
+                    // leftover must not replace it.
+                    let replace_null = !vstack_own_null.contains(&slot);
+                    note_stack_override(&mut overrides, slot, value, replace_null);
                 }
             }
         }
@@ -1689,8 +2408,8 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
             }
             let vstack_box = (ctx.vstack_valid
                 && ctx.vstack_depth == depth
-                && ctx.frame_state.borrow().vstack_boxes.len() >= depth)
-                .then(|| ctx.frame_state.borrow().vstack_boxes[slot - nlocals]);
+                && ctx.frame_state.borrow().capture_vstack().len() >= depth)
+                .then(|| ctx.frame_state.borrow().capture_vstack()[slot - nlocals]);
             let vstack_concrete =
                 vstack_box.map(|opref| concrete_ref_for_opref(ctx, opref).is_some());
             let pcdep_color = pcdep_entries
@@ -2036,17 +2755,26 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode_index: u32,
     call_jit_pc: usize,
+    resume_at: Option<usize>,
 ) -> Option<InlineParentBlackhole> {
     let pjc = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)?;
     let call = decode_op_at(&pjc.jitcode.code, call_jit_pc)?;
+    let resume_pc = resume_at.unwrap_or(call.next_pc);
     let result_bank = call.result_argcode();
     let result_color = (result_bank != 'v')
         .then(|| pjc.jitcode.code.get(call.next_pc.checked_sub(1)?).copied())
         .flatten()
         .map(usize::from);
+    // After-call resume: the callee writes dest (`_setup_return_value_*`).
+    // Mid-opcode helper parent: blackhole re-executes CALL, so dest is
+    // not pending and the live window is the CALL `-live-`.
+    let skip_result = resume_pc == call.next_pc;
+    let pending_i = skip_result && result_bank == 'i';
+    let pending_r = skip_result && result_bank == 'r';
+    let pending_f = skip_result && result_bank == 'f';
     let live = crate::state::frame_liveness_reg_indices_by_bank_at(
         jitcode_index as i32,
-        i32::try_from(call.next_pc).ok()?,
+        i32::try_from(resume_pc).ok()?,
     );
     // `_copy_data_from_miframe` (`blackhole.py`) copies the WHOLE
     // bank — `range(num_regs_i/r/f())` — filtering only on "the MIFrame has a
@@ -2102,7 +2830,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     let mut int_seeded = vec![false; pjc.jitcode.num_regs_i()];
     for &color in &live.int {
         let color = color as usize;
-        if result_bank == 'i' && result_color == Some(color) {
+        if pending_i && result_color == Some(color) {
             continue;
         }
         let got = if paused_regs_i.is_some() {
@@ -2145,7 +2873,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         }
     }
     for color in 0..pjc.jitcode.num_regs_i() {
-        if int_seeded[color] || (result_bank == 'i' && result_color == Some(color)) {
+        if int_seeded[color] || (pending_i && result_color == Some(color)) {
             continue;
         }
         let concrete = if paused_regs_i.is_some() {
@@ -2168,7 +2896,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     let mut ref_seeded = vec![false; pjc.jitcode.num_regs_r()];
     for &color in &live.ref_ {
         let color = color as usize;
-        if result_bank == 'r' && result_color == Some(color) {
+        if pending_r && result_color == Some(color) {
             continue;
         }
         // `concrete_registers_r` is the color-indexed shadow of `registers_r`:
@@ -2263,7 +2991,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         }
     }
     for color in 0..pjc.jitcode.num_regs_r() {
-        if ref_seeded[color] || (result_bank == 'r' && result_color == Some(color)) {
+        if ref_seeded[color] || (pending_r && result_color == Some(color)) {
             continue;
         }
         // `ConcreteValue::Null` is the walker's "unknown" sentinel rather than a
@@ -2287,7 +3015,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     let mut float_seeded = vec![false; pjc.jitcode.num_regs_f()];
     for &color in &live.float {
         let color = color as usize;
-        if result_bank == 'f' && result_color == Some(color) {
+        if pending_f && result_color == Some(color) {
             continue;
         }
         let got = registers_f.get(color);
@@ -2320,7 +3048,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     // colors that already have a Float.  A swept color is opportunistic; it
     // must not be able to turn a usable image into a declined one.
     for color in 0..pjc.jitcode.num_regs_f() {
-        if float_seeded[color] || (result_bank == 'f' && result_color == Some(color)) {
+        if float_seeded[color] || (pending_f && result_color == Some(color)) {
             continue;
         }
         let Some(opref) = registers_f.get(color) else {
@@ -2342,7 +3070,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         eprintln!(
             "[fbw-blackhole] caller image jitcode_index={jitcode_index} \
              resume_pc={} banks={}/{}/{} swept={}/{}/{}",
-            call.next_pc,
+            resume_pc,
             int_values.len(),
             ref_values.len(),
             float_values.len(),
@@ -2353,7 +3081,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     }
 
     Some(InlineParentBlackhole {
-        resume_pc: call.next_pc,
+        resume_pc,
         int_values,
         ref_values,
         float_values,
@@ -2392,8 +3120,16 @@ fn clear_in_a_call_result(
 ) -> Option<(usize, usize, OpRef)> {
     let (bank, color) = result_register?;
     let (index, cleared) = match bank {
-        'i' => (0, trace_ctx.const_int(0)),
-        'r' => (1, trace_ctx.const_ref(pyre_object::PY_NULL as i64)),
+        'i' => {
+            let cleared = trace_ctx.const_int(0);
+            super::assert_int_bank_box(cleared, "in_a_call");
+            (0, cleared)
+        }
+        'r' => {
+            let cleared = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+            super::assert_ref_bank_box(cleared, "in_a_call");
+            (1, cleared)
+        }
         'f' => (2, trace_ctx.const_float(0)),
         _ => return None,
     };
@@ -2406,6 +3142,11 @@ fn clear_in_a_call_result(
 /// the paused `MIFrame`, keeps reading the caller's registers.
 fn restore_in_a_call_result(banks: [&RegisterBank; 3], saved: Option<(usize, usize, OpRef)>) {
     if let Some((index, color, saved)) = saved {
+        match index {
+            0 => super::assert_int_bank_box(saved, "in_a_call"),
+            1 => super::assert_ref_bank_box(saved, "in_a_call"),
+            _ => {}
+        }
         banks[index].set(color, saved);
     }
 }
@@ -2570,13 +3311,14 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         None,
     );
     restore_in_a_call_result(banks, saved);
+    let boxes = boxes.map_err(|_| unavail("Unavail::Top/BoxesErr"))?;
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
         call_pc: Some(call_jit_pc),
         resume_pc: resume_marker_jit_pc,
         call_stack_overrides,
-        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
+        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc, None),
         resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
@@ -2687,10 +3429,12 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         call_jit_pc,
         caller_liveness_word,
     );
-    restore_in_a_call_result(banks, saved);
     let boxes = match boxes {
         Ok(b) => b,
-        Err(_) => return Err(unavail("Unavail::Nested/BoxesErr")),
+        Err(_) => {
+            restore_in_a_call_result(banks, saved);
+            return Err(unavail("Unavail::Nested/BoxesErr"));
+        }
     };
     // #343 depth-2 operand flush.  `emit_new_pyframe_inline_with_params` seeds
     // this inlined-callee frame's `locals_cells_stack_w` virtual array with LOCALS
@@ -2714,6 +3458,17 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
     // A void call leaves no pending result, so every operand slot is a
     // sibling (`get_list_of_active_boxes` clears only the `_result_argcode`
     // bank's register).
+    //
+    // Flush while dest is still cleared (`get_list_of_active_boxes(in_a_call)`).
+    // Restoring dest first let a COPY shape that maps the result color onto a
+    // sibling operand (the stacked addend under CALL) store the last CALL
+    // argument into that slot. Reconstruct of a materialized frame then reads
+    // the array for dest-color siblings, because the pending color is removed
+    // from the resume stream.
+    let dest_color = match result_register {
+        Some(('r', color)) => Some(color),
+        _ => None,
+    };
     let result_slots = usize::from(!call_is_void);
     if resume_marker_jit_pc.is_some() {
         if caller_liveness_word != majit_ir::resumedata::NO_JITCODE_PC && depth > result_slots {
@@ -2723,6 +3478,7 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                 .flatten()
                 .filter(|&r| r != OpRef::NONE)
             else {
+                restore_in_a_call_result(banks, saved);
                 return Err(unavail("Unavail::Nested/NoFrameRed"));
             };
             // `gen_store_back_in_vable` reads the array with
@@ -2757,11 +3513,17 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
                     .unwrap_or_else(|| array_descr.index());
                 // Live Ref colors at the CALL return coordinate, same enumeration
                 // as `collect_callee_active_boxes`.
-                let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+                let live_banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
                     jitcode_index as i32,
                     caller_liveness_word,
                 );
-                for &color in &banks.ref_ {
+                for &color in &live_banks.ref_ {
+                    // `get_list_of_active_boxes(in_a_call=True)` leaves dest
+                    // unset. A COPY of that color onto a sibling operand must
+                    // not store dest's pre-call TOS (the last CALL arg).
+                    if dest_color == Some(color as usize) {
+                        continue;
+                    }
                     let Some(operand) = ctx.registers_r.get(color as usize) else {
                         continue;
                     };
@@ -2807,13 +3569,14 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
             }
         }
     }
+    restore_in_a_call_result(banks, saved);
     Ok(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: Some(call_jit_pc),
         call_pc: Some(call_jit_pc),
         resume_pc: resume_marker_jit_pc,
         call_stack_overrides: Vec::new(),
-        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
+        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc, None),
         resume_coord: ParentResumeCoord::CallFallthrough(call_jit_pc),
         resume_marker_jit_pc,
         boxes,
@@ -2913,6 +3676,114 @@ fn jitcode_index_names_python_code(jitcode_index: u32) -> bool {
         .is_some_and(|pjc| pjc.is_populated() && !pjc.code_ptr.is_null())
 }
 
+/// Copy opcode-entry operand-stack boxes from the callee vstack mirror
+/// (and the per-slot OpRef shadow) onto the register bank a snapshot
+/// will encode. `emit_pushvalue` stores `setarrayitem_vable` with no dest
+/// colour, so opcode-start `-live-` names stack colours that are still
+/// NONE; `pyframe.py` `pushvalue` wrote the slot, and the mirror is that
+/// write. A GuardClass inside a nested COMPARE helper resumes at the
+/// opcode start and re-pops those slots.
+fn overlay_callee_vstack_onto_regs<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    callee_jitcode_index: i32,
+    callee_jitcode_pc: i32,
+    stack_base: usize,
+    recovered_regs_r: &mut [OpRef],
+) {
+    let maps =
+        crate::state::bridge_semantic_maps_from_jitcode_pc(callee_jitcode_index, callee_jitcode_pc);
+    let vstack_boxes = ctx.frame_state.borrow().capture_vstack();
+    // Colors the opcode-entry mirror named, including CONST_NULL. A leftover
+    // portal ConstPtr(0) in the register is not that write.
+    let mut vstack_filled = vec![false; recovered_regs_r.len()];
+    if ctx.vstack_valid && ctx.vstack_depth <= vstack_boxes.len() {
+        for &(bank, color, slot) in &maps.pcdep_entries {
+            if bank != 1 {
+                continue;
+            }
+            let slot = slot as usize;
+            let Some(stack_slot) = slot.checked_sub(stack_base) else {
+                continue;
+            };
+            if stack_slot >= ctx.vstack_depth {
+                continue;
+            }
+            let value = vstack_boxes[stack_slot];
+            if value == OpRef::NONE {
+                continue;
+            }
+            if let Some(register) = recovered_regs_r.get_mut(color as usize) {
+                // Opcode-entry vstack is this frame's SET store, including
+                // PUSH_NULL / LOAD_ATTR-method CONST_NULL. A leftover
+                // portal ConstPtr(0) in the register is not this frame's
+                // SET (`resume.py` `rebuild_from_resumedata`).
+                *register = value;
+                if let Some(flag) = vstack_filled.get_mut(color as usize) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    let state = ctx.frame_state.borrow();
+    let Some(shadow) = state.callee_shadow.as_ref() else {
+        return;
+    };
+    if !shadow.frame_box.is_none() {
+        let (frame_reg, _) = crate::state::portal_red_regs_at(callee_jitcode_index);
+        if frame_reg != u16::MAX
+            && let Some(slot) = recovered_regs_r.get_mut(frame_reg as usize)
+            && slot.is_none()
+        {
+            *slot = shadow.frame_box;
+        }
+    }
+    for (color, value) in recovered_regs_r.iter_mut().enumerate() {
+        if vstack_filled.get(color).copied().unwrap_or(false) {
+            continue;
+        }
+        // Opcode-entry did not name this color. A leftover portal
+        // ConstPtr(0) is not this frame's SET; `callee_shadow` is.
+        if !value.is_none() && !opref_is_null_const_ptr(*value) {
+            continue;
+        }
+        let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
+            stack_base,
+            maps.stack_depth_at_pc,
+            &maps.pcdep_entries,
+            color,
+        ) else {
+            continue;
+        };
+        if let Some(&slot_value) = shadow.opref.get(&(slot as i64))
+            && !slot_value.is_none()
+        {
+            *value = slot_value;
+        }
+    }
+}
+
+/// The `-live-` at which a Python parent paused under a nested helper
+/// resumes.
+///
+/// `resume.py` `rebuild_from_resumedata` / `blackhole.py`
+/// `setup_resume_at_op` keep that parent at its jitcode CALL pc. The
+/// popped operands stay in registers. `resume_marker_for_jitcode_pc`
+/// predecessor-scans the op-start table onto the containing opcode's
+/// `jit_merge_point`; resuming there re-pops slots `emit_popvalue_ref!`
+/// already cleared. The trailing `-live-` after CALL is the residual
+/// `after_residual_call` coordinate; using it here skips the helper
+/// (`[Call, -live-]` has no inner frame).
+fn helper_parent_call_live(pjc: &crate::pyjitcode::PyJitCode, call_jit_pc: usize) -> Option<usize> {
+    let op_live = crate::state::op_live();
+    let opcode_entry = pjc.resume_marker_for_jitcode_pc(call_jit_pc);
+    let usable =
+        |pc: usize| opcode_entry != Some(pc) && pjc.jitcode.can_decode_live_vars(pc, op_live);
+    if usable(call_jit_pc) {
+        return Some(call_jit_pc);
+    }
+    preceding_live_marker(pjc, call_jit_pc).filter(|&pc| usable(pc))
+}
+
 /// Capture the current inlined Python frame at a translated helper call's
 /// entry boundary, for a helper whose return the walk converts before it
 /// becomes the call's result ([`HelperReturn::Converted`]). No `MIFrame`
@@ -3010,10 +3881,13 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
-    // Same parent resume as `run_orthodox_helper_subwalk`: the op2 `-live-`
-    // after `jit_merge_point` on a loop-header opcode
-    // (`jtransform.py handle_jit_marker__jit_merge_point`).
-    let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
+    // Nested-helper parent: resume at the CALL's own `-live-`, the
+    // coordinate `rebuild_from_resumedata` / `setup_resume_at_op` uses
+    // (`resume.py`, `blackhole.py`). `resume_marker_for_jitcode_pc`
+    // predecessor-scans onto the containing opcode's `jit_merge_point`;
+    // blackhole would then re-pop slots `emit_popvalue_ref!` already
+    // cleared. The popped operands stay in this frame's registers.
+    let resume_marker_jit_pc = helper_parent_call_live(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
         collect_callee_active_boxes(
@@ -3026,7 +3900,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         )
         .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
     } else {
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack_boxes = ctx.frame_state.borrow().capture_vstack();
         let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
         // SAFETY: checked non-null above and valid for this full-body walk.
@@ -3044,6 +3918,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
             "builtin_wrapper_call_entry",
             vstack,
         )
+        .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
     };
     Ok(InlineParentFrame {
         jitcode_index,
@@ -3051,7 +3926,12 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         call_pc: Some(call_jit_pc),
         resume_pc: Some(resume_marker_jit_pc),
         call_stack_overrides: Vec::new(),
-        blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
+        blackhole: capture_inline_parent_blackhole(
+            ctx,
+            jitcode_index,
+            call_jit_pc,
+            Some(resume_marker_jit_pc),
+        ),
         resume_coord: ParentResumeCoord::Backxlat(resume_marker_jit_pc),
         resume_marker_jit_pc: Some(resume_marker_jit_pc),
         boxes,
@@ -3394,57 +4274,74 @@ fn publish_outermost_parent_vable_scalars<Sym: WalkSym>(
         last_instr_op,
         Value::Int(last_instr_value),
     );
-    let vsd_value = unsafe {
-        let jc = &*caller_sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            caller_sym.valuestackdepth() as i64
-        } else {
-            let raw = || {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(resume_py_pc as usize)
-                    .copied()
-            };
-            let twin: Option<Option<u16>> = if outer.jitcode_index != jc.index as u32 {
-                None
+    // Portal `valuestackdepth` stays the box `emit_vsd!` wrote at the
+    // call site for ordinary guards.  An inlined callee's
+    // `setfield_vable_i` does not update the portal
+    // (`vable_is_standard_virtualizable` is false during
+    // `inline_subwalk`), so that box is the caller's depth.  A
+    // liveness-table rewrite would publish the shared-copy switch-union
+    // peak onto the portal array.
+    //
+    // `GUARD_NOT_FORCED` is the exception.  The CALL's opcode-start
+    // `emit_vsd!` is PRE-pop (args still on the stack); dest of
+    // CallMayForce lives in FRAME fail_args (`make_result_of_lastop`)
+    // and `setarrayitem` has not run.  Fallthrough of the CALL is
+    // POST-push; dest is the slot below that.  Publish the PRE-push
+    // depth so `write_from_resume_data_partial` does not make that
+    // unwritten slot a live TOS.
+    if matches!(
+        ctx.trace_ctx
+            .last_op_opcode()
+            .or(ctx.trace_ctx.last_guard_opcode()),
+        Some(OpCode::GuardNotForced)
+    ) {
+        let caller_code = unsafe {
+            let jc = &*caller_sym.jitcode();
+            if jc.payload.code_ptr.is_null() {
+                0usize
             } else {
-                match outer.resume_coord {
-                    ParentResumeCoord::Backxlat(jitcode_pc) => jc
-                        .payload
-                        .depth_trivia_populated()
-                        .then(|| jc.payload.depth_trivia_for_jitcode_pc(jitcode_pc)),
-                    ParentResumeCoord::CallFallthrough(call_jit_pc) => jc
-                        .payload
-                        .depth_after_residual_populated()
-                        .then(|| jc.payload.depth_after_residual_for_jitcode_pc(call_jit_pc)),
-                }
-            };
-            let depth = match twin {
-                Some(d) => {
-                    if pcmap_afterresidual_audit_enabled() {
-                        assert_eq!(
-                            d,
-                            raw(),
-                            "PYRE_PCMAP_AFTERRESIDUAL_AUDIT: multiframe vsd depth twin diverged (py {resume_py_pc})"
-                        );
-                    }
-                    d
-                }
-                None => raw(),
-            };
-            match depth {
-                Some(d) => (caller_sym.nlocals() + d as usize) as i64,
-                None => caller_sym.valuestackdepth() as i64,
+                jc.payload.code_ptr as usize
             }
+        };
+        // `resume_py_pc` is the CALL fallthrough (LOAD_SMALL_INT after
+        // `use_map`); its entry depth is POST-push. Dest is the slot
+        // below that. The after-residual depth twin is the *next*
+        // opcode's entry (BINARY *), one above dest. Read the raw
+        // CodeObject liveness at `resume_py_pc`; the emit_vsd box is
+        // already POST-push, so it is only a minus-one fallback.
+        let nlocals = caller_sym.nlocals();
+        let emit_vsd = vable_static_int(ctx, "valuestackdepth").map(|v| v as usize);
+        let post_rel = if caller_code == 0 {
+            None
+        } else {
+            let code = unsafe { &*(caller_code as *const pyre_interpreter::CodeObject) };
+            crate::liveness::liveness_for(code as *const _).stack_depth_at(resume_py_pc as usize)
+        };
+        let stack_base = if caller_code == 0 {
+            nlocals
+        } else {
+            let code = unsafe { &*(caller_code as *const pyre_interpreter::CodeObject) };
+            code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
+        };
+        let pre_vsd = post_rel
+            .filter(|&d| d > 0)
+            .map(|d| stack_base + d - 1)
+            .filter(|&vsd| vsd >= stack_base)
+            .or_else(|| {
+                emit_vsd
+                    .filter(|&v| v > stack_base)
+                    .map(|post| post.saturating_sub(1))
+            });
+        if let Some(pre_vsd) = pre_vsd {
+            let vsd_op = ctx.trace_ctx.const_int(pre_vsd as i64);
+            crate::trace_opcode::mirror_vable_static_to_boxes(
+                ctx.trace_ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(pre_vsd as i64),
+            );
         }
-    };
-    let vsd_op = ctx.trace_ctx.const_int(vsd_value);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        ctx.trace_ctx,
-        "valuestackdepth",
-        vsd_op,
-        Value::Int(vsd_value),
-    );
+    }
     Ok(saved)
 }
 
@@ -3463,26 +4360,23 @@ fn boxes_matching_resume_liveness(
     pc_word: u32,
     op_pc: usize,
 ) -> Result<Vec<OpRef>, DispatchError> {
-    let expected = crate::state::frame_value_count_at(frame.jitcode_index as i32, pc_word as i32);
-    // No box is invented for a slot the image does not hold: a section of
-    // the wrong length cannot be numbered, so the guard is not recorded.
-    if frame.boxes.len() != expected {
+    // Collection is `get_list_of_active_boxes` at `resume_marker_jit_pc`;
+    // publish is `resolve_resume_pc_with_jitcode_pc` of that marker
+    // (identity when the marker is a `-live-`). A pc the decoder cannot
+    // name, or an image whose length disagrees with that window, is
+    // refused — the neighbouring-live recapture is not `enumerate_vars`.
+    let Some(expected) =
+        crate::state::try_frame_value_count_at(frame.jitcode_index as i32, pc_word as i32)
+    else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
+    };
+    if frame.boxes.len() == expected {
+        Ok(frame.boxes.clone())
+    } else {
+        Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })
     }
-    Ok(frame.boxes.clone())
 }
 
-/// Number a helper-guard snapshot: paused callers outermost-first, then
-/// the helper itself when the caller appended that innermost section.
-///
-/// `parent_frames` is the whole framestack's paused levels flattened in
-/// order, so a level that ran between two frames arrives already at its own
-/// depth — `descr_call`'s tail, held on the `__init__` frame that owns it,
-/// reaches here as `[caller, tail, __init__]` without this path inserting
-/// anything. Nothing here may re-position a level relative to the innermost
-/// callee; a helper descent is not that callee's depth. The outermost
-/// section must name a Python `CodeObject`: a helper-only numbering would
-/// make the helper the vable portal frame (`rebuild_from_resumedata`).
 /// The framestack a guard captures once `finishframe` popped the callee: the
 /// paused callers, the innermost with `result` in the slot
 /// `make_result_of_lastop` writes (`pyjitpl.py do_residual_call`, which
@@ -3500,7 +4394,13 @@ fn walker_capture_finished_callee_snapshot<Sym: WalkSym>(
     {
         caller.boxes[idx] = result;
     }
-    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+    walker_capture_transparent_helper_snapshot(
+        ctx,
+        op_pc,
+        false,
+        parent_frames,
+        GuardStampTarget::LastOp,
+    )
 }
 
 /// The paused callers [`walker_capture_finished_callee_snapshot`] captures,
@@ -3533,10 +4433,55 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
     Some(parent_frames)
 }
 
+/// `opencoder.py` `_ensure_parent_resumedata` numbers each `framestack`
+/// `MIFrame` once. `sections` are the live helper `MIFrame`s (outermost
+/// ancestor first, innermost last). Paused-caller images stop at the last
+/// numbered caller, so the trailing helper images match a prefix of
+/// `sections`; drop that suffix of images (and a numbered innermost image).
+/// Outer images stay.
+pub(crate) fn drop_parent_images_of_live_helper_sections(
+    parents: &mut Vec<InlineParentFrame>,
+    sections: &[(u32, u32, u32, Vec<OpRef>)],
+    is_transparent_helper: impl Fn(u32) -> bool,
+) {
+    let Some(inner) = sections.last() else {
+        return;
+    };
+    if parents.last().is_some_and(|last| {
+        is_transparent_helper(last.jitcode_index) && last.jitcode_index == inner.0
+    }) {
+        parents.pop();
+    }
+    let start = parents
+        .iter()
+        .rposition(|p| !is_transparent_helper(p.jitcode_index))
+        .map_or(0, |i| i + 1);
+    let images = &parents[start..];
+    let drop_n = (1..=images.len().min(sections.len()))
+        .rev()
+        .find(|&n| {
+            images[images.len() - n..]
+                .iter()
+                .zip(&sections[..n])
+                .all(|(p, s)| p.jitcode_index == s.0)
+        })
+        .unwrap_or(0);
+    parents.truncate(parents.len() - drop_n);
+}
+
+/// A guard inside a canonical helper body, or a paused-parent-only capture
+/// (operator tail / finished callee) that reuses the same encoder.
+///
+/// `parent_frames` is the whole framestack's paused levels flattened in
+/// order. When this walk is a live helper (`transparent_helper_subwalk`),
+/// `collect_live_helper_guard_sections` appends one section per helper
+/// `MIFrame` after those parents, innermost last
+/// (`MetaInterp.capture_resumedata`). Images of live helper frames are dropped.
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    parent_frames: Vec<InlineParentFrame>,
+    after_residual_call: bool,
+    mut parent_frames: Vec<InlineParentFrame>,
     guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
@@ -3561,16 +4506,21 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
+    let helper_sections = collect_live_helper_guard_sections(ctx, op_pc, after_residual_call)?;
+    drop_parent_images_of_live_helper_sections(&mut parent_frames, &helper_sections, |index| {
+        crate::state::jitcode_is_transparent_helper(index as i32)
+    });
     let saved_vable = publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);
     // `capture_resumedata` numbers every `MetaInterp.framestack` level in one
     // `ResumeDataLoopMemo` pass (`resume.py` `number`). Each section's tagged
-    // values are the live boxes at that frame's published pc, so the length
-    // agrees with `get_current_position_info` / `frame_value_count_at` when
-    // cranelift rebuilds the numbering. A stored `in_a_call` image whose
-    // length differs from that window refuses the capture.
-    let mut captured: Vec<(u32, u32, u32, Vec<OpRef>)> = Vec::with_capacity(parent_frames.len());
+    // values are the live boxes at that frame's published pc — the same
+    // `self.pc` collection used — so the length agrees with
+    // `get_current_position_info` / `frame_value_count_at`. A stored image
+    // whose length differs from that window refuses the capture.
+    let mut captured: Vec<(u32, u32, u32, Vec<OpRef>)> =
+        Vec::with_capacity(parent_frames.len() + helper_sections.len());
     for frame in &parent_frames {
         let word = frame
             .resume_marker_jit_pc
@@ -3586,6 +4536,7 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         let boxes = boxes_matching_resume_liveness(frame, pc_word, op_pc)?;
         captured.push((frame.jitcode_index, pc_word, py_pc, boxes));
     }
+    captured.extend(helper_sections);
     let frames: Vec<(u32, u32, u32, &[OpRef])> = captured
         .iter()
         .map(|(jitcode_index, pc_word, py_pc, boxes)| {
@@ -3678,7 +4629,13 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     };
     parent_frames.push(caller);
     parent_frames.push(tail_frame);
-    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
+    walker_capture_transparent_helper_snapshot(
+        ctx,
+        op_pc,
+        false,
+        parent_frames,
+        GuardStampTarget::LastOp,
+    )
 }
 
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
@@ -3704,6 +4661,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         return walker_capture_transparent_helper_snapshot(
             ctx,
             callee_op_pc,
+            after_residual_call,
             parent_frames,
             guard_stamp,
         );
@@ -3757,31 +4715,74 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // the call). `resume_marker_for_jitcode_pc` is the opcode-start
     // `-live-`; resuming there re-executes the call from the `in_a_call`
     // image whose operands `get_list_of_active_boxes` has cleared.
+    //
+    // A guard still inside this callee's shared `dispatch_bytecode`
+    // copy encodes the opcode that entered the copy, not the switch
+    // union.  A hook residual is not a Python CALL.
+    let in_shared_hook = ctx.session.borrow().hold_opcode_live_before;
+    let callee_resume_op_pc = if in_shared_hook && ctx.live_before_jit_pc != usize::MAX {
+        ctx.live_before_jit_pc
+    } else {
+        callee_op_pc
+    };
+    let callee_after_residual = after_residual_call && !in_shared_hook;
     let callee_jitcode_pc: i32 = if let Some(carried) = scope.carried_resume_jit_pc {
         carried as i32
     } else {
-        match after_residual_call {
-            true => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
-                .or_else(|| {
-                    // Fallback only, for the same reason as the single-frame path:
-                    // the sticky cursor names this frame's op only while no other
-                    // residual has passed, so it may not displace the twin.
+        match callee_after_residual {
+            true => if matches!(
+                ctx.trace_ctx.last_guard_opcode(),
+                Some(OpCode::GuardNotForced)
+            ) {
+                gnf_after_residual_live_marker(
+                    &callee_pjc,
+                    callee_resume_op_pc,
+                    ctx.live_after_jit_pc,
+                )
+            } else {
+                after_residual_guard_marker(&callee_pjc, callee_resume_op_pc, None).or_else(|| {
                     (ctx.live_after_jit_pc != usize::MAX
                         && callee_pjc
                             .jitcode
                             .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
                     .then_some(ctx.live_after_jit_pc)
                 })
-                .map(|m| m as i32)
-                .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
+            }
+            .map(|m| m as i32)
+            .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC),
             // `get_list_of_active_boxes` (`pyjitpl.py`): a plain guard reads
             // `pc = self.pc - SIZE_LIVE_OP`. A branch guard's `callee_op_pc`
             // is already that `-live-` (`generate_guard(resumepc=orgpc)`);
             // [`plain_guard_resume_jitcode_pc`] keeps it instead of walking
             // three bytes earlier onto the opcode-start twin.
-            false => plain_guard_resume_jitcode_pc(&callee_pjc, callee_op_pc),
+            false => {
+                if in_shared_hook {
+                    // Shared `dispatch_bytecode` records the opcode that
+                    // entered the copy. Publish that pc only when it is a
+                    // `-live-`; otherwise the same preceding-live walk the
+                    // plain path uses (`generate_guard(resumepc=orgpc)`).
+                    let op_live = crate::state::op_live();
+                    if callee_pjc
+                        .jitcode
+                        .can_decode_live_vars(callee_resume_op_pc, op_live)
+                    {
+                        callee_resume_op_pc as i32
+                    } else {
+                        plain_guard_resume_jitcode_pc(&callee_pjc, callee_op_pc)
+                    }
+                } else {
+                    plain_guard_resume_jitcode_pc(&callee_pjc, callee_op_pc)
+                }
+            }
         }
     };
+    // `resume.py` `consume_one_section` splits this frame with
+    // `frame_value_count_at` at the published pc. A coordinate that is
+    // not a `-live-` cannot be numbered (`capture_resumedata` uses
+    // `self.pc` after the `-live-` that `get_list_of_active_boxes` read).
+    if !crate::state::frame_pc_is_resolved_offset_at(callee_jitcode_index, callee_jitcode_pc) {
+        return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: callee_op_pc });
+    }
     let mf_diag = fbw_mf_diag_enabled();
     let recipe_resultcolor_audit = pcmap_recipe_resultcolor_audit_enabled();
     if (mf_diag || recipe_resultcolor_audit) && !callee_pjc.code_ptr.is_null() {
@@ -3906,7 +4907,13 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // its frame-local shadow.  This is the inline-frame counterpart of
     // `collect_outer_active_boxes`' virtualizable-slot recovery, and preserves
     // the one-red-frame-per-MIFrame shape instead of falling back to the root.
-    let mut recovered_regs_r = ctx.registers_r.to_vec();
+    // Callee coordinate is in another jitcode; the hold's entry pc does not
+    // order against it.
+    let held = held_hook_banks(ctx, usize::MIN);
+    let mut recovered_regs_r = match held.as_ref() {
+        Some(held) if in_shared_hook => held.r.clone(),
+        _ => ctx.registers_r.to_vec(),
+    };
     let stack_base = if callee_pjc.code_ptr.is_null() {
         0
     } else {
@@ -3915,6 +4922,29 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     };
     let maps =
         crate::state::bridge_semantic_maps_from_jitcode_pc(callee_jitcode_index, callee_jitcode_pc);
+    // The kept-stack guard gate is certified by this callee frame's
+    // operand-stack mirror.  Publish the same boxes into the carried
+    // coordinate's Ref colors before collecting the frame snapshot, so the
+    // resume encoder consumes the exact per-frame state that admitted the
+    // guard.  RPython reads these values directly from the active MIFrame's
+    // register bank; the assignment below is pyre's slot-to-color lowering of
+    // that one-red-frame state, not a lookup through the outer portal frame.
+    // Opcode-start resume re-pops the slots `pushvalue` stored. After a
+    // residual the register bank already holds the result
+    // (`pyjitpl.py get_list_of_active_boxes`); overlaying the still-pre-call
+    // vstack there replaced the result colour with the stale operand.
+    // Every other guard — GuardClass on COMPARE, a branch whose not-taken
+    // edge has not executed its colour moves — reads the certified
+    // per-frame vstack, the analogue of `MIFrame.registers_r`.
+    if !callee_after_residual {
+        overlay_callee_vstack_onto_regs(
+            ctx,
+            callee_jitcode_index,
+            callee_jitcode_pc,
+            stack_base,
+            &mut recovered_regs_r,
+        );
+    }
     if recovered_regs_r.iter().any(|value| value.is_none()) && !callee_pjc.code_ptr.is_null() {
         if let Some(shadow) = ctx.frame_state.borrow().callee_shadow.as_ref() {
             for (color, value) in recovered_regs_r.iter_mut().enumerate() {
@@ -3929,7 +4959,9 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                 ) else {
                     continue;
                 };
-                if let Some(&slot_value) = shadow.opref.get(&(slot as i64)) {
+                if let Some(&slot_value) = shadow.opref.get(&(slot as i64))
+                    && !slot_value.is_none()
+                {
                     *value = slot_value;
                 }
             }
@@ -3940,7 +4972,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         // still its empty/null value and the next opcode overwrites it before
         // any read.  Admit exactly that metadata-proven result color as NULL;
         // every other missing live color still declines below.
-        if after_residual_call {
+        if callee_after_residual {
             let marker_result = usize::try_from(callee_jitcode_pc)
                 .ok()
                 .and_then(|coord| callee_pjc.result_color_trivia_for_jitcode_pc(coord))
@@ -3949,14 +4981,24 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             seed_missing_fallthrough_result(&mut recovered_regs_r, marker_result, null_ref);
         }
     }
-    let callee_boxes = collect_callee_active_boxes(
-        ctx.registers_i,
-        &recovered_regs_r,
-        ctx.registers_f,
-        callee_jitcode_index as u32,
-        callee_op_pc,
-        callee_jitcode_pc,
-    )?;
+    let callee_boxes = match held.as_ref() {
+        Some(held) if in_shared_hook => collect_callee_active_boxes(
+            &held.i,
+            &recovered_regs_r,
+            &held.f,
+            callee_jitcode_index as u32,
+            callee_op_pc,
+            callee_jitcode_pc,
+        )?,
+        _ => collect_callee_active_boxes(
+            ctx.registers_i,
+            &recovered_regs_r,
+            ctx.registers_f,
+            callee_jitcode_index as u32,
+            callee_op_pc,
+            callee_jitcode_pc,
+        )?,
+    };
 
     // Publish the OUTERMOST caller's vable scalars for its resume coordinate so
     // the resume reader restores the caller's `PyFrame` at the CALL return

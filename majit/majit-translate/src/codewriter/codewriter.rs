@@ -649,9 +649,8 @@ impl CodeWriter {
 
         // Indirect calls were lowered in place on the graphs `CallControl`
         // owns (`CallControl::lower_registered_indirect_calls`), before this
-        // clone. That pass leaves a family with no registered impl as a
-        // `CallTarget::Indirect` marker; the clone jtransform rewrites takes
-        // it as the unknown family (`indirect_call` with `graphs=None`).
+        // clone. A family with no registered impl stays `IndirectCall`
+        // with `graphs=None` (unknown family).
         let mut graph_owned = graph.clone();
         // The error carrier's `raise e` / `except OperationError as e`
         // edges, annotated as such, move to the runtime exception value
@@ -661,8 +660,6 @@ impl CodeWriter {
             &callcontrol.error_carrier().clone(),
         );
         crate::translator::rtyper::rpbc::lower_indirect_calls(&mut graph_owned, callcontrol);
-        #[cfg(debug_assertions)]
-        crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(&graph_owned);
         // Pre-jtransform rtyper fold of unit-variant ctors to singleton
         // instance constants (`rtyper/rpbc.py::SingleFrozenPBCRepr`).
         // Catches both the Match-arm and Skip-arm graphs; the

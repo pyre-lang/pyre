@@ -7149,26 +7149,13 @@ impl Descr for SimpleFieldDescr {
         self.ei_index.store(ei_index, Ordering::Relaxed);
     }
     fn is_always_pure(&self) -> bool {
-        // `llsupport/descr.py get_field_descr` sets
-        // `is_pure = STRUCT._immutable_field(fieldname) != False`, and a `?`
-        // entry ranks `IR_QUASIIMMUTABLE`, an `ImmutableRanking` instance
-        // whose `__nonzero__` is false but which is not `False` — so upstream
-        // answers true here for a quasi-immutable field.
-        //
-        // pyre answers false on purpose, and the reason is the const-fold this
-        // word also licenses: upstream can afford it because the codewriter
-        // emits `record_quasiimmut_field` immediately before every
-        // quasi-immutable read (`jtransform.py`), so the marker and its
-        // `GUARD_NOT_INVALIDATED` are always already there.  pyre's emitters do
-        // not all pair them, and a read that folds without the marker leaves a
-        // loop no write can retire.  The nine `function.rs` `?` fields depend
-        // on this; see `pyre-jit-trace/src/descr.rs`.
-        //
-        // The other half of upstream's word — that a quasi-immutable entry
-        // survives a call's cache wipe — is not skipped, it is spelled at the
-        // invalidation sites in `optimizeopt/heap.rs` instead, which is why
-        // this stays a const-fold gate only.
-        self.is_immutable && !self.is_quasi_immutable
+        // `descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False`
+        // (true for a `?` field: `IR_QUASIIMMUTABLE` is falsy but `!= False`).
+        // The mint stamps `is_immutable` for every declared rank. A hand group
+        // whose `?` readers are not all paired with `record_quasiimmut_field`
+        // stamps `is_immutable = false` on that row (`FUNCTION_DESCR_GROUP`
+        // in `pyre-jit-trace/src/descr.rs`).
+        self.is_immutable
     }
     fn is_quasi_immutable(&self) -> bool {
         self.is_quasi_immutable
@@ -7244,6 +7231,40 @@ impl FieldDescr for SimpleFieldDescr {
 
     fn stored_load_is_acquire(&self) -> bool {
         self.load_is_acquire
+    }
+}
+
+#[cfg(test)]
+mod simple_field_descr_purity_tests {
+    use super::*;
+
+    #[test]
+    fn quasi_immutable_declared_field_is_always_pure() {
+        let declared = SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            true,
+            ArrayFlag::Signed,
+            "S.f".to_string(),
+            "f".to_string(),
+        )
+        .with_quasi_immutable(true);
+        assert!(declared.is_always_pure());
+
+        let not_stamped = SimpleFieldDescr::new_with_name(
+            0,
+            0,
+            8,
+            Type::Int,
+            false,
+            ArrayFlag::Signed,
+            "S.g".to_string(),
+            "g".to_string(),
+        )
+        .with_quasi_immutable(true);
+        assert!(!not_stamped.is_always_pure());
     }
 }
 

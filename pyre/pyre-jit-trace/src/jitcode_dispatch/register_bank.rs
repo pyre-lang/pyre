@@ -147,6 +147,12 @@ impl RegisterBank {
         self.0.as_ref().map_or(0, |slots| slots.len())
     }
 
+    /// Mutable prefix of `copy_constants` / `MIFrame.setup`. The suffix
+    /// `[num_regs, len)` is `ConstClass(constants[i])` and is not a dest.
+    pub fn num_regs(&self) -> usize {
+        self.1
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn root(&self) -> RegisterBankRoot {

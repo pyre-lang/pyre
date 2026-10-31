@@ -1526,20 +1526,11 @@ pub struct PyFrame {
     pub w_yielding_from: PyObjectRef,
     /// PyPy: `f_backref = jit.vref_None`.
     pub f_backref: *mut PyFrame,
-    /// pyframe.py:115-116 — `self.builtin = space.builtin
-    /// .pick_builtin(w_globals)`, gated under `honor__builtins__`
-    /// (`baseobjspace::HONOR_BUILTINS`, default False).  With the option
-    /// off (the default) `frame_builtin*` returns `space.builtin`, ignoring
-    /// a custom `__builtins__` in globals; with it on the `pick_builtin*`
-    /// family honors `globals['__builtins__']`.  Consulted by LOAD_GLOBAL's
-    /// builtins fallback (`pyopcode.py`) via
-    /// `space.finditem_str(self.w_builtin.w_dict, name)` — honouring
-    /// dict subclass `__getitem__` overrides (`moduledef.py:102-103`)
-    /// without an extra storage-keyed fast path.  `frame.get_builtin()`
-    /// returns this directly so callers (`exec`'s
-    /// `setdefault('__builtins__', self.get_builtin())` at
-    /// `pyopcode.py`) see the picked Module, not the EC's
-    /// default builtin.
+    /// `pyframe.py __init__` assigns `self.builtin` only when
+    /// `honor__builtins__` is on. Default is off: constructors store
+    /// NULL and [`Self::get_builtin`] answers `space.builtin`. A
+    /// non-null field is an `exec`/`eval` frame that honors its
+    /// globals' `__builtins__` (3.15).
     pub w_builtin: PyObjectRef,
 }
 
@@ -5498,20 +5489,15 @@ impl PyFrame {
         self.set_escaped(true);
     }
 
-    /// pyframe.py `get_builtin` — returns `self.builtin` (the
-    /// per-frame picked builtin Module, set at frame creation by
-    /// `pick_builtin(w_globals)`).  Falls back to the EC's default
-    /// builtin when the frame was constructed without globals.
+    /// `pyframe.py get_builtin` with `honor__builtins__=False` is
+    /// `self.space.builtin`. A non-null field is an `exec`/`eval` frame
+    /// that honors its globals' `__builtins__` (3.15).
     #[inline]
     pub fn get_builtin(&self) -> PyObjectRef {
         if !self.w_builtin.is_null() {
             return self.w_builtin;
         }
-        let execution_context = crate::call::getexecutioncontext();
-        if execution_context.is_null() {
-            return pyre_object::PY_NULL;
-        }
-        unsafe { (*execution_context).get_builtin() }
+        crate::importing::space_builtin()
     }
 
     /// `frame.f_backref()` — force the caller vref.  `f_backref` holds a
@@ -8010,5 +7996,29 @@ x = 7
         let plain = frame.make_arguments(1, false, pyre_object::PY_NULL);
         assert!(!plain.methodcall);
         assert_eq!(plain.arguments_w.len(), 1);
+    }
+
+    #[test]
+    fn frame_without_builtin_field_reads_space_builtin() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let code = crate::compile_exec("x = 1\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code);
+        let globals = pyre_object::w_dict_new();
+        let frame = super::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+            .expect("frame");
+        assert!(
+            frame.w_builtin.is_null(),
+            "ordinary constructors store NULL"
+        );
+        let space = crate::importing::space_builtin();
+        assert!(
+            std::ptr::eq(frame.get_builtin(), space),
+            "NULL field reads space.builtin"
+        );
+        assert!(
+            std::ptr::eq(crate::PyExecutionContext::default().get_builtin(), space),
+            "same-thread ExecutionContext::get_builtin is space.builtin"
+        );
     }
 }

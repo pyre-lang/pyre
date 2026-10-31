@@ -245,7 +245,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `box_value` resolves these via `TraceCtx::constants` so
     // downstream getfield chains see the constant's `Value::*`.
     for (i, &v) in top_constants_i.iter().enumerate() {
-        top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
+        let boxed = trace_ctx.const_int(v);
+        super::assert_int_bank_box(boxed, "allocate_callee_register_banks");
+        top_regs_i[top_num_regs_i + i] = boxed;
         top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
     }
     // A constant-pool slot holds a KNOWN value, so a zero is the known
@@ -257,7 +259,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // slot).
     for (i, v) in top_constants_r.iter().enumerate() {
         let v = v.get();
-        top_regs_r.set(top_num_regs_r + i, trace_ctx.const_ref(v));
+        let boxed = trace_ctx.const_ref(v);
+        super::assert_ref_bank_box(boxed, "allocate_callee_register_banks");
+        top_regs_r.set(top_num_regs_r + i, boxed);
         top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in top_constants_f.iter().enumerate() {
@@ -300,12 +304,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         });
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        super::assert_ref_bank_box(box_ref, "setup_call");
         top_regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
             top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
     for (i, &box_ref) in argboxes_i.iter().enumerate() {
+        super::assert_int_bank_box(box_ref, "setup_call");
         top_regs_i[i] = box_ref;
         if let Some(majit_ir::Value::Int(v)) = trace_ctx.box_value(box_ref) {
             top_concrete_i[i] = ConcreteValue::Int(v);
@@ -936,11 +942,16 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     };
     let cleared = result_register.and_then(|(bank, color)| {
         let (regs, cleared) = match bank {
-            'i' => (&mut regs_i, trace_ctx.const_int(0)),
-            'r' => (
-                &mut regs_r,
-                trace_ctx.const_ref(pyre_object::PY_NULL as i64),
-            ),
+            'i' => {
+                let cleared = trace_ctx.const_int(0);
+                super::assert_int_bank_box(cleared, "in_a_call");
+                (&mut regs_i, cleared)
+            }
+            'r' => {
+                let cleared = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+                super::assert_ref_bank_box(cleared, "in_a_call");
+                (&mut regs_r, cleared)
+            }
             'f' => (&mut regs_f, trace_ctx.const_float(0)),
             _ => return None,
         };
@@ -969,7 +980,8 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         OuterActiveBoxesEntryTwin::Trivia,
         "bridge_root_parent",
         None,
-    );
+    )
+    .ok()?;
     // The concrete image this paused root resumes from when a descendant
     // sub-walk aborts and the drain converts the chain instead of rewinding to
     // the guard. Each bank skips the call-result color for the same reason it
@@ -1046,8 +1058,18 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         // Color-indexed banks (`consume_boxes`). All three carry the cleared
         // result color (`MIFrame.get_list_of_active_boxes(in_a_call=True)`);
         // null and non-ref boxes remain.
-        registers_r: paused_register_bank(regs_r.iter().copied()),
-        registers_i: paused_register_bank(regs_i.iter().copied()),
+        registers_r: {
+            for &op in &regs_r {
+                super::assert_ref_bank_box(op, "paused_register_bank");
+            }
+            paused_register_bank(regs_r.iter().copied())
+        },
+        registers_i: {
+            for &op in &regs_i {
+                super::assert_int_bank_box(op, "paused_register_bank");
+            }
+            paused_register_bank(regs_i.iter().copied())
+        },
         registers_f: paused_register_bank(regs_f.iter().copied()),
         frame_state: None,
         caller_py_pc: None,
@@ -1597,14 +1619,18 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let mut concrete_r = vec![ConcreteValue::Null; total_r];
     let mut concrete_i = vec![ConcreteValue::Null; total_i];
     for (i, &v) in jc.constants_i.iter().enumerate() {
-        regs_i[num_regs_i + i] = ctx.const_int(v);
+        let boxed = ctx.const_int(v);
+        super::assert_int_bank_box(boxed, "allocate_callee_register_banks");
+        regs_i[num_regs_i + i] = boxed;
         concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
     }
     // A null constant is a known `PY_NULL`, not an untracked slot -- same
     // reading as the top-level seeding above and as `build_callee_banks`.
     for (i, v) in jc.constants_r.iter().enumerate() {
         let v = v.get();
-        regs_r.set(num_regs_r + i, ctx.const_ref(v));
+        let boxed = ctx.const_ref(v);
+        super::assert_ref_bank_box(boxed, "allocate_callee_register_banks");
+        regs_r.set(num_regs_r + i, boxed);
         concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in jc.constants_f.iter().enumerate() {
@@ -1618,6 +1644,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }));
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        super::assert_ref_bank_box(box_ref, "setup_call");
         regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(box_ref) {
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
@@ -1636,6 +1663,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         if box_ref.is_none() {
             continue;
         }
+        super::assert_int_bank_box(box_ref, "setup_call");
         regs_i[i] = box_ref;
         if let Some(majit_ir::Value::Int(v)) = ctx.box_value(box_ref) {
             concrete_i[i] = ConcreteValue::Int(v);
@@ -1649,7 +1677,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     }
     if let Some(result) = child_result {
         // `_setup_return_value_*` (`blackhole.py`): the callee's result
-        // lands in `code[position - 1]` of the call it paused in.
+        // lands in `code[position - 1]` of the call it paused in, in the
+        // result bank of that call. Helper jitcodes return int/float as
+        // well as ref (`compare_value_from_tag`, range length).
         match super::call_result_register_in(jc.code.as_slice(), entry) {
             super::CallResultRegister::Void => {}
             super::CallResultRegister::Reg('r', call_dst_reg) => {
@@ -1660,6 +1690,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                         callee_num_regs_r: regs_r.len(),
                     }));
                 }
+                super::assert_ref_bank_box(result, "make_result_of_lastop");
                 regs_r.set(call_dst_reg, result);
                 if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
                     concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
@@ -1673,6 +1704,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                         callee_num_regs_i: regs_i.len(),
                     }));
                 }
+                super::assert_int_bank_box(result, "make_result_of_lastop");
                 regs_i[call_dst_reg] = result;
                 if let Some(majit_ir::Value::Int(v)) = ctx.box_value(result) {
                     concrete_i[call_dst_reg] = ConcreteValue::Int(v);
@@ -1700,7 +1732,27 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let outer_active_boxes = root_frame.boxes.clone();
 
     let callee_code = jc.code.as_slice();
-    let lookup_ref: &SubJitCodeLookup = &sub_jitcode_lookup;
+    // Build-time helpers (`JitCode::from_canonical`) resolve `d`/`j` through
+    // `ALL_DESCRS` and leave `exec.descrs` empty. Walking one as a per-fn
+    // carrier aborts every descr operand (`DescrIndexOutOfRange { len: 0 }`).
+    let uses_global_descr_pool =
+        callee_pjc.jitcode.uses_global_descr_pool() || callee_pjc.code_ptr.is_null();
+    let global_descrs = crate::jitcode_runtime::descr_ref_table();
+    let descr_refs: &dyn DescrRefTable = if uses_global_descr_pool {
+        global_descrs
+    } else {
+        &perfn_descr_refs
+    };
+    let raw_descrs = if uses_global_descr_pool {
+        RawDescrPool::Global
+    } else {
+        RawDescrPool::PerFn(perfn_descrs)
+    };
+    let lookup_ref: &SubJitCodeLookup = if uses_global_descr_pool {
+        &GLOBAL_SUB_JITCODE_LOOKUP_FN
+    } else {
+        &sub_jitcode_lookup
+    };
     // `callee_w_code` is the callee frame's `pycode` red — a
     // `W_Code` object.  `callee_code_key` is the raw compiled-code pointer the
     // recipe carries, which is the JIT-side key, not that object; the live
@@ -1719,6 +1771,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     if callee_w_code == 0 && !callee_pjc.code_ptr.is_null() {
         return None;
     }
+    let is_helper = callee_w_code == 0 && callee_pjc.code_ptr.is_null();
 
     // Deepest recipe only (`child_result` is the middle `finishframe`
     // path; `handler_entry` is an already-routed ChangeFrame). A paused
@@ -1771,12 +1824,14 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let mut pending_tails: Vec<InlineParentFrame> = Vec::new();
     for parent_recipe in paused_parent_recipes {
         if parent_recipe.len_tail
+            || crate::state::recipe_is_helper_mi_frame(parent_recipe)
             || crate::state::jitcode_is_transparent_helper(parent_recipe.jitcode_index)
         {
-            // The recipe's jitcode is the operator tail that was paused
-            // (`bh_len_tail` or `bh_truth_bool_tail`), or a descended helper
-            // paused past its CALL. Rebuilding `Len` unconditionally would
-            // run the length check on a `__bool__` result.
+            // Operator tail or helper `MIFrame`: no Python code object.
+            // The recipe's jitcode is the paused level; rebuild it as a
+            // parent so a guard inside the resumed callee encodes it
+            // (`capture_resumedata` keeps every `inline_call` on the
+            // framestack).
             if parent_recipe.jitcode_pc < 0 {
                 return None;
             }

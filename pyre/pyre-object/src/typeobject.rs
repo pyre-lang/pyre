@@ -1287,6 +1287,27 @@ pub unsafe fn w_type_current_qmut_instance(
     )
 }
 
+impl W_TypeObject {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_version_tag" => {
+                if !self.mutate_version_tag.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_version_tag) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+}
+
 /// Revoke every loop that baked this type's `version_tag` as a constant
 /// (`quasiimmut.py make_invalidation_function._invalidate_now`).
 ///
@@ -1303,23 +1324,13 @@ pub unsafe fn w_type_current_qmut_instance(
 /// [`Box`] here is that collection. Called from [`w_type_set_version_tag`] right
 /// before the new tag is published.
 ///
-/// Upstream runs the whole walk outside traced code — `_invalidate_now` is
-/// reached from the residual `jit_force_quasi_immutable` path, never from a
-/// trace — so the sweep is residualised the same way
-/// ([`crate::quasiimmut::sweep_quasi_immut_field`]). The installed check stays
-/// traced, so mutating a type no loop depends on still makes no call.
-///
 /// # Safety
 /// `obj` must be null or point at a valid `W_TypeObject`.
 pub unsafe fn w_type_notify_mutate_version_tag(obj: PyObjectRef) {
     if obj.is_null() || !is_type(obj) {
         return;
     }
-    let field = &(*(obj as *const W_TypeObject)).mutate_version_tag;
-    if !field.is_installed() {
-        return;
-    }
-    crate::quasiimmut::sweep_quasi_immut_field(field);
+    (*(obj as *const W_TypeObject)).jit_force_quasi_immutable("mutate_version_tag");
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for this type's `name?`.
@@ -1711,17 +1722,16 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut crate::object_array::Fixe
 }
 
 /// True when `cls` occurs in `w_type`'s MRO — the pointer-identity subtype
-/// membership scan `W_TypeObject.issubtype` / `_issubtype` performs
-/// (typeobject.py:603/1640).  The single home for the MRO subtype check;
-/// interpreter-level subtype guards and reflected-binop dispatch delegate
-/// here rather than each re-scanning the MRO.
+/// membership scan `_issubtype` performs (typeobject.py).  The single home
+/// for the MRO subtype check; interpreter-level subtype guards and
+/// reflected-binop dispatch delegate here rather than each re-scanning
+/// the MRO.
 ///
-/// Under the JIT `issubtype` runs this scan inside `_pure_issubtype`
-/// (`@elidable_promote`, typeobject.py:1657), so the MRO membership walk
-/// is not traced — its result is promoted.  The `dont_look_inside` marker
-/// is the equivalent boundary: the JIT residualises the call instead of
-/// tracing the per-type MRO read the tracer cannot model.
-#[majit_macros::dont_look_inside]
+/// `W_TypeObject.issubtype` is the look-inside wrapper: it promotes both
+/// types and, under the JIT with two live version tags, calls
+/// `_pure_issubtype` (`@elidable_promote`).  This function is `_issubtype`
+/// itself — the elidable wrapper is the boundary, so the scan stays
+/// look-inside for the non-elidable path.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

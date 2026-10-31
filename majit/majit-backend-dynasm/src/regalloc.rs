@@ -1469,7 +1469,7 @@ impl RegisterManager {
         Loc::Reg(reg)
     }
 
-    /// regalloc.py:696
+    /// llsupport/regalloc.py `_sync_var_to_stack`.
     pub fn _sync_var_to_stack(
         &mut self,
         v: OpRef,
@@ -1478,19 +1478,25 @@ impl RegisterManager {
         fm: &mut FrameManager,
     ) {
         if fm.get(v, longevity).is_none() {
-            // regalloc.py:696-704: allocate frame slot and emit move.
-            let reg = self.reg_bindings_get(v, longevity);
+            // llsupport/regalloc.py `_sync_var_to_stack`: `reg =
+            // self.reg_bindings[v]` (KeyError if the box is not in a
+            // register), then `to = self.frame_manager.loc(v)` and
+            // `assembler.regalloc_mov(reg, to)`. Binding a frame slot
+            // without the store leaves a live Ref's gcmap bit covering
+            // stale bits.
+            let r = self.reg_bindings_get(v, longevity).unwrap_or_else(|| {
+                panic!(
+                    "_sync_var_to_stack: box not bound to a register (llsupport/regalloc.py reg_bindings[v])"
+                )
+            });
             let to = fm.loc(v, tp, false, longevity);
-            if let Some(r) = reg {
-                // RPython: self.assembler.regalloc_mov(reg, to)
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
-                        v, r, to.position
-                    );
-                }
-                self.spill_moves.push((Loc::Reg(r), Loc::Frame(to)));
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
+                    v, r, to.position
+                );
             }
+            self.spill_moves.push((Loc::Reg(r), Loc::Frame(to)));
         }
         // otherwise it's clean (already on stack)
     }
@@ -2080,6 +2086,8 @@ impl<'a> RegAlloc<'a> {
     /// `arg.type` per box; pyre routes through `self.tp`, which resolves a
     /// real Box's intrinsic type and falls back to `Type::Int` only for a
     /// `TempVar` (the `_check_type` exemption, regalloc.py).
+    /// aarch64/regalloc.py `possibly_free_vars_for_op` also frees
+    /// `op.getfailargs()` when `op.is_guard()`.
     pub fn possibly_free_vars_for_op(&mut self, op: &Op) {
         for arg in op.args_slice().iter() {
             if !arg.is_constant() && !arg.is_none() {
@@ -2087,6 +2095,11 @@ impl<'a> RegAlloc<'a> {
                 let tp = self.tp(arg);
                 self.possibly_free_var(arg, tp);
             }
+        }
+        if op.opcode.is_guard()
+            && let Some(fail_args) = op.guard_fail_args()
+        {
+            self._possibly_free_j2_vars(fail_args.iter().map(|a| a.to_opref()));
         }
     }
 
@@ -2532,8 +2545,33 @@ impl<'a> RegAlloc<'a> {
                 );
                 (None, raw_op.opcode.result_type())
             }
-            LirOp::Call { dst, args, .. } => {
+            LirOp::Call {
+                dst, args, opcode, ..
+            } => {
                 self._possibly_free_j2_vars(args.iter().copied());
+                // aarch64/assembler.py `_walk_operations`: CallMayForce /
+                // CallReleaseGil / CallAssembler is paired with the
+                // following GuardNotForced, then
+                // `possibly_free_vars(guard_op.getfailargs())`.
+                if opcode.is_call_may_force()
+                    || opcode.is_call_release_gil()
+                    || opcode.is_call_assembler()
+                {
+                    let operations = self.operations;
+                    let next_i = (self.rm.position as usize).saturating_add(1);
+                    if let Some(next) = operations.get(next_i)
+                        && matches!(
+                            next.opcode,
+                            OpCode::GuardNotForced | OpCode::GuardNotForced2
+                        )
+                    {
+                        if let Some(fail_args) = next.guard_fail_args() {
+                            let fail_args: SmallVec<[OpRef; 4]> =
+                                fail_args.iter().map(|a| a.to_opref()).collect();
+                            self._possibly_free_j2_vars(fail_args.into_iter());
+                        }
+                    }
+                }
                 (*dst, raw_op.opcode.result_type())
             }
             LirOp::Opcode {
@@ -3114,6 +3152,82 @@ mod tests {
         assert!(reg2 == reg0 || reg2 == reg1);
         // The spilled variable should now be in the frame
         assert!(fm.get_frame_depth() >= 1);
+    }
+
+    /// llsupport/regalloc.py `_sync_var_to_stack`: a box not yet in the
+    /// frame lives in a register; allocate a slot and emit the move.
+    #[test]
+    fn sync_var_to_stack_emits_reg_to_frame_move() {
+        let mut longevity = LifetimeManager::new();
+        let v = OpRef::ref_op(0);
+        longevity.set(v, Lifetime::new(0, 5));
+        let mut rm = RegisterManager::new(
+            vec![EAX, ECX],
+            vec![],
+            vec![EAX, ECX],
+            EBP,
+            Some(vec![Type::Int, Type::Ref]),
+            EAX,
+        );
+        rm.position = 0;
+        let mut fm = FrameManager::new(0);
+        let reg = rm
+            .try_allocate_reg(v, None, false, &mut longevity)
+            .expect("register for box");
+        rm._sync_var_to_stack(v, Type::Ref, &mut longevity, &mut fm);
+        let frame = fm
+            .get(v, &longevity)
+            .expect("_sync_var_to_stack binds a frame slot");
+        assert!(
+            rm.spill_moves.iter().any(|(src, dst)| {
+                matches!(
+                    (src, dst),
+                    (Loc::Reg(r), Loc::Frame(f)) if *r == reg && f.position == frame.position
+                )
+            }),
+            "spill_moves must contain (Reg, Frame): {:?}",
+            rm.spill_moves
+        );
+    }
+
+    /// After a Ref dies at a guard, `possibly_free_vars_for_op` frees its
+    /// failarg slot (`aarch64/regalloc.py`), so `get_gcmap` does not mark
+    /// that frame bit at the next collecting call.
+    #[test]
+    fn dead_ref_failarg_frame_bit_cleared_after_guard() {
+        let p0 = OpRef::input_arg_ref(0);
+        let i0 = OpRef::input_arg_int(1);
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
+        let ops = rcs(vec![
+            make_guard(OpCode::GuardTrue, 0, &[i0], &[p0]),
+            make_op(OpCode::Finish, 1, &[i0]),
+        ]);
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let slot = ra
+            .fm
+            .get(p0, &ra.longevity)
+            .expect("inputarg frame loc from _set_initial_bindings");
+        ra.rm.position = 0;
+        ra.xrm.position = 0;
+        ra.possibly_free_vars_for_op(ops[0].as_ref());
+        assert!(
+            ra.fm.boxes_in_frame[slot.get_position()].is_none(),
+            "dying failarg must leave its frame slot: {:?}",
+            ra.fm.boxes_in_frame
+        );
+        ra.rm.position = 1;
+        ra.xrm.position = 1;
+        let gcmap = ra.get_gcmap(&[], false);
+        let index = slot.get_position() + crate::arch::JITFRAME_FIXED_SIZE;
+        let word_index = index / (crate::arch::WORD * 8);
+        let bit_index = index % (crate::arch::WORD * 8);
+        let bit_set = unsafe { *gcmap.add(1 + word_index) & (1usize << bit_index) != 0 };
+        assert!(
+            !bit_set,
+            "gcmap must not mark a Ref that died at the preceding guard (slot {})",
+            slot.get_position()
+        );
     }
 
     #[test]

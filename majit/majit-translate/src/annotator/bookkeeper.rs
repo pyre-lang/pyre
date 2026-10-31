@@ -1685,7 +1685,7 @@ impl Bookkeeper {
 
     /// Resolve a bare trait `leaf` to the unique registered dispatch-family
     /// base spelling ([`Self::trait_family_bases`] key = the trait's
-    /// full `name_path()`).  The inline-Field `CallTarget::Indirect` carries
+    /// full `name_path()`).  The inline-Field `IndirectCall.family_key` carries
     /// the trait by leaf (`dyn_indirect_target` strips the vtable path to its
     /// leaf, matching `register_trait_method`), but the receiver-narrowing
     /// cast (`__cast_instance_intrinsic`) and the family base mint both key on the

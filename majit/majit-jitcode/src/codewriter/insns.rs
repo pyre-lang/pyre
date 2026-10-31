@@ -230,10 +230,10 @@ pub const BC_MOVE_I_D: u8 = 38;
 // release/may-force policy rides on `EffectInfo.extraeffect`.
 pub const BC_RECORD_EXACT_VALUE_I: u8 = 41;
 pub const BC_RECORD_EXACT_VALUE_R: u8 = 40;
-// slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
-// — release-GIL policy rides on
-// `EffectInfo.call_release_gil_target` (`effectinfo.py
-// is_call_release_gil`).
+// Slot 42 was formerly `BC_CALL_RELEASE_GIL_INT`; release-GIL policy
+// rides on `EffectInfo.call_release_gil_target` (`effectinfo.py
+// is_call_release_gil`). Reused below as
+// [`BC_JIT_FORCE_QUASI_IMMUTABLE_I`].
 // BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
 // resoperation.py (`# no such thing`) excludes
 // CALL_RELEASE_GIL_R from the upstream opcode table.
@@ -675,14 +675,10 @@ pub const BC_ABORT_RESULT_R: u8 = 195;
 // address refused by `rewrite_op_getsubstruct`).
 pub const BC_ABORT_RESULT_I: u8 = 249;
 
-// pyre-only `vtable_method_ptr/rd>i` — emitted by `OpKind::
-// VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython has no counterpart
-// because Python dispatch goes through `cpu.bh_call_*` resolved at
-// runtime; pyre's Rust port hits this only when a `dyn Trait` method
-// pointer must be reified into the bytecode stream (backend-epic
-// adaptation, see `blackhole.rs`'s `handler_vtable_method_ptr_bail`, which
-// aborts the frame rather than manufacturing a pointer).
-pub const BC_VTABLE_METHOD_PTR: u8 = 196;
+// slot 196 (formerly BC_VTABLE_METHOD_PTR) freed — dyn Trait dispatch
+// is `ClassRepr.getclsfield` (`getfield_raw_i` of `{vtable}.method_*`)
+// plus `indirect_call`. Do not reuse this byte until a new opcode is
+// assigned here on purpose.
 
 // `record_quasiimmut_field/rdd` — RPython `blackhole.py bhimpl_record_quasiimmut_field`
 // `bhimpl_record_quasiimmut_field`.  Records that a quasi-immutable
@@ -696,6 +692,14 @@ pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
 // mutate fielddescr.  Byte 39 is the first unused opcode number
 // (`wellknown_bh_insns` ∪ `extension_insns` fill 199-254).
 pub const BC_JIT_FORCE_QUASI_IMMUTABLE: u8 = 39;
+// `jit_force_quasi_immutable/id` — the same op when the owner is a raw
+// address in the int bank (`assembler.py` argcodes `id`; `getkind` of
+// `lltype.Signed` / a non-GC ptr). Slot 42 is the lowest unused byte
+// (formerly `BC_CALL_RELEASE_GIL_INT`; that policy now rides on
+// `EffectInfo.call_release_gil_target`). Slot 196 stays unused: the
+// file holds that freed byte until a new opcode is assigned there on
+// purpose.
+pub const BC_JIT_FORCE_QUASI_IMMUTABLE_I: u8 = 42;
 
 // `assert_not_none/r` — RPython `pyjitpl.py opimpl_assert_not_none`
 // + `blackhole.py bhimpl_assert_not_none`.  Records that `box` is
@@ -1213,6 +1217,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // field descr + mutate descr (no result).
     m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
     m.insert("jit_force_quasi_immutable/rd", BC_JIT_FORCE_QUASI_IMMUTABLE);
+    m.insert(
+        "jit_force_quasi_immutable/id",
+        BC_JIT_FORCE_QUASI_IMMUTABLE_I,
+    );
 
     // Heapcache hint markers — `pyjitpl.py:385-410`.
     // `assert_not_none/r` records that `box` is non-null;
@@ -1481,13 +1489,6 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // pyre-only `abort/>i` — Int-result variant, handled by
     // `handler_abort_result_marker_i` exactly like `abort/`.
     m.insert("abort/>i", BC_ABORT_RESULT_I);
-    // pyre-only `vtable_method_ptr/rd>i` — emitted by
-    // `OpKind::VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython's dispatch
-    // resolves dyn-method addresses through `cpu.bh_call_*` at runtime
-    // and never needs to reify a method pointer into the bytecode stream;
-    // pyre's Rust port hits this only on `dyn Trait` calls, where the
-    // backend epic must look up the vtable slot itself.
-    m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
     // pyre-only `arraybase_vable/rdd>i` — address of item 0 of a
     // virtualizable array field.  Registered here rather than in
     // `wellknown_bh_insns` beside `arraylen_vable` because RPython has no

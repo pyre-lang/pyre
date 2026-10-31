@@ -2250,18 +2250,6 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
-            // RPython `rpython/jit/codewriter/jtransform.py:546` emits
-            // `int_guard_value(op.args[0])` where `op.args[0]` is already a
-            // `Ptr(FuncType)` integer after rtype.  Rust `&dyn Trait` is a
-            // fat pointer so the rtyper-equivalent layer
-            // (`translator/rtyper/rclass.rs::class_get_method_ptr`) emits
-            // `OpKind::VtableMethodPtr(receiver)` with the
-            // `(trait_root, method_name)` pair; the assembler encodes it
-            // as `vtable_method_ptr/rd>i` carrying a `BhDescr::VtableMethod`.
-            // The result register is the integer function address that
-            // `int_guard_value` and the subsequent `residual_call_*`
-            // consume — backend lowering of the actual vtable slot read
-            // is not yet implemented.
             // blackhole.py `@arguments("cpu", "r", returns="i")
             // bhimpl_guard_class` — one ref register in, the class out.
             // The result bank follows the register the original read was
@@ -2292,32 +2280,6 @@ impl AssemblerEncode for Assembler {
                 );
                 argcodes.push(kc);
                 state.code.push(reg);
-                let opname = op_kind_to_opname(&op.kind);
-                let key = format!("{opname}/{argcodes}");
-                let opnum = self.get_opnum(&key);
-                state.code[startposition] = opnum;
-            }
-            OpKind::VtableMethodPtr {
-                receiver,
-                trait_root,
-                method_name,
-            } => {
-                let (reg, kc) = self.lookup_reg_with_kind_var(receiver, regallocs);
-                state.code.push(reg);
-                argcodes.push(kc);
-                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VtableMethod {
-                    trait_root: trait_root.clone(),
-                    method_name: method_name.clone(),
-                });
-                state.code.push((descr_idx & 0xFF) as u8);
-                state.code.push((descr_idx >> 8) as u8);
-                argcodes.push('d');
-                if let Some(result) = op.result.as_ref() {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                }
                 let opname = op_kind_to_opname(&op.kind);
                 let key = format!("{opname}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -2365,9 +2327,9 @@ impl AssemblerEncode for Assembler {
             }
             // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
             // `jit_force_quasi_immutable(v_inst, descr1)` — a register or
-            // pooled `r` constant followed by one fielddescr. The blackhole
+            // pooled constant followed by one fielddescr. The blackhole
             // counterpart `bhimpl_jit_force_quasi_immutable` expects
-            // argcodes `rd`.
+            // argcodes `rd` (GC owner) or `id` (raw address).
             OpKind::JitForceQuasiImmutable { base, mutate_field } => {
                 match base {
                     crate::model::LinkArg::Value(var) => {
@@ -2378,13 +2340,13 @@ impl AssemblerEncode for Assembler {
                     crate::model::LinkArg::Const(c) => {
                         let kind = crate::flatten::constant_kind(c);
                         assert!(
-                            kind == 'r',
-                            "jit_force_quasi_immutable const base must be Ref, got {kind:?} — graph {:?}",
+                            kind == 'r' || kind == 'i',
+                            "jit_force_quasi_immutable const base must be Ref or Int, got {kind:?} — graph {:?}",
                             self.current_graph_name,
                         );
                         let byte = self.emit_const(&c.value, kind, state, callcontrol);
                         state.code.push(byte);
-                        argcodes.push('r');
+                        argcodes.push(kind);
                     }
                 }
                 // `jtransform.py rewrite_op_jit_force_quasi_immutable`
@@ -3783,7 +3745,6 @@ impl AssemblerEncode for Assembler {
                 OpKind::GuardFalse { .. } => "GuardFalse",
                 OpKind::GuardValue { .. } => "GuardValue",
                 OpKind::GuardClass { .. } => "GuardClass",
-                OpKind::VtableMethodPtr { .. } => "VtableMethodPtr",
                 OpKind::IndirectCall { .. } => "IndirectCall",
                 OpKind::VableFieldRead { .. } => "VableFieldRead",
                 OpKind::VableFieldWrite { .. } => "VableFieldWrite",
@@ -6090,7 +6051,8 @@ fn fielddescrof(
             FieldLayoutResolution::Unresolved => {}
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
-            is_immutable = rank.is_immutable();
+            // Declared (any rank) ⇒ immutable, `descr.py get_field_descr`.
+            is_immutable = true;
             is_quasi_immutable = rank.is_quasi_immutable();
         }
         // Both fallbacks above take `offset` from a second source — the
@@ -6944,9 +6906,6 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::CallMayForce { .. } => "call_may_force".into(),
         OpKind::InlineCall { .. } => "inline_call".into(),
         OpKind::RecursiveCall { .. } => "recursive_call".into(),
-        // RPython: no dedicated opname — the vtable entry becomes the `funcptr`
-        // Variable that `int_guard_value` + `residual_call_*` consume.
-        OpKind::VtableMethodPtr { .. } => "vtable_method_ptr".into(),
         OpKind::IndirectCall { .. } => "indirect_call".into(),
         // jtransform.py:901-903 — `record_quasiimmut_field(v_inst, descr, descr1)`.
         OpKind::RecordQuasiImmutField { .. } => "record_quasiimmut_field".into(),
@@ -10862,6 +10821,50 @@ mod tests {
             field_descr_names.contains(&"mutate_code"),
             "expected Field descr for `mutate_code`, got {:?}",
             field_descr_names
+        );
+    }
+
+    /// A `Signed` owner (raw address) keys `jit_force_quasi_immutable/id`.
+    /// `lookup_reg_with_kind_var` maps `ConcreteType::Signed` to `'i'`.
+    #[test]
+    fn assembles_jit_force_quasi_immutable_id() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("force_qmut_raw");
+        let base_var = push_input_var(&mut graph, "owner", ValueType::Int);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::JitForceQuasiImmutable {
+                base: LinkArg::Value(base_var.clone()),
+                mutate_field: FieldDescriptor::new("mutate_code", Some("Function".to_string())),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::Signed);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let key_count = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("jit_force_quasi_immutable/"))
+            .count();
+        assert_eq!(
+            key_count,
+            1,
+            "expected exactly one jit_force_quasi_immutable/* key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("jit_force_quasi_immutable/id"),
+            "expected key jit_force_quasi_immutable/id, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
         );
     }
 

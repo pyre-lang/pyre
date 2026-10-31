@@ -1129,6 +1129,12 @@ fn real_main() {
                     "opcode_ops",
                     "compare_value_from_tag",
                 ]),
+                // LOAD_GLOBAL — `celldict.py _load_global_fallback` (`flatten.rs inline_call_targets`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "eval",
+                    "_load_global_fallback",
+                ]),
                 // BINARY_SLICE residual `bh_binary_slice_fn`. The portal
                 // never calls this split, so the descent looks the body up
                 // by this graph key (`specialize.rs
@@ -1879,8 +1885,7 @@ fn real_main() {
                 | majit_translate::jitcode::BhDescr::Size { .. } => 0_u8,
                 majit_translate::jitcode::BhDescr::Switch { .. }
                 | majit_translate::jitcode::BhDescr::VableField { .. }
-                | majit_translate::jitcode::BhDescr::VableArray { .. }
-                | majit_translate::jitcode::BhDescr::VtableMethod { .. } => 2_u8,
+                | majit_translate::jitcode::BhDescr::VableArray { .. } => 2_u8,
             });
             // `GcCache.get_field_descr` attaches every FieldDescr to the
             // one SizeDescr in `GcCache._cache_size[STRUCT]`; the parent and

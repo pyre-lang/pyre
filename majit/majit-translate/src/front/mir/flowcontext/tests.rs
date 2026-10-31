@@ -195,6 +195,7 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
         &body,
         crate::HostStaticAddrs::default(),
         &jitdriver_receiver_roots,
+        None,
         &context.struct_field_attrs,
         &struct_fields,
         &context.dont_look_inside,

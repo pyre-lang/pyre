@@ -939,6 +939,83 @@ pub fn builtin_module_names() -> Vec<&'static str> {
     names
 }
 
+/// `baseobjspace.py make_builtins` `self.builtin = Module(self, w_name)`: the one
+/// prebuilt `builtins` Module.
+static SPACE_BUILTIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// `space.builtin`. Elidable: one process-wide immortal Module, so a traced
+/// call with no arguments folds to a constant
+/// (`pyjitpl.py record_result_of_call_pure`).
+#[majit_macros::elidable_cannot_raise]
+pub fn space_builtin() -> PyObjectRef {
+    // A caller that arrives while another thread runs `make_builtins` must
+    // not wait holding the GIL: the builder gives the GIL up inside
+    // `init_typeobjects` and needs it back (`init_typeobjects`).
+    if let Some(&w_builtin) = SPACE_BUILTIN.get() {
+        return w_builtin as PyObjectRef;
+    }
+    let mut waiting = Some(crate::module::thread::before_external_block());
+    *SPACE_BUILTIN.get_or_init(|| {
+        drop(waiting.take());
+        make_builtins()
+    }) as PyObjectRef
+}
+
+/// `baseobjspace.py make_builtins` (`@not_rpython`): allocate the one process
+/// `builtins` Module at space setup. Tests that never call `init_sys_path`
+/// still reach this through [`space_builtin`]'s OnceLock.
+#[majit_macros::not_rpython]
+fn make_builtins() -> usize {
+    let dict = crate::builtins::new_builtin_module_dict();
+    // `w_module_dict_new` is `malloc_typed_stable` (non-moving). The immortal
+    // Module's `w_dict` plus `try_gc_write_barrier` enrolls it in
+    // `prebuilt_root_objects`, replacing the EC `pin_root`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict);
+    // Enumerating a dict materialises key objects and can collect.  Keep
+    // only owned key strings across that operation; raw values must be
+    // looked up again after the module allocation.
+    let entries = unsafe {
+        pyre_object::w_dict_str_entries(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+    };
+    let mut keys = Vec::with_capacity(entries.len());
+    for (key, _) in entries {
+        keys.push(key);
+    }
+    let module = pyre_object::w_module_new_aliasing_dict(
+        pyre_object::w_str_new("builtins"),
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+    );
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(module);
+    // function.py BuiltinFunction.w_moduleobj. The defining
+    // module object does not exist while `new_builtin_module_dict` fills
+    // the namespace, so bind each builtin's `__self__` now.
+    for key in keys {
+        if let Some(value) = unsafe {
+            pyre_object::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                &key,
+            )
+        } {
+            unsafe {
+                crate::function::builtin_function_set_module_obj(
+                    value,
+                    pyre_object::gc_roots::shadow_stack_get(module_slot),
+                )
+            };
+        }
+    }
+    // `baseobjspace.py:650` installs a self-reference here
+    // (`self.setitem(self.builtin.w_dict, '__builtins__', w_builtin)`).
+    // 3.15 does not: `__builtins__` is planted by the frame/import
+    // machinery into *other* modules' globals, so `builtins` itself has
+    // no such key and `import builtins; builtins.__builtins__` raises
+    // AttributeError.
+    pyre_object::gc_roots::shadow_stack_get(module_slot) as usize
+}
+
 /// Install all standard builtin modules.
 ///
 /// Mirrors PyPy's `baseobjspace.make_builtins()` +
@@ -1102,6 +1179,7 @@ pub fn install_builtin_modules() {
     if let Some(hooks) = optional_module_hooks() {
         (hooks.install_modules)();
     }
+    space_builtin();
 }
 
 fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1955,17 +2033,27 @@ pub fn getbuiltinmodule(
 
 /// `space.builtin_modules[name]`.
 ///
-/// The `builtins` entry is `space.builtin`: every frame falls back to the
-/// execution context's module for `LOAD_GLOBAL`, so `import builtins` binds
-/// that one. Every other entry is built by [`new_builtin_module`] the first
-/// time it is named and kept in [`BUILTIN_MODULES`].
+/// The `builtins` entry is [`space_builtin`]: `space.builtin_modules['builtins']
+/// is space.builtin`. Every other entry is built by [`new_builtin_module`] the
+/// first time it is named and kept in [`BUILTIN_MODULES`].
 fn builtin_modules_get(
     name: &str,
     execution_context: *const PyExecutionContext,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
-    if name == "builtins" && !execution_context.is_null() {
-        return Ok(Some(unsafe { (*execution_context).get_builtin() }));
+    if name == "builtins" {
+        let w_mod = space_builtin();
+        let mut table = BUILTIN_MODULES.lock();
+        if let Some(entry) = table.get_mut("builtins")
+            && entry.w_mod == 0
+        {
+            // Young module pointer into a prebuilt `space.builtin_modules` slot
+            // (`incminimark.py remember_young_pointer_from_prebuilt`).
+            entry.w_mod = w_mod as usize;
+            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        }
+        return Ok(Some(w_mod));
     }
+    let _ = execution_context;
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock();
         let Some((static_name, def)) = table.get_key_value(name) else {
@@ -2249,22 +2337,6 @@ fn new_builtin_module(
                 )
             };
         }
-    }
-    // `baseobjspace.py make_builtins` installs the self
-    // reference `space.builtin.w_dict['__builtins__'] = space.builtin`
-    // so user code can reach the builtins module through
-    // `import builtins; builtins.__builtins__`.  The pyre split
-    // between EC.builtins_module (used by LOAD_GLOBAL fallback) and
-    // the import-time module (returned here) is a known pre-existing
-    // adaptation; install the self-reference on the imported flavour
-    // so `import builtins; builtins.__builtins__ is builtins` holds
-    // for user code regardless of the split.
-    if name == "builtins" {
-        crate::module_ns_store(
-            pyre_object::gc_roots::shadow_stack_get(save_point),
-            "__builtins__",
-            pyre_object::gc_roots::shadow_stack_get(module_slot),
-        );
     }
     Ok(pyre_object::gc_roots::shadow_stack_get(module_slot))
 }
@@ -3746,9 +3818,10 @@ pub(crate) fn sys_modules_finditem_str_exact(
     }
     let hash = unsafe { pyre_object::w_str_hash_memoized(w_name) };
     if majit_metainterp::jit::we_are_jitted() {
+        let key_str = unsafe { pyre_object::unicodeobject::w_str_storage(w_name) };
         return unsafe {
             pyre_object::dictmultiobject::w_dict_get_strategy(dict)
-                .getitem_str_hashed(dict, key, hash)
+                .getitem_str_hashed(dict, key_str, hash)
         };
     }
     match unsafe {
@@ -3929,10 +4002,7 @@ pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
 /// The other half of [`get_interpreter_sys_module`]: `PyInterpreterState`
 /// carries `builtins` beside `sysdict`, and `finalize_modules_delete_special`
 /// reads both from there rather than through a mapping the program owns.
-/// The module this returns is the registry's, not
-/// `ExecutionContext::get_builtin()`'s -- the two are the split described at
-/// `builtin_modules_get`, and finalization wants the one whose dict
-/// `sys.modules` published.
+/// Once import has published it, this is [`space_builtin`].
 pub fn get_interpreter_builtins_module() -> Option<PyObjectRef> {
     nullable_to_option(sys_modules_registry_get(prebuilt_str_storage("builtins")))
 }
@@ -6836,7 +6906,8 @@ unsafe fn sys_modules_exact_str(name: &str) -> PyObjectRef {
             .getitem_str(dict, name)
             .unwrap_or(pyre_object::PY_NULL);
     }
-    pyre_object::dictmultiobject::w_dict_get_strategy(dict).getitem_str(dict, name)
+    let name_str = pyre_object::unicodeobject::prebuilt_str_storage(name);
+    pyre_object::dictmultiobject::w_dict_get_strategy(dict).getitem_str(dict, name_str)
 }
 
 /// `space.call_method` of a three-argument callable, as five words.
@@ -9708,6 +9779,26 @@ mod tests {
         assert!(
             matches!(normalized.components().next(), Some(Component::Prefix(_))),
             "{normalized:?}"
+        );
+    }
+
+    #[test]
+    fn space_builtin_is_the_builtins_module() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        install_builtin_modules();
+        let space = space_builtin();
+        let table = builtin_modules_get("builtins", std::ptr::null())
+            .expect("builtins table lookup")
+            .expect("builtins table entry");
+        assert!(
+            std::ptr::eq(space, table),
+            "space.builtin is the builtins table entry"
+        );
+        let ec = crate::PyExecutionContext::default();
+        assert!(
+            std::ptr::eq(space, ec.get_builtin()),
+            "ExecutionContext::get_builtin is space.builtin"
         );
     }
 }

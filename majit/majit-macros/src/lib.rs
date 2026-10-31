@@ -1361,6 +1361,7 @@ fn trampoline_skip_reason(
     func: &ItemFn,
     attr_name: &str,
     word_enums: &[Path],
+    word_newtypes: &[Path],
 ) -> Option<HelperFnAddrSkip> {
     if !func.sig.generics.params.is_empty() {
         return Some(HelperFnAddrSkip::Generic);
@@ -1399,18 +1400,24 @@ fn trampoline_skip_reason(
     {
         return Some(HelperFnAddrSkip::Other);
     }
-    if func.sig.receiver().is_some() {
-        return Some(HelperFnAddrSkip::MethodReceiver);
+    if let Some(receiver) = func.sig.receiver() {
+        let is_shared_ref_self = receiver.reference.is_some()
+            && receiver.mutability.is_none()
+            && receiver.colon_token.is_none();
+        if !is_shared_ref_self {
+            return Some(HelperFnAddrSkip::MethodReceiver);
+        }
     }
     for arg in &func.sig.inputs {
         let FnArg::Typed(pat_type) = arg else {
-            return Some(HelperFnAddrSkip::Other);
+            continue;
         };
         if pair_slice_param(&pat_type.ty).is_some() {
             continue;
         }
         if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none()
             && !is_word_enum_arg(&pat_type.ty, word_enums)
+            && !is_word_newtype_arg(&pat_type.ty, word_newtypes)
         {
             return Some(HelperFnAddrSkip::Other);
         }
@@ -1702,20 +1709,42 @@ fn is_word_enum_arg(ty: &Type, word_enums: &[Path]) -> bool {
     })
 }
 
+fn is_word_newtype_arg(ty: &Type, word_newtypes: &[Path]) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.qself.is_some() {
+        return false;
+    }
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    word_newtypes.iter().any(|path| {
+        path.segments
+            .last()
+            .is_some_and(|listed| listed.ident == segment.ident)
+    })
+}
+
 fn emit_helper_call_target_fn(
     func: &ItemFn,
     register_fnaddr: bool,
     register_as: Option<&Ident>,
     attr_name: &str,
     word_enums: &[Path],
+    word_newtypes: &[Path],
     for_native_entry: bool,
 ) -> syn::Result<Option<(Ident, Ident, proc_macro2::TokenStream)>> {
-    if let Some(reason) = trampoline_skip_reason(func, attr_name, word_enums) {
+    if let Some(reason) = trampoline_skip_reason(func, attr_name, word_enums, word_newtypes) {
         if register_fnaddr {
             report_helper_fnaddr_skip(&func.sig.ident, reason);
         }
         return Ok(None);
     }
+    let has_receiver = func.sig.receiver().is_some();
+    // A method's trampoline is an associated fn: the `module_path!()` row would miss the `Self` type and statics are not
+    // allowed in an impl block, so a method is published through `jit_fnaddr.rs` only.
+    let register_fnaddr = register_fnaddr && !has_receiver;
 
     let trace_target_name = helper_call_target_fn_name(&Path::from(func.sig.ident.clone()))?;
     let concrete_target_name = format_ident!("{}_concrete", trace_target_name);
@@ -1725,10 +1754,18 @@ fn emit_helper_call_target_fn(
     let mut fnaddr_args = Vec::new();
     let mut has_float_arg = false;
     for (index, arg) in func.sig.inputs.iter().enumerate() {
+        let arg_ident = format_ident!("__majit_arg_{index}");
+        if matches!(arg, FnArg::Receiver(_)) {
+            wrapper_params.push(quote! { #arg_ident: i64 });
+            fnaddr_params.push(quote! { #arg_ident: i64 });
+            let converted = quote! { unsafe { &*((#arg_ident) as usize as *const Self) } };
+            converted_args.push(converted.clone());
+            fnaddr_args.push(converted);
+            continue;
+        }
         let syn::FnArg::Typed(pat_type) = arg else {
             return Ok(None);
         };
-        let arg_ident = format_ident!("__majit_arg_{index}");
         if let Some((item_ty, is_mut)) = pair_slice_param(&pat_type.ty) {
             let len_ident = format_ident!("__majit_arg_{index}_len");
             wrapper_params.push(quote! { #arg_ident: i64 });
@@ -1742,10 +1779,16 @@ fn emit_helper_call_target_fn(
         }
         wrapper_params.push(quote! { #arg_ident: i64 });
         let word_enum = is_word_enum_arg(&pat_type.ty, word_enums);
+        let word_newtype = is_word_newtype_arg(&pat_type.ty, word_newtypes);
         let converted = if word_enum {
             let ty = &pat_type.ty;
             quote! {
                 <#ty as ::majit_ir::helper_fnaddr::FieldlessEnumArg>::from_discriminant(#arg_ident)
+            }
+        } else if word_newtype {
+            let ty = &pat_type.ty;
+            quote! {
+                <#ty as ::majit_ir::helper_fnaddr::WordNewtypeArg>::from_word(#arg_ident)
             }
         } else if let Some(converted) = helper_arg_from_i64(&arg_ident, &pat_type.ty) {
             converted
@@ -1753,7 +1796,10 @@ fn emit_helper_call_target_fn(
             return Ok(None);
         };
         converted_args.push(converted.clone());
-        if !word_enum && helper_call_kind_for_type(&pat_type.ty) == HelperCallKind::Float {
+        if !word_enum
+            && !word_newtype
+            && helper_call_kind_for_type(&pat_type.ty) == HelperCallKind::Float
+        {
             has_float_arg = true;
             fnaddr_params.push(quote! { #arg_ident: f64 });
             fnaddr_args.push(quote! { #arg_ident });
@@ -1781,15 +1827,20 @@ fn emit_helper_call_target_fn(
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
     // `unsafe` wrapper there would be an unused-unsafe warning).
-    let mut call_expr = if func.sig.unsafety.is_some() {
-        quote! { unsafe { #helper_name(#(#converted_args),*) } }
+    let helper_path = if has_receiver {
+        quote! { Self::#helper_name }
     } else {
-        quote! { #helper_name(#(#converted_args),*) }
+        quote! { #helper_name }
+    };
+    let mut call_expr = if func.sig.unsafety.is_some() {
+        quote! { unsafe { #helper_path(#(#converted_args),*) } }
+    } else {
+        quote! { #helper_path(#(#converted_args),*) }
     };
     let mut fnaddr_call_expr = if func.sig.unsafety.is_some() {
-        quote! { unsafe { #helper_name(#(#fnaddr_args),*) } }
+        quote! { unsafe { #helper_path(#(#fnaddr_args),*) } }
     } else {
-        quote! { #helper_name(#(#fnaddr_args),*) }
+        quote! { #helper_path(#(#fnaddr_args),*) }
     };
     let result_payload = result_exc_payload(&func.sig.output);
     let return_kind = if let Some(ok_ty) = result_payload {
@@ -2020,8 +2071,17 @@ fn helper_policy_tokens_for_fn(
     else {
         return Ok(unsupported);
     };
-    let trace_addr = quote! { #trace_target_name as *const () };
-    let concrete_addr = quote! { #concrete_target_name as *const () };
+    let (trace_addr, concrete_addr) = if func.sig.receiver().is_some() {
+        (
+            quote! { Self::#trace_target_name as *const () },
+            quote! { Self::#concrete_target_name as *const () },
+        )
+    } else {
+        (
+            quote! { #trace_target_name as *const () },
+            quote! { #concrete_target_name as *const () },
+        )
+    };
     // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
@@ -2507,7 +2567,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None, attr_name, &[], false) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name, &[], &[], false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2693,7 +2753,7 @@ fn expand_dont_look_inside_attribute(
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None, attr_name, word_enums, false) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name, word_enums, &[], false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2803,7 +2863,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
     let marker = format_ident!("{marker_name}");
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, false, None, attr_name, &[], false) {
+        match emit_helper_call_target_fn(&func, false, None, attr_name, &[], &[], false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -3385,11 +3445,11 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
 
     // Parse promote_args from attribute
-    let promote_args_str = if attr.is_empty() {
-        "all".to_string()
+    let (promote_args_str, config_word_newtypes): (String, Vec<Path>) = if attr.is_empty() {
+        ("all".to_string(), Vec::new())
     } else {
         let config = parse_macro_input!(attr as ElidablePromoteArgs);
-        config.promote_args
+        (config.promote_args, config.word_newtypes)
     };
 
     let arg_count = func.sig.inputs.len();
@@ -3468,14 +3528,21 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         sig: orig_sig,
         ..func.clone()
     };
-    let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable", &[], false) {
-            Ok(Some((trace_name, concrete_name, tokens))) => {
-                (Some(trace_name), Some(concrete_name), Some(tokens))
-            }
-            Ok(None) => (None, None, None),
-            Err(err) => return err.to_compile_error().into(),
-        };
+    let (trace_target_name, concrete_target_name, call_target_fn) = match emit_helper_call_target_fn(
+        &orig_func,
+        true,
+        Some(fn_name),
+        "elidable",
+        &[],
+        &config_word_newtypes,
+        false,
+    ) {
+        Ok(Some((trace_name, concrete_name, tokens))) => {
+            (Some(trace_name), Some(concrete_name), Some(tokens))
+        }
+        Ok(None) => (None, None, None),
+        Err(err) => return err.to_compile_error().into(),
+    };
     let policy_path = Path::from(orig_name.clone());
     let policy_fn = match emit_helper_policy_fn(
         &policy_path,
@@ -3547,6 +3614,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Parse helper for `#[elidable_promote(promote_args = "...")]`.
 struct ElidablePromoteArgs {
     promote_args: String,
+    word_newtypes: Vec<Path>,
 }
 
 impl Parse for ElidablePromoteArgs {
@@ -3557,8 +3625,25 @@ impl Parse for ElidablePromoteArgs {
         }
         input.parse::<Token![=]>()?;
         let value: syn::LitStr = input.parse()?;
+        let word_newtypes = if input.is_empty() {
+            Vec::new()
+        } else {
+            input.parse::<Token![,]>()?;
+            let name: Ident = input.parse()?;
+            if name != "word_newtypes" {
+                return Err(syn::Error::new(name.span(), "expected word_newtypes(...)"));
+            }
+            let content;
+            parenthesized!(content in input);
+            let paths = syn::punctuated::Punctuated::<Path, Token![,]>::parse_terminated(&content)?;
+            if !input.is_empty() {
+                return Err(input.error("unexpected tokens after word_newtypes"));
+            }
+            paths.into_iter().collect()
+        };
         Ok(Self {
             promote_args: value.value(),
+            word_newtypes,
         })
     }
 }
@@ -3801,7 +3886,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     let call_target_fn = if policy_attr_follows || policy_attr_expanded {
         None
     } else {
-        match emit_helper_call_target_fn(&func, true, None, "oopspec", &[], false) {
+        match emit_helper_call_target_fn(&func, true, None, "oopspec", &[], &[], false) {
             Ok(Some((_, _, tokens))) => Some(tokens),
             Ok(None) => None,
             Err(err) => return err.to_compile_error().into(),
@@ -3997,11 +4082,29 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
     // `getfunctionptr` of the decorated function. It is published to
     // `HELPER_FNADDRS` like every other residual entry.
     let call_target_fn =
-        match emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], false) {
+        match emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], &[], false) {
             Ok(Some((_, _, tokens))) => Some(tokens),
             Ok(None) => None,
             Err(err) => return err.to_compile_error(),
         };
+
+    // rlib/jit.py look_inside_iff — trampoline = dont_look_inside(...): the residual target gets the same
+    // word-ABI entry a #[dont_look_inside] helper gets.
+    let mut trampoline_item = func.clone();
+    trampoline_item.sig.ident = trampoline_name.clone();
+    let trampoline_call_target_fn = match emit_helper_call_target_fn(
+        &trampoline_item,
+        true,
+        None,
+        "look_inside_iff",
+        &[],
+        &[],
+        false,
+    ) {
+        Ok(Some((_, _, tokens))) => Some(tokens),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error(),
+    };
 
     quote! {
         // rlib/jit.py — func = unroll_safe(func)
@@ -4028,6 +4131,8 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
             #trampoline_oopspec_markers
             #orig_call
         }
+
+        #trampoline_call_target_fn
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
@@ -4171,20 +4276,21 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // A helper it declines — a generic, or a parameter type the trampoline
     // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
     // path this expansion had before.
-    let native_entry = match emit_helper_call_target_fn(&func, false, None, "jit_inline", &[], true)
-    {
-        Ok(Some((trace_target, _concrete, wrapper))) => {
-            let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
-                Ok(classes) => classes,
-                Err(err) => return err.to_compile_error().into(),
-            };
-            let result_class =
-                jit_interp::jitcode_lower::inline_return_kind_class(helper.return_kind);
-            Some((wrapper, trace_target, arg_classes, result_class))
-        }
-        Ok(None) => None,
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let native_entry =
+        match emit_helper_call_target_fn(&func, false, None, "jit_inline", &[], &[], true) {
+            Ok(Some((trace_target, _concrete, wrapper))) => {
+                let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func)
+                {
+                    Ok(classes) => classes,
+                    Err(err) => return err.to_compile_error().into(),
+                };
+                let result_class =
+                    jit_interp::jitcode_lower::inline_return_kind_class(helper.return_kind);
+                Some((wrapper, trace_target, arg_classes, result_class))
+            }
+            Ok(None) => None,
+            Err(err) => return err.to_compile_error().into(),
+        };
     let (native_entry_fn, set_native_entry) = match &native_entry {
         // The returned target matches `arg_classes`: integer arguments use
         // the widening shim, and a `'f'` argument uses the real `f64` entry
@@ -5063,7 +5169,7 @@ mod tests {
     }
 
     fn skip(src: &str) -> Option<HelperFnAddrSkip> {
-        trampoline_skip_reason(&parse_fn(src), "dont_look_inside", &[])
+        trampoline_skip_reason(&parse_fn(src), "dont_look_inside", &[], &[])
     }
 
     #[test]
@@ -5173,11 +5279,17 @@ mod tests {
                 &parse_fn("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }"),
                 "dont_look_inside_cannot_raise",
                 &[],
+                &[],
             ),
             Some(HelperFnAddrSkip::ResultReturn)
         );
+        assert_eq!(skip("fn f(&self, x: i64) -> i64 { x }"), None);
         assert_eq!(
-            skip("fn f(&self, x: i64) -> i64 { x }"),
+            skip("fn f(&mut self, x: i64) -> i64 { x }"),
+            Some(HelperFnAddrSkip::MethodReceiver)
+        );
+        assert_eq!(
+            skip("fn f(self, x: i64) -> i64 { x }"),
             Some(HelperFnAddrSkip::MethodReceiver)
         );
         assert_eq!(
@@ -5210,9 +5322,12 @@ mod tests {
     fn gcref_pointer_alias_emits_a_word_abi_trampoline() {
         let func =
             parse_fn("fn ll_vec_setitem_fast_r(l: &mut Vec<GCREF>, index: usize, item: GCREF) {}");
-        assert_eq!(trampoline_skip_reason(&func, "dont_look_inside", &[]), None);
+        assert_eq!(
+            trampoline_skip_reason(&func, "dont_look_inside", &[], &[]),
+            None
+        );
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let text = tokens.to_string();
@@ -5226,9 +5341,12 @@ mod tests {
 
         let ret =
             parse_fn("fn ll_vec_newlist_hint_r(lengthhint: usize) -> Vec<GCREF> { Vec::new() }");
-        assert_eq!(trampoline_skip_reason(&ret, "dont_look_inside", &[]), None);
+        assert_eq!(
+            trampoline_skip_reason(&ret, "dont_look_inside", &[], &[]),
+            None
+        );
         let (_, _, ret_tokens) =
-            emit_helper_call_target_fn(&ret, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&ret, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let ret_text = ret_tokens.to_string();
@@ -5245,7 +5363,7 @@ mod tests {
     fn object_gcarray_trampoline_is_one_ref_word() {
         let func = parse_fn("fn f(xs: &[PyObjectRef]) -> i64 { 0 }");
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let text = tokens.to_string();
@@ -5265,7 +5383,7 @@ mod tests {
     fn nullable_pointer_option_arg_rebuilds_none_from_zero() {
         let func = parse_fn("fn f(a: Option<PyObjectRef>) -> i64 { 0 }");
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let text = tokens.to_string();
@@ -5279,7 +5397,7 @@ mod tests {
     fn pair_slice_trampoline_emits_ptr_len_and_arity_three() {
         let func = parse_fn("fn f(o: PyObjectRef, xs: &[*mut u8]) -> i64 { 0 }");
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let text = tokens.to_string();
@@ -5299,7 +5417,7 @@ mod tests {
     fn shared_rstr_ref_trampoline_is_one_ref_word() {
         let func = parse_fn("fn f(o: PyObjectRef, name: &Wtf8) -> i64 { 0 }");
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let text = tokens.to_string();
@@ -5318,7 +5436,7 @@ mod tests {
 
         let str_func = parse_fn("fn g(s: &str) -> i64 { 0 }");
         let (_, _, str_tokens) =
-            emit_helper_call_target_fn(&str_func, true, None, "dont_look_inside", &[], false)
+            emit_helper_call_target_fn(&str_func, true, None, "dont_look_inside", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let str_text = str_tokens.to_string();
@@ -5334,7 +5452,7 @@ mod tests {
         let func = parse_fn("fn f(op: CompareOp) -> i64 { 0 }");
         let words: WordEnumsArg = syn::parse_str("word_enums(CompareOp)").unwrap();
         assert_eq!(
-            trampoline_skip_reason(&func, "dont_look_inside", &words.0),
+            trampoline_skip_reason(&func, "dont_look_inside", &words.0, &[]),
             None
         );
         assert_eq!(
@@ -5342,7 +5460,7 @@ mod tests {
             Some(HelperFnAddrSkip::Other)
         );
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &words.0, false)
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &words.0, &[], false)
                 .expect("emit")
                 .expect("trampoline");
         assert!(
@@ -5357,7 +5475,7 @@ mod tests {
         let orig = parse_fn("fn _orig_leaf_unlikely_name(x: i64) -> i64 { x }");
         let wrapper: Ident = syn::parse_str("leaf").unwrap();
         let (_, _, tokens) =
-            emit_helper_call_target_fn(&orig, true, Some(&wrapper), "elidable", &[], false)
+            emit_helper_call_target_fn(&orig, true, Some(&wrapper), "elidable", &[], &[], false)
                 .expect("emit")
                 .expect("trampoline");
         let text = tokens.to_string();
@@ -5367,6 +5485,37 @@ mod tests {
         );
         assert!(text.contains("stringify ! (leaf)"), "{text}");
     }
+
+    #[test]
+    fn word_newtype_arg_is_accepted_only_when_listed() {
+        let func = parse_fn("fn f(v: VersionTag) -> i64 { 0 }");
+        let listed: Path = syn::parse_quote!(VersionTag);
+        assert_eq!(
+            trampoline_skip_reason(&func, "elidable", &[], &[listed]),
+            None
+        );
+        assert_eq!(
+            trampoline_skip_reason(&func, "elidable", &[], &[]),
+            Some(HelperFnAddrSkip::Other)
+        );
+    }
+
+    #[test]
+    fn shared_ref_self_method_emits_trampoline() {
+        let func = parse_fn("fn f(&self, x: i64) -> i64 { x }");
+        assert_eq!(
+            trampoline_skip_reason(&func, "dont_look_inside", &[], &[]),
+            None
+        );
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(text.contains("Self :: "), "{text}");
+        assert!(text.contains("as * const Self"), "{text}");
+    }
+
     fn specialize_argtype_tokens(attr: &str, src: &str) -> proc_macro2::TokenStream {
         let args: SpecializeArgtypeArgs = syn::parse_str(attr).expect("indices parse");
         expand_specialize_argtype(&args.indices, &parse_fn(src))
@@ -5522,6 +5671,42 @@ mod tests {
                 .all(|attr| !attr_ends_with(attr, "oopspec")),
             "dispatch must not keep a pending #[oopspec] attr"
         );
+    }
+
+    /// Residual jitcode targets `<name>_trampoline`. That fn gets the same
+    /// word-ABI `HELPER_FNADDRS` adapter `#[dont_look_inside]` publishes:
+    /// `Option<*mut T>` / `Option<PyObjectRef>` is one nullable pointer word.
+    #[test]
+    fn look_inside_iff_trampoline_gets_the_word_abi_call_target() {
+        let func = parse_fn(
+            r#"
+            fn lookup(d: i64, key: i64) -> Option<*mut u8> {
+                None
+            }
+            "#,
+        );
+        let predicate: Path = syn::parse_str("lookup_iff").unwrap();
+        let items = parse_expansion_items(expand_look_inside_iff_item(predicate, func));
+        let _ = expansion_fn(&items, "lookup_trampoline");
+        let trampoline_target = expansion_fn(&items, "__majit_call_target_lookup_trampoline");
+        let text = quote! { #trampoline_target }.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target_lookup_trampoline (__majit_arg_0 : i64 , __majit_arg_1 : i64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("lookup_trampoline ("), "{text}");
+        assert!(
+            text.contains(":: core :: option :: Option :: Some (__majit_ptr)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(":: core :: option :: Option :: None => 0"),
+            "{text}"
+        );
+        assert!(text.contains("stringify ! (lookup_trampoline)"), "{text}");
+        assert!(text.contains("as * const () , 2"), "{text}");
     }
 
     /// Same move when `#[oopspec]` already expanded and left markers in the

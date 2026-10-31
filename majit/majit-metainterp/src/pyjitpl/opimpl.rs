@@ -83,6 +83,8 @@ where
             Self::opimpl_record_quasiimmut_field;
         table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE as usize] =
             Self::opimpl_jit_force_quasi_immutable;
+        table[jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I as usize] =
+            Self::opimpl_jit_force_quasi_immutable_i;
         table[jitcode::insns::BC_INT_ADD as usize] = Self::opimpl_int_add;
         table[jitcode::insns::BC_INT_SUB as usize] = Self::opimpl_int_sub;
         table[jitcode::insns::BC_INT_MUL as usize] = Self::opimpl_int_mul;
@@ -2421,25 +2423,6 @@ where
             let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
             (opcode_pc, vable_reg, array_idx, index_reg, dest)
         };
-        if crate::vable_read_probe_enabled() {
-            let depth = self.frames.len();
-            let frame = self.frames.current_mut();
-            eprintln!(
-                "[vable-read-probe] reg jitcode={} depth={} vable_reg={} \
-                 reg_opref={:?} reg_value={:?}",
-                frame.jitcode.name,
-                depth,
-                vable_reg,
-                frame.ref_regs[vable_reg],
-                frame
-                    .ref_regs
-                    .get(vable_reg)
-                    .copied()
-                    .flatten()
-                    .and_then(|op| ctx.box_bits(op))
-                    .map(|v| format!("0x{v:x}")),
-            );
-        }
         let Some((vable_opref, fdescr, adescr)) =
             self.vable_array_descrs(ctx, vable_reg, array_idx)
         else {
@@ -2597,7 +2580,6 @@ where
             adescr,
             value,
             Value::Int(concrete),
-            false,
         ) {
             // Promoted index falls outside the standard virtualizable
             // array (e.g. a transient out-of-bounds state-field index);
@@ -2664,7 +2646,6 @@ where
             adescr,
             value,
             Value::Ref(majit_ir::GcRef(concrete as usize)),
-            false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
             VableArrayStore::Stored(_) => {}
@@ -2728,7 +2709,6 @@ where
             adescr,
             value,
             Value::Float(f64::from_bits(concrete as u64)),
-            false,
         ) {
             VableArrayStore::OutOfVable => return TraceAction::Abort,
             VableArrayStore::Stored(_) => {}
@@ -2919,13 +2899,34 @@ where
     }
 
     #[inline(never)]
-    #[allow(unused_variables)]
     fn opimpl_jit_force_quasi_immutable(
         &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
-        _runtime: &R,
+        runtime: &R,
         bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_jit_force_quasi_immutable_kind(ctx, sym, runtime, bytecode, false)
+    }
+
+    #[inline(never)]
+    fn opimpl_jit_force_quasi_immutable_i(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.opimpl_jit_force_quasi_immutable_kind(ctx, sym, runtime, bytecode, true)
+    }
+
+    fn opimpl_jit_force_quasi_immutable_kind(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        _bytecode: u8,
+        owner_is_raw: bool,
     ) -> TraceAction {
         // pyjitpl.py opimpl_jit_force_quasi_immutable:
         //   @arguments("box", "descr", "orgpc")
@@ -2951,7 +2952,12 @@ where
             };
         let struct_opref = {
             let frame = self.frames.current_mut();
-            match frame.ref_regs[struct_reg] {
+            let slot = if owner_is_raw {
+                frame.int_regs[struct_reg]
+            } else {
+                frame.ref_regs[struct_reg]
+            };
+            match slot {
                 Some(opref) => opref,
                 None => return TraceAction::Abort,
             }
@@ -2972,6 +2978,8 @@ where
         //   if mutatefielddescr.is_pointer_field(): GETFIELD_GC_R
         //   elif mutatefielddescr.is_float_field(): GETFIELD_GC_R
         //   else: GETFIELD_GC_I
+        // A raw owner uses the matching GETFIELD_RAW_* (`jtransform.py
+        // rewrite_op_getfield` picks raw vs gc by the owner's lltype).
         // execute_with_descr records and executes the load without
         // consulting or populating the heapcache
         // (`_opimpl_getfield_gc_any_pureornot` is the path that does).
@@ -2979,20 +2987,36 @@ where
         let (opnum, resvalue, nonnull) = if fd.is_pointer_field() {
             let loaded = self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd);
             (
-                OpCode::GetfieldGcR,
+                if owner_is_raw {
+                    OpCode::GetfieldRawR
+                } else {
+                    OpCode::GetfieldGcR
+                },
                 Value::Ref(loaded),
                 loaded.as_usize() != 0,
             )
         } else if fd.is_float_field() {
             let loaded = self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd);
             (
-                OpCode::GetfieldGcR,
+                if owner_is_raw {
+                    OpCode::GetfieldRawR
+                } else {
+                    OpCode::GetfieldGcR
+                },
                 Value::Ref(loaded),
                 loaded.as_usize() != 0,
             )
         } else {
             let loaded = self.cpu.bh_getfield_gc_i(struct_ptr as usize, fd);
-            (OpCode::GetfieldGcI, Value::Int(loaded), loaded != 0)
+            (
+                if owner_is_raw {
+                    OpCode::GetfieldRawI
+                } else {
+                    OpCode::GetfieldGcI
+                },
+                Value::Int(loaded),
+                loaded != 0,
+            )
         };
         let mutatebox = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
@@ -4957,14 +4981,12 @@ where
                 // point is registered below and later read by the
                 // segmenting consumers, which install cell flags and
                 // so need a key a chain walk can match, not a bucket.
-                let Some(inner_key_typed) =
-                    ctx.merge_point_green_key(
-                        &mp_green_ints,
-                        &mp_green_refs,
-                        &mp_green_floats,
-                        &mp_green_spec,
-                    )
-                else {
+                let Some(inner_key_typed) = ctx.merge_point_green_key(
+                    &mp_green_ints,
+                    &mp_green_refs,
+                    &mp_green_floats,
+                    &mp_green_spec,
+                ) else {
                     return TraceAction::Continue;
                 };
                 let inner_key = inner_key_typed.get_uhash();

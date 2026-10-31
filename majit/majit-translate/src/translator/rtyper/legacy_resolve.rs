@@ -739,9 +739,6 @@ fn infer_concrete_from_op(
         OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
             valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
         }
-        // Vtable funcptr extraction returns an integer pointer (RPython
-        // `op.args[0]` of `indirect_call` is `Ptr(FuncType)`).
-        OpKind::VtableMethodPtr { .. } => ConcreteType::Signed,
         OpKind::IndirectCall { result_ty, .. } => {
             valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs)
         }

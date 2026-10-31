@@ -1,21 +1,15 @@
-//! Polymorphic Bound Callable (PBC) representation — lowers indirect
-//! method calls on `dyn Trait` receivers.
+//! Polymorphic Bound Callable (PBC) representation — fills the
+//! `c_graphs` family on `OpKind::IndirectCall`.
 //!
 //! RPython equivalent:
 //! `rpython/rtyper/rpbc.py FunctionReprBase.call`. RPython's
-//! rtyper materialises the funcptr Variable via
-//! `convert_to_concrete_llfn` and then emits
-//! `genop('indirect_call', [funcptr, *args, c_graphs])` carrying the
-//! full row-of-graphs as the trailing Constant. Pyre's rtyper-equivalent
-//! does the same shape over `OpKind::Call { target: CallTarget::Indirect
-//! { trait_root, method_name }, .. }` sites: insert a `VtableMethodPtr`
-//! to materialise the funcptr Variable, then replace the original Call
-//! with an `OpKind::IndirectCall` carrying funcptr + args + the family
-//! `graphs` (full `c_graphs`, not yet filtered by JIT candidates —
-//! that filtering happens later in `call.py::graphs_from(op)`).
-//!
-//! After this pass, no `CallTarget::Indirect` survives in the graph;
-//! `jtransform` only sees `OpKind::IndirectCall` for indirect dispatch.
+//! rtyper materialises the funcptr via `ClassRepr.getclsfield` and then
+//! emits `genop('indirect_call', [funcptr, *args, c_graphs])` carrying the
+//! full row-of-graphs as the trailing Constant. The MIR frontend already
+//! emits that `{vtable}.method_*` FieldRead plus `IndirectCall` with a
+//! `family_key`; this pass copies `all_impls_for_indirect` onto `graphs`
+//! (full `c_graphs`, not yet filtered by JIT candidates — that filtering
+//! happens later in `call.py::graphs_from(op)`).
 
 #![allow(private_interfaces)]
 #![cfg_attr(test, allow(non_snake_case))]
@@ -31,9 +25,7 @@ use crate::annotator::model::{AnnotatorError, DescKind, SomeObjectTrait, SomePBC
 use crate::call::CallControl;
 use crate::flowspace::argument::CallShape;
 use crate::flowspace::pygraph::PyGraph;
-use crate::model::{
-    BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation, ValueType,
-};
+use crate::model::{FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
@@ -43,12 +35,6 @@ use crate::translator::rtyper::lltypesystem::lltype::{
 use crate::translator::rtyper::rclass;
 use crate::translator::rtyper::rmodel::warning;
 use crate::translator::rtyper::rtyper::RPythonTyper;
-// `lower_indirect_calls` records the inserted `VtableMethodPtr` funcptr
-// as Signed for downstream regalloc / flatten via
-// `FunctionGraph::set_concretetype_of_inline(&var, ConcreteType::Signed)` —
-// the rtyper-orthodox `v.concretetype = lltype` write
-// (`rpython/rtyper/rtyper.py setconcretetype`).
-
 /// RPython `ConcreteCallTableRow(dict)` (rpbc.py).
 #[derive(Clone, Debug)]
 pub struct ConcreteCallTableRow {
@@ -320,17 +306,10 @@ pub(crate) fn select_call_family_row(
     })
 }
 
-/// Walk every `OpKind::Call` whose target is `CallTarget::Indirect` and
-/// rewrite it into the RPython-orthodox pair:
-///
-/// 1. `OpKind::VtableMethodPtr { receiver, trait_root, method_name }`
-///    → produces `funcptr: Variable` (Int kind)
-/// 2. `OpKind::IndirectCall { funcptr, args, graphs, result_ty }`
-///    → mirrors RPython `indirect_call(funcptr, *args, c_graphs)`
-///
-/// `args` remain the full call argument list, including the receiver.
-/// RPython's `convert_to_concrete_llfn` materialises the funcptr but the
-/// eventual `indirect_call` still receives `self, ...` as ordinary args.
+/// Fill `OpKind::IndirectCall.graphs` from `family_key` via
+/// `all_impls_for_indirect` (`FunctionReprBase.call` /
+/// `row_of_graphs.values()`). The frontend already emitted the
+/// `{vtable}.method_*` FieldRead plus `IndirectCall`.
 pub fn lower_indirect_calls(graph: &mut JitFunctionGraph, call_control: &CallControl) {
     lower_indirect_calls_with(graph, call_control, true);
 }
@@ -383,12 +362,37 @@ pub(crate) fn lower_indirect_calls_with(
     let builtin_wrappers = call_control.builtin_wrapper_indirect_graphs();
     for block in &mut graph.blocks {
         for op in &mut block.operations {
+            let SpaceOperation { result, kind } = op;
             if let OpKind::IndirectCall {
-                graphs, family_key, ..
-            } = &mut op.kind
+                graphs,
+                family_key,
+                result_ty,
+                ..
+            } = kind
             {
                 if let Some((trait_root, method_name)) = family_key.clone() {
                     let family = call_control.all_impls_for_indirect(&trait_root, &method_name);
+                    // `rpbc.py FunctionReprBase.call` assigns the call result's
+                    // concretetype from the selected call-family row.  Use that family
+                    // result here as well: a dependency LLBC can expose a transparent
+                    // scalar wrapper only as an opaque declaration, while a local family
+                    // member still supplies the complete translated signature.
+                    let declared =
+                        call_control.declared_result_type_for_indirect(&trait_root, &method_name);
+                    if let Some(declared) = declared {
+                        *result_ty = match declared {
+                            majit_ir::value::Type::Int => ValueType::Int,
+                            majit_ir::value::Type::Ref => ValueType::Ref(None),
+                            majit_ir::value::Type::Float => ValueType::Float,
+                            majit_ir::value::Type::Void => ValueType::Void,
+                        };
+                        if let Some(result) = result {
+                            JitFunctionGraph::set_concretetype_of_inline(
+                                result,
+                                crate::codewriter::type_state::valuetype_to_concrete(result_ty),
+                            );
+                        }
+                    }
                     if !family.is_empty() {
                         *graphs = Some(family);
                         *family_key = None;
@@ -416,158 +420,6 @@ pub(crate) fn lower_indirect_calls_with(
                 } else if collapse_unresolved {
                     *graphs = None;
                 }
-            }
-        }
-    }
-
-    // Collect the (block, op_index) sites first so the rewrite below
-    // can mutate the graph without aliasing the borrow.
-    let sites: Vec<(usize, usize)> = graph
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(bid, block)| {
-            block
-                .operations
-                .iter()
-                .enumerate()
-                .filter_map(move |(oi, op)| match &op.kind {
-                    OpKind::Call {
-                        target: CallTarget::Indirect { .. },
-                        ..
-                    } => Some((bid, oi)),
-                    _ => None,
-                })
-        })
-        .collect();
-
-    // Process in reverse so earlier indices stay valid as later sites
-    // grow by 1 op (the inserted `VtableMethodPtr`).
-    for (bid, oi) in sites.into_iter().rev() {
-        let block_id = BlockId(bid);
-        let op = graph.blocks[bid].operations[oi].clone();
-        let (target, args, mut result_ty, result) = match op.kind {
-            OpKind::Call {
-                target,
-                args,
-                result_ty,
-            } => (target, args, result_ty, op.result),
-            _ => unreachable!("site filter mismatch"),
-        };
-        let (trait_root, method_name, attached) = match target {
-            CallTarget::Indirect {
-                trait_root,
-                method_name,
-                graphs,
-            } => (trait_root, method_name, graphs),
-            _ => unreachable!("site filter mismatch"),
-        };
-        // `annotate_access_directly` stamps the specialized row on the
-        // op (`row_of_graphs.values()`). Prefer that family so lowering
-        // emits the AccessDirect copies the annotator selected.
-        let family = match attached {
-            Some(family) if !family.is_empty() => family,
-            _ => call_control.all_impls_for_indirect(&trait_root, &method_name),
-        };
-        // An empty lookup is an unknown family. Collapsing it to `None`
-        // on the shared graph makes effect analysis report random effects
-        // for a call the analyzers previously did not enumerate. Leave the
-        // `CallTarget::Indirect` in place unless this pass is collapsing.
-        if family.is_empty() && !collapse_unresolved {
-            continue;
-        }
-        // `rpbc.py FunctionReprBase.call` assigns the call result's
-        // concretetype from the selected call-family row.  Use that family
-        // result here as well: a dependency LLBC can expose a transparent
-        // scalar wrapper only as an opaque declaration, while a local family
-        // member still supplies the complete translated signature.
-        let declared = call_control.declared_result_type_for_indirect(&trait_root, &method_name);
-        if let Some(declared) = declared {
-            result_ty = match declared {
-                majit_ir::value::Type::Int => ValueType::Int,
-                majit_ir::value::Type::Ref => ValueType::Ref(None),
-                majit_ir::value::Type::Float => ValueType::Float,
-                majit_ir::value::Type::Void => ValueType::Void,
-            };
-            if let Some(result) = &result {
-                JitFunctionGraph::set_concretetype_of_inline(
-                    result,
-                    crate::codewriter::type_state::valuetype_to_concrete(&result_ty),
-                );
-            }
-        }
-        let receiver_var = args
-            .first()
-            .unwrap_or_else(|| {
-                panic!(
-                    "dyn-Trait method call must have a receiver arg \
-                     (trait_root={trait_root:?} method={method_name:?} graph={:?})",
-                    graph.name,
-                )
-            })
-            .clone();
-        // RPython rclass.py getclsfield (condensed into a single op).
-        let funcptr_var = rclass::class_get_method_ptr(
-            graph,
-            block_id,
-            oi,
-            receiver_var.into_variable(),
-            trait_root.clone(),
-            method_name.clone(),
-        );
-        // RPython rpbc.py:216 `c_graphs = row_of_graphs.values()` — full
-        // family without JIT candidate filtering.
-        //
-        // `None` means "unknown family" — matches
-        // `rpython/translator/backendopt/graphanalyze.py:117`, where
-        // `graphs is None` short-circuits family analyzers to
-        // `top_result()` (conservative: canraise, can_invalidate, etc.
-        // default to True). `Some(vec![])` would instead be treated as
-        // "empty family → No/false" by every analyzer, which is unsafe
-        // when external/unregistered impls might still be called.
-        // Pyre's source-only parser only sees `#[trait_method]`-
-        // registered impls; if none are registered for a
-        // `(trait, method)` family, we don't know whether that's
-        // because the family is truly empty or because the impls live
-        // outside the analyzed sources, so we take the conservative
-        // `None` path.
-        let graphs = if family.is_empty() {
-            None
-        } else {
-            Some(family)
-        };
-        // The original Call op is now at index `oi + 1` because
-        // `class_get_method_ptr` inserted `VtableMethodPtr` at `oi`.
-        graph.blocks[bid].operations[oi + 1] = SpaceOperation {
-            result,
-            kind: OpKind::IndirectCall {
-                funcptr: funcptr_var,
-                args: crate::model::call_arg_vars(&args),
-                graphs,
-                family_key: None,
-                result_ty,
-            },
-        };
-    }
-}
-
-/// Debug-build invariant: after `lower_indirect_calls` runs, no
-/// `CallTarget::Indirect` may survive in the graph. Callers can run
-/// this assert to catch missed sites early.
-#[cfg(debug_assertions)]
-pub fn assert_no_indirect_call_targets(graph: &JitFunctionGraph) {
-    for (bid, block) in graph.blocks.iter().enumerate() {
-        for (oi, op) in block.operations.iter().enumerate() {
-            if let OpKind::Call {
-                target: CallTarget::Indirect { .. },
-                ..
-            } = &op.kind
-            {
-                panic!(
-                    "post-lowering invariant violation: \
-                     CallTarget::Indirect survived at block {bid} op {oi}: {:?}",
-                    op
-                );
             }
         }
     }
@@ -890,108 +742,10 @@ pub(crate) mod tests {
         assert!(Rc::ptr_eq(&selected.anygraph.graph, &cached_graph.graph));
     }
 
-    fn build_indirect_graph() -> crate::model::FunctionGraph {
-        let mut graph = crate::model::FunctionGraph::new("outer");
-        let receiver_var = graph
-            .push_op_var(
-                graph.startblock,
-                OpKind::Input {
-                    name: "h".to_string(),
-                    ty: ValueType::Unknown,
-                    class_root: None,
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: crate::model::CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args(vec![receiver_var]),
-                result_ty: ValueType::Void,
-            },
-            true,
-        );
-        graph.set_return(graph.startblock, None);
-        graph
-    }
-
-    /// Boundary: pre-lowering graph has `CallTarget::Indirect`;
-    /// post-lowering graph has `VtableMethodPtr + IndirectCall` and
-    /// zero `Indirect` targets.  Mirrors `rpbc.py call` emit shape.
-    /// Runs through the cfg(test)-gated legacy annotate / resolve_types
-    /// pair because `function_graph_to_flowspace` rejects
-    /// `CallTarget::Indirect` (it is the rclass-rewrite pre-image,
-    /// not a flowspace operand) — the production path lowers it
-    /// away first.
-    #[test]
-    fn lower_indirect_calls_eliminates_call_target_indirect() {
-        use crate::call::CallControl;
-        use crate::model::CallTarget;
-        use crate::translator::rtyper::legacy_annotator::annotate;
-        use crate::translator::rtyper::legacy_resolve::resolve_types;
-
-        let mut cc = CallControl::new();
-        cc.register_trait_method(
-            "run",
-            Some("Handler"),
-            "A",
-            crate::model::FunctionGraph::new("A::run"),
-        );
-        cc.register_trait_method(
-            "run",
-            Some("Handler"),
-            "B",
-            crate::model::FunctionGraph::new("B::run"),
-        );
-        cc.find_all_graphs_for_tests();
-
-        let mut graph = build_indirect_graph();
-
-        // Pre-lowering: a CallTarget::Indirect exists.
-        let pre_indirect = graph.blocks[graph.startblock.0]
-            .operations
-            .iter()
-            .filter(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::Indirect { .. },
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(pre_indirect, 1, "expected 1 Indirect Call pre-lowering");
-
-        annotate(&graph);
-        resolve_types(&graph, &std::collections::HashSet::new());
-        lower_indirect_calls(&mut graph, &cc);
-
-        // Post-lowering: invariant — zero Indirect targets.
-        #[cfg(debug_assertions)]
-        assert_no_indirect_call_targets(&graph);
-
-        // Post-lowering: exactly one VtableMethodPtr and one IndirectCall.
-        let ops = &graph.blocks[graph.startblock.0].operations;
-        let vtable_ptr_count = ops
-            .iter()
-            .filter(|op| matches!(&op.kind, OpKind::VtableMethodPtr { .. }))
-            .count();
-        let indirect_call_count = ops
-            .iter()
-            .filter(|op| matches!(&op.kind, OpKind::IndirectCall { .. }))
-            .count();
-        assert_eq!(vtable_ptr_count, 1);
-        assert_eq!(indirect_call_count, 1);
-    }
-
     /// `ClassRepr.getclsfield` produces a real vtable `getfield`, and
     /// `FunctionReprBase.call` only appends the PBC graph family before its
     /// `indirect_call`.  A MIR dynamic-call operand already contains that
-    /// field projection, so rtyping must retain it rather than replace it with
-    /// pyre's name-only `VtableMethodPtr` pseudo-op (which no backend can
-    /// execute).
+    /// field projection, so rtyping must retain it and only fill `graphs`.
     #[test]
     fn existing_vtable_field_read_keeps_its_funcptr_and_only_fills_family() {
         use crate::call::CallControl;
@@ -1049,11 +803,6 @@ pub(crate) mod tests {
         lower_indirect_calls(&mut graph, &cc);
 
         let ops = &graph.blocks[graph.startblock.0].operations;
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(op.kind, OpKind::VtableMethodPtr { .. })),
-            "an existing getfield must not be replaced by VtableMethodPtr",
-        );
         let indirect = ops
             .iter()
             .find_map(|op| match &op.kind {
@@ -1071,6 +820,10 @@ pub(crate) mod tests {
         assert!(indirect.2.is_none(), "rtyper must consume the family key");
     }
 
+    /// `FunctionReprBase.call` assigns the call result from the selected
+    /// family row. A front-end op that only saw an opaque `Ref(None)` must
+    /// pick up the family's declared `Int` on both `result_ty` and the
+    /// result variable's concretetype.
     #[test]
     fn indirect_family_result_retypes_opaque_caller_result() {
         use crate::call::CallControl;
@@ -1082,6 +835,10 @@ pub(crate) mod tests {
             Some("Storage"),
             "<default methods of Storage>",
             crate::model::FunctionGraph::new("Storage::pop").with_return_type("i64"),
+        );
+        assert_eq!(
+            cc.declared_result_type_for_indirect("Storage", "pop"),
+            Some(majit_ir::value::Type::Int)
         );
 
         let mut graph = crate::model::FunctionGraph::new("caller");
@@ -1096,12 +853,25 @@ pub(crate) mod tests {
                 true,
             )
             .unwrap();
+        let funcptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "funcptr".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
         let result = graph
             .push_op_var(
                 graph.startblock,
-                OpKind::Call {
-                    target: CallTarget::indirect("Storage", "pop"),
-                    args: crate::model::call_args(vec![receiver]),
+                OpKind::IndirectCall {
+                    funcptr,
+                    args: vec![receiver],
+                    graphs: None,
+                    family_key: Some(("Storage".to_string(), "pop".to_string())),
                     result_ty: ValueType::Ref(None),
                 },
                 true,
@@ -1191,11 +961,6 @@ pub(crate) mod tests {
             })
             .count();
         assert_eq!(method_count, 1, "Method target must survive lowering");
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::VtableMethodPtr { .. })),
-            "inherent call must not produce VtableMethodPtr"
-        );
         assert!(
             !ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::IndirectCall { .. })),
@@ -1914,7 +1679,7 @@ where
         // deterministic across HashMap iteration orders — order has no
         // semantic meaning at the indirect_call protocol level
         // (`lower_indirect_calls` in this file still recovers the
-        // graphs from `OpKind::Call { CallTarget::Indirect, .. }`,
+        // graphs from `OpKind::IndirectCall.family_key`,
         // which is the authoritative channel).
         let mut graph_ids: Vec<usize> = row
             .row_of_graphs

@@ -705,6 +705,11 @@ impl<'a> Lowering<'a> {
     /// Charon leaves the declaration generic (`monomorphize:false`), so
     /// `fn f<T>(x: &T)` is a `TypeVar` and does not name the wrapper. The
     /// operand's place type is the type the call actually passes.
+    ///
+    /// `RootScope` is the exception: it *is* the save-point word
+    /// (`framework.py push_roots` / `pop_roots` livevars length,
+    /// `shadowstack.py gc_push_roots`). `Rvalue::Ref` aliases that word, and
+    /// the residual ABI takes it by value (`WordAbi` / `ResidualRet`).
     pub(in crate::front::mir) fn refuse_borrowed_transparent_scalar_residual(
         &self,
         mir_bb: usize,
@@ -720,9 +725,18 @@ impl<'a> Lowering<'a> {
         if !fun_decl_is_residual(fd, self.dont_look_inside) {
             return Ok(());
         }
+        // Charon names inherent methods `gc_roots::<Impl>::pin_roots`.
+        // After `repr(transparent)` the declared receiver is already
+        // `&usize`, so `tyref_is_root_scope` misses it. The residual ABI
+        // takes the save-point word by value (`framework.py push_roots`
+        // livevars length / `WordAbi`). Skip the whole call: later args
+        // (`&[PyObjectRef]`) must not trip the same refusal.
+        if gc_root_scope_residual_method_path(&fd.item_meta.name_path()) {
+            return Ok(());
+        }
         for (index, declared) in fd.signature.inputs.iter().enumerate() {
             let passed = arg_tys.get(index).and_then(Option::as_ref);
-            if std::iter::once(declared).chain(passed).any(|ty| {
+            let Some(ty) = std::iter::once(declared).chain(passed).find(|ty| {
                 tyref_is_borrowed_transparent_scalar(
                     ty,
                     self.llbc,
@@ -730,13 +744,17 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 )
-            }) {
-                return Err(LowerError::Unsupported(format!(
-                    "bb{mir_bb}: residual `{}` argument {index} borrows a \
-                     repr(transparent) scalar; the word is not an address",
-                    fd.item_meta.name_path()
-                )));
+            }) else {
+                continue;
+            };
+            if tyref_is_root_scope(ty, self.llbc) {
+                continue;
             }
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: residual `{}` argument {index} borrows a \
+                 repr(transparent) scalar; the word is not an address",
+                fd.item_meta.name_path()
+            )));
         }
         Ok(())
     }
@@ -771,6 +789,37 @@ pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
 pub(in crate::front::mir) fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.contains(&ROOT_SCOPE_MODULE)
+}
+
+/// Charon names an inherent method `gc_roots::<Impl>::leaf` or
+/// `gc_roots::RootScope::leaf`. The residual ABI takes the save-point
+/// word by value (`WordAbi` / `ResidualRet`), so
+/// `refuse_borrowed_transparent_scalar_residual` must not reject these
+/// callees after `repr(transparent)` peels the receiver to `&usize`.
+/// Looking inside emits `getfield_raw_i` of that word as a struct
+/// pointer (`root_scope_close` of save-point 4 SIGSEGVs at address 4).
+/// Every `dont_look_inside_cannot_raise` RootScope helper is a residual,
+/// including `set` / `normalize_moved` / Drop and the free
+/// `root_scope_close`.
+pub(in crate::front::mir) fn gc_root_scope_residual_method_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    if !segments.contains(&ROOT_SCOPE_MODULE) {
+        return false;
+    }
+    if segments.contains(&ROOT_SCOPE_TYPE) || segments.iter().any(|s| s.starts_with('<')) {
+        return true;
+    }
+    matches!(segments.last().copied(), Some(ROOT_SCOPE_CLOSE))
+}
+
+/// `RootScope` or `&RootScope`: `strip_ty_wrappers` peels the borrow, and
+/// the transparent wrapper is the save-point word.
+pub(in crate::front::mir) fn tyref_is_root_scope(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
@@ -1950,6 +1999,24 @@ pub(in crate::front::mir) fn trait_default_method_id(
         .get(method as usize)?
         .pointer("/skip_binder/default/id")?
         .as_u64()
+}
+
+/// The impl's own body for `method_idx`, or the trait default when the
+/// impl does not override it (`ClassDesc.lookup` /
+/// [`trait_method_on_known_receiver`]).
+pub(in crate::front::mir) fn impl_or_default_method_fn_id(
+    llbc: &Llbc,
+    impl_id: u64,
+    method_idx: u64,
+) -> Option<u64> {
+    let trait_id = llbc
+        .trait_impls_raw()
+        .get(impl_id as usize)?
+        .get("impl_trait")?
+        .get("id")?
+        .as_u64()?;
+    crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
+        .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
 }
 
 /// The function item a `FnDef` node names, spelled as the `RegularCall`

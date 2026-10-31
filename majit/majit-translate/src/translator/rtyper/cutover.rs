@@ -1301,7 +1301,6 @@ fn op_result_can_remove(kind: &crate::model::OpKind) -> bool {
             | OpKind::BinOp { .. }
             | OpKind::UnaryOp { .. }
             | OpKind::IsInstance { .. }
-            | OpKind::VtableMethodPtr { .. }
             | OpKind::RecordQuasiImmutField { .. }
             | OpKind::NewTuple { .. }
             | OpKind::NewList { .. }
@@ -1818,21 +1817,6 @@ const UNPORTED_CATEGORIES: &[(&[&str], &str)] = &[
         &["is of instances of the non-pointers"],
         "rtype-is-non-pointer",
     ),
-    (
-        &["Call with CallTarget::Indirect", "rclass"],
-        "indirect-call-pre-rtyper",
-    ),
-    // `dyn Trait` dispatch still enters the real-rtyper flowspace
-    // adapter as pyre's pre-rtyper `CallTarget::Indirect` shape in
-    // some registry-prefill paths.  The production codewriter's
-    // jtransform path already runs `rpbc::lower_indirect_calls`
-    // before consuming these graphs; the real-rtyper cutover path
-    // cannot yet express the matching rclass/rpbc rewrite before
-    // adapter input without leaking post-rtyper `VtableMethodPtr` /
-    // `IndirectCall` ops into flowspace.  Treat this as a
-    // known-unported real-path gap so the dual gate falls back to
-    // the legacy type walker instead of panicking during registry
-    // population.
     // `annrpython.py mergeinputargs` — an inputarg Variable
     // has no annotation. Happens when cross-block locals
     // threading misses a name in the predecessor link; the
@@ -5073,8 +5057,6 @@ fn classify_unported_reason(reason: &str) -> &'static str {
         // reached getitem/contains before the call-based keyeq branch of
         // `build_ll_dict_lookup_helper_graph` was ported. #140 DictRepr epic.
         "DICT-KEY-EQ (str/instance dict keys)"
-    } else if reason.contains("Call with CallTarget::Indirect") {
-        "DYN-TRAIT-INDIRECT (lower_indirect_calls)"
     } else if reason.contains("pair(s1, s2).union() found no arm") {
         // Two dispositions share one message, and they call for opposite
         // work.  Upstream's union table is same-kind almost throughout, so a
@@ -8996,19 +8978,6 @@ mod tests {
     }
 
     #[test]
-    fn known_unported_classifies_indirect_call_adapter_invariant() {
-        let msg = "translate_op: Call with CallTarget::Indirect at result=Some(v4) \
-                   must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
-                   reaching the flowspace adapter";
-        assert_eq!(
-            unported_category(msg),
-            Some("indirect-call-pre-rtyper"),
-            "the indirect-call gap keeps its stable fallback category"
-        );
-        assert!(is_known_unported(msg));
-    }
-
-    #[test]
     fn known_unported_classifies_noneify_on_ptr_merge() {
         // A `_ptr ∪ NoneType` block merge reaches `SomeValue::noneify()`
         // on a `SomePtr` operand — a parity-correct raise (default
@@ -9058,22 +9027,12 @@ mod tests {
                 Some("annotator-fixpoint-failed"),
             ),
             (
-                "translate_op: Call with CallTarget::Indirect at result=Some(v4) \
-                 must be lowered to VtableMethodPtr + IndirectCall by rclass.rs before \
-                 reaching the flowspace adapter",
-                Some("indirect-call-pre-rtyper"),
-            ),
-            (
                 "RPython noneify() not supported for this annotation",
                 Some("noneify-on-ptr"),
             ),
             (
                 "dict key eq function not wired for StringRepr",
                 Some("dict-key-eq-missing"),
-            ),
-            (
-                "Call with CallTarget::Indirect must be rewritten by rclass",
-                Some("indirect-call-pre-rtyper"),
             ),
             ("variable v3 is live", None),
         ];

@@ -1872,6 +1872,11 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((Some(op), res));
                     }
+                    if cast_kind_is_unsize(&op_json) {
+                        // Dest aliases this data word (`same_as`); keep the
+                        // constant vtable's TraitImpl id for Path B.
+                        self.record_unsize_vtable_impl(&op_json, &arg);
+                    }
                     // A transparent address-cast word is a GCREF pointer even
                     // though its place type is the inner `usize`. Reading it
                     // back (`roots[i].0 as *mut _`) must not emit
@@ -2557,6 +2562,11 @@ impl<'a> Lowering<'a> {
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
                     return Ok((Some(op), res));
+                }
+                if cast_kind_is_unsize(&kind) {
+                    // Dest aliases this data word (`same_as`); keep the
+                    // constant vtable's TraitImpl id for Path B.
+                    self.record_unsize_vtable_impl(&kind, &v);
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -4444,6 +4454,91 @@ impl<'a> Lowering<'a> {
         if crate::model::FunctionGraph::concretetype_of(recv) == crate::model::ConcreteType::Void {
             *recv = self.emit_zst_self_address(bb_id);
         }
+    }
+
+    /// Record a dest-only Unsize `VTable(TraitImpl { id }, _)` against the
+    /// data-word Variable the dest aliases.
+    fn record_unsize_vtable_impl(&mut self, cast: &serde_json::Value, data_word: &Variable) {
+        if let Some(impl_id) = unsize_cast_vtable_impl_id(cast, self.llbc) {
+            self.unsize_vtable_impl.insert(data_word.id(), impl_id);
+        }
+    }
+
+    /// TraitImpl id recorded for `recv`, following block-input copies.
+    fn unsize_impl_id_of(&self, recv: &Variable) -> Option<u64> {
+        let mut id = recv.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if let Some(&impl_id) = self.unsize_vtable_impl.get(&id) {
+                return Some(impl_id);
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return None;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return None,
+            }
+        }
+    }
+
+    /// Direct `Call` of the Unsize-named impl method (or the trait default
+    /// the impl inherits). Same `OpKind::Call` [`trait_method_on_known_receiver`]
+    /// feeds the concrete-receiver path.
+    ///
+    /// `rpbc.py FunctionReprBase.call`: a Constant funcptr is a direct_call;
+    /// an Unsize vtable is a constant.
+    pub(in crate::front::mir) fn unsize_constant_vtable_direct_call(
+        &self,
+        reg: &RegularCall,
+        args: &[Variable],
+        result_ty: ValueType,
+    ) -> Option<OpKind> {
+        let recv = args.first()?;
+        let impl_id = self.unsize_impl_id_of(recv)?;
+        let CallKind::Trait(payload) = &reg.kind else {
+            return None;
+        };
+        let method_idx = payload.as_array()?.get(1)?.as_u64()?;
+        let (fn_id, segments) = impl_method_call_segments(self.llbc, impl_id, method_idx)?;
+        Some(OpKind::Call {
+            target: CallTarget::function_path(segments).with_fun_decl_id(fn_id),
+            args: crate::model::call_args(args.to_vec()),
+            result_ty,
+        })
+    }
+
+    /// `ClassRepr.getclsfield`: the method slot is a field read off the
+    /// vtable word. Path B's Trait-on-dyn call has no MIR `Field[Adt({vtable}),
+    /// slot]` operand, so this synthesizes the same `FieldRead` Path A's
+    /// `resolve_operand` of that projection already emits.
+    pub(in crate::front::mir) fn emit_vtable_method_slot_read(
+        &mut self,
+        mir_bb: usize,
+        receiver: &Variable,
+        trait_decl_path: &str,
+        method_name: &str,
+    ) -> Variable {
+        let vtable_path = format!("{trait_decl_path}::{{vtable}}");
+        let owner_root =
+            tombstoned_owner_spelling(&vtable_path, "{vtable}", self.tombstoned_leaves);
+        let owner_id = majit_ir::descr::StructId::from_canonical(&owner_root);
+        let funcptr = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(funcptr.clone()),
+            kind: OpKind::FieldRead {
+                base: receiver.clone(),
+                field: FieldDescriptor::new(format!("method_{method_name}"), Some(owner_root))
+                    .with_owner_id(Some(owner_id))
+                    .with_base_is_deref(true),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+        funcptr
     }
 
     /// Fat-pointer DATA word of `recv`, or `None` when `recv` is not a

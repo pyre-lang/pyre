@@ -197,6 +197,7 @@ impl HeuristicLayoutProvider {
                     &known_aligns,
                     &imm_ranks,
                     raw_alloc_flavor_structs,
+                    fields_by_struct,
                 );
                 if known_sizes.get(struct_name) != Some(&layout.size)
                     || known_aligns.get(struct_name) != Some(&layout.align)
@@ -236,6 +237,7 @@ impl LayoutProvider for HeuristicLayoutProvider {
             &self.known_struct_aligns,
             &imm_ranks,
             &self.raw_alloc_flavor_structs,
+            &self.fields_by_struct,
         ))
     }
 

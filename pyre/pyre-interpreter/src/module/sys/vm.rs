@@ -4153,6 +4153,27 @@ impl AuditHolder {
             hooks_w: Box::new([]),
         }
     }
+
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_hooks_armed" => {
+                if !self.mutate_hooks_armed.is_installed() {
+                    return;
+                }
+                unsafe {
+                    pyre_object::quasiimmut::sweep_quasi_immut_field(&self.mutate_hooks_armed);
+                }
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
 }
 
 static AUDIT_HOOKS: std::sync::atomic::AtomicPtr<AuditHolder> =
@@ -4493,11 +4514,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         let next = next.into_boxed_slice();
         // Notification precedes the store, as `rclass.py:1010-1012
         // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
-        // The `is_installed()` fast path is `quasiimmut.py invalidation`'s
-        // null test, so an unwatched install stays lock-free.
-        if (*holder).mutate_hooks_armed.is_installed() {
-            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).mutate_hooks_armed);
-        }
+        (*holder).jit_force_quasi_immutable("mutate_hooks_armed");
         (*holder).hooks_w = next;
         (*holder).hooks_armed.set(true);
     }

@@ -25,6 +25,14 @@ pub unsafe trait FieldlessEnumArg: Copy {
     fn from_discriminant(d: i64) -> Self;
 }
 
+/// A `Copy` newtype over one machine word that a residual call passes as
+/// that word (`VersionTag(u64)`).
+/// # Safety: `from_word` must rebuild exactly the value whose single field
+/// is that word.
+pub unsafe trait WordNewtypeArg: Copy {
+    fn from_word(word: i64) -> Self;
+}
+
 /// One residual-call trampoline the macros published.
 #[derive(Clone, Copy)]
 pub struct HelperFnAddr {

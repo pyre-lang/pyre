@@ -3009,18 +3009,6 @@ pub enum BhDescr {
     VableField { index: usize },
     /// Virtualizable array descriptor: index into VirtualizableInfo.array_fields.
     VableArray { index: usize },
-    /// Vtable-method descriptor for `funcptr_from_vtable`.  Carries the
-    /// trait + method identity so the runtime (when ported) can resolve
-    /// the receiver fat pointer's vtable slot to a function address.
-    /// RPython's `op.args[0]` is already a `Ptr(FuncType)` after rtype
-    /// (`rpython/jit/codewriter/jtransform.py:546`); Rust `&dyn Trait` is
-    /// a fat pointer so the slot lookup must happen at runtime.  No
-    /// blackhole/backend consumer ships with this commit — the
-    /// descriptor exists so the IR survives serialization.
-    VtableMethod {
-        trait_root: String,
-        method_name: String,
-    },
 }
 
 /// descriptor census: the length-bearing content of the serialized descr pool.
@@ -3237,14 +3225,6 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
             } => {
                 out.vec_members += const_keys_in_order.len();
                 "switch"
-            }
-            BhDescr::VtableMethod {
-                trait_root,
-                method_name,
-            } => {
-                out.string_count += 2;
-                out.string_bytes += trait_root.len() + method_name.len();
-                "vtable_method"
             }
             BhDescr::Call { calldescr } => {
                 account_effect(&calldescr.extra_info, &mut out);

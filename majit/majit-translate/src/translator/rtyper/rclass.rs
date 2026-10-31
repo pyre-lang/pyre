@@ -64,9 +64,7 @@ thread_local! {
 use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
-use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
-use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     self, _ptr, ForwardReference, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, Struct,
@@ -76,47 +74,6 @@ use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprStat
 use crate::translator::rtyper::rtyper::{
     GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
 };
-
-// VtableMethodPtr helper (carried over from the pre-R1 rclass.rs scaffold).
-
-/// Insert a `VtableMethodPtr` op at `(block_id, op_index)` and return the
-/// produced funcptr Variable. Writes the funcptr's `concretetype` cell to
-/// `Signed` so downstream passes (`build_value_kinds`, regalloc, flatten)
-/// see the funcptr as integer kind — matching `int_guard_value(op.args[0])`
-/// in `jtransform.py:546`.
-///
-/// RPython equivalent: `ClassRepr.getclsfield(vcls, attr, llops)`
-/// (`rclass.py`), which appends `cast_pointer + getfield(vtable,
-/// mangled_name)` to `llops`. The full `getclsfield` is ported on
-/// [`ClassRepr`] and on the rooted [`RootClassRepr`]; this
-/// freestanding helper stays as a
-/// TODO: bridge for the pyre IR representation of
-/// vtable method slots (see the `OpKind::VtableMethodPtr` comment
-/// block in `model.rs`).
-pub(crate) fn class_get_method_ptr(
-    graph: &mut FunctionGraph,
-    block_id: BlockId,
-    op_index: usize,
-    receiver: Variable,
-    trait_root: String,
-    method_name: String,
-) -> Variable {
-    let funcptr_var = graph.alloc_value_var();
-    let op = SpaceOperation {
-        result: Some(funcptr_var.clone()),
-        kind: OpKind::VtableMethodPtr {
-            receiver,
-            trait_root,
-            method_name,
-        },
-    };
-    graph.blocks[block_id.0].operations.insert(op_index, op);
-    // RPython parity: every Variable carries `concretetype` inline
-    // (`rtyper.py setconcretetype v.concretetype = ...`).  Write through the
-    // backing cell so downstream consumers see Signed.
-    FunctionGraph::set_concretetype_of_inline(&funcptr_var, ConcreteType::Signed);
-    funcptr_var
-}
 
 // rclass.py — FieldListAccessor / ImmutableRanking / IR_* constants.
 

@@ -1275,6 +1275,21 @@ pub extern "C" fn jit_compare_value_from_tag(
 }
 
 #[majit_macros::jit_may_force]
+pub extern "C" fn jit_load_global_fallback(frame: PyObjectRef, varname: i64) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[frame, varname as usize as PyObjectRef]);
+    let frame = pyre_object::gc_roots::shadow_stack_get(base);
+    let varname = pyre_object::gc_roots::shadow_stack_get(base + 1) as usize as i64;
+    // One `Ref` word: the rstr `STR` the jitcode holds for `&str`.
+    let varname =
+        unsafe { core::str::from_utf8_unchecked(majit_ir::helper_fnaddr::rstr_payload(varname)) };
+    match crate::eval::_load_global_fallback(frame, varname) {
+        Ok(value) => value,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+    }
+}
+
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_unary_negative_value(value: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let value = pyre_object::gc_roots::pin_root(value);

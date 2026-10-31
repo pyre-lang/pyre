@@ -77,6 +77,10 @@ struct ProviderTables {
 struct ProvidedCrate {
     llbc: Llbc,
     state: CrateLoweringState,
+    /// Crates already in the provider when this one was created:
+    /// whole-program graph visibility the per-crate extraction splits
+    /// apart.
+    prior: Vec<Rc<ProvidedCrate>>,
 }
 
 /// Owned mirror of [`crate::ScalarFieldStore`], held for the reason the
@@ -176,7 +180,8 @@ impl GraphBodyProvider {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
-        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let prior = self.crates.clone();
+        let krate = Rc::new(ProvidedCrate { llbc, state, prior });
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -214,7 +219,8 @@ impl GraphBodyProvider {
             state.absorb_struct_fields(prev.state.struct_fields());
             state.absorb_raw_alloc_flavor_structs(prev.state.raw_alloc_flavor_structs());
         }
-        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let prior = self.crates.clone();
+        let krate = Rc::new(ProvidedCrate { llbc, state, prior });
         let functions = self.declare_crate(&krate, None, Some(&function_filter));
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
@@ -386,13 +392,44 @@ impl ProvidedCrate {
     /// Run `f` over this crate's lowering context.
     fn lowering<R>(&self, tables: &ProviderTables, f: impl FnOnce(&CrateLowering<'_>) -> R) -> R {
         tables.with_static_addrs(|static_addrs| {
+            let prior_fat_dyn_callee =
+                |name_path: &str| self.lower_prior_fat_dyn_callee(tables, name_path);
             f(&CrateLowering::new(
                 &self.llbc,
                 static_addrs,
                 &tables.jitdriver_receiver_roots,
                 &self.state,
+                Some(&prior_fat_dyn_callee),
             ))
         })
+    }
+
+    /// Lower a fat-`&dyn` callee whose body lives in a crate already in
+    /// `prior` — whole-program graph visibility the per-crate extraction
+    /// splits apart. An ambiguous `name_path` in one crate answers
+    /// `None`, as [`GraphBodyProvider::source_for_name_path`] does.
+    fn lower_prior_fat_dyn_callee(
+        &self,
+        tables: &ProviderTables,
+        name_path: &str,
+    ) -> Option<FunctionGraph> {
+        for prior in self.prior.iter().rev() {
+            let mut found = None;
+            for fd in prior.llbc.iter_local_fns() {
+                if fd.item_meta.name_path() != name_path || !fd.has_unstructured_body() {
+                    continue;
+                }
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(fd.def_id);
+            }
+            let Some(def_id) = found else {
+                continue;
+            };
+            return prior.lowering(tables, |l| l.lower_fat_dyn_callee_local(def_id));
+        }
+        None
     }
 
     /// Build the body of the declaration `def_id` and stamp its header on
@@ -526,10 +563,13 @@ fn borrowed_segments(segments: &[String]) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
-    use crate::model::FunctionGraph;
+    use crate::flowspace::model::Variable;
+    use crate::model::{
+        BlockId, CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation, VecFieldPart,
+    };
 
     const CORPUS: &str = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
 
@@ -793,5 +833,534 @@ mod tests {
                 "{name} graph hints"
             );
         }
+    }
+
+    const OBJECT_LLBC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    );
+    const INTERP_LLBC: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-interpreter.ullbc"
+    );
+
+    fn load_llbc_if_present(path: &str) -> Option<Llbc> {
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+            return None;
+        }
+        Some(Llbc::load(path).unwrap_or_else(|err| panic!("load {path}: {err}")))
+    }
+
+    fn call_names_get_strategy(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::FunctionPath { segments, .. } => segments
+                .iter()
+                .any(|segment| segment == "w_dict_get_strategy"),
+            CallTarget::Method { name, .. } => name == "w_dict_get_strategy",
+            _ => false,
+        }
+    }
+
+    fn assert_strategy_getter_spliced(graph: &FunctionGraph) {
+        let still_calls_strategy = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                let OpKind::Call { target, .. } = &op.kind else {
+                    return false;
+                };
+                call_names_get_strategy(target)
+            })
+        });
+        assert!(
+            !still_calls_strategy,
+            "w_dict_get_strategy stayed a call\n{}",
+            graph.dump()
+        );
+        let has_imp_fat = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } => {
+                    field.name == "imp"
+                        && matches!(
+                            field.vec_part,
+                            Some(
+                                VecFieldPart::FatVtable
+                                    | VecFieldPart::FatLen
+                                    | VecFieldPart::FatData
+                            )
+                        )
+                }
+                _ => false,
+            })
+        });
+        assert!(
+            has_imp_fat,
+            "no FieldRead of imp tagged FatVtable/FatLen/FatData\n{}",
+            graph.dump()
+        );
+    }
+
+    fn program_function<'a>(
+        program: &'a SemanticProgram,
+        module_path: &str,
+        name: &str,
+    ) -> &'a SemanticFunction {
+        program
+            .functions
+            .iter()
+            .find(|function| function.module_path == module_path && function.name == name)
+            .unwrap_or_else(|| {
+                let names: Vec<_> = program
+                    .functions
+                    .iter()
+                    .map(|function| format!("{}::{}", function.module_path, function.name))
+                    .collect();
+                panic!("missing {module_path}::{name} in {names:?}")
+            })
+    }
+
+    /// Interpreter callers of a pyre-object fat `&dyn` return splice the
+    /// earlier crate's body so `DictStrategyRef.imp` is two field reads.
+    #[test]
+    fn finditem_str_named_splices_the_cross_crate_strategy_getter() {
+        let Some(object_llbc) = load_llbc_if_present(OBJECT_LLBC) else {
+            return;
+        };
+        let Some(interp_llbc) = load_llbc_if_present(INTERP_LLBC) else {
+            return;
+        };
+        let mut provider = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+            Default::default(),
+        );
+        provider.lower_named_for_test(object_llbc, &["w_dict_get_strategy"]);
+        let program =
+            provider.lower_named_for_test(interp_llbc, &["finditem_str_named", "view_as_kwargs"]);
+        for name in ["finditem_str_named", "view_as_kwargs"] {
+            let function = program_function(&program, "baseobjspace", name);
+            let graph = function.lazy_graph().get().unwrap_or_else(|| {
+                panic!(
+                    "{}::{} body did not lower",
+                    function.module_path, function.name
+                )
+            });
+            assert_strategy_getter_spliced(graph);
+        }
+    }
+
+    fn producer(graph: &FunctionGraph, var_id: u64) -> Option<(BlockId, &SpaceOperation)> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| {
+                    op.result
+                        .as_ref()
+                        .is_some_and(|result| result.id() == var_id)
+                })
+                .map(|op| (block.id, op))
+        })
+    }
+
+    fn is_cast_op(kind: &OpKind) -> Option<&Variable> {
+        match kind {
+            OpKind::UnaryOp { op, operand, .. }
+                if op == "same_as" || op == "cast_int_to_ptr" || op == "cast_ptr_to_int" =>
+            {
+                Some(operand)
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().is_some_and(|s| {
+                s == "cast_int_to_ptr" || s == "cast_ptr_to_int" || s == "same_as"
+            }) =>
+            {
+                args.first().and_then(|arg| arg.as_variable())
+            }
+            _ => None,
+        }
+    }
+
+    fn walk_imp_vec_part(
+        graph: &FunctionGraph,
+        block: BlockId,
+        var: &Variable,
+        want: &[VecFieldPart],
+        seen: &mut HashSet<(usize, u64)>,
+    ) -> bool {
+        if !seen.insert((block.0, var.id())) {
+            return false;
+        }
+        if let Some((def_block, op)) = producer(graph, var.id()) {
+            return match &op.kind {
+                OpKind::FieldRead { field, .. }
+                    if field.name == "imp"
+                        && field.vec_part.is_some_and(|part| want.contains(&part)) =>
+                {
+                    true
+                }
+                kind if is_cast_op(kind).is_some() => {
+                    walk_imp_vec_part(graph, def_block, is_cast_op(kind).unwrap(), want, seen)
+                }
+                _ => false,
+            };
+        }
+        let Some(block_ref) = graph.blocks.get(block.0) else {
+            return false;
+        };
+        let preds = graph.predecessors(block);
+        if preds.is_empty() {
+            return false;
+        }
+        let index = block_ref.inputargs.iter().position(|arg| arg == var);
+        preds.iter().all(|pred| {
+            let Some(pred_block) = graph.blocks.get(pred.0) else {
+                return false;
+            };
+            let incoming: Vec<_> = pred_block
+                .exits
+                .iter()
+                .filter(|link| link.target == block)
+                .collect();
+            if incoming.is_empty() {
+                return false;
+            }
+            incoming.iter().all(|link| {
+                let src = if let Some(index) = index {
+                    link.args.get(index).and_then(|arg| arg.as_variable())
+                } else {
+                    Some(var)
+                };
+                src.is_some_and(|src| walk_imp_vec_part(graph, *pred, src, want, seen))
+            })
+        })
+    }
+
+    fn assert_vtable_slot_indirect_call(
+        graph: &FunctionGraph,
+        trait_root: &str,
+        method_name: &str,
+    ) {
+        let field_name = format!("method_{method_name}");
+        let expected_key = Some((trait_root.to_string(), method_name.to_string()));
+        let mut hits = 0usize;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let OpKind::IndirectCall {
+                    funcptr,
+                    args,
+                    family_key,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if family_key != &expected_key {
+                    continue;
+                }
+                hits += 1;
+                let Some((_, funcptr_op)) = producer(graph, funcptr.id()) else {
+                    panic!(
+                        "{trait_root}::{method_name} funcptr has no producer\n{}",
+                        graph.dump()
+                    );
+                };
+                let OpKind::FieldRead { base, field, .. } = &funcptr_op.kind else {
+                    panic!(
+                        "{trait_root}::{method_name} funcptr is not a FieldRead: {:?}\n{}",
+                        funcptr_op.kind,
+                        graph.dump()
+                    );
+                };
+                assert_eq!(
+                    field.name, field_name,
+                    "{trait_root}::{method_name} funcptr field"
+                );
+                assert_eq!(
+                    field.owner_root.as_deref(),
+                    Some("dictmultiobject::DictStrategy::{vtable}"),
+                    "{trait_root}::{method_name} vtable owner_root"
+                );
+                let mut seen = HashSet::new();
+                assert!(
+                    walk_imp_vec_part(
+                        graph,
+                        block.id,
+                        base,
+                        &[VecFieldPart::FatLen, VecFieldPart::FatMeta],
+                        &mut seen
+                    ),
+                    "{field_name} base does not reach FatLen/FatMeta of imp\n{}",
+                    graph.dump()
+                );
+                let receiver = args.first().unwrap_or_else(|| {
+                    panic!("{trait_root}::{method_name} IndirectCall has no args[0]")
+                });
+                let mut seen = HashSet::new();
+                assert!(
+                    walk_imp_vec_part(
+                        graph,
+                        block.id,
+                        receiver,
+                        &[VecFieldPart::FatData],
+                        &mut seen
+                    ),
+                    "{trait_root}::{method_name} args[0] does not reach FatData of imp\n{}",
+                    graph.dump()
+                );
+                assert_eq!(
+                    FunctionGraph::concretetype_of(base),
+                    ConcreteType::Signed,
+                    "vtable word must be an int so getfield_raw_i loads it"
+                );
+            }
+        }
+        assert!(
+            hits > 0,
+            "no IndirectCall family_key=({trait_root}, {method_name})\n{}",
+            graph.dump()
+        );
+    }
+
+    /// Path B: a bodyless `dyn DictStrategy` method lowers to the same
+    /// `{vtable}.method_*` FieldRead plus `IndirectCall { family_key }` as
+    /// Path A's inline vtable-slot dispatch.
+    #[test]
+    fn finditem_str_named_calls_getitem_str_through_the_vtable_slot() {
+        let Some(object_llbc) = load_llbc_if_present(OBJECT_LLBC) else {
+            return;
+        };
+        let Some(interp_llbc) = load_llbc_if_present(INTERP_LLBC) else {
+            return;
+        };
+        let mut provider = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+            Default::default(),
+        );
+        provider.lower_named_for_test(object_llbc, &["w_dict_get_strategy"]);
+        let program =
+            provider.lower_named_for_test(interp_llbc, &["finditem_str_named", "view_as_kwargs"]);
+        let finditem = program_function(&program, "baseobjspace", "finditem_str_named");
+        let finditem_graph = finditem.lazy_graph().get().unwrap_or_else(|| {
+            panic!(
+                "{}::{} body did not lower",
+                finditem.module_path, finditem.name
+            )
+        });
+        assert_vtable_slot_indirect_call(finditem_graph, "DictStrategy", "getitem_str");
+        let view = program_function(&program, "baseobjspace", "view_as_kwargs");
+        let view_graph = view
+            .lazy_graph()
+            .get()
+            .unwrap_or_else(|| panic!("{}::{} body did not lower", view.module_path, view.name));
+        assert_vtable_slot_indirect_call(view_graph, "DictStrategy", "view_as_kwargs");
+    }
+
+    fn impls_with_owner_leaf<'a>(
+        program: &'a SemanticProgram,
+        method: &str,
+        owner_leaf: &str,
+    ) -> Vec<&'a SemanticFunction> {
+        program
+            .functions
+            .iter()
+            .filter(|function| {
+                function.name == method
+                    && function
+                        .self_ty_root
+                        .as_deref()
+                        .is_some_and(|owner| owner.rsplit("::").next() == Some(owner_leaf))
+            })
+            .collect()
+    }
+
+    fn require_impl<'a>(
+        program: &'a SemanticProgram,
+        method: &str,
+        owner_leaf: &str,
+    ) -> &'a SemanticFunction {
+        let impls = impls_with_owner_leaf(program, method, owner_leaf);
+        let trait_impls: Vec<_> = impls
+            .iter()
+            .copied()
+            .filter(|function| function.trait_root.is_some())
+            .collect();
+        match trait_impls.as_slice() {
+            [one] => *one,
+            [] => panic!(
+                "no trait-impl {owner_leaf}::{method}; candidates: {:?}",
+                impls
+                    .iter()
+                    .map(|function| (
+                        function.self_ty_root.as_deref(),
+                        function.trait_root.as_deref(),
+                        function.trait_qualified.as_deref(),
+                        function.trait_impl_identity.as_deref()
+                    ))
+                    .collect::<Vec<_>>()
+            ),
+            _ => panic!(
+                "ambiguous trait-impl {owner_leaf}::{method}: {} matches",
+                trait_impls.len()
+            ),
+        }
+    }
+
+    fn family_mentions(family: &[crate::parse::CallPath], needle: &str) -> bool {
+        family
+            .iter()
+            .any(|path| path.segments.iter().any(|segment| segment.contains(needle)))
+    }
+
+    /// `lib.rs` family insert (`rpbc.py FunctionReprBase.call` /
+    /// `row_of_graphs.values()`): every `(self_ty_root, trait_root)` pair.
+    fn register_trait_families_like_production(
+        program: &SemanticProgram,
+        call_control: &mut crate::call::CallControl,
+    ) {
+        for func in &program.functions {
+            let (Some(owner), Some(trait_leaf)) = (&func.self_ty_root, &func.trait_root) else {
+                continue;
+            };
+            let path = match func.trait_impl_identity.as_deref() {
+                Some(identity) => crate::parse::CallPath::from_segments(
+                    crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
+                ),
+                None => crate::parse::CallPath::for_impl_method(owner, &func.name),
+            };
+            call_control.register_trait_family_path(&func.name, trait_leaf, path);
+        }
+        for func in &program.functions {
+            let (None, Some(trait_leaf)) = (&func.self_ty_root, &func.trait_root) else {
+                continue;
+            };
+            let impl_type = format!("<default methods of {trait_leaf}>");
+            call_control.register_trait_family_member(&func.name, trait_leaf, &impl_type);
+        }
+    }
+
+    /// Interpreter-crate overrides of a pyre-object trait join the same
+    /// PBC family the object-crate impls and the vtable call sites use.
+    /// Charon `item_meta.is_local` is the extraction crate, not the
+    /// translated-program boundary (`local_crates::is_local_crate_root`).
+    #[test]
+    fn dict_strategy_indirect_families_include_cross_crate_overrides() {
+        let Some(object_llbc) = load_llbc_if_present(OBJECT_LLBC) else {
+            return;
+        };
+        let Some(interp_llbc) = load_llbc_if_present(INTERP_LLBC) else {
+            return;
+        };
+        let object_crate = object_llbc.crate_name().to_string();
+        let interp_crate = interp_llbc.crate_name().to_string();
+        crate::local_crates::with_local_crate_root(&object_crate, || {
+            crate::local_crates::with_local_crate_root(&interp_crate, || {
+                let skipped: mir::LoweringSkips = Default::default();
+                let mut provider = GraphBodyProvider::new(
+                    crate::HostStaticAddrs::default(),
+                    &[],
+                    HashMap::new(),
+                    FuncObjDeclarations::default(),
+                    skipped.clone(),
+                );
+                let object_program =
+                    provider.lower_named_for_test(object_llbc, &["getitem_str", "view_as_kwargs"]);
+                let interp_program =
+                    provider.lower_named_for_test(interp_llbc, &["getitem_str", "view_as_kwargs"]);
+
+                let object_get = require_impl(&object_program, "getitem_str", "ObjectDictStrategy");
+                let unicode_get =
+                    require_impl(&object_program, "getitem_str", "UnicodeDictStrategy");
+                let module_get = require_impl(&object_program, "getitem_str", "ModuleDictStrategy");
+                let mapdict_get = require_impl(&interp_program, "getitem_str", "MapDictStrategy");
+                let classdict_get =
+                    require_impl(&interp_program, "getitem_str", "ClassDictStrategySlot");
+                let unicode_kwargs =
+                    require_impl(&object_program, "view_as_kwargs", "UnicodeDictStrategy");
+                let default_get = object_program
+                    .functions
+                    .iter()
+                    .find(|function| {
+                        function.name == "getitem_str"
+                            && function.self_ty_root.is_none()
+                            && function.trait_root.as_deref() == Some("DictStrategy")
+                    })
+                    .expect("DictStrategy default getitem_str");
+
+                let trait_root = object_get.trait_root.as_deref();
+                let trait_qualified = object_get.trait_qualified.as_deref();
+                assert_eq!(
+                    trait_root,
+                    Some("DictStrategy"),
+                    "object-side trait_root={trait_root:?} trait_qualified={trait_qualified:?}"
+                );
+                for (label, function) in [
+                    ("ObjectDictStrategy", object_get),
+                    ("UnicodeDictStrategy", unicode_get),
+                    ("ModuleDictStrategy", module_get),
+                    ("MapDictStrategy", mapdict_get),
+                    ("ClassDictStrategySlot", classdict_get),
+                    ("UnicodeDictStrategy.view_as_kwargs", unicode_kwargs),
+                ] {
+                    assert_eq!(
+                        (
+                            function.trait_root.as_deref(),
+                            function.trait_qualified.as_deref()
+                        ),
+                        (trait_root, trait_qualified),
+                        "{label} trait_root={:?} trait_qualified={:?} vs object-side {trait_root:?} {trait_qualified:?}",
+                        function.trait_root,
+                        function.trait_qualified
+                    );
+                }
+                // Default bodies leave `trait_qualified` empty; the family
+                // key is still the leaf `trait_root`.
+                assert_eq!(default_get.trait_root.as_deref(), Some("DictStrategy"));
+                assert_eq!(default_get.trait_qualified, None);
+
+                let mut call_control = crate::call::CallControl::new();
+                register_trait_families_like_production(&object_program, &mut call_control);
+                register_trait_families_like_production(&interp_program, &mut call_control);
+                let family_get = call_control.all_impls_for_indirect("DictStrategy", "getitem_str");
+                let family_kw =
+                    call_control.all_impls_for_indirect("DictStrategy", "view_as_kwargs");
+                for needle in [
+                    "MapDictStrategy",
+                    "ClassDictStrategySlot",
+                    "ObjectDictStrategy",
+                    "UnicodeDictStrategy",
+                    "ModuleDictStrategy",
+                    "<default methods of DictStrategy>",
+                ] {
+                    assert!(
+                        family_mentions(&family_get, needle),
+                        "getitem_str family missing {needle}: {family_get:?}"
+                    );
+                }
+                assert!(
+                    family_mentions(&family_kw, "UnicodeDictStrategy"),
+                    "view_as_kwargs family missing UnicodeDictStrategy: {family_kw:?}"
+                );
+
+                let unicode_lowered = unicode_kwargs.lazy_graph().get();
+                let skips = skipped.borrow();
+                let unicode_skips: Vec<_> = skips
+                    .iter()
+                    .filter(|(name, _)| name.contains("view_as_kwargs"))
+                    .cloned()
+                    .collect();
+                eprintln!(
+                    "UnicodeDictStrategy::view_as_kwargs lowered={} DeclBuildError skips={unicode_skips:?}",
+                    unicode_lowered.is_some()
+                );
+            })
+        });
     }
 }

@@ -223,6 +223,39 @@ pub struct W_Property {
     pub mutate_fdel: crate::quasiimmut::QuasiImmutField,
 }
 
+impl W_Property {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_fget" => {
+                if !self.mutate_fget.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_fget) };
+            }
+            "mutate_fset" => {
+                if !self.mutate_fset.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_fset) };
+            }
+            "mutate_fdel" => {
+                if !self.mutate_fdel.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_fdel) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+}
+
 /// Allocate a new property object.
 ///
 /// PyPy: W_Property.__init__(space, w_fget, w_fset, w_fdel, w_doc)
@@ -303,17 +336,9 @@ pub unsafe fn w_property_reinit(
     // with the value it already holds invalidates as well.  Nothing else
     // revokes them: re-initialising an installed descriptor changes no type's
     // version tag, which is the only other pin a fold over `obj.name` holds.
-    // The `is_installed` test is `pyjitpl.py`'s `mutatebox.nonnull()` — a
-    // property no loop watches pays one load.
-    if (*prop).mutate_fget.is_installed() {
-        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fget);
-    }
-    if (*prop).mutate_fset.is_installed() {
-        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fset);
-    }
-    if (*prop).mutate_fdel.is_installed() {
-        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fdel);
-    }
+    (*prop).jit_force_quasi_immutable("mutate_fget");
+    (*prop).jit_force_quasi_immutable("mutate_fset");
+    (*prop).jit_force_quasi_immutable("mutate_fdel");
     (*prop).fget = fget;
     (*prop).fset = fset;
     (*prop).fdel = fdel;

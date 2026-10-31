@@ -47,6 +47,7 @@
 //! to consult — `assembler.assemble` populates `code` in place and
 //! per-PC mapping is implicit in the bytecode stream.
 
+use majit_jitcode::codewriter::jitcode::ConstSlotR;
 use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
@@ -197,10 +198,12 @@ pub struct PyJitCodeMetadata {
     pub pcdep_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u8, u16, u16)>)>,
     /// Const Ref operand-stack slots after Python trivia, resolved with the
     /// same exact-marker and predecessor-op-start tiers as the trivia-aware
-    /// depth twin.
-    pub const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
+    /// depth twin. GCREF words live in [`ConstSlotR`] so
+    /// [`crate::state::walk_jitcode_constants_refs`] can forward them
+    /// (`JitCode.constants_ptr`).
+    pub const_ref_trivia_marker_by_jit_pc: Vec<(usize, Vec<(u16, ConstSlotR)>)>,
     /// Predecessor-op-start tier of the trivia-aware const Ref slot twin.
-    pub const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
+    pub const_ref_trivia_pred_by_jit_pc: Vec<(usize, Vec<(u16, ConstSlotR)>)>,
     /// Trivia-aware twin of `result_color_at_pc`, split into the
     /// SAME exact-marker / predecessor-op-start tiers as the depth-trivia
     /// twin. Each entry records
@@ -297,10 +300,14 @@ pub struct PyJitCodeMetadata {
     /// boundary at-or-before `off`). A PREDECESSOR binary search (largest
     /// offset ≤ jit_pc) returns the slots for a carried resume coordinate.
     /// Built in the same `by_off` loop as `pcdep_by_jit_pc`; empty for skeleton
-    /// / fixture. Read on the decode-identity path of
-    /// `const_ref_slots_at_pc_at`, mirroring the `pcdep_by_jit_pc` /
-    /// `depth_pred_by_jit_pc` twins' production use.
-    pub const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, i64)>)>,
+    /// / fixture. Read by `const_ref_slots_from_pc_pred`, mirroring the
+    /// `pcdep_by_jit_pc` / `depth_pred_by_jit_pc` twins' production use.
+    ///
+    /// Each raw is a GCREF captured at codewrite (`LOAD_CONST` /
+    /// `LOAD_SMALL_INT`). `walk_jitcode_constants_refs` forwards the
+    /// [`ConstSlotR`] the same way it forwards `constants_r`; a plain
+    /// `i64` copy is not a MiniMark field and goes stale after a minor.
+    pub const_ref_slots_by_jit_pc: Vec<(usize, Vec<(u16, ConstSlotR)>)>,
     /// True once `assembler.assemble`'s setup-time drain has run and stamped
     /// the per-Python-PC maps (`codewriter.rs` `finalize_jitcode`). The
     /// install-mode discriminator [`PyJitCode::is_populated`] reads this flag instead of testing
@@ -800,15 +807,30 @@ impl PyJitCode {
     /// The const operand-stack slots keyed by a JitCode byte offset via
     /// the `const_ref_slots_by_jit_pc` predecessor twin. Returns the slots for
     /// a carried resume coordinate; `None` when the twin is empty (skeleton /
-    /// fixture). Consumed on the decode-identity path of
-    /// `const_ref_slots_at_pc_at`.
+    /// fixture). Consumed by `const_ref_slots_from_pc_pred`.
     pub fn const_ref_slots_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
         let table = &self.metadata.const_ref_slots_by_jit_pc;
         if table.is_empty() {
             return None;
         }
         let search = table.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| table[i].1.clone())
+        Self::predecessor_index(search)
+            .map(|i| PyJitCodeMetadata::snapshot_const_ref_slots(&table[i].1))
+    }
+
+    /// Exact-match twin of [`Self::const_ref_slots_for_jitcode_pc`].
+    /// A predecessor lookup at CALL can name a prior `LOAD_CONST` None
+    /// for the `PUSH_NULL` slot; reconstruction refills interned
+    /// `ConstPtr(0)` only from this exact list (`raw != 0`).
+    pub fn const_ref_slots_exact_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
+        let table = &self.metadata.const_ref_slots_by_jit_pc;
+        if table.is_empty() {
+            return None;
+        }
+        table
+            .binary_search_by_key(&jit_pc, |&(off, _)| off)
+            .ok()
+            .map(|i| PyJitCodeMetadata::snapshot_const_ref_slots(&table[i].1))
     }
 
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode
@@ -855,17 +877,18 @@ impl PyJitCode {
 
     /// Trivia-aware const Ref slot list keyed by a JitCode byte offset,
     /// resolved with exact-marker precedence and an op-start predecessor scan.
-    pub fn const_ref_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<&[(u16, i64)]> {
+    pub fn const_ref_trivia_for_jitcode_pc(&self, jit_pc: usize) -> Option<Vec<(u16, i64)>> {
         let marker = &self.metadata.const_ref_trivia_marker_by_jit_pc;
         let pred = &self.metadata.const_ref_trivia_pred_by_jit_pc;
         if marker.is_empty() && pred.is_empty() {
             return None;
         }
         if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
-            return Some(&marker[i].1);
+            return Some(PyJitCodeMetadata::snapshot_const_ref_slots(&marker[i].1));
         }
         let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
-        Self::predecessor_index(search).map(|i| pred[i].1.as_slice())
+        Self::predecessor_index(search)
+            .map(|i| PyJitCodeMetadata::snapshot_const_ref_slots(&pred[i].1))
     }
 
     /// Trivia-aware result color keyed by a JitCode byte offset,
@@ -903,6 +926,20 @@ impl PyJitCode {
         }
         let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
         Self::predecessor_index(search).and_then(|i| pred[i].1)
+    }
+
+    /// op3 `-live-` of the portal merge for `py_pc`.
+    ///
+    /// `jtransform.py Transformer.handle_jit_marker__jit_merge_point` emits
+    /// `[op3=-live-, op1=jit_merge_point, op2=-live-]`. The resume-marker twin
+    /// advances onto op2 for a guard that continues in blackhole.
+    /// `pyframe.py pushvalue` / `popvalue` already wrote the frame.
+    pub fn portal_merge_op3_live_for_py_pc(&self, py_pc: u32) -> Option<usize> {
+        self.metadata
+            .py_floor_by_jit_pc
+            .iter()
+            .find(|&&(_, py)| py == py_pc)
+            .map(|&(off, _)| off as usize)
     }
 
     /// Forward Python PC paired with a carried resume JitCode PC. This is a
@@ -1168,6 +1205,33 @@ impl PyJitCode {
 }
 
 impl PyJitCodeMetadata {
+    /// Publish a codewrite-time `(slot, raw GCREF)` table as [`ConstSlotR`]
+    /// cells `walk_jitcode_constants_refs` can forward.
+    pub fn wrap_const_ref_table(
+        table: Vec<(usize, Vec<(u16, i64)>)>,
+    ) -> Vec<(usize, Vec<(u16, ConstSlotR)>)> {
+        table
+            .into_iter()
+            .map(|(off, slots)| {
+                (
+                    off,
+                    slots
+                        .into_iter()
+                        .map(|(slot, raw)| (slot, ConstSlotR::new(raw)))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Load the current forwarded addresses from a [`ConstSlotR`] slot list.
+    pub fn snapshot_const_ref_slots(slots: &[(u16, ConstSlotR)]) -> Vec<(u16, i64)> {
+        slots
+            .iter()
+            .map(|(slot, cell)| (*slot, cell.get()))
+            .collect()
+    }
+
     /// The identity/empty metadata: all `*_by_jit_pc` translation tables empty,
     /// `portal_frame_reg`/`portal_ec_reg` at the `u16::MAX` sentinel (a real `0`
     /// would alias locals-bank color 0), every scalar zero/false.  Shared by

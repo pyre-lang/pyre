@@ -331,7 +331,10 @@ impl Assembler {
 
         self.fix_labels(&mut state);
 
-        let jitcode = state.builder.try_finish()?;
+        let jitcode = match state.builder.try_finish() {
+            Some(jitcode) => jitcode,
+            None => return None,
+        };
         dump_assembled_ssarepr(ssarepr, &jitcode);
         // `assembler.py` checks the completed register/constant namespace
         // before making the JitCode. Runtime-generated graphs use the checked
@@ -1660,11 +1663,13 @@ fn dispatch_op(
                 ),
             }
         }
-        "int_neg" | "int_invert" => {
+        "int_neg" | "int_invert" | "int_is_zero" | "int_is_true" => {
             let dst = expect_result_reg(result, Kind::Int, "int unary needs result");
             let opcode = match opname {
                 "int_neg" => majit_ir::OpCode::IntNeg,
                 "int_invert" => majit_ir::OpCode::IntInvert,
+                "int_is_zero" => majit_ir::OpCode::IntIsZero,
+                "int_is_true" => majit_ir::OpCode::IntIsTrue,
                 _ => unreachable!(),
             };
             state

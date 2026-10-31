@@ -583,21 +583,6 @@ pub fn vable_idx_probe_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_VABLE_IDX_PROBE").is_some())
 }
 
-/// Which exit of `TraceCtx::vable_getarrayitem_ref_checked` answered, and
-/// whether it carried a concrete.
-///
-/// A `getarrayitem_vable_r` that returns `(opref, None)` leaves the reading
-/// register concrete-less, and the next opcode that demands the value —
-/// `ref_return` in the three-op `load_local_value` jitcode — panics in
-/// `read_ref_reg` with "jitcode concrete ref register was uninitialized".
-/// Four different exits produce that `None`, and the panic names none of
-/// them, so the probe prints on every exit including the answering ones:
-/// silence on an exit must mean "not reached", never "reached and fine".
-pub fn vable_read_probe_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_VABLE_READ_PROBE").is_some())
-}
-
 pub fn mptrace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_MPTRACE").is_some())

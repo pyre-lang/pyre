@@ -312,22 +312,6 @@ pub enum CallTarget {
         #[serde(default)]
         variant_tag: Option<i64>,
     },
-    /// RPython: `indirect_call` opname. Receiver's static type is a
-    /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
-    /// is resolved via vtable.  `trait_root` + `method_name` together
-    /// key the candidate family in `CallControl.trait_method_impls`.
-    Indirect {
-        trait_root: String,
-        method_name: String,
-        /// Selected call-family row (`rpbc.py FunctionsPBCRepr.call` /
-        /// `row_of_graphs.values()`), stamped by
-        /// `annotate_access_directly` so discovery and
-        /// `lower_indirect_calls` follow the specialized graphs.
-        /// Transient (`#[serde(skip)]`) — the rtyper rewrite copies it
-        /// onto [`OpKind::IndirectCall::graphs`].
-        #[serde(skip, default)]
-        graphs: Option<Vec<crate::parse::CallPath>>,
-    },
     UnsupportedExpr,
 }
 
@@ -473,14 +457,6 @@ impl CallTarget {
         }
     }
 
-    pub fn indirect(trait_root: impl Into<String>, method_name: impl Into<String>) -> Self {
-        Self::Indirect {
-            trait_root: trait_root.into(),
-            method_name: method_name.into(),
-            graphs: None,
-        }
-    }
-
     pub fn synthetic_transparent_ctor(name: impl Into<String>) -> Self {
         Self::SyntheticTransparentCtor {
             name: name.into(),
@@ -570,7 +546,6 @@ impl CallTarget {
                 segs.push(name.as_str());
                 Some(segs)
             }
-            CallTarget::Indirect { method_name, .. } => Some(vec![method_name.as_str()]),
             CallTarget::UnsupportedExpr => None,
         }
     }
@@ -650,11 +625,6 @@ impl fmt::Display for CallTarget {
                     )
                 }
             }
-            CallTarget::Indirect {
-                trait_root,
-                method_name,
-                ..
-            } => write!(f, "<dyn {trait_root}>::{method_name}"),
             CallTarget::UnsupportedExpr => f.write_str("<unsupported-call-expr>"),
         }
     }
@@ -1437,28 +1407,11 @@ pub enum OpKind {
     GuardClass {
         base: crate::flowspace::model::Variable,
     },
-    /// Project a callee function pointer out of a `dyn Trait` receiver's
-    /// vtable for the named method slot.  Result is integer-typed so it
-    /// can be fed to `int_guard_value` (RPython `jtransform.py`).
-    ///
-    /// TODO: pyre adaptation of `rclass.py getclsfield()`. RPython
-    /// emits a `cast_pointer + getfield(vtable_struct, method_name)` chain
-    /// because `ClassRepr` models the vtable as an explicit `Struct`. Rust
-    /// `dyn Trait` vtable layout is compiler-internal (unstable ABI), so
-    /// pyre cannot model the vtable as an IR struct — this single op stands
-    /// in for the chain and must be emitted by the rtyper-equivalent layer
-    /// (`translator/rtyper/rclass.rs`), never by `jtransform`.
-    VtableMethodPtr {
-        receiver: crate::flowspace::model::Variable,
-        trait_root: String,
-        method_name: String,
-    },
     /// Indirect call — `funcptr` is the `Variable` carrying the callable
-    /// produced by the rtyper layer (e.g. from `VtableMethodPtr` for
-    /// `dyn Trait` dispatch). `args` are the full call arguments,
-    /// including the receiver. `graphs` mirrors the trailing `c_graphs`
-    /// constant from `rpbc.py`: `Some(full_family)` when known,
-    /// `None` otherwise.
+    /// (`ClassRepr.getclsfield` of `{vtable}.method_*`). `args` are the
+    /// full call arguments, including the receiver. `graphs` mirrors the
+    /// trailing `c_graphs` constant from `rpbc.py`: `Some(full_family)`
+    /// when known, `None` otherwise.
     ///
     /// RPython: `rpython/rtyper/rpbc.py`
     /// ```python
@@ -1805,9 +1758,10 @@ pub enum OpKind {
     /// with `descr1 = fielddescrof(STRUCT, 'mutate_' + name)`.
     /// `v_inst` is an `AbstractValue` — a `Variable` (register operand) or a
     /// `Constant` (prebuilt instance).  `LinkArg::Value`/`Const` mirrors that
-    /// union so a Constant ref stays inline as a pooled `r` operand
+    /// union so a Constant stays inline as a pooled operand
     /// (`assembler.py` `emit_const`) instead of being hoisted into a
-    /// register; the opcode key stays `jit_force_quasi_immutable/rd`.
+    /// register. The opcode key is `jit_force_quasi_immutable/rd` for a
+    /// GC owner and `/id` for a raw address (`getkind` Signed / non-GC ptr).
     JitForceQuasiImmutable {
         base: crate::model::LinkArg,
         mutate_field: FieldDescriptor,

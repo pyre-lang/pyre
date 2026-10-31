@@ -146,6 +146,12 @@ pub struct PyreFieldDescr {
 /// is a distinct ARRAY from the plain twin of the same width, so the
 /// registry returns one Arc per `(shape, acquire)` the way
 /// `descr.py` `cache[ARRAY]` returns one object per ARRAY.
+///
+/// `is_gc_managed` is likewise ARRAY identity: `descr.py`
+/// `get_array_descr(gccache, ARRAY_OR_STRUCT)` caches per ARRAY
+/// object and derives gc-ness from `ARRAY._gckind` (`rffi.CArray`
+/// is raw). Two ARRAYs that share a structural shape but disagree
+/// on `_gckind` are distinct cache keys.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct ArrayDescrKey {
     base_size: usize,
@@ -253,9 +259,18 @@ fn get_or_create_array_descr(
     item_type: Type,
     signed: bool,
     len_offset: Option<usize>,
+    is_gc_managed: bool,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
-        base_size, item_size, type_id, item_type, signed, len_offset, None, false, true,
+        base_size,
+        item_size,
+        type_id,
+        item_type,
+        signed,
+        len_offset,
+        None,
+        false,
+        is_gc_managed,
     )
 }
 
@@ -302,9 +317,10 @@ fn get_or_create_array_descr_with_full_id(
             .get(&gc_key)
             .cloned()
             .filter(|existing| {
-                existing
-                    .as_array_descr()
-                    .is_some_and(|ad| ad.load_is_acquire() == key.load_is_acquire)
+                existing.as_array_descr().is_some_and(|ad| {
+                    ad.load_is_acquire() == key.load_is_acquire
+                        && ad.is_gc_managed() == key.is_gc_managed
+                })
             })
         {
             // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
@@ -379,14 +395,7 @@ fn get_or_create_array_descr_with_full_id(
     // `ptr - GcHeader::SIZE`.  The jitcode intern path is
     // `Assembler::add_raw_int_array_descr_signed` (`is_gc_managed: false`).
     // A producer that shipped `is_gc_managed: false` keeps it as well.
-    if !key.is_gc_managed
-        || key
-            .array_type_id
-            .as_deref()
-            .is_some_and(|s| s.starts_with("majit::raw_carray_"))
-    {
-        array_descr.set_is_gc_managed(false);
-    }
+    array_descr.set_is_gc_managed(key.is_gc_managed);
     let arc: DescrRef = Arc::new(array_descr);
     cache.insert(key.clone(), arc.clone());
     // Publish the freshly-minted SimpleArrayDescr into
@@ -2304,15 +2313,9 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// 'w_kw_defs?']`.
 ///
 /// The `?` makes each field quasi-immutable and `[*]` makes the selected
-/// elements immutable after the field has been promoted.  All nine are marked
-/// here through the `quasi` row: `descr.py:229 is_pure =
-/// STRUCT._immutable_field(fieldname) != False` answers true for a
-/// quasi-immutable field — `IR_QUASIIMMUTABLE` is an object, so `!= False`
-/// holds — which is what the `is_immutable` column carries.  The rank is what
-/// keeps the read from folding on that column alone:
-/// `SimpleFieldDescr::is_always_pure` is `is_immutable && !is_quasi_immutable`,
-/// so the fold stays behind `record_quasiimmut_field` + `GUARD_NOT_INVALIDATED`
-/// exactly as `jtransform.py:895-903` sequences it.
+/// elements immutable after the field has been promoted. All nine go through
+/// the `quasi` row, which stamps `is_immutable = false` because those readers
+/// are not all paired with `record_quasiimmut_field` (see the `quasi` closure).
 ///
 /// The write half these descriptors depend on is
 /// `Function::jit_force_quasi_immutable("mutate_<name>")`, called immediately
@@ -2336,6 +2339,7 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// pins of the same slots pass that same mutate descr. The dispatch arm is
 /// `jitcode_dispatch/mod.rs` `"record_quasiimmut_field/rdd"`.
 ///
+
 /// The entries are in byte-offset order and each key is the struct's own field
 /// name, which is what makes the group's numbering agree with the analyzer's.
 /// `index_in_parent` is a field's slot number in the virtual
@@ -2372,7 +2376,14 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             false,
         )
     };
-    // A `function.py:34-42` entry: pure by `descr.py:229`, quasi by its `?`.
+    // Hand-written inline-call paths read `code?`/`w_func_globals?`/`defs_w?`
+    // off a baked ConstPtr callable through GETFIELD+GUARD_VALUE without a
+    // `record_quasiimmut_field` marker: the marker's QuasiImmutDescr keeps the
+    // owner by raw address and the callee may be relocated by the collector
+    // (`jitcode_dispatch/inline_call.rs walker_guard_function_field` and the
+    // `defs_w` read in `try_walker_inline_resolved_user_call`). Stamp
+    // `is_immutable = false` so `is_always_pure` stays false until those
+    // readers are paired.
     let quasi = |key, offset| {
         (
             key,
@@ -2380,7 +2391,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             std::mem::size_of::<usize>(),
             Type::Ref,
             false,
-            true,
+            false,
             true,
         )
     };
@@ -3514,8 +3525,7 @@ static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::
             ),
             // `pyframe.py FrameDebugData.is_being_profiled`. Mutable:
             // `executioncontext.py setprofile` writes it on every live
-            // frame. Appended at the tail so existing accessors that
-            // resolve by position keep their slots.
+            // frame.
             (
                 "is_being_profiled",
                 std::mem::offset_of!(FrameDebugData, is_being_profiled),
@@ -3996,8 +4006,17 @@ pub fn make_array_descr_with_type(
     len_offset: Option<usize>,
     item_type: Type,
     signed: bool,
+    is_gc_managed: bool,
 ) -> DescrRef {
-    get_or_create_array_descr(base_size, item_size, type_id, item_type, signed, len_offset)
+    get_or_create_array_descr(
+        base_size,
+        item_size,
+        type_id,
+        item_type,
+        signed,
+        len_offset,
+        is_gc_managed,
+    )
 }
 
 /// Bridge-only factory that threads the codewriter's `array_type_id`
@@ -4006,6 +4025,9 @@ pub fn make_array_descr_with_type(
 /// identical structural fields but different lltype spellings receive
 /// distinct registry slots — matching upstream
 /// `gccache._cache_array[ARRAY_OR_STRUCT]` (`descr.py get_array_descr`).
+///
+/// `is_gc_managed` is `ARRAY._gckind` (`cpu.arraydescrof(rffi.CArray(TYPE))`
+/// is raw).
 pub fn make_array_descr_with_full_id(
     base_size: usize,
     item_size: usize,
@@ -4015,6 +4037,7 @@ pub fn make_array_descr_with_full_id(
     signed: bool,
     array_type_id: Option<String>,
     load_is_acquire: bool,
+    is_gc_managed: bool,
 ) -> DescrRef {
     get_or_create_array_descr_with_full_id(
         base_size,
@@ -4025,7 +4048,7 @@ pub fn make_array_descr_with_full_id(
         len_offset,
         array_type_id,
         load_is_acquire,
-        true,
+        is_gc_managed,
     )
 }
 
@@ -4509,6 +4532,7 @@ pub fn dict_lookup_entries_array_descr() -> DescrRef {
             false,
             Some("dict.lookup.entries".to_string()),
             false,
+            true,
         )
     });
     DESCR.clone()
@@ -4929,9 +4953,10 @@ fn mutate_descr_for_quasi_field_of_parent(field: &DescrRef, parent: &DescrRef) -
 /// `LOAD_GLOBAL` / `STORE_GLOBAL` cell folds bake the stored cell under a
 /// `QUASIIMMUT_FIELD` on this field. `_setitem_str_cell_known` (`celldict.py`)
 /// calls `mutated()` before every write that replaces the stored pointer.
-/// `is_immutable` / `is_quasi_immutable` match
-/// [`make_quasi_immutable_field_descr`]. Its HeapCache `index` is the
+/// Declared rank ⇒ `is_immutable` (`descr.py get_field_descr`
+/// `_immutable_field != False`). Its HeapCache `index` is the
 /// interned `(STRUCT, fieldname)` identity.
+
 ///
 /// `caches` is `celldict.py ModuleDictStrategy.caches`. `heaptracker.py
 /// all_fielddescrs` walks every field of the STRUCT; the JIT never loads
@@ -4986,7 +5011,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             version_offset,
             8,
             Type::Int,
-            false,
+            true,
             true,
             ArrayFlag::Unsigned,
             0,
@@ -7881,7 +7906,8 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // plus `code_ptr` (`jit_immutable_fields`). `co_name` / `co_qualname` are
     // listed upstream but these slots are realized lazily, so they stay
     // mutable. `w_filename` is realized in `PyCode.__init__` and listed
-    // immutable. `w_globals?` is filled on first execution and then promoted.
+    // immutable. `w_globals?` is filled on first execution and then promoted;
+    // a declared `?` rank stamps `is_immutable` (`descr.py get_field_descr`).
     let word_int = |key, offset, immutable| (key, offset, WORD, Type::Int, false, immutable, false);
     let word_ref =
         |key, offset, immutable, quasi| (key, offset, WORD, Type::Ref, false, immutable, quasi);
@@ -7931,7 +7957,7 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             word_ref(
                 "w_globals",
                 std::mem::offset_of!(PyCode, w_globals),
-                false,
+                true,
                 true,
             ),
             word_ref(
@@ -9241,6 +9267,18 @@ pub fn ec_mutate_w_tracefunc_descr() -> DescrRef {
     )
 }
 
+/// `ExecutionContext.is_tracing`, the counter `bytecode_only_trace`
+/// tests before `run_trace_func`.  Standalone so it does not restamp
+/// `EC_DESCR_GROUP` `index_in_parent` ranks.
+pub fn ec_is_tracing_descr() -> DescrRef {
+    make_field_descr(
+        std::mem::offset_of!(pyre_interpreter::ExecutionContext, is_tracing),
+        std::mem::size_of::<i32>(),
+        Type::Int,
+        true,
+    )
+}
+
 /// Field descr for `ExecutionContext::profilefunc`, the slot
 /// `executioncontext.py` lists as `profilefunc?` next to `w_tracefunc?`.
 ///
@@ -9466,12 +9504,14 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
 /// One process-wide `i64` at offset 0 of a non-GC `static mut`, plus the
 /// hidden `mutate_gil_ready` / `mutate_gil_ready_lock` words
 /// (`rclass.py InstanceRepr._setup_repr` / `quasiimmut.py
-/// get_mutate_field_name`). Both `is_immutable` and `is_quasi_immutable`
-/// are set so `SimpleFieldDescr::is_always_pure` stays false: an
-/// always-pure read of a constant receiver folds the zero with no
-/// `QuasiimmutField` and no invalidation. `is_gc_managed` is false so the
+/// get_mutate_field_name`). `gil_ready?` is declared (`#[jit_immutable_fields]`),
+/// so the row sets `is_immutable` and `is_quasi_immutable`
+/// (`descr.py get_field_descr`) and the read records `record_quasiimmut_field/idd`
+/// with `mutate_gil_ready` first (`jtransform.py rewrite_op_getfield`).
+/// `is_gc_managed` is false so the
 /// read does not emit `GUARD_GC_TYPE` against the bytes before the static.
 /// HeapCache `index` is the interned `(STRUCT, fieldname)` identity.
+
 static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     use pyre_object::gil_ready::GilReadyState;
@@ -10360,7 +10400,7 @@ mod tests {
                 Type::Ref,
                 false,
                 6,
-                false,
+                true,
             ),
             (
                 pycode_hidden_applevel_descr(),
@@ -11715,6 +11755,7 @@ mod tests {
             false,
             Some("pyre::test_singleton_id".to_string()),
             false,
+            true,
         );
         let b = crate::descr::make_array_descr_with_full_id(
             0,
@@ -11725,6 +11766,7 @@ mod tests {
             false,
             Some("pyre::test_singleton_id".to_string()),
             false,
+            true,
         );
         assert!(
             std::sync::Arc::ptr_eq(&a, &b),
@@ -13393,10 +13435,10 @@ mod tests {
     }
 
     #[test]
-    fn gil_ready_descr_is_quasi_immutable_not_always_pure() {
+    fn gil_ready_descr_is_quasi_immutable_and_always_pure() {
         let descr = gil_ready_descr();
         assert!(descr.is_quasi_immutable());
-        assert!(!descr.is_always_pure());
+        assert!(descr.is_always_pure());
         assert!(
             std::sync::Arc::ptr_eq(
                 &descr,
@@ -13576,7 +13618,7 @@ mod tests {
             version.index()
         );
         assert!(version.is_quasi_immutable());
-        assert!(!version.is_always_pure());
+        assert!(version.is_always_pure());
         assert_eq!(
             version_field.offset(),
             core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
@@ -14402,6 +14444,64 @@ mod tests {
     /// address the same three words through the same descriptor objects.
     /// `pypy/jit/backend/llsupport/descr.py GcCache.get_field_descr` has no
     /// second identity for a field merely because a different graph read it.
+    /// Flatten's shared we_are_jitted block reads `FrameDebugData.w_f_trace`
+    /// through `flatten_descr_by_ptr`.  Reconstruct that BhDescr here and
+    /// require `make_descr_from_bh` to return the declared group Arc — heap
+    /// CSE keys on descr identity, and a parallel mint (`T{cache_key}.…`)
+    /// records a getfield at every opcode instead of one GuardFalse.
+    #[test]
+    fn make_descr_from_bh_roundtrips_flatten_w_f_trace_to_declared_group() {
+        use majit_jitcode::jitcode::{BhDescr, bh_field_specs_from_size_descr};
+
+        let canonical = frame_debug_data_w_f_trace_descr();
+        let field = canonical
+            .as_field_descr()
+            .expect("w_f_trace is a FieldDescr");
+        let display_name = field.field_name();
+        let field_key = field.field_key();
+        let owner = if display_name == field_key {
+            ""
+        } else {
+            display_name
+                .strip_suffix(field_key)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .unwrap_or("")
+        };
+        let parent = field.get_parent_descr().and_then(|parent| {
+            parent.as_size_descr().map(|size| {
+                std::sync::Arc::new(majit_jitcode::jitcode::BhSizeSpec {
+                    size: size.size(),
+                    type_id: size.cache_key(),
+                    vtable: size.vtable() as u64,
+                    owner: owner.to_string(),
+                    is_gc_managed: size.is_gc_managed(),
+                    headerless: size.headerless(),
+                    all_fielddescrs: bh_field_specs_from_size_descr(size),
+                })
+            })
+        });
+        let descr = make_descr_from_bh(&BhDescr::Field {
+            offset: field.offset(),
+            field_size: field.field_size(),
+            field_type: field.field_type(),
+            field_flag: field.field_flag(),
+            is_field_signed: field.is_field_signed(),
+            is_immutable: field.is_immutable(),
+            is_quasi_immutable: canonical.is_quasi_immutable(),
+            index_in_parent: Some(field.index_in_parent()),
+            parent,
+            name: display_name.to_string(),
+            owner: owner.to_string(),
+            load_is_acquire: field.stored_load_is_acquire(),
+        });
+        let got = descr.as_field_descr().expect("FieldDescr");
+        assert!(
+            std::sync::Arc::ptr_eq(&descr, &canonical),
+            "flatten w_f_trace BhDescr must rebuild as the declared group Arc, got {}",
+            got.field_name(),
+        );
+    }
+
     #[test]
     fn make_descr_from_bh_bridges_execution_context_fields_to_declared_group() {
         use majit_ir::descr::ArrayFlag;
@@ -16181,31 +16281,6 @@ mod switch_descr_tests {
     }
 }
 
-/// Trace-side adapter for pyre's Rust-vtable method descriptor.
-#[derive(Debug)]
-pub struct PyreVtableMethodDescr {
-    trait_root: String,
-    method_name: String,
-}
-
-impl PyreVtableMethodDescr {
-    pub fn new(trait_root: String, method_name: String) -> Self {
-        Self {
-            trait_root,
-            method_name,
-        }
-    }
-}
-
-impl Descr for PyreVtableMethodDescr {
-    fn repr(&self) -> String {
-        format!(
-            "VtableMethodDescr({}::{})",
-            self.trait_root, self.method_name
-        )
-    }
-}
-
 /// `assembler.py Assembler.descrs` parity adapter — translate one
 /// codewriter-side `BhDescr` slot (`majit-jitcode/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
@@ -16235,9 +16310,9 @@ impl Descr for PyreVtableMethodDescr {
 ///   `make_call_descr_with_effect`, preserving RPython `call.py:320`
 ///   effectinfo_from_writeanalyze parity for descr cache keys and
 ///   residual-call classification.
-/// * `Switch` / `VableField` / `VableArray` / `VtableMethod` — trace-side
-///   adapters preserve the descriptor slot instead of substituting a
-///   fail-descr placeholder.
+/// * `Switch` / `VableField` / `VableArray` — trace-side adapters
+///   preserve the descriptor slot instead of substituting a fail-descr
+///   placeholder.
 pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
     use majit_jitcode::jitcode::BhDescr;
     match bh {
@@ -16357,9 +16432,10 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // vtable-less SizeDescr and mints
             // `T{cache_key}.FrameDebugData.w_f_trace`. Heap CSE keys on
             // descr identity, so that parallel mint keeps two reads of one
-            // field apart. One field is one descr (`descr.py
-            // get_field_descr`); bridge to the declared group before that
-            // mint, same as ExecutionContext above.
+            // field apart and records a getfield at every opcode. One field
+            // is one descr (`descr.py get_field_descr`); bridge to the
+            // declared group before that mint, same as ExecutionContext
+            // above.
             //
             // Flatten stores the display name (`FrameDebugData.w_f_trace`)
             // and the owner separately. The packed parent may spell the
@@ -17219,13 +17295,6 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
         BhDescr::VableArray { index } => {
             crate::frame_layout::pyframe_array_field_descr(*index as u16)
         }
-        BhDescr::VtableMethod {
-            trait_root,
-            method_name,
-        } => Arc::new(PyreVtableMethodDescr::new(
-            trait_root.clone(),
-            method_name.clone(),
-        )),
     }
 }
 

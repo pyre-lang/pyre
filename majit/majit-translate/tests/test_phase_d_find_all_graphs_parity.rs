@@ -146,24 +146,40 @@ fn find_all_graphs_does_not_follow_portal_recursive_edges() {
 }
 
 /// Same as `build_caller_graph` but the single call is an `indirect_call`
-/// site — a `dyn Trait` method call, before `rpbc::lower_indirect_calls`
-/// rewrites it into `VtableMethodPtr` + `OpKind::IndirectCall`.  That
-/// lowering runs inside `transform_graph_to_jitcode`, i.e. after
-/// `find_all_graphs`, so this is the shape the BFS sees.
+/// site — `{vtable}.method_*` FieldRead plus `OpKind::IndirectCall` with
+/// `family_key`. BFS expands that key through `all_impls_for_indirect`.
 fn build_indirect_caller_graph(name: &str, trait_root: &str, method_name: &str) -> FunctionGraph {
-    use majit_translate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+    use majit_translate::model::{FieldDescriptor, OpKind, SpaceOperation, ValueType};
 
     let mut graph = FunctionGraph::new(name);
     let receiver = graph.alloc_value_var();
+    let funcptr = graph.alloc_value_var();
     let result_var = graph.alloc_value_var();
     graph
         .block_mut(graph.startblock)
         .operations
         .push(SpaceOperation {
+            result: Some(funcptr.clone()),
+            kind: OpKind::FieldRead {
+                base: receiver.clone(),
+                field: FieldDescriptor::new(
+                    format!("method_{method_name}"),
+                    Some(format!("{trait_root}::{{vtable}}")),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+    graph
+        .block_mut(graph.startblock)
+        .operations
+        .push(SpaceOperation {
             result: Some(result_var.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::indirect(trait_root, method_name),
-                args: majit_translate::model::call_args(vec![receiver]),
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args: vec![receiver],
+                graphs: None,
+                family_key: Some((trait_root.to_string(), method_name.to_string())),
                 result_ty: ValueType::Int,
             },
         });
