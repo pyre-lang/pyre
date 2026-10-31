@@ -1396,10 +1396,11 @@ pub fn function_call_args(func: PyObjectRef, args: &crate::argument::Arguments) 
     )
 }
 
-/// Call a user function with pre-resolved args (scope already packed by
-/// resolve_kwargs). Skips defaults-fill and pack_varargs — the caller
-/// (call_kw) already produced the final scope via resolve_kwargs which
-/// mirrors PyPy's Arguments.parse_into_scope.
+/// Call a user function whose scope is already bound.
+///
+/// `pycode.py PyCode.funcrun` binds with `argument.py Arguments.parse_into_scope`
+/// and then runs the frame. `resolve_kwargs` fills the same scope shape for
+/// every other target. Skips defaults-fill and pack_varargs.
 pub fn call_user_function_resolved(
     execution_context: *const crate::PyExecutionContext,
     mut callable: PyObjectRef,
@@ -2106,14 +2107,13 @@ fn call_kw_in_ctx_impl(
         );
     }
 
-    // Resolve keyword args into positional order.
-    // argument.py Arguments._match_signature step: match keywords to
-    // argnames, fill defaults, pack *args/**kwargs. PyPy's
-    // `space.call_args` performs this exactly once; pyre mirrors that
-    // by calling resolve_kwargs here and then dispatching directly to
-    // call_user_function_resolved — which skips the defaults_fill /
-    // pack_varargs replay that call_user_function_with_args performs
-    // for positional-only paths.
+    // Keyword binding runs once, in `function.py Function.call_args`.
+    // A plain user function takes `pycode.py PyCode.funcrun`:
+    // `argument.py Arguments.parse_into_scope`, then the callee.
+    // Every other target keeps `resolve_kwargs`. Either binder fills
+    // the scope `call_user_function_resolved` runs, so that entry skips
+    // the defaults-fill / pack_varargs replay
+    // `call_user_function_with_args` performs for positional-only paths.
     let is_builtin = unsafe { crate::is_function(callable_unwrapped) }
         && unsafe {
             crate::is_builtin_code(crate::getcode(callable_unwrapped) as pyre_object::PyObjectRef)
@@ -2198,11 +2198,10 @@ fn call_kw_in_ctx_impl(
         }
     }
 
-    // pypy/interpreter/function.py Method.call_args parity: unwrap
-    // bound method by prepending the receiver, then run resolve_kwargs
-    // against the underlying function. This matches
-    // `self.space.call_args(w_function, args)` after the MRO-dispatched
-    // `im_func` has been extracted.
+    // `function.py Method.call_args` prepends the receiver
+    // (`argument.py Arguments.prepend`) and then calls `Function.call_args`.
+    // `Arguments.replace_arguments` leaves `methodcall` false; the flag
+    // above is only the `callmethod.py CALL_METHOD_KW` self slot.
     let (target_func, mut prepended) = if unsafe { pyre_object::is_method(callable_unwrapped) } {
         let func = unsafe { pyre_object::w_method_get_func(callable_unwrapped) };
         let receiver = unsafe {
@@ -2225,6 +2224,28 @@ fn call_kw_in_ctx_impl(
         (callable_unwrapped, None)
     };
     let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
+    // The caller frame stays anchored across binding and the callee. A user
+    // function does not receive it: `Function.call_args` is the entry, and
+    // `call_user_function_resolved` keeps that shape. The non-user arm reads
+    // it back with `FrameAnchor::live` for `call_callable_with_mode`.
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
+    // `crate::is_function` is also true for a builtin function and a method
+    // descriptor. Those stay on `resolve_kwargs` (the builtin arm above
+    // already returned). `get_pycode` is the same user-code gate
+    // `call_user_function_resolved` uses.
+    let plain_user = unsafe {
+        crate::is_function(target_func)
+            && !crate::is_builtin_code(crate::getcode(target_func) as pyre_object::PyObjectRef)
+    };
+    if plain_user {
+        return call_user_function_from_call_kw(
+            execution_context,
+            target_func,
+            call_args,
+            kwarg_names,
+            methodcall,
+        );
+    }
     // `resolve_kwargs` reaches `store_collected_keyword`, whose `__hash__`
     // can collect. The kwnames tuple and the target are read again on the
     // binding-error path, and `call_callable_with_mode` still needs the
@@ -2232,7 +2253,6 @@ fn call_kw_in_ctx_impl(
     // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
     // keeping the raw pointer live across the call.
     let n_args = call_args.len();
-    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     let roots = pyre_object::gc_roots::push_roots();
     let func_slot = roots.publish(&[target_func, kwarg_names]);
     let args_base = roots.publish(call_args);
@@ -2272,6 +2292,210 @@ fn call_kw_in_ctx_impl(
             frame_anchor.live(),
         )
     }
+}
+
+/// `function.py Function.call_args` → `pycode.py PyCode.funcrun` →
+/// `argument.py Arguments.parse_into_scope`.
+///
+/// The receiver is already the first positional (`function.py Method.call_args`
+/// → `argument.py Arguments.prepend`). `methodcall` is the
+/// `callmethod.py CALL_METHOD_KW` flag `Arguments` stores. `w_firstarg` is
+/// null: `PyCode.funcrun` passes `None`.
+///
+/// The bound scope has the `Arguments.parse_into_scope` layout
+/// (`co_argcount + kwonly + *args + **kwargs`, defaults filled) and is what
+/// `call_user_function_resolved` copies into the new frame.
+fn call_user_function_from_call_kw(
+    execution_context: *const crate::PyExecutionContext,
+    target_func: PyObjectRef,
+    call_args: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+    methodcall: bool,
+) -> PyResult {
+    let n_args = call_args.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let func_slot = roots.publish(&[target_func, kwarg_names]);
+    let args_base = roots.publish(call_args);
+    roots.normalize(func_slot, 2 + n_args);
+
+    let nkw = {
+        let names = roots.get(func_slot + 1);
+        if unsafe { pyre_object::is_tuple(names) } {
+            unsafe { pyre_object::w_tuple_len(names) }
+        } else {
+            0
+        }
+    };
+    let n_pos = n_args.saturating_sub(nkw);
+
+    // `w_tuple_getitem` can rebox a keyword name. Pin each name with its
+    // value before the next getitem. A missing tuple item is skipped on both
+    // lists so they stay parallel. `nkw == 0` passes `keyword_names_w=None`
+    // (`Arguments` with no keywords), including an empty kwnames tuple.
+    let mut n_kept = 0usize;
+    let mut names_base = 0usize;
+    let mut values_base = 0usize;
+    if nkw > 0 {
+        names_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut kept_ki = Vec::with_capacity(nkw);
+        for ki in 0..nkw {
+            if n_pos.saturating_add(ki) >= n_args {
+                continue;
+            }
+            let names_obj = roots.get(func_slot + 1);
+            let Some(name_obj) = (unsafe { pyre_object::w_tuple_getitem(names_obj, ki as i64) })
+            else {
+                continue;
+            };
+            let _ = roots.pin_root(name_obj);
+            kept_ki.push(ki);
+        }
+        n_kept = kept_ki.len();
+        values_base = pyre_object::gc_roots::shadow_stack_len();
+        for ki in kept_ki {
+            let _ = roots.pin_root(roots.get(args_base + n_pos + ki));
+        }
+    }
+
+    // `function.py fget_func_qualname` allocates when `w_qualname` is null.
+    // `PyCode.funcrun` passes `func.qualname` into `parse_into_scope`.
+    let fnname = unsafe { crate::function_get_qualname(roots.get(func_slot)) };
+
+    let mut ndef = 0usize;
+    let mut defaults_base = 0usize;
+    {
+        let defaults_obj = unsafe { crate::function_get_defaults(roots.get(func_slot)) };
+        if !defaults_obj.is_null() && unsafe { pyre_object::is_tuple(defaults_obj) } {
+            ndef = unsafe { pyre_object::w_tuple_len(defaults_obj) };
+        }
+    }
+    if ndef > 0 {
+        defaults_base = pyre_object::gc_roots::shadow_stack_len();
+        for index in 0..ndef {
+            let defaults_obj = unsafe { crate::function_get_defaults(roots.get(func_slot)) };
+            let item = unsafe { pyre_object::w_tuple_getitem(defaults_obj, index as i64) }
+                .unwrap_or(pyre_object::PY_NULL);
+            let _ = roots.pin_root(item);
+        }
+    }
+
+    let signature = {
+        let func_now = roots.get(func_slot);
+        let code_ptr = unsafe { crate::get_pycode(func_now) };
+        let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        user_function_signature(code)
+    };
+    let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
+
+    // `Arguments::full` copies, then `_combine_wrapped` can safepoint.
+    // `match_signature` copies positionals into `scope_w` before its own
+    // `push_roots`, so the fields it reads are reloaded from this bracket
+    // after that safepoint and after the qualname / defaults allocations.
+    let pos = read_root_run(&roots, args_base, n_pos);
+    let names = if nkw == 0 {
+        None
+    } else {
+        Some(read_root_run(&roots, names_base, n_kept))
+    };
+    let values = if nkw == 0 {
+        None
+    } else {
+        Some(read_root_run(&roots, values_base, n_kept))
+    };
+    let mut arguments =
+        crate::argument::Arguments::full(&pos, names.as_deref(), values.as_deref(), methodcall);
+    arguments.arguments_w = read_root_run(&roots, args_base, n_pos);
+    if nkw == 0 {
+        arguments.keyword_names_w = None;
+        arguments.keywords_w = None;
+    } else {
+        arguments.keyword_names_w = Some(read_root_run(&roots, names_base, n_kept));
+        arguments.keywords_w = Some(read_root_run(&roots, values_base, n_kept));
+    }
+    let defaults_now = if ndef == 0 {
+        Vec::new()
+    } else {
+        read_root_run(&roots, defaults_base, ndef)
+    };
+    let defaults_arg = if ndef == 0 {
+        None
+    } else {
+        Some(defaults_now.as_slice())
+    };
+    let w_kw_defs = {
+        let kw = unsafe { crate::function_get_kwdefaults(roots.get(func_slot)) };
+        if kw.is_null() || unsafe { pyre_object::is_none(kw) } {
+            pyre_object::PY_NULL
+        } else {
+            kw
+        }
+    };
+    arguments.parse_into_scope(
+        pyre_object::PY_NULL,
+        &mut scope_w,
+        &fnname,
+        &signature,
+        defaults_arg,
+        w_kw_defs,
+    )?;
+    let func_now = roots.get(func_slot);
+    call_user_function_resolved(execution_context, func_now, &scope_w)
+}
+
+fn read_root_run(
+    roots: &pyre_object::gc_roots::RootScope,
+    base: usize,
+    len: usize,
+) -> Vec<PyObjectRef> {
+    let mut out = Vec::with_capacity(len);
+    for index in 0..len {
+        out.push(roots.get(base + index));
+    }
+    out
+}
+
+/// `pycode.py make_signature`.
+///
+/// `gateway::Signature` stores `&'static str` for literal builtin names.
+/// `co_varnames` lives in the code body. `PyCode.funcrun` only needs those
+/// names for `Arguments.parse_into_scope`. The function is rooted for that
+/// call, and `pycode.rs release_code_object_body` clears `co_varnames` only
+/// after the last wrapper is gone. `parse_into_scope` turns an `ArgErr`
+/// (which clones the `Signature`) into a string before returning, so the
+/// borrowed names do not escape this call.
+fn user_function_signature(code: &crate::CodeObject) -> crate::gateway::Signature {
+    let kwonlyargcount = code.kwonlyarg_count as usize;
+    let mut argcount = code.arg_count as usize + kwonlyargcount;
+    let posonlyargcount = code.posonlyarg_count as usize;
+    let mut argnames = Vec::with_capacity(argcount);
+    for index in 0..argcount {
+        argnames.push(code_varname(code.varnames[index].as_str()));
+    }
+    let varargname = if code.flags.contains(crate::CodeFlags::VARARGS) {
+        let name = code_varname(code.varnames[argcount].as_str());
+        argcount += 1;
+        Some(name)
+    } else {
+        None
+    };
+    let kwargname = if code.flags.contains(crate::CodeFlags::VARKEYWORDS) {
+        Some(code_varname(code.varnames[argcount].as_str()))
+    } else {
+        None
+    };
+    crate::gateway::Signature::new(
+        argnames,
+        varargname,
+        kwargname,
+        kwonlyargcount,
+        posonlyargcount,
+    )
+}
+
+fn code_varname(name: &str) -> &'static str {
+    // SAFETY: `name` points into `co_varnames` for the `parse_into_scope` call.
+    // See `user_function_signature`.
+    unsafe { &*(name as *const str) }
 }
 
 /// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
@@ -6499,6 +6723,160 @@ except TypeError as e:
         assert_eq!(
             r_starstar_extra,
             "f() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
+    }
+}
+
+/// CALL_KW on a plain user function binds through
+/// `argument.py Arguments.parse_into_scope` (`pycode.py PyCode.funcrun`).
+#[cfg(test)]
+mod call_kw_parse_into_scope_tests {
+    fn run_snippet(source: &str) -> pyre_object::PyObjectRef {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("call_kw parse_into_scope snippet");
+        frame.get_w_globals()
+    }
+
+    fn get_str(w_globals: pyre_object::PyObjectRef, name: &str) -> String {
+        let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+        unsafe { pyre_object::w_str_get_wtf8(value) }
+            .as_str()
+            .expect(name)
+            .to_string()
+    }
+
+    fn expect_int(w_globals: pyre_object::PyObjectRef, name: &str, expected: i64) {
+        let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+        let got = unsafe { pyre_object::w_int_get_value(value) };
+        assert_eq!(got, expected, "{name}");
+    }
+
+    fn expect_ints(w_globals: pyre_object::PyObjectRef, name: &str, expected: &[i64]) {
+        let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+        unsafe {
+            assert!(pyre_object::is_tuple(value), "{name}");
+            assert_eq!(pyre_object::w_tuple_len(value), expected.len(), "{name}");
+            for (index, want) in expected.iter().enumerate() {
+                let item = pyre_object::w_tuple_getitem(value, index as i64).expect(name);
+                assert_eq!(pyre_object::w_int_get_value(item), *want, "{name}[{index}]");
+            }
+        }
+    }
+
+    #[test]
+    fn call_kw_user_function_binds_keywords_and_reports_signature_errors() {
+        let source = "\
+def f_kwonly(a, *, k):
+    return (a, k)
+r_kwonly = f_kwonly(1, k=2)
+
+def f_kwdef(*, k=3):
+    return k
+r_kwdef = f_kwdef()
+r_kwover = f_kwdef(k=4)
+
+def f_varkw(a, **kw):
+    return (a, kw['b'], tuple(sorted(kw)))
+r_varkw_head = f_varkw(1, c=3, b=2)
+
+def f_dup(a):
+    return a
+try:
+    f_dup(1, a=2)
+except TypeError as e:
+    r_dup = str(e)
+
+def f_unexpected(a):
+    return a
+try:
+    f_unexpected(a=1, b=2)
+except TypeError as e:
+    r_unexpected = str(e)
+
+def f_missing(a):
+    return a
+try:
+    f_missing()
+except TypeError as e:
+    r_missing = str(e)
+
+def f_missing_kw(*, k):
+    return k
+try:
+    f_missing_kw()
+except TypeError as e:
+    r_missing_kw = str(e)
+
+class A:
+    def m(self, a, *, k):
+        return (self.n, a, k)
+obj = A()
+obj.n = 7
+bm = obj.m
+r_bound = bm(1, k=2)
+r_method = obj.m(1, k=2)
+try:
+    bm(k=2)
+except TypeError as e:
+    r_bound_missing = str(e)
+";
+        let w_globals = run_snippet(source);
+        expect_ints(w_globals, "r_kwonly", &[1, 2]);
+        expect_int(w_globals, "r_kwdef", 3);
+        expect_int(w_globals, "r_kwover", 4);
+        let varkw = unsafe { pyre_object::w_dict_getitem_str(w_globals, "r_varkw_head") }
+            .expect("r_varkw_head");
+        unsafe {
+            assert!(pyre_object::is_tuple(varkw));
+            assert_eq!(pyre_object::w_tuple_len(varkw), 3);
+            assert_eq!(
+                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(varkw, 0).unwrap()),
+                1
+            );
+            assert_eq!(
+                pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(varkw, 1).unwrap()),
+                2
+            );
+            let keys = pyre_object::w_tuple_getitem(varkw, 2).unwrap();
+            assert_eq!(pyre_object::w_tuple_len(keys), 2);
+            assert_eq!(
+                pyre_object::w_str_get_wtf8(pyre_object::w_tuple_getitem(keys, 0).unwrap())
+                    .as_str()
+                    .unwrap(),
+                "b"
+            );
+            assert_eq!(
+                pyre_object::w_str_get_wtf8(pyre_object::w_tuple_getitem(keys, 1).unwrap())
+                    .as_str()
+                    .unwrap(),
+                "c"
+            );
+        }
+        assert_eq!(
+            get_str(w_globals, "r_dup"),
+            "f_dup() got multiple values for argument 'a'"
+        );
+        assert_eq!(
+            get_str(w_globals, "r_unexpected"),
+            "f_unexpected() got an unexpected keyword argument 'b'"
+        );
+        assert_eq!(
+            get_str(w_globals, "r_missing"),
+            "f_missing() missing 1 required positional argument: 'a'"
+        );
+        assert_eq!(
+            get_str(w_globals, "r_missing_kw"),
+            "f_missing_kw() missing 1 required keyword-only argument: 'k'"
+        );
+        expect_ints(w_globals, "r_bound", &[7, 1, 2]);
+        expect_ints(w_globals, "r_method", &[7, 1, 2]);
+        assert_eq!(
+            get_str(w_globals, "r_bound_missing"),
+            "A.m() missing 1 required positional argument: 'a'"
         );
     }
 }
