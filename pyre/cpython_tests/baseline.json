@@ -443,8 +443,7 @@
       "dynasm": "PASS"
     },
     "test.test_exceptions": {
-      "dynasm": "FAIL",
-      "reason": "3.15 SyntaxError text and offsets from the external RustPython parser: mapping-pattern **rest not last (offsets 18/36 vs 11/29) and test_encodings' unparenthesized generator argument reported as invalid syntax"
+      "dynasm": "PASS"
     },
     "test.test_extcall": {
       "dynasm": "FAIL"
@@ -1093,9 +1092,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ssl": {
-      "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "test_server_side_bad_params (gh-156793): SSLObject.session is None on the rustls-backed _ssl"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_stable_abi_ctypes": {
       "dynasm": "SKIP",
@@ -1154,8 +1152,7 @@
       "dynasm": "FAIL"
     },
     "test.test_symtable": {
-      "dynasm": "FAIL",
-      "reason": "3.15 <genexpr> scope naming (test_class_get_methods and others); symbol table names come from the external RustPython symboltable"
+      "dynasm": "PASS"
     },
     "test.test_syntax": {
       "dynasm": "FAIL"

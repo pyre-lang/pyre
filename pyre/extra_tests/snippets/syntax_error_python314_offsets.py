@@ -97,9 +97,10 @@ assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (2, 3
     error.end_offset,
 )
 
+# An unparenthesized generator argument keeps the parser's message and its whole range.
 error = syntax_error('"┬ó┬ó┬ó┬ó┬ó┬ó" + f(4, x for x in range(1))')
-assert error.msg == "invalid syntax", error.msg
-assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 25, 1, 28), (
+assert error.msg == "Generator expression must be parenthesized", error.msg
+assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == (1, 23, 1, 42), (
     error.lineno,
     error.offset,
     error.end_lineno,

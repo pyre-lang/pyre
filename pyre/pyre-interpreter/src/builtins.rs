@@ -16011,52 +16011,6 @@ fn global_nonlocal_conflict_span(
     Some((format!("name '{name}' is nonlocal and global"), start, end))
 }
 
-/// `python.gram:invalid_expression` wins over `invalid_arguments` when an
-/// unparenthesized generator call is the right operand of a binary expression.
-/// CPython 3.14 selects the `for` token in that form rather than the complete
-/// generator range selected by Ruff.
-fn binary_call_generator_error_span(source: &str) -> Option<(usize, usize)> {
-    let bytes = source.as_bytes();
-    'for_index: for for_index in 0..bytes.len().saturating_sub(2) {
-        if &bytes[for_index..for_index + 3] != b"for"
-            || bytes
-                .get(for_index.wrapping_sub(1))
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            || bytes
-                .get(for_index + 3)
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        {
-            continue;
-        }
-        let Some(open) = bytes[..for_index].iter().rposition(|byte| *byte == b'(') else {
-            continue;
-        };
-        let mut cursor = open;
-        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
-            cursor -= 1;
-        }
-        let name_end = cursor;
-        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
-        {
-            cursor -= 1;
-        }
-        if cursor == name_end {
-            continue;
-        }
-        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
-            cursor -= 1;
-        }
-        if !matches!(
-            bytes.get(cursor.wrapping_sub(1)),
-            Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'|' | b'&' | b'^')
-        ) {
-            continue 'for_index;
-        }
-        return Some((for_index, for_index + 3));
-    }
-    None
-}
-
 /// `python-in-rpython.gram` `invalid_arguments` / `invalid_kwarg` select the
 /// keyword name through its `=` when a bare comprehension follows a keyword
 /// value: `f(name = value for value in iterable)`. Ruff rejects the same input
@@ -18529,20 +18483,9 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         msg = replacement.clone();
     }
     let scope_span = scope_conflict.map(|(_, start, end)| (start, end));
-    let generator_span = match &e {
-        crate::compile::CompileError::Parse(parse_error)
-            if matches!(
-                &parse_error.error,
-                ParseErrorType::UnparenthesizedGeneratorExpression
-            ) =>
-        {
-            binary_call_generator_error_span(source)
-        }
-        _ => None,
-    };
-    if generator_span.is_some() {
-        msg = "invalid syntax".to_owned();
-    }
+    // rpypegparse.py invalid_arguments selects the expression through the
+    // last comprehension item, including in a binary operand. The compiler
+    // parser already supplies that range; keep its message and locations.
     // An unparenthesized `yield` where the grammar has no expression
     // alternative for it (`return yield 42`) matches no rule, so the parser's
     // generic error names the `yield` token itself.
@@ -18677,7 +18620,6 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         .or(scope_span)
         .or(lambda_span)
         .or(late_dollar_span)
-        .or(generator_span)
         .or(yield_span)
         .or(delimiter_span);
     let eof_token = match &e {
@@ -30162,23 +30104,41 @@ mod tests {
     }
 
     #[test]
-    fn binary_call_generator_error_selects_for_token() {
-        let source = "\"┬ó┬ó┬ó┬ó┬ó┬ó\" + f(4, x for x in range(1))\n";
-        let error = crate::compile::compile_source(source, crate::compile::Mode::Exec).unwrap_err();
-        assert!(matches!(
-            error,
-            crate::compile::CompileError::Parse(ref parse_error)
-                if matches!(
-                    &parse_error.error,
-                    rustpython_compiler::parser::ParseErrorType::UnparenthesizedGeneratorExpression
-                )
-        ));
-        let start = source.find("for").unwrap();
-        assert_eq!(
-            binary_call_generator_error_span(source),
-            Some((start, start + 3))
-        );
-        assert_eq!(binary_call_generator_error_span("f(4, x for x in y)"), None);
+    fn generator_error_keeps_parser_range() {
+        crate::typedef::init_typeobjects();
+        let _ = new_builtin_module_dict();
+        for source in [
+            "\"┬ó┬ó┬ó┬ó┬ó┬ó\" + f(4, x for x in range(1))\n",
+            "# coding: cp437\n\"┬ó┬ó┬ó┬ó┬ó┬ó\" + f(4, x for x in range(1))\n",
+        ] {
+            let mode = crate::compile::Mode::Exec;
+            let error = crate::compile::compile_source(source, mode).unwrap_err();
+            let mut error = compile_err_to_syntax_error(error, source, mode);
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = roots.pin_roots(&[error.to_exc_object()]);
+            let exc = roots.get(slot);
+            unsafe {
+                assert_eq!(
+                    pyre_object::w_str_get_wtf8(
+                        pyre_object::interp_exceptions::w_exception_get_syntax_msg(exc)
+                    )
+                    .as_bytes(),
+                    b"Generator expression must be parenthesized",
+                );
+                assert_eq!(
+                    pyre_object::w_int_get_value(
+                        pyre_object::interp_exceptions::w_exception_get_syntax_offset(exc)
+                    ),
+                    23,
+                );
+                assert_eq!(
+                    pyre_object::w_int_get_value(
+                        pyre_object::interp_exceptions::w_exception_get_syntax_end_offset(exc)
+                    ),
+                    42,
+                );
+            }
+        }
     }
 
     #[test]

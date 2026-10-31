@@ -128,7 +128,16 @@ fn table_data(table: &SymbolTable) -> PyObjectRef {
     let children_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     append_public_children(table, children_slot);
 
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&table.name));
+    // symtable.py SymbolVisitor.visit_Lambda / _visit_comprehension name
+    // anonymous scopes with angle brackets. RustPython keeps the compiler's
+    // internal spelling here; expose the same public name as its _symtable
+    // PySymbolTable.name adapter, without renaming ordinary user functions.
+    let name = match table.typ {
+        CompilerScope::Lambda => "<lambda>",
+        CompilerScope::Comprehension if table.name.as_str() == "genexpr" => "<genexpr>",
+        _ => table.name.as_str(),
+    };
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(name));
     let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(table_type(table) as i64));
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

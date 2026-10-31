@@ -25,6 +25,7 @@ use sha1::{Digest, Sha1};
 use x509_parser::prelude::FromDer;
 
 use rustpython_host_env::ssl as host_ssl;
+use rustpython_host_env::ssl::session::{ClientSessionKind, SESSION_CACHE_SIZE};
 #[cfg(feature = "host_env")]
 use rustpython_host_env::ssl::{cipher, keylog, msg, providers::CryptoExt};
 
@@ -121,6 +122,7 @@ pub struct Context {
     /// reused by the allocator, so an `SSLSession` must not be matched to its
     /// originating context by pointer value.
     identity: usize,
+    policy_identity: parking_lot::RwLock<Arc<()>>,
     protocol: i32,
     check_hostname: bool,
     verify_mode: i32,
@@ -269,6 +271,13 @@ fn crl_scope(verify_flags: i32) -> CrlScope {
 }
 
 impl Context {
+    // RustPython PySSLContext.invalidate_policy: an old session's saved
+    // ClientConfig must never override a later context policy. There is no
+    // server-config cache to clear here; configs are built per connection.
+    fn invalidate_policy(&self) {
+        *self.policy_identity.write() = Arc::new(());
+    }
+
     fn new(protocol: i32) -> Result<Self, &'static str> {
         ensure_provider();
         if !matches!(
@@ -286,6 +295,7 @@ impl Context {
             .map_err(|_| "failed to initialize TLS session ticket encryption")?;
         Ok(Self {
             identity: NEXT_CONTEXT_IDENTITY.fetch_add(1, Ordering::Relaxed),
+            policy_identity: parking_lot::RwLock::new(Arc::new(())),
             protocol,
             check_hostname: client,
             verify_mode: if client { CERT_REQUIRED } else { CERT_NONE },
@@ -394,6 +404,7 @@ macro_rules! context_scalar {
         #[inline(never)]
         pub unsafe fn $set(context: *mut Context, value: $ty) {
             unsafe { (*context).$field = value };
+            unsafe { (&*context).invalidate_policy() };
         }
     };
 }
@@ -444,6 +455,7 @@ pub fn parse_length_prefixed_alpn(data: &[u8]) -> Result<Vec<Vec<u8>>, &'static 
 #[inline(never)]
 pub unsafe fn context_set_alpn(context: *mut Context, protocols: Vec<Vec<u8>>) {
     unsafe { (*context).alpn_protocols = protocols };
+    unsafe { (&*context).invalidate_policy() };
 }
 
 /// Add DER trust anchors, returning `(accepted, rejected)`.
@@ -507,6 +519,7 @@ impl Context {
             .add(CertificateDer::from(der.clone()))
             .map_err(pem_error)?;
         self.root_der.push(der);
+        self.invalidate_policy();
         Ok(true)
     }
 }
@@ -660,6 +673,7 @@ pub unsafe fn context_load_cert_chain(
     } else {
         context.certified_keys.push(certified);
     }
+    context.invalidate_policy();
     Ok(true)
 }
 
@@ -713,6 +727,7 @@ pub unsafe fn context_load_verify_file(
             .any(|known| known.as_ref() == crl.as_ref())
         {
             context.crls.push(crl);
+            context.invalidate_policy();
         }
     }
     Ok(added)
@@ -730,6 +745,7 @@ pub unsafe fn context_add_verify_dir(context: *mut Context, path: &std::path::Pa
     if !context.capaths.iter().any(|known| known == &path) {
         context.capaths.push(path);
         *context.capath_cache.lock() = None;
+        context.invalidate_policy();
     }
 }
 
@@ -1758,6 +1774,7 @@ pub unsafe fn context_set_cipher_list(
     pattern: &str,
 ) -> Result<(), &'static str> {
     unsafe { (*context).cipher_suites = Some(parse_cipher_string(pattern)?) };
+    unsafe { (&*context).invalidate_policy() };
     Ok(())
 }
 
@@ -1777,6 +1794,7 @@ pub unsafe fn context_set_ecdh_curve(
     let _ = cipher::kx_group_by_openssl_name(curve).ok_or("unknown elliptic curve")?;
     let group = kx_group_from_openssl_list_name(curve).ok_or("unknown elliptic curve name")?;
     unsafe { (*context).kx_groups = Some(vec![group]) };
+    unsafe { (&*context).invalidate_policy() };
     Ok(())
 }
 
@@ -1819,6 +1837,7 @@ pub unsafe fn context_set_ciphersuites(
     pattern: &str,
 ) -> Result<(), &'static str> {
     unsafe { (*context).tls13_cipher_suites = Some(parse_ciphersuites(pattern)?) };
+    unsafe { (&*context).invalidate_policy() };
     Ok(())
 }
 
@@ -1883,6 +1902,7 @@ fn parse_groups(
 #[inline(never)]
 pub unsafe fn context_set_groups(context: *mut Context, list: &str) -> Result<(), &'static str> {
     unsafe { (*context).kx_groups = parse_groups(list)? };
+    unsafe { (&*context).invalidate_policy() };
     Ok(())
 }
 
@@ -1937,6 +1957,7 @@ pub unsafe fn context_set_server_sigalgs(
     list: &str,
 ) -> Result<(), &'static str> {
     unsafe { (*context).server_sigalgs = Some(parse_sigalgs(list)?) };
+    unsafe { (&*context).invalidate_policy() };
     Ok(())
 }
 
@@ -1950,6 +1971,7 @@ pub unsafe fn context_set_client_sigalgs(
     list: &str,
 ) -> Result<(), &'static str> {
     unsafe { (*context).client_sigalgs = Some(parse_sigalgs(list)?) };
+    unsafe { (&*context).invalidate_policy() };
     Ok(())
 }
 
@@ -2617,32 +2639,49 @@ impl rustls::client::ResolvesClientCert for MultiCertResolver {
 #[derive(Debug)]
 struct CapturingClientSessionStore {
     inner: rustls::client::ClientSessionMemoryCache,
-    latest_tls12: Mutex<
-        Option<(
-            rustls::pki_types::ServerName<'static>,
-            rustls::client::Tls12ClientSessionValue,
-        )>,
-    >,
     public_id: Mutex<Option<Vec<u8>>>,
     creation_time: Mutex<Option<u64>>,
+    server_name: rustls::pki_types::ServerName<'static>,
 }
 
 impl CapturingClientSessionStore {
-    fn new() -> Self {
+    fn new(server_name: rustls::pki_types::ServerName<'static>) -> Self {
         Self {
-            inner: rustls::client::ClientSessionMemoryCache::new(8),
-            latest_tls12: Mutex::new(None),
+            // RustPython CapturingClientSessionStore.new uses this size.
+            // rustls 0.23's LimitedCache.get_or_insert_default_and_edit
+            // reserves an insertion slot: new(8) rounds down to one server
+            // and immediately evicts its sole entry, including its tickets.
+            inner: rustls::client::ClientSessionMemoryCache::new(SESSION_CACHE_SIZE),
             public_id: Mutex::new(None),
             creation_time: Mutex::new(None),
+            server_name,
         }
     }
 
-    fn seed(&self, session: &NativeSession) {
-        self.inner
-            .set_tls12_session(session.server_name.clone(), session.value.clone());
-        *self.latest_tls12.lock() = Some((session.server_name.clone(), session.value.clone()));
-        *self.public_id.lock() = Some(session.id.clone());
-        *self.creation_time.lock() = Some(session.creation_time);
+    // RustPython host_env ssl/session.rs CapturingClientSessionStore.transfer_session:
+    // TLS 1.2 values can be cloned, but a TLS 1.3 ticket must be taken from
+    // the real backend cache and moved, never duplicated into another cache.
+    fn transfer_session(
+        &self,
+        target: &Self,
+        server_name: &rustls::pki_types::ServerName<'static>,
+        kind: ClientSessionKind,
+    ) {
+        if let Some(group) = self.kx_hint(server_name) {
+            target.set_kx_hint(server_name.clone(), group);
+        }
+        match kind {
+            ClientSessionKind::Tls12 => {
+                if let Some(value) = self.tls12_session(server_name) {
+                    target.set_tls12_session(server_name.clone(), value);
+                }
+            }
+            ClientSessionKind::Tls13 => {
+                if let Some(ticket) = self.take_tls13_ticket(server_name) {
+                    target.insert_tls13_ticket(server_name.clone(), ticket);
+                }
+            }
+        }
     }
 
     fn ensure_metadata(&self) {
@@ -2668,22 +2707,52 @@ impl CapturingClientSessionStore {
     }
 
     fn snapshot(
-        &self,
+        self: &Arc<Self>,
         context_identity: usize,
+        policy_identity: Arc<()>,
         config: Arc<rustls::ClientConfig>,
         verified_chain_builder: Arc<VerifiedChainBuilder>,
+        kind: ClientSessionKind,
     ) -> Option<NativeSession> {
-        let (server_name, value) = self.latest_tls12.lock().clone()?;
-        self.ensure_metadata();
+        if kind == ClientSessionKind::Tls12 {
+            self.tls12_session(&self.server_name)?;
+            self.ensure_metadata();
+        }
+        // PyPy _stdssl.SSLSession.__new__ returns SSL_get1_session even for
+        // TLS 1.3 before NewSessionTicket. RustPython's
+        // create_session_after_handshake likewise owns the config and store
+        // independently of whether a resumption value has arrived yet.
+        // No-ticket snapshots have an empty id and no ticket lifetime hint.
+        let id = match kind {
+            ClientSessionKind::Tls12 => self.public_id.lock().clone()?,
+            ClientSessionKind::Tls13 => self.public_id.lock().clone().unwrap_or_default(),
+        };
+        let creation_time = *self.creation_time.lock().get_or_insert_with(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
         Some(NativeSession {
             context_identity,
+            policy_identity,
             config,
             verified_chain_builder,
-            server_name,
-            value,
-            id: self.public_id.lock().clone()?,
-            creation_time: self.creation_time.lock().unwrap_or(0),
-            timeout: 43_200,
+            server_name: self.server_name.clone(),
+            session_store: self.clone(),
+            kind,
+            has_ticket: !id.is_empty(),
+            id,
+            creation_time,
+            // rustls does not publish ticket bytes/epoch/lifetime. Keep the
+            // existing TLS 1.2 metadata convention and use RustPython's
+            // SessionData lifetime for TLS 1.3. These are public metadata,
+            // never substitute cryptographic resumption values.
+            timeout: if kind == ClientSessionKind::Tls12 {
+                43_200
+            } else {
+                7200
+            },
         })
     }
 }
@@ -2709,9 +2778,7 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
         server_name: rustls::pki_types::ServerName<'static>,
         value: rustls::client::Tls12ClientSessionValue,
     ) {
-        self.inner
-            .set_tls12_session(server_name.clone(), value.clone());
-        *self.latest_tls12.lock() = Some((server_name, value));
+        self.inner.set_tls12_session(server_name, value);
         self.ensure_metadata();
     }
 
@@ -2719,26 +2786,11 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
         &self,
         server_name: &rustls::pki_types::ServerName<'_>,
     ) -> Option<rustls::client::Tls12ClientSessionValue> {
-        // Keep the one TLS 1.2 value directly on this per-connection store,
-        // matching ClientSessionStore's documented cardinality.  The inner
-        // cache remains responsible for KX hints and TLS 1.3 ticket queues.
-
-        self.latest_tls12
-            .lock()
-            .as_ref()
-            .filter(|(known_name, _)| known_name == server_name)
-            .map(|(_, value)| value.clone())
+        self.inner.tls12_session(server_name)
     }
 
     fn remove_tls12_session(&self, server_name: &rustls::pki_types::ServerName<'static>) {
         self.inner.remove_tls12_session(server_name);
-        let mut latest = self.latest_tls12.lock();
-        if latest
-            .as_ref()
-            .is_some_and(|(known_name, _)| known_name == server_name)
-        {
-            *latest = None;
-        }
     }
 
     fn insert_tls13_ticket(
@@ -2747,6 +2799,7 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
         value: rustls::client::Tls13ClientSessionValue,
     ) {
         self.inner.insert_tls13_ticket(server_name, value);
+        self.ensure_metadata();
     }
 
     fn take_tls13_ticket(
@@ -2757,12 +2810,16 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
     }
 }
 
+#[derive(Clone)]
 pub struct NativeSession {
     context_identity: usize,
+    policy_identity: Arc<()>,
     config: Arc<rustls::ClientConfig>,
     verified_chain_builder: Arc<VerifiedChainBuilder>,
     server_name: rustls::pki_types::ServerName<'static>,
-    value: rustls::client::Tls12ClientSessionValue,
+    session_store: Arc<CapturingClientSessionStore>,
+    kind: ClientSessionKind,
+    has_ticket: bool,
     id: Vec<u8>,
     creation_time: u64,
     timeout: u64,
@@ -2774,16 +2831,7 @@ pub unsafe fn session_clone(session: *const NativeSession) -> *mut NativeSession
         return std::ptr::null_mut();
     }
     let session = unsafe { &*session };
-    Box::into_raw(Box::new(NativeSession {
-        context_identity: session.context_identity,
-        config: session.config.clone(),
-        verified_chain_builder: session.verified_chain_builder.clone(),
-        server_name: session.server_name.clone(),
-        value: session.value.clone(),
-        id: session.id.clone(),
-        creation_time: session.creation_time,
-        timeout: session.timeout,
-    }))
+    Box::into_raw(Box::new(session.clone()))
 }
 
 #[inline(never)]
@@ -2811,6 +2859,21 @@ pub unsafe fn session_creation_time(session: *const NativeSession) -> u64 {
 #[inline(never)]
 pub unsafe fn session_timeout(session: *const NativeSession) -> u64 {
     unsafe { (&*session).timeout }
+}
+
+#[inline(never)]
+pub unsafe fn session_has_ticket(session: *const NativeSession) -> bool {
+    unsafe { (&*session).has_ticket }
+}
+
+#[inline(never)]
+pub unsafe fn session_ticket_lifetime_hint(session: *const NativeSession) -> u64 {
+    let session = unsafe { &*session };
+    if session.has_ticket {
+        session.timeout
+    } else {
+        0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3669,7 +3732,9 @@ pub struct TlsConnection {
     pending_received_tls: Vec<u8>,
     pending_received_tls_start: usize,
     client_config: Option<Arc<rustls::ClientConfig>>,
+    policy_identity: Arc<()>,
     client_session_store: Option<Arc<CapturingClientSessionStore>>,
+    previous_session: Option<NativeSession>,
     context_identity: usize,
     server_context: *const Context,
     server_hit_counted: bool,
@@ -3998,6 +4063,7 @@ pub unsafe fn connection_new(
 ) -> NativeResult<*mut TlsConnection> {
     ensure_provider();
     let context = unsafe { &*context };
+    let policy_identity = context.policy_identity.read().clone();
     if server_side && context.protocol == PROTOCOL_TLS_CLIENT {
         return Err((
             0,
@@ -4023,7 +4089,7 @@ pub unsafe fn connection_new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
             ),
         };
-        let store = Arc::new(CapturingClientSessionStore::new());
+        let store = Arc::new(CapturingClientSessionStore::new(name.clone()));
         let (mut config, verified_chain_builder) = if session.is_null() {
             let (config, builder) = client_config(context)?;
             (config, builder)
@@ -4032,13 +4098,24 @@ pub unsafe fn connection_new(
             if session.context_identity != context.identity {
                 return Err((0, "Session refers to a different SSLContext.".to_string()));
             }
-            if session.server_name == name {
-                store.seed(session);
+            // RustPython's reusable_session filter: reuse the saved verifier
+            // and credentials only for the same policy and hostname. capath
+            // trust can change on disk independently of the context identity.
+            if context.capaths.is_empty()
+                && Arc::ptr_eq(&session.policy_identity, &policy_identity)
+                && session.server_name == name
+                && session.has_ticket
+            {
+                session
+                    .session_store
+                    .transfer_session(&store, &name, session.kind);
+                (
+                    (*session.config).clone(),
+                    session.verified_chain_builder.clone(),
+                )
+            } else {
+                client_config(context)?
             }
-            (
-                (*session.config).clone(),
-                session.verified_chain_builder.clone(),
-            )
         };
         config.resumption = rustls::client::Resumption::store(store.clone());
         config.key_log = key_log.clone();
@@ -4077,7 +4154,9 @@ pub unsafe fn connection_new(
         pending_received_tls: Vec::new(),
         pending_received_tls_start: 0,
         client_config: retained_client_config,
+        policy_identity,
         client_session_store: retained_client_store,
+        previous_session: unsafe { session.as_ref() }.cloned(),
         context_identity: context.identity,
         server_context: std::ptr::null(),
         server_hit_counted: false,
@@ -4506,9 +4585,10 @@ pub unsafe fn connection_session_reused(connection: *const TlsConnection) -> Opt
     Some(inner.handshake_kind() == Some(rustls::HandshakeKind::Resumed))
 }
 
-/// Snapshot the actual opaque rustls TLS 1.2 resumption value captured for
-/// this connection. The returned session keeps its ClientConfig alive so the
-/// verifier/credential identity checks performed by rustls remain valid.
+/// _stdssl.SSLSession.__new__: snapshot the session after handshake. As in
+/// RustPython's PySSLSession, retain the config and the real backend store so
+/// rustls' verifier/credential identity checks and single-use tickets survive
+/// destruction of the original connection.
 ///
 /// # Safety
 /// `connection` must point to a live connection.
@@ -4518,10 +4598,14 @@ pub unsafe fn connection_session(connection: *const TlsConnection) -> *mut Nativ
     let Some(inner) = connection.inner.as_ref() else {
         return std::ptr::null_mut();
     };
-    if inner.is_handshaking() || inner.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_2)
-    {
+    if inner.is_handshaking() {
         return std::ptr::null_mut();
     }
+    let kind = match inner.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_2) => ClientSessionKind::Tls12,
+        Some(rustls::ProtocolVersion::TLSv1_3) => ClientSessionKind::Tls13,
+        _ => return std::ptr::null_mut(),
+    };
     let (Some(store), Some(config), Some(verified_chain_builder)) = (
         connection.client_session_store.as_ref(),
         connection.client_config.as_ref(),
@@ -4529,14 +4613,26 @@ pub unsafe fn connection_session(connection: *const TlsConnection) -> *mut Nativ
     ) else {
         return std::ptr::null_mut();
     };
-    store
-        .snapshot(
-            connection.context_identity,
-            config.clone(),
-            verified_chain_builder.clone(),
-        )
-        .map(|session| Box::into_raw(Box::new(session)))
-        .unwrap_or(std::ptr::null_mut())
+    let Some(mut session) = store.snapshot(
+        connection.context_identity,
+        connection.policy_identity.clone(),
+        config.clone(),
+        verified_chain_builder.clone(),
+        kind,
+    ) else {
+        return std::ptr::null_mut();
+    };
+    // RustPython create_session_after_handshake preserves the old public
+    // metadata only if the server actually resumed, not merely because the
+    // caller offered a session (it may be expired, consumed, or rejected).
+    if inner.handshake_kind() == Some(rustls::HandshakeKind::Resumed)
+        && let Some(previous) = &connection.previous_session
+    {
+        session.id = previous.id.clone();
+        session.creation_time = previous.creation_time;
+        session.timeout = previous.timeout;
+    }
+    Box::into_raw(Box::new(session))
 }
 
 /// Negotiated OpenSSL-style cipher name and effective key size.
@@ -4736,6 +4832,156 @@ mod tests {
             connection_free(server);
             context_free(client_ctx);
             context_free(server_ctx);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "host_env")]
+    fn tls13_session_exists_before_ticket_and_keeps_snapshot_metadata() {
+        unsafe {
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                context_set_minimum_version(client, 0x304);
+                context_set_num_tickets(server, 1);
+            });
+            assert!(connection_session(client).is_null());
+            // Stop after the server receives Finished, before its tickets
+            // reach the client. This is connected_bio_pair's observable
+            // pre-ticket session, not a fabricated resumption payload.
+            for _ in 0..32 {
+                let c2s = connection_take_tls(client).unwrap();
+                if !c2s.is_empty() {
+                    connection_receive_tls(server, &c2s).unwrap();
+                }
+                if connection_waiting_for_server_config(server) {
+                    connection_accept_server(server, server_ctx).unwrap();
+                }
+                if !connection_is_handshaking(client) && !connection_is_handshaking(server) {
+                    break;
+                }
+                let s2c = connection_take_tls(server).unwrap();
+                if !s2c.is_empty() {
+                    connection_receive_tls(client, &s2c).unwrap();
+                }
+            }
+            assert!(!connection_is_handshaking(client));
+            assert!(!connection_is_handshaking(server));
+            assert_eq!(connection_version(client), Some("TLSv1.3"));
+            let before_ticket = connection_session(client);
+            assert!(!before_ticket.is_null());
+            assert!(session_id(before_ticket).is_empty());
+            assert!(!session_has_ticket(before_ticket));
+            assert_eq!(session_ticket_lifetime_hint(before_ticket), 0);
+            assert!(session_creation_time(before_ticket) > 0);
+            assert_eq!(session_timeout(before_ticket), 7200);
+
+            let tickets = connection_take_tls(server).unwrap();
+            assert!(!tickets.is_empty());
+            connection_receive_tls(client, &tickets).unwrap();
+            let after_ticket = connection_session(client);
+            assert!(!after_ticket.is_null());
+            assert!(session_has_ticket(after_ticket));
+            assert!(!session_id(after_ticket).is_empty());
+            assert!(session_ticket_lifetime_hint(after_ticket) > 0);
+            assert!(session_id(before_ticket).is_empty());
+            assert!(!session_has_ticket(before_ticket));
+
+            // A snapshot made before a ticket arrived must not acquire the
+            // later ticket just because the native store outlives the socket.
+            let next_client =
+                connection_new(client_ctx, false, Some("localhost"), before_ticket).unwrap();
+            let next_server = connection_new(server_ctx, true, None, std::ptr::null()).unwrap();
+            handshake_pair(next_client, next_server, server_ctx).unwrap();
+            assert_eq!(connection_session_reused(next_client), Some(false));
+            connection_free(next_client);
+            connection_free(next_server);
+            session_free(after_ticket);
+            session_free(before_ticket);
+            free_pair(client_ctx, server_ctx, client, server);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "host_env")]
+    fn explicit_sessions_resume_after_original_connection_is_freed() {
+        unsafe {
+            for version in [0x303, 0x304] {
+                let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                    context_set_minimum_version(client, version);
+                    context_set_maximum_version(client, version);
+                    context_set_num_tickets(server, 1);
+                });
+                handshake_pair(client, server, server_ctx).unwrap();
+                let session = connection_session(client);
+                assert!(!session.is_null());
+                assert!(session_has_ticket(session));
+                let id = session_id(session);
+                let created = session_creation_time(session);
+                let cloned = session_clone(session);
+                session_free(session);
+                connection_free(client);
+                connection_free(server);
+
+                for attempt in 0..2 {
+                    let client =
+                        connection_new(client_ctx, false, Some("localhost"), cloned).unwrap();
+                    let server = connection_new(server_ctx, true, None, std::ptr::null()).unwrap();
+                    handshake_pair(client, server, server_ctx).unwrap();
+                    let resumed = version == 0x303 || attempt == 0;
+                    assert_eq!(
+                        connection_session_reused(client),
+                        Some(resumed),
+                        "version={version:#x}, attempt={attempt}"
+                    );
+                    let next = connection_session(client);
+                    assert!(!next.is_null());
+                    if resumed {
+                        assert_eq!(session_id(next), id);
+                        assert_eq!(session_creation_time(next), created);
+                    } else {
+                        // The TLS 1.3 ticket was moved into the first attempt.
+                        // A clone of the wrapper must not duplicate the ticket.
+                        assert_ne!(session_id(next), id);
+                    }
+                    session_free(next);
+                    connection_free(client);
+                    connection_free(server);
+                }
+                session_free(cloned);
+                context_free(client_ctx);
+                context_free(server_ctx);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "host_env")]
+    fn explicit_session_does_not_restore_superseded_context_policy() {
+        unsafe {
+            for (original, updated, expected) in
+                [(0x303, 0x304, "TLSv1.3"), (0x304, 0x303, "TLSv1.2")]
+            {
+                let (client_ctx, server_ctx, client, server) = tls13_pair(|client, _| {
+                    context_set_minimum_version(client, original);
+                    context_set_maximum_version(client, original);
+                });
+                handshake_pair(client, server, server_ctx).unwrap();
+                context_set_minimum_version(client_ctx, updated);
+                context_set_maximum_version(client_ctx, updated);
+                // Snapshot after the mutation: the session still belongs to
+                // the policy used for the original handshake, not the live
+                // context's new policy.
+                let session = connection_session(client);
+                assert!(!session.is_null());
+                let next = connection_new(client_ctx, false, Some("localhost"), session).unwrap();
+                let peer = connection_new(server_ctx, true, None, std::ptr::null()).unwrap();
+                handshake_pair(next, peer, server_ctx).unwrap();
+                assert_eq!(connection_version(next), Some(expected));
+                assert_eq!(connection_session_reused(next), Some(false));
+                session_free(session);
+                connection_free(next);
+                connection_free(peer);
+                free_pair(client_ctx, server_ctx, client, server);
+            }
         }
     }
 

@@ -41,6 +41,9 @@ pub struct W_MemoryBIO {
 #[derive(Default)]
 pub struct W_SSLSession {
     pub backend: *mut pyre_native::ssl::NativeSession,
+    // PyPy _stdssl.SSLSession.__new__: self._ctx = ssl.ctx. The session
+    // owns its Python context as well as the opaque native resumption state.
+    pub _ctx: PyObjectRef,
 }
 
 /// A TLS record's header: the content type, the two protocol version bytes,
@@ -627,15 +630,28 @@ fn allocate_ssl_socket(
     })
 }
 
-fn allocate_ssl_session(backend: *mut pyre_native::ssl::NativeSession) -> PyObjectRef {
+fn allocate_ssl_session(
+    backend: *mut pyre_native::ssl::NativeSession,
+    context: PyObjectRef,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let context_slot = roots.pin_roots(&[context]);
     let _ = ssl_session_methods::type_object();
-    W_SSLSession::allocate_stable(W_SSLSession {
+    let session = W_SSLSession::allocate_stable(W_SSLSession {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
         },
         backend,
-    })
+        _ctx: PY_NULL,
+    });
+    // Reload the rooted context after allocation, then publish the edge on
+    // the stable object through the ordinary old-to-young write barrier.
+    pyre_object::gc_hook::try_gc_write_barrier(session as pyre_object::gc_hook::GCREF);
+    W_SSLSession::from_obj(session)
+        .expect("fresh SSLSession")
+        ._ctx = roots.get(context_slot);
+    session
 }
 
 fn allocate_certificate(der: Vec<u8>) -> PyObjectRef {
@@ -2364,7 +2380,7 @@ mod ssl_socket_methods {
             if backend.is_null() {
                 w_none()
             } else {
-                allocate_ssl_session(backend)
+                allocate_ssl_session(backend, self.context)
             }
         }
 
@@ -2990,12 +3006,12 @@ mod ssl_session_methods {
 
         #[getter]
         fn ticket_lifetime_hint(&self) -> i64 {
-            unsafe { pyre_native::ssl::session_timeout(self.backend) as i64 }
+            unsafe { pyre_native::ssl::session_ticket_lifetime_hint(self.backend) as i64 }
         }
 
         #[getter]
         fn has_ticket(&self) -> bool {
-            true
+            unsafe { pyre_native::ssl::session_has_ticket(self.backend) }
         }
 
         fn __eq__(&self, other: PyObjectRef) -> PyObjectRef {
@@ -3643,7 +3659,7 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
     });
     types.push(ModuleGcType {
         descriptor: <W_SSLSession as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::Object,
+        layout: pyre_class,
         destructor: Some(gc_destructor!(w_ssl_session_dealloc)),
     });
     types.push(ModuleGcType {

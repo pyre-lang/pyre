@@ -509,6 +509,12 @@ pub unsafe fn session_creation_time(_session: *const NativeSession) -> u64 {
 pub unsafe fn session_timeout(_session: *const NativeSession) -> u64 {
     0
 }
+pub unsafe fn session_has_ticket(_session: *const NativeSession) -> bool {
+    false
+}
+pub unsafe fn session_ticket_lifetime_hint(_session: *const NativeSession) -> u64 {
+    0
+}
 
 pub struct TlsMessageEvent {
     pub write: bool,

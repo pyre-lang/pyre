@@ -831,6 +831,16 @@ impl<K, V, S> RDict<K, V, S> {
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
     /// `before`, which is `ll_dictiter_reversed`'s walk.  A fresh reverse walk
     /// starts at `usize::MAX`.
+    ///
+    /// [3.15-spec] A cursor above `num_ever_used_items` is clamped and the walk
+    /// continues into whatever the table holds now; `_ll_dictnext_reversed`
+    /// (`rordereddict.py`, PyPy issue 5596) stops there instead.  The
+    /// observable difference: after `clear` and a refill below the cursor,
+    /// `dictreviter_iter_lock_held` keeps walking and raises "dictionary keys
+    /// changed during iteration" once its count runs out
+    /// (`test_dict.test_reversed_dict_keys_changed_during_iteration`), which
+    /// the clamp reproduces through the `startlen` check in
+    /// `dict_iter_descr_next`; stopping would end the iteration silently.
     #[inline]
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
         let mut i = before.min(self.num_ever_used_items);
