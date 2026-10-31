@@ -47,11 +47,16 @@ def run(engine) -> int:
         (root / "src").mkdir()
         (root / "data").mkdir()
         (root / "data" / "rules.txt").write_text("rules")
+        (root / "src" / "inner.rs").write_text('include_str!("../data/rules.txt");\n')
         (outside / "far.txt").write_text("far")
 
         # FOLD: the file joins the digest. PASS: nothing to add, and nothing
         # unresolved was passed over. REFUSE: extraction stops.
         cases = [
+            ("ordinary source without includes", "pub fn answer() -> i64 { 42 }", "PASS"),
+            ("literal include", 'include!("../data/rules.txt");', "FOLD data/rules.txt"),
+            ("bytes with whitespace", 'include_bytes! \n ( "../data/rules.txt" );', "FOLD data/rules.txt"),
+            ("transitive include", 'include!("inner.rs");', "FOLD data/rules.txt,src/inner.rs"),
             ("literal outside the pathspecs", 'include_str!("../data/rules.txt");', "FOLD data/rules.txt"),
             ("literal already enumerated", 'include_str!("lib.rs");', "PASS"),
             ("nonexistent path", 'include_str!("../nope.txt");', "PASS"),

@@ -1539,6 +1539,7 @@ pub(in crate::front::mir) fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u
 pub(in crate::front::mir) fn fundecl_keeps_zst_self(
     llbc: &Llbc,
     fd: &FunDecl,
+    decl_locals: Option<&majit_charon_reader::ullbc::Locals>,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
@@ -1546,8 +1547,18 @@ pub(in crate::front::mir) fn fundecl_keeps_zst_self(
     if trait_impl_trait_path_for_fundecl(llbc, fd).is_none() {
         return false;
     }
-    let Some(locals) = fd.unstructured_locals() else {
-        return false;
+    // Reuse the declaration's locals when the caller already read them.
+    // Specialization callers must use the original declaration, not its
+    // substituted locals: the receiver rule is a property of the template.
+    let parsed_locals;
+    let locals = if let Some(locals) = decl_locals {
+        locals
+    } else {
+        parsed_locals = fd.unstructured_locals();
+        let Some(locals) = parsed_locals.as_ref() else {
+            return false;
+        };
+        locals
     };
     let Some(local) = locals.locals.get(1) else {
         return false;

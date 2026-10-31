@@ -3413,6 +3413,26 @@ fn root_stack_analysis_charges_no_unknown_body_in_an_artefact_below_the_api() {
                 &[krate, "gc_roots", "push_roots"],
                 serde_json::json!("Missing"),
             ));
+            for (id, drop_body) in [
+                (4, serde_json::Value::Null),
+                (5, serde_json::json!({"Structured": {}})),
+                (6, serde_json::json!({"Unstructured": {}})),
+                (
+                    7,
+                    serde_json::json!({"Unstructured": body(vec![
+                        block(serde_json::json!("Return")),
+                    ])}),
+                ),
+                (
+                    8,
+                    serde_json::json!({"Unstructured": body(vec![
+                        block(call(0, vec![copy(1)], 2, 1)),
+                        block(serde_json::json!("Return")),
+                    ])}),
+                ),
+            ] {
+                funs.push(fun(id, &["core", "ptr", "drop_in_place"], drop_body));
+            }
         }
         llbc_with_types(krate, vec![], funs)
     };
@@ -3441,6 +3461,21 @@ fn root_stack_analysis_charges_no_unknown_body_in_an_artefact_below_the_api() {
     let analyzer = super::RootStackAnalyzer::new(&above, &root_state);
     assert!(analyzer.regular_call_touches_root_stack(&direct));
     assert!(analyzer.regular_call_touches_root_stack(&method));
+    // Opaque, non-ULLBC and unreadable drop glue remain neutral even above
+    // the API. A readable body is analysed, including on cached queries.
+    for _ in 0..2 {
+        for id in 4..=8 {
+            let drop: RegularCall = serde_json::from_value(serde_json::json!({
+                "kind": {"Fun": id}, "generics": null
+            }))
+            .expect("drop call parses");
+            assert_eq!(
+                analyzer.regular_call_touches_root_stack(&drop),
+                id == 8,
+                "drop glue {id}"
+            );
+        }
+    }
 }
 
 #[test]

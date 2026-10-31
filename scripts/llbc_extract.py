@@ -380,7 +380,17 @@ def include_closure(root: Path, files: set[Path]) -> set[Path]:
         source = root / rel_source
         if not source.is_file():
             continue
-        text = read_input_bytes(root, rel_source).decode("utf-8", errors="replace")
+        raw = read_input_bytes(root, rel_source)
+        # Every spelling accepted by _INCLUDE_CALL contains one of these tokens.
+        # Most Rust inputs contain none: avoid decoding them and running the
+        # regex over their entire contents. Keep argument validation below.
+        if (
+            b"include!" not in raw
+            and b"include_str!" not in raw
+            and b"include_bytes!" not in raw
+        ):
+            continue
+        text = raw.decode("utf-8", errors="replace")
         for call in _INCLUDE_CALL.finditer(text):
             line = text.count("\n", 0, call.start()) + 1
             where = f"{rel_source.as_posix()}:{line}"

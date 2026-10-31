@@ -1613,7 +1613,10 @@ impl<'a> RootStackAnalyzer<'a> {
         // `analyze_trait_call` applies to it unchanged -- a value can close a
         // bracket only by holding a guard it was handed, and the body that
         // handed it over is charged.
-        if path.rsplit("::").next() == Some("drop_in_place") && fd.unstructured().is_none() {
+        // Probe only the tag here: the body is parsed below, after the
+        // analysed-call cache. Cached drop glue must not be decoded again.
+        let drop_glue = path.rsplit("::").next() == Some("drop_in_place");
+        if drop_glue && !fd.has_unstructured_body() {
             return false;
         }
         if fd.body.is_none() {
@@ -1630,6 +1633,9 @@ impl<'a> RootStackAnalyzer<'a> {
                 elaborate_vec_drops(self.llbc, &mut body);
                 self.analyze_body(&body, seen)
             }
+            // A tagged but unreadable drop body used to take the body-less
+            // drop-glue branch too. Keep that answer after the cheap tag check.
+            None if drop_glue => false,
             None => self.analyze_external_call(fd),
         };
         seen.leave_with(id, result, &mut self.state.analyzed_calls.borrow_mut());

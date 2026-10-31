@@ -1844,6 +1844,7 @@ impl<'l> CrateLowering<'l> {
             fundecl_keeps_zst_self(
                 self.llbc,
                 fd,
+                Some(&locals),
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
                 &self.state.raw_alloc_flavor_structs,
@@ -2053,6 +2054,7 @@ impl<'l> CrateLowering<'l> {
             fundecl_keeps_zst_self(
                 self.llbc,
                 fd,
+                None,
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
                 &self.state.raw_alloc_flavor_structs,
@@ -5635,6 +5637,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // `dont_look_inside` is keyed by `strip_crate_prefix(name_path())` on
     // the declaration. A Charon instance name does not spell that key.
     let self_dont_look_inside = fun_decl_is_dont_look_inside(fd, dont_look_inside);
+    let keep_zst_self = fundecl_keeps_zst_self(
+        llbc,
+        fd,
+        if spec_body { None } else { Some(&u.locals) },
+        tombstoned_leaves,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    );
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
     // `front::result_exc`); the caller rule applies to the diamond
@@ -6461,13 +6471,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             accum,
             root_stack,
             self_dont_look_inside,
-            fundecl_keeps_zst_self(
-                llbc,
-                fd,
-                tombstoned_leaves,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            ),
+            keep_zst_self,
         )?;
         lo.struct_fields = Some(struct_fields);
         lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -6526,13 +6530,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         accum,
         root_stack,
         self_dont_look_inside,
-        fundecl_keeps_zst_self(
-            llbc,
-            fd,
-            tombstoned_leaves,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        ),
+        keep_zst_self,
     )?;
     lo.struct_fields = Some(struct_fields);
     lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -6577,13 +6575,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 accum,
                 root_stack,
                 self_dont_look_inside,
-                fundecl_keeps_zst_self(
-                    llbc,
-                    fd,
-                    tombstoned_leaves,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                ),
+                keep_zst_self,
             )?;
             lo.struct_fields = Some(struct_fields);
             lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();

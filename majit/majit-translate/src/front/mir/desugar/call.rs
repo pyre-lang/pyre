@@ -6272,6 +6272,7 @@ impl<'a> Lowering<'a> {
                         && fundecl_keeps_zst_self(
                             self.llbc,
                             fd,
+                            None,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
