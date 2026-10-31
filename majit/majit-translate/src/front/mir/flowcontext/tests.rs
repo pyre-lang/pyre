@@ -4477,6 +4477,12 @@ fn str_family_class_roots_reject_lookalikes() {
     }
     assert!(super::is_str_family_class_root("string::String"));
     assert!(super::is_str_family_class_root("str"));
+    assert!(super::is_str_family_class_root(
+        "pyre_object::unicodeobject::Utf8Str"
+    ));
+    assert!(super::is_str_family_class_root(
+        "pyre_object::bytesobject::BytesBlock"
+    ));
     assert!(!super::is_str_family_class_root("other::Utf8Str"));
     assert!(!super::is_str_family_class_root("other::Wtf8Buf"));
     assert!(!super::is_str_family_class_root("other::BytesBlock"));
@@ -6204,6 +6210,248 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
             );
         }
     });
+}
+
+/// `celldict::<Impl>::getitem_str` getattr's `getdictvalue_no_unwrapping`
+/// on `self`. The Input must name `ModuleDictStrategy` so
+/// `derive_subject_inputcells` intern's a ClassDef.
+#[test]
+fn module_dict_strategy_getitem_str_self_names_class_root() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::SomeValue;
+    use crate::model::OpKind;
+    use std::rc::Rc;
+
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let fds: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            let p = fd.item_meta.name_path();
+            p.contains("celldict") && p.ends_with("getitem_str")
+        })
+        .collect();
+    assert!(
+        !fds.is_empty(),
+        "celldict getitem_str FunDecls in pyre-object LLBC"
+    );
+    let context = super::LowerContext::new(&llbc);
+    let registry = context.struct_field_registry();
+    let keys: Vec<_> = registry
+        .fields
+        .keys()
+        .filter(|k| k.contains("ModuleDict"))
+        .cloned()
+        .collect();
+    eprintln!("ModuleDict registry keys={keys:?}");
+    assert!(
+        registry.struct_root_rows_known("celldict::ModuleDictStrategy")
+            || keys.iter().any(|k| k.contains("ModuleDictStrategy")),
+        "harvest must register ModuleDictStrategy, keys={keys:?}"
+    );
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(registry));
+    for fd in fds {
+        let path = fd.item_meta.name_path();
+        let graph =
+            super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        let inputs: Vec<_> = graph
+            .blocks
+            .iter()
+            .find(|b| b.id == graph.startblock)
+            .expect("startblock")
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input {
+                    name,
+                    ty,
+                    class_root,
+                } => Some((name.clone(), ty.clone(), class_root.clone())),
+                _ => None,
+            })
+            .collect();
+        eprintln!("getitem_str path={path} inputs={inputs:?}");
+        let self_root = inputs.first().and_then(|(_, _, root)| root.as_deref());
+        assert!(
+            self_root.is_some_and(|root| root.contains("ModuleDictStrategy")),
+            "self Input of {path} must name ModuleDictStrategy, got {inputs:?}"
+        );
+        let cells = crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(
+            &graph,
+            Some(&bk),
+        )
+        .unwrap_or_else(|err| panic!("derive {path}: {err}"));
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!(
+                "getitem_str self must seed SomeInstance, got {:?}",
+                cells[0]
+            );
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "getitem_str self of {path} must intern ModuleDictStrategy, got {inst:?}"
+        );
+    }
+}
+
+/// `w_module_dict_get_strategy` returns `*mut ModuleDictStrategy`.
+/// `bind_classed_ref_return_annotation` intern's that classdef so
+/// `w_module_dict_getitem_str`'s `getattr("getitem_str")` resolves.
+#[test]
+fn w_module_dict_get_strategy_names_return_class_root() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let fds: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            fd.item_meta
+                .name_path()
+                .ends_with("w_module_dict_get_strategy")
+        })
+        .collect();
+    assert!(
+        !fds.is_empty(),
+        "w_module_dict_get_strategy FunDecl in pyre-object LLBC"
+    );
+    let context = super::LowerContext::new(&llbc);
+    for fd in fds {
+        let path = fd.item_meta.name_path();
+        let graph =
+            super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        eprintln!(
+            "get_strategy path={path} return_type={:?} return_class_root={:?} return_can_be_none={}",
+            graph.return_type, graph.return_class_root, graph.return_can_be_none
+        );
+        assert!(
+            graph
+                .return_class_root
+                .as_deref()
+                .is_some_and(|root| root.contains("ModuleDictStrategy")),
+            "get_strategy must advertise ModuleDictStrategy, got return_type={:?} return_class_root={:?}",
+            graph.return_type,
+            graph.return_class_root
+        );
+        // `ptr_null_constant` is classdef-less. `lltype.nullptr(T)` still
+        // recasts that null onto ModuleDictStrategy so it unions with the
+        // `owner` field CAST instead of absorbing the classdef.
+        let mut null_mut_result = None;
+        let mut null_cast_to_strategy = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call { target, args, .. }
+                        if target.to_string() == "core::ptr::null_mut"
+                            || target.to_string() == "std::ptr::null_mut" =>
+                    {
+                        null_mut_result = op.result.clone();
+                        let _ = args;
+                    }
+                    kind if crate::model::cast_instance_root(kind)
+                        .is_some_and(|root| root.contains("ModuleDictStrategy")) =>
+                    {
+                        if let (Some(null_res), OpKind::Call { args, .. }) =
+                            (null_mut_result.as_ref(), kind)
+                            && let Some(cast_arg) = args.first().and_then(LinkArg::as_variable)
+                            && cast_arg.id() == null_res.id()
+                        {
+                            null_cast_to_strategy = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            null_cast_to_strategy,
+            "null_mut of *mut ModuleDictStrategy must CAST onto that class"
+        );
+    }
+}
+
+/// `ExecutionContext::get_builtin` stores `builtin_dict_cache` with
+/// `Cell::set`. That write is the field's `setfield`, not a residual
+/// `set` graph shared with `Cell<bool>::set`.
+#[test]
+fn executioncontext_get_builtin_cell_set_is_field_write() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let graph = crate::front::mir::lower_function(
+        &llbc,
+        "pyre_interpreter::executioncontext::<Impl>::get_builtin",
+    )
+    .expect("lower ExecutionContext::get_builtin");
+    let writes_cache = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "builtin_dict_cache"
+            )
+        })
+    });
+    assert!(
+        writes_cache,
+        "get_builtin must setfield builtin_dict_cache, ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        !calls_leaf(&graph, "set"),
+        "get_builtin must not residualize Cell::set, ops={:?}",
+        graph_call_leaves(&graph)
+    );
+}
+
+/// `LiveIter::entry_at` is `entries_item_ptr(*self.entries).add(i)` then
+/// `e.f_valid`. The add is `lltype.direct_ptradd`, not residual host `add`.
+/// Generic `Entry<K,V>` has no resolved Charon size; the item is that
+/// struct so `rewrite_op_direct_ptradd` can scale from `sizeof(TO.OF)`.
+#[test]
+fn liveiter_entry_at_lowers_ptr_add_as_direct_ptradd() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let fds: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            let p = fd.item_meta.name_path();
+            p.contains("rordereddict") && p.contains("entry_at")
+        })
+        .collect();
+    assert!(
+        !fds.is_empty(),
+        "rordereddict entry_at FunDecls in pyre-object LLBC"
+    );
+    let context = super::LowerContext::new(&llbc);
+    for fd in fds {
+        let path = fd.item_meta.name_path();
+        let graph =
+            super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        assert!(
+            calls_leaf(&graph, "direct_ptradd"),
+            "LiveIter::entry_at {path} must emit direct_ptradd, ops={:?}",
+            graph_call_leaves(&graph)
+        );
+        assert!(
+            !calls_leaf(&graph, "add"),
+            "LiveIter::entry_at {path} must not residualize host add, ops={:?}",
+            graph_call_leaves(&graph)
+        );
+    }
 }
 
 #[test]

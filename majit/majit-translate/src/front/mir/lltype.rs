@@ -4389,7 +4389,13 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        let root = adt_node_class_root_with(node, llbc, no_tombstoned_leaves())?;
+        // GCREFOpaque implements GcType so it is a named ADT, but the
+        // residual is `lltype.GCREF` (`SomePtr`), not a ClassDef.
+        if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+            return None;
+        }
+        return Some(root);
     }
     let type_args = adt
         .get("generics")
@@ -6760,6 +6766,19 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     if !decl.is_repr_transparent() {
         return None;
     }
+    // `Cell<T>` / `UnsafeCell<T>` are the slot, not `T`. Peeling them
+    // for value typing makes `Cell<bool>::set` and `Cell<PyObjectRef>::set`
+    // share one residual graph named `set` whose slot 0 is Bool ∪ PyObject
+    // (`annrpython.py` `mergeinputargs`). `Cell::get` is a field read
+    // (`is_cell_get`); the wrapper stays the Input class.
+    let path = decl.item_meta.name_path();
+    if path == "core::cell::Cell"
+        || path.ends_with("::Cell")
+        || path == "core::cell::UnsafeCell"
+        || path.ends_with("::UnsafeCell")
+    {
+        return None;
+    }
     match &decl.kind {
         TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
             let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
@@ -7382,7 +7401,8 @@ pub(in crate::front::mir) fn split_struct_instantiation_suffix(
 /// getkind, `SomePtr`), the node is not a pointer (a by-value
 /// transparent handle keeps its own class), the pointee is a Raw
 /// struct (`&mut S` stays `Ref(None)` with `class_root` on the Input),
-/// or the pointee has no class root (`GCREFOpaque`, `*mut u8`). The
+/// or the pointee is GCREF erasure (`GCREFOpaque`) / has no class root
+/// (`*mut u8`). The
 /// spelling is the same `adt_node_class_root_with` produces
 /// (`"pyobject::PyObject"`), which `Bookkeeper::project_struct_field_type` /
 /// `lltype_for_named_ref` resolve to the classdef.
@@ -9198,6 +9218,24 @@ pub(in crate::front::mir) fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) ->
 /// whether the pointee is `dyn`.
 pub(in crate::front::mir) fn tyref_is_inline_fat_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_inline_fat_box(ty, llbc) || tyref_is_fat_ref(ty, llbc)
+}
+
+/// `&[T]` / `&mut [T]`: a `Ref` whose pointee is Charon's `Slice`.
+/// `Box<[T]>::deref` returns this; identity-alias it onto the Box, which
+/// is already the list (`rlist.py` `ll_fixed_items`).
+pub(in crate::front::mir) fn tyref_is_slice_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = node
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+        .and_then(|pointee| strip_ty_indirections(pointee, llbc))
+    else {
+        return false;
+    };
+    pointee.get("Slice").is_some()
 }
 
 pub(in crate::front::mir) fn tyref_is_fat_ref(ty: &TyRef, llbc: &Llbc) -> bool {

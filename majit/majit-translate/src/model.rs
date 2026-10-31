@@ -2461,16 +2461,27 @@ pub fn cast_instance_call(
 
 /// Same as [`cast_instance_call`] with an explicit result type.
 /// Niche-null string payloads use `ValueType::Str` rather than `Ref`.
+///
+/// A GCREF / `GCREFOpaque` dest is `lltype.GCREF` (`SomePtr`). Interning
+/// the empty pointee as a ClassDef types Void on the real rtyper path
+/// (`llannotation.py` `lltype_to_annotation`). ByteStr `"GCREF"` is the
+/// `iter_next` recast; the analyzer accepts both spellings.
 pub fn cast_instance_call_result(
     root: impl Into<String>,
     operand: crate::flowspace::model::Variable,
     result_ty: ValueType,
 ) -> OpKind {
+    let root = root.into();
+    let (root, result_ty) = if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+        ("GCREF".to_string(), ValueType::Ref(None))
+    } else {
+        (root, result_ty)
+    };
     OpKind::Call {
         target: CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]),
         args: vec![
             LinkArg::from(operand),
-            LinkArg::from(ConstValue::byte_str(root.into())),
+            LinkArg::from(ConstValue::byte_str(root)),
         ],
         result_ty,
     }

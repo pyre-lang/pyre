@@ -222,7 +222,7 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
     let new_storage = crate::gc_storage::gc_alloc_young_storage_box(
         crate::dictmultiobject::object_dict_storage_new(),
         crate::dictmultiobject::object_dict_storage_gc_type_id(),
-    );
+    ) as *mut crate::dictmultiobject::ObjectDictStorage;
     let new_map = &mut *new_storage;
     for (i, &hash) in hashes.iter().enumerate() {
         let obj = roots.get(pairs_base + 2 * i);
@@ -320,7 +320,7 @@ impl DictStrategy for IdentityDictStrategy {
         crate::gc_storage::gc_alloc_young_storage_box(
             IdentityDictStorage::new(),
             identity_dict_storage_gc_type_id(),
-        ) as crate::gc_hook::GCREF
+        )
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem` —

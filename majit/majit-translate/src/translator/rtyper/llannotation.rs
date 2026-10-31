@@ -251,40 +251,53 @@ impl SomePtr {
         };
         let example = self.ll_ptrtype._example();
         match example._lookup_adtmeth(attr) {
-            Err(lltype::AttributeError) => match example.getattr(attr) {
-                Ok(v) => {
-                    let s = ll_to_annotation(v);
-                    Ok(gc_class_root_ptr_as_instance(&s).unwrap_or(s))
+            Err(lltype::AttributeError) => {
+                // `direct_ptradd` stamps `CArrayPtr(item)` so
+                // `rewrite_op_direct_ptradd` can read `sizeof(TO.OF)`.
+                // Field getattr of a named struct item reads `Array.OF`
+                // (`_example()` of a length-0 array cannot `getitem(0)`).
+                if let Some(field_t) = carray_item_struct_field_type(&self.ll_ptrtype, attr) {
+                    return Ok(carray_item_field_annotation(field_t));
                 }
-                // A raw-pointer `p.is_null()` whose receiver keeps its
-                // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
-                // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
-                // this `SomePtr.getattr` rather than the `SomeObject` /
-                // `SomeInstance` `is_null` arms.  `front::mir` already
-                // routed it as `CallTarget::Method { name: "is_null",
-                // receiver_root: "mut_ptr"/"const_ptr" }`, which
-                // `jtransform` lowers to `ptr_iszero` regardless of the
-                // receiver repr; answer the getattr with the same
-                // `ptr_method_is_null` bound method so the result types as
-                // `SomeBool`.  Last-resort after both `_lookup_adtmeth` and
-                // the struct-field `getattr`, so a real `is_null` adt
-                // member or field is never shadowed.
-                Err(_) if attr == "is_null" => {
-                    Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
-                        "ptr_method_is_null",
-                        SomeValue::Ptr(self.clone()),
-                        "is_null",
-                    )))
+                match example.getattr(attr) {
+                    Ok(v) => {
+                        let s = ll_to_annotation(v);
+                        Ok(gc_class_root_ptr_as_instance(&s).unwrap_or(s))
+                    }
+                    // A raw-pointer `p.is_null()` whose receiver keeps its
+                    // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
+                    // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
+                    // this `SomePtr.getattr` rather than the `SomeObject` /
+                    // `SomeInstance` `is_null` arms.  `front::mir` already
+                    // routed it as `CallTarget::Method { name: "is_null",
+                    // receiver_root: "mut_ptr"/"const_ptr" }`, which
+                    // `jtransform` lowers to `ptr_iszero` regardless of the
+                    // receiver repr; answer the getattr with the same
+                    // `ptr_method_is_null` bound method so the result types as
+                    // `SomeBool`.  Last-resort after both `_lookup_adtmeth` and
+                    // the struct-field `getattr`, so a real `is_null` adt
+                    // member or field is never shadowed.
+                    Err(_) if attr == "is_null" => {
+                        Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "ptr_method_is_null",
+                            SomeValue::Ptr(self.clone()),
+                            "is_null",
+                        )))
+                    }
+                    // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref`: the
+                    // receiver is already the nullable pointer word
+                    // (`raw_struct_ptr_annotation`). Identity, same as
+                    // `front::mir` `is_raw_ptr_as_ref`.
+                    Err(_) if attr == "as_ref" || attr == "as_mut" => {
+                        Ok(SomeValue::BuiltinMethod(SomeBuiltinMethod::new(
+                            "ptr_method_as_ref",
+                            SomeValue::Ptr(self.clone()),
+                            attr,
+                        )))
+                    }
+                    Err(e) => Err(AnnotatorError::new(e)),
                 }
-                // `Option<RawStruct>::as_ref` / `<*mut T>::as_ref`: the
-                // receiver is already the nullable pointer word
-                // (`raw_struct_ptr_annotation`). Identity, same as
-                // `front::mir` `is_raw_ptr_as_ref`.
-                Err(_) if attr == "as_ref" || attr == "as_mut" => Ok(SomeValue::BuiltinMethod(
-                    SomeBuiltinMethod::new("ptr_method_as_ref", SomeValue::Ptr(self.clone()), attr),
-                )),
-                Err(e) => Err(AnnotatorError::new(e)),
-            },
+            }
             Ok(lltype::LowLevelAdtMember::Method { ll_ptrtype, func }) => {
                 Ok(SomeValue::LLADTMeth(SomeLLADTMeth::new(ll_ptrtype, func)))
             }
@@ -357,6 +370,21 @@ impl SomePtr {
                 s_attr.const_()
             );
         };
+        if let Some((struct_t, field_t)) = carray_item_struct_field(&self.ll_ptrtype, attr) {
+            if field_t != lltype::LowLevelType::Void
+                && !carray_item_struct_field_accepts(&field_t, s_value)
+            {
+                let v_lltype = annotation_to_lltype(s_value, None).ok();
+                return Err(AnnotatorError::new(format!(
+                    "{} instance field {:?}:\nexpects {:?}\n    got {:?}",
+                    struct_t._name,
+                    attr,
+                    field_t,
+                    v_lltype.unwrap_or(lltype::LowLevelType::Void)
+                )));
+            }
+            return Ok(SomeValue::Impossible);
+        }
         let mut example = self.ll_ptrtype._example();
         if example.getattr(attr).map_err(AnnotatorError::new)? != lltype::LowLevelValue::Void {
             let v_lltype = annotation_to_lltype(s_value, None)?;
@@ -438,6 +466,71 @@ fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
         true,
         std::collections::BTreeMap::new(),
     )))
+}
+
+/// Item struct of `CArrayPtr(Struct)` / `Ptr(FixedSizeArray(Struct))`.
+/// `direct_ptradd` stamps the array wrapper so `rewrite_op_direct_ptradd`
+/// can scale `TO.OF`; field getattr/setattr reads that item layout.
+fn carray_item_struct(ptr: &lltype::Ptr) -> Option<&lltype::Struct> {
+    let of = match &ptr.TO {
+        lltype::PtrTarget::Array(arr) => &arr.OF,
+        lltype::PtrTarget::FixedSizeArray(arr) => &arr.OF,
+        _ => return None,
+    };
+    match of {
+        lltype::LowLevelType::Struct(st) => Some(st.as_ref()),
+        _ => None,
+    }
+}
+
+fn carray_item_struct_field_type(ptr: &lltype::Ptr, attr: &str) -> Option<lltype::LowLevelType> {
+    carray_item_struct(ptr)?.getattr_field_type(attr)
+}
+
+/// Address-typed item fields are GC pointer words whose overlay missed
+/// `GCREF`. Annotate them as classdef-less instances so they union with
+/// `SomeInstance(PyObject)`.
+fn carray_item_field_annotation(field_t: lltype::LowLevelType) -> SomeValue {
+    if matches!(field_t, lltype::LowLevelType::Address) {
+        return SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+            None,
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+    }
+    lltype_to_annotation(field_t)
+}
+
+fn is_pointer_word_lltype(ty: &lltype::LowLevelType) -> bool {
+    matches!(
+        ty,
+        lltype::LowLevelType::Ptr(_) | lltype::LowLevelType::Address
+    )
+}
+
+fn carray_item_struct_field<'a>(
+    ptr: &'a lltype::Ptr,
+    attr: &str,
+) -> Option<(&'a lltype::Struct, lltype::LowLevelType)> {
+    let st = carray_item_struct(ptr)?;
+    let field_t = st.getattr_field_type(attr)?;
+    Some((st, field_t))
+}
+
+/// `InstanceRepr.lowleveltype` is `Ptr(GcStruct)`. A store of
+/// `SomeInstance` into an item-struct pointer or Address field is that word.
+fn carray_item_struct_field_accepts(field_t: &lltype::LowLevelType, s_value: &SomeValue) -> bool {
+    match annotation_to_lltype(s_value, None) {
+        Ok(v_lltype) if v_lltype == *field_t => true,
+        Ok(v_lltype) if integer_number_lltype(&v_lltype) && integer_number_lltype(field_t) => true,
+        Ok(v_lltype) if is_pointer_word_lltype(&v_lltype) && is_pointer_word_lltype(field_t) => {
+            true
+        }
+        Err(_) if matches!(s_value, SomeValue::Instance(_)) && is_pointer_word_lltype(field_t) => {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Named scalar fields of `rust_vec_lltype`'s `Struct(raw) "RustVec"`

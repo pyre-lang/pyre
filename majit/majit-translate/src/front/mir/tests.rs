@@ -8812,6 +8812,101 @@ fn user_trait_named_default_is_not_integer_zero() {
 }
 
 #[test]
+fn trait_default_of_string_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_trait_call_fixture(
+        "trait_default_string",
+        &["core", "default", "Default"],
+        "default",
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph =
+        super::lower_function(&llbc, "trait_default_string").expect("lower Trait Default String");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "<String as Default>::default must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "Trait Default of String must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn alloc_string_default_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_extern_call_fixture_with_types(
+        "default_string",
+        &["alloc", "string", "<Impl>", "default"],
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph = super::lower_function(&llbc, "default_string").expect("lower alloc String default");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "alloc::string::<Impl>::default must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "alloc String default must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn alloc_string_new_is_empty_str() {
+    let string_ty = serde_json::json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let llbc = std_extern_call_fixture_with_types(
+        "new_string",
+        &["alloc", "string", "<Impl>", "new"],
+        &[],
+        string_ty,
+        vec![code_struct(0, &["alloc", "string", "String"])],
+    );
+    let graph = super::lower_function(&llbc, "new_string").expect("lower alloc String::new");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__str_const", ""]
+        )),
+        "alloc::string::<Impl>::new must become __str_const \"\"; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "new"),
+        "alloc String::new must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
 fn trait_default_of_wtf8buf_is_empty_str() {
     let wtf8buf = serde_json::json!({"Adt": {
         "id": 0,
@@ -13617,6 +13712,42 @@ pub(in crate::front::mir) fn kwargs_unerase_cast_llbc(src_is_gcref: bool) -> Llb
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("kwargs unerase fixture parses")
+}
+
+#[test]
+fn dont_look_inside_gcref_ptr_residual_is_gcref_token() {
+    let llbc = kwargs_unerase_cast_llbc(true);
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| fd.item_meta.name_path().ends_with("::unerase"))
+        .expect("unerase");
+    let gcref_ty = fd.signature.inputs.first().expect("unerase takes a GCREF");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let spec = crate::ErrorCarrierSpec::default();
+    let empty = std::collections::HashSet::<String>::new();
+    assert_eq!(
+        super::lltype::dont_look_inside_return_token(
+            gcref_ty,
+            &llbc,
+            spec,
+            &gc_struct_ids,
+            &empty,
+        )
+        .as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE),
+        "a *mut GCREFOpaque residual FUNC.RESULT is gcref, not ref"
+    );
+    assert_eq!(
+        super::lltype::dont_look_inside_return_class_root(
+            gcref_ty,
+            &llbc,
+            spec,
+            &gc_struct_ids,
+            &empty,
+        ),
+        None,
+        "GCREFOpaque must not intern a residual ClassDef"
+    );
 }
 
 #[test]
@@ -25703,13 +25834,35 @@ fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
 /// replace / U+FFFD (`typedef::decode_utf8_with_errors`), never a Cow.
 /// The Result Err arm is `RaiseImplicit(AssertionError)`
 /// (`rtyper/debug.py ll_assert`), never a fabricated `""`.
+/// `oefmt`'s `%s`/`%8` Bytes arm passes `&[u8]`, the window pair ABI.
 #[test]
-#[ignore]
 fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = crate::test_support::load_ullbc(path);
-    let graph = crate::test_support::lower_function(llbc, "oefmt").expect("lower oefmt");
-    let paths = oefmt_call_paths(&graph);
+    let interpreter =
+        crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+    let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+    let program = crate::test_support::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter, object],
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+        &["error"],
+        &["oefmt"],
+    )
+    .expect("lower oefmt");
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "oefmt")
+        .expect("oefmt graph")
+        .graph();
+    let paths = oefmt_call_paths(graph);
     assert!(
         !paths.iter().any(|segments| {
             segments
@@ -25725,10 +25878,66 @@ fn oefmt_from_utf8_lossy_lowers_to_decode_utf8_replace() {
         "decode_utf8_with_errors must remain in the caller: {paths:#?}"
     );
     assert!(
-        !oefmt_mentions_cow(&graph),
+        !oefmt_mentions_cow(graph),
         "from_utf8_lossy dest is a plain string, not Cow: {graph:#?}"
     );
-    oefmt_decode_utf8_err_arm_is_assert_raise(&graph);
+    oefmt_decode_utf8_err_arm_is_assert_raise(graph);
+}
+
+/// `CStr::from_ptr(p).to_string_lossy()` is `rffi.charp2str`, never a
+/// residual Cow or 1-arg `cast_int_to_ptr` (`Ptr(MAJIT_REF_OPAQUE)`).
+#[test]
+fn gai_strerror_lowers_cstr_lossy_to_charp2str() {
+    let interpreter = Llbc::load(crate::runtime_names::artifacts::INTERPRETER_ULLBC)
+        .expect("load interpreter LLBC");
+    let object =
+        Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("load object LLBC");
+    let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[interpreter, object],
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+        &["rsocket_rffi"],
+        &["gai_strerror"],
+    )
+    .expect("lower gai_strerror");
+    let names: Vec<_> = program
+        .functions
+        .iter()
+        .map(|f| format!("{}::{}", f.module_path, f.name))
+        .collect();
+    let graph = program
+        .functions
+        .iter()
+        .find(|f| f.name == "gai_strerror")
+        .unwrap_or_else(|| panic!("gai_strerror graph; have {names:#?}"))
+        .graph();
+    let paths = oefmt_call_paths(graph);
+    assert!(
+        !paths.iter().any(|segments| {
+            segments
+                .last()
+                .is_some_and(|leaf| leaf == "to_string_lossy" || leaf == "from_utf8_lossy")
+        }),
+        "to_string_lossy / from_utf8_lossy must not remain a residual: {paths:#?}"
+    );
+    assert!(
+        paths.iter().any(|segments| {
+            segments.last().map(String::as_str) == Some(crate::runtime_names::shims::CHARP2STR)
+        }),
+        "CStr::to_string_lossy copies through rffi.charp2str: {paths:#?}"
+    );
+    assert!(
+        !oefmt_mentions_cow(graph),
+        "to_string_lossy dest is a plain string, not Cow: {graph:#?}"
+    );
 }
 
 /// `decompose_valuefmt` `current: String` is a `StringBuilder`

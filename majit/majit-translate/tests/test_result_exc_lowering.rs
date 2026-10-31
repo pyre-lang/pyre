@@ -10,7 +10,9 @@ use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
-use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
+use majit_translate::model::{
+    CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind, cast_instance_root,
+};
 use majit_translate::{CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
 
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
@@ -1298,6 +1300,109 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
             OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "map")),
         "`.map(Some)` leaves no residual Result::map"
     );
+}
+
+fn is_pyerror_handle_root(root: &str) -> bool {
+    root.rsplit("::").next() == Some("PyError")
+}
+
+/// `PyError(make_pyerror(...))` is one pointer word. Value typing keeps
+/// the wrapper class (`tyref_transparent_inner_value_type` is None for a
+/// transparent GC handle), so construction recasts through
+/// `retag_error_carrier` rather than instantiate+setattr of `__pos_0`.
+fn assert_pyerror_wrap_is_one_word(graph: &majit_translate::model::FunctionGraph, name: &str) {
+    let mut pos0_writes = Vec::new();
+    let mut ctor_owners = Vec::new();
+    let mut handle_retags = Vec::new();
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::FieldWrite { field, .. }
+                if field.name == "__pos_0"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(is_pyerror_handle_root) =>
+            {
+                pos0_writes.push(field.owner_root.clone());
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name: ctor_name,
+                        owner_path,
+                        ..
+                    },
+                ..
+            } if is_pyerror_handle_root(ctor_name)
+                || owner_path
+                    .iter()
+                    .any(|segment| is_pyerror_handle_root(segment)) =>
+            {
+                ctor_owners.push(format!("{}::{ctor_name}", owner_path.join("::")));
+            }
+            kind => {
+                if let Some(root) = cast_instance_root(kind)
+                    && is_pyerror_handle_root(root)
+                {
+                    handle_retags.push(root.to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        pos0_writes.is_empty(),
+        "{name}: PyError construction must not setattr __pos_0: {pos0_writes:?}"
+    );
+    assert!(
+        ctor_owners.is_empty(),
+        "{name}: PyError construction must not instantiate the handle: {ctor_owners:?}"
+    );
+    assert!(
+        !handle_retags.is_empty(),
+        "{name}: PyError construction recasts the pointer onto the handle class, got {handle_retags:?}"
+    );
+}
+
+#[test]
+fn pyerror_new_is_one_word_retag() {
+    let name = "pyre_interpreter::error::<Impl>::new";
+    let graph = lower_function(interp(), name).expect("lower PyError::new");
+    assert_pyerror_wrap_is_one_word(&graph, name);
+}
+
+#[test]
+fn pyerror_attribute_error_delegates_without_handle_ctor() {
+    let name = "pyre_interpreter::error::<Impl>::attribute_error";
+    let graph = lower_function(interp(), name).expect("lower PyError::attribute_error");
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::FieldWrite { field, .. }
+                if field.name == "__pos_0"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(is_pyerror_handle_root) =>
+            {
+                panic!("{name}: PyError construction must not setattr __pos_0");
+            }
+            OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name: ctor_name,
+                        owner_path,
+                        ..
+                    },
+                ..
+            } if is_pyerror_handle_root(ctor_name)
+                || owner_path
+                    .iter()
+                    .any(|segment| is_pyerror_handle_root(segment)) =>
+            {
+                panic!("{name}: PyError construction must not instantiate the handle");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `ll_math.py ll_math_sqrt` raises `ValueError("math domain error")` in

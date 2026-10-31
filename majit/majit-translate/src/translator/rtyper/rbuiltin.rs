@@ -245,6 +245,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "get_raw_address_of_string",
             rtype_builtin_get_raw_address_of_string,
         ),
+        // Translator shim: `__majit_charp2str` → HOST_ENV `charp2str`
+        // (`rffi.charp2str`).
+        ("charp2str", rtype_builtin_charp2str),
+        // Translator shim: `__majit_charpsize2str` → HOST_ENV `charpsize2str`
+        // (`rffi.charpsize2str`).
+        ("charpsize2str", rtype_builtin_charpsize2str),
         // Translator shim: `__majit_nonmoving_raw_ptr_for_resizable_list`
         // → `rgc.nonmoving_raw_ptr_for_resizable_list`.
         (
@@ -2414,6 +2420,58 @@ pub fn rtype_builtin_get_raw_address_of_string(
         move |_rtyper, _args, _result| {
             build_ll_get_raw_address_of_string_helper_graph("ll_get_raw_address_of_string")
         },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// `charp2str(cp)` — the front's `__majit_charp2str` spelling of
+/// `rffi.py charp2str`. The `cp` argument is `CCHARP`. Returns `STR`.
+pub fn rtype_builtin_charp2str(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rffi::{CCHARP, build_ll_charp2str_helper_graph};
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    use crate::translator::rtyper::rmodel::PtrRepr;
+
+    let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+        return Err(TyperError::message("CCHARP is not a Ptr"));
+    };
+    let r_cp: Arc<dyn Repr> = Arc::new(PtrRepr::new(*ccharp));
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_cp.as_ref())])?;
+    hop.exception_is_here()?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_charp2str".to_string(),
+        vec![(*CCHARP).clone()],
+        STRPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_charp2str_helper_graph("ll_charp2str"),
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// `charpsize2str(cp, size)` — the front's `__majit_charpsize2str`
+/// spelling of `rffi.py charpsize2str`. Returns `STR`.
+pub fn rtype_builtin_charpsize2str(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rffi::{
+        CCHARP, build_ll_charpsize2str_helper_graph,
+    };
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    use crate::translator::rtyper::rmodel::PtrRepr;
+
+    let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+        return Err(TyperError::message("CCHARP is not a Ptr"));
+    };
+    let r_cp: Arc<dyn Repr> = Arc::new(PtrRepr::new(*ccharp));
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(r_cp.as_ref()),
+        ConvertedTo::LowLevelType(&LowLevelType::Signed),
+    ])?;
+    hop.exception_is_here()?;
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        "ll_charpsize2str".to_string(),
+        vec![(*CCHARP).clone(), LowLevelType::Signed],
+        STRPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_charpsize2str_helper_graph("ll_charpsize2str"),
     )?;
     hop.gendirectcall(&helper, vlist)
 }
@@ -5546,6 +5604,124 @@ mod tests {
         );
     }
 
+    fn charp2str_hop() -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        HighLevelOp,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomePtr;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let v = Variable::named("cp");
+        v.set_concretetype(Some((*CCHARP).clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new((*ccharp).clone())));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(*ccharp)) as Arc<dyn Repr>));
+        (ann, hop)
+    }
+
+    fn charpsize2str_hop() -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        HighLevelOp,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomePtr};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let v_cp = Variable::named("cp");
+        v_cp.set_concretetype(Some((*CCHARP).clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_cp));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new((*ccharp).clone())));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(*ccharp)) as Arc<dyn Repr>));
+        let v_size = Variable::named("size");
+        v_size.set_concretetype(Some(LowLevelType::Signed));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_size));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(signed_repr()));
+        (ann, hop)
+    }
+
+    fn assert_charp_str_direct_call(hop: &HighLevelOp, result: &Hlvalue, helper_name: &str) {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert_eq!(&ops.ops[0].result, result);
+        let Hlvalue::Variable(v) = result else {
+            panic!("direct_call result is a Variable, got {result:?}");
+        };
+        assert_eq!(v.concretetype(), Some(STRPTR.clone()));
+        let Hlvalue::Constant(func) = &ops.ops[0].args[0] else {
+            panic!("direct_call arg0 is the helper");
+        };
+        let rendered = format!("{:?}", func.value);
+        assert!(
+            rendered.contains(helper_name),
+            "must call {helper_name}, got {rendered}"
+        );
+    }
+
     fn typer_calls_exception_cannot_occur(
         hop: &HighLevelOp,
         _kwds_i: &HashMap<String, usize>,
@@ -6950,6 +7126,24 @@ mod tests {
             }
             other => panic!("constant string must convert to an LLPtr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rtype_builtin_charp2str_direct_calls_ll_charp2str() {
+        let (_ann, hop) = charp2str_hop();
+        let result = rtype_builtin_charp2str(&hop, &HashMap::new())
+            .expect("rtype")
+            .expect("direct_call result");
+        assert_charp_str_direct_call(&hop, &result, "ll_charp2str");
+    }
+
+    #[test]
+    fn rtype_builtin_charpsize2str_direct_calls_ll_charpsize2str() {
+        let (_ann, hop) = charpsize2str_hop();
+        let result = rtype_builtin_charpsize2str(&hop, &HashMap::new())
+            .expect("rtype")
+            .expect("direct_call result");
+        assert_charp_str_direct_call(&hop, &result, "ll_charpsize2str");
     }
 
     #[test]

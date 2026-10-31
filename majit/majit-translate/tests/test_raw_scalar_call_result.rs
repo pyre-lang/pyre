@@ -70,7 +70,9 @@ use majit_translate::{
         LowerError, discover_fnptr_field_families, lower_fun_decl, lower_function,
         lower_function_with_static_addrs,
     },
-    model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
+    model::{
+        CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType, cast_instance_root,
+    },
     translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget},
 };
 use serde_json::{Value, json};
@@ -534,6 +536,109 @@ fn is_mapdict_node_leaf(root: &str) -> bool {
             root.rsplit("::").next(),
             Some("AbstractAttribute" | "Terminator" | "PlainAttribute")
         )
+}
+
+fn is_w_root(root: &str) -> bool {
+    root.rsplit("::").next() == Some("PyObject")
+}
+
+fn field_read_result<'a>(
+    graph: &'a FunctionGraph,
+    field: &str,
+) -> Option<&'a majit_translate::flowspace::model::Variable> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead { field: descr, .. } if descr.name == field => op.result.as_ref(),
+            _ => None,
+        })
+}
+
+fn recast_of_var_is_w_root(
+    graph: &FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| {
+            let Some(root) = cast_instance_root(&op.kind) else {
+                return false;
+            };
+            if !is_w_root(root) {
+                return false;
+            }
+            match &op.kind {
+                OpKind::Call { args, .. } => args
+                    .first()
+                    .and_then(LinkArg::as_variable)
+                    .is_some_and(|operand| operand == var),
+                _ => false,
+            }
+        })
+}
+
+/// `w_none` reads a `OnceLock<usize>` whose refs row is the interned
+/// object. The `as PyObjectRef` dest is `Bookkeeper.immutablevalue` of
+/// that prebuilt `W_Root`, so the ConstRefAddr is narrowed onto
+/// `pyobject::PyObject` rather than left as `SomePtr(GCREF)`.
+#[test]
+fn prebuilt_none_singleton_narrows_to_w_root() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let addr = 0x1234_5678;
+    let refs = [("noneobject::NONE_SINGLETON", addr)];
+    let graph = lower_function_with_static_addrs(
+        llbc,
+        "pyre_object::noneobject::w_none",
+        HostStaticAddrs {
+            refs: &refs,
+            ..Default::default()
+        },
+    )
+    .expect("lower w_none");
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(&op.kind, OpKind::ConstRefAddr(value) if *value == addr)),
+        "w_none keeps the registered prebuilt address"
+    );
+    match root_op(&graph, &returned_var(&graph)) {
+        Some(kind) if cast_instance_root(kind).is_some_and(is_w_root) => {}
+        other => panic!("w_none must return a pyobject::PyObject recast, got {other:?}"),
+    }
+}
+
+/// Overlay `w_cls` is `PyObjectRef`. The FieldRead stays a SomePtr getattr
+/// on the raw dest; the result is then recast to `pyobject::PyObject` so
+/// `instance_getclass` can merge it with `(*obj).w_class`.
+#[test]
+fn map_terminator_w_cls_narrows_to_w_root() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    common::with_shared_lowering(llbc, |context| {
+        let mut saw = false;
+        for leaf in ["map_terminator_w_cls", "instance_getclass"] {
+            let fns = mapdict_fns(&llbc, leaf);
+            assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
+            for fd in fns {
+                let graph = lower_fun_decl(&context, fd)
+                    .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+                if let Some(w_cls) = field_read_result(&graph, "w_cls")
+                    && recast_of_var_is_w_root(&graph, w_cls)
+                {
+                    saw = true;
+                }
+            }
+        }
+        assert!(
+            saw,
+            "FieldRead of w_cls must recast onto pyobject::PyObject"
+        );
+    });
 }
 
 fn operand_is_word(graph: &FunctionGraph, arg: &LinkArg) -> bool {

@@ -2459,6 +2459,10 @@ fn function_path_builtin_shim(segments: &[String]) -> Option<&'static str> {
         Some("unichr_as_utf8")
     } else if leaf == shims::GET_RAW_ADDRESS_OF_STRING {
         Some("get_raw_address_of_string")
+    } else if leaf == shims::CHARP2STR {
+        Some("charp2str")
+    } else if leaf == shims::CHARPSIZE2STR {
+        Some("charpsize2str")
     } else if leaf == shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST {
         Some("nonmoving_raw_ptr_for_resizable_list")
     } else {
@@ -2927,7 +2931,26 @@ fn emit_function_path_high_level_op(
                 FlowspaceOp::new("simple_call", vec![bound_method], result),
             ])
         }
-        FunctionPathHighLevel::VecCtor => Ok(vec![FlowspaceOp::new("newlist", vec![], result)]),
+        FunctionPathHighLevel::VecCtor => {
+            // One-word `Vec::new` is the RustVec header (`emit_vec_new`
+            // already rewrites to `ll_vec_newemptylist_*`). A residual
+            // `vec::Vec::new` whose result is that stamped header must
+            // annotate as `SomeRustVec`: kwargs storage is a Tuple of
+            // those headers, and `List ∪ RustVec` has no union arm
+            // (`llannotation.py`).
+            if let Some(header) = op.result.as_ref().and_then(|var| var.concretetype())
+                && let Some(kind) = crate::translator::rtyper::rrustvec::rust_vec_item_kind(&header)
+            {
+                return rust_vec_helper_ops(
+                    majit_ir::rvec::VecOp::NewEmpty,
+                    kind,
+                    arg_hls,
+                    result,
+                    op.result.as_ref(),
+                );
+            }
+            Ok(vec![FlowspaceOp::new("newlist", vec![], result)])
+        }
         FunctionPathHighLevel::NewlistHint => {
             if arg_hls.len() != 1 {
                 return Err(TyperError::message(format!(
@@ -5613,9 +5636,19 @@ pub(crate) fn derive_subject_inputcells(
                 // `SomeString` cell that `project_struct_field_type` assigns it.
                 if class_root
                     .as_deref()
-                    .is_some_and(crate::front::mir::is_str_family_class_root)
+                    .is_some_and(crate::annotator::bookkeeper::struct_root_is_string_family)
                 {
                     cells.push(crate::annotator::model::s_str0());
+                    continue;
+                }
+                // `IdentityKey` is the object pointer (`identitydict.py`).
+                // `project_struct_field_type` already aliases it to
+                // `PyObjectRef`; minting `IdentityKey` here made
+                // `generalize_key` raise `PyObject ∪ IdentityKey`.
+                if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                    && crate::annotator::bookkeeper::is_identity_key_spelling(root)
+                {
+                    cells.push(bk.project_struct_field_type(root));
                     continue;
                 }
                 if let (Some(root), Some(bk)) = (class_root.as_ref(), bookkeeper) {
@@ -5695,11 +5728,13 @@ pub(crate) fn derive_subject_inputcells(
                     // generic struct in a harvested foreign-body crate).
                     // A broad `field_rows` knownness seeds every suffixed
                     // closure / Option and union-fails their `call_once`.
-                    let known = bk
-                        .struct_fields
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|reg| split_struct_template_rows_known(reg, root))
+                    let interned = bk.classdef_for_known_struct_root(root);
+                    let known = interned.is_some()
+                        || bk
+                            .struct_fields
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|reg| split_struct_template_rows_known(reg, root))
                         // A `MutRef<T>` cell is a synthetic one-field class with no
                         // struct-field rows, interned by qualname like its constructor.
                         || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
@@ -5726,13 +5761,23 @@ pub(crate) fn derive_subject_inputcells(
                             cells.push(cell);
                             continue;
                         }
-                        let cd = bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
-                            TyperError::message(format!(
-                                "derive_subject_inputcells: startblock.inputargs[{idx}] \
-                                 ({var:?}) `Ref` receiver root {root:?} failed struct-root \
-                                 ClassDef registration: {e:?}"
-                            ))
-                        })?;
+                        let cd = match interned {
+                            Some(cd) => cd,
+                            None if crate::annotator::bookkeeper::struct_root_is_string_family(
+                                root,
+                            ) =>
+                            {
+                                cells.push(crate::annotator::model::s_str0());
+                                continue;
+                            }
+                            None => bk.getuniqueclassdef_for_struct_root(root).map_err(|e| {
+                                TyperError::message(format!(
+                                    "derive_subject_inputcells: startblock.inputargs[{idx}] \
+                                     ({var:?}) `Ref` receiver root {root:?} failed struct-root \
+                                     ClassDef registration: {e:?}"
+                                ))
+                            })?,
+                        };
                         cells.push(crate::annotator::model::SomeValue::Instance(
                             crate::annotator::model::SomeInstance::new(
                                 Some(cd),
@@ -5846,9 +5891,6 @@ pub(crate) fn derive_subject_inputcells(
 /// `struct_instantiation_suffix`: Entry, plus a generic struct in a
 /// harvested foreign-body crate).
 fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, root: &str) -> bool {
-    if reg.fields.contains_key(root) {
-        return true;
-    }
     // A generic enum instantiation whose arguments are type parameters
     // (`option::Option<v0>`) is the template declaration
     // (`bookkeeper.py` `getuniqueclassdef`). Concrete suffixed Option
@@ -5857,14 +5899,7 @@ fn split_struct_template_rows_known(reg: &crate::front::StructFieldRegistry, roo
     if enum_type_parameter_instantiation(reg, root) {
         return true;
     }
-    if reg.field_rows(root).is_none() {
-        return false;
-    }
-    if reg.owner_in_foreign_body_crate(root) {
-        return true;
-    }
-    let stripped = majit_ir::descr::strip_instantiation_suffix(root);
-    stripped.ends_with("::rordereddict_entries::Entry") || stripped == "Entry"
+    reg.struct_root_rows_known(root)
 }
 
 /// True when `root` is `Enum<template><type-param, …>` of a harvested
@@ -7940,6 +7975,33 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_gcrefopaque_ref_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_gcref");
+        let entry = graph.startblock;
+        let p_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "root".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("header::GCREFOpaque".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("GCREFOpaque argument Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Ref + class_root GCREFOpaque must seed SomePtr(GCREF), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_ccharp_ref_input_as_someptr() {
         let mut graph = LegacyGraph::new("takes_ccharp");
         let entry = graph.startblock;
@@ -8155,6 +8217,95 @@ mod tests {
         assert!(
             value.classdef.is_none(),
             "nonsplit template rows must not intern Foo<i64>"
+        );
+    }
+
+    /// Crate-stripped Input intern spelling after promote dropped the
+    /// stripped harvest key and left the crate-prefixed key plus the
+    /// bare leaf. `lookup_fields` unique-suffix is ambiguous; intern
+    /// still seeds the ClassDef.
+    #[test]
+    fn derive_subject_inputcells_seeds_crate_prefixed_utf8str_as_somestring() {
+        let mut graph = LegacyGraph::new("ll_stringslice_startstop");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "s".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("pyre_object::unicodeobject::Utf8Str".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, recv);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "pyre_object::unicodeobject::Utf8Str".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("length".to_string(), "i64".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("crate-prefixed Utf8Str must seed a definite cell");
+        assert!(
+            matches!(cells[0], SomeValue::String(_)),
+            "Utf8Str harvest rows must seed SomeString, got {:?}",
+            cells[0]
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_interns_crate_stripped_against_crate_prefixed_harvest() {
+        let mut graph = LegacyGraph::new("getitem_str");
+        let entry = graph.startblock;
+        let recv = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "self".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("celldict::ModuleDictStrategy".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, recv);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        let rows = vec![
+            ("storage".to_string(), "ModuleDictStorage".to_string()),
+            ("owner".to_string(), "i64".to_string()),
+        ];
+        fields.fields.insert(
+            "pyre_object::celldict::ModuleDictStrategy".to_string(),
+            rows.clone(),
+        );
+        fields.fields.insert("ModuleDictStrategy".to_string(), rows);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("crate-stripped ModuleDictStrategy must intern");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!(
+                "ModuleDictStrategy must seed SomeInstance, got {:?}",
+                cells[0]
+            )
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("crate-prefixed harvest must intern ModuleDictStrategy");
+        assert!(
+            classdef.borrow().attrs.contains_key("storage"),
+            "intern must project crate-prefixed rows onto the crate-stripped ClassDef"
         );
     }
 
@@ -12164,6 +12315,90 @@ mod tests {
                 .expect("get_raw_address_of_string builtin")
         );
         assert_eq!(translated[0].args[1..], [s]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_charp2str_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let cp = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), cp.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::CHARP2STR.into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Str,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_charp2str marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("charp2str")
+                .expect("charp2str builtin")
+        );
+        assert_eq!(translated[0].args[1..], [cp]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_charpsize2str_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let cp = Hlvalue::Variable(Variable::new());
+        let size = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), cp.clone());
+        value_map.insert(vars[1].clone(), size.clone());
+        value_map.insert(vars[2].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![crate::runtime_names::shims::CHARPSIZE2STR.into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
+                result_ty: ValueType::Str,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_charpsize2str marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("charpsize2str")
+                .expect("charpsize2str builtin")
+        );
+        assert_eq!(translated[0].args[1..], [cp, size]);
         assert_eq!(translated[0].result, result_var);
     }
 

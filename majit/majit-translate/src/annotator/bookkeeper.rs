@@ -1297,6 +1297,8 @@ fn projected_contains_list(value: &SomeValue) -> bool {
 /// `FixedObjectArray._items` is the flexible object array (`rlist.py`
 /// `l.items`). `ItemsBlock` keeps its `capacity` field, so it stays a
 /// struct: projecting it to the item list makes `getattr("capacity")` miss.
+/// `GcEntries` keeps `length` (`entries_allocated_len`), so it stays a
+/// struct too.
 fn fixed_object_array_items_field(canonical: &str) -> Option<&'static str> {
     let leaf = canonical
         .rsplit("::")
@@ -3031,6 +3033,9 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Option<Rc<RefCell<ClassDef>>> {
+        if struct_root_refuses_classdef_intern(root) {
+            return None;
+        }
         if !self.struct_root_is_known(root) {
             return None;
         }
@@ -3048,7 +3053,7 @@ impl Bookkeeper {
         {
             let fields = self.struct_fields.borrow();
             if let Some(reg) = fields.as_ref()
-                && (reg.fields.contains_key(root) || reg.fields.contains_key(canonical.as_str()))
+                && (reg.struct_root_rows_known(root) || reg.struct_root_rows_known(&canonical))
             {
                 return true;
             }
@@ -3098,6 +3103,12 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        // `IdentityKey` is the object pointer (`identitydict.py`); minting
+        // a sibling ClassDef makes `generalize_key` raise
+        // `PyObject ∪ IdentityKey` (`rclass.py` no common base).
+        if is_identity_key_spelling(root) {
+            return self.getuniqueclassdef_for_struct_root("pyobject::PyObject");
+        }
         // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
         // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
         // `SomePtr(GCREF)` and raises (`llannotation.py`
@@ -3105,6 +3116,11 @@ impl Bookkeeper {
         if is_gcref_type_spelling(root) {
             return Err(AnnotatorError::new(format!(
                 "lltype.GcOpaqueType has no ClassDef: {root}"
+            )));
+        }
+        if struct_root_refuses_classdef_new(root) {
+            return Err(AnnotatorError::new(format!(
+                "struct root {root} is not a ClassDef intern"
             )));
         }
         let determinism_trace = crate::determinism_trace_enabled();
@@ -3133,7 +3149,7 @@ impl Bookkeeper {
             if graph.contains(&n) {
                 continue;
             }
-            if is_gcref_type_spelling(&n) {
+            if struct_root_refuses_classdef_new(&n) {
                 continue;
             }
             // Register the node's identity ClassDef in `descs` (RPython's
@@ -3163,7 +3179,7 @@ impl Bookkeeper {
             let referenced: Vec<String> = {
                 let guard = self.struct_fields.borrow();
                 if let Some(reg) = guard.as_ref() {
-                    if let Some(fields) = reg.fields.get(&n) {
+                    if let Some(fields) = reg.intern_field_rows(&n) {
                         let mut out: Vec<String> = Vec::new();
                         for row in fields {
                             if row.name == "__class__" {
@@ -3572,11 +3588,7 @@ impl Bookkeeper {
                     {
                         r.fields.get(n).cloned()
                     } else {
-                        r.fields.get(n).cloned().or_else(|| {
-                            r.fields
-                                .get(majit_ir::descr::strip_generic_args(n).as_ref())
-                                .cloned()
-                        })
+                        r.intern_field_rows(n).map(|rows| rows.to_vec())
                     }
                 }) {
                     Some(f) => f,
@@ -4629,7 +4641,7 @@ impl Bookkeeper {
         // identity). The constructor is that pointer, so the dict key
         // cell is the same nullable instance. A separate `IdentityKey`
         // class has no common base with `PyObject`.
-        if t == "IdentityKey" || t.ends_with("::IdentityKey") {
+        if is_identity_key_spelling(t) {
             return self.project_struct_field_type("PyObjectRef");
         }
         // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
@@ -4976,7 +4988,7 @@ impl Bookkeeper {
             if let Some(items_ty) = items_ty {
                 if let Ok(classdef) = self.getuniqueclassdef_for_struct_root(stripped)
                     && let Some(s_items) =
-                        super::classdesc::ClassDef::about_attribute(&classdef, "_items")
+                        super::classdesc::ClassDef::about_attribute(&classdef, items_field)
                     && matches!(s_items, SomeValue::List(_))
                 {
                     return s_items;
@@ -6401,6 +6413,13 @@ fn registry_declares_spelling(reg: &crate::front::StructFieldRegistry, lookup: &
     unique_path_suffix_identity(reg, lookup).is_some()
 }
 
+/// `identitydict.py IdentityKey`: `repr(transparent)` over `PyObjectRef`.
+/// The key cell is the object (`rclass.py` identity hash); a sibling
+/// ClassDef has no common base with `PyObject`.
+pub(crate) fn is_identity_key_spelling(stripped: &str) -> bool {
+    stripped == "IdentityKey" || stripped.ends_with("::IdentityKey")
+}
+
 /// `lltype.GCREF` and the Rust pointee of `*mut GCREFOpaque`.
 /// `llannotation.py` `lltype_to_annotation` maps GCREF to `SomePtr`;
 /// `__cast_instance_intrinsic` must not mint a `GCREFOpaque` classdef
@@ -6423,6 +6442,96 @@ pub(crate) fn gcref_ptr_annotation() -> super::model::SomeValue {
     crate::translator::rtyper::llannotation::lltype_to_annotation(
         crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
     )
+}
+
+/// rstr `STR` / WTF-8 string-family class roots. Interning these as
+/// `SomeInstance(ClassDef)` makes `String ∪ Instance(Utf8Str)` fail
+/// and `jtransform.py Transformer._handle_stroruni_call` reject the
+/// receiver (`SoU.TO` must be `rstr.STR` or `UNICODE`).
+pub(crate) fn struct_root_is_string_family(root: &str) -> bool {
+    if is_string_spelling(root) {
+        return true;
+    }
+    if crate::front::mir::is_str_family_class_root(root)
+        || crate::front::mir::is_str_oopspec_class_root(root)
+    {
+        return true;
+    }
+    let canonical = majit_ir::descr::canonical_struct_name(root);
+    crate::front::mir::is_str_family_class_root(&canonical)
+        || crate::front::mir::is_str_oopspec_class_root(&canonical)
+}
+
+/// GC-transform owner-root handle (`rbigint::gc::RBigIntGcRoot`).
+/// Return dest and harvest skip ClassDef intern; `New` interns via
+/// [`getuniqueclassdef_for_struct_root`].
+fn is_owner_root_handle(root: &str) -> bool {
+    root == "RBigIntGcRoot" || root.ends_with("::RBigIntGcRoot")
+}
+
+fn struct_root_leaf(root: &str) -> &str {
+    root.rsplit("::").next().unwrap_or(root)
+}
+
+/// `repr(transparent)` integer handles (`eval::FrameAnchor`,
+/// `listobject::ListGuard`, `bytecode::InternalBitFlags`,
+/// `bytecode::oparg::OpArg`). The frontend types the wrapper as its word.
+fn is_integer_handle_root(root: &str) -> bool {
+    matches!(
+        struct_root_leaf(root),
+        "FrameAnchor" | "ListGuard" | "InternalBitFlags" | "OpArg"
+    )
+}
+
+/// `object_array::FixedObjectArray` is a list payload. Return dest and
+/// harvest skip ClassDef intern so `List` binds; `New` intern's via
+/// [`getuniqueclassdef_for_struct_root`].
+fn is_fixed_object_array_root(root: &str) -> bool {
+    struct_root_leaf(root) == "FixedObjectArray"
+}
+
+/// libffi C structs (`ffi_cif`, `ffi_type`, `ffi_closure`). The body
+/// binds a `SomePtr`.
+fn is_c_ffi_struct_root(root: &str) -> bool {
+    matches!(
+        struct_root_leaf(root),
+        "ffi_cif" | "ffi_type" | "ffi_closure"
+    )
+}
+
+/// `Option` / `Result` class roots, including a monomorphization
+/// (`option::Option<NonNull<PyObject>>`). Return dest and harvest skip
+/// ClassDef intern; `New` and enum-payload intern via
+/// [`getuniqueclassdef_for_struct_root`].
+fn is_option_or_result_class_root(root: &str) -> bool {
+    let stripped = majit_ir::descr::strip_generic_args(root);
+    matches!(
+        stripped.rsplit("::").next().unwrap_or(stripped.as_ref()),
+        "Option" | "Result"
+    )
+}
+
+/// Struct roots that must not intern a `ClassDef` as a return dest or
+/// harvest: GCREF erasure, rstr `STR` / WTF-8 string family, owner-root
+/// handles, integer handles, libffi C structs, and Option/Result.
+pub(crate) fn struct_root_refuses_classdef_intern(root: &str) -> bool {
+    is_gcref_type_spelling(root)
+        || struct_root_is_string_family(root)
+        || is_owner_root_handle(root)
+        || is_integer_handle_root(root)
+        || is_c_ffi_struct_root(root)
+        || is_option_or_result_class_root(root)
+        || is_fixed_object_array_root(root)
+}
+
+/// ClassDef intern of a `New` owner. Owner-root handles intern so
+/// `OpKind::New` can `instantiate`; return-stamp and harvest skip them
+/// via [`struct_root_refuses_classdef_intern`].
+fn struct_root_refuses_classdef_new(root: &str) -> bool {
+    is_gcref_type_spelling(root)
+        || struct_root_is_string_family(root)
+        || is_integer_handle_root(root)
+        || is_c_ffi_struct_root(root)
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -6449,7 +6558,7 @@ fn collect_referenced_struct_names(
         | "f64" | "bool" | "String" | "str" | "char" | "()" => return,
         _ => {}
     }
-    if is_gcref_type_spelling(stripped) {
+    if struct_root_refuses_classdef_intern(stripped) {
         return;
     }
     for wrapper in [
@@ -6498,6 +6607,9 @@ fn collect_referenced_struct_names(
             None => rest.trim(),
         };
         collect_referenced_struct_names(inner, reg, out);
+        return;
+    }
+    if struct_root_refuses_classdef_intern(stripped) {
         return;
     }
     if reg.fields.contains_key(stripped) {
@@ -7621,6 +7733,190 @@ mod tests {
             String,
             Vec<String>,
         )>());
+    }
+
+    #[test]
+    fn identity_key_spelling_matches_qualified_and_leaf() {
+        assert!(is_identity_key_spelling("IdentityKey"));
+        assert!(is_identity_key_spelling("identitydict::IdentityKey"));
+        assert!(!is_identity_key_spelling("ObjectKey"));
+        assert!(!is_identity_key_spelling("pyobject::PyObject"));
+    }
+
+    #[test]
+    fn classdef_for_known_struct_root_interns_crate_stripped_against_crate_prefixed() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("storage".to_string(), "i64".to_string())];
+        reg.fields.insert(
+            "pyre_object::celldict::ModuleDictStrategy".to_string(),
+            rows.clone(),
+        );
+        reg.fields.insert("ModuleDictStrategy".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .classdef_for_known_struct_root("celldict::ModuleDictStrategy")
+            .expect("crate-stripped intern of crate-prefixed harvest");
+        assert!(
+            cd.borrow().attrs.contains_key("storage"),
+            "intern_field_rows must project the crate-prefixed layout"
+        );
+    }
+
+    #[test]
+    fn classdef_for_known_struct_root_refuses_utf8str_harvest() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![
+            ("hash".to_string(), "i64".to_string()),
+            ("length".to_string(), "i64".to_string()),
+        ];
+        for root in [
+            "unicodeobject::Utf8Str",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+            "bytesobject::BytesBlock",
+            "pyre_object::bytesobject::BytesBlock",
+            "rbigint::gc::RBigIntGcRoot",
+            "RBigIntGcRoot",
+            "eval::FrameAnchor",
+            "FrameAnchor",
+            "listobject::ListGuard",
+            "ListGuard",
+            "InternalBitFlags",
+            "bytecode::oparg::OpArg",
+            "OpArg",
+            "option::Option<NonNull<PyObject>>",
+            "Result<*mut PyObject,PyError>",
+            "ffi_cif",
+            "libffi::raw::ffi_cif",
+            "object_array::FixedObjectArray",
+            "FixedObjectArray",
+        ] {
+            reg.fields.insert(root.to_string(), rows.clone());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        for root in [
+            "unicodeobject::Utf8Str",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+            "bytesobject::BytesBlock",
+            "pyre_object::bytesobject::BytesBlock",
+            "rbigint::gc::RBigIntGcRoot",
+            "RBigIntGcRoot",
+            "eval::FrameAnchor",
+            "FrameAnchor",
+            "listobject::ListGuard",
+            "ListGuard",
+            "InternalBitFlags",
+            "bytecode::oparg::OpArg",
+            "OpArg",
+            "option::Option<NonNull<PyObject>>",
+            "Result<*mut PyObject,PyError>",
+            "ffi_cif",
+            "libffi::raw::ffi_cif",
+            "object_array::FixedObjectArray",
+            "FixedObjectArray",
+        ] {
+            assert!(
+                bk.classdef_for_known_struct_root(root).is_none(),
+                "{root} harvest rows must not intern a ClassDef"
+            );
+        }
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_owner_root_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "rbigint::gc::RBigIntGcRoot".to_string(),
+            vec![("slot".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("rbigint::gc::RBigIntGcRoot")
+                .is_none(),
+            "return-stamp harvest must still refuse the owner-root handle"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("rbigint::gc::RBigIntGcRoot")
+            .expect("New of an owner-root handle interns a ClassDef");
+        assert!(
+            cd.borrow().attrs.contains_key("slot"),
+            "New intern must project the owner-root layout"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_refuses_integer_handle_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "eval::FrameAnchor".to_string(),
+            vec![("depth".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.getuniqueclassdef_for_struct_root("eval::FrameAnchor")
+                .is_err(),
+            "New of a repr(transparent) integer handle must not intern a ClassDef"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_fixed_object_array_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "object_array::FixedObjectArray".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("_items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("object_array::FixedObjectArray")
+                .is_none(),
+            "return-stamp harvest must still refuse FixedObjectArray"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("object_array::FixedObjectArray")
+            .expect("New of FixedObjectArray interns a ClassDef");
+        assert!(
+            cd.borrow().attrs.contains_key("len"),
+            "New intern must project the FixedObjectArray layout"
+        );
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_interns_option_new() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option<NonNull<PyObject>>".to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        assert!(
+            bk.classdef_for_known_struct_root("option::Option<NonNull<PyObject>>")
+                .is_none(),
+            "return-stamp harvest must still refuse Option"
+        );
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("option::Option<NonNull<PyObject>>")
+            .expect("New of Option interns a ClassDef for enum payload");
+        assert!(
+            cd.borrow().attrs.contains_key("__pos_0"),
+            "New intern must project the Option payload layout"
+        );
     }
 
     #[test]

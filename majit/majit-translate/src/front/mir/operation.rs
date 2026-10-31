@@ -1890,6 +1890,31 @@ impl<'a> Lowering<'a> {
             .or_else(|| raw_ptr_pointee_container_root(node, self.llbc))
     }
 
+    /// Class root of a registered-GC pointer field (`PyObjectRef` /
+    /// `*mut PyObject`). `None` for flavor-raw overlays (`MapNode`),
+    /// GCREF erasure, list/tuple/string owners (`rlist` / `rtuple` /
+    /// `rstr`), and non-pointer types. Overlay `SomePtr.getattr` of a
+    /// GCREF field (`overlay_field_lltype`) is `lltype.cast_opaque_ptr`
+    /// onto this instance (`lltype.py` `ann_cast_opaque_ptr`); instance
+    /// getfield of a typed pointer field is already SomeInstance.
+    pub(in crate::front::mir) fn registered_gc_ptr_field_root(&self, ty: &TyRef) -> Option<String> {
+        let root = registered_gc_ptr_class_root_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )?;
+        if majit_ir::descr::is_list_container_spelling(&root)
+            || majit_ir::descr::is_shaped_tuple_name(&root)
+            || is_str_family_class_root(&root)
+            || crate::annotator::bookkeeper::is_gcref_type_spelling(&root)
+        {
+            return None;
+        }
+        Some(root)
+    }
+
     /// Re-express a GC-reference value at a statically-known RPython
     /// instance boundary.  A `RawPtr` of a registered GC struct is
     /// already `Ref(Some(root))` from [`tyref_to_value_type_with`];
@@ -2792,7 +2817,7 @@ impl<'a> Lowering<'a> {
                     // not keep `SomePtr(GCREF)`. A flavor-raw dest is
                     // int-banked (`rclass.py getgcflavor`); folding would
                     // leave a GC `*const ()` actual against FUNC.ARGS Int.
-                    if matches!(dst_kind, ValueType::Ref(_))
+                    if matches!(dst_kind, ValueType::Ref(_) | ValueType::Str)
                         && flavor_raw_pointer_class_root(
                             dest_ty,
                             self.llbc,
@@ -2819,7 +2844,7 @@ impl<'a> Lowering<'a> {
                     // pointer and narrow it to the destination class.
                     // Returning the pre-cast `*const ()` leaves a
                     // classdef-less instance beside `Instance(PyObject)`.
-                    if matches!(dst_kind, ValueType::Ref(_))
+                    if matches!(dst_kind, ValueType::Ref(_) | ValueType::Str)
                         && let Some(orig) = self.address_cast_pointer(&arg)
                     {
                         match self.ptr_cast_marker(
@@ -2858,6 +2883,13 @@ impl<'a> Lowering<'a> {
                         && !graph_is_items_block_base_accessor(&self.graph.name)
                     {
                         return Ok((None, self.emit_gc_ref_as_ccharp(mir_bb, arg)));
+                    }
+                    // Int / CCHARP used as `&str` is `rffi.charp2str`, not
+                    // 1-arg `cast_int_to_ptr` (`Ptr(MAJIT_REF_OPAQUE)`).
+                    if matches!(dst_kind, ValueType::Str)
+                        && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    {
+                        return Ok((None, self.emit_int_word_as_rstr_str(mir_bb, arg)));
                     }
                     let dst_kind = if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                         && let Some(raw) = raw_scalar_address_value_type(dest_ty, self.llbc)
@@ -3252,6 +3284,13 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 );
+                // Int / CCHARP used as `&str` is `rffi.charp2str`, not
+                // 1-arg `cast_int_to_ptr` (`Ptr(MAJIT_REF_OPAQUE)`).
+                if matches!(dst_kind, ValueType::Str)
+                    && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                {
+                    return Ok((None, self.emit_int_word_as_rstr_str(mir_bb, v)));
+                }
                 let dest_raw_addr = ty_is_raw_address(
                     &ty,
                     self.llbc,
@@ -4571,6 +4610,19 @@ impl<'a> Lowering<'a> {
             return None;
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
+            // `lltype.GCREF` is SomePtr (`llannotation.py` `lltype_to_annotation`).
+            // Interning `GCREFOpaque` as a ClassDef makes the recast result
+            // an empty-struct Instance (Void on the real rtyper path) that
+            // `pairtype(SomePtr, SomeObject).union` refuses against EmptyDict
+            // `null_mut` (`kwargsdict.py` / `identitydict.py` `get_empty_storage`).
+            // ByteStr `"GCREF"` + `Ref(None)` is the `iter_next` GCREF recast.
+            if crate::annotator::bookkeeper::is_gcref_type_spelling(&root) {
+                return Some(crate::model::cast_instance_call_result(
+                    "GCREF",
+                    arg.clone(),
+                    ValueType::Ref(None),
+                ));
+            }
             // ByteStr is the intern leaf (`Function`, `PyObject`):
             // `bookkeeper.py` `getuniqueclassdef`, `stamp_named_ref_call_dests`.
             // `result_ty` is the crate-relative layout owner when that path
@@ -6688,24 +6740,33 @@ impl<'a> Lowering<'a> {
                                 }) {
                                     None
                                 } else {
-                                    stripped.and_then(|n| {
-                                        raw_ptr_pointee_class_root_with(
-                                            n,
-                                            self.llbc,
-                                            self.tombstoned_leaves,
-                                        )
-                                        .or_else(|| {
-                                            let root = adt_node_class_root_with(
+                                    // `from_obj` yields `&'static mut Self`
+                                    // (`pyre_class`). Deref of that borrow is
+                                    // the same instance narrow as `*mut Self`;
+                                    // leaving it uncast reads `maxlen` /
+                                    // `size` / `ptr` off `PyObject`.
+                                    self.registered_gc_ptr_field_root(&pre.ty).or_else(|| {
+                                        stripped.and_then(|n| {
+                                            raw_ptr_pointee_class_root_with(
                                                 n,
                                                 self.llbc,
                                                 self.tombstoned_leaves,
-                                            )?;
-                                            // `&ObjectKey` is the dict key the
-                                            // `eq` body reads `.hash` from. Other
-                                            // structs stay uncast: a blanket
-                                            // narrow paints `Tuple` onto values
-                                            // that are already tuples.
-                                            (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
+                                            )
+                                            .or_else(
+                                                || {
+                                                    let root = adt_node_class_root_with(
+                                                        n,
+                                                        self.llbc,
+                                                        self.tombstoned_leaves,
+                                                    )?;
+                                                    // `&ObjectKey` is the dict key the
+                                                    // `eq` body reads `.hash` from. Other
+                                                    // structs stay uncast: a blanket
+                                                    // narrow paints `Tuple` onto values
+                                                    // that are already tuples.
+                                                    (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
+                                                },
+                                            )
                                         })
                                     })
                                 }
@@ -6805,6 +6866,25 @@ impl<'a> Lowering<'a> {
                     let read_rstr_attr = self.exception_disc_info_for_ty(&inner.ty).is_some()
                         && (tyref_is_by_value_alloc_string(&field_ty, self.llbc)
                             || tyref_is_by_value_alloc_string(&place_ty, self.llbc));
+                    // Overlay raw storage (`declared_raw_adt_node`):
+                    // `SomePtr.getattr` of a GCREF field is
+                    // `lltype.cast_opaque_ptr` onto the instance
+                    // (`lltype.py` `ann_cast_opaque_ptr`). A GC
+                    // instance's typed pointer field is already
+                    // SomeInstance; a second
+                    // `__cast_instance_intrinsic` is the double
+                    // narrow `jtransform.py`
+                    // `rewrite_op_cast_opaque_ptr` aliases away.
+                    let overlay_gcref_getattr = tyref_node(&inner.ty, self.llbc)
+                        .and_then(|n| {
+                            declared_raw_adt_node(
+                                n,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                self.immutable_fields,
+                            )
+                        })
+                        .is_some();
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -6963,12 +7043,48 @@ impl<'a> Lowering<'a> {
                             }
                             return Ok(res);
                         }
+                        let recast_root = self
+                            .registered_gc_ptr_field_root(&place_ty)
+                            .or_else(|| self.option_payload_instance_class_root(&place_ty))
+                            .or_else(|| {
+                                tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
+                            })
+                            .unwrap_or_else(|| W_ROOT_CLASS_ROOT.to_string());
                         let narrowed = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
-                            kind: crate::model::cast_instance_call(W_ROOT_CLASS_ROOT, res),
+                            kind: crate::model::cast_instance_call(recast_root, res),
+                        });
+                        return Ok(narrowed);
+                    }
+                    // Overlay `w_cls` is GCREF (`overlay_field_lltype`).
+                    // Recast that SomePtr getattr onto the instance so
+                    // `instance_getclass` can merge it with
+                    // `(*obj).w_class` (`llannotation.py`
+                    // `pairtype(SomePtr, SomeObject).union`). Flavor-raw
+                    // overlay pointers (`terminator`) stay `SomePtr`.
+                    // Instance getfield of a typed `*const ClassObject` /
+                    // `*mut PyFrame` is already SomeInstance: one cast
+                    // at the GCREF → instance boundary
+                    // (`jtransform.py` `rewrite_op_cast_opaque_ptr`).
+                    if overlay_gcref_getattr
+                        && !dyn_vtable
+                        && !tyref_is_dyn_pointer(&field_ty, self.llbc)
+                        && !tyref_is_dyn_pointer(&place_ty, self.llbc)
+                        && !tyref_is_inline_fat_ptr(&field_ty, self.llbc)
+                        && !tyref_is_inline_fat_ptr(&place_ty, self.llbc)
+                        && let Some(root) = self
+                            .registered_gc_ptr_field_root(&place_ty)
+                            .or_else(|| self.registered_gc_ptr_field_root(&field_ty))
+                    {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: crate::model::cast_instance_call(root, res),
                         });
                         return Ok(narrowed);
                     }
@@ -8077,6 +8193,10 @@ impl<'a> Lowering<'a> {
         // `UnsafeCell<T>` is `#[repr(transparent)]` but the foreign decl
         // is `Opaque`, so the scalar-transparent table never records
         // it. One operand is the cell word.
+        // A transparent GC handle wrapping `*mut registered` keeps the
+        // wrapper class for value typing (`tyref_transparent_inner_value_type`
+        // is None). Construction is still that one pointer word; the
+        // Operand arm recasts it through `retag_error_carrier`.
         if n_operands == 1 && tyref_is_unsafecell(dest_ty, self.llbc) {
             return Ok(AggregateShape::Operand {
                 index: 0,
@@ -8091,6 +8211,7 @@ impl<'a> Lowering<'a> {
             &self.raw_alloc_flavor_structs,
         )
         .is_some()
+            || self.ty_is_error_carrier(dest_ty)
         {
             if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
                 if index >= n_operands {
@@ -8224,11 +8345,14 @@ impl<'a> Lowering<'a> {
                     || ((result_owner == "Tuple" || result_owner == "Array")
                         && name.starts_with("__pos_"))
                     || crate::front::result_exc::type_spelling_is_uninhabited(&field_ty);
+                // Error-carrier field 0 stores the inner object class
+                // (`PyErrorObject`), matching `recast_error_carrier_field_store`.
                 AggregateField {
                     name,
                     void,
                     narrow_root: handle_store_root
                         .clone()
+                        .or_else(|| self.error_carrier_inner_class_root(dest_ty))
                         .or_else(|| self.typed_ref_field_narrow_root(declared_ty)),
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)

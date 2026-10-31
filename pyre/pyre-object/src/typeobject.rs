@@ -728,7 +728,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         );
         let _ = crate::gc_roots::pin_root(name as PyObjectRef);
         let qualname =
-            crate::gc_storage::gc_alloc_young_storage_box(name_value, name_storage_gc_type_id());
+            crate::gc_storage::gc_alloc_young_storage_box(name_value, name_storage_gc_type_id())
+                as *mut String;
         let name = crate::gc_roots::shadow_stack_get(save_point + 2) as *mut String;
         (name, qualname)
     };

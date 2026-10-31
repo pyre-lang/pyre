@@ -7216,6 +7216,28 @@ mod tests {
     }
 
     #[test]
+    fn integer_getattr_pos0_is_the_word() {
+        let ann = mk_ann();
+        let mut v = Variable::named("flags");
+        ann.setbinding(&mut v, SomeValue::Integer(SomeInteger::new(true, true)));
+        let hl = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_0"))),
+            ],
+        );
+        let result = hl
+            .consider(&ann)
+            .expect("integer __pos_0 getattr must succeed")
+            .unwrap();
+        assert!(
+            matches!(result, SomeValue::Integer(_)),
+            "repr(transparent) integer __pos_0 is the word, got {result:?}"
+        );
+    }
+
+    #[test]
     fn classed_instance_getattr_is_null_dispatch() {
         // The ptr-method arm answers a classed receiver (`SomeInstance(cd)`
         // from `cast_pointer`) only while the class hierarchy defines no

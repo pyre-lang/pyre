@@ -640,6 +640,46 @@ impl StructFieldRegistry {
         self.lookup_fields(owner)
     }
 
+    /// Rows used to intern a struct-root ClassDef.
+    ///
+    /// Exact harvest key first, then a unique crate-prefixed key of a
+    /// crate-stripped intern spelling (`celldict::ModuleDictStrategy` vs
+    /// `pyre_object::celldict::ModuleDictStrategy` after
+    /// `promote_cross_crate_stripped_keys` drops the stripped alias). The
+    /// bare leaf (`ModuleDictStrategy`) is a suffix of that intern spelling
+    /// and would make [`Self::unique_suffix_owner_key`] ambiguous, so it
+    /// is ignored here. [`Self::lookup_fields`] remains the template-row
+    /// fallback (`RangeInclusive<i64>` → `RangeInclusive`).
+    pub(crate) fn intern_field_rows(&self, owner: &str) -> Option<&[FieldRow]> {
+        if let Some(rows) = self.fields.get(owner) {
+            return Some(rows.as_slice());
+        }
+        if let Some(key) = self.unique_longer_owner_key(owner) {
+            return self.fields.get(key).map(Vec::as_slice);
+        }
+        self.lookup_fields(owner)
+    }
+
+    /// Internable struct-root spelling: an unsuffixed harvest hit
+    /// (exact or crate-prefixed), or the split-struct template set
+    /// (`struct_instantiation_suffix`: Entry, plus a generic struct in a
+    /// harvested foreign-body crate). A broad `field_rows` knownness
+    /// seeds every suffixed closure / Option and union-fails their
+    /// `call_once`.
+    pub(crate) fn struct_root_rows_known(&self, root: &str) -> bool {
+        if self.intern_field_rows(root).is_none() {
+            return false;
+        }
+        if majit_ir::descr::strip_instantiation_suffix(root) == root {
+            return true;
+        }
+        if self.owner_in_foreign_body_crate(root) {
+            return true;
+        }
+        let stripped = majit_ir::descr::strip_instantiation_suffix(root);
+        stripped.ends_with("::rordereddict_entries::Entry") || stripped == "Entry"
+    }
+
     pub fn is_enum_base(&self, owner: &str) -> bool {
         self.lookup_fields(owner)
             .is_some_and(|rows| matches!(rows, [row] if row.name == "__discriminant"))
@@ -877,6 +917,38 @@ impl StructFieldRegistry {
             self.foreign_body_roots.iter().any(|r| r == root)
                 && crate_relative_struct_path(ks.as_ref(), &self.foreign_body_roots) == tail
         })
+    }
+
+    /// Registry key that is a strict path-prefix of `owner` (crate-prefixed
+    /// harvest of a crate-stripped intern spelling). The bare leaf alias is
+    /// a suffix of `owner` and is ignored.
+    fn unique_longer_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
+        let stripped = majit_ir::descr::strip_generic_args(owner);
+        let owner = stripped.as_ref();
+        let leaf = owner.rsplit("::").next().unwrap_or(owner);
+        self.ensure_field_path_index();
+        let matched = {
+            let index = self.field_path_index.borrow();
+            let index = index.as_ref().expect("path index built");
+            let mut found: Option<String> = None;
+            let mut ambiguous = false;
+            if let Some(bucket) = index.by_last.get(leaf) {
+                for key in bucket {
+                    if !is_path_suffix(key, owner) {
+                        continue;
+                    }
+                    if found.is_some() {
+                        ambiguous = true;
+                        break;
+                    }
+                    found = Some(key.clone());
+                }
+            }
+            if ambiguous { None } else { found }
+        }?;
+        self.fields
+            .get_key_value(&matched)
+            .map(|(key, _)| key.as_str())
     }
 
     fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
@@ -1380,6 +1452,37 @@ mod tests {
         );
         assert_eq!(reg.field_name_at("UnknownOwner", 0), None);
         assert_eq!(reg.field_name_at("PyError", 1), None);
+    }
+
+    /// Crate-stripped intern vs crate-prefixed harvest plus the bare leaf
+    /// alias: `lookup_fields` unique-suffix is ambiguous, `intern_field_rows`
+    /// still finds the longer key.
+    #[test]
+    fn intern_field_rows_prefers_crate_prefixed_over_bare_leaf() {
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("owner".to_string(), "i64".to_string())];
+        reg.fields.insert(
+            "pyre_object::celldict::ModuleDictStrategy".to_string(),
+            rows.clone(),
+        );
+        reg.fields.insert("ModuleDictStrategy".to_string(), rows);
+        assert!(
+            reg.field_rows("celldict::ModuleDictStrategy").is_none(),
+            "unique-suffix of the intern spelling vs the leaf alias is ambiguous"
+        );
+        let interned = reg
+            .intern_field_rows("celldict::ModuleDictStrategy")
+            .expect("crate-prefixed harvest of the crate-stripped intern spelling");
+        assert_eq!(interned[0].name, "owner");
+        assert!(reg.struct_root_rows_known("celldict::ModuleDictStrategy"));
+        reg.fields.insert(
+            "Foo".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        assert!(
+            !reg.struct_root_rows_known("Foo<i64>"),
+            "nonsplit template rows must not intern a suffixed local struct"
+        );
     }
 
     fn free_fn(name: &str) -> SemanticFunction {

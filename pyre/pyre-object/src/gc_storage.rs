@@ -68,6 +68,11 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
 /// (`MAJIT_GC_YOUNG_RAWMALLOC=0`) is born old instead, and the barrier after
 /// the write keeps a filled table's children reachable in that case; it is a
 /// no-op on a young header.
+///
+/// The result is [`crate::gc_hook::GCREF`] (`rerased.py` `_some_erased`,
+/// `new_erasing_pair` `erase`). `get_empty_storage` returns that word
+/// (`identitydict.py` `self.erase(d)`); a typed user recasts to `*mut T`
+/// (`unerase`).
 // `specialize:argtype(0)` (`specialize.py` `specialize_argtype`) gives each
 // payload shape its own residual graph, matching [`gc_alloc_storage_box`].
 // Charon extracts with `monomorphize: false`, so a generic body without
@@ -75,7 +80,7 @@ pub fn gc_alloc_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
 #[majit_macros::specialize_argtype(0)]
 #[majit_macros::dont_look_inside]
 #[inline(never)]
-pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
+pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> crate::gc_hook::GCREF {
     if tid != 0 {
         let raw = crate::gc_hook::try_gc_alloc_young_nonmoving_no_collect_raw(
             tid,
@@ -86,10 +91,10 @@ pub fn gc_alloc_young_storage_box<T: 'static>(value: T, tid: u32) -> *mut T {
                 std::ptr::write(raw as *mut T, value);
             }
             crate::gc_hook::try_gc_write_barrier_managed(raw);
-            return raw as *mut T;
+            return raw;
         }
     }
-    crate::lltype::malloc_raw(value)
+    crate::lltype::malloc_raw(value) as crate::gc_hook::GCREF
 }
 
 /// GC-sweep destructor for a storage box built by
