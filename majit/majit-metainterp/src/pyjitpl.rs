@@ -14563,8 +14563,31 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_entry_on_driver(jd_no, green_key)?
             .meta
             .clone();
-        let mut result = self.execute_assembler_at_dispatch_key(
+        Some(self.run_compiled_detailed_with_token_on_driver(
+            jd_no,
+            green_key,
             &token,
+            meta,
+            live_values,
+            dispatch_key,
+        ))
+    }
+
+    /// [`Self::run_compiled_detailed_with_values_on_driver`] for a caller
+    /// that already read the cell's token and the metadata it runs under:
+    /// `warmstate.py maybe_compile_and_run` hands the token it read to
+    /// `execute_assembler` without consulting the cell again.
+    pub fn run_compiled_detailed_with_token_on_driver(
+        &mut self,
+        jd_no: usize,
+        green_key: u64,
+        token: &JitCellToken,
+        meta: std::sync::Arc<M>,
+        live_values: &[Value],
+        dispatch_key: u32,
+    ) -> CompileResult<M> {
+        let mut result = self.execute_assembler_at_dispatch_key(
+            token,
             green_key,
             Some(meta),
             live_values,
@@ -14593,7 +14616,7 @@ impl<M: Clone> MetaInterp<M> {
                     Self::decode_exit_slots(&self.backend, frame, fd.fail_arg_types());
             }
         }
-        Some(result)
+        result
     }
 
     /// `compile.py must_compile` reads the failing GUARD_VALUE's operand off the
@@ -15973,6 +15996,22 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// [`Self::resolve_cell_key_on_driver`] for a caller holding the greens
+    /// themselves (`JitCell.get_jitcell(*greenargs)`).
+    #[inline]
+    pub fn resolve_cell_key_with_greenargs_on_driver(
+        &self,
+        jd_no: usize,
+        green_key_hash: u64,
+        greenargs: &[i64],
+        types: &[majit_ir::GreenType],
+    ) -> u64 {
+        match self.warm_state_ref_for_driver(jd_no) {
+            Some(warm) => warm.resolve_cell_key_with_greenargs(green_key_hash, greenargs, types),
+            None => green_key_hash,
+        }
+    }
+
     /// Check if any guard in the compiled trace has Float-typed fail_args.
     /// Used to gate bridge compilation: traces with Float guards have
     /// type metadata issues that cause crashes on bridge guard failures.
@@ -16370,8 +16409,12 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `compile.py` `send_loop_to_backend` / `compile_tmp_callback` register
-    /// the token on `warmrunnerdesc.memory_manager`.
-    fn keep_compiled_token_alive(&mut self, token: &std::sync::Arc<majit_backend::JitCellToken>) {
+    /// the token on `warmrunnerdesc.memory_manager`; `warmstate.py
+    /// execute_assembler` keeps the token it was handed alive the same way.
+    pub(crate) fn keep_compiled_token_alive(
+        &mut self,
+        token: &std::sync::Arc<majit_backend::JitCellToken>,
+    ) {
         self.memory_manager.keep_loop_alive(token);
     }
 
@@ -22797,7 +22840,10 @@ pub enum RunResult<M> {
 
 pub enum DetailedDriverRunOutcome {
     Finished {
-        typed_values: Vec<Value>,
+        /// The exit slots as decoded, inline for a short exit: a portal
+        /// FINISH hands back one value, and copying it into a heap `Vec`
+        /// cost an allocation and a free on every compiled return.
+        typed_values: crate::compile::ExitValues,
         via_blackhole: bool,
         /// When true, Int-typed values are raw integers (not boxed pointers).
         raw_int_result: bool,

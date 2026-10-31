@@ -9835,7 +9835,7 @@ impl<S: JitState> JitDriver<S> {
         if result.is_finish {
             // Taken, not copied: this arm returns below, so the exit values in
             // `result` have no reader past this point.
-            let typed_values = std::mem::take(&mut result.typed_values).into_vec();
+            let typed_values = std::mem::take(&mut result.typed_values);
             let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
             drop(result);
             self.restore_trace_vable_ptr(saved_vable_ptr);
@@ -9885,6 +9885,45 @@ impl<S: JitState> JitDriver<S> {
         green_key: u64,
         target_pc: usize,
         state: &mut S,
+        env: &S::Env,
+        pre_run: impl FnOnce(),
+    ) -> DetailedDriverRunOutcome {
+        let Some(procedure_token) = self
+            .meta
+            .get_procedure_token_on_driver(self.index().unwrap_or(0), green_key)
+        else {
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[jit][run-compiled-abort] key={} reason=missing-procedure-token target_pc={}",
+                    green_key, target_pc
+                );
+            }
+            return DetailedDriverRunOutcome::Abort {
+                restored: false,
+                via_blackhole: false,
+            };
+        };
+        self.run_compiled_detailed_with_bridge_token(
+            green_key,
+            &procedure_token,
+            target_pc,
+            state,
+            env,
+            pre_run,
+        )
+    }
+
+    /// [`Self::run_compiled_detailed_with_bridge_keyed`] on the token the
+    /// caller's entry decision read off the cell. `warmstate.py
+    /// maybe_compile_and_run` carries that one token out through
+    /// `EnterJitAssembler(procedure_token, *args)`, and `execute_assembler`
+    /// runs it and keeps it alive without asking the cell again.
+    pub fn run_compiled_detailed_with_bridge_token(
+        &mut self,
+        green_key: u64,
+        procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
         _env: &S::Env,
         pre_run: impl FnOnce(),
     ) -> DetailedDriverRunOutcome {
@@ -9904,12 +9943,14 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         };
-        let descriptor = self.driver_descriptor_for(state, &meta);
+        // The cached descriptor's `Arc` stays on the driver, as on the
+        // back-edge entry: cloning it here bumped and dropped the count on
+        // every call.
+        let descriptor_ptr = self.driver_descriptor_ptr(state, &meta);
+        let descriptor = unsafe { descriptor_ptr.map(|ptr| &*ptr) };
         // Resolved here with the descriptor and carried to both ends of
         // the run; see `sync_before` for why it is not asked for twice.
-        let vable = descriptor
-            .as_deref()
-            .and_then(JitDriverStaticData::virtualizable);
+        let vable = descriptor.and_then(JitDriverStaticData::virtualizable);
         // warmstate.py:482-511: RPython enters execute_token directly
         // when the green key matches — no is_compatible check.
         // pyre still needs this gate because compiled code reads
@@ -9946,7 +9987,7 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        let live_values = state.extract_live_values(&meta);
+        let mut live_values = state.extract_live_values(&meta);
         if crate::debug::have_debug_prints() {
             let vals: Vec<String> = live_values
                 .iter()
@@ -9959,7 +10000,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
         if !Self::live_values_match_descriptor(
-            descriptor.as_deref(),
+            descriptor,
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
@@ -9978,9 +10019,17 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
-        let Some(live_values) =
-            self.extend_compiled_live_values(green_key, state, &meta, vable, live_values)
-        else {
+        let mut boxes = Vec::new();
+        let mut array_lengths = Vec::new();
+        if !self.extend_compiled_live_values_into(
+            procedure_token,
+            state,
+            &meta,
+            vable,
+            &mut live_values,
+            &mut boxes,
+            &mut array_lengths,
+        ) {
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][run-compiled-abort] key={} reason=extend-live-values target_pc={}",
@@ -9992,26 +10041,16 @@ impl<S: JitState> JitDriver<S> {
                 restored: false,
                 via_blackhole: false,
             };
-        };
+        }
         pre_run();
-        let Some(mut result) = self.meta.run_compiled_detailed_with_values_on_driver(
+        let mut result = self.meta.run_compiled_detailed_with_token_on_driver(
             self.index().unwrap_or(0),
             green_key,
+            procedure_token,
+            meta,
             &live_values,
             0,
-        ) else {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit][run-compiled-abort] key={} reason=backend-run target_pc={}",
-                    green_key, target_pc
-                );
-            }
-            self.restore_trace_vable_ptr(saved_vable_ptr);
-            return DetailedDriverRunOutcome::Abort {
-                restored: false,
-                via_blackhole: false,
-            };
-        };
+        );
 
         let is_finish = result.is_finish;
         let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
@@ -10037,13 +10076,12 @@ impl<S: JitState> JitDriver<S> {
         let savedata = result.savedata;
         let deadframe = result.deadframe.take();
 
-        // memmgr.py: keep_loop_alive(loop_token) on the executing
-        // driver's warmstate, matching execute_assembler.
-        self.meta
-            .keep_loop_alive_on_driver(self.index().unwrap_or(0), green_key);
+        // `warmstate.py execute_assembler`: `memory_manager.keep_loop_alive`
+        // on the token it ran.
+        self.meta.keep_compiled_token_alive(procedure_token);
 
         if is_finish {
-            let typed_values = std::mem::take(&mut result.typed_values).into_vec();
+            let typed_values = std::mem::take(&mut result.typed_values);
             drop(result);
             self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Finished {
@@ -11184,6 +11222,23 @@ impl<S: JitState> JitDriver<S> {
             self.index().unwrap_or(0),
             green_key_hash,
             Some(&make_green_key),
+        )
+    }
+
+    /// [`Self::resolve_cell_key`] for a door that holds the greens:
+    /// `JitCell.get_jitcell(*greenargs)` compares them in place.
+    #[inline]
+    pub fn resolve_cell_key_with_greenargs(
+        &self,
+        green_key_hash: u64,
+        greenargs: &[i64],
+        types: &[majit_ir::GreenType],
+    ) -> u64 {
+        self.meta.resolve_cell_key_with_greenargs_on_driver(
+            self.index().unwrap_or(0),
+            green_key_hash,
+            greenargs,
+            types,
         )
     }
 

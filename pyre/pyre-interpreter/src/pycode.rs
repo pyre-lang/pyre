@@ -4468,15 +4468,28 @@ pub fn first_traceable_index(code: &crate::CodeObject) -> usize {
 /// The scan reads only opcode families, which specialization keeps, so the
 /// answer is a function of the code object: `@jit.elidable`, like
 /// [`crate::pyframe::npure_cellvars`].  `PyFrame::next_instr` calls it on
-/// every dispatch of a frame that has not run an instruction yet.
+/// every dispatch of a frame that has not run an instruction yet, so it
+/// stops where [`first_traceable_index`] does: `RETURN_GENERATOR` is part of
+/// the prologue ahead of that `RESUME`, and a code object that reaches it
+/// without one has none.  Scanning past it walked the whole body of every
+/// plain function on each call.
 #[majit_macros::elidable_cannot_raise]
 pub fn after_return_generator_index(code: &crate::CodeObject) -> usize {
     use crate::bytecode::Instruction;
+    use crate::bytecode::oparg::{ResumeContext, ResumeLocation};
 
     let mut index = 0;
     while let Some(op) = base_op(code, index) {
-        if matches!(op, Instruction::ReturnGenerator) {
-            return index + 1;
+        match op {
+            Instruction::ReturnGenerator => return index + 1,
+            Instruction::Resume { .. }
+                if u32::from(u8::from(code.instructions[index].arg))
+                    & ResumeContext::LOCATION_MASK
+                    != u32::from(ResumeLocation::AtGenExprStart.as_u8()) =>
+            {
+                return 0;
+            }
+            _ => {}
         }
         index += 1;
     }
