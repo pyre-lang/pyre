@@ -119,6 +119,41 @@ fn errno_w_type(class_name: &str) -> PyObjectRef {
         .expect("OSError must be installed")
 }
 
+/// interp_signal.py `setitimer` unwrap `float` (`gateway_float_w` / `space.float_w`).
+/// An int instance converts by payload (`W_IntObject.float_w`); a subclass shares
+/// the int layout (`is_int` reads `ob_type`), so its `__float__` is not consulted.
+/// Other objects fall through to `float_w`.
+#[cfg(all(unix, feature = "host_env"))]
+fn itimer_seconds_w(w_obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    unsafe {
+        if pyre_object::is_float(w_obj) {
+            return Ok(pyre_object::w_float_get_value(w_obj));
+        }
+        if pyre_object::pyobject::is_bool(w_obj) {
+            return Ok(if pyre_object::boolobject::w_bool_get_value(w_obj) {
+                1.0
+            } else {
+                0.0
+            });
+        }
+        if pyre_object::pyobject::is_int(w_obj) {
+            return Ok(pyre_object::w_int_get_value(w_obj) as f64);
+        }
+        if pyre_object::pyobject::is_long(w_obj) {
+            let f = pyre_object::longobject::jit_bigint_to_f64_or_inf(
+                pyre_object::longobject::w_long_get_value(w_obj),
+            );
+            if !f.is_finite() {
+                return Err(crate::PyError::overflow_error(
+                    "int too large to convert to float",
+                ));
+            }
+            return Ok(f);
+        }
+    }
+    crate::baseobjspace::float_w(w_obj)
+}
+
 /// interp_signal.py `timeval_from_double`.
 #[cfg(all(unix, feature = "host_env"))]
 fn timeval_from_double(d: f64) -> libc::timeval {
@@ -940,6 +975,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         w_fd, w_warn => crate::baseobjspace::is_true(w_warn)
                     )?
                 };
+                // interp_signal.py `set_wakeup_fd` — `threadlocals.signals_enabled()`.
+                let ec = crate::call::getexecutioncontext() as *const ExecutionContext;
+                if ec.is_null() || unsafe { (*ec).signals_enabled == 0 } {
+                    return Err(crate::PyError::value_error(
+                        "set_wakeup_fd only works in main thread or with \
+                         __pypy__.thread.enable_signals()",
+                    ));
+                }
                 // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
                 // the only place a descriptor is asked whether it is a socket.
                 #[cfg_attr(not(all(windows, not(feature = "sandbox"))), expect(unused_mut))]
@@ -1327,73 +1370,84 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 0,
             )
         );
-        // setitimer(which, seconds, interval=0.0) -> (delay, interval)
+        // setitimer(which, first, interval=0.0, /) -> (delay, interval)
+        // [3.15-spec] positional-only (clinic "/"); PyPy accepts keywords. Names are PyPy's.
         crate::__pyre_store!(
             ns,
             "setitimer",
-            crate::make_builtin_function("setitimer", |args| {
-                #[cfg(feature = "sandbox")]
-                {
-                    let _ = args;
-                    return Err(crate::host_seam::stub("signal.setitimer"));
-                }
-                #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-                {
-                    if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
-                            "setitimer() requires at least 2 arguments",
-                        ));
-                    }
-                    let mut w_which = args[0];
-                    let mut w_seconds = args[1];
-                    let mut w_interval = if args.len() >= 3 {
-                        args[2]
-                    } else {
-                        pyre_object::PY_NULL
-                    };
-                    // interp_signal.py `setitimer` `@unwrap_spec(which=int, ...)`.
-                    // `w_interval` is PY_NULL when omitted; it still occupies a
-                    // live local across `gateway_int_w`.
-                    let which = pyre_object::with_roots!(
-                        w_which, w_seconds, w_interval => crate::baseobjspace::gateway_int_w(w_which)
-                    )? as i32;
-                    let read_f = |o: pyre_object::PyObjectRef| -> f64 {
-                        unsafe {
-                            if pyre_object::is_float(o) {
-                                pyre_object::w_float_get_value(o)
-                            } else {
-                                pyre_object::w_int_get_value(o) as f64
-                            }
+            crate::gateway::function_set_null_positional_defaults(
+                crate::make_builtin_function_with_signature(
+                    "setitimer",
+                    |args| {
+                        #[cfg(feature = "sandbox")]
+                        {
+                            let _ = args;
+                            return Err(crate::host_seam::stub("signal.setitimer"));
                         }
-                    };
-                    let mut new_value = libc::itimerval {
-                        it_value: timeval_from_double(read_f(w_seconds)),
-                        it_interval: if w_interval.is_null() {
-                            timeval_from_double(0.0)
-                        } else {
-                            timeval_from_double(read_f(w_interval))
-                        },
-                    };
-                    let mut old = unsafe { std::mem::zeroed::<libc::itimerval>() };
-                    let ret = pyre_object::with_roots!(w_which, w_seconds, w_interval => unsafe {
-                        majit_rlib::rsignal::c_setitimer(which, &mut new_value, &mut old)
-                    });
-                    if ret != 0 {
-                        return Err(crate::error::exception_from_saved_errno(
-                            pyre_object::PY_NULL,
-                            errno_w_type("signal.ItimerError"),
-                        ));
-                    }
-                    Ok(itimer_retval(&old))
-                }
-                #[cfg(not(feature = "host_env"))]
-                {
-                    let _ = args;
-                    Err(crate::PyError::not_implemented(
-                        "signal.setitimer requires host_env feature",
-                    ))
-                }
-            })
+                        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+                        {
+                            let mut w_which =
+                                args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                            let mut w_first =
+                                args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                            let mut w_interval =
+                                args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                            // interp_signal.py `setitimer`
+                            // `@unwrap_spec(which=int, first=float, interval=float)`.
+                            let which = pyre_object::with_roots!(
+                                w_which, w_first, w_interval =>
+                                    crate::baseobjspace::gateway_int_w(w_which)
+                            )? as i32;
+                            let first = pyre_object::with_roots!(
+                                w_which, w_first, w_interval =>
+                                    itimer_seconds_w(w_first)
+                            )?;
+                            let interval = if w_interval.is_null() {
+                                0.0
+                            } else {
+                                pyre_object::with_roots!(
+                                    w_which, w_first, w_interval =>
+                                        itimer_seconds_w(w_interval)
+                                )?
+                            };
+                            let mut new_value = libc::itimerval {
+                                it_value: timeval_from_double(first),
+                                it_interval: timeval_from_double(interval),
+                            };
+                            let mut old = unsafe { std::mem::zeroed::<libc::itimerval>() };
+                            let ret = pyre_object::with_roots!(
+                                w_which, w_first, w_interval => unsafe {
+                                    majit_rlib::rsignal::c_setitimer(
+                                        which, &mut new_value, &mut old,
+                                    )
+                                }
+                            );
+                            if ret != 0 {
+                                return Err(crate::error::exception_from_saved_errno(
+                                    pyre_object::PY_NULL,
+                                    errno_w_type("signal.ItimerError"),
+                                ));
+                            }
+                            Ok(itimer_retval(&old))
+                        }
+                        #[cfg(not(feature = "host_env"))]
+                        {
+                            let _ = args;
+                            Err(crate::PyError::not_implemented(
+                                "signal.setitimer requires host_env feature",
+                            ))
+                        }
+                    },
+                    crate::gateway::Signature::new(
+                        vec!["which", "first", "interval"],
+                        None,
+                        None,
+                        0,
+                        3,
+                    ),
+                ),
+                1,
+            )
         );
         // getitimer(which) -> (delay, interval)
         crate::__pyre_store!(

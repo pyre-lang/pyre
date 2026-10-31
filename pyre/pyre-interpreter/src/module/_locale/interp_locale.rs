@@ -7,11 +7,7 @@
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
 
-#[cfg(all(
-    any(unix, windows),
-    feature = "host_env",
-    not(feature = "sandbox")
-))]
+#[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
 fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> crate::PyError {
     crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
 }
@@ -570,9 +566,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             };
             // `w_locale` is PY_NULL when omitted; it still occupies a live
             // local across `gateway_int_w`.
+            // `rlocale.py setlocale` keeps the full integer for
+            // `LC_MIN <= category <= LC_MAX`, then `rffi.cast(rffi.INT, category)`.
             let cat = pyre_object::with_roots!(
                 w_category, w_locale => crate::baseobjspace::gateway_int_w(w_category)
-            )? as i32;
+            )?;
             let locale_str: Option<String> =
                 if !w_locale.is_null() && !unsafe { pyre_object::is_none(w_locale) } {
                     if !unsafe { pyre_object::is_str(w_locale) } {
@@ -606,15 +604,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 #[cfg(windows)]
                 if locale_str.as_deref().is_some_and(windows_encoding_too_long) {
-                    if !(majit_rlib::rlocale::LC_MIN..=majit_rlib::rlocale::LC_MAX).contains(&cat) {
+                    if !((majit_rlib::rlocale::LC_MIN as i64)
+                        ..=(majit_rlib::rlocale::LC_MAX as i64))
+                        .contains(&cat)
+                    {
                         return Err(locale_error("invalid locale category"));
                     }
                     return Err(locale_error("unsupported locale setting"));
                 }
                 match majit_rlib::rlocale::setlocale(cat, c_locale.as_deref()) {
-                    Ok(Ok(bytes)) => Ok(pyre_object::w_str_new_managed(
-                        &String::from_utf8_lossy(&bytes),
-                    )),
+                    Ok(Ok(bytes)) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+                        &bytes,
+                    ))),
                     Ok(Err(majit_rlib::rlocale::LocaleError::InvalidCategory)) => {
                         Err(locale_error("invalid locale category"))
                     }

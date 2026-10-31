@@ -197,7 +197,7 @@ fn set_locale_from_env() {
         // `rlocale.setlocale` lets `MemoryError` escape — observable: startup continues; evidence:
         // v3.15.0 Python/preconfig.c `_PyPreConfig_Write` discards `_Py_SetLocaleFromEnv(LC_CTYPE)`,
         // which copies nothing. Nothing here reads the locale name either.
-        let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
+        let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE as i64, Some(c""));
     }
 }
 

@@ -4595,13 +4595,13 @@ fn locale_asks_for_surrogateescape() -> Result<bool, crate::PyError> {
             // `initstdio` installs the locale the environment names before
             // reading it back, so what is tested is the locale the C library
             // took rather than the variables that asked for it.
-            if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
+            if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE as i64, Some(c"")) {
                 return Err(crate::error::get_converted_unexpected_exception(
                     pyre_object::PY_NULL,
                     &e,
                 ));
             }
-            let effective = match majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None) {
+            let effective = match majit_rlib::rlocale::setlocale(libc::LC_CTYPE as i64, None) {
                 Ok(Ok(bytes)) => Some(bytes),
                 Ok(Err(_)) => None,
                 Err(e) => {

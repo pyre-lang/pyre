@@ -4,7 +4,8 @@
 //! (`'sorted': 'app_functional.sorted'`, `'sum': 'app_functional.sum'`).
 //! The Python bodies are what the JIT traces: `sorted` as `list(iterable)`
 //! then `list.sort` (`CALL_ASSEMBLER` into `list__do_extend_from_iterable`);
-//! `sum` as `_regular_sum`'s `last = last + x` (ints stay unboxed).  The
+//! `sum` as `_int_sum`'s `last = last + x` (ints stay unboxed), handing
+//! off to `_float_sum` / `_complex_sum` / `_regular_sum`.  The
 //! interp-level `builtin_sorted` body cannot be descended: its generated
 //! wrapper reaches hundreds of un-lowered helpers after an effect
 //! (`PYRE_FBW_INLINE_DIAG` `un-lowered helper call in body`).

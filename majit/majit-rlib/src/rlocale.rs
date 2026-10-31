@@ -251,18 +251,20 @@ pub fn numeric_formatting() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), crate::rffi::
     Ok((b".".to_vec(), Vec::new(), Vec::new()))
 }
 
-/// `rlocale.py setlocale`. A category outside `LC_MIN..=LC_MAX` is
-/// [`LocaleError::InvalidCategory`] (the MSVC runtime's invalid-parameter
+/// `rlocale.py setlocale`. The range check sees the full-width `category`
+/// before `rffi.cast(rffi.INT, category)`. A value outside `LC_MIN..=LC_MAX`
+/// is [`LocaleError::InvalidCategory`] (the MSVC runtime's invalid-parameter
 /// handler would end the process on one); a null host result is
 /// [`LocaleError::Unsupported`].
 pub fn setlocale(
-    category: i32,
+    category: i64,
     locale: Option<&std::ffi::CStr>,
 ) -> Result<Result<Vec<u8>, LocaleError>, crate::rffi::MemoryError> {
     #[cfg(windows)]
-    if !(LC_MIN..=LC_MAX).contains(&category) {
+    if !(LC_MIN as i64..=LC_MAX as i64).contains(&category) {
         return Ok(Err(LocaleError::InvalidCategory));
     }
+    let category = category as i32; // rffi.cast(rffi.INT, category)
     #[cfg(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
         feature = "host_env"
@@ -480,7 +482,7 @@ mod tests {
         assert_eq!(lc.decimal_point, b".");
         assert_eq!(super::numeric_formatting().unwrap().0, b".");
         assert_eq!(
-            super::setlocale(super::LC_MAX + 1, None)
+            super::setlocale(i64::from(super::LC_MAX) + 1, None)
                 .unwrap()
                 .unwrap_err(),
             super::LocaleError::InvalidCategory
