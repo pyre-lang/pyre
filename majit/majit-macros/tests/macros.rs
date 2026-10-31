@@ -1076,7 +1076,7 @@ mod jit_struct {
 }
 
 mod helper_fnaddr_registry {
-    use majit_macros::{dont_look_inside, elidable_promote};
+    use majit_macros::{dont_look_inside, elidable_promote, getfunctionptr};
     use std::cell::Cell;
 
     #[dont_look_inside]
@@ -1130,6 +1130,13 @@ mod helper_fnaddr_registry {
     #[elidable_promote]
     fn probe_elidable(x: i64) -> i64 {
         x + 1
+    }
+
+    type GCREF = *mut u8;
+
+    #[getfunctionptr]
+    fn residual_word_result(flag: i64, x: GCREF) -> Result<GCREF, PyError> {
+        if flag == 0 { Err(PyError(3)) } else { Ok(x) }
     }
 
     #[test]
@@ -1246,6 +1253,31 @@ mod helper_fnaddr_registry {
         assert!(
             found_wrapper,
             "elidable_promote wrapper path was not also published"
+        );
+    }
+
+    /// The object-slice shape (`&[PyObjectRef]`) is covered on the pyre side
+    /// by `jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals`
+    /// (pyre-interpreter `jit_fnaddr.rs`).
+    #[test]
+    fn getfunctionptr_registers_a_word_result_trampoline() {
+        let x: GCREF = 0x20 as GCREF;
+        assert!(matches!(
+            residual_word_result(1, x),
+            Ok(p) if p == 0x20 as GCREF
+        ));
+        assert!(residual_word_result(0, x).is_err());
+
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::residual_word_result") {
+                assert_eq!(desc.arity, 2);
+                found = true;
+            }
+        });
+        assert!(
+            found,
+            "getfunctionptr trampoline was not registered under residual_word_result"
         );
     }
 }

@@ -109,3 +109,51 @@ fn cell_store_in_a_loop_survives_being_compiled() {
     );
     assert_eq!(stdout.trim(), "8997000");
 }
+
+/// `reached_loop_header` continue-tracing nulls the dead `locals_cells_stack_w`
+/// tail (`null_vable_dead_array_tail`). That store is
+/// `_opimpl_setarrayitem_vable`: box then `synchronize_virtualizable_at`, so
+/// the tracing heap agrees before the next `getfield_vable_r`.
+#[test]
+fn loop_header_after_call_ex_keeps_dead_stack_tail_synchronized() {
+    let program = "\
+import pypyjit
+pypyjit.set_param(\"function_threshold=1\")
+def f():
+    pass
+def run():
+    func, args, kwargs = f, (), {}
+    func(*args, **kwargs)
+    n = 0
+    while n < 1:
+        n += 1
+run()
+print(\"ok\")
+";
+    let mut command = Command::new(PYRE);
+    for flag in [
+        "MAJIT_STATS",
+        "MAJIT_LOG",
+        "PYRE_MC_DIAG",
+        "PYRE_GC_DIAG",
+        "PYRE_FBW_SPEC_CENSUS",
+        "PYRE_CELL_CENSUS",
+        "PYRE_FBW_DEPTH_CENSUS",
+    ] {
+        command.env_remove(flag);
+    }
+    let output = command
+        .args(["-c", program])
+        .output()
+        .expect("run pyre-dynasm");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "CALL_FUNCTION_EX then a later loop_header must keep the dead stack \
+         tail synchronized; a box-only CONST_NULL trips \
+         check_synchronized_virtualizable. stdout: {stdout:?} stderr: {stderr}"
+    );
+    assert_eq!(stdout.trim(), "ok");
+    assert!(stderr.is_empty(), "{stderr}");
+}

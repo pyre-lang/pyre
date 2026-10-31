@@ -1,7 +1,6 @@
-# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
-# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
-# rather than any generated code, and reads whatever the host's process
-# spawn cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`: wall-clock is startup-dominated next to pypy. The
+# jitstats baselines gate it (CALL_ASSEMBLER compiles the except* loop;
+# pypy jit-summary reports 16 loops / 23 bridges).
 def m(label, value):
     print(label, "->", repr(value))
 
