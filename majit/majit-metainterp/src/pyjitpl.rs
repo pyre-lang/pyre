@@ -31570,7 +31570,7 @@ mod tests {
     fn start_retrace_from_guard_keeps_tracing_when_compiled_loops_misses() {
         // compile.py `_trace_and_compile_from_bridge`:
         // `loop_token = self.rd_loop_token.loop_token_wref()`. A live
-        // token traces even when no frontend row is filed.
+        // `loop_token_wref` starts the bridge.
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let source_driver = meta

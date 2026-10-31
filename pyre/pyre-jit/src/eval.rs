@@ -12056,7 +12056,10 @@ fn handle_fail(
     // machine trace on every iteration.
     //
     // Only when the guard's owning token IS the one currently installed.  A
-    // retired token's descrs stay reachable through the loop's side tables
+    // retired token's descrs stay reachable through the compiled loop
+    // token's GC ref tracer (`model.py`
+    // `CompiledLoopToken.asmmemmgr_gcreftracers`), the `JitCellToken`
+    // keepalive in `memmgr.py` `alive_loops`, and the deadframe's descr Arc,
     // long after the key has been recompiled, and `invalidate_loop` resolves
     // the key through `get_procedure_token`, which skips invalidated tokens —
     // so an unscoped revoke kills the *replacement* loop instead, on every
