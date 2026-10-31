@@ -2256,12 +2256,14 @@ impl WarmEnterState {
         reds: &[Value],
     ) -> FunctionEntryStep {
         let cell = self.cell_by_key(cell_key);
-        let is_runnable = cell.as_ref().is_some_and(|c| {
-            c.is_compiled()
-                && has_compiled_meta()
-                && c.get_procedure_token()
-                    .is_some_and(|token| token.has_compiled_code())
-        });
+        // `maybe_compile_and_run` reads `procedure_token =
+        // cell.get_procedure_token()` once, decides on it, and raises
+        // `EnterJitAssembler` with that same token.
+        let runnable_token = cell
+            .as_ref()
+            .filter(|c| c.is_compiled() && has_compiled_meta())
+            .and_then(|c| c.get_procedure_token())
+            .filter(|token| token.has_compiled_code());
         let hash = self.bucket_of(cell_key);
         let (greenargs, green_types) = match green_key {
             Some(key) => (Some(key.values.as_slice()), key.types.as_slice()),
@@ -2274,16 +2276,12 @@ impl WarmEnterState {
             greenargs,
             green_types,
             reds,
-            is_runnable,
+            runnable_token.is_some(),
             WarmEntryDoor::FunctionEntry { engine_is_tracing },
         ) {
-            HotResult::RunCompiled => FunctionEntryStep::RunCompiled(
-                cell.and_then(|c| {
-                    c.get_procedure_token()
-                        .filter(|token| token.has_compiled_code())
-                })
-                .expect("runnable compiled token"),
-            ),
+            HotResult::RunCompiled => {
+                FunctionEntryStep::RunCompiled(runnable_token.expect("runnable compiled token"))
+            }
             HotResult::StartTracing => FunctionEntryStep::Proceed,
             HotResult::NotHot | HotResult::AlreadyTracing => FunctionEntryStep::NotHot,
         }
@@ -2892,6 +2890,26 @@ impl WarmEnterState {
     #[inline]
     pub fn resolve_cell_key(&self, hash: u64, make_key: impl FnOnce() -> GreenKey) -> u64 {
         self.lookup_chain_with_key(&make_key())
+            .and_then(|cell| cell.cell_key.get())
+            .unwrap_or(hash)
+    }
+
+    /// [`Self::resolve_cell_key`] against greens already in hand:
+    /// `JitCell.get_jitcell(*greenargs)` compares them in place, so a door
+    /// that holds the greens builds no [`GreenKey`] to find its cell.
+    /// `hash` must be `get_uhash(*greenargs)`.
+    #[inline]
+    pub fn resolve_cell_key_with_greenargs(
+        &self,
+        hash: u64,
+        greenargs: &[i64],
+        types: &[GreenType],
+    ) -> u64 {
+        debug_assert_eq!(
+            hash,
+            GreenKey::with_types(greenargs.to_vec(), types.to_vec()).get_uhash()
+        );
+        self.lookup_chain_with_greenargs(hash, greenargs, types)
             .and_then(|cell| cell.cell_key.get())
             .unwrap_or(hash)
     }

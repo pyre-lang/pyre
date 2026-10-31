@@ -1671,9 +1671,20 @@ pub fn pypyjit_greenkey_uhash(pc: usize, is_being_profiled: bool, code_ptr: u64)
 /// arm records.
 pub fn pypyjit_greenkey(pc: usize, is_being_profiled: bool, code_ptr: u64) -> GreenKey {
     GreenKey::with_types(
-        vec![pc as i64, is_being_profiled as i64, code_ptr as i64],
-        vec![GreenType::Int, GreenType::Int, GreenType::Ref],
+        pypyjit_greenargs(pc, is_being_profiled, code_ptr).to_vec(),
+        PYPYJIT_GREEN_TYPES.to_vec(),
     )
+}
+
+/// The slot types of the pypyjit portal green tuple; see [`pypyjit_greenkey`].
+pub const PYPYJIT_GREEN_TYPES: [GreenType; 3] = [GreenType::Int, GreenType::Int, GreenType::Ref];
+
+/// `*greenargs` of the pypyjit portal, in [`pypyjit_greenkey`]'s slot order,
+/// for a cell read that compares greens in place (`JitCell.comparekey`)
+/// without building a [`GreenKey`].
+#[inline]
+pub fn pypyjit_greenargs(pc: usize, is_being_profiled: bool, code_ptr: u64) -> [i64; 3] {
+    [pc as i64, is_being_profiled as i64, code_ptr as i64]
 }
 
 /// One slot of a driver's green-argument TYPE spec.
