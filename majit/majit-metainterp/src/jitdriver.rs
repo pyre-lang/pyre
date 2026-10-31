@@ -6738,15 +6738,15 @@ impl<S: JitState> JitDriver<S> {
         // straight to `jitcounter.tick(hash, increment_threshold)` and, on
         // overflow, `bound_reached`. The resolution above reads the
         // cell-owned `JC_TEMPORARY` flag explicitly: a callback token has a
-        // body, and pyre may retain frontend metadata for the loop it
-        // displaced, so neither token nor metadata presence identifies it.
+        // body, so token presence alone would enter it. The flag is what
+        // identifies the tmp callback.
         // Binding the token rather than testing a predicate and
         // unwrapping afterwards keeps the decision and execution in step — the
         // fall-through below IS the counter processing upstream continues
         // with. Token presence stays one conjunct: it is the
         // `cell.get_procedure_token() is not None` half (code present and not
         // invalidated). `invalidate_loop` marks the token; presence is still
-        // that token, not a frontend row.
+        // that token.
         // The token is read through the resolved cell key, so the artifact the
         // entry DECIDES on and the artifact it EXECUTES are the same object.
         //
@@ -9841,9 +9841,9 @@ impl<S: JitState> JitDriver<S> {
     /// to resolving first and then asking; this only stops paying for the
     /// repeats.
     ///
-    /// `JC_TEMPORARY` is part of the answer because retained frontend metadata
-    /// must not make a `compile_tmp_callback` token executable as the loop it
-    /// displaced, matching the flag-first branch of
+    /// `JC_TEMPORARY` is part of the answer because a `compile_tmp_callback`
+    /// token has a body and must not be entered as the loop it displaced,
+    /// matching the flag-first branch of
     /// `WarmEnterState.maybe_compile_and_run`.
     ///
     /// The resolved key travels back so the caller can take it: a door that
@@ -13798,9 +13798,8 @@ mod tests {
     fn a_runnable_token_enters_without_a_compiled_loops_row() {
         // Twin of `runnable_procedure_token_reads_the_entry_driver`'s no-row
         // arm: `warmstate.py maybe_compile_and_run` enters on
-        // `cell.get_procedure_token()` and `execute_assembler` never reads
-        // `compiled_loops`. `fill_entry_reds_without_meta` supplies the live
-        // reds, so `back_edge_resolved` must not skip the run.
+        // `cell.get_procedure_token()`. `fill_entry_reds_without_meta` supplies
+        // the live reds, so `back_edge_resolved` must not skip the run.
         let (mut driver, hash, _key) = confirm_enter_jit_hook_compiled_loop(10);
         let token = driver
             .runnable_procedure_token(hash)
@@ -16375,8 +16374,9 @@ mod tests {
     fn test_multi_entry_points_share_compiled_loops() {
         // Two entry points register different functions on the same driver.
         // A loop compiled from one entry point is visible to back_edge calls
-        // from any entry point, since they share the same MetaInterp and
-        // compiled loop table (keyed by green_key, not by entry point name).
+        // from any entry point: they share the same MetaInterp and the
+        // cell's procedure token (`warmstate.py` `JitCell.get_procedure_token`),
+        // keyed by green_key, not by entry point name.
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         driver.register_entry_point("func_a", &[Type::Int]);
