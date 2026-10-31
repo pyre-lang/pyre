@@ -7913,6 +7913,12 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
+        // `SwitchToBlackhole` unwinds. A deeper helper already staged its
+        // MIFrame; rolling this CALL back to the ordinary residual would
+        // apply the executed body a second time.
+        Err(error) if abort_blackhole_latched() && error.leaves_complete_image() => {
+            return Err(error);
+        }
         // `try_execute_residual_call_via_executor_inner` declines an un-lowered
         // in-body helper (a tagged symbolic fnaddr) while inlining a
         // sub-jitcode, so the descent aborts instead of baking the hash as a
@@ -8438,6 +8444,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
 
     let walk_result = match walk_result {
         Ok(outcome) => outcome,
+        Err(error) if abort_blackhole_latched() && error.leaves_complete_image() => {
+            return Err(error);
+        }
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) if rewind.nothing_applied() => {
             cut_declined_subwalk(ctx, rewind.pre_fold_pos);
             return Ok(None);
@@ -19280,6 +19289,12 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
             | DispatchError::GuardResumeCoordinateUnavailable { .. }),
         ) => {
+            // `SwitchToBlackhole` unwinds `_interpret`. A deeper helper
+            // already staged its MIFrame; cutting and residualizing this
+            // CALL would apply the executed residual a second time.
+            if abort_blackhole_latched() {
+                return Err(error);
+            }
             // A walk that already applied an effect cannot be handed to the
             // residual call, which would apply it again.  Journaled stores
             // are undone by the cut and do not block.  The abort
@@ -20224,6 +20239,17 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         .expect("SubWalkSuspended without a pending callee frame");
                     self.push_frame(child);
                 }
+                // `SwitchToBlackhole` unwinds `_interpret` without any frame
+                // on the way out re-running its CALL. A deeper helper already
+                // staged the abort image; replaying this CALL would apply the
+                // residual a second time.
+                Err(error) if abort_blackhole_latched() => {
+                    self.exchange.completed.clear();
+                    while !self.frames.is_empty() {
+                        let _ = self.pop_frame();
+                    }
+                    return Err(error);
+                }
                 result => {
                     self.exchange.completed.clear();
                     let frame = self.pop_frame();
@@ -20483,12 +20509,13 @@ fn splice_ancestor_helper_slice<Sym: WalkSym>(
         ) else {
             return false;
         };
-        // Same capability `multi_frame_blackhole_preflight` asks of the
-        // levels it saw; a refusal fails the splice.
-        if super::residual_call::codeless_level_may_stop_blackhole(&miframe) {
-            return false;
-        }
         helpers.push(miframe);
+    }
+    // Same capability `multi_frame_blackhole_preflight` asks of the
+    // levels it saw; a refusal fails the splice. Innermost-first so a
+    // parent follows its landing catch only when the child may raise.
+    if super::residual_call::spliced_helpers_may_stop_blackhole(&helpers) {
+        return false;
     }
     splice_helper_frames_before_innermost(helpers)
 }

@@ -348,6 +348,77 @@ pub(crate) struct InlineBodyFacts {
     pub(crate) has_exception_table: bool,
 }
 
+/// Remaining-body answers from one resume pc, for one
+/// `in_flight_callee_may_raise` flag.
+///
+/// `codeless_level_may_stop_blackhole` / `level_may_raise` read these on
+/// every abort. The facts depend only on the jitcode, the start pc, and
+/// the in-flight flag (`blackhole.py` `run`, `handle_exception_in_frame`,
+/// `_resume_mainloop`). Cached on [`PyJitCodePayload`] per pc like
+/// [`PyJitCodePayload::helper_resume_blockers`].
+#[derive(Clone, Copy)]
+pub(crate) struct BlackholeResumeFacts {
+    /// [`crate::jitcode_runtime::blackhole_resume_reachable_starts`] returned
+    /// `None` (`switch` or an undecodable instruction).
+    pub(crate) switch_or_undecodable: bool,
+    /// Some reachable op's `bhimpl_*` may raise, or the scan failed.
+    pub(crate) may_raise: bool,
+    /// Some reachable start can `reject_unresolved_call`.
+    pub(crate) may_stop: bool,
+}
+
+/// Per-pc slots for [`BlackholeResumeFacts`]. Index 0 is
+/// `in_flight_callee_may_raise = false`; index 1 is true.
+struct BlackholeResumePcScan {
+    slots: [std::cell::OnceCell<BlackholeResumeFacts>; 2],
+}
+
+impl BlackholeResumePcScan {
+    fn new() -> Self {
+        Self {
+            slots: [std::cell::OnceCell::new(), std::cell::OnceCell::new()],
+        }
+    }
+}
+
+/// Uncached remaining-body facts from `pc`. Production callers go through
+/// [`PyJitCodePayload::blackhole_resume_facts`].
+pub(crate) fn compute_blackhole_resume_facts(
+    jitcode: &RuntimeJitCode,
+    pc: usize,
+    in_flight_callee_may_raise: bool,
+) -> BlackholeResumeFacts {
+    match crate::jitcode_runtime::blackhole_resume_reachable_starts(
+        jitcode.code.as_slice(),
+        pc,
+        in_flight_callee_may_raise,
+    ) {
+        None => BlackholeResumeFacts {
+            switch_or_undecodable: true,
+            may_raise: true,
+            may_stop: jitcode.blackhole_may_reject_unresolved_call(),
+        },
+        Some(starts) => {
+            let may_raise =
+                starts.iter().any(|&start| {
+                    match crate::jitcode_runtime::decode_op_at(jitcode.code.as_slice(), start) {
+                        None => true,
+                        Some(op) => !crate::jitcode_runtime::blackhole_decoded_op_cannot_raise(
+                            jitcode.code.as_slice(),
+                            &op,
+                            Some(jitcode),
+                        ),
+                    }
+                });
+            BlackholeResumeFacts {
+                switch_or_undecodable: false,
+                may_raise,
+                may_stop: jitcode.blackhole_may_reject_unresolved_call_at(&starts),
+            }
+        }
+    }
+}
+
 /// Code positions of the ops the loop-entry pre-scans in `trace.rs` look
 /// for, each list in code order.  Every trace attempt on a body asks the same
 /// questions of the same bytes, so they are decoded once per body.
@@ -431,6 +502,9 @@ pub struct PyJitCodePayload {
     /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`], dropped
     /// with the body by `replace_with`.
     pub(crate) helper_resume_blockers: std::cell::OnceCell<Box<[std::cell::OnceCell<bool>]>>,
+    /// Lazily-built per-pc answers of [`Self::blackhole_resume_facts`],
+    /// dropped with the body by `replace_with`.
+    pub(crate) blackhole_resume_scans: std::cell::OnceCell<Box<[BlackholeResumePcScan]>>,
 }
 
 impl PyJitCodePayload {
@@ -453,6 +527,33 @@ impl PyJitCodePayload {
             .map(|&(_, off)| off as usize)
             .min()
             .and_then(|entry| self.loop_scan().merge_point_at_or_after(entry))
+    }
+
+    /// Remaining-body facts from `pc` under `in_flight_callee_may_raise`.
+    ///
+    /// Same owner and per-pc `OnceCell` shape as
+    /// [`crate::jitcode_dispatch::helper_resume_reaches_blocker`]. The
+    /// answer is a property of this body after publication, so the first
+    /// abort from a pc pays the scan and later aborts read the slot.
+    pub(crate) fn blackhole_resume_facts(
+        &self,
+        pc: usize,
+        in_flight_callee_may_raise: bool,
+    ) -> BlackholeResumeFacts {
+        let jitcode = std::sync::Arc::clone(&self.jitcode);
+        let memo = self.blackhole_resume_scans.get_or_init(|| {
+            (0..jitcode.code.len())
+                .map(|_| BlackholeResumePcScan::new())
+                .collect()
+        });
+        match memo.get(pc) {
+            Some(slot) => *slot.slots[usize::from(in_flight_callee_may_raise)].get_or_init(|| {
+                compute_blackhole_resume_facts(jitcode.as_ref(), pc, in_flight_callee_may_raise)
+            }),
+            None => {
+                compute_blackhole_resume_facts(jitcode.as_ref(), pc, in_flight_callee_may_raise)
+            }
+        }
     }
 }
 
@@ -485,9 +586,9 @@ pub struct PyJitCode {
 // publication path, which runs under pyre's single-threaded JIT setup before
 // the populated object is handed to runtime readers. Runtime-visible index
 // stamping uses atomics on the inner `RuntimeJitCode`. The lazily-built
-// `sub_descr_pool` `OnceCell` is initialized only from the trace-side walker
-// (`state::sub_jitcode_descr_pool_for_code`), which runs on the single
-// thread owning the thread-local `METAINTERP_SD` store.
+// `sub_descr_pool` / `helper_resume_blockers` / `blackhole_resume_scans`
+// `OnceCell`s are initialized only from the trace-side walker, which runs
+// on the single thread owning the thread-local `METAINTERP_SD` store.
 unsafe impl Sync for PyJitCode {}
 
 impl Deref for PyJitCode {
@@ -624,6 +725,7 @@ impl PyJitCode {
             inline_body_facts: std::cell::OnceCell::new(),
             loop_scan: std::cell::OnceCell::new(),
             helper_resume_blockers: std::cell::OnceCell::new(),
+            blackhole_resume_scans: std::cell::OnceCell::new(),
         })
     }
 
@@ -663,6 +765,7 @@ impl PyJitCode {
             inline_body_facts,
             loop_scan,
             helper_resume_blockers,
+            blackhole_resume_scans,
         } = next.payload.into_inner();
         let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
             .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
@@ -684,6 +787,7 @@ impl PyJitCode {
             current.inline_body_facts = inline_body_facts;
             current.loop_scan = loop_scan;
             current.helper_resume_blockers = helper_resume_blockers;
+            current.blackhole_resume_scans = blackhole_resume_scans;
             let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
             *current_jitcode = next_jitcode;
             current.metadata = metadata;

@@ -5250,6 +5250,32 @@ pub fn step<Sym: WalkSym>(
     result
 }
 
+/// Resume pc for a transparent-helper capability-gap abort that already
+/// applied an effect this step.
+///
+/// `MIFrame._get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position`
+/// before the opimpl, so an executed residual is already behind the frame.
+/// Only a step whose `fbw_executed_effect_count` moved latches, and only at
+/// the next instruction when that pc is known exactly: residual dispatch
+/// stores it in `live_after_jit_pc`, and `decode_op_at` must show it
+/// adjacent. A step that applied nothing returns `None` so the caller can
+/// still cut and residualize the CALL.
+fn helper_capability_gap_resume_pc(
+    code: &[u8],
+    opcode_position: usize,
+    live_after_jit_pc: usize,
+    effects_at_step: usize,
+) -> Option<usize> {
+    if fbw_executed_effect_count() == effects_at_step {
+        return None;
+    }
+    if live_after_jit_pc == usize::MAX {
+        return None;
+    }
+    let next_pc = decode_op_at(code, opcode_position)?.next_pc;
+    (live_after_jit_pc == next_pc).then_some(live_after_jit_pc)
+}
+
 /// Walk the code from `start_pc` until a terminating opcode fires.
 /// Returns the terminating outcome plus the pc immediately after the
 /// terminator. Top-level callers expect `DispatchOutcome::Terminate`
@@ -5281,6 +5307,7 @@ pub fn walk<Sym: WalkSym>(
         // when this step's own sub-walk propagates.
         ctx.session.borrow_mut().crossed_inline_subwalk = false;
         let opcode_position = pc;
+        let effects_at_step = fbw_executed_effect_count();
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
@@ -5375,31 +5402,76 @@ pub fn walk<Sym: WalkSym>(
                             ..
                         } | DispatchError::AbortPermanentMarkerReached { .. }
                     );
+                let abort_image_latchable = (error.leaves_complete_image()
+                    || (frames_materialized && error.can_convert_seeded_inline()))
+                    && !carrier_owned
+                    && !abort_blackhole_latched();
+                // A transparent helper is its own MIFrame (`pyjitpl.py
+                // MIFrame._get_opimpl_method` sets `self.pc = position` before
+                // the opimpl). `blackhole.py convert_and_run_from_pyjitpl`
+                // copies every framestack level via `_copy_data_from_miframe`
+                // and resumes the helper past an already-executed residual.
+                // Latch that image here, then splice paused ancestors, matching
+                // the post-step TraceTooLong arm (`mod2786`). A declined latch
+                // falls through to the enclosing Python `mod2730` coordinate.
+                if ctx.fbw_mode.transparent_helper_subwalk && error.leaves_complete_image() {
+                    let effects_moved = fbw_executed_effect_count() != effects_at_step;
+                    let decoded_next = decode_op_at(code, opcode_position).map(|op| op.next_pc);
+                    let resume_pc = abort_image_latchable
+                        .then(|| {
+                            helper_capability_gap_resume_pc(
+                                code,
+                                opcode_position,
+                                ctx.live_after_jit_pc,
+                                effects_at_step,
+                            )
+                        })
+                        .flatten();
+                    if fbw_state::fbw_debug_abort_enabled() {
+                        let live_after = if ctx.live_after_jit_pc == usize::MAX {
+                            "unset".to_string()
+                        } else {
+                            ctx.live_after_jit_pc.to_string()
+                        };
+                        let next_pc = decoded_next
+                            .map(|pc| pc.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        let resume = resume_pc
+                            .map(|pc| pc.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        eprintln!(
+                            "[walk-abort-helper-latch] pc={} resume_pc={} latchable={} \
+                             live_after={} next_pc={} effects_moved={}",
+                            opcode_position,
+                            resume,
+                            abort_image_latchable,
+                            live_after,
+                            next_pc,
+                            effects_moved,
+                        );
+                    }
+                    if let Some(resume_pc) = resume_pc {
+                        let mut latched = latch_abort_blackhole(ctx, resume_pc, "mod2730-helper");
+                        if latched {
+                            let splice_ok =
+                                inline_call::splice_active_driver_ancestors::<Sym>(ctx.trace_ctx);
+                            latched = finish_helper_abort_latch(ctx.session, splice_ok);
+                        }
+                        if latched {
+                            return Err(error);
+                        }
+                    }
+                }
                 // Kept in lockstep with the epilogue's own gate: an abort that
                 // reports a MISSING value cannot be converted, because the
                 // image it would hand the blackhole is the one that just
                 // failed to resolve ([`DispatchError::leaves_complete_image`]).
                 //
-                // A translated builtin gateway is not an MIFrame.  Let its
-                // error unwind to the enclosing Python walk, where the same
-                // latch is built from that frame's own register banks.  If we
-                // latch here, `build_multi_frame_miframe` appends the helper's
-                // r0 args-slice as though it were a Python red frame and the
-                // blackhole resume loses per-frame identity.  This is the
-                // abort counterpart of the transparent-helper guard snapshot.
-                // Trace-length is not deferred: `_interpret` checks it on the
-                // helper MIFrame itself, and the post-step arm below does too.
-                //
                 // A seeded inline whose abort is a modeling gap rather than a
                 // missing value latches even when the root allow-list has not
                 // named the class: `run_blackhole_interp_to_cancel_tracing`
                 // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame
-                    && (error.leaves_complete_image()
-                        || (frames_materialized && error.can_convert_seeded_inline()))
-                    && !carrier_owned
-                    && !abort_blackhole_latched()
-                {
+                if coordinate_belongs_to_this_frame && abort_image_latchable {
                     // The image belongs to THIS WalkContext's MIFrame, so its
                     // resume coordinate must be this frame's opcode boundary.
                     // A canonical helper is transparent: an error raised at
@@ -5407,9 +5479,9 @@ pub fn walk<Sym: WalkSym>(
                     // helper JitCode and is not a coordinate in this Python
                     // frame's JitCode.  RPython keeps those as distinct
                     // MIFrames; pairing the helper pc with the enclosing frame
-                    // lands `setposition` inside an operand payload.  Resume
-                    // the enclosing frame at the opcode whose step propagated
-                    // the abort instead.
+                    // lands `setposition` inside an operand payload.  When the
+                    // helper arm above did not latch, resume the enclosing
+                    // frame at the opcode whose step propagated the abort.
                     let _ = latch_abort_blackhole(ctx, opcode_position, "mod2730");
                 }
                 return Err(error);
