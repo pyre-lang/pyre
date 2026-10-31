@@ -11718,23 +11718,30 @@ fn confirm_reds_if_installed(
     jd_no: usize,
     reds: Vec<Value>,
 ) -> Vec<Value> {
-    if driver
-        .meta_interp()
-        .warm_state_ref_for_driver(jd_no)
-        .is_some_and(|ws| ws.has_confirm_enter_jit())
-    {
+    if confirm_enter_jit_installed(driver, jd_no) {
         reds
     } else {
         Vec::new()
     }
 }
 
+fn confirm_enter_jit_installed(driver: &JitDriver<PyreJitState>, jd_no: usize) -> bool {
+    driver
+        .meta_interp()
+        .warm_state_ref_for_driver(jd_no)
+        .is_some_and(|ws| ws.has_confirm_enter_jit())
+}
+
+/// The portal's reds are read only when the hook is installed, so a door
+/// without one allocates nothing for them on each call.
 fn pypyjit_confirm_reds(driver: &JitDriver<PyreJitState>, frame: &mut PyFrame) -> Vec<Value> {
-    confirm_reds_if_installed(
+    if !confirm_enter_jit_installed(
         driver,
         pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX,
-        pypyjit_portal_reds(frame).to_vec(),
-    )
+    ) {
+        return Vec::new();
+    }
+    pypyjit_portal_reds(frame).to_vec()
 }
 
 /// RPython warmstate.py maybe_compile_and_run.
@@ -13213,20 +13220,18 @@ fn bound_reached(
     // reaches the same traces.
     let _topframeref_guard =
         TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
-    // The token stays bound for the whole run, which is what
-    // `EnterJitAssembler(procedure_token, ...)` does with it upstream; the run
-    // resolves the key itself, so it is only the pin.
-    let outcome = if procedure_token.is_some() {
-        Some(driver.run_compiled_detailed_with_bridge_keyed(
+    // The run takes the token this decision read, which is what
+    // `EnterJitAssembler(procedure_token, ...)` carries upstream.
+    let outcome = procedure_token.as_ref().map(|procedure_token| {
+        driver.run_compiled_detailed_with_bridge_token(
             green_key,
+            procedure_token,
             loop_header_pc,
             &mut jit_state,
             env,
             || {},
-        ))
-    } else {
-        None
-    };
+        )
+    });
     if let Some(mut outcome) = outcome {
         // Drain the exception `park_jit_pending_error` parked
         // (`unpackiterable_driver`). A prologue overflow is already in
@@ -13322,9 +13327,11 @@ fn tick_function_entry_from_portal(frame: &mut PyFrame) {
     let is_being_profiled = frame.get_is_being_profiled();
     let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let pair = driver_pair();
-    let green_key = pair.0.resolve_cell_key(green_key_hash, || {
-        pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
-    });
+    let green_key = pair.0.resolve_cell_key_with_greenargs(
+        green_key_hash,
+        &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, code_ptr as u64),
+        &majit_ir::PYPYJIT_GREEN_TYPES,
+    );
     let reds = pypyjit_confirm_reds(&pair.0, frame);
     let _ = pair.0.function_entry_step(
         green_key,
@@ -13414,11 +13421,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // never entered, and every call paid a full trace-start attempt.
     //
     // `code_ptr` is the PyCode object `frame.pycode` holds, which is the green
-    // `interp_jit.PyPyJitDriver` carries, so the typed key built here names the
+    // `interp_jit.PyPyJitDriver` carries, so the greens compared here name the
     // cell `green_key_hash` hashes.
-    let green_key = pair.0.resolve_cell_key(green_key_hash, || {
-        pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
-    });
+    let green_key = pair.0.resolve_cell_key_with_greenargs(
+        green_key_hash,
+        &majit_ir::pypyjit_greenargs(entry_pc, is_being_profiled, code_ptr as u64),
+        &majit_ir::PYPYJIT_GREEN_TYPES,
+    );
 
     // `warmstate.py maybe_compile_and_run` tests `cell.flags & JC_TRACING` on
     // the cell the chain walk found (`function_entry_step` → AlreadyTracing,
@@ -13450,10 +13459,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let driver = &mut pair.0;
 
     // `warmstate.py maybe_compile_and_run` carries the token the cell read
-    // produced out through `EnterJitAssembler(procedure_token, *execute_args)`;
-    // holding it here is what keeps it alive across the run the way upstream's
-    // reference does. The run resolves the key itself, so it is only the pin.
-    if let FunctionEntryStep::RunCompiled(_procedure_token) = step {
+    // produced out through `EnterJitAssembler(procedure_token, *execute_args)`,
+    // and the run below executes that token rather than reading the cell again.
+    if let FunctionEntryStep::RunCompiled(procedure_token) = step {
         // A compiled trace polls the breaker word at its loop header
         // (`interp_jit.py jump_absolute`), masked with `JIT_BREAKER_MASK`.
         // A recursive Python call can, however, repeatedly enter a compiled
@@ -13541,8 +13549,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // callees and exits through the same guards.
         let _topframeref_guard =
             TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
-        let mut outcome = driver.run_compiled_detailed_with_bridge_keyed(
+        let mut outcome = driver.run_compiled_detailed_with_bridge_token(
             green_key,
+            &procedure_token,
             frame_root.frame().next_instr(),
             &mut jit_state,
             &env,
