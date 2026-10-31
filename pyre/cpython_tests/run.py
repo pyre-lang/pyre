@@ -1251,6 +1251,10 @@ def main() -> int:
     env = dict(os.environ)
     env["MAJIT_STRICT"] = "1"
     env["MAJIT_STATS"] = "1"
+    # A SIGSEGV in a gated module (test_decimal's IBM invert) dies with no
+    # Python traceback. `classify` keeps the stderr tail; this is what
+    # writes the faulting PC into that tail.
+    env.setdefault("PYTHONFAULTHANDLER", "1")
     # Several regression tests spawn sys.executable and assert the child's
     # stdout/stderr exactly. Keep the machine-readable panic counters on the
     # direct pyre process without leaking diagnostic output into its children.
