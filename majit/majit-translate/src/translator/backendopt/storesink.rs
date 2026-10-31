@@ -506,15 +506,9 @@ fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
         LowLevelValue::SignedLongLongLong(n) => Some(ConstValue::Int128(*n)),
         LowLevelValue::UnsignedLongLongLong(u) => Some(ConstValue::UInt128(*u)),
         LowLevelValue::Bool(b) => Some(ConstValue::Bool(*b)),
-        LowLevelValue::Float(bits) | LowLevelValue::LongFloat(bits) => {
-            Some(ConstValue::Float(*bits))
-        }
-        LowLevelValue::SingleFloat(bits) => {
-            // Upstream stores the raw f32 value on `Constant.value`.
-            // pyre's `ConstValue::Float` carries `f64::to_bits`, so
-            // promote `f32 → f64` numerically, then encode as bits.
-            Some(ConstValue::float(f32::from_bits(*bits) as f64))
-        }
+        LowLevelValue::Float(bits) => Some(ConstValue::Float(*bits)),
+        LowLevelValue::LongFloat(bits) => Some(ConstValue::LongFloat(*bits)),
+        LowLevelValue::SingleFloat(bits) => Some(ConstValue::SingleFloat(*bits)),
         LowLevelValue::Char(c) => {
             // Upstream `_ptr.field` for a Char-typed slot is a
             // Python str of length 1. The Rust port carries
@@ -522,11 +516,7 @@ fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
             // `opimpl.rs`'s `op_cast_int_to_char`).
             Some(ConstValue::ByteStr(vec![*c as u8]))
         }
-        LowLevelValue::UniChar(c) => {
-            // Upstream `_ptr.field` for a UniChar-typed slot is a
-            // unicode of length 1. UniChar Constants are `UniStr`.
-            Some(ConstValue::UniStr(c.to_string()))
-        }
+        LowLevelValue::UniChar(c) => Some(ConstValue::uni_str(c.to_string())),
         LowLevelValue::Ptr(p) => Some(ConstValue::LLPtr(p.clone())),
         LowLevelValue::Address(a) => Some(ConstValue::LLAddress(a.clone())),
         // Void / Struct / Array / Opaque / InteriorPtr have no flat
@@ -550,6 +540,13 @@ mod tests {
 
     fn const_field(name: &str) -> Hlvalue {
         Hlvalue::Constant(Constant::new(ConstValue::byte_str(name)))
+    }
+
+    #[test]
+    fn unichar_field_value_equals_equivalent_unistr() {
+        let v = lowlevel_value_to_const_value(&LowLevelValue::UniChar('A')).expect("UniChar");
+        assert_eq!(v, ConstValue::uni_str("A"));
+        assert_eq!(v, ConstValue::UniChar(u32::from('A')));
     }
 
     #[test]

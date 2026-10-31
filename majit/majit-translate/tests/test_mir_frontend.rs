@@ -3453,7 +3453,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
 #[test]
 fn frame_box_owner_root_word_roundtrips() {
     use majit_translate::front::mir::{LowerContext, lower_fun_decl};
-    use majit_translate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation};
+    use majit_translate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
     let llbc = load_llbc(INTERPRETER_LLBC);
     let context = lower_context_for(llbc);
@@ -3650,17 +3650,18 @@ fn frame_box_owner_root_word_roundtrips() {
         "deref_mut returns: {deref_returns:?}"
     );
     let ret_op = defining_op(&deref_mut, deref_returns[0]);
-    assert_eq!(
-        majit_translate::model::cast_instance_root(&ret_op.kind),
-        Some("pyframe::PyFrame"),
-        "deref_mut must retarget frame_ptr's word to PyFrame, got {:?}",
-        ret_op.kind
-    );
-    let frame_ptr_result = operand_ids(ret_op).first().copied().expect("cast operand");
-    let call = defining_op(&deref_mut, frame_ptr_result);
-    let call_name = match &call.kind {
-        OpKind::Call { target, .. } => call_target_text(target),
-        other => panic!("deref_mut cast operand is {other:?}"),
+    // `frame_ptr` is already `Ref(Some("pyframe::PyFrame"))`; the identity recast
+    // `result_narrow_root` used to emit is gone (`rclass.py`
+    // `getinstancerepr`). The Call dest is the return value.
+    let call_name = match &ret_op.kind {
+        OpKind::Call {
+            target,
+            result_ty: ValueType::Ref(Some(root)),
+            ..
+        } if root == "pyframe::PyFrame" => call_target_text(target),
+        other => panic!(
+            "deref_mut must return frame_ptr as Ref(Some(\"pyframe::PyFrame\")), got {other:?}"
+        ),
     };
     assert!(
         call_name.ends_with("frame_ptr"),
@@ -3708,6 +3709,117 @@ fn frame_box_owner_root_word_roundtrips() {
         ptr_ancestors.contains(&new_operand),
         "owner_root's new(r) operand is not the frame pointer stored in ptr"
     );
+}
+
+/// `function_get_qualname_obj` force receiver is the CAST of the
+/// reloaded `PyObjectRef` onto `Function` (`rclass.py`
+/// `getinstancerepr(classdef)`). The Call dest carries that root.
+#[test]
+fn function_get_qualname_obj_force_receiver_is_function_cast() {
+    use majit_translate::model::{CallTarget, LinkArg, OpKind, ValueType};
+
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let graph = lower_named(llbc, "function_get_qualname_obj").expect("lower");
+
+    fn value_id(arg: &LinkArg) -> Option<u64> {
+        match arg {
+            LinkArg::Value(var) => Some(var.id()),
+            LinkArg::Const(_) => None,
+        }
+    }
+
+    fn defining_op(
+        graph: &majit_translate::model::FunctionGraph,
+        id: u64,
+    ) -> Option<&majit_translate::model::SpaceOperation> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
+        })
+    }
+
+    fn call_leaf(target: &CallTarget) -> String {
+        match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().cloned().unwrap_or_default()
+            }
+            CallTarget::Method { name, .. } => name.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    let mut dump = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Input {
+                    name,
+                    ty,
+                    class_root,
+                } => dump.push(format!("Input {name} ty={ty:?} class_root={class_root:?}")),
+                OpKind::Call {
+                    target,
+                    result_ty,
+                    args,
+                } => {
+                    let leaf = call_leaf(target);
+                    if matches!(
+                        leaf.as_str(),
+                        "shadow_stack_get"
+                            | "pin_root"
+                            | "jit_force_quasi_immutable"
+                            | "__cast_instance_intrinsic"
+                    ) || majit_translate::model::cast_instance_root(&op.kind).is_some()
+                    {
+                        dump.push(format!(
+                            "Call {leaf} result_ty={result_ty:?} root={:?} args={args:?} dest={:?}",
+                            majit_translate::model::cast_instance_root(&op.kind),
+                            op.result.as_ref().map(|v| v.id())
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let force = graph.blocks.iter().find_map(|block| {
+        block.operations.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "jit_force_quasi_immutable"
+            )
+        })
+    });
+    let force = force.unwrap_or_else(|| panic!("no jit_force_quasi_immutable: {dump:?}"));
+    let OpKind::Call { args, .. } = &force.kind else {
+        panic!("force is not a Call: {dump:?}");
+    };
+    let recv = value_id(&args[0]).unwrap_or_else(|| panic!("force arg0 is not a value: {dump:?}"));
+    let producer = defining_op(&graph, recv)
+        .unwrap_or_else(|| panic!("force arg0 v{recv} has no defining op: {dump:?}"));
+    let root = majit_translate::model::cast_instance_root(&producer.kind);
+    assert_eq!(
+        root,
+        Some("function::Function"),
+        "force receiver must be CAST onto Function; producer={:?} dump={dump:?}",
+        producer.kind
+    );
+    match &producer.kind {
+        OpKind::Call {
+            result_ty: ValueType::Ref(Some(name)),
+            ..
+        } => assert!(
+            name == "Function" || name == "function::Function",
+            "CAST dest result_ty is the intern leaf or the layout owner, got {name}"
+        ),
+        other => panic!("CAST dest result_ty must be a named Ref, got {other:?}"),
+    }
 }
 
 /// `FrameBox` on the fib path roots the frame with `OwnerRootGuard`. The

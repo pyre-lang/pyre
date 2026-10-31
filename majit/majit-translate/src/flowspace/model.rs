@@ -2956,6 +2956,13 @@ pub enum ConstValue {
     /// `Eq`). Use `ConstValue::float(value)` / `ConstValue::as_float()`
     /// to convert.
     Float(u64),
+    /// RPython `r_singlefloat` (`rarithmetic.py`). IEEE 754 binary32 bits
+    /// (`struct.pack("f", floatval)`). `r_singlefloat._TYPE = SingleFloat`.
+    SingleFloat(u32),
+    /// RPython `r_longfloat` (`rarithmetic.py`). `r_longfloat.value` is a
+    /// Python float; stored as `f64` bits. `typeOf` maps `r_longfloat` to
+    /// `LongFloat`.
+    LongFloat(u64),
     /// Python dict constant. Mirrors upstream `Constant(dict)` and is
     /// used both for `func.__globals__` and optimizer rewrites like
     /// `transform_list_contains`. `Arc` is the shared handle for one
@@ -2973,6 +2980,10 @@ pub enum ConstValue {
     ByteStr(Vec<u8>),
     /// Python 2 unicode constant (`unicode`).
     UniStr(String),
+    /// RPython `unichr` result / `lltype.UniChar`. A Unicode code point in
+    /// `0..=0x10FFFF`, including surrogates. Rust `char` cannot hold a
+    /// surrogate, so the carrier is `u32`.
+    UniChar(u32),
     /// Python tuple constant. Used by `CallSpec.as_list()` to unpack
     /// `*args` exactly like upstream's `w_stararg.value`.
     Tuple(Vec<ConstValue>),
@@ -3013,6 +3024,10 @@ pub enum ConstValue {
     /// at the `Address` lowleveltype slot used by
     /// `MultipleUnrelatedFrozenPBCRepr`.
     LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address),
+    /// RPython `llmemory.AddressAsInt` (`Symbolic` whose `lltype()` is
+    /// `Signed`). Payload is the address `cast_adr_to_int(..., 'symbolic')`
+    /// captured; `intmask` of a Symbolic returns the Symbolic.
+    AddressAsInt(crate::translator::rtyper::lltypesystem::lltype::_address),
     /// Arbitrary host-level Python object (class, module, builtin
     /// callable, instance). General carrier that stands in for an arbitrary
     /// object stored in upstream `Constant.value` — see `HostObject`.
@@ -3170,9 +3185,20 @@ impl PartialEq for ConstValue {
             (ConstValue::Int128(a), ConstValue::Int128(b)) => a == b,
             (ConstValue::UInt128(a), ConstValue::UInt128(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
+            (ConstValue::SingleFloat(a), ConstValue::SingleFloat(b)) => a == b,
+            (ConstValue::LongFloat(a), ConstValue::LongFloat(b)) => {
+                // `r_longfloat.__eq__`: compare the wrapped float value
+                // (`+0.0 == -0.0`, NaN unequal).
+                f64::from_bits(*a) == f64::from_bits(*b)
+            }
             (ConstValue::Dict(a), ConstValue::Dict(b)) => a == b,
             (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) => a == b,
             (ConstValue::UniStr(a), ConstValue::UniStr(b)) => a == b,
+            (ConstValue::UniChar(a), ConstValue::UniChar(b)) => a == b,
+            (ConstValue::UniChar(cp), ConstValue::UniStr(s))
+            | (ConstValue::UniStr(s), ConstValue::UniChar(cp)) => {
+                uni_str_single_codepoint(s) == Some(*cp)
+            }
             (ConstValue::Tuple(a), ConstValue::Tuple(b)) => a == b,
             (ConstValue::List(a), ConstValue::List(b)) => a == b,
             (ConstValue::Bool(a), ConstValue::Bool(b)) => a == b,
@@ -3189,6 +3215,7 @@ impl PartialEq for ConstValue {
                 a._hashable_identity() == b._hashable_identity()
             }
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
+            (ConstValue::AddressAsInt(a), ConstValue::AddressAsInt(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
             (ConstValue::Repr(a), ConstValue::Repr(b)) => a == b,
@@ -3226,8 +3253,15 @@ impl std::fmt::Display for ConstValue {
             ConstValue::Int128(value) => write!(f, "{value}"),
             ConstValue::UInt128(value) => write!(f, "{value}"),
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
+            ConstValue::SingleFloat(bits) => {
+                write!(f, "r_singlefloat({})", f32::from_bits(*bits))
+            }
+            ConstValue::LongFloat(bits) => {
+                write!(f, "r_longfloat({})", f64::from_bits(*bits))
+            }
             ConstValue::ByteStr(value) => write!(f, "b{:?}", String::from_utf8_lossy(value)),
             ConstValue::UniStr(value) => write!(f, "u{value:?}"),
+            ConstValue::UniChar(cp) => write!(f, "unichr({cp:#x})"),
             ConstValue::Bool(value) => write!(f, "{value}"),
             ConstValue::None => f.write_str("None"),
             ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
@@ -3242,6 +3276,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
+            | ConstValue::AddressAsInt(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
             ConstValue::AddressOffset(offset) => write!(f, "{offset:?}"),
             ConstValue::InheritanceId { value, .. } => write!(f, "<inheritance-id {value}>"),
@@ -3251,6 +3286,12 @@ impl std::fmt::Display for ConstValue {
 
 impl Hash for ConstValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        if let Some(cp) = self.unicode_scalar_codepoint() {
+            // UniChar and a length-1 UniStr are one unicode domain.
+            0x75u8.hash(state);
+            cp.hash(state);
+            return;
+        }
         std::mem::discriminant(self).hash(state);
         match self {
             ConstValue::Atom(atom) => atom.hash(state),
@@ -3260,6 +3301,17 @@ impl Hash for ConstValue {
             ConstValue::Int128(value) => value.hash(state),
             ConstValue::UInt128(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
+            ConstValue::SingleFloat(bits) => bits.hash(state),
+            ConstValue::LongFloat(bits) => {
+                // `r_longfloat.__hash__` is `hash(self.value)`: ±0 share
+                // hash 0; NaN is unequal so hashing by bits is allowed.
+                let f = f64::from_bits(*bits);
+                if f == 0.0 {
+                    0u64.hash(state);
+                } else {
+                    bits.hash(state);
+                }
+            }
             ConstValue::Dict(items) => {
                 // Python dict equality ignores insertion order; hash
                 // each entry independently and sort the resulting
@@ -3281,6 +3333,7 @@ impl Hash for ConstValue {
             }
             ConstValue::ByteStr(value) => value.hash(state),
             ConstValue::UniStr(value) => value.hash(state),
+            ConstValue::UniChar(_) => {}
             ConstValue::Tuple(items) => items.hash(state),
             ConstValue::List(items) => items.hash(state),
             ConstValue::Bool(value) => value.hash(state),
@@ -3290,7 +3343,7 @@ impl Hash for ConstValue {
             ConstValue::Graphs(graphs) => graphs.hash(state),
             ConstValue::LowLevelType(lltype) => lltype.hash(state),
             ConstValue::LLPtr(ptr) => ptr._hashable_identity().hash(state),
-            ConstValue::LLAddress(addr) => match addr {
+            ConstValue::LLAddress(addr) | ConstValue::AddressAsInt(addr) => match addr {
                 crate::translator::rtyper::lltypesystem::lltype::_address::Null => 0u8.hash(state),
                 crate::translator::rtyper::lltypesystem::lltype::_address::Fake(p) => {
                     1u8.hash(state);
@@ -3808,6 +3861,9 @@ impl Constant {
     fn uses_hashable_identity_fallback(value: &ConstValue) -> bool {
         match value {
             ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Graphs(_) => true,
+            // `AddressAsInt` is a `Symbolic` (`objectmodel.py`);
+            // `Hashable.__init__` falls back to `id(self.value)`.
+            ConstValue::AddressAsInt(_) => true,
             ConstValue::Tuple(items) => items.iter().any(Self::uses_hashable_identity_fallback),
             _ => false,
         }
@@ -3903,9 +3959,12 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::Int128(_) => "Int128",
         ConstValue::UInt128(_) => "UInt128",
         ConstValue::Float(_) => "Float",
+        ConstValue::SingleFloat(_) => "SingleFloat",
+        ConstValue::LongFloat(_) => "LongFloat",
         ConstValue::Dict(_) => "Dict",
         ConstValue::ByteStr(_) => "ByteStr",
         ConstValue::UniStr(_) => "UniStr",
+        ConstValue::UniChar(_) => "UniChar",
         ConstValue::Tuple(_) => "Tuple",
         ConstValue::List(_) => "List",
         ConstValue::Bool(_) => "Bool",
@@ -3916,6 +3975,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::LowLevelType(_) => "LowLevelType",
         ConstValue::LLPtr(_) => "LLPtr",
         ConstValue::LLAddress(_) => "LLAddress",
+        ConstValue::AddressAsInt(_) => "AddressAsInt",
         ConstValue::HostObject(_) => "HostObject",
         ConstValue::AddressOffset(_) => "AddressOffset",
         ConstValue::SpecTag(_) => "SpecTag",
@@ -3942,8 +4002,10 @@ impl PartialEq for Constant {
                 (ConstValue::List(a), ConstValue::List(b)) => Arc::ptr_eq(a, b),
                 (ConstValue::Dict(a), ConstValue::Dict(b)) => Arc::ptr_eq(a, b),
                 // Vec-backed `Tuple` / `Graphs(Vec<usize>)` carry no shared object identity.
+                // `AddressAsInt` is a `Symbolic` (unhashable), keyed by `id(value)`.
                 (ConstValue::Graphs(_), ConstValue::Graphs(_))
-                | (ConstValue::Tuple(_), ConstValue::Tuple(_)) => self.id == other.id,
+                | (ConstValue::Tuple(_), ConstValue::Tuple(_))
+                | (ConstValue::AddressAsInt(_), ConstValue::AddressAsInt(_)) => self.id == other.id,
                 _ => false,
             }
         } else {
@@ -3969,6 +4031,14 @@ impl Hash for Constant {
         } else {
             self.value.hash(state);
         }
+    }
+}
+
+fn uni_str_single_codepoint(s: &str) -> Option<u32> {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Some(u32::from(ch)),
+        _ => None,
     }
 }
 
@@ -4009,6 +4079,16 @@ impl ConstValue {
     pub fn as_uni_str(&self) -> Option<&str> {
         match self {
             ConstValue::UniStr(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Code point shared by `UniChar` and a length-1 `UniStr`. Surrogates
+    /// live only on `UniChar` (`String` cannot hold them).
+    pub fn unicode_scalar_codepoint(&self) -> Option<u32> {
+        match self {
+            ConstValue::UniChar(cp) => Some(*cp),
+            ConstValue::UniStr(s) => uni_str_single_codepoint(s),
             _ => None,
         }
     }
@@ -4090,9 +4170,14 @@ impl ConstValue {
             // Python `bool(float)` is `float != 0.0` (including -0.0
             // which equals 0.0 under IEEE 754).
             ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
+            // `r_singlefloat.__nonzero__` / `r_longfloat.__nonzero__` raise
+            // TypeError; there is no boolean value.
+            ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => None,
             ConstValue::Dict(items) => Some(!items.is_empty()),
             ConstValue::ByteStr(s) => Some(!s.is_empty()),
             ConstValue::UniStr(s) => Some(!s.is_empty()),
+            // `unichr` result is a length-1 unicode; always true.
+            ConstValue::UniChar(_) => Some(true),
             ConstValue::Tuple(items) => Some(!items.is_empty()),
             ConstValue::List(items) => Some(!items.is_empty()),
             ConstValue::Bool(value) => Some(*value),
@@ -4101,10 +4186,11 @@ impl ConstValue {
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
             ConstValue::LowLevelType(_) => Some(true),
             ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
-            // `fakeaddress.__nonzero__` (llmemory.py) = `ptr is not
-            // None`: a `Fake` and an (odd, tagged-int) `IntCast` are both
-            // non-NULL, only `Null` is false. Single-sourced on `nonzero`.
+            // `fakeaddress.__nonzero__` (llmemory.py) = `ptr is not None`.
+            // `IntCast(0)` is NULL. Single-sourced on `nonzero`.
             ConstValue::LLAddress(addr) => Some(addr.nonzero()),
+            // `AddressAsInt.__nonzero__` = `bool(self.adr)`.
+            ConstValue::AddressAsInt(addr) => Some(addr.nonzero()),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
@@ -4186,9 +4272,10 @@ impl ConstValue {
             | ConstValue::Int128(_)
             | ConstValue::UInt128(_) => HOST_ENV.lookup_builtin("int"),
             ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
+            ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => None,
             ConstValue::Bool(_) => HOST_ENV.lookup_builtin("bool"),
             ConstValue::ByteStr(_) => HOST_ENV.lookup_builtin("str"),
-            ConstValue::UniStr(_) => HOST_ENV.lookup_builtin("unicode"),
+            ConstValue::UniStr(_) | ConstValue::UniChar(_) => HOST_ENV.lookup_builtin("unicode"),
             ConstValue::Tuple(_) => HOST_ENV.lookup_builtin("tuple"),
             ConstValue::List(_) => HOST_ENV.lookup_builtin("list"),
             ConstValue::Dict(_) => HOST_ENV.lookup_builtin("dict"),
@@ -4202,6 +4289,7 @@ impl ConstValue {
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
             | ConstValue::LLAddress(_)
+            | ConstValue::AddressAsInt(_)
             | ConstValue::AddressOffset(_)
             | ConstValue::InheritanceId { .. }
             | ConstValue::SpecTag(_)
@@ -6086,6 +6174,48 @@ mod tests {
             ConstValue::LLAddress(_address::IntCast(0x41)).truthy(),
             Some(true)
         );
+        assert_eq!(
+            ConstValue::LLAddress(_address::IntCast(0)).truthy(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn unichar_and_length_one_unistr_are_one_unicode_domain() {
+        let ch = ConstValue::UniChar(u32::from('A'));
+        let s = ConstValue::uni_str("A");
+        assert_eq!(ch, s);
+        assert_eq!(s, ch);
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        ch.hash(&mut ha);
+        s.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+        assert_ne!(ch, ConstValue::uni_str("AB"));
+        assert_ne!(ConstValue::UniChar(0xD800), ConstValue::uni_str("A"));
+    }
+
+    #[test]
+    fn longfloat_eq_and_hash_follow_float_value() {
+        let pos = ConstValue::LongFloat(0.0f64.to_bits());
+        let neg = ConstValue::LongFloat((-0.0f64).to_bits());
+        assert_eq!(pos, neg);
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        pos.hash(&mut ha);
+        neg.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+        let nan = ConstValue::LongFloat(f64::NAN.to_bits());
+        assert_ne!(nan, nan);
+    }
+
+    #[test]
+    fn address_as_int_constant_uses_identity_fallback() {
+        use lltype::_address;
+        let a = Constant::new(ConstValue::AddressAsInt(_address::Null));
+        let b = Constant::new(ConstValue::AddressAsInt(_address::Null));
+        assert_ne!(a, b);
+        assert_eq!(a, a);
     }
 
     #[test]

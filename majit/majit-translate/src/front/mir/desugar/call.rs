@@ -190,15 +190,12 @@ impl<'a> Lowering<'a> {
         // `SomeInstance(classdef)` rather than the classdef-less shell
         // `valuetype_to_someshell(Ref)` would seed.
         //
-        // A call returning `*mut <registered ADT>` (a `PyObjectRef`) still
-        // collapses to `Ref(None)` — `tyref_to_value_type` erases the
-        // pointee class root.  Capture the pointee root now so the result can be
-        // narrowed to `SomeInstance(root)` after the call op: the call-result
-        // twin of the FieldRead-base and ptr-identity-cast `__cast_instance_intrinsic`
-        // narrows, letting a downstream getattr / method dispatch on the result
-        // resolve instead of blocking the annotator on a classdef-less instance.
-        // Gated on the raw-pointer pointee (not a bare ADT) so foreign value
-        // types (`BigInt` / `Wtf8Buf` — no registered struct) are excluded.
+        // A call returning `*mut <registered ADT>` now carries
+        // `Ref(Some(pointee))` from `tyref_to_value_type_with`. Recast
+        // only when the target root differs from that declared pointee
+        // (a downcast). Identity at jitcode
+        // (`__cast_instance_intrinsic` → `cast_pointer` → `same_as`)
+        // when the roots already match.
         //
         // `tupleobject.py wraptuple` length 2 unpacks `list_w` through
         // `specialisedtupleobject.py makespecialisedtuple` (`w_arg1, w_arg2 =
@@ -273,16 +270,14 @@ impl<'a> Lowering<'a> {
                 // payload class directly so a generated gateway wrapper's
                 // successful match arm can dispatch `self.method()`.
                 .or_else(|| self.option_niche_payload_class_root(dest_class_ty))
-                // A `dont_look_inside` residual returning `Option<*mut PyObject>`
-                // erases the same way — `dont_look_inside_return_token` maps it to
-                // the `ref` GCREF token, so `result_ty` is `Ref(None)` too — but its
-                // `call.dest.ty` is the `Option<…>` ADT, not a bare raw pointer, so
-                // the `raw_ptr_pointee_class_root` above misses.  Narrow it to the
-                // per-instantiation `Option` enum root a constructed
-                // `Some(..)`/`None` of the same instantiation mints, so the caller's
-                // `if let Some(x) = ..` (`Discriminant` → `__discriminant` read, then
-                // the Some-arm `__pos_0` payload) resolves against the Option classdef
-                // instead of blocking on a classdef-less GCREF.
+                // A `dont_look_inside` residual returning `Option<*mut T>`
+                // whose dest type is the `Option<…>` ADT, not a bare raw
+                // pointer, misses `raw_ptr_pointee_class_root`. Narrow it
+                // to the per-instantiation `Option` enum root a constructed
+                // `Some(..)`/`None` of the same instantiation mints, so the
+                // caller's `if let Some(x) = ..` (`Discriminant` →
+                // `__discriminant` read, then the Some-arm `__pos_0`
+                // payload) resolves against the Option classdef.
                 .or_else(|| self.option_residual_narrow_root(dest_class_ty))
                 // A tuple/array returned across a call boundary has the same
                 // synthetic positional layout as one built in the caller,
@@ -312,6 +307,15 @@ impl<'a> Lowering<'a> {
                         .then_some(root)
                 }),
             _ => None,
+        };
+        // The Call dest is already `SomeInstance(root)` when `result_ty`
+        // names that root. Recast only a genuine downcast. Keep
+        // `result_narrow_root` for the ARRAY layout stamp
+        // (`do_fixed_newlist` `op.result.concretetype.TO`) and for an
+        // array-item recast whose getarrayitem dest is still GCREF.
+        let recast_result_root = match (&result_ty, result_narrow_root.as_ref()) {
+            (ValueType::Ref(Some(declared)), Some(narrowed)) if declared == narrowed => None,
+            (_, other) => other.cloned(),
         };
 
         // Resolve arguments before deciding the call shape so receiver
@@ -8652,12 +8656,11 @@ impl<'a> Lowering<'a> {
         // Reload before `edge_args` so the successor sees the word the
         // callee wrote through the raw out-parameter.
         self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads)?;
-        // Narrow a classdef-less registered-ADT call result to
-        // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
-        // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
-        // already-resolved results and production codegen are unaffected; only
-        // a `Ref(None)` raw-`PyObjectRef` result gains its pointee class.
-        if let Some(root) = result_narrow_root {
+        // Narrow a call result whose declared pointee differs from the
+        // target class (`recast_result_root`). Identity at jitcode
+        // (`__cast_instance_intrinsic` → cast_pointer → `same_as`) when
+        // the roots already match, so the Call dest is the value.
+        if let Some(root) = recast_result_root {
             let narrowed = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);

@@ -372,8 +372,8 @@ pub struct TypeDecl {
     #[serde(default)]
     pub ptr_metadata: Value,
     /// Set when a defining crate's struct fields were copied onto this
-    /// import. Field projection reads those fields. Call routing,
-    /// construction, spill, and metadata still treat the decl as the
+    /// import. Field projection and initialization read those fields. Call
+    /// routing, spill, and metadata still treat the decl as the
     /// opaque import: the copy is not a second definition of the class.
     #[serde(skip)]
     pub published_struct_copy: bool,

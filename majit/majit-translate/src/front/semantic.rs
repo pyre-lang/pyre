@@ -50,6 +50,12 @@ pub struct SemanticFunction {
     /// RPython: `op.result.concretetype` — full return type string.
     /// Used for array identity resolution on Call result values.
     pub return_type: Option<String>,
+    /// Class key of a `ref` residual whose `_signature_` analog is
+    /// `SomeInstance(classdef)`. Set for a by-value ADT and for a pointer
+    /// to a registered GC struct.
+    pub return_class_root: Option<String>,
+    /// The residual instance may be null (`SomeInstance.can_be_None`).
+    pub return_can_be_none: bool,
     /// Owner type for impl methods (e.g. "MyStruct" for `impl MyStruct { fn foo() }`).
     /// Used to construct the full CallPath for return_type registration.
     pub self_ty_root: Option<String>,
@@ -150,6 +156,8 @@ impl SemanticFunction {
                 graph_name.into(),
             )),
             return_type: None,
+            return_class_root: None,
+            return_can_be_none: false,
             self_ty_root,
             trait_impl_id: None,
             trait_impl_identity: None,
@@ -251,33 +259,15 @@ pub(crate) fn crate_relative_struct_path<'a>(path: &'a str, foreign_roots: &[Str
     }
 }
 
-/// First balanced `<…>` group, including brackets. A trailing enum
-/// variant (`Result<T>::Ok`) is excluded.
-fn generic_args_span(name: &str) -> Option<&str> {
-    let start = name.find('<')?;
-    let mut depth = 0usize;
-    for (offset, byte) in name.as_bytes()[start..].iter().copied().enumerate() {
-        match byte {
-            b'<' => depth += 1,
-            b'>' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(&name[start..=start + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 fn split_comma_args(inner: &str) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
     let mut depth: i32 = 0;
     let mut start: usize = 0;
-    for (i, b) in inner.bytes().enumerate() {
+    let bytes = inner.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
         match b {
             b'<' | b'(' | b'[' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
             b'>' | b')' | b']' => depth -= 1,
             b',' if depth == 0 => {
                 let segment = inner[start..i].trim();
@@ -299,7 +289,7 @@ fn split_comma_args(inner: &str) -> Vec<&str> {
 /// Type arguments of the first `<…>` group (`CodeObject<ConstantData>` →
 /// `["ConstantData"]`, `RangeInclusive<u8>` → `["u8"]`).
 pub(crate) fn instantiation_type_args(name: &str) -> Vec<&str> {
-    let Some(span) = generic_args_span(name) else {
+    let Some(span) = majit_ir::descr::generic_args_span(name) else {
         return Vec::new();
     };
     split_comma_args(&span[1..span.len() - 1])
@@ -1268,6 +1258,10 @@ mod tests {
         ));
         assert!(type_arg_is_scalar_layout("i64"));
         assert!(!type_arg_is_scalar_layout("ConstantData"));
+        assert_eq!(
+            instantiation_type_args("option::Option<fn(*mut u8) -> Result<*mut u8,E>>::Some"),
+            ["fn(*mut u8) -> Result<*mut u8,E>"]
+        );
     }
 
     #[test]
@@ -1322,6 +1316,8 @@ mod tests {
             name: name.into(),
             graph: crate::model::LazyGraph::built(FunctionGraph::new(name)),
             return_type: None,
+            return_class_root: None,
+            return_can_be_none: false,
             self_ty_root: None,
             trait_impl_id: None,
             trait_impl_identity: None,

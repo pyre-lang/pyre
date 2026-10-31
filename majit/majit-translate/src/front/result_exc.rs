@@ -19912,7 +19912,7 @@ mod live_mut_gc_erasure_tests {
                         "shadow_stack_get",
                     ]),
                     args: crate::model::call_args(vec![idx.clone()]),
-                    result_ty: ValueType::Ref(None),
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
                 },
                 true,
             )

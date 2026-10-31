@@ -1531,6 +1531,10 @@ impl Repr for UniCharRepr {
                 ConstValue::UniStr(s.clone()),
                 LowLevelType::UniChar,
             )),
+            ConstValue::UniChar(cp) if *cp <= 0x10FFFF => Ok(Constant::with_concretetype(
+                ConstValue::UniChar(*cp),
+                LowLevelType::UniChar,
+            )),
             ConstValue::ByteStr(b) if b.len() == 1 && b[0] < 0x80 => {
                 Ok(Constant::with_concretetype(
                     ConstValue::UniStr((b[0] as char).to_string()),
@@ -3908,6 +3912,18 @@ mod tests {
         let r = char_repr();
         let err = r.convert_const(&ConstValue::uni_str("a")).unwrap_err();
         assert!(err.to_string().contains("not a character"));
+    }
+
+    #[test]
+    fn unichar_repr_convert_const_accepts_unichar_carrier_including_surrogate() {
+        let r = unichar_repr();
+        let c = r.convert_const(&ConstValue::UniChar(0xD800)).unwrap();
+        assert_eq!(c.value, ConstValue::UniChar(0xD800));
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::UniChar));
+        let bmp = r
+            .convert_const(&ConstValue::UniChar(u32::from('A')))
+            .unwrap();
+        assert_eq!(bmp.value, ConstValue::UniChar(u32::from('A')));
     }
 
     #[test]

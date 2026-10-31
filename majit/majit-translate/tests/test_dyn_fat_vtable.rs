@@ -192,6 +192,9 @@ fn w_dict_getitem_str_hashed_assembles_with_vtable_word() {
     let segments: Vec<String> = graph.name.split("::").map(str::to_string).collect();
     let path = majit_translate::CallPath::from_segments(segments);
     let mut callcontrol = majit_translate::codewriter::call::CallControl::new();
+    callcontrol.set_struct_fields(
+        majit_translate::front::mir::LowerContext::new(llbc).struct_field_registry(),
+    );
     callcontrol.register_function_graph(path.clone(), graph.clone());
     let mut codewriter = majit_translate::codewriter::codewriter::CodeWriter::new();
     let jitcode = std::sync::Arc::new(majit_translate::codewriter::jitcode::JitCode::new(
@@ -461,6 +464,9 @@ fn w_dict_len_indirect_call_receiver_kind_matches_zst_length_self() {
     let caller_path = majit_translate::CallPath::from_segments(caller_segments);
     let callee_path = majit_translate::CallPath::from_segments(callee_segments);
     let mut callcontrol = majit_translate::codewriter::call::CallControl::new();
+    callcontrol.set_struct_fields(
+        majit_translate::front::mir::LowerContext::new(llbc).struct_field_registry(),
+    );
     callcontrol.register_function_graph(caller_path.clone(), caller.clone());
     callcontrol.register_function_graph(callee_path.clone(), callee.clone());
     let cfg = majit_translate::GraphTransformConfig::default();

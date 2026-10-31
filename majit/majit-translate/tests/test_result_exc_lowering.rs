@@ -3,10 +3,15 @@
 
 mod common;
 
-use common::{INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_named_with_static_addrs};
+use common::{
+    INTERPRETER_LLBC, MODULE_LLBC, load_llbc, lower_context_for, lower_named_with_static_addrs,
+};
 use majit_charon_reader::Llbc;
+use majit_translate::codewriter::call::CallControl;
+use majit_translate::codewriter::codewriter::CodeWriter;
+use majit_translate::codewriter::jitcode::JitCode;
 use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, LinkArg, OpKind};
-use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
+use majit_translate::{CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs};
 
 /// Load `pyre-interpreter.ullbc` once and share it across every test.
 ///
@@ -74,6 +79,31 @@ fn is_root_scope_close(op: &OpKind) -> bool {
             if segments.last().map(String::as_str) == Some("root_scope_close")
                 || (segments.last().map(String::as_str) == Some("drop_in_place")
                     && segments.iter().any(|s| s == "RootScope")))
+}
+
+/// `PinnedResult::reload` reads `roots` / `base` off a raw stack struct and
+/// matches `&mut PyResult`. `fielddescrof` now panics on a fabricated slot
+/// (`descr.py get_field_descr`), so this graph must assemble with real
+/// layout rows rather than `getfield_raw_r`.
+#[test]
+fn pinned_result_reload_assembles() {
+    let name = "pyre_interpreter::executioncontext::<Impl>::reload";
+    let graph = lower_function(interp(), name).expect("lower reload");
+    let path = CallPath::from_segments(["pyre_interpreter", "executioncontext", "reload"]);
+    let mut callcontrol = CallControl::new();
+    callcontrol.set_struct_fields(lower_context_for(interp()).struct_field_registry());
+    callcontrol.register_function_graph(path.clone(), graph.clone());
+    let mut codewriter = CodeWriter::new();
+    let jitcode = std::sync::Arc::new(JitCode::new("reload"));
+    codewriter.transform_graph_to_jitcode(
+        &graph,
+        &path,
+        &mut callcontrol,
+        &GraphTransformConfig::default(),
+        &jitcode,
+        false,
+        0,
+    );
 }
 
 #[test]

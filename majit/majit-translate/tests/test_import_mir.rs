@@ -1041,6 +1041,8 @@ fn root_producers(
 /// `SomePtr(CCHARP)` onto `copy_bytes` dst.
 #[test]
 fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
+    use majit_translate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
     let llbc = load_llbc(RLIB_LLBC);
     let charpsize = lower_named(llbc, "charpsize2str").expect("lower charpsize2str");
     let str2charp = lower_named(llbc, "str2charp").expect("lower str2charp");
@@ -1093,15 +1095,16 @@ fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
         }
         _ => None,
     });
-    let result_arg = result_arg.expect(&format!(
-        "str2charp's Ok payload base is the ? desugar's __cast_instance_intrinsic; base_roots={base_roots:?}"
-    ));
+    // `rffi.py str2charp` copies into the raw allocation. A frontend
+    // `cast_pointer` alias may narrow its Result carrier, but is not a
+    // required producer when the call already carries that class.
+    let result_arg = result_arg.unwrap_or_else(|| ok_payload_base.clone());
     let result_roots = root_producers(&str2charp, &result_arg);
     assert!(
         result_roots
             .iter()
             .any(|(kind, _)| call_path_leaf(kind) == Some("raw_malloc_or_memory_error")),
-        "str2charp's Ok payload is the variant cast of raw_malloc_or_memory_error's Result; result_roots={result_roots:?}"
+        "str2charp's Ok payload comes from raw_malloc_or_memory_error's Result; result_roots={result_roots:?}"
     );
 
     let ret = graph_return_value(&raw_malloc).expect("raw_malloc returns a value");
@@ -1112,6 +1115,13 @@ fn charpsize2str_and_str2charp_copy_bytes_dst_is_ccharp() {
             args,
             ..
         } if segments.last().map(String::as_str) == Some("cast_int_to_ptr") && args.len() == 2 => {
+            assert!(
+                matches!(&args[0], LinkArg::Const(c)
+                    if matches!(&c.value, majit_translate::flowspace::model::ConstValue::LowLevelType(ty)
+                        if **ty == *CCHARP)),
+                "rffi.str2charp allocation must be cast to CCHARP, got {:?}",
+                args[0]
+            );
             args.get(1).and_then(LinkArg::as_variable).cloned()
         }
         _ => None,

@@ -300,6 +300,8 @@ fn fast2locals_assembles() {
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();
+    let llbc = interpreter_llbc().expect("fast2locals_assembles already lowered from this LLBC");
+    callcontrol.set_struct_fields(lower_context_for(llbc).struct_field_registry());
     callcontrol.set_exc_pytype_rows(vec![(
         "interp_exceptions::EXC_STOPITERATION_TYPE".to_string(),
         1,

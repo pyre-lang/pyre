@@ -528,6 +528,16 @@ impl CodeWriter {
                     graph,
                     &callcontrol.raw_alloc_flavor_structs,
                 );
+                // Skip commits `GcRef` as `rclass.OBJECTPTR`
+                // (`concrete_to_canonical_lltype`). A Call dest whose
+                // `result_ty` names a registered GC struct is
+                // `getinstancerepr(classdef)` (`rtyper.py`
+                // `setconcretetype`, `rclass.py` `getinstancerepr`),
+                // the same producer `backfill_untyped_call_results`
+                // uses when the dest is untyped.
+                if let Ok((_, rtyper)) = self.dual_gate_registry(callcontrol).ensure_session() {
+                    crate::translator::rtyper::cutover::stamp_named_ref_call_dests(graph, &rtyper);
+                }
                 // Clear `Variable.annotation` after the Skip-arm
                 // legacy walker has committed each cell's
                 // `Variable.concretetype` via

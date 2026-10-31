@@ -324,27 +324,31 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         // is the same ordinary narrowing used for pointer-valued call results;
         // weakening the shared Tuple field would diverge from RPython's concrete
         // `InstanceRepr` field setup (`rclass.py`).
-        let payload = emit_narrow(graph, then_bb, payload, &site.payload_class_root);
-        graph.block_mut(then_bb).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: args_tuple.clone(),
-                field: FieldDescriptor {
-                    name: "__pos_0".to_string(),
-                    owner_root: Some(tuple_owner.clone()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                    inline_vec: false,
-                    vec_part: None,
-                    owner_declared_gc: None,
-                    host_index: None,
-                    scalar_word: None,
+        if majit_ir::descr::is_shaped_tuple_name(&tuple_owner) {
+            let payload = emit_narrow(graph, then_bb, payload, &site.payload_class_root);
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: args_tuple.clone(),
+                    field: FieldDescriptor {
+                        name: "__pos_0".to_string(),
+                        owner_root: Some(tuple_owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    value: LinkArg::Value(payload),
+                    ty: site.payload_ty.clone(),
                 },
-                value: LinkArg::Value(payload),
-                ty: site.payload_ty.clone(),
-            },
-        });
+            });
+        } else {
+            drop(payload);
+        }
         let call_result = graph.alloc_value_var();
         graph.block_mut(then_bb).operations.push(SpaceOperation {
             result: Some(call_result.clone()),
@@ -488,7 +492,7 @@ mod tests {
             payload_ty: ValueType::Int,
             payload_class_root: None,
             result_ty: ValueType::Int,
-            args_tuple_suffix: String::new(),
+            args_tuple_suffix: "<i64>".into(),
             niche: false,
             int_null: None,
             scalar_niche: false,

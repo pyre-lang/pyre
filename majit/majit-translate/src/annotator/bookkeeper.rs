@@ -42,8 +42,8 @@ use super::dictdef::{DictDef, DictKey};
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomeOrderedDict, SomePBC, SomeString, SomeTuple, SomeType, SomeUnicodeCodePoint,
-    SomeUnicodeString, SomeValue, s_impossible_value, s_none, union,
+    SomeLongFloat, SomeOrderedDict, SomePBC, SomeSingleFloat, SomeString, SomeTuple, SomeType,
+    SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, s_impossible_value, s_none, union,
 };
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
@@ -674,7 +674,7 @@ impl PbcAttrFamily {
 
 /// `SomePtr(Ptr(Struct raw))` for `class_root`, or `None` when that owner
 /// is not a Raw struct with registry rows.
-fn raw_struct_ptr_from_layout(
+pub(crate) fn raw_struct_ptr_from_layout(
     registry: &crate::front::StructFieldRegistry,
     layouts: &crate::codewriter::call::StructLayoutTable,
     class_root: &str,
@@ -4099,6 +4099,18 @@ impl Bookkeeper {
         Some(SomeValue::RustVec(s_vec))
     }
 
+    /// Stored raw pointers (`*mut T` / `*const T`) and the `PyObjectRef`
+    /// alias (`*mut pyobject::PyObject`) can be null. RPython
+    /// `SomeInstance.__init__(classdef, can_be_None=True)` (`model.py`);
+    /// `noneify` is that constructor for an Instance. Other projections
+    /// are unchanged. `&T` never reaches this helper.
+    fn nullable_raw_ptr_annotation(s: SomeValue) -> SomeValue {
+        match &s {
+            SomeValue::Instance(_) => s.noneify().unwrap_or(s),
+            _ => s,
+        }
+    }
+
     /// TODO: no upstream equivalent.  Project a Rust type
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
@@ -4131,16 +4143,20 @@ impl Bookkeeper {
         // annotation itself.  Resolve the alias before the ordinary named
         // struct arm so list item repr construction sees that same root
         // `ClassDef`, rather than minting a classdef-less placeholder.
+        // The alias is a raw pointer, so the instance is nullable
+        // (`PY_NULL`): `SomeInstance.__init__(…, can_be_None=True)`.
         if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
-            return self.project_struct_field_type("pyobject::PyObject");
+            return Self::nullable_raw_ptr_annotation(
+                self.project_struct_field_type("pyobject::PyObject"),
+            );
         }
         // `IdentityKey` is `repr(transparent)` over `PyObjectRef`
         // (`IdentityDictStrategy`: the key is the object, compared by
         // identity). The constructor is that pointer, so the dict key
-        // cell is the same instance. A separate `IdentityKey` class
-        // has no common base with `PyObject`.
+        // cell is the same nullable instance. A separate `IdentityKey`
+        // class has no common base with `PyObject`.
         if t == "IdentityKey" || t.ends_with("::IdentityKey") {
-            return self.project_struct_field_type("pyobject::PyObject");
+            return self.project_struct_field_type("PyObjectRef");
         }
         // A function-pointer field is `Ptr(FuncType)` (`lltype.py FuncType`,
         // `SomePtr`), not a classdef-less `SomeInstance`.  Raw `fn` has
@@ -4227,11 +4243,11 @@ impl Bookkeeper {
                 );
                 return SomeValue::Instance(super::model::SomeInstance::new(
                     None,
-                    false,
+                    true,
                     std::collections::BTreeMap::new(),
                 ));
             }
-            return s_pointee;
+            return Self::nullable_raw_ptr_annotation(s_pointee);
         }
         let stripped = t
             .trim_start_matches('&')
@@ -5264,6 +5280,16 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Float(s))
             }
+            ConstValue::SingleFloat(_) => {
+                let mut s = SomeSingleFloat::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::SingleFloat(s))
+            }
+            ConstValue::LongFloat(_) => {
+                let mut s = SomeLongFloat::new();
+                s.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::LongFloat(s))
+            }
             ConstValue::ByteStr(s) => {
                 let no_nul = !s.contains(&0);
                 let result = if s.len() == 1 {
@@ -5291,6 +5317,12 @@ impl Bookkeeper {
                     SomeValue::UnicodeString(st)
                 };
                 Ok(result)
+            }
+            ConstValue::UniChar(cp) => {
+                let no_nul = *cp != 0;
+                let mut ch = SomeUnicodeCodePoint::new(no_nul);
+                ch.inner.base.const_box = Some(Constant::new(x.clone()));
+                Ok(SomeValue::UnicodeCodePoint(ch))
             }
             ConstValue::None => Ok(s_none()),
             ConstValue::Tuple(items) => {
@@ -5328,8 +5360,9 @@ impl Bookkeeper {
                 }
                 Ok(result)
             }
-            ConstValue::AddressOffset(_) => {
-                // AddressOffset.annotation() returns SomeInteger()
+            ConstValue::AddressOffset(_) | ConstValue::AddressAsInt(_) => {
+                // AddressOffset.annotation() / AddressAsInt.annotation()
+                // return SomeInteger().
                 let mut s = SomeInteger::new(false, false);
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Integer(s))
@@ -7481,6 +7514,33 @@ mod tests {
             Rc::ptr_eq(&alias_class, &root_classdef),
             "the source alias and registered PyObject root must share one ClassDef"
         );
+        assert!(
+            alias_item.can_be_none,
+            "PyObjectRef is *mut PyObject and can be PY_NULL"
+        );
+
+        let SomeValue::Instance(raw_ptr_item) =
+            bk.project_struct_field_type("*mut pyobject::PyObject")
+        else {
+            panic!("*mut pyobject::PyObject must project to the PyObject instance")
+        };
+        assert!(
+            raw_ptr_item.can_be_none,
+            "*mut / *const of a classed pointee can be null"
+        );
+        assert!(
+            raw_ptr_item
+                .classdef
+                .as_ref()
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &root_classdef))
+        );
+
+        let SomeValue::Instance(borrowed_item) =
+            bk.project_struct_field_type("&pyobject::PyObject")
+        else {
+            panic!("&pyobject::PyObject must project to the PyObject instance")
+        };
+        assert!(!borrowed_item.can_be_none, "&T is a non-null reference");
 
         let SomeValue::List(array) = bk.project_struct_field_type("[PyObjectRef; 0]") else {
             panic!("a PyObjectRef array tail must project to a list")
@@ -7556,10 +7616,13 @@ mod tests {
         use crate::annotator::model::SomeValue;
         let bk = bk();
         match bk.project_struct_field_type("*mut TlsConnection") {
-            SomeValue::Instance(inst) => assert!(
-                inst.classdef.is_none(),
-                "opaque C pointer is the classdef-less Ref fold"
-            ),
+            SomeValue::Instance(inst) => {
+                assert!(
+                    inst.classdef.is_none(),
+                    "opaque C pointer is the classdef-less Ref fold"
+                );
+                assert!(inst.can_be_none, "a stored raw pointer can be null");
+            }
             other => panic!("expected classdef-less instance, got {other:?}"),
         }
     }

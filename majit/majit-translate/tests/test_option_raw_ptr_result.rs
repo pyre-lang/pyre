@@ -34,6 +34,7 @@ fn assemble(leaf: &str) {
     graph.return_type = func.return_type.clone();
     let path = CallPath::from_segments(["charon_corpus", leaf]);
     let mut callcontrol = CallControl::new();
+    callcontrol.set_struct_fields(program.struct_fields.clone());
     callcontrol.register_function_graph(path.clone(), graph.clone());
     let mut codewriter = CodeWriter::new();
     let jitcode = std::sync::Arc::new(JitCode::new(leaf));

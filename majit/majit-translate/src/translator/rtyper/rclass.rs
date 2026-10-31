@@ -19,10 +19,11 @@
 //!
 //! Deferred:
 //!
-//! * `_check_for_immutable_hints` (rclass.py),
-//!   `special_memory_pressure` + `mutate_*` quasi-immutable fields
-//!   (rclass.py). Phase R2-D, gated on `classdesc.get_param`
-//!   / bookkeeper `memory_pressure_types`.
+//! * `special_memory_pressure` (rclass.py). Phase R2-D, gated on
+//!   bookkeeper `memory_pressure_types`. `_check_for_immutable_hints`
+//!   copies `classdesc.immutable_fields` onto `immutable_field_set`;
+//!   `_setup_repr` appends `mutate_<name>` `OBJECTPTR` fields for
+//!   quasi-immutable attrs.
 //!
 //! Phase R3 landed (`ClassRepr.init_vtable` at [`ClassRepr::init_vtable`]
 //! line 838, `fill_vtable_root` at [`ClassRepr::fill_vtable_root`] line
@@ -444,18 +445,25 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::Int128(value) => *value != 0,
         ConstValue::UInt128(value) => *value != 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
+        ConstValue::SingleFloat(_) => {
+            panic!("TypeError: not supported on r_singlefloat instances")
+        }
+        ConstValue::LongFloat(_) => {
+            panic!("TypeError: not supported on r_longfloat instances")
+        }
         ConstValue::ByteStr(text) => !text.is_empty(),
         ConstValue::UniStr(text) => !text.is_empty(),
+        ConstValue::UniChar(_) => true,
         ConstValue::Tuple(items) => !items.is_empty(),
         ConstValue::List(items) => !items.is_empty(),
         ConstValue::Dict(items) => !items.is_empty(),
+        ConstValue::LLAddress(addr) | ConstValue::AddressAsInt(addr) => addr.nonzero(),
         ConstValue::Atom(_)
         | ConstValue::Code(_)
         | ConstValue::Function(_)
         | ConstValue::Graphs(_)
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
-        | ConstValue::LLAddress(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)
@@ -2384,11 +2392,10 @@ impl Repr for RootClassRepr {
 /// `rtyper.getrepr(attrdef.s_value)` + `mangled_name = 'inst_' + name`
 /// (rclass.py), and the `object_type` Struct body includes the
 /// `(mangled_name, r.lowleveltype)` pairs alongside `('super',
-/// rbase.object_type)`. The `special_memory_pressure` /
-/// `mutate_<name>` quasi-immutable fields (rclass.py), the
-/// `_check_for_immutable_hints` branch (rclass.py), and the
-/// `rtti=True` kwarg (rclass.py `attachRuntimeTypeInfo` side
-/// effect) remain R2-D / R3 scope.
+/// rbase.object_type)`. `_setup_repr` copies
+/// `classdesc.immutable_fields` onto `immutable_field_set` and
+/// appends `mutate_<name>` `OBJECTPTR` fields for quasi-immutable
+/// attrs (rclass.py). `special_memory_pressure` remains R2-D.
 #[derive(Debug)]
 pub struct InstanceRepr {
     /// RPython `self.rtyper = rtyper` (rclass.py:469).
@@ -2428,9 +2435,7 @@ pub struct InstanceRepr {
     allinstancefields: RefCell<HashMap<String, (String, Arc<dyn Repr>)>>,
     /// RPython `self.immutable_field_set = set()` (rclass.py) for
     /// classdef=None, overwritten by `_check_for_immutable_hints` for
-    /// classdef!=None (rclass.py). R2-C keeps it as an empty set —
-    /// the immutable-hint derivation lands in R2-D.
-    #[allow(dead_code)]
+    /// classdef!=None (`self.immutable_field_set = classdesc.immutable_fields`).
     immutable_field_set: RefCell<HashSet<String>>,
     /// RPython `self._reusable_prebuilt_instance` (rclass.py:807).
     /// Lazy-initialised by [`Self::get_reusable_prebuilt_instance`] —
@@ -4480,18 +4485,36 @@ impl Repr for InstanceRepr {
         Repr::setup(rbase.as_ref())?;
         *self.rbase.borrow_mut() = Some(rbase.clone());
 
+        // rclass.py `_check_for_immutable_hints`:
+        // `self.immutable_field_set = classdesc.immutable_fields`.
+        *self.immutable_field_set.borrow_mut() = classdef_rc
+            .borrow()
+            .classdesc
+            .borrow()
+            .immutable_fields
+            .clone();
+
         // rclass.py:548-554 — `object_type = MkStruct(classdef.name,
         // ('super', rbase.object_type), hints=hints, adtmeths=adtmeths,
         // *llfields, **kwds)` + `self.object_type.become(object_type)`.
         // Gc-flavor also passes `rtti=True` (rclass.py) so the
         // struct carries an `_runtime_type_info` opaque consumable by
-        // `fill_vtable_root` via `getRuntimeTypeInfo`. Immutable /
-        // special_memory_pressure hints stay unported (R2-D).
+        // `fill_vtable_root` via `getRuntimeTypeInfo`.
+        // `special_memory_pressure` hints stay unported (R2-D).
         // `VirtualizableInstanceRepr._setup_repr_llfields`: extra llfields
         // (the virtualizable token as `llmemory.GCREF`) precede the instance
         // attrs (`llfields + myllfields`).
         if let Some(vable) = self.virtualizable.borrow().as_ref() {
             myllfields.splice(0..0, vable.setup_repr_llfields());
+        }
+        // rclass.py — `for name, attrdef in attrs:
+        //     if not attrdef.readonly and self.is_quasi_immutable(name):
+        //         llfields.append(('mutate_' + name, OBJECTPTR))`.
+        let arc_self = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+        for (attr_name, (_s_value, readonly)) in &attrs_sorted {
+            if !*readonly && arc_self.is_quasi_immutable(attr_name) {
+                myllfields.push((format!("mutate_{attr_name}"), OBJECTPTR.clone()));
+            }
         }
         // `_parse_field_list` reads `self.fields`. Store them before
         // `MkStruct` so the `virtualizable_accessor` hint can name the
@@ -5057,6 +5080,12 @@ pub(crate) type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+    #[test]
+    #[should_panic(expected = "not supported on r_singlefloat instances")]
+    fn const_truthy_singlefloat_raises_type_error() {
+        let _ = const_truthy(&ConstValue::SingleFloat(1f32.to_bits()));
+    }
 
     #[test]
     fn top_level_runtime_helper_parity_surface() {
@@ -7327,6 +7356,45 @@ mod tests {
             .get("inst_x")
             .expect("object_type must carry inst_x field");
         assert_eq!(*x_field, LowLevelType::Signed);
+    }
+
+    #[test]
+    fn instance_repr_setup_appends_mutate_field_for_quasi_immutable_attr() {
+        use crate::annotator::model::SomeInteger;
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("Function", None);
+        attach_attr(
+            &classdef,
+            "w_qualname",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        classdef
+            .borrow()
+            .classdesc
+            .borrow_mut()
+            .immutable_fields
+            .insert("w_qualname?".to_string());
+
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type is ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("object_type resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type resolves to Struct");
+        };
+        assert!(
+            body._flds.get("mutate_w_qualname").is_some(),
+            "rclass.py _setup_repr appends mutate_<name> OBJECTPTR; names={:?}",
+            body._names
+        );
+        assert_eq!(
+            body._flds.get("mutate_w_qualname").cloned(),
+            Some(OBJECTPTR.clone())
+        );
     }
 
     #[test]

@@ -2700,9 +2700,9 @@ mod tests {
     /// resolved offsets themselves — the offsets (buf@0/pos@8/end@16/total@24/
     /// pieces@32) are verified directly against `fielddescrof` in
     /// `call::tests::rtyper_synthesised_stringbuilder_struct_resolves_its_field_descrs`.
-    /// (`fielddescrof` falls back to slot 0 rather than panicking when the
-    /// owner is unregistered, so a body-nonempty assertion alone cannot
-    /// discriminate the layout — that is the descr test's job.)
+    /// (`fielddescrof` panics when `getattr(STRUCT, fieldname)` misses, so
+    /// a body-nonempty assertion alone cannot discriminate the layout —
+    /// that is the descr test's job.)
     #[test]
     fn ll_getlength_drains_with_the_stringbuilder_layout() {
         use crate::codewriter::call::CallControl;

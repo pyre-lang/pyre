@@ -10,10 +10,10 @@ use crate::annotator::model::{KnownType, SomeObject, SomeObjectTrait, SomeValue}
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer, GCREF,
-    GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
-    cast_opaque_ptr, cast_pointer, container_value_as_ptr, direct_arrayitems, direct_fieldptr,
-    direct_ptradd, nullptr, parentlink,
+    _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer,
+    CastWhateverError, GCREF, GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget,
+    WEAKREF_PTR, cast_int_to_ptr, cast_opaque_ptr, cast_pointer, container_value_as_ptr,
+    direct_arrayitems, direct_fieldptr, direct_ptradd, normalizeptr, nullptr, parentlink,
 };
 
 /// RPython `class fakeaddress(object)` (llmemory.py).
@@ -1217,13 +1217,47 @@ pub fn cast_any_ptr(expected: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
     cast_pointer(expected, ptr)
 }
 
-/// `cast_ptr_to_adr(obj)` (llmemory.py): wrap a low-level pointer in
-/// a fake address, normalizing a null pointer to `NULL`.
+/// `_ptr._cast_to_adr` (lltype.py) then `fakeaddress(ptr)` / `NULL`.
+/// Function pointers and `_subarray` wrap the pointer itself; the normal
+/// case wraps `normalizeptr(self)`. `llarena._oldobj_to_address` for a
+/// freed object is unported (`lltypesystem/mod.rs`).
 pub fn cast_ptr_to_adr(obj: &_ptr) -> _address {
-    if obj.nonzero() {
-        _address::Fake(Box::new(obj.clone()))
-    } else {
-        _address::Null
+    if matches!(obj._TYPE.TO, PtrTarget::Func(_)) {
+        return if obj.nonzero() {
+            _address::Fake(Box::new(obj.clone()))
+        } else {
+            _address::Null
+        };
+    }
+    if let Ok(true) = obj._was_freed() {
+        // `llarena._oldobj_to_address` is unported. Keep the freed pointer
+        // wrapped so later `_obj` checks fail the same way a non-arena freed
+        // pointer does upstream.
+        return _address::Fake(Box::new(obj.clone()));
+    }
+    if let Ok(Some(_ptr_obj::Subarray(_))) = obj._obj0_value() {
+        return if obj.nonzero() {
+            _address::Fake(Box::new(obj.clone()))
+        } else {
+            _address::Null
+        };
+    }
+    match normalizeptr(obj, true) {
+        Ok(Some(p)) => {
+            if p.nonzero() {
+                _address::Fake(Box::new(p))
+            } else {
+                _address::Null
+            }
+        }
+        Ok(None) => _address::Null,
+        Err(_) => {
+            if obj.nonzero() {
+                _address::Fake(Box::new(obj.clone()))
+            } else {
+                _address::Null
+            }
+        }
     }
 }
 
@@ -1242,22 +1276,35 @@ pub fn cast_adr_to_int(adr: &_address, mode: Option<&str>) -> Result<i64, String
     }
 }
 
-/// `cast_int_to_adr(int)` (llmemory.py):
-///
-/// ```python
-/// def cast_int_to_adr(int):
-///     if isinstance(int, AddressAsInt):
-///         return int.adr
-///     try:
-///         ptr = lltype.cast_int_to_ptr(_NONGCREF, int)
-///     except ValueError:
-///         from rpython.rtyper.lltypesystem import ll2ctypes
-///         ptr = ll2ctypes._int2obj[int]._as_ptr()
-///     return cast_ptr_to_adr(ptr)
-/// ```
-///
-/// The `AddressAsInt` branch is moot — pyre carries no `AddressAsInt`
-/// constant. Folding the composition three ways:
+/// `cast_adr_to_int` including `'symbolic'` → `AddressAsInt`.
+pub fn cast_adr_to_int_value(
+    adr: &_address,
+    mode: Option<&str>,
+) -> Result<ConstValue, CastWhateverError> {
+    match mode.unwrap_or("emulated") {
+        "emulated" | "forced" => cast_adr_to_int(adr, mode)
+            .map(ConstValue::Int)
+            .map_err(CastWhateverError::TypeError),
+        "symbolic" => match adr {
+            _address::Null => Ok(ConstValue::Int(0)),
+            _address::IntCast(n) => Ok(ConstValue::Int(*n)),
+            _address::Fake(ptr) => {
+                if let Ok(Some(_ptr_obj::IntCast(n))) = ptr._obj0_value() {
+                    Ok(ConstValue::Int(n))
+                } else {
+                    Ok(ConstValue::AddressAsInt(adr.clone()))
+                }
+            }
+        },
+        other => Err(CastWhateverError::TypeError(format!(
+            "unsupported cast_adr_to_int mode {other:?}"
+        ))),
+    }
+}
+
+/// `cast_int_to_adr(int)` (llmemory.py) for a word-sized integer. The
+/// `isinstance(int, AddressAsInt)` branch lives on
+/// [`cast_int_value_to_adr`]. Folding the integer composition:
 /// - `int == 0`: `cast_int_to_ptr` returns `nullptr(_NONGCREF.TO)`, whose
 ///   `_obj0` is `None`, so `cast_ptr_to_adr` (`fakeaddress.__init__`,
 ///   llmemory.py) normalizes the null ptr to the NULL address.
@@ -1278,6 +1325,15 @@ pub fn cast_int_to_adr(int: i64) -> Option<_address> {
     }
 }
 
+/// `cast_int_to_adr` including `isinstance(int, AddressAsInt): return int.adr`.
+pub fn cast_int_value_to_adr(value: &ConstValue) -> Option<_address> {
+    match value {
+        ConstValue::AddressAsInt(adr) => Some(adr.clone()),
+        ConstValue::Int(n) => cast_int_to_adr(*n),
+        _ => None,
+    }
+}
+
 /// `cast_adr_to_ptr(adr, EXPECTED_TYPE)` (llmemory.py) =
 /// `adr._cast_to_ptr(EXPECTED_TYPE)` (llmemory.py). `_fixup()` is the
 /// identity here (the llarena fake-arena rebind is unported). A live address
@@ -1289,17 +1345,20 @@ pub fn cast_int_to_adr(int: i64) -> Option<_address> {
 /// other concrete/opaque `EXPECTED` fails through `cast_opaque_ptr` because the
 /// bare-integer container has no `_obj.container` (upstream `InvalidCast`).
 pub fn cast_adr_to_ptr(adr: &_address, expected: &Ptr) -> Result<_ptr, String> {
+    // `fakeaddress._cast_to_ptr`: `_fixup()` then `cast_any_ptr` / `nullptr`.
+    // `_fixup` is the identity here (`llarena.getfakearenaaddress` is unported).
     match adr {
         _address::Fake(ptr) => cast_any_ptr(expected, ptr),
         _address::Null => nullptr(expected.TO.clone().into()),
-        // A `ConstRefAddr` raw host pointer has no live container to re-cast at
-        // fold time — upstream's rtyper would hold the prebuilt object's `_ptr`
-        // (via `convert_const`); pyre cannot rebuild it from the bare integer.
-        // It flows only as a `Ref` constant and never reaches here in practice.
-        _address::IntCast(_) => Err(
-            "cast_adr_to_ptr on a ConstRefAddr raw host pointer: no live container at fold time"
-                .into(),
-        ),
+        // Tagged-integer addresses from `cast_int_to_adr` rebuild a `_NONGCREF`
+        // `_ptr` (0 / odd). An even `ConstRefAddr` integer has no live
+        // container and no `ll2ctypes._int2obj` table.
+        _address::IntCast(n) => {
+            let rebuilt = cast_int_to_adr(*n).ok_or_else(|| {
+                format!("cast_adr_to_ptr on even integer address {n}: no ll2ctypes._int2obj")
+            })?;
+            cast_adr_to_ptr(&rebuilt, expected)
+        }
     }
 }
 
@@ -1418,6 +1477,20 @@ mod tests {
         };
         let tagged = cast_int_to_ptr(&ptr_t, 19).unwrap();
         assert_eq!(cast_adr_to_int(&cast_ptr_to_adr(&tagged), None), Ok(19));
+    }
+
+    #[test]
+    fn symbolic_cast_returns_intcast_payload_and_zero_for_null() {
+        assert_eq!(
+            cast_adr_to_int_value(&_address::IntCast(41), Some("symbolic")).unwrap(),
+            ConstValue::Int(41)
+        );
+        assert_eq!(
+            cast_adr_to_int_value(&_address::IntCast(0), Some("symbolic")).unwrap(),
+            ConstValue::Int(0)
+        );
+        assert!(!_address::IntCast(0).nonzero());
+        assert!(_address::IntCast(41).nonzero());
     }
 
     #[test]

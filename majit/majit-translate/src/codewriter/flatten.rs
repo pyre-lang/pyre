@@ -374,6 +374,7 @@ fn signed_switch_key(value: &ConstValue) -> Option<i64> {
             Some(i64::from(u32::from(c)))
         }
         ConstValue::ByteStr(bytes) if bytes.len() == 1 => Some(i64::from(bytes[0])),
+        ConstValue::UniChar(cp) => Some(i64::from(*cp)),
         _ => None,
     }
 }
@@ -1651,11 +1652,19 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
-        | ConstValue::LLAddress(_) => 'i',
+        | ConstValue::LLAddress(_)
+        | ConstValue::AddressAsInt(_) => 'i',
         ConstValue::Int128(_) | ConstValue::UInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }
+        // `history.py getkind`: SingleFloat is stored in an int when
+        // supported; LongFloat is too large.
+        ConstValue::SingleFloat(_) => 'i',
         ConstValue::Float(_) => 'f',
+        ConstValue::LongFloat(_) => {
+            panic!("getkind: type LongFloat is too large")
+        }
+        ConstValue::UniChar(_) => 'i',
         ConstValue::None
         | ConstValue::ByteStr(_)
         | ConstValue::UniStr(_)
@@ -1755,6 +1764,18 @@ mod tests {
         var: &crate::flowspace::model::Variable,
     ) -> Register {
         Register::new(RegKind::Int, regallocs[&RegKind::Int].coloring[var])
+    }
+
+    #[test]
+    fn constvalue_kind_singlefloat_is_int_and_longfloat_is_too_large() {
+        assert_eq!(
+            constvalue_kind(&ConstValue::SingleFloat(1f32.to_bits())),
+            'i'
+        );
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            constvalue_kind(&ConstValue::LongFloat(1.0f64.to_bits()))
+        }));
+        assert!(panicked.is_err(), "LongFloat is too large for getkind");
     }
 
     #[test]

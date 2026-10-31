@@ -364,6 +364,8 @@ pub unsafe fn set_type_hasdict(w_type: PyObjectRef, v: bool) {
 /// `_mapdict_init_empty` for a carrier whose `map` is still null
 /// (`mapdict.py user_setup` copies `w_subtype.terminator` at construction;
 /// `typeobject.py W_TypeObject.__init__` stores that terminator after layout).
+/// Like `user_setup`, this reads the completed type's terminator; allocating
+/// one here would move type initialization into a JIT-visible instance read.
 /// `_getusercls` allocators stamp `map: 0` (`pyre-object` cannot call this
 /// layer), so the null-map check stays: copy the type's terminator into the
 /// instance before any `node_read`/`node_write`/`node_delete`.
@@ -384,7 +386,7 @@ pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) -> PyObjectRef {
         return obj;
     }
     let w_type = instance_getclass(obj);
-    let term = type_terminator_or_create(w_type);
+    let term = ensure_type_terminator(w_type);
     inst._set_mapdict_map(term);
     obj
 }
@@ -529,30 +531,6 @@ pub unsafe fn typedef_owns_dict(obj: PyObjectRef) -> bool {
         && unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) }
 }
 
-/// Read `w_type.terminator` (`typeobject.py W_TypeObject.__init__` /
-/// [`install_type_terminator`]). Types built after bootstrap always have
-/// one. A null slot on a type that already has a layout is a missed
-/// construction site. Incomplete types (`w_type_new` in unit tests, layout
-/// still null) still need a terminator when `_getusercls` stamped `map: 0`.
-///
-/// # Safety
-/// `w_type` must be a live `W_TypeObject`.
-unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
-    let term = unsafe { pyre_object::w_type_get_terminator(w_type) };
-    if !term.is_null() {
-        return term;
-    }
-    debug_assert!(
-        unsafe { pyre_object::w_type_get_layout_ptr(w_type) }.is_null(),
-        "typeobject.py W_TypeObject.__init__ stores terminator after layout"
-    );
-    let hasdict = unsafe { pyre_object::w_type_get_hasdict(w_type) };
-    let typedef_hasdict = unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) };
-    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict);
-    unsafe { pyre_object::w_type_set_terminator(w_type, term) };
-    term
-}
-
 /// Forward `Terminator.w_cls` stored in the immortal map node.
 ///
 /// PyPy's `Terminator` is a GC object (`mapdict.py`); `w_cls` is an
@@ -655,7 +633,7 @@ pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
     unsafe { ensure_mapdict_initialized(obj) };
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let w_cls = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let new_term = unsafe { type_terminator_or_create(w_cls) };
+    let new_term = unsafe { ensure_type_terminator(w_cls) };
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let mut inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
@@ -5634,8 +5612,7 @@ pub unsafe fn node_write<O: MapdictObject>(
 
 /// `MapDictStrategy.length` (mapdict.py) — count the DICT attributes
 /// by walking the `search(DICT)` chain. `dont_look_inside`: the map-node layer
-/// (incl. `ensure_mapdict_initialized` → `new_instance_terminator`) is a JIT
-/// residual boundary while Slice D's unboxed branches stay unported, matching
+/// is a JIT residual boundary while Slice D's unboxed branches stay unported, matching
 /// [`instance_node_getdictvalue`].
 ///
 /// # Safety
@@ -7564,6 +7541,7 @@ mod tests {
         unsafe {
             let w_class =
                 pyre_object::w_type_new("SlotsOnlyStr", pyre_object::PY_NULL, std::ptr::null_mut());
+            install_type_terminator(w_class);
             assert!(!pyre_object::w_type_get_hasdict(w_class));
             // The class flag defaults false. `setweakref` gates the SPECIAL
             // slot on `TypeDef.weakrefable`, which this slots layout sets.

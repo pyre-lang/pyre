@@ -546,7 +546,7 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
     );
     assert_eq!(
         tyref_ref_param_class_root(&tupled, &fn_llbc, no_tombstoned_leaves(), None),
-        Some(shaped)
+        Some(shaped.clone())
     );
     let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
@@ -561,6 +561,55 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
         .as_deref(),
         Some("Tuple<i64,bool>"),
         "a pair tuple must keep SomeTuple items, not collapse to ref"
+    );
+
+    // Construction keys `__pos_N` off `tyref_tuple_suffix` /
+    // `tyref_positional_aggregate_root`. A hash-consed or `Value`-wrapped
+    // destination must recover the same shaped owner the read side uses,
+    // otherwise assemble asks `getattr(Tuple, __pos_0)`.
+    assert!(
+        !tyref_tuple_suffix(&tupled, &fn_llbc).is_empty(),
+        "dedup Tuple<fn> construction suffix must not collapse to unit Tuple"
+    );
+    assert_eq!(
+        tyref_positional_aggregate_root(&tupled, &fn_llbc),
+        Some(shaped.clone())
+    );
+    let hashed = TyRef::Other(serde_json::json!({
+        "HashConsedValue": [99, {
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "types": [
+                        { "Scalar": { "Integer": { "Signed": "I64" } } },
+                        { "Scalar": "Bool" }
+                    ]
+                }
+            }
+        }]
+    }));
+    assert_eq!(tyref_tuple_suffix(&hashed, &llbc), "<i64,bool>");
+    assert_eq!(
+        tyref_positional_aggregate_root(&hashed, &llbc),
+        Some("Tuple<i64,bool>".to_string())
+    );
+    let valued = TyRef::Other(serde_json::json!({
+        "Value": [7, {
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "types": [
+                        { "Scalar": { "Integer": { "Signed": "I64" } } },
+                        { "Scalar": "Bool" }
+                    ]
+                }
+            }
+        }]
+    }));
+    assert_eq!(tyref_tuple_suffix(&valued, &llbc), "<i64,bool>");
+    assert_eq!(
+        tyref_positional_aggregate_root(&valued, &llbc),
+        Some("Tuple<i64,bool>".to_string())
     );
 }
 
@@ -4277,6 +4326,46 @@ fn empty_tuple_tyref_is_void() {
     );
 }
 
+/// `rtuple.py TupleRepr` preserves each item's low-level representation.
+#[test]
+fn shared_byte_window_tuple_keeps_both_words_without_aliasing_a_mutable_list() {
+    let llbc = empty_llbc();
+    let tuple = |borrow| {
+        TyRef::Other(serde_json::json!({"Adt": {
+            "builtin": "Tuple",
+            "generics": {"types": [{"Ref": ["'_", {
+                "Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]
+            }, borrow]}]}
+        }}))
+    };
+    let shared = tyref_positional_aggregate_root(&tuple("Shared"), &llbc).unwrap();
+    let mutable = tyref_positional_aggregate_root(&tuple("Mut"), &llbc).unwrap();
+    assert_ne!(shared, mutable, "window and byte list have distinct reprs");
+    let cc = crate::codewriter::call::CallControl::new();
+    let layout = cc
+        .struct_layout_for(&shared)
+        .expect("shared window tuple layout");
+    let word = crate::layout::target_word_size();
+    assert_eq!(layout.size, 2 * word);
+    assert_eq!(
+        layout
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.offset))
+            .collect::<Vec<_>>(),
+        vec![("__pos_0", 0), ("__pos_0.len", word)]
+    );
+    let mutable_layout = cc
+        .struct_layout_for(&mutable)
+        .expect("mutable byte-list tuple layout");
+    assert!(
+        mutable_layout
+            .fields
+            .iter()
+            .all(|field| field.name != "__pos_0.len")
+    );
+}
+
 fn indexed_rows(rows: Vec<(u64, serde_json::Value)>) -> serde_json::Value {
     let max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
     let mut slots = vec![serde_json::Value::Null; max + 1];
@@ -7714,8 +7803,8 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
     assert_eq!(signature.argnames.len(), 1);
     assert_eq!(
         token.as_deref(),
-        Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE),
-        "the declared PyObjectRef return keeps its typed object-pointer shell"
+        Some("ref"),
+        "a residual *mut registered-GC-struct return is the ref token; the class root is on the graph"
     );
 }
 
@@ -7786,7 +7875,7 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
     assert_eq!(signature.argnames.len(), 1);
     assert!(
         crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_some(),
-        "Option<PyObjectRef> residual must shell as one nullable GCREF word"
+        "Option<PyObjectRef> residual must shell as one nullable ref word"
     );
 }
 
