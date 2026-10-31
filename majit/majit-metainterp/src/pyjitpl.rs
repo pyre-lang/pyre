@@ -159,9 +159,7 @@ use majit_ir::{
 use crate::blackhole::ExceptionState;
 use crate::compile;
 use crate::compile::make_jitcell_token;
-pub use crate::compile::{
-    CompileResult, CompiledExitLayout, ExitRawValues, ExitTypes, ExitValues, RawCompileResult,
-};
+pub use crate::compile::{CompileResult, ExitRawValues, ExitValues, RawCompileResult};
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 #[cfg(test)]
@@ -12771,9 +12769,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Typed-input raw fast-path runner.  Avoids explicit deadframe decoding
     /// in the caller while preserving typed exits, savedata, and exception
-    /// state. The exit layout is `exit_layout_for_descr` on the descr the
-    /// deadframe named (`compile.py ResumeGuardDescr.get_resumestorage`
-    /// returns self).
+    /// state. Slot types and resume storage come off the descr the deadframe
+    /// named (`compile.py ResumeGuardDescr.get_resumestorage` returns self).
     pub fn run_compiled_raw_detailed_with_values(
         &mut self,
         green_key: u64,
@@ -12798,16 +12795,19 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py AbstractResumeGuardDescr.handle_fail` reads `self`.
         // Slot types are `descr.fail_arg_types()`; resume storage is the
         // descr (`ResumeGuardDescr.get_resumestorage`).
-        let exit_layout = compile::exit_layout_for_descr(&result.descr_arc);
-        let effective_is_finish = result.is_finish || exit_layout.is_finish;
+        let descr_is_finish = result
+            .descr_arc
+            .as_fail_descr()
+            .is_some_and(|fd| fd.is_finish());
+        let effective_is_finish = result.is_finish || descr_is_finish;
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] run_compiled_exit: gk={} fi={} tid={} result.finish={} layout.finish={} effective={}",
+                "[jit] run_compiled_exit: gk={} fi={} tid={} result.finish={} descr.finish={} effective={}",
                 green_key,
                 fail_index,
                 trace_id,
                 result.is_finish,
-                exit_layout.is_finish,
+                descr_is_finish,
                 effective_is_finish
             );
         }
@@ -12848,7 +12848,6 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc,
             is_finish: effective_is_finish,
             is_exit_frame_with_exception: result.is_exit_frame_with_exception,
-            exit_layout,
             savedata: result.savedata,
             exception,
             status: result.status,
@@ -12906,7 +12905,6 @@ impl<M: Clone> MetaInterp<M> {
                 descr_arc: Some(descr_arc),
                 is_finish: true,
                 is_exit_frame_with_exception: true,
-                exit_layout: None,
                 rd_loop_token: None,
                 savedata: None,
                 deadframe: Some(frame),
@@ -12936,16 +12934,9 @@ impl<M: Clone> MetaInterp<M> {
 
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
         // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
-        // and `fail_index == u32::MAX`; they carry no per-trace exit
-        // metadata. Carry no layout, mirroring RPython where FINISH descrs
-        // are dispatched on identity — this result's readers open the layout
-        // only on the guard arm. Guard layouts come from the failing descr
-        // (`compile.py AbstractResumeGuardDescr.handle_fail`).
-        let exit_layout = if is_finish {
-            None
-        } else {
-            Some(compile::exit_layout_for_descr(&descr_arc))
-        };
+        // and `fail_index == u32::MAX`. RPython dispatches them on identity;
+        // `compile.py AbstractResumeGuardDescr.handle_fail` reads the failing
+        // descr itself.
         let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
         let savedata = self.backend.get_savedata_ref(&frame);
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
@@ -12970,7 +12961,6 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc: (!is_finish).then_some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout: exit_layout.map(Box::new),
             rd_loop_token,
             savedata,
             deadframe: Some(frame),
@@ -13029,7 +13019,6 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descr_arc) = &result.descr_arc
             && !Self::is_jump_exit(result.is_finish, result.fail_index)
         {
-            result.exit_layout = Some(Box::new(compile::exit_layout_for_descr(descr_arc)));
             // `execute_assembler_at_dispatch_key` decodes no values on a guard
             // exit; this runner's callers hand a dense list to
             // `resume_in_blackhole`, so read the fail-arg slots off the
@@ -13270,7 +13259,6 @@ impl<M: Clone> MetaInterp<M> {
                 descr_arc: Some(descr_arc),
                 is_finish: true,
                 is_exit_frame_with_exception: true,
-                exit_layout: None,
                 rd_loop_token: None,
                 savedata: None,
                 deadframe: Some(frame),
@@ -13291,13 +13279,8 @@ impl<M: Clone> MetaInterp<M> {
             Self::finish_compiled_run_io();
             let typed_values =
                 Self::decode_exit_slots(&self.backend, &frame, descr.fail_arg_types());
-            // No layout. A final descr resumes nothing, so every field of one
-            // built here is a default: the two guard-only slot lists are empty
-            // because they exist for the blackhole resume and the bridge, and
-            // a returned frame reaches neither. Both readers of this field
-            // (`jitdriver`'s two run loops) take their copy after their finish
-            // and JUMP arms have returned, so a layout built here would be
-            // copied out of this result and dropped without a reader.
+            // A final descr resumes nothing. Guard-only readers
+            // (`handle_fail` / blackhole) never see this arm.
             return CompileResult {
                 typed_values,
                 meta,
@@ -13306,7 +13289,6 @@ impl<M: Clone> MetaInterp<M> {
                 descr_arc: None,
                 is_finish,
                 is_exit_frame_with_exception,
-                exit_layout: None,
                 rd_loop_token: None,
                 savedata: None,
                 deadframe: None,
@@ -13353,9 +13335,9 @@ impl<M: Clone> MetaInterp<M> {
             ExitValues::new()
         };
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
-        // Only the layout fallback and the `must_compile` identity read it, and
-        // a JUMP exit reaches neither, so the owning-key resolution is not
-        // paid on the back edge.
+        // Only `descr_owning_green_key` and the `must_compile` identity read
+        // it, and a JUMP exit reaches neither, so the owning-key resolution
+        // is not paid on the back edge.
         let rd_loop_token = if is_jump_exit {
             None
         } else {
@@ -13370,9 +13352,8 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
-        // No layout on the steady entry: the guard arm in `jitdriver` reads
-        // the descr, as `compile.py handle_fail` does. The detailed runners
-        // attach one for their callers via `exit_layout_for_descr`.
+        // The guard arm in `jitdriver` reads the descr, as
+        // `compile.py handle_fail` does.
         let savedata = if is_guard_forced {
             self.backend.get_savedata_ref(&frame)
         } else {
@@ -13407,7 +13388,6 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout: None,
             rd_loop_token,
             savedata,
             deadframe: Some(frame),
@@ -16197,8 +16177,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `descr` is the forced guard's own `ResumeGuardDescr`
     /// (`compile.py ResumeGuardForcedDescr.handle_async_forcing` reads
-    /// `self`). The layout is `exit_layout_for_descr` /
-    /// `get_resumestorage`; the cell token is not consulted.
+    /// `self`). Resume payload is `get_resumestorage`; the cell token is
+    /// not consulted.
     fn handle_async_forcing_with_allocator(
         &mut self,
         descr: &majit_ir::DescrRef,
@@ -16220,8 +16200,6 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py ResumeGuardForcedDescr.handle_async_forcing` is a
         // method on the failed descr and reads `self` (`rd_numb` /
         // `rd_consts` / ...).
-        let exit_layout = compile::exit_layout_for_descr(descr);
-
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
         // The stack-critical section lives on
         // `ResumeGuardForcedDescr.force_now`, which wraps
@@ -16232,7 +16210,8 @@ impl<M: Clone> MetaInterp<M> {
         // wholesale; missing rd_virtuals / rd_pendingfields here meant
         // forced virtuals fell back to NullAllocator entries and pending
         // heap writes were dropped on async forcing.
-        let storage = exit_layout.storage.as_deref();
+        let storage = crate::resume::get_resumestorage(descr);
+        let storage = storage.as_deref();
         let numb_root = storage.and_then(|s| s.rd_numb_ref());
         let rd_numb = numb_root.map(|n| n.as_slice()).unwrap_or(&[]);
         let rd_consts: &[Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
@@ -16259,9 +16238,8 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .collect::<Vec<_>>()
         });
-        // The layout resolved above already carries them; `get_recovery_slot_
-        // types` is `exit_types.to_vec()` off a second resolution of the same
-        // key, so re-asking can only lose them.
+        // Slot types live on this descr (`fail_arg_types`); a second
+        // lookup of the same guard can only lose them.
         // compile.py ResumeGuardForcedDescr.handle_async_forcing:
         // vinfo = self.jitdriver_sd.virtualizable_info
         // (`self.jitdriver_sd` is the failed descr's
@@ -16586,66 +16564,10 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// `handle_guard_failure()` variant that also carries backend savedata.
-    pub fn recover_guard_state_with_savedata(
-        &mut self,
-        descr: &majit_ir::DescrRef,
-        green_key: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    ) -> Option<GuardRecovery> {
-        // pyjitpl.py: try_to_free_some_loops
-        self.try_to_free_some_loops();
-        let trace_id = descr.as_fail_descr().map(|d| d.trace_id()).unwrap_or(0);
-        self.recover_guard_state(
-            descr,
-            green_key,
-            trace_id,
-            fail_index,
-            fail_values,
-            None,
-            savedata,
-            exception,
-        )
-    }
-
-    /// Handle a guard failure in a specific compiled trace (root loop or bridge).
-    ///
-    /// This is the trace-aware counterpart to `handle_guard_failure()`. Callers
-    /// should use the `trace_id` reported by `run_compiled_detailed()` when the
-    /// failing exit may come from a bridge.
-    pub fn recover_guard_state_in_trace(
-        &mut self,
-        descr: &majit_ir::DescrRef,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        typed_fail_values: Option<&[Value]>,
-        exception: ExceptionState,
-    ) -> Option<GuardRecovery> {
-        self.recover_guard_state(
-            descr,
-            green_key,
-            trace_id,
-            fail_index,
-            fail_values,
-            typed_fail_values,
-            None,
-            exception,
-        )
-    }
-
-    /// `recover_guard_state_in_trace()` variant that also carries backend savedata.
-    ///
-    /// `descr` is the failed guard (`compile.py AbstractResumeGuardDescr.handle_fail`
-    /// reads `self`). The layout is `exit_layout_for_descr`.
+    /// Assemble a `GuardRecovery` from a compiled-run guard failure:
+    /// fail values, optional typed values, backend savedata, and exception state.
     pub fn recover_guard_state(
         &mut self,
-        descr: &majit_ir::DescrRef,
-        green_key: u64,
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
@@ -16653,12 +16575,9 @@ impl<M: Clone> MetaInterp<M> {
         savedata: Option<GcRef>,
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
-        let exit_layout = compile::exit_layout_for_descr(descr);
-
         Some(GuardRecovery {
             trace_id,
             fail_index,
-            exit_layout,
             fail_values: fail_values.to_vec(),
             typed_fail_values: typed_fail_values.map(|values| values.to_vec()),
             savedata,
@@ -16697,12 +16616,10 @@ impl<M: Clone> MetaInterp<M> {
             return Some(jump);
         }
 
-        // Guard failure — recover. `compile.py AbstractResumeGuardDescr.handle_fail`
-        // reads `self`; the detailed run always carries that descr on a guard exit.
-        let descr = result.descr_arc.as_ref()?;
+        // Guard failure — recover. The detailed run always carries that descr
+        // on a guard exit (`cpu.get_latest_descr`).
+        result.descr_arc.as_ref()?;
         let recovery = self.recover_guard_state(
-            descr,
-            green_key,
             trace_id,
             fail_index,
             &values,
@@ -20704,8 +20621,6 @@ pub struct GuardRecovery {
     pub trace_id: u64,
     /// Index of the failed guard.
     pub fail_index: u32,
-    /// Static layout metadata for this compiled exit.
-    pub exit_layout: CompiledExitLayout,
     /// Raw fail_values from the DeadFrame.
     pub fail_values: Vec<i64>,
     /// Typed fail values decoded from the backend deadframe, when available.
@@ -20786,8 +20701,6 @@ pub enum DetailedDriverRunOutcome {
         owning_key: u64,
         /// Raw register values from compiled code exit.
         raw_values: Vec<i64>,
-        /// Guard exit layout (rd_numb, fail_arg_types, etc.).
-        exit_layout: CompiledExitLayout,
         /// `cpu.grab_exc_value(deadframe)` (llmodel.py) — the pending
         /// exception object captured at guard failure (0 if none). Seeds
         /// the blackhole resume (blackhole.py:1794
@@ -31249,7 +31162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_async_forcing_prepares_rd_virtuals_from_exit_layout() {
+    fn test_handle_async_forcing_prepares_rd_virtuals_from_descr() {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(29);
@@ -31286,7 +31199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_async_forcing_reads_descr_exit_layout_after_live_token_replace() {
+    fn test_handle_async_forcing_reads_descr_after_live_token_replace() {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.active_jitdriver_sd = Some(0);
@@ -31457,91 +31370,6 @@ mod tests {
     // `cpu.get_latest_descr()` (`history.py:125`) returns the same
     // descr object the metainterp stamped; there is no "backend
     // override" to test.
-
-    #[test]
-    fn guard_failure_recovery_reads_descr_exit_layout_after_live_token_replace() {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = gk(88);
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
-        let mut guard = mk_op_with_descr(
-            OpCode::GuardTrue,
-            &[OpRef::input_arg_int(0)],
-            OpRef::NONE.raw(),
-            descr.clone(),
-        );
-        guard.setfailargs(smallvec::smallvec![bound_operand(OpRef::input_arg_int(0))]);
-        guard.set_fail_arg_types(vec![Type::Int]);
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            guard,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-        attach_procedure_to_interp_entry(
-            &mut meta,
-            &green_key,
-            &inputargs,
-            ops,
-            majit_ir::ConstMap::default(),
-        );
-
-        let fail_descr = descr.as_fail_descr().expect("resume guard");
-        let trace_id = fail_descr.trace_id();
-        let fail_index = fail_descr.fail_index_per_trace();
-        let old_token = meta
-            .get_procedure_token(green_key.get_uhash())
-            .expect("live token");
-        fail_descr.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
-        let expected = crate::compile::exit_layout_for_descr(&descr);
-
-        let _fresh_token_keepalive = {
-            let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
-            let mut fresh_token = JitCellToken::new(9002);
-            fresh_token.green_key = std::cell::Cell::new(green_key.get_uhash());
-            let fresh_arc = std::sync::Arc::new(fresh_token);
-            meta.warm_state_for_driver(compiling_jd)
-                .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&fresh_arc));
-            (old_token, fresh_arc)
-        };
-
-        let recovery = meta
-            .recover_guard_state(
-                &descr,
-                green_key.get_uhash(),
-                trace_id,
-                fail_index,
-                &[42],
-                Some(&[Value::Int(42)]),
-                None,
-                ExceptionState::default(),
-            )
-            .expect("guard recovery should read descr storage after the live token is replaced");
-
-        assert_eq!(
-            recovery.exit_layout.source_op_index,
-            expected.source_op_index
-        );
-        assert_eq!(
-            recovery
-                .exit_layout
-                .storage
-                .as_ref()
-                .and_then(|storage| storage.rd_numb().map(|numb| numb.to_vec())),
-            expected
-                .storage
-                .as_ref()
-                .and_then(|storage| storage.rd_numb().map(|numb| numb.to_vec()))
-        );
-        assert_eq!(
-            recovery.exit_layout.exit_types.as_slice(),
-            expected.exit_types.as_slice()
-        );
-    }
 
     #[test]
     fn start_retrace_from_guard_keeps_tracing_when_compiled_loops_misses() {

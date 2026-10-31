@@ -578,10 +578,8 @@ fn main() {
 ///
 /// Seven shared rows have gone:
 ///
-/// - `<[Type]>::to_vec`, the exit's type list copied out of the failing descr
-///   into the exit layout. `CompiledExitLayout::exit_types` is now inline
-///   storage wide enough for the exits a steady entry produces, so the copy
-///   costs the allocator nothing until an exit is wider than that.
+/// - `<[Type]>::to_vec`, the exit's type list is no longer copied out of the
+///   failing descr at all — readers use `descr.fail_arg_types()` in place.
 /// - `<[Value]>::to_vec`, the FINISH values copied out of the run result. The
 ///   FINISH arm returns immediately after publishing them, so nothing reads
 ///   the source and the values are moved instead.

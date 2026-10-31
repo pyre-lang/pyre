@@ -928,8 +928,7 @@ use crate::TraceAction;
 use crate::blackhole::ExceptionState;
 use crate::jit_state::JitState;
 use crate::pyjitpl::{
-    AbortReason, BackEdgeAction, CompiledExitLayout, DetailedDriverRunOutcome, InlineDecision,
-    JitStats, MetaInterp,
+    AbortReason, BackEdgeAction, DetailedDriverRunOutcome, InlineDecision, JitStats, MetaInterp,
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
@@ -9535,9 +9534,6 @@ impl<S: JitState> JitDriver<S> {
         let trace_id = result.trace_id;
         // Carried past the finish arm below, which is the one that has none.
         let descr_arc = result.descr_arc.take();
-        // The pointer travels; the layout behind it is opened past the finish
-        // arm below, which is the one that carries none.
-        let exit_layout = result.exit_layout.take();
         let guard_value_operand = result.guard_value_operand;
         // See the sibling run loop.
         let descr_owning_key = result.rd_loop_token;
@@ -9593,12 +9589,7 @@ impl<S: JitState> JitDriver<S> {
             .map(|frame| self.meta.raw_exit_slots_from_deadframe(frame, fd))
             .unwrap_or_default();
         drop(result);
-        let exit_layout = *exit_layout.expect("a guard exit carries its exit layout");
-        let fallback_green_key = if exit_layout.rd_loop_token != 0 {
-            exit_layout.rd_loop_token
-        } else {
-            green_key
-        };
+        let fallback_green_key = majit_backend::descr_owning_green_key(fd).unwrap_or(green_key);
         // Carried off the result — see the sibling run loop.
         let owning_key = descr_owning_key.unwrap_or(fallback_green_key);
         // `warmstate.py execute_assembler` passes this driver's
@@ -9658,7 +9649,6 @@ impl<S: JitState> JitDriver<S> {
             should_bridge,
             owning_key,
             raw_values,
-            exit_layout,
             guard_exc,
             savedata,
             deadframe,

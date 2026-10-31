@@ -8,8 +8,8 @@
 //!
 //! The `resume_in_blackhole` entry itself lives with its caller, as
 //! `pyre_jit::eval::resume_in_blackhole_from_exit_layout`: it needs the
-//! backend's exit layout plus the driver's `vinfo`/`vrefinfo`/`ginfo`, none
-//! of which this crate can name.  What this module owns is everything it
+//! failing descr plus the driver's `vinfo`/`vrefinfo`/`ginfo`, none of
+//! which this crate can name.  What this module owns is everything it
 //! calls into — `blackhole_from_resumedata`, `prepare_resume_from_failure`
 //! and `run_forever`.
 

@@ -92,17 +92,6 @@ fn fail_arg_type(opref: &OpRef) -> Type {
     opref.ty().unwrap_or(Type::Ref)
 }
 
-/// Storage for one exit's type list.
-///
-/// Inline up to a width that costs nothing. `Type` is one byte, so sixteen of
-/// them occupy exactly the bytes a heap vector spends on its pointer and
-/// capacity anyway: both spellings are 24 bytes. What the inline storage buys
-/// is that the steady exit — a FINISH returning one word, or a guard with a
-/// handful of fail arguments — carries its types without asking the allocator,
-/// on a path taken once per entry into compiled code. A wider exit spills to
-/// the heap and pays exactly what it paid before.
-pub type ExitTypes = smallvec::SmallVec<[Type; 16]>;
-
 /// Inline width of the two decoded-exit buffers below.
 ///
 /// Chosen from the exit arities a compiled entry actually returns, not from
@@ -151,52 +140,20 @@ pub fn raw_exit_values(typed: &[Value]) -> ExitRawValues {
     typed.iter().map(Value::as_raw_i64).collect()
 }
 
-/// Static exit metadata for a compiled guard or finish point.
-#[derive(Debug, Clone)]
-pub struct CompiledExitLayout {
-    /// compile.py:186 rd_loop_token: the green_key of the compiled loop
-    /// that owns this guard. Used by handle_fail to find the owning
-    /// compiled entry without scanning all entries.
-    pub rd_loop_token: u64,
-    pub trace_id: u64,
-    pub fail_index: u32,
-    pub source_op_index: Option<usize>,
-    pub exit_types: ExitTypes,
-    pub is_finish: bool,
-    /// `compile.py ExitFrameWithExceptionDescrRef`
-    /// vs `compile.py DoneWithThisFrameDescrRef`: distinguishes
-    /// the exception-propagation FINISH so the synthesis fallback at
-    /// `make_finish_fail_descr_typed` routes a `[Type::Ref]` exit to the
-    /// correct `_DoneWithThisFrameDescr` subclass.
-    pub is_exception_exit: bool,
-    /// compile.py `ResumeGuardDescr` storage handle — shared
-    /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
-    pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
-}
-
-/// `compile.py AbstractResumeGuardDescr.handle_fail`: the failing exit is
-/// described by the descr the deadframe named and by nothing else —
-/// `ResumeGuardDescr.get_resumestorage()` for the `rd_*` payload,
-/// `fail_arg_types` for the slot types, `rd_loop_token` for the owning
-/// loop. No frontend record is consulted: `send_bridge_to_backend` keeps
-/// none for a bridge, and a loop's guard answers the same way.
+/// Whether the collector traces fail-arg slot `slot`.
 ///
-/// `storage` is `None` for a descr with no resume payload (the
-/// `_DoneWithThisFrameDescr` family and `ExitFrameWithExceptionDescrRef`).
-pub fn exit_layout_for_descr(descr_arc: &majit_ir::DescrRef) -> CompiledExitLayout {
-    let descr = descr_arc
-        .as_fail_descr()
-        .expect("a compiled exit's descr always implements FailDescr");
-    CompiledExitLayout {
-        rd_loop_token: majit_backend::descr_owning_green_key(descr).unwrap_or(0),
-        trace_id: descr.trace_id(),
-        fail_index: descr.fail_index_per_trace(),
-        source_op_index: descr.source_op_index(),
-        exit_types: ExitTypes::from_slice(descr.fail_arg_types()),
-        is_finish: descr.is_finish(),
-        is_exception_exit: descr.is_exit_frame_with_exception(),
-        storage: crate::resume::get_resumestorage(descr_arc),
-    }
+/// `llsupport/assembler.py compute_gcmap` skips the hole a virtual leaves
+/// (`if arg is None: continue`), marks every remaining `REF`-typed failarg,
+/// and narrows nothing else. A force token is marked like any other, because
+/// `resoperation.py FORCE_TOKEN/0/r` is REF — it returns the jitframe, itself
+/// a GC object that moves — and both emitted gcmaps
+/// (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
+///
+/// The skip has nothing to do here: every fail arg is bound, so the type
+/// test is the whole rule. Do not narrow it by force-token position: that
+/// would stop rooting a live jitframe pointer.
+pub fn is_traced_ref_slot(fail_arg_types: &[Type], slot: usize) -> bool {
+    fail_arg_types.get(slot) == Some(&Type::Ref)
 }
 
 /// The pc the outermost frame of `descr`'s resume data resumes at.
@@ -208,27 +165,6 @@ pub fn exit_layout_for_descr(descr_arc: &majit_ir::DescrRef) -> CompiledExitLayo
 pub fn guard_resume_pc(descr: &dyn majit_ir::FailDescr) -> Option<u64> {
     let rd_numb = descr.rd_numb_arc()?;
     crate::resume::outermost_frame_pc(rd_numb.as_ref()).map(|pc| pc as u64)
-}
-
-impl CompiledExitLayout {
-    /// Whether the collector traces exit slot `slot`.
-    ///
-    /// The rule `llsupport/assembler.py compute_gcmap` applies: it skips the
-    /// hole a virtual leaves (`if arg is None: continue`), marks every
-    /// remaining `REF`-typed failarg, and narrows nothing else.  A force
-    /// token is marked like any other, because `resoperation.py
-    /// FORCE_TOKEN/0/r` is REF upstream as well — it returns the jitframe,
-    /// itself a GC object that moves — and both emitted gcmaps
-    /// (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
-    ///
-    /// The skip has nothing to do here: an exit layout reaches this point
-    /// with every fail arg bound, so the type test is the whole rule.
-    ///
-    /// Do not narrow it by force-token position: that would stop rooting a
-    /// live jitframe pointer.
-    pub fn is_traced_ref_slot(&self, slot: usize) -> bool {
-        self.exit_types.get(slot) == Some(&Type::Ref)
-    }
 }
 
 /// Typed result from running compiled code.
@@ -278,18 +214,6 @@ pub struct CompileResult<M> {
     /// `pyjitpl.py compile_exit_frame_with_exception`).
     /// jitdriver routes this to `jitexc.ExitFrameWithExceptionRef`.
     pub is_exit_frame_with_exception: bool,
-    /// The failing guard's exit description, and `None` on a FINISH exit.
-    ///
-    /// Held behind a pointer because this result is returned BY VALUE from
-    /// every compiled entry, so an inline layout is bytes moved on each one.
-    /// Every reader (`jitdriver`'s two run loops and pyre's drain loop) opens
-    /// the layout only past its own FINISH and `fail_index == u32::MAX` arms,
-    /// so a call that returns through either was copying a layout nothing read.
-    ///
-    /// The allocation lands where the layout is built, which the FINISH arm now
-    /// returns before reaching. A FINISH exit stores one null word here, so the
-    /// steady entry path's allocation count is unchanged.
-    pub exit_layout: Option<Box<CompiledExitLayout>>,
     /// `compile.py handle_fail` reads `resumedescr.rd_loop_token` once and
     /// hands the loop it names to everything downstream. The green key of the
     /// `JitCellToken` the failing descr belongs to, recovered by walking
@@ -297,9 +221,9 @@ pub struct CompileResult<M> {
     ///
     /// `None` when the walk finds no live owner (memmgr eviction) and on a
     /// finish or back-edge JUMP exit, neither of which has a guard identity to
-    /// recover: the layout fallback and `must_compile` are the only readers,
-    /// and neither exit reaches either. Readers fall back to the key of the
-    /// entry they came in through.
+    /// recover: `descr_owning_green_key` and `must_compile` are the only
+    /// readers, and neither exit reaches either. Readers fall back to the
+    /// key of the entry they came in through.
     pub rd_loop_token: Option<u64>,
     pub savedata: Option<GcRef>,
     /// `llmodel.py` deadframe from `cpu.force` / `execute_token`.
@@ -341,7 +265,6 @@ pub struct RawCompileResult<M> {
     /// compile.py ExitFrameWithExceptionDescrRef parity —
     /// mirrors `CompileResult::is_exit_frame_with_exception`.
     pub is_exit_frame_with_exception: bool,
-    pub exit_layout: CompiledExitLayout,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
@@ -609,8 +532,8 @@ fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     op: &Op,
     is_finish: bool,
     inputargs: &[A],
-) -> ExitTypes {
-    let mut out = ExitTypes::new();
+) -> Vec<Type> {
+    let mut out = Vec::new();
     let want = if is_finish {
         Some(op.num_args())
     } else {
@@ -636,7 +559,7 @@ fn exit_types_for_guard_or_finish<A: AsRef<InputArg>>(
     if let Some(fail_args) = op.guard_fail_args() {
         // Copy types first: `guard_fail_args` and the extra type slice
         // cannot be borrowed together (both extras).
-        let mut fa_types = ExitTypes::new();
+        let mut fa_types = Vec::new();
         let had_types = op
             .with_fail_arg_types(|types| {
                 fa_types.extend_from_slice(types);
@@ -1508,28 +1431,22 @@ mod tests {
         );
     }
 
-    /// The deadframe rooting in `handle_fail` reaches the layout, not the
-    /// descr it came from, so the layout answers from its own types.  A
-    /// force-token slot is traced like any other ref — `compute_gcmap`
+    /// The deadframe rooting in `handle_fail` reads `descr.fail_arg_types()`.
+    /// A force-token slot is traced like any other ref — `compute_gcmap`
     /// marks every REF failarg it does not skip, and it skips only the hole a
     /// virtual leaves.
     #[test]
-    fn exit_layout_traces_every_ref_slot_including_force_tokens() {
-        let layout = CompiledExitLayout {
-            rd_loop_token: 0,
-            trace_id: 0,
-            fail_index: 0,
-            source_op_index: None,
-            exit_types: ExitTypes::from_slice(&[Type::Ref, Type::Int, Type::Ref]),
-            is_finish: false,
-            is_exception_exit: false,
-            storage: None,
-        };
+    fn fail_arg_types_trace_every_ref_slot_including_force_tokens() {
+        let descr = make_resume_guard_descr_typed(vec![Type::Ref, Type::Int, Type::Ref]);
+        let types = descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .fail_arg_types();
 
-        assert!(layout.is_traced_ref_slot(0));
-        assert!(!layout.is_traced_ref_slot(1));
-        assert!(layout.is_traced_ref_slot(2));
-        assert!(!layout.is_traced_ref_slot(3));
+        assert!(is_traced_ref_slot(types, 0));
+        assert!(!is_traced_ref_slot(types, 1));
+        assert!(is_traced_ref_slot(types, 2));
+        assert!(!is_traced_ref_slot(types, 3));
     }
 
     /// Frame value count for the stamp-guard descr fixtures below, each

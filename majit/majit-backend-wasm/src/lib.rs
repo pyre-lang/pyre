@@ -7066,7 +7066,7 @@ impl majit_backend::Backend for WasmBackend {
     /// of triggering a bridge. Build one layout per exit from the metainterp
     /// `ResumeGuardDescr` the optimizer stamped on the guard (`meta_descr`); the
     /// wasm backend keeps no machine-code recovery metadata (resume runs through
-    /// `exit_layout_for_descr` / `get_resumestorage` on that descr), so the
+    /// `get_resumestorage` on that descr), so the
     /// recovery / rd_* / gc-slot fields stay empty. Consumers read
     /// `is_finish` and `source_op_index` from this list and the resume
     /// payload from the descr Arc.

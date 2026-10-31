@@ -184,7 +184,7 @@ pub use call_descr::{
     nursery_alloc_effect_info, str_concat_effect_info,
 };
 pub use compile::{
-    AllVirtuals, exit_layout_for_descr, guard_resume_pc, make_fail_descr, make_fail_descr_typed,
+    AllVirtuals, guard_resume_pc, is_traced_ref_slot, make_fail_descr, make_fail_descr_typed,
     make_finish_fail_descr_typed, raw_exit_values, resume_guard_descr, set_all_virtuals_gc_type_id,
 };
 pub use io_buffer::{
@@ -250,11 +250,11 @@ pub use pyjitpl::dispatch::{
 };
 pub use pyjitpl::{
     BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
-    ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, DetailedDriverRunOutcome,
-    InlineDecision, JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame,
-    MIFrameStack, MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData,
-    PortalGreenKey, PrepareResumeFromFailure, RawCompileResult, SharedBlackholeInterpPool,
-    SharedLiveness, StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
+    ClosureRuntimeWithResolver, CompileOutcome, DetailedDriverRunOutcome, InlineDecision,
+    JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
+    MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey,
+    PrepareResumeFromFailure, RawCompileResult, SharedBlackholeInterpPool, SharedLiveness,
+    StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
     build_state_field_snapshot, call_int_function, call_int_function_typed, call_ref_function,
     call_ref_function_typed, call_void_function, call_void_function_typed, counters,
     decode_jit_merge_point_banks, record_application_traceback_for_recording,
