@@ -5,7 +5,7 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::IndexMapExt;
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -26,7 +26,7 @@ use cranelift_codegen::ir::Value as CValue;
 use majit_backend::{
     AsmInfo, BackendError, CompiledLoopToken, CompiledTraceInfo, CpuDescrAttachments,
     CpuDescrHandle, DeadFrame, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout,
-    FailDescrLayout, JitCellToken, TerminalExitLayout,
+    FailDescrLayout, JitCellToken,
 };
 use majit_gc::header::{GcHeader, TYPE_ID_BITS, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
@@ -10224,7 +10224,6 @@ struct CompiledLoop {
     /// Position-aligned `FailDescrCell` wrappers (see
     /// `RegisteredLoopTarget::fail_descr_cells`).
     fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
-    terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -10318,16 +10317,6 @@ impl CompiledLoop {
         let blocks = std::mem::take(&mut self.asm_memory_blocks);
         crate::stub::patch_pending_failure_recoveries(&self.pending_guard_tokens);
         blocks
-    }
-
-    #[inline]
-    fn terminal_exit_layouts_ref(&self) -> &Vec<TerminalExitLayout> {
-        unsafe { &*self.terminal_exit_layouts.get() }
-    }
-
-    #[inline]
-    fn terminal_exit_layouts_mut(&self) -> &mut Vec<TerminalExitLayout> {
-        unsafe { &mut *self.terminal_exit_layouts.get() }
     }
 }
 
@@ -10515,26 +10504,6 @@ fn find_trace_fail_descr_layouts_in_fail_descrs(
             }
             if let Some(layouts) =
                 find_trace_fail_descr_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
-            {
-                return Some(layouts);
-            }
-        }
-    }
-    None
-}
-
-fn find_trace_terminal_exit_layouts_in_fail_descrs(
-    fail_descrs: &[DescrRef],
-    trace_id: u64,
-) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-    for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref() {
-            if bridge.trace_id == trace_id {
-                return Some(bridge.terminal_exit_layouts_ref().clone());
-            }
-            if let Some(layouts) =
-                find_trace_terminal_exit_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
             {
                 return Some(layouts);
             }
@@ -11308,9 +11277,9 @@ fn identity_recovery_layout(
             header_pc: Some(header_pc),
             source_guard,
             pc: guard_resume_pc.unwrap_or(header_pc),
-            // JUMP/FINISH identity frame for inspection
-            // (`compiled_terminal_exit_layouts`). Production deopt from a
-            // guard decodes the descr's `rd_numb`
+            // CALL_ASSEMBLER caller-prefix identity frame
+            // (`deadframe_recovery_layout_for_call_assembler`). Production
+            // deopt from a guard decodes the descr's `rd_numb`
             // (`ResumeGuardDescr.get_resumestorage`); this layout is not
             // that path.
             jitcode_index: 0,
@@ -12789,8 +12758,6 @@ impl CraneliftBackend {
                 _ => {}
             }
         }
-        let terminal_exit_layouts =
-            collect_terminal_exit_layouts(ops, inputargs, trace_id, header_pc, source_guard)?;
 
         let known_values = build_known_values_set(inputargs, ops);
         let used_vars = build_used_vars_set(ops);
@@ -20735,7 +20702,6 @@ impl CraneliftBackend {
             pending_guard_tokens,
             fail_descrs,
             fail_descr_cells,
-            terminal_exit_layouts: UnsafeCell::new(terminal_exit_layouts),
             num_inputs: inputargs.len(),
             num_ref_roots: reserved_tail,
             max_output_slots,
@@ -21964,65 +21930,6 @@ fn collect_guards(
     Ok(())
 }
 
-fn collect_terminal_exit_layouts(
-    ops: &[Op],
-    inputargs: &[InputArgRc],
-    trace_id: u64,
-    header_pc: u64,
-    source_guard: Option<(u64, u32)>,
-) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let type_index = OpTypeIndex::new(inputargs, ops);
-    let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
-    let mut layouts = Vec::new();
-    let mut fail_index = 0u32;
-
-    for (op_index, op) in ops.iter().enumerate() {
-        let is_guard = op.opcode.is_guard();
-        let is_finish = op.opcode == OpCode::Finish;
-        let is_jump = op.opcode == OpCode::Jump;
-
-        if is_finish || is_jump {
-            let arg_oprefs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
-            let exit_types =
-                infer_fail_arg_types(&arg_oprefs, &type_index, &type_overrides, op_index)?;
-            let recovery_layout = (is_jump || is_finish).then(|| {
-                identity_recovery_layout(
-                    trace_id,
-                    header_pc,
-                    None, // terminal exits don't need per-guard resume_pc
-                    source_guard,
-                    &exit_types,
-                )
-            });
-            layouts.push(TerminalExitLayout {
-                op_index,
-                trace_id,
-                trace_info: Some(CompiledTraceInfo {
-                    trace_id,
-                    input_types: inputargs.iter().map(|arg| arg.tp.get()).collect(),
-                    header_pc,
-                    source_guard: None,
-                }),
-                fail_index: if is_finish { fail_index } else { u32::MAX },
-                exit_types,
-                is_finish,
-                is_exception_exit: op
-                    .getdescr()
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .is_some_and(|fd| fd.is_exit_frame_with_exception()),
-                recovery_layout,
-            });
-        }
-
-        if is_guard || is_finish {
-            fail_index += 1;
-        }
-    }
-
-    Ok(layouts)
-}
-
 /// `clt.frame_info.jfi_frame_depth` of `token`, or 0 when it has no
 /// compiled loop token.
 fn clt_frame_depth(token: &JitCellToken) -> usize {
@@ -22785,12 +22692,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 );
             }
         }
-        {
-            let terminal_exit_layouts = compiled.terminal_exit_layouts_mut();
-            for layout in terminal_exit_layouts.iter_mut() {
-                layout.trace_info = Some(bridge_trace_info.clone());
-            }
-        }
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr) {
             unregister_bridge_call_assembler_expectations(&bridge);
         }
@@ -22817,7 +22718,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 body_ptr: compiled.body_ptr,
                 fail_descrs: compiled.fail_descrs,
                 fail_descr_cells: compiled.fail_descr_cells,
-                terminal_exit_layouts: compiled.terminal_exit_layouts,
                 loop_reentry,
                 num_inputs: bridge_num_inputs,
                 num_ref_roots: compiled.num_ref_roots,
@@ -23347,54 +23247,6 @@ impl majit_backend::Backend for CraneliftBackend {
             ));
         }
         find_trace_fail_descr_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
-    }
-
-    fn compiled_terminal_exit_layouts(
-        &self,
-        token: &JitCellToken,
-    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        Some(compiled.terminal_exit_layouts_ref().clone())
-    }
-
-    fn compiled_bridge_terminal_exit_layouts(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-        let original_compiled = original_token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
-            let fd = as_fd(descr);
-            fd.fail_index() == source_fail_index && fd.trace_id() == source_trace_id
-        })?;
-        let bridge = fail_descr_bridge_ref(as_fd(source_descr));
-        let bridge = bridge.as_ref()?;
-        Some(bridge.terminal_exit_layouts_ref().clone())
-    }
-
-    fn compiled_trace_terminal_exit_layouts(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        if compiled.trace_id == trace_id {
-            return Some(compiled.terminal_exit_layouts_ref().clone());
-        }
-        find_trace_terminal_exit_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
 
     fn compiled_trace_info(
@@ -29762,127 +29614,12 @@ mod tests {
             .expect("compiled layouts should exist");
         let layout = &layouts[0];
         assert_eq!(layout.source_op_index, Some(1));
-        // Backend no longer caches per-fail-descr recovery
-        // layouts.  Terminal exit layouts (sibling test below) still
-        // carry the recovery_layout because they live on
-        // `CompiledLoop.terminal_exit_layouts`, not on the descr.
+        // Backend no longer caches per-fail-descr recovery layouts.
         assert!(
             layout.recovery_layout.is_none(),
             "per-fail-descr recovery_layout is metainterp-owned"
         );
         assert_eq!(layout.fail_arg_types, vec![Type::Ref, Type::Int]);
-    }
-
-    #[test]
-    fn test_compiled_terminal_exit_layouts_include_backend_jump_recovery_layout() {
-        let mut backend = CraneliftBackend::new();
-
-        // The JUMP passes its two args in the opposite order to the LABEL, so
-        // the recovery layout under test is built from a Ref and an Int that
-        // sit at swapped positions rather than from a straight-through
-        // backedge.
-        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Jump,
-                &[OpRef::input_arg_ref(1), OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        backend.set_next_trace_id(77);
-        backend.set_next_header_pc(1234);
-        let token = JitCellToken::new(8009);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let layouts = backend
-            .compiled_terminal_exit_layouts(&token)
-            .expect("compiled terminal layouts should exist");
-        assert_eq!(layouts.len(), 1);
-        let layout = &layouts[0];
-        assert_eq!(layout.op_index, 1);
-        assert_eq!(layout.trace_id, 77);
-        assert_eq!(layout.fail_index, u32::MAX);
-        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Int]);
-        assert!(!layout.is_finish);
-        let recovery = layout
-            .recovery_layout
-            .as_ref()
-            .expect("jump layout should include backend recovery layout");
-        assert_eq!(recovery.frames.len(), 1);
-        assert_eq!(recovery.frames[0].trace_id, Some(77));
-        assert_eq!(recovery.frames[0].header_pc, Some(1234));
-        assert_eq!(recovery.frames[0].pc, 1234);
-        assert_eq!(
-            recovery.frames[0].slots,
-            vec![
-                majit_backend::ExitValueSourceLayout::ExitValue(0),
-                majit_backend::ExitValueSourceLayout::ExitValue(1),
-            ]
-        );
-        assert_eq!(
-            recovery.frames[0].slot_types,
-            Some(vec![Type::Ref, Type::Int])
-        );
-    }
-
-    #[test]
-    fn test_compiled_terminal_exit_layouts_include_backend_finish_recovery_layout() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_ref_rc(1)];
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_float(0), OpRef::input_arg_ref(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_ref(1), OpRef::input_arg_float(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        backend.set_next_trace_id(79);
-        backend.set_next_header_pc(5678);
-        let token = JitCellToken::new(8011);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let layouts = backend
-            .compiled_terminal_exit_layouts(&token)
-            .expect("compiled terminal layouts should exist");
-        assert_eq!(layouts.len(), 1);
-        let layout = &layouts[0];
-        assert_eq!(layout.op_index, 1);
-        assert_eq!(layout.trace_id, 79);
-        assert_eq!(layout.fail_index, 0);
-        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
-        assert!(layout.is_finish);
-        let recovery = layout
-            .recovery_layout
-            .as_ref()
-            .expect("finish layout should include backend recovery layout");
-        assert_eq!(recovery.frames.len(), 1);
-        assert_eq!(recovery.frames[0].trace_id, Some(79));
-        assert_eq!(recovery.frames[0].header_pc, Some(5678));
-        assert_eq!(recovery.frames[0].pc, 5678);
-        assert_eq!(
-            recovery.frames[0].slots,
-            vec![
-                majit_backend::ExitValueSourceLayout::ExitValue(0),
-                majit_backend::ExitValueSourceLayout::ExitValue(1),
-            ]
-        );
-        assert_eq!(
-            recovery.frames[0].slot_types,
-            Some(vec![Type::Ref, Type::Float])
-        );
     }
 
     #[test]
@@ -29954,21 +29691,6 @@ mod tests {
         assert_eq!(bridge_info.input_types, vec![Type::Int]);
         assert_eq!(bridge_info.header_pc, 2000);
         assert_eq!(bridge_info.source_guard, Some((90, 0)));
-
-        let bridge_terminal_layouts = backend
-            .compiled_trace_terminal_exit_layouts(&token, 91)
-            .expect("bridge terminal layouts should exist");
-        assert_eq!(bridge_terminal_layouts.len(), 1);
-        assert_eq!(bridge_terminal_layouts[0].trace_id, 91);
-        assert_eq!(
-            bridge_terminal_layouts[0]
-                .recovery_layout
-                .as_ref()
-                .expect("bridge terminal layout should have recovery")
-                .frames[0]
-                .pc,
-            2000
-        );
     }
 
     #[test]
@@ -30032,16 +29754,6 @@ mod tests {
             guard_layout.recovery_layout.is_none(),
             "bridge guard fail_descr recovery_layout is None at the backend boundary"
         );
-
-        let bridge_terminal_layouts = backend
-            .compiled_trace_terminal_exit_layouts(&token, 191)
-            .expect("bridge terminal layouts should exist");
-        let finish_recovery = bridge_terminal_layouts[0]
-            .recovery_layout
-            .as_ref()
-            .expect("bridge finish should carry backend recovery");
-        assert_eq!(finish_recovery.frames.len(), 1);
-        assert_eq!(finish_recovery.frames[0].pc, 2000);
     }
 
     #[test]
@@ -30135,22 +29847,6 @@ mod tests {
         assert!(
             nested_guard_layout.recovery_layout.is_none(),
             "nested bridge guard fail_descr recovery_layout is None at the backend boundary"
-        );
-
-        let nested_terminal_layouts = backend
-            .compiled_trace_terminal_exit_layouts(&token, 292)
-            .expect("nested bridge terminal layouts should exist");
-        let nested_finish_recovery = nested_terminal_layouts[0]
-            .recovery_layout
-            .as_ref()
-            .expect("nested bridge finish should carry backend recovery");
-        assert_eq!(
-            nested_finish_recovery
-                .frames
-                .iter()
-                .map(|frame| frame.pc)
-                .collect::<Vec<_>>(),
-            vec![3000]
         );
     }
 

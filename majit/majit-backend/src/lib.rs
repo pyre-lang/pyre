@@ -879,34 +879,6 @@ pub struct FailDescrLayout {
     pub descr: Option<majit_ir::DescrRef>,
 }
 
-/// Static layout metadata for a terminal exit within a compiled trace.
-///
-/// Unlike [`FailDescrLayout`], terminal exits are keyed by the trace op index
-/// rather than a backend fail descriptor, because `JUMP` exits do not
-/// necessarily correspond to a deadframe-producing guard site.
-#[derive(Debug, Clone)]
-pub struct TerminalExitLayout {
-    /// Trace op index of the terminal `FINISH`/`JUMP`.
-    pub op_index: usize,
-    /// Compiled trace identifier that owns this exit.
-    pub trace_id: u64,
-    /// Backend-owned metadata for the trace that owns this exit.
-    pub trace_info: Option<CompiledTraceInfo>,
-    /// Backend fail-index if this terminal exit is also a fail descriptor.
-    pub fail_index: u32,
-    /// Typed layout of the exit slots.
-    pub exit_types: Vec<Type>,
-    /// Whether this exit is a `FINISH` rather than a `JUMP`.
-    pub is_finish: bool,
-    /// `compile.py ExitFrameWithExceptionDescrRef` discriminator;
-    /// see `FailDescrLayout::is_exception_exit`.
-    pub is_exception_exit: bool,
-    /// Exit slot indices that hold rooted GC references.
-    /// Exit slot indices that carry opaque FORCE_TOKEN handles.
-    /// Optional backend-origin recovery layout for this terminal exit.
-    pub recovery_layout: Option<ExitRecoveryLayout>,
-}
-
 /// Result of compiling a loop or bridge.
 #[derive(Debug)]
 pub struct AsmInfo {
@@ -3862,33 +3834,6 @@ pub trait Backend: Send {
         _token: &JitCellToken,
         _trace_id: u64,
     ) -> Option<Vec<FailDescrLayout>> {
-        None
-    }
-
-    /// Inspect static terminal-exit layouts for a compiled loop token.
-    fn compiled_terminal_exit_layouts(
-        &self,
-        _token: &JitCellToken,
-    ) -> Option<Vec<TerminalExitLayout>> {
-        None
-    }
-
-    /// Inspect static terminal-exit layouts for a bridge attached to a source guard.
-    fn compiled_bridge_terminal_exit_layouts(
-        &self,
-        _original_token: &JitCellToken,
-        _source_trace_id: u64,
-        _source_fail_index: u32,
-    ) -> Option<Vec<TerminalExitLayout>> {
-        None
-    }
-
-    /// Inspect static terminal-exit layouts for any compiled trace owned by this token.
-    fn compiled_trace_terminal_exit_layouts(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-    ) -> Option<Vec<TerminalExitLayout>> {
         None
     }
 
