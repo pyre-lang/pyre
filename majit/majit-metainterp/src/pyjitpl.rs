@@ -14722,8 +14722,7 @@ impl<M: Clone> MetaInterp<M> {
             self.jitlog_trace_aborted();
             return false;
         };
-        let (retraced_count, loop_num_inputs) =
-            (tok.get_retraced_count(), tok.inputarg_types().len());
+        let retraced_count = tok.get_retraced_count();
         // Box identity: stage bridge_inputarg_base from the process-wide
         // high-water so this bridge's OpRefs sit above every previously
         // compiled trace. See Optimizer::optimize_bridge docstring
@@ -14877,7 +14876,6 @@ impl<M: Clone> MetaInterp<M> {
                 &mut retraced_count,
                 retrace_limit,
                 None,
-                Some(loop_num_inputs),
                 bridge_inputarg_base,
             )
         };
@@ -15323,7 +15321,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut retraced_count = self
             .get_procedure_token_on_driver(compiling_jd, cell_token_key)
             .map_or(0, |tok| tok.get_retraced_count());
-        let (loop_num_inputs, pending_bridge_rd): (usize, Option<PendingBridgeRd>) = {
+        let pending_bridge_rd: Option<PendingBridgeRd> = {
             // `fail_descr.trace_id()` is the bridge origin's allocated
             // id (non-zero per `alloc_trace_id` starting at 1).  RPython
             // reaches the same value through the resumekey object's
@@ -15343,7 +15341,7 @@ impl<M: Clone> MetaInterp<M> {
             // guard sits in the root loop or in a bridge the frontend never
             // indexed (`send_bridge_to_backend`).  The pool Arcs are the ones
             // the descr holds, so the deserializer shares them.
-            let pending = crate::resume::get_resumestorage(fail_descr_arc).map(|storage| {
+            crate::resume::get_resumestorage(fail_descr_arc).map(|storage| {
                 // Each bridge inputarg carries its `box.type`
                 // (resoperation.py InputArgInt/727/739 InputArg{Int,Ref,Float});
                 // mint the typed `OpRef::input_arg_*` variant via
@@ -15408,13 +15406,7 @@ impl<M: Clone> MetaInterp<M> {
                     all_descrs: self.staticdata.all_descrs().lock().clone(),
                     cpu: self.cpu.clone(),
                 }
-            });
-            (
-                // Parent inputarg_types belong to the failing guard's loop
-                // (`rd_loop_token` / `descr_owning_jct`).
-                source_jct.inputarg_types().len(),
-                pending,
-            )
+            })
         };
         // Box identity: stage bridge_inputarg_base from the process-wide
         // high-water so this bridge's OpRefs sit above every previously
@@ -15625,7 +15617,6 @@ impl<M: Clone> MetaInterp<M> {
                     &mut retraced_count,
                     retrace_limit,
                     pending_bridge_rd,
-                    Some(loop_num_inputs),
                     bridge_inputarg_base,
                 )
             })
