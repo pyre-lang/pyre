@@ -308,6 +308,8 @@ fn fold_recorded_jump_args(
 pub struct UnrollOptimizer {
     /// Backend capability propagated to both phase optimizers.
     pub supports_efficient_uint_mul_high: bool,
+    /// optimizer.py Optimizer.jitdriver_sd
+    pub jitdriver_sd: usize,
     /// The short preamble from the preamble optimization pass.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// history.py: JitCellToken.target_tokens — compiled versions of this loop.
@@ -542,6 +544,7 @@ impl UnrollOptimizer {
     fn pin_inner_optimizer(&self, opt: &mut crate::optimizeopt::optimizer::Optimizer) {
         opt.cpu = self.cpu.clone();
         opt.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        opt.jitdriver_sd = self.jitdriver_sd;
         opt.set_pureop_historylength(self.pureop_historylength);
         if let Some(vrefinfo) = self.vrefinfo.clone() {
             opt.set_vrefinfo(vrefinfo);
@@ -602,6 +605,7 @@ impl UnrollOptimizer {
     pub fn new() -> Self {
         UnrollOptimizer {
             supports_efficient_uint_mul_high: true,
+            jitdriver_sd: 0,
             short_preamble: None,
             target_tokens: Vec::new(),
             attach_jitcell_token: None,
@@ -785,6 +789,7 @@ impl UnrollOptimizer {
         // backend's answer over as the two-phase path does, or these callers
         // get UINT_MUL_HIGH on a backend that has none.
         optimizer.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        optimizer.jitdriver_sd = self.jitdriver_sd;
         optimizer.add_pass(Box::new(OptUnroll::new()));
         optimizer.propagate_all_forward(ops)
     }
@@ -797,9 +802,11 @@ impl UnrollOptimizer {
     /// `unroll.py:119-123 except SpeculativeError: raise InvalidLoop`.
     pub fn optimize_peeled_loop(&mut self, ops: &[Op]) -> Vec<Op> {
         let supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        let jitdriver_sd = self.jitdriver_sd;
         with_speculative_to_invalid_loop(|| {
             let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
             optimizer.supports_efficient_uint_mul_high = supports_efficient_uint_mul_high;
+            optimizer.jitdriver_sd = jitdriver_sd;
             optimizer.propagate_all_forward(ops)
         })
     }
@@ -865,6 +872,7 @@ impl UnrollOptimizer {
     ) -> Vec<Op> {
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::default_pipeline();
         optimizer.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        optimizer.jitdriver_sd = self.jitdriver_sd;
         optimizer.add_pass(Box::new(OptUnroll::new()));
         let result = optimizer.optimize_with_constants(ops, constants);
         let sp = crate::optimizeopt::shortpreamble::extract_short_preamble(&result);

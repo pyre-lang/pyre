@@ -336,6 +336,8 @@ pub(crate) struct PendingBridgeRd {
 pub struct Optimizer {
     /// Backend capability threaded into each optimization context.
     pub supports_efficient_uint_mul_high: bool,
+    /// optimizer.py Optimizer.jitdriver_sd
+    pub jitdriver_sd: usize,
     passes: Vec<Box<dyn Optimization>>,
     pub pureop_historylength: usize,
     /// Final num_inputs after optimization (may increase if virtualizable
@@ -1415,6 +1417,7 @@ impl Optimizer {
     pub fn new() -> Self {
         Optimizer {
             supports_efficient_uint_mul_high: true,
+            jitdriver_sd: 0,
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
@@ -2965,6 +2968,7 @@ impl Optimizer {
         // PtrInfo has no `known_class` recorded.
         ctx.cpu = self.cpu.clone();
         ctx.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        ctx.jitdriver_sd = self.jitdriver_sd;
         // RPython resume.py parity: Phase 2 optimizer needs imported_label_args
         // to resolve NONE positions in fail_args inherited from Phase 1.
         ctx.imported_virtuals = self.imported_virtuals.clone();
@@ -6950,7 +6954,7 @@ mod tests {
         let mut guard_a = Op::with_descr(
             OpCode::GuardNotForced,
             &[],
-            crate::compile::make_resume_guard_forced_descr_typed(guard_types_a.clone()),
+            crate::compile::make_resume_guard_forced_descr_typed(guard_types_a.clone(), 0),
         );
         guard_a.setfailargs(
             vec![
@@ -6986,7 +6990,7 @@ mod tests {
         let mut guard_b = Op::with_descr(
             OpCode::GuardNotForced,
             &[],
-            crate::compile::make_resume_guard_forced_descr_typed(guard_types_b.clone()),
+            crate::compile::make_resume_guard_forced_descr_typed(guard_types_b.clone(), 0),
         );
         guard_b.setfailargs(
             vec![
