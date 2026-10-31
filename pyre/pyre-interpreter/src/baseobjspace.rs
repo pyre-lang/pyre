@@ -29,6 +29,38 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use crate::objspace::descroperation::user_overridden_class;
 pub use crate::objspace::descroperation::*;
 
+/// `baseobjspace.py ObjSpace.make_builtins` initializes `space.builtin`
+/// before any Python frame runs. `module.py Module.__init__` owns the
+/// dictionary; `function.py BuiltinFunction.w_moduleobj` points back to the
+/// defining module. Keep both owners rooted while attaching that identity.
+pub(crate) fn make_builtins(w_dict: PyObjectRef) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let _ = roots.pin_root(w_dict);
+    // Enumeration may realize wrapped keys and collect. Only owned key
+    // strings survive the Module allocation; values are looked up again.
+    let entries = unsafe { pyre_object::w_dict_str_entries(roots.get(dict_slot)) };
+    let mut keys = Vec::with_capacity(entries.len());
+    for (key, _) in entries {
+        keys.push(key);
+    }
+    let module = pyre_object::w_module_new_aliasing_dict(
+        pyre_object::w_str_new("builtins"),
+        roots.get(dict_slot),
+    );
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(module);
+    for key in keys {
+        if let Some(value) = unsafe { pyre_object::w_dict_getitem_str(roots.get(dict_slot), &key) }
+        {
+            unsafe {
+                crate::function::builtin_function_set_module_obj(value, roots.get(module_slot))
+            };
+        }
+    }
+    roots.get(module_slot)
+}
+
 // ── Pending dict-key-callback error slot ─────────────────────────────
 // The `r_dict(eq_w, hash_w)` callbacks (`pyre_object_hash_w_trampoline`
 // / `pyre_object_eq_w_trampoline` in pyre-jit) cannot return a `Result`
@@ -6110,8 +6142,9 @@ pub fn finditem_str_named(
         // `sys.modules` read.  Under the JIT the compiled loop has already
         // pinned the dict identity; the interpreter keeps the locked wrapper.
         if majit_metainterp::jit::we_are_jitted() {
+            let hash = named_key_hash(key, pycode, nameindex);
             return Ok(pyre_object::dictmultiobject::nullable_to_option(unsafe {
-                pyre_object::dictmultiobject::w_dict_get_strategy(obj).getitem_str(obj, key)
+                pyre_object::dictmultiobject::w_dict_getitem_str_shortcut_hashed(obj, key, hash)
             }));
         }
         return finditem_str_shortcut_interp(obj, key, pycode, nameindex);

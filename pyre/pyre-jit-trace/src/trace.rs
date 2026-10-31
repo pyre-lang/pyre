@@ -1687,29 +1687,35 @@ fn carrier_catch_target(code: &[u8], pc: usize, frame: &str) -> Option<usize> {
 /// The recipe carries no materialized frame, so this takes the fabricating
 /// hook: it builds one from the promoted code / globals, which is what
 /// `record_inline_application_traceback` falls back to for an unseeded level.
+/// `false` when the crossed frame's globals cannot be recovered: the
+/// caller discards the carrier walk so the blackhole runs the real
+/// frame and `pytraceback.record_application_traceback` attaches it.
 fn record_carrier_crossed_frame_traceback(
     ctx: &mut TraceCtx,
     recipe: &majit_metainterp::ReconstructRecipe,
     exc: majit_ir::OpRef,
     exc_concrete: crate::state::ConcreteValue,
-) {
+) -> bool {
     let crate::state::ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return;
+        return true;
     };
     if exc_ptr.is_null() {
-        return;
+        return true;
     }
     let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr);
     // A synthetic frame carries the sentinel or null instead of a real code
     // object; the hook dereferences it, so both checks precede `is_code`, whose
     // type check would deref the sentinel.
     if w_code.is_null() || w_code as usize == usize::MAX {
-        return;
+        return true;
     }
     if !unsafe { pyre_interpreter::pycode::is_code(w_code) } {
-        return;
+        return true;
     }
     let w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe);
+    if w_globals.is_null() {
+        return false;
+    }
     majit_metainterp::record_inline_application_traceback_for_recording(
         exc_ptr as usize as i64,
         w_code as usize as i64,
@@ -1719,7 +1725,7 @@ fn record_carrier_crossed_frame_traceback(
     );
     let hook = majit_metainterp::record_inline_application_traceback_hook_address();
     if hook.is_null() || exc.is_none() {
-        return;
+        return true;
     }
     let w_code_op = ctx.const_ref(w_code as usize as i64);
     let w_globals_op = ctx.const_ref(w_globals as usize as i64);
@@ -1737,6 +1743,7 @@ fn record_carrier_crossed_frame_traceback(
         ],
         majit_metainterp::default_effect_info(),
     );
+    true
 }
 
 fn carrier_root_catch_target<Sym: WalkSym>(sym: &Sym, root_pc: usize) -> Option<usize> {
@@ -2099,8 +2106,20 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // sub-walk's local-concrete shadow so a nested self-recursive call's int arg
         // is known.
         let recipe = &ctx.reconstruct_recipe_with_current_refs(recipe);
-        let callee_w_globals =
-            crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe) as usize;
+        let callee_w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, recipe);
+        if callee_w_globals.is_null() {
+            discard_bridge_carrier_walk(
+                ctx,
+                sym,
+                entry_depth,
+                pre_pos,
+                &pre_virtualref_boxes,
+                true,
+            );
+            crate::jitcode_dispatch::census_record("P2Drain::NoCalleeGlobals");
+            return p2_drain_abort();
+        }
+        let callee_w_globals = callee_w_globals as usize;
         let nlocals = recipe.nlocals.min(recipe.concrete_r.len());
         let local_oprefs = &recipe.registers_r[..nlocals.min(recipe.registers_r.len())];
         let local_concretes = &recipe.concrete_r[..nlocals];
@@ -2771,7 +2790,10 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 }
             }
         } else {
-            record_carrier_crossed_frame_traceback(ctx, middle, exc, exc_concrete);
+            if !record_carrier_crossed_frame_traceback(ctx, middle, exc, exc_concrete) {
+                crate::jitcode_dispatch::census_record("P2Drain::NoCalleeGlobals");
+                return None;
+            }
             crate::jitcode_dispatch::carrier_ec_leave(ctx, sym, true);
             crate::jitcode_dispatch::pop_reconstructed_portal_callee(ctx, true);
         }
@@ -2879,8 +2901,12 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
         return None;
     };
-    let middle_w_globals =
-        crate::state::recover_inline_callee_globals_from_recipe(ctx, middle) as usize;
+    let middle_w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, middle);
+    if middle_w_globals.is_null() {
+        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeGlobals");
+        return None;
+    }
+    let middle_w_globals = middle_w_globals as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];
@@ -3246,8 +3272,12 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
         return None;
     };
-    let middle_w_globals =
-        crate::state::recover_inline_callee_globals_from_recipe(ctx, middle) as usize;
+    let middle_w_globals = crate::state::recover_inline_callee_globals_from_recipe(ctx, middle);
+    if middle_w_globals.is_null() {
+        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeGlobals");
+        return None;
+    }
+    let middle_w_globals = middle_w_globals as usize;
     let middle_nlocals = middle.nlocals.min(middle.concrete_r.len());
     let middle_local_oprefs = &middle.registers_r[..middle_nlocals.min(middle.registers_r.len())];
     let middle_local_concretes = &middle.concrete_r[..middle_nlocals];

@@ -6596,6 +6596,76 @@ fn hint_force_virtualizable_is_a_noop_without_virtualizable_info() {
 }
 
 #[test]
+fn establish_nullity_of_a_null_constant_neither_counts_nor_guards() {
+    // heapcache.py is_nullity_known: a Const answers bool(box.getref_base()),
+    // so ConstPtr(0) is not known. pyjitpl.py _establish_nullity then
+    // skips GUARD_ISNULL because the box is already a Const, and does
+    // not count HEAPCACHED_OPS.
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_null();
+    let ops_before = tc.num_ops();
+    let heapcached_before = tc.profiler().snapshot().heapcached_ops;
+    with_hint_walk_context(
+        &mut tc,
+        &mut [operand],
+        &mut [ConcreteValue::Null],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            assert_eq!(
+                establish_nullity_of_box(wc, 0, operand).unwrap(),
+                Some(false)
+            );
+            assert_eq!(wc.trace_ctx.num_ops(), ops_before);
+            assert_eq!(
+                wc.trace_ctx.profiler().snapshot().heapcached_ops,
+                heapcached_before
+            );
+            assert_eq!(
+                establish_nullity_of_box(wc, 0, operand).unwrap(),
+                Some(false)
+            );
+            assert_eq!(
+                wc.trace_ctx.profiler().snapshot().heapcached_ops,
+                heapcached_before
+            );
+        },
+    );
+}
+
+#[test]
+fn establish_nullity_of_box_with_flag_and_absent_concrete_declines() {
+    // value = box.nonnull() is computed first; missing bits decline
+    // before the HF_KNOWN_NULLITY flag is consulted, so there is no
+    // HEAPCACHED_OPS count and no guard.
+    let mut tc = fresh_trace_ctx();
+    let operand = dummy_ptr_eq_box(&mut tc);
+    tc.heap_cache_mut().nullity_now_known(operand);
+    assert!(tc.heap_cache().is_nullity_known(operand));
+    let ops_before = tc.num_ops();
+    let heapcached_before = tc.profiler().snapshot().heapcached_ops;
+    with_hint_walk_context(
+        &mut tc,
+        &mut [operand],
+        &mut [ConcreteValue::Null],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            assert_eq!(establish_nullity_of_box(wc, 0, operand).unwrap(), None);
+            assert_eq!(wc.trace_ctx.num_ops(), ops_before);
+            assert_eq!(
+                wc.trace_ctx.profiler().snapshot().heapcached_ops,
+                heapcached_before
+            );
+        },
+    );
+}
+
+#[test]
 fn establish_nullity_of_box_guards_observations_and_declines_missing_values() {
     // pyjitpl.py MIFrame._establish_nullity: observing a pointer records
     // its guard once, then heapcache.nullity_now_known answers later reads.
@@ -6763,21 +6833,20 @@ fn goto_if_not_ptr_nonzero_uses_known_nonnull_heapcache_without_a_ref_shadow() {
     tc.heap_cache_mut().new_object(operand);
     let ops_before = tc.num_ops();
     let mut regs_r = [operand];
-    // The Ref shadow is absent, yet the heapcache already proved non-nullness.
-    // `_establish_nullity` answers from the cache before demanding a pointer.
+    // `value = box.nonnull()` is computed first (`pyjitpl.py
+    // _establish_nullity`). A New with the flag but no concrete bits
+    // declines rather than assuming non-null.
     let mut concrete_r = [ConcreteValue::Null];
-    let (outcome, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
-        .expect("a heapcache-known non-null box needs no ref shadow");
-    assert_eq!(outcome, DispatchOutcome::Continue);
+    let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
+        .expect_err("a heapcache flag without box.nonnull() bits must decline");
     assert_eq!(
-        next_pc, 5,
-        "a known non-null pointer falls through without reading a shadow"
+        err,
+        DispatchError::UnsupportedOpname {
+            pc: 0,
+            key: "goto_if_not_ptr_nonzero/rL",
+        },
     );
-    assert_eq!(
-        tc.num_ops(),
-        ops_before,
-        "the heapcache-known fast path emits no nullity guard"
-    );
+    assert_eq!(tc.num_ops(), ops_before, "a declined step records nothing");
 }
 
 #[test]

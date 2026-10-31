@@ -3280,8 +3280,8 @@ impl NamespaceOpcodeHandler for PyFrame {
         {
             return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
-        let mut w_builtin = pyre_object::with_roots!(w_globals => self.get_builtin());
         if use_cache {
+            let mut w_builtin = pyre_object::with_roots!(w_globals => self.get_builtin());
             let cache_hit: Option<PyObjectRef> = unsafe {
                 pyre_object::with_roots!(w_builtin, w_globals => load_global_via_cache(
                     w_globals,
@@ -3303,7 +3303,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
         if !w_globals.is_null()
-            && let Some(value) = pyre_object::with_roots!(w_builtin, w_globals =>
+            && let Some(value) = pyre_object::with_roots!(w_globals =>
                 crate::baseobjspace::finditem_str_named(
                     w_globals,
                     name,
@@ -3315,11 +3315,20 @@ impl NamespaceOpcodeHandler for PyFrame {
             return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
         // `self.get_builtin().getdictvalue(space, varname)`.
+        // `pyopcode.py _load_global` reaches this only after the globals
+        // probe misses. In particular, the jitted cache-bypass path must
+        // not materialize or read a builtin module for a globals hit.
+        let w_builtin = pyre_object::with_roots!(w_globals => self.get_builtin());
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
             let mut w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null()
                 && let Some(value) = pyre_object::with_roots!(w_dict =>
-                    crate::baseobjspace::finditem_str(w_dict, name)
+                    crate::baseobjspace::finditem_str_named(
+                        w_dict,
+                        name,
+                        self.pycode as PyObjectRef,
+                        nameindex,
+                    )
                 )?
             {
                 return crate::lazyimport::maybe_reify_str(value, name, w_dict);

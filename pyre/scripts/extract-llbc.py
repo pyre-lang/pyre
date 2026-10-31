@@ -260,6 +260,17 @@ def interpreter_charon_args(crate_dir: Path) -> list[str]:
     """
     args = [
         *PYRE_RUNTIME_CHARON_ARGS,
+        # `dictmultiobject.py W_DictObject.get_strategy` is a field read,
+        # followed by `DictStrategy.getitem_str` dispatch. Charon needs the
+        # foreign trait's vtable layout to normalize that dispatch to a
+        # concrete slot read (`rclass.py ClassRepr.getclsfield`), and the
+        # getter body to keep both words of its fat return in this graph
+        # (`front::dyn_fat::splice_fat_dyn_returns`). An opaque declaration
+        # leaves the obsolete name-based VtableMethodPtr in the jitcode.
+        "--include",
+        "pyre_object::dictmultiobject::DictStrategy",
+        "--include",
+        "pyre_object::dictmultiobject::w_dict_get_strategy",
         "--opaque",
         "crate::module",
         "--include",

@@ -8075,10 +8075,12 @@ pub fn unicode_index_storage_descr() -> DescrRef {
 static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_interpreter::pycode::PyCode;
     // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field
-    // plus `code_ptr` (`jit_immutable_fields`). `co_name` / `co_qualname` are
-    // listed upstream but these slots are realized lazily, so they stay
-    // mutable. `w_filename` is realized in `PyCode.__init__` and listed
-    // immutable. `w_globals?` is filled on first execution and then promoted.
+    // plus `code_ptr` (`jit_immutable_fields`). `co_names_w[*]` is the interned
+    // name table; the field descr is immutable and the `[*]` item-pure flag
+    // lives on `jit_immutable_fields`. `co_name` / `co_qualname` are listed
+    // upstream but these slots are realized lazily, so they stay mutable.
+    // `w_filename` is realized in `PyCode.__init__` and listed immutable.
+    // `w_globals?` is filled on first execution and then promoted.
     let word_int = |key, offset, immutable| (key, offset, WORD, Type::Int, false, immutable, false);
     let word_ref =
         |key, offset, immutable, quasi| (key, offset, WORD, Type::Ref, false, immutable, quasi);

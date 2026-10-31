@@ -4218,6 +4218,48 @@ pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
     dict_entries_get_str(entries, key, hash)
 }
 
+/// Jitted `objspace.py StdObjSpace.finditem_str` for a regular dict.
+///
+/// Pin the holder (`celldict.py ModuleDictStrategy.getdictvalue_no_unwrapping`
+/// promotes `self`) then `strategy_is` on `kind` (`w_dict_lookup_checked`).
+/// Unicode and Object share the object-table hashed probe; Empty misses.
+/// Remaining strategies residualise through
+/// [`w_dict_getitem_str_hashed_residual`].  No `DictOperationGuard`:
+/// `finditem_str` calls `w_obj.getitem_str(key)` without the user-facing lock.
+///
+/// # Safety
+/// `obj` must be a live `W_DictObject` (not a module dict).
+pub unsafe fn w_dict_getitem_str_shortcut_hashed(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+) -> PyObjectRef {
+    let holder = (*(obj as *const W_DictObject)).dstrategy;
+    let dstrategy = &*majit_ir::jit::promote(holder as *const DictStrategyRef);
+    if strategy_is(dstrategy, StrategyKind::Empty)
+        || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
+    {
+        return PY_NULL;
+    }
+    if strategy_is(dstrategy, StrategyKind::Unicode) || strategy_is(dstrategy, StrategyKind::Object)
+    {
+        return w_dict_getitem_str_object_strategy_hashed(obj, key, hash).unwrap_or(PY_NULL);
+    }
+    w_dict_getitem_str_hashed_residual(obj, key, hash)
+}
+
+/// Residual arm of [`w_dict_getitem_str_shortcut_hashed`] for a strategy that
+/// is not Empty, Unicode, or Object.  `dont_look_inside` emits the word-ABI
+/// trampoline `llmodel.py bh_call_r` needs for a `&str` argument.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_dict_getitem_str_hashed_residual(
+    obj: PyObjectRef,
+    key: &str,
+    hash: i64,
+) -> PyObjectRef {
+    w_dict_get_strategy(obj).getitem_str_hashed(obj, key, hash)
+}
+
 /// `W_DictMultiObject.setitem_str` — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
 /// The module-dict arm is looked inside through [`w_dict_setitem_str_hashed`]
 /// into `ModuleDictStrategy.setitem_str`; the generic arm is the residual

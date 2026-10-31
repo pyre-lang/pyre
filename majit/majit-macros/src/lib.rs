@@ -5575,6 +5575,27 @@ mod tests {
         })
     }
 
+    #[test]
+    fn look_inside_iff_trampoline_has_word_abi_for_str_and_nullable_result() {
+        let func = parse_fn(
+            "pub unsafe fn lookup(entries: *const (), hash: i64, key: &str) -> Option<PyObjectRef> { None }",
+        );
+        let predicate: Path = syn::parse_str("lookup_iff").unwrap();
+        let items = parse_expansion_items(expand_look_inside_iff_item(predicate, func));
+        let target = expansion_fn(&items, "__majit_call_target_lookup_trampoline");
+        assert_eq!(target.sig.inputs.len(), 3);
+        for arg in &target.sig.inputs {
+            let FnArg::Typed(arg) = arg else {
+                panic!("word ABI cannot have a receiver");
+            };
+            let ty = &arg.ty;
+            assert_eq!(quote!(#ty).to_string(), "i64");
+        }
+        let output = &target.sig.output;
+        assert_eq!(quote!(#output).to_string(), "-> i64");
+        assert!(target.sig.abi.is_some(), "residual entry must have a C ABI");
+    }
+
     /// `rlib/jit.py look_inside_iff`: `trampoline.oopspec = func.oopspec;
     /// del func.oopspec`. A still-pending `#[oopspec]` attr is consumed and
     /// lands on the dont_look_inside trampoline, not the looked-inside body.

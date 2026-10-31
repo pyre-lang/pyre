@@ -4849,63 +4849,110 @@ pub(crate) fn trace_float_block_setitem_value(
 ///
 /// `jtransform.py rewrite_op_getfield` records `record_quasiimmut_field`
 /// with `mutate_w_globals` before the load (`pycode.py` `"w_globals?"`).
-pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    let debugdata = opimpl_getfield_gc_r(ctx, frame, crate::descr::pyframe_debugdata_descr());
-    if frame_debugdata_box_is_known_non_null(ctx, debugdata) {
-        return opimpl_getfield_gc_r(
-            ctx,
+/// The published-pycode arm is `jit.promote(self.pycode).w_globals`
+/// (`pyframe.py PyFrame.get_w_globals`): `implement_guard_value` skips a
+/// box that is already a `Const`.
+pub(crate) fn frame_get_globals_obj<Sym: WalkSym>(
+    ctx: &mut crate::jitcode_dispatch::WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame: OpRef,
+) -> Result<OpRef, crate::jitcode_dispatch::DispatchError> {
+    let debugdata = opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        frame,
+        crate::descr::pyframe_debugdata_descr(),
+    );
+    if frame_debugdata_box_is_known_non_null(ctx.trace_ctx, debugdata) {
+        return Ok(opimpl_getfield_gc_r(
+            ctx.trace_ctx,
             debugdata,
             crate::descr::frame_debug_data_w_globals_descr(),
-        );
+        ));
     }
     // The caller established null debugdata: published `pycode.w_globals`.
     let code_descr = crate::descr::pyframe_code_descr();
-    let pycode = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], code_descr.clone());
+    let pycode =
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::GetfieldGcR, &[frame], code_descr.clone());
     // `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
     // This GetfieldGcR is a walker pin, not `execute_with_descr`, so stamp
     // the live pycode the executor would have left on the box.
-    if let Some(struct_ptr) = concrete_gc_ptr(ctx, frame) {
-        if let Some(live) = ctx.field_sanity_load(struct_ptr, &code_descr, Type::Ref) {
-            ctx.set_opref_concrete(pycode, live);
+    if let Some(struct_ptr) = concrete_gc_ptr(ctx.trace_ctx, frame) {
+        if let Some(live) = ctx
+            .trace_ctx
+            .field_sanity_load(struct_ptr, &code_descr, Type::Ref)
+        {
+            ctx.trace_ctx.set_opref_concrete(pycode, live);
         }
     }
+    // `pyframe.py get_w_globals`: `jit.promote(self.pycode).w_globals`.
+    // `implement_guard_value` returns a Const box unchanged.
+    let pycode = if let Some(bits) = pycode_promote_bits(ctx.trace_ctx, pycode) {
+        crate::jitcode_dispatch::walker_implement_guard_value(ctx, op_pc, pycode, bits)?
+    } else {
+        pycode
+    };
     let descr = crate::descr::pycode_w_globals_descr();
     if let Some(mutate) = crate::descr::mutate_descr_for_quasi_field(&descr) {
-        record_quasiimmut_field(ctx, pycode, descr.clone(), Some(&mutate));
+        record_quasiimmut_field(ctx.trace_ctx, pycode, descr.clone(), Some(&mutate));
     }
-    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[pycode], descr)
+    Ok(ctx
+        .trace_ctx
+        .record_op_with_descr(OpCode::GetfieldGcR, &[pycode], descr))
+}
+
+fn pycode_promote_bits(ctx: &TraceCtx, op: OpRef) -> Option<i64> {
+    match ctx.box_value(op) {
+        Some(Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
+            Some(r.as_usize() as i64)
+        }
+        _ => match ctx.concrete_of_opref(op) {
+            Some(Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
+                Some(r.as_usize() as i64)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// `box.nonnull()` from the box's own concrete (`box_value` /
+/// `concrete_of_opref`). `None` when those bits are absent — never assume
+/// non-null. `NO_CONCRETE` is absence, not a pointer.
+pub(crate) fn box_nonnull_value(ctx: &TraceCtx, op: OpRef) -> Option<bool> {
+    match ctx.box_value(op) {
+        Some(Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => Some(r.as_usize() != 0),
+        Some(Value::Int(n)) => Some(n != 0),
+        Some(_) => None,
+        None => match ctx.concrete_of_opref(op) {
+            Some(Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => Some(r.as_usize() != 0),
+            Some(Value::Int(n)) => Some(n != 0),
+            _ => None,
+        },
+    }
 }
 
 /// Nullity already decided for a `debugdata` box: a `ConstPtr(0)`, or
-/// `heapcache.py is_nullity_known` together with a null concrete
-/// (`TraceCtx::heapcache_nullity_known` → `Some(false)`). A `New` /
-/// `NewWithVtable` is never this arm. A recording-time null without those
-/// facts is not knowledge: `_establish_nullity` (`pyjitpl.py`) records
-/// `GUARD_ISNULL` and then `heapcache.nullity_now_known`.
+/// `heapcache.py is_nullity_known` together with a null concrete. A `New`
+/// is covered by the flag `heapcache.py new` stamps. A recording-time null
+/// without those facts is not knowledge: `_establish_nullity` (`pyjitpl.py`)
+/// records `GUARD_ISNULL` and then `heapcache.nullity_now_known`.
 pub(crate) fn frame_debugdata_box_is_known_null(ctx: &TraceCtx, op: OpRef) -> bool {
     if ctx.const_value(op) == Some(0) {
         return true;
     }
-    if matches!(ctx.opcode_of(op), Some(OpCode::New | OpCode::NewWithVtable)) {
-        return false;
-    }
-    ctx.heapcache_nullity_known(op) == Some(false)
+    ctx.heap_cache().is_nullity_known(op) && box_nonnull_value(ctx, op) == Some(false)
 }
 
-/// Non-null already decided for a `debugdata` box: a non-zero constant, a
-/// `New` / `NewWithVtable` (fresh allocation, `heapcache.py new`), or
-/// `heapcache.py is_nullity_known` together with a non-null concrete
-/// (`TraceCtx::heapcache_nullity_known` → `Some(true)`). A recording-time
+/// Non-null already decided for a `debugdata` box: a non-zero constant, or
+/// `heapcache.py is_nullity_known` together with a non-null concrete. A
+/// `New` is covered by the flag `heapcache.py new` stamps. A recording-time
 /// pointer without those facts is not knowledge: `_establish_nullity`
 /// (`pyjitpl.py`) records `GUARD_NONNULL`.
 pub(crate) fn frame_debugdata_box_is_known_non_null(ctx: &TraceCtx, op: OpRef) -> bool {
     if let Some(word) = ctx.const_value(op) {
         return word != 0;
     }
-    if matches!(ctx.opcode_of(op), Some(OpCode::New | OpCode::NewWithVtable)) {
-        return true;
-    }
-    ctx.heapcache_nullity_known(op) == Some(true)
+    ctx.heap_cache().is_nullity_known(op) && box_nonnull_value(ctx, op) == Some(true)
 }
 
 /// `FixedObjectArray.len` sits at payload offset 0. `set_forwarding_address`
@@ -16406,12 +16453,18 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// heapcache. With a frame red present, `pycode.w_globals` is used only when
 /// that frame's `debugdata` is known null (`heapcache.py is_nullity_known`,
 /// a constructor `ConstPtr(0)`, or a constant 0). An unknown `debugdata`
-/// returns `PY_NULL` so the caller declines (`P2Recipe::NoCalleeGlobals`)
-/// rather than rebuilding under the code's first namespace. A Python callee
-/// with no frame red is declined at reconstruct time (`NoFrameForGlobals`).
-/// Recipes that carry no frame red (transparent helpers, `len_tail`,
-/// `ctor_tail`) keep the first-namespace fallback;
-/// the portal/root is `resume_data.frames[0]` and is not recovered here.
+/// returns `PY_NULL`. Every caller declines that result rather than
+/// substituting the code's first namespace: `emit_reconstructed_callee_pyframe`
+/// and `setup_reconstructed_callee_frame` return `None`;
+/// `assemble_bridge_inline_pending` is reached only after that decline;
+/// `drive_bridge_carrier` discards the walk; `drive_middle_frame_*` return
+/// `None`; `record_carrier_crossed_frame_traceback` aborts the carrier walk
+/// so the blackhole/`pytraceback.record_application_traceback` attaches the
+/// real frame. A Python callee with no frame red is declined at reconstruct
+/// time (`NoFrameForGlobals`). Recipes that carry no frame red (transparent
+/// helpers, `len_tail`, `ctor_tail`) keep the
+/// first-namespace fallback; the portal/root is `resume_data.frames[0]` and
+/// is not recovered here.
 pub(crate) fn recover_inline_callee_globals_from_recipe(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
@@ -16531,6 +16584,10 @@ pub(crate) fn assemble_bridge_inline_pending(
     // `debugdata` is known null. PY_NULL here is an unknown `debugdata`:
     // the caller declines rather than taking the first namespace.
     let w_globals = recover_inline_callee_globals_from_recipe(ctx, recipe);
+    debug_assert!(
+        !w_globals.is_null(),
+        "setup_reconstructed_callee_frame declined a PY_NULL globals result"
+    );
 
     // resume.py rebuild_from_resumedata newframe + reload: the decoded boxes are reloaded
     // into the symbolic frame below. `setup_reconstructed_callee_frame`

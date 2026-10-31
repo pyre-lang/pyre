@@ -607,6 +607,17 @@ enum FreshFrameGotoFold {
     Label,
 }
 
+/// CFG worklist item for [`decoded_ops_on_fresh_frame_kind`].
+///
+/// `from_debugdata_label` is the folded NonNull `debugdata` goto's pc and
+/// the register that goto tested, carried only along the Label successor
+/// of that goto (and the constructor straight-line after it).
+#[derive(Clone, Copy, Debug)]
+struct FreshFrameWork {
+    pc: usize,
+    from_debugdata_label: Option<(usize, u8)>,
+}
+
 /// Callee-body ops a fresh inlined frame would execute.
 ///
 /// The inlined callee frame is a virtual whose `debugdata` is None
@@ -618,6 +629,10 @@ enum FreshFrameGotoFold {
 /// itself not yielded. Ops reachable only through the other arm are dropped.
 /// The LOAD_FAST unbound-local test (`goto_if_not_ptr_nonzero` after
 /// `getarrayitem_vable_r`) folds to its bound arm the same way.
+/// A NonNull payload also folds `FrameDebugData.w_f_trace` to its null
+/// successor when the worklist proves that goto sits on the Label of the
+/// folded `debugdata` test (`pyopcode.py dispatch_bytecode`; a fresh
+/// `FrameDebugData` stores `w_f_trace = None`).
 ///
 /// [`decoded_ops_on_fresh_frame`] is the null-`debugdata` fold. A callee
 /// built with a non-null payload uses [`decoded_ops_on_fresh_frame_kind`].
@@ -654,16 +669,29 @@ pub(crate) fn decoded_ops_on_fresh_frame_kind(
     }
     let mut reachable = vec![false; n];
     let mut folded_goto = vec![false; n];
-    let mut work = vec![0usize];
+    let mut work = vec![FreshFrameWork {
+        pc: 0,
+        from_debugdata_label: None,
+    }];
     reachable[0] = true;
     let starts: Vec<usize> = ops.iter().map(|op| op.pc).collect();
-    while let Some(pc) = work.pop() {
+    while let Some(item) = work.pop() {
+        let pc = item.pc;
         let Some(idx) = at[pc] else {
             return None;
         };
         let d = &ops[idx];
         let pred = previous_non_live_op(&ops, idx);
-        let folded = fresh_frame_goto_fold(body_code, d, pred, descr_refs, debugdata);
+        let folded = fresh_frame_goto_fold(
+            body_code,
+            &ops,
+            &at,
+            d,
+            pred,
+            descr_refs,
+            debugdata,
+            item.from_debugdata_label,
+        );
         if folded != FreshFrameGotoFold::None {
             folded_goto[pc] = true;
         }
@@ -675,7 +703,19 @@ pub(crate) fn decoded_ops_on_fresh_frame_kind(
                 continue;
             }
             reachable[succ] = true;
-            work.push(succ);
+            work.push(FreshFrameWork {
+                pc: succ,
+                from_debugdata_label: fresh_frame_succ_debugdata_hint(
+                    body_code,
+                    d,
+                    folded,
+                    debugdata,
+                    pred,
+                    descr_refs,
+                    item.from_debugdata_label,
+                    succ,
+                ),
+            });
         }
     }
     Some(
@@ -696,6 +736,32 @@ fn previous_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Option<&'a Deco
         if !is_live_marker(ops[i].opname) {
             return Some(&ops[i]);
         }
+    }
+    None
+}
+
+fn next_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Option<&'a DecodedOp> {
+    let mut i = idx + 1;
+    while i < ops.len() {
+        if !is_live_marker(ops[i].opname) {
+            return Some(&ops[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn first_non_live_from<'a>(
+    ops: &'a [DecodedOp],
+    at: &[Option<usize>],
+    pc: usize,
+) -> Option<&'a DecodedOp> {
+    let mut idx = at.get(pc).copied().flatten()?;
+    while idx < ops.len() {
+        if !is_live_marker(ops[idx].opname) {
+            return Some(&ops[idx]);
+        }
+        idx += 1;
     }
     None
 }
@@ -748,6 +814,87 @@ fn debugdata_field_name(name: &str) -> bool {
     name == "debugdata" || name.rsplit(['.', ':']).next() == Some("debugdata")
 }
 
+fn descr_is_frame_debugdata_w_f_trace(descr: &DescrRef) -> bool {
+    if std::sync::Arc::ptr_eq(descr, &crate::descr::frame_debug_data_w_f_trace_descr()) {
+        return true;
+    }
+    descr.as_field_descr().is_some_and(|field| {
+        field.offset() == pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET
+            && w_f_trace_field_name(field.field_name())
+    })
+}
+
+fn w_f_trace_field_name(name: &str) -> bool {
+    name == "w_f_trace" || name.rsplit(['.', ':']).next() == Some("w_f_trace")
+}
+
+fn is_getfield_gc_r_w_f_trace(
+    code: &[u8],
+    op: &DecodedOp,
+    tested_reg: u8,
+    descr_refs: &[DescrRef],
+) -> bool {
+    if !op.opname.starts_with("getfield_gc_r") {
+        return false;
+    }
+    let Some(&base) = code.get(op.pc + 1) else {
+        return false;
+    };
+    if base != tested_reg {
+        return false;
+    }
+    let Some(descr_index) = descr_operand_index(code, op) else {
+        return false;
+    };
+    body_descr_at(descr_refs, descr_index)
+        .as_ref()
+        .is_some_and(descr_is_frame_debugdata_w_f_trace)
+}
+
+fn is_w_f_trace_null_goto_from_folded_debugdata(
+    code: &[u8],
+    ops: &[DecodedOp],
+    at: &[Option<usize>],
+    op: &DecodedOp,
+    dd_goto_pc: usize,
+    tested_reg: u8,
+    descr_refs: &[DescrRef],
+) -> bool {
+    if op.opname != "goto_if_not_ptr_iszero" {
+        return false;
+    }
+    let Some(dd_idx) = at.get(dd_goto_pc).copied().flatten() else {
+        return false;
+    };
+    let dd_op = &ops[dd_idx];
+    let Some(off) = label_operand_offset(dd_op.argcodes) else {
+        return false;
+    };
+    let label_target = read_label(code, dd_op, off);
+    let Some(first) = first_non_live_from(ops, at, label_target) else {
+        return false;
+    };
+    if !is_getfield_gc_r_w_f_trace(code, first, tested_reg, descr_refs) {
+        return false;
+    }
+    let Some(first_idx) = at.get(first.pc).copied().flatten() else {
+        return false;
+    };
+    let Some(second) = next_non_live_op(ops, first_idx) else {
+        return false;
+    };
+    if second.pc != op.pc {
+        return false;
+    }
+    let Some(&cond) = code.get(op.pc + 1) else {
+        return false;
+    };
+    let Some(&dst) = code.get(first.next_pc.wrapping_sub(1)) else {
+        return false;
+    };
+    cond == dst
+}
+
 fn ptr_iszero_goto_of_pred(
     code: &[u8],
     op: &DecodedOp,
@@ -797,19 +944,31 @@ fn is_fresh_frame_debugdata_null_goto(
         .is_some_and(descr_is_vable_debugdata)
 }
 
-/// Fold the constructor `debugdata` null-test and the LOAD_FAST unbound
+/// Fold the constructor `debugdata` null-test, the LOAD_FAST unbound
 /// check (`pyopcode.py LOAD_FAST` as `emit_load_fast_checked!` flattens it:
-/// `getarrayitem_vable_r` of the local, then `goto_if_not_ptr_nonzero`).
-/// The `w_f_trace` null-test is left to the walker
-/// (`opimpl_goto_if_not_ptr_iszero` / `_establish_nullity` answers it from the
-/// heapcache-known PY_NULL of a fresh `FrameDebugData`). This scan is
-/// admission-only (`decoded_ops_on_fresh_frame_kind`).
+/// `getarrayitem_vable_r` of the local, then `goto_if_not_ptr_nonzero`),
+/// and — only with a worklist proof — the `w_f_trace` null-test of a
+/// NonNull `FrameDebugData`.
+///
+/// The `w_f_trace` `goto_if_not_ptr_iszero` folds to its is-null
+/// successor (`Fallthrough`) when this pc was reached as the Label
+/// successor of a `debugdata` null-goto this scan folded to `Label` for
+/// `FreshFrameDebugdata::NonNull`; the first non-live op at that Label
+/// is a `getfield_gc_r` whose BASE is the register that debugdata goto
+/// tested and whose descr is `FrameDebugData.w_f_trace`; and this op is
+/// the next non-live `goto_if_not_ptr_iszero` testing that getfield's
+/// destination. A constructor `FrameDebugData` stores `w_f_trace = None`
+/// (`pyframe.py FrameDebugData`; `emit_new_frame_debug_data_inline`).
+/// This scan is admission-only (`decoded_ops_on_fresh_frame_kind`).
 fn fresh_frame_goto_fold(
     code: &[u8],
+    ops: &[DecodedOp],
+    at: &[Option<usize>],
     op: &DecodedOp,
     pred: Option<&DecodedOp>,
     descr_refs: &[DescrRef],
     debugdata: FreshFrameDebugdata,
+    from_debugdata_label: Option<(usize, u8)>,
 ) -> FreshFrameGotoFold {
     if is_fresh_frame_debugdata_null_goto(code, op, pred, descr_refs) {
         return match debugdata {
@@ -820,7 +979,51 @@ fn fresh_frame_goto_fold(
     if is_load_fast_unbound_check_goto(code, pred, op) {
         return FreshFrameGotoFold::Fallthrough;
     }
+    if let Some((dd_goto_pc, tested_reg)) = from_debugdata_label
+        && is_w_f_trace_null_goto_from_folded_debugdata(
+            code, ops, at, op, dd_goto_pc, tested_reg, descr_refs,
+        )
+    {
+        return FreshFrameGotoFold::Fallthrough;
+    }
     FreshFrameGotoFold::None
+}
+
+/// Hint carried to `succ` from the op just processed. The Label
+/// successor of a NonNull-folded `debugdata` goto receives that goto's
+/// pc and tested register; live markers and a matching `w_f_trace`
+/// getfield keep the incoming hint; a fold consumes it.
+fn fresh_frame_succ_debugdata_hint(
+    code: &[u8],
+    d: &DecodedOp,
+    folded: FreshFrameGotoFold,
+    debugdata: FreshFrameDebugdata,
+    pred: Option<&DecodedOp>,
+    descr_refs: &[DescrRef],
+    incoming: Option<(usize, u8)>,
+    succ: usize,
+) -> Option<(usize, u8)> {
+    if folded == FreshFrameGotoFold::Label
+        && debugdata == FreshFrameDebugdata::NonNull
+        && is_fresh_frame_debugdata_null_goto(code, d, pred, descr_refs)
+    {
+        let off = label_operand_offset(d.argcodes)?;
+        if succ == read_label(code, d, off) {
+            return code.get(d.pc + 1).copied().map(|reg| (d.pc, reg));
+        }
+        return None;
+    }
+    if folded != FreshFrameGotoFold::None {
+        return None;
+    }
+    let hint = incoming?;
+    if is_live_marker(d.opname) {
+        return Some(hint);
+    }
+    if is_getfield_gc_r_w_f_trace(code, d, hint.1, descr_refs) {
+        return Some(hint);
+    }
+    None
 }
 
 fn switch_targets_for_body(descr_refs: &[DescrRef], descr_index: usize) -> Option<Vec<usize>> {
@@ -1215,6 +1418,103 @@ mod seeded_frame_op_tests {
             .expect("body must decode");
         let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
         assert_eq!(names, ["getfield_vable_r", "live", "raise"]);
+    }
+
+    fn debugdata_and_w_f_trace_null_goto_body(getfield_base: u8) -> (Vec<u8>, Vec<DescrRef>) {
+        let getfield_vable = insn("getfield_vable_r/rd>r");
+        let getfield_gc = insn("getfield_gc_r/rd>r");
+        let live = insn("live/");
+        let goto_z = insn("goto_if_not_ptr_iszero/rL");
+        let int_ret = insn("int_return/i");
+        let raise = insn("raise/r");
+        // pc 0: getfield_vable_r r0, descr0 -> r1
+        // pc 5: live/
+        // pc 8: goto_if_not_ptr_iszero r1, 15
+        // pc 13: raise r0  (debugdata-null arm)
+        // pc 15: getfield_gc_r rBASE, descr1 -> r2
+        // pc 20: live/
+        // pc 23: goto_if_not_ptr_iszero r2, 30
+        // pc 28: int_return i0
+        // pc 30: raise r0  (w_f_trace hook arm)
+        let code = vec![
+            getfield_vable,
+            0,
+            0,
+            0,
+            1,
+            live,
+            0,
+            0,
+            goto_z,
+            1,
+            15,
+            0,
+            0,
+            raise,
+            0,
+            getfield_gc,
+            getfield_base,
+            1,
+            0,
+            2,
+            live,
+            0,
+            0,
+            goto_z,
+            2,
+            30,
+            0,
+            0,
+            int_ret,
+            0,
+            raise,
+            0,
+        ];
+        let descrs = vec![
+            crate::frame_layout::pyframe_static_field_descr(
+                crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX as u16,
+            ),
+            crate::descr::frame_debug_data_w_f_trace_descr(),
+        ];
+        (code, descrs)
+    }
+
+    #[test]
+    fn fresh_frame_ops_non_null_debugdata_drops_the_w_f_trace_hook_arm() {
+        let (code, descrs) = debugdata_and_w_f_trace_null_goto_body(1);
+        let ops = decoded_ops_on_fresh_frame_kind(&code, &descrs, FreshFrameDebugdata::NonNull)
+            .expect("body must decode");
+        let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
+        assert_eq!(
+            names,
+            [
+                "getfield_vable_r",
+                "live",
+                "getfield_gc_r",
+                "live",
+                "int_return"
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_frame_ops_do_not_fold_w_f_trace_when_getfield_base_differs() {
+        let (code, descrs) = debugdata_and_w_f_trace_null_goto_body(0);
+        let ops = decoded_ops_on_fresh_frame_kind(&code, &descrs, FreshFrameDebugdata::NonNull)
+            .expect("body must decode");
+        let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
+        assert_eq!(
+            names,
+            [
+                "getfield_vable_r",
+                "live",
+                "getfield_gc_r",
+                "live",
+                "goto_if_not_ptr_iszero",
+                "int_return",
+                "raise"
+            ]
+        );
     }
 
     #[test]

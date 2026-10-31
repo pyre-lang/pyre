@@ -7117,6 +7117,15 @@ pub extern "C" fn bh_load_global_fn(
     // frame the JIT built lives in the nursery, so hold it on the shadow stack
     // and re-read at each use instead of carrying the operand across.
     let frame_anchor = unsafe { pyre_interpreter::eval::FrameAnchor::from_raw(frame_ptr) };
+    // `pyopcode.py getname_w` / `_load_global` keep the name's identity;
+    // `rstr.py LLHelpers.ll_strhash` reuses its cached hash. Match the
+    // interpreter's `load_global_value` by passing the code/name slot to
+    // `finditem_str_named`, including on the builtins leg after a miss.
+    // A globals probe can run Python and collect, so root the code wrapper
+    // and reload it before each lookup.
+    let code_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = code_roots.base();
+    let _ = code_roots.pin_root(w_code_ptr);
     let parent_frame_ptr = frame_anchor.live();
     // pyopcode.py `_load_global`:
     //   w_value = self.space.finditem_str(self.get_w_globals_storage(), varname)
@@ -7129,10 +7138,15 @@ pub extern "C" fn bh_load_global_fn(
     let w_globals = if !parent_frame_ptr.is_null() {
         unsafe { (*parent_frame_ptr).get_w_globals() }
     } else {
-        unsafe { pyre_interpreter::w_code_get_w_globals(w_code_ptr as pyre_object::PyObjectRef) }
+        unsafe { pyre_interpreter::w_code_get_w_globals(code_roots.get(code_slot)) }
     };
     if !w_globals.is_null() {
-        match pyre_interpreter::baseobjspace::finditem_str(w_globals, varname) {
+        match pyre_interpreter::baseobjspace::finditem_str_named(
+            w_globals,
+            varname,
+            code_roots.get(code_slot),
+            idx,
+        ) {
             Ok(Some(w_value)) => return w_value,
             Ok(None) => {}
             Err(mut err) => {
@@ -7152,7 +7166,12 @@ pub extern "C" fn bh_load_global_fn(
         if !w_builtin.is_null() && unsafe { pyre_object::is_module(w_builtin) } {
             let w_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
             if !w_dict.is_null() {
-                match pyre_interpreter::baseobjspace::finditem_str(w_dict, varname) {
+                match pyre_interpreter::baseobjspace::finditem_str_named(
+                    w_dict,
+                    varname,
+                    code_roots.get(code_slot),
+                    idx,
+                ) {
                     Ok(Some(w_value)) => return w_value,
                     Ok(None) => {}
                     Err(mut err) => {
@@ -7173,6 +7192,62 @@ pub extern "C" fn bh_load_global_fn(
     let exc_obj = err.to_exc_object();
     publish_residual_call_exception(exc_obj);
     PY_NULL
+}
+
+#[cfg(test)]
+mod tests_bh_load_global {
+    use super::*;
+    #[test]
+    fn bh_load_global_reuses_name_hash_and_observes_rebinding() {
+        // pyopcode.py getname_w / rstr.py LLHelpers.ll_strhash: changing a
+        // value requires a new dict probe, but never a new hash of its name.
+        pyre_interpreter::typedef::init_typeobjects();
+        let expected_hash = pyre_interpreter::builtins::hash_str_bytes(b"issue2506_global");
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.base();
+        let code = pyre_interpreter::compile_exec("issue2506_global").unwrap();
+        let _ = roots.pin_root(pyre_interpreter::box_code_object(code));
+        let _ = roots.pin_root(pyre_object::w_dict_new());
+        unsafe {
+            pyre_interpreter::w_code_set_w_globals(roots.get(base), roots.get(base + 1));
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                roots.get(base + 1),
+                "issue2506_global",
+                pyre_object::w_none(),
+            );
+            let name = pyre_interpreter::pycode::w_code_getname_w(roots.get(base), 0);
+            assert!(!name.is_null());
+            let _ = roots.pin_root(name);
+            pyre_object::unicodeobject::w_str_set_hash(roots.get(base + 2), 0);
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                bh_load_global_fn(PY_NULL, roots.get(base), std::ptr::null_mut(), 0),
+                pyre_object::w_none()
+            );
+        }
+        assert_eq!(
+            unsafe { pyre_object::unicodeobject::w_str_get_hash(roots.get(base + 2)) },
+            expected_hash,
+            "the residual must memoize the code object's name, not a temporary key"
+        );
+
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                roots.get(base + 1),
+                "issue2506_global",
+                pyre_object::w_bool_from(true),
+            );
+        }
+        assert_eq!(
+            bh_load_global_fn(PY_NULL, roots.get(base), std::ptr::null_mut(), 0),
+            pyre_object::w_bool_from(true)
+        );
+        assert_eq!(
+            unsafe { pyre_object::unicodeobject::w_str_get_hash(roots.get(base + 2)) },
+            expected_hash
+        );
+    }
 }
 
 /// LOAD_FROM_DICT_OR_GLOBALS residual (`load_from_dict_or_globals` HLOp →
