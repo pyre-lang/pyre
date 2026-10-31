@@ -506,10 +506,10 @@ fn recursive_call_assembler_does_not_refill_zeroed_nursery_frames() {
     // bridge, and `BRIDGE_OK` counts the bridges the backend accepted — the
     // same event `bridges_compiled` counts, since both are bumped only on the
     // `Ok` side of `compile_bridge`. So both follow from the committed
-    // `pyre/bench/fib_recursive.jitstats`: `loops_compiled=1` +
-    // `bridges_compiled=7`. Re-record these two alongside that baseline.
-    assert_eq!(stat_value(&stderr, "compiles"), 8);
-    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 7);
+    // `pyre/bench/fib_recursive.jitstats`: `loops_compiled=3` +
+    // `bridges_compiled=15`. Re-record these two alongside that baseline.
+    assert_eq!(stat_value(&stderr, "compiles"), 18);
+    assert_eq!(stat_value(&stderr, "BRIDGE_OK"), 15);
     assert_no_call_assembler_frame_fill(&stderr);
 }
 
