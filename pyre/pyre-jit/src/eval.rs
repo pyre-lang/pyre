@@ -5499,27 +5499,36 @@ fn walk_jit_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// blackhole helper parks the exception's raw pointer there until the
 /// dispatcher drains it (`bhimpl_abort_permanent` / handler dispatch); in that
 /// window the exception is reachable only through the raw TLS `i64`. Same
-/// carrier/children split as [`walk_jit_exc_value`].
+/// carrier/children split as [`walk_jit_exc_value`]. The visitor may forward
+/// the exception, so the forwarded address is stored back into the cell
+/// (`rthread.py _trace_tlref` visits the slot itself).
 fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-    if exc == 0 {
-        return;
-    }
-    let mut gcref = majit_ir::GcRef(exc as usize);
-    visitor(&mut gcref);
-    unsafe {
-        pyre_interpreter::eval::walk_raw_exception_roots(
-            gcref.0 as pyre_object::PyObjectRef,
-            visitor,
-        )
-    };
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let exc = c.get();
+        if exc == 0 {
+            return;
+        }
+        let mut gcref = majit_ir::GcRef(exc as usize);
+        visitor(&mut gcref);
+        if gcref.0 as i64 != exc {
+            c.set(gcref.0 as i64);
+        }
+        unsafe {
+            pyre_interpreter::eval::walk_raw_exception_roots(
+                gcref.0 as pyre_object::PyObjectRef,
+                visitor,
+            )
+        };
+    });
 }
 
 /// Root the exception grabbed off a failing guard's deadframe
 /// (`GUARD_EXC_VALUE`): the grab drops `jf_guard_exc`, the collector's only
 /// handle on it, and the bridge / blackhole handoff reconstructs resume state
 /// through the blackhole allocator before re-rooting the value. Same
-/// carrier/children split as [`walk_jit_exc_value`].
+/// carrier/children split as [`walk_jit_exc_value`]. The visitor may forward
+/// the exception, so the forwarded address is stored back into the cell
+/// (`rthread.py _trace_tlref` visits the slot itself).
 ///
 /// This slot reaches only the *collecting* thread's cell; every other mutator's
 /// cell is reached through the per-mutator `PyFrameRootArea`, which carries the
@@ -5527,18 +5536,23 @@ fn walk_bh_last_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// _trace_tlref` enumerates every thread's block rather than resolving the
 /// thread local on whichever thread started the collection.
 fn walk_guard_exc_value(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    let exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
-    if exc == 0 {
-        return;
-    }
-    let mut gcref = majit_ir::GcRef(exc as usize);
-    visitor(&mut gcref);
-    unsafe {
-        pyre_interpreter::eval::walk_raw_exception_roots(
-            gcref.0 as pyre_object::PyObjectRef,
-            visitor,
-        )
-    };
+    majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| {
+        let exc = c.get();
+        if exc == 0 {
+            return;
+        }
+        let mut gcref = majit_ir::GcRef(exc as usize);
+        visitor(&mut gcref);
+        if gcref.0 as i64 != exc {
+            c.set(gcref.0 as i64);
+        }
+        unsafe {
+            pyre_interpreter::eval::walk_raw_exception_roots(
+                gcref.0 as pyre_object::PyObjectRef,
+                visitor,
+            )
+        };
+    });
 }
 
 /// Forward the GC-managed children of the immortal exception singletons.
@@ -11614,22 +11628,20 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     // jumping to the inner `body_pc` corrupts the operand stack (a later
     // FOR_ITER/GET_ITER then reads a wrong slot as an iterator).  Deliver only
     // when the frame is PROVABLY at the header for `body_pc`: it is parked at
-    // the instruction whose FOR_ITER unit is `body_pc - 1` — past any
-    // `EXTENDED_ARG` prefix, since the frame parks at the prefix
-    // (`foriter_unit_at`).
+    // the instruction whose FOR_ITER unit — past any `EXTENDED_ARG` prefix,
+    // since the frame parks at the prefix (`foriter_unit_at`) — has
+    // `semantic_fallthrough_pc` `body_pc`.
+
     // The walk parks the live frame at the loop header it entered, so a
     // header-entry consume satisfies this and still DELIVERS; a non-header
     // inner consume fails it and is REFUSED — the stash is dropped (already
     // taken above) and the legacy bypass keeps the conservative drop-on-abort,
     // never a stack-corrupting push.  This is the `fbw_foriter_inflight_take`
     // refuse-when-not-provably-safe model applied to the stack-state axis.
-    // `body_pc` is the FOR_ITER `orgpc + 1`, so it is always >= 1; the header
-    // pc is one before it.  A `body_pc == 0` (impossible) wraps to `usize::MAX`
-    // and fails the FOR_ITER unit match, so the guard stays safe without a
-    // separate zero check.
     let at_loop_header =
-        pyre_jit_trace::jitcode_dispatch::foriter_unit_at(frame_addr, frame.next_instr())
-            == Some(body_pc.wrapping_sub(1));
+        pyre_jit_trace::jitcode_dispatch::foriter_body_pc_at(frame_addr, frame.next_instr())
+            == Some(body_pc);
+
     if !at_loop_header {
         pyre_jit_trace::jitcode_dispatch::fbw_foriter_report_refused_header();
         if pyre_jit_trace::jitcode_dispatch::fbw_debug_abort_enabled() {
@@ -11648,9 +11660,7 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     // with the iterator on TOS, so a single push lands `item` exactly where
     // the body's STORE_FAST expects TOS.
     frame.push(item);
-    // Resume at the FOR_ITER fallthrough body opcode.  `next_instr` /
-    // `last_instr` are Python bytecode coordinates, matching `body_pc`
-    // (the FOR_ITER `orgpc + 1`).
+    // Resume at the FOR_ITER fallthrough body opcode (`semantic_fallthrough_pc`).
     frame.set_last_instr_from_next_instr(body_pc);
     pyre_jit_trace::jitcode_dispatch::fbw_foriter_report_delivered();
     true
@@ -15112,23 +15122,20 @@ pub(crate) fn decode_and_restore_guard_failure(
     }
 
     if restored {
-        // `next_instr()` is derived from the vable `last_instr` field.  The
-        // full-body walk sets the concrete frame's `last_instr` once at the
-        // loop header and does not advance it per opcode, so for a mid-body
-        // guard that field — and hence `next_instr()` — carries the loop
-        // header pc instead of the guard's resume opcode.  The per-frame
-        // section pc (`ResumedFrame.py_pc`, the same coordinate
-        // `resume_in_blackhole` resumes at) is the correct resume point.
-        // Prefer it when the two disagree; for the retired MIFrame tracer they always
-        // match (the frame's `last_instr` tracks the Python pc), so this is
-        // a no-op there. With flipped pc words, a single-frame resume uses
-        // the restored vable position and a multi-frame resume uses the
-        // innermost decoded section position.
+        // The bridge resumes at the innermost section pc read from the
+        // guard's resume storage (`ResumedFrame.py_pc`, the coordinate
+        // `resume_in_blackhole` resumes at), for a single frame as well as
+        // for inlined callees. The vable `last_instr` is not that position:
+        // it is interpreter-visible state, and after a
+        // residual call the snapshot capture can publish the next instruction
+        // while the numbered jitcode pc is still inside the current one. A
+        // guard that shares that storage (`optimizer.py
+        // _copy_resume_data_from`) must restart at the storage's pc
+        // (`pyjitpl.py handle_guard_failure` -> `resume.py
+        // rebuild_from_resumedata` -> `MIFrame.setup_resume_at_op`).
         let ni = jit_state.next_instr();
         let innermost = resumed_frames.last();
-        let resume_pc = if resumed_frames.len() == 1 {
-            ni
-        } else if innermost.is_some_and(|f| f.py_pc == usize::MAX) {
+        let resume_pc = if innermost.is_some_and(|f| f.py_pc == usize::MAX) {
             // Helper innermost: the live frame's vable next-instr, not
             // a fake Python pc. Continuations keep their twin / trivia pc.
             ni
@@ -17555,9 +17562,9 @@ mod tests {
 
     /// Find the first JitCode `-live-` offset where every requested local
     /// slot and operand-stack depth carries a color AND the compiled live set
-    /// contains all of those colors. Returns that JitCode offset, its full
-    /// live set, and the mapped colors (locals first, then stack depths in
-    /// order).
+    /// contains all of those colors AND the Int and Float liveness banks are
+    /// both empty. Returns that JitCode offset, its full live set, and the
+    /// mapped colors (locals first, then stack depths in order).
     fn live_pc_with_slot_colors(
         jitcode_index: i32,
         code: &pyre_interpreter::CodeObject,
@@ -17587,10 +17594,14 @@ mod tests {
                             .map(|&(_, c, _)| u32::from(c))
                     }))
                     .collect::<Option<Vec<u32>>>()?;
-                let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
+                let live_by_bank = pyre_jit_trace::state::frame_liveness_reg_indices_by_bank_at(
                     jitcode_index,
                     jit_pc as i32,
                 );
+                if !live_by_bank.int.is_empty() || !live_by_bank.float.is_empty() {
+                    return None;
+                }
+                let live = live_by_bank.flattened();
                 colors
                     .iter()
                     .all(|c| live.contains(c))
@@ -17599,41 +17610,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "no JitCode -live- offset carries colors for local slots \
-                     {local_slots:?} + stack depths {stack_depths:?}"
-                )
-            })
-    }
-
-    #[allow(dead_code)]
-    fn live_pc_containing_all(
-        jitcode_index: i32,
-        _code: &pyre_interpreter::CodeObject,
-        regs: &[u32],
-    ) -> (usize, Vec<u32>) {
-        let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)
-            .expect("compiled trace-side jitcode must be registered");
-        let op_live = pyre_jit_trace::state::op_live();
-        let live_by_jit_pc: Vec<(usize, Vec<u32>)> = (0..payload.jitcode.body().code.len())
-            .filter(|&jit_pc| payload.jitcode.can_decode_live_vars(jit_pc, op_live))
-            .map(|jit_pc| {
-                let live = pyre_jit_trace::state::frame_liveness_reg_indices_at(
-                    jitcode_index,
-                    jit_pc as i32,
-                );
-                (jit_pc, live)
-            })
-            .collect();
-        live_by_jit_pc
-            .iter()
-            .find_map(|(jit_pc, live)| {
-                regs.iter()
-                    .all(|reg| live.contains(reg))
-                    .then_some((*jit_pc, live.clone()))
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "compiled JitCode liveness should expose regs {regs:?}; got {:?}",
-                    live_by_jit_pc
+                     {local_slots:?} + stack depths {stack_depths:?} with empty Int/Float banks"
                 )
             })
     }

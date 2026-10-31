@@ -3455,8 +3455,10 @@ pub(crate) fn collect_callee_active_boxes(
 /// sits under a `FOR_ITER` iterator costs the caller a compiled loop and a
 /// bridge — measured on
 /// `recursive_call_frame_relocation` (`for k in range(n): r += cat(n - 1)`) as
-/// `loops_compiled 3 -> 2`, `bridges_compiled 3 -> 2` and 0.18s -> 0.22s.  The
-/// residual path keeps that loop, so leave the iterator-bearing shape to it.
+/// `loops_compiled 3 -> 2`.  The residual path keeps that loop, so leave the
+/// iterator-bearing shape to it.  `do_recursive_call(..., assembler_call=True)`
+/// (`pyjitpl.py`) is the inlined callee's own header, keyed at `next_instr`,
+/// not this CALL-site fold's `pc = 0` token.
 fn loop_carried_slot_keeps_fold_profitable<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     slot: OpRef,
@@ -3726,11 +3728,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // the iterator disqualifies the fold — see
     // `loop_carried_slot_keeps_fold_profitable`.  Declining every loop-carried
     // operand instead kept a recursion called from a `while` body on the
-    // residual path permanently: `r(8)` a million times over measured 1.23s
-    // against 0.07s for the same run with the numeric shape admitted, because
-    // every recursive call re-entered through the func-entry residency door.
-    // The loopless `fib` shape keeps only within-iteration temps (a prior call
-    // result), no InputArg, and was foldable either way.
+    // residual path permanently.
     //
     // The screen is about a recursion re-entering through the loop it sits
     // in.  A foreign, non-recursive callee called from a `for` body is the
@@ -4306,6 +4304,44 @@ fn portal_runner_call_target() -> Option<(i64, majit_ir::DescrRef)> {
 pub(crate) struct WalkerLoopCalleePortalRecord {
     pub result: OpRef,
     pub raised: Option<(OpRef, ConcreteValue)>,
+}
+
+/// Map a seeded loop-bearing inline abort to `CALL_ASSEMBLER` when the abort
+/// sits at the callee's own loop header and a procedure token exists.
+///
+/// `pyjitpl.py do_recursive_call` / `_opimpl_recursive_call` with
+/// `assembler_call=True`: an inlined callee that reaches its header finishes
+/// the frame and enters the compiled loop rather than aborting the enclosing
+/// trace. The live `jit_merge_point` recovery already surfaces
+/// [`DispatchOutcome::SubLoopCalleeCallAssembler`]; a nested drive that
+/// raises [`DispatchError::LoopBearingCalleeInlineUnsupported`] at that
+/// header takes the same token lookup (`get_or_make_portal_assembler_token_arc`
+/// keyed at the header `next_instr`).
+fn loop_bearing_header_call_assembler(
+    abort_jit_pc: usize,
+    w_code: *const (),
+    is_being_profiled: bool,
+) -> Option<DispatchOutcome> {
+    let pjc = crate::state::pyjitcode_for_code(w_code)?;
+    let py_pc =
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, abort_jit_pc) as usize;
+    if !pyre_interpreter::code_pc_is_loop_header(w_code as pyre_object::PyObjectRef, py_pc) {
+        return None;
+    }
+    let callee_key = crate::driver::make_green_key_typed(w_code, py_pc, is_being_profiled);
+    let (driver, _) = crate::driver::driver_pair();
+    let greenboxes = [
+        Value::Int(py_pc as i64),
+        Value::Int(is_being_profiled as i64),
+        Value::Ref(majit_ir::GcRef(w_code as usize)),
+    ];
+    let red_types = [Type::Ref, Type::Ref];
+    let token =
+        driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types)?;
+    Some(DispatchOutcome::SubLoopCalleeCallAssembler {
+        token: Some(token),
+        target_pc: py_pc,
+    })
 }
 
 /// Inline-route wrapper around [`record_walker_loop_callee_portal_call`].
@@ -11198,7 +11234,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     (
                         jc_index,
-                        super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc),
+                        // Post-call `-live-`, matching
+                        // `compute_inline_caller_frame`.
+                        inline_call_return_marker(&jc.payload, op.pc),
                         py_pc as u32,
                     )
                 };
@@ -11206,6 +11244,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     Some(m) => m as i32,
                     None => majit_ir::resumedata::NO_JITCODE_PC,
                 };
+                let result_register = super::residual_call::parent_call_result_color(
+                    unsafe { &(*sym.jitcode()).payload },
+                    op.pc,
+                );
+                let banks = [ctx.registers_i, ctx.registers_r, ctx.registers_f];
+                let saved = clear_in_a_call_result(ctx.trace_ctx, banks, result_register);
                 let boxes = collect_outer_active_boxes(
                     sym,
                     ctx.trace_ctx,
@@ -11222,6 +11266,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     "call_site_capture",
                     None,
                 );
+                restore_in_a_call_result(banks, saved);
                 (
                     boxes,
                     EntryPyPc::Jit(op.pc),
@@ -11633,6 +11678,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         };
         // `blackhole_if_trace_too_long` raises out of `_interpret`. `popframe`
         // and `ExecutionContext.leave` are after that point and must not run.
+        let result = match result {
+            Err(DispatchError::LoopBearingCalleeInlineUnsupported {
+                pc,
+                blackhole_required,
+            }) if callee_frame_seeded && constructor_result.is_none() => {
+                match loop_bearing_header_call_assembler(
+                    pc,
+                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
+                    is_being_profiled,
+                ) {
+                    Some(outcome) => Ok((outcome, op.next_pc)),
+                    None => Err(DispatchError::LoopBearingCalleeInlineUnsupported {
+                        pc,
+                        blackhole_required,
+                    }),
+                }
+            }
+            other => other,
+        };
         if let Err(error @ DispatchError::TraceTooLong { .. }) = result {
             if entered_ec.is_some() {
                 let frame_ptr = sub_wc
@@ -16676,13 +16740,13 @@ pub(crate) struct GeneratorResumeCensus {
     resume_py_pc: usize,
     /// The JitCode byte offset that coordinate resolves to, once it does.
     marker_offset: Option<usize>,
-    /// Whether the code object owns a Python-level loop header, read as a
-    /// `merge_entry_by_green` entry other than function entry.  This is the
-    /// one gate a resume cannot simply refuse: a `while` generator's own loop
-    /// header sits between the resume and the yield, and upstream crosses it
-    /// exactly once because `should_unroll_one_iteration` answers True for a
-    /// generator code object.  Counting the bodies that have one prices that
-    /// hook against the ones a straight-line resume would already serve.
+    /// Whether the code object owns a Python-level loop header, from
+    /// `find_loop_header_pcs`.  This is the one gate a resume cannot simply
+    /// refuse: a `while` generator's own loop header sits between the resume
+    /// and the yield, and upstream crosses it exactly once because
+    /// `should_unroll_one_iteration` answers True for a generator code object.
+    /// Counting the bodies that have one prices that hook against the ones a
+    /// straight-line resume would already serve.
     ///
     /// NOT [`callee_body_owns_loop_header`], which asks the jitcode for a
     /// `loop_header` op. Per-fn jitcodes emit that op for every body
@@ -16767,11 +16831,8 @@ fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResu
     let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
         decline!(V::NoJitcode)
     };
-    census.owns_loop_header = pjc
-        .metadata
-        .merge_entry_by_green
-        .iter()
-        .any(|&(py, _)| py != 0);
+    census.owns_loop_header = !pjc.code_ptr.is_null()
+        && !pyre_interpreter::find_loop_header_pcs(unsafe { &*pjc.code_ptr }).is_empty();
     census.n_py_instrs = pjc.metadata.n_py_instrs as usize;
     census.tables = (
         pjc.metadata.py_exact_by_jit_pc.len(),

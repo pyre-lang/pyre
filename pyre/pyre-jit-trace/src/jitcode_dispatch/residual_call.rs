@@ -6060,9 +6060,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // `vstack_cur_pypc` is the pc the walk is ABOUT TO ENTER
     // (`reconcile_vstack_at_boundary` sets it to `new_pypc` after reconciling
     // the PREVIOUS opcode), so at this residual it names the opcode being
-    // walked.  The loop-var store is recognised by the FOR_ITER body's own
-    // relation `body_pc + 1 == vstack_cur_pypc`, i.e. the walk has advanced one
-    // opcode past the recorded body pc — not by a next-instr convention.
+    // walked.  `inflight_foriter_body_pc` is `semantic_fallthrough_pc` of the
+    // owning `FOR_ITER` (`handle_jit_marker__jit_merge_point` only at
+    // instruction starts), so the loop-var store is the opcode at `body_pc`.
     let is_loop_var_binding_store = is_loop_var_binding_store(ctx, helper);
     // PUSH_EXC_INFO's carrier clear is void-returning, so `writes_live_heap`
     // alone counts it.  The slot it writes exists only to keep a propagating
@@ -7579,6 +7579,17 @@ fn live_py_pc_from_snapshot<Sym: WalkSym>(
         return None;
     }
     let jc = unsafe { &*sym.jitcode() };
+    // `pyopcode.py dispatch_bytecode` sets `self.last_instr` to the opcode
+    // whose jitted arm runs `ec.bytecode_only_trace(self)`.  That arm can be
+    // laid out past the last opcode start, where the floor mapping names a
+    // later instruction; the exact table names the owning opcode
+    // (`vstack_step_py_pc` prefers it for the same reason).
+    if let Some(exact) = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+        &jc.payload.metadata.py_exact_by_jit_pc,
+        jit_pc,
+    ) {
+        return Some(exact);
+    }
     Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
         &jc.payload.metadata,
         jit_pc,
@@ -8236,7 +8247,7 @@ fn is_loop_var_binding_store<Sym: WalkSym>(
         helper,
         majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
     ) && fbw_foriter_inflight_top_body_pc()
-        .is_some_and(|body_pc| body_pc + 1 == ctx.vstack_cur_pypc as usize)
+        .is_some_and(|body_pc| body_pc == ctx.vstack_cur_pypc as usize)
 }
 
 /// Journal the namespace binding a `STORE_NAME` / `STORE_GLOBAL` /

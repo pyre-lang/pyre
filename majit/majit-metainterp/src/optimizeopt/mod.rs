@@ -314,6 +314,24 @@ impl Drop for LiveOpPublication {
 
 fn walk_live_op(op: &Op, visitor: &mut dyn FnMut(&mut GcRef)) {
     op.walk_const_ptr_refs_mut(visitor);
+    // compile.py ResumeGuardDescr._attrs_ traces the resume storage through
+    // the guard, independently of ResumeDataLoopMemo. The phase-1 optimizer
+    // can die before phase 2 or backend compilation collects; its emitted
+    // guards still own the shared pool (resume.py ResumeDataVirtualAdder.finish).
+    // Follow that owner here, including ResumeGuardCopiedDescr.prev, rather
+    // than relying on the weak in-flight memo or the not-yet-published loop.
+    op.with_fail_descr(|fd| {
+        fd.visit_rd_numb(visitor);
+        if let Some(pool) = fd.rd_consts_pool() {
+            // SAFETY: this is the stop-the-world compile root walk. Update
+            // the shared holder so every guard reading the pool sees moves.
+            for constant in unsafe { pool.as_mut_vec_for_gc() } {
+                if let majit_ir::Const::Ref(gcref) = constant {
+                    visitor(gcref);
+                }
+            }
+        }
+    });
     // A folded const can sit on `_forwarded` before emit copies it into an arg.
     // `ForwardedSlot::borrow` copies the packed word; `walk_const_ptr_refs`
     // still traces the `SmallWide` index.
@@ -351,6 +369,33 @@ mod walk_live_op_quasiimmut_tests {
         fn instance_identity(&self) -> usize {
             1
         }
+    }
+
+    #[test]
+    fn published_guard_keeps_resume_consts_live_without_optimizer() {
+        let descr = crate::compile::make_resume_guard_descr_typed(Vec::new());
+        descr
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_consts(Some(vec![majit_ir::Const::Ref(GcRef(0x4100))]));
+        let ops = vec![OpRc::new(Op::with_descr(
+            OpCode::GuardTrue,
+            &[],
+            descr.clone(),
+        ))];
+        // The phase-1 optimizer and its memo are gone; only the emitted
+        // guard owns the pool while phase 2 or the backend can collect.
+        let mut roots = CompileLiveOpRoots::default();
+        let _published = roots.publish_vec(&ops);
+        roots.walk(&mut |slot| {
+            if slot.0 == 0x4100 {
+                slot.0 = 0x5100;
+            }
+        });
+        assert_eq!(
+            descr.as_fail_descr().unwrap().rd_consts().unwrap()[0].getref_base(),
+            GcRef(0x5100),
+        );
     }
 
     #[test]

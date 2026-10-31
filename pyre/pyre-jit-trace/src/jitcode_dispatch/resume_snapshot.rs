@@ -262,14 +262,10 @@ pub(crate) fn segmented_python_opcode_resume_pc<Sym: WalkSym>(
 /// Capture the `GUARD_ALWAYS_FAILS` used by a synthesized per-Python-opcode
 /// debug merge point.
 ///
-/// Upstream records that guard in the interpreter dispatch JitCode, after its
-/// real `jit_merge_point`; `after_residual_call=True` advances past that marker
-/// and lands on the Python opcode the dispatch loop is about to execute.
-/// Pyre's per-CodeObject JitCode has no such marker. Its synthesized DMP is
-/// already sitting at the first operation of that Python opcode, so applying
-/// the generic `GUARD_ALWAYS_FAILS` advance would skip the opcode entirely.
-/// A loop-header floor still contains the portal `jit_merge_point`; resume at
-/// that marker's op2 `-live-` so the blackhole does not re-enter the preamble.
+/// Recorded only for a floor that has no portal `jit_merge_point`
+/// (`record_python_debug_merge_point`). The synthesized DMP sits at the
+/// first operation of that Python opcode, so applying the generic
+/// `GUARD_ALWAYS_FAILS` advance would skip the opcode entirely.
 pub(crate) fn walker_capture_segmented_python_opcode_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -290,10 +286,10 @@ pub(crate) fn walker_capture_segmented_python_opcode_guard<Sym: WalkSym>(
     walker_capture_snapshot_for_last_guard_impl(ctx, op_pc, false, GuardCaptureScope::default())
 }
 
-/// JitCode pc the segmented merge-point guard resumes at: the `-live-`
+/// JitCode pc the segmented merge-point guard resumes at: the op2 `-live-`
 /// immediately after `jit_merge_point` (`jtransform.py
-/// handle_jit_marker__jit_merge_point` op2). Falls back to the first byte
-/// after the merge op when that marker is missing.
+/// handle_jit_marker__jit_merge_point` op2). Falls back to
+/// the first byte after the merge op when that marker is missing.
 pub(crate) fn segmented_merge_point_resume_pc<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     merge_pc: usize,
@@ -713,7 +709,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             .unwrap_or(0) as usize,
                     };
                     let code = unsafe { &*code_ptr };
-                    reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true);
+                    reconcile_vstack_at_boundary(ctx, code, py_pc, resume_depth, true, op_pc);
                 }
             }
             // Publish `last_instr = py_pc - 1` to the vable static shadow
@@ -878,7 +874,26 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         } else {
                             OpRef::NONE
                         };
-                        vstack_box_for_snapshot(v).map(|v| (nvs + nlocals + s, v))
+                        let v = vstack_box_for_snapshot(v)?;
+                        let idx = nvs + nlocals + s;
+                        // The operand stack is `virtualizable_boxes`
+                        // (`pyjitpl.py get_list_of_active_boxes` reads only
+                        // live colors; `reached_loop_header` takes the vable
+                        // boxes). A NULL constant in the mirror can be a dead
+                        // color a later op reused (`vstack_last_ref`), so it
+                        // does not replace a real vable box unless that slot
+                        // holds a stored NULL (`PUSH_NULL`).
+                        if opref_is_null_const_ptr(v) {
+                            if let Some(old) = ctx.trace_ctx.virtualizable_box_at(idx) {
+                                if old != OpRef::NONE
+                                    && !opref_is_null_const_ptr(old)
+                                    && !ctx.trace_ctx.virtualizable_slot_stored_live_null(idx)
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                        Some((idx, v))
                     })
                     .collect()
             } else {
@@ -1126,25 +1141,19 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     "guard_snapshot_after_residual",
                 )
             } else {
-                let entry = unsafe {
-                    crate::py_coord::first_floor_boundary_for_py(
-                        &walked_owned.payload.metadata,
-                        liveness_py_pc,
-                    )
-                    .map(|(pc, _)| pc)
-                };
-                match entry {
-                    Some(pc) => (
-                        pc as i32,
-                        OuterActiveBoxesEntryTwin::Plain,
-                        "guard_snapshot_fallthrough",
-                    ),
-                    None => (
-                        resolved_offset as i32,
-                        OuterActiveBoxesEntryTwin::Trivia,
-                        "guard_snapshot_fallthrough",
-                    ),
-                }
+                // `get_list_of_active_boxes` (`pyjitpl.py`) reads the
+                // registers live at the resume `-live-`; `ResumeDataLoopMemo.number`
+                // (`resume.py`) encodes those boxes. The opcode-start floor
+                // (`py_floor_by_jit_pc`) is the leading `-live-` before
+                // `jit_merge_point`; a guard whose
+                // resume is a later op2 (this opcode's post-merge marker,
+                // or the next Python opcode's) would invert that later live
+                // set through the floor's color→slot map.
+                (
+                    resolved_offset as i32,
+                    OuterActiveBoxesEntryTwin::Plain,
+                    "guard_snapshot_resume",
+                )
             };
             let active = collect_outer_active_boxes(
                 sym,
@@ -2385,7 +2394,7 @@ pub(crate) fn inline_call_return_marker(
 /// reads as `CONST_FALSE` / `CONST_NULL` / `CONST_FZERO` in its
 /// `_result_argcode` bank. `banks` is `[int, ref, float]`. Returns the box
 /// the walk keeps there, for [`restore_in_a_call_result`].
-fn clear_in_a_call_result(
+pub(crate) fn clear_in_a_call_result(
     trace_ctx: &mut TraceCtx,
     banks: [&RegisterBank; 3],
     result_register: Option<(char, usize)>,
@@ -2404,7 +2413,10 @@ fn clear_in_a_call_result(
 
 /// Put back the box [`clear_in_a_call_result`] displaced: the walk, unlike
 /// the paused `MIFrame`, keeps reading the caller's registers.
-fn restore_in_a_call_result(banks: [&RegisterBank; 3], saved: Option<(usize, usize, OpRef)>) {
+pub(crate) fn restore_in_a_call_result(
+    banks: [&RegisterBank; 3],
+    saved: Option<(usize, usize, OpRef)>,
+) {
     if let Some((index, color, saved)) = saved {
         banks[index].set(color, saved);
     }

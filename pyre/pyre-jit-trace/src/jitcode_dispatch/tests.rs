@@ -21262,6 +21262,12 @@ fn walk_undecodable_byte_surfaces_typed_error() {
     );
 }
 
+fn test_pycode_ptr() -> *const () {
+    use pyre_interpreter::{compile_exec, w_code_new};
+    let code = compile_exec("None").expect("test code should compile");
+    w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ()
+}
+
 /// `jit_merge_point/cIRFIRF` reached_loop_header behaviour: first
 /// visit of a (green key, red shape) registers the merge point and
 /// continues unrolling; the second visit with the same key + shape
@@ -21289,7 +21295,8 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
     // `current_merge_points = [(original_boxes, start)]`
     // (`pyjitpl.py` `_compile_and_run_once`); the first matching header visit closes.
     // Recorder inputargs are the two reds the header live-args carry.
-    let green_key_typed = crate::driver::make_green_key_typed(0x1_0000 as *const (), 42, false);
+    let pycode_ptr = test_pycode_ptr();
+    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr, 42, false);
     let green_key = green_key_typed.get_uhash();
     let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
     tc.set_green_key_values(green_key_typed.clone());
@@ -21299,7 +21306,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         "seed must match header live-arg length so the first visit closes"
     );
     let next_instr = tc.const_int(42); // gi[0] = Python pc
-    let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
+    let pycode = tc.const_ref(pycode_ptr as i64); // gr[0] = PyCode ptr
     let red0 = tc.const_ref(0x2_0000); // rr[0]
     let red1 = tc.const_ref(0x3_0000); // rr[1]
     let is_being_profiled = tc.const_int(0); // gi[1]
@@ -21507,10 +21514,11 @@ fn jit_merge_point_continue_puts_back_same_as_reds() {
         0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
         0x00, // rf: len=0
     ];
-    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let pycode_ptr = test_pycode_ptr();
+    let green_key = crate::driver::make_green_key(pycode_ptr, 42, false);
     let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
     let next_instr = tc.const_int(42);
-    let pycode = tc.const_ref(0x1_0000);
+    let pycode = tc.const_ref(pycode_ptr as i64);
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
     let is_being_profiled = tc.const_int(0);
@@ -21582,7 +21590,8 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
         0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
         0x00, // rf: len=0
     ];
-    let green_key_typed = crate::driver::make_green_key_typed(0x1_0000 as *const (), 42, false);
+    let pycode_ptr = test_pycode_ptr();
+    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr, 42, false);
     let green_key = green_key_typed.get_uhash();
     let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
     tc.set_green_key_values(green_key_typed.clone());
@@ -21590,7 +21599,7 @@ fn jit_merge_point_consumes_prepared_bridge_exception_resume() {
     let saved = tc.save_exception();
     tc.seed_bridge_exception_resume(saved);
     let next_instr = tc.const_int(42);
-    let pycode = tc.const_ref(0x1_0000);
+    let pycode = tc.const_ref(pycode_ptr as i64);
     let red0 = tc.const_ref(0x2_0000);
     let red1 = tc.const_ref(0x3_0000);
     let is_being_profiled = tc.const_int(0); // gi[1]
@@ -21828,7 +21837,7 @@ fn loop_header_stamp_is_consumed_by_jit_merge_point() {
     assert!(!installed.is_null());
     let code = pyjit.jitcode.code.as_slice();
 
-    let pycode_ptr = 0x1_0000usize;
+    let pycode_ptr = test_pycode_ptr() as usize;
     let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr as *const (), 42, false);
     let green_key = green_key_typed.get_uhash();
     let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
@@ -21945,8 +21954,8 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         0x00, // rr
         0x00, // rf
     ];
-    let pycode_ptr = 0x1_0000usize;
-    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr as *const (), 42, false);
+    let pycode_ptr = test_pycode_ptr();
+    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr, 42, false);
     let green_key = green_key_typed.get_uhash();
     // Header live args are the reds only (none on this form). Seed the
     // same empty shape production `_compile_and_run_once` seeds

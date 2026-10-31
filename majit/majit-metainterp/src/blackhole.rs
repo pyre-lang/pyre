@@ -1193,12 +1193,10 @@ impl BlackholeInterpreter {
         if current_exc != 0 && !self.handle_exception_in_frame(current_exc) {
             // No handler: propagate.  The exception leaves this frame here,
             // so record its node — see [`Self::record_frame_traceback`].
-            // Publish into the walked slot first: the record allocates a
-            // nursery traceback and the minor moves the exception. Re-read
-            // the slot afterwards; `current_exc` is not rewritten.
+            // The record allocates a nursery traceback and the minor moves
+            // the exception; take the forwarded address it returns.
+            let current_exc = self.record_frame_traceback(current_exc);
             self.exception_last_value = current_exc;
-            self.record_frame_traceback(self.exception_last_value);
-            let current_exc = self.exception_last_value;
             if self.nextblackholeinterp.is_none() {
                 return Err(self.exit_frame_with_exception(current_exc));
             }
@@ -1218,13 +1216,10 @@ impl BlackholeInterpreter {
 
         // Check for exception during execution
         if self.got_exception {
-            let exc = self.exception_last_value;
             // `run` reached the end of the frame with an uncaught exception, so
             // the frame is left here — see [`Self::record_frame_traceback`].
-            // The record moves the nursery exception. `exception_last_value`
-            // is the walked root; the local is stale once it returns.
-            self.record_frame_traceback(exc);
-            let exc = self.exception_last_value;
+            let exc = self.record_frame_traceback(self.exception_last_value);
+            self.exception_last_value = exc;
             if self.nextblackholeinterp.is_none() {
                 // blackhole.py:1629
                 return Err(self.exit_frame_with_exception(exc));
@@ -1648,18 +1643,13 @@ impl BlackholeInterpreter {
             return false;
         }
         let target = majit_jitcode::jitcode::read_label_at(code, catch_pos + 1);
-        // Take the exception into this frame's walked slot before anything
-        // below can allocate.  `record` builds a traceback node, and on the
-        // inline-callee path this slot is the exception's ONLY root at that
-        // moment: `handler_inline_call_nested_ext` reads
-        // `callee.exception_last_value` after `callee.run()` returned, which
-        // popped the callee's `push_bh_regs` entry, and a callee-local `raise`
-        // never went through `BH_LAST_EXC_VALUE`.  The exception is a nursery
-        // object (`w_exception_new_empty` → `alloc_exception_nursery`), so
-        // the record moves it; the walked slot is what the collector
-        // rewrites.  A local copied before the record is stale afterwards.
-        self.exception_last_value = exc_value;
-        self.record_frame_traceback(exc_value);
+        // `record` builds a traceback node, which can move the nursery
+        // exception (`w_exception_new_empty` → `alloc_exception_nursery`); on
+        // the inline-callee path the caller's local is its only handle
+        // (`handler_inline_call_nested_ext` reads `callee.exception_last_value`
+        // after `callee.run()` popped the callee's `push_bh_regs` entry). Store
+        // the forwarded address the record returns.
+        self.exception_last_value = self.record_frame_traceback(exc_value);
         self.position = target;
         self.last_exc().set(0);
         // A residual `bh_call` that raised published the exception into BOTH
@@ -1694,15 +1684,22 @@ impl BlackholeInterpreter {
     /// lookup; `RaiseWithExplicitTraceback` skips it for a bare reraise. The
     /// installed hook additionally drops a node the exception's chain head
     /// already carries, so a second call for one delivery is a no-op.
-    fn record_frame_traceback(&self, exc_value: i64) {
+    ///
+    /// Returns `exc_value`'s address after the record. The record allocates,
+    /// so the exception rides in a shadow-stack root across it
+    /// (`framework.py push_roots`) and is read back from there; a field of
+    /// `self` is no substitute, since the collector rewrites it through a raw
+    /// root the optimizer does not see behind `&mut self`.
+    fn record_frame_traceback(&self, exc_value: i64) -> i64 {
         if exc_value == 0 {
-            return;
+            return exc_value;
         }
         if self.jitcode.code.get(self.last_opcode_position) == Some(&jitcode::insns::BC_RERAISE) {
-            return;
+            return exc_value;
         }
         let jitcode_index = self.jitcode.try_index().map_or(-1, |index| index as i32);
         let position = self.last_opcode_position as i32;
+        let root = majit_gc::shadow_stack::push(GcRef(exc_value as usize));
         match self.record_caught_exception {
             Some(record) => record(
                 exc_value,
@@ -1725,6 +1722,9 @@ impl BlackholeInterpreter {
                 position,
             ),
         }
+        let exc_value = majit_gc::shadow_stack::get(root).0 as i64;
+        majit_gc::shadow_stack::pop_to(root);
+        exc_value
     }
 
     /// blackhole.py handle_rvmprof_enter.
@@ -3676,7 +3676,7 @@ pub fn run_forever<P: BlackholeInterpPool>(
 pub fn run_forever_with_portal<P: BlackholeInterpPool>(
     builder: &mut P,
     mut bh: Box<BlackholeInterpreter>,
-    mut current_exc: i64,
+    current_exc: i64,
     portal_runner: Option<
         &dyn Fn(&JitException) -> Result<(BhReturnType, i64), PortalRunnerFailure>,
     >,
@@ -3684,6 +3684,14 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
     on_leave_level: Option<&dyn Fn(i64)>,
     mut terminal_out: Option<&mut Option<BlackholeTerminalImage>>,
 ) -> JitException {
+    // `_run_forever`'s `current_exc` is a traced `OBJECTPTR` local: the level
+    // callbacks, `release_interp` and `handle_jitexception` between two
+    // `resume_mainloop` calls can collect.
+    let mut current_exc_slot = [current_exc];
+    let _current_exc_root = crate::resume::ResumeRefRootsScope::enter();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(&mut current_exc_slot);
+    }
     loop {
         // executioncontext.py enter: publish this level's frame as
         // `ec.topframeref` before its residuals run (pyjitpl multi-frame
@@ -3693,9 +3701,9 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
             on_enter_level(bh.virtualizable_ptr);
         }
         // blackhole.py:1754-1755
-        match bh.resume_mainloop(current_exc) {
+        match bh.resume_mainloop(current_exc_slot[0]) {
             Ok(exc) => {
-                current_exc = exc;
+                current_exc_slot[0] = exc;
             }
             Err(jit_exc) => {
                 // blackhole.py:1756-1758
@@ -3720,7 +3728,7 @@ pub fn run_forever_with_portal<P: BlackholeInterpPool>(
                         // instead would execute its tail a second time and
                         // overwrite the installed result.
                         bh = new_bh;
-                        current_exc = exc;
+                        current_exc_slot[0] = exc;
                     }
                     Err(propagated_exc) => {
                         // Bottommost or unhandled — propagate out
@@ -3800,6 +3808,12 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
 ) -> JitException {
     // blackhole.py:1803-1810
     let roots_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    // `metainterp.last_exc_value` is a traced field that upstream reads after
+    // the acquire loop below; root the copy for that window.
+    let mut last_exc_slot = [last_exc_value];
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(&mut last_exc_slot);
+    }
     let on_enter_level = config.as_ref().and_then(|config| config.on_enter_level);
     let on_leave_level = config.as_ref().and_then(|config| config.on_leave_level);
 
@@ -3838,6 +3852,7 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
         // that invariant into an apparently resumable interpreter exit.
         panic!("convert_and_run_from_pyjitpl: metainterp framestack is empty");
     };
+    let last_exc_value = last_exc_slot[0];
     // blackhole.py:1812-1818
     let current_exc = if raising_exception {
         last_exc_value
@@ -6537,38 +6552,42 @@ mod tests {
         }
 
         thread_local! {
-            /// Address of the interpreter's `exception_last_value` slot, read
-            /// back by [`probe_exception_slot_at_record_time`].
-            static PROBE_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-            /// What that slot held when the recorder ran.
+            /// Recorder `exc` argument when [`probe_exception_slot_at_record_time`] ran.
             static PROBE_SEEN: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+            /// Shadow-stack top at that moment (`record_frame_traceback` push).
+            static PROBE_SHADOW: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
         }
 
         /// Stand-in for pyre's `record_caught_blackhole_traceback`.  The real
         /// one allocates a `PyTraceback`, i.e. it is a GC safepoint; this one
-        /// just samples the slot that has to be covering the exception by then.
+        /// samples the shadow-stack slot that covers the exception across it.
         extern "C" fn probe_exception_slot_at_record_time(
-            _exc: i64,
+            exc: i64,
             _frame: i64,
             _jitcode_index: i64,
             _opcode_position: i64,
         ) {
-            let slot = PROBE_SLOT.with(|c| c.get()) as *const i64;
-            let seen = if slot.is_null() { -1 } else { unsafe { *slot } };
-            PROBE_SEEN.with(|c| c.set(seen));
+            PROBE_SEEN.with(|c| c.set(exc));
+            let depth = majit_gc::shadow_stack::depth();
+            let seen = if depth == 0 {
+                -1
+            } else {
+                majit_gc::shadow_stack::get(depth - 1).0 as i64
+            };
+            PROBE_SHADOW.with(|c| c.set(seen));
         }
 
-        /// `route_to_catch` must publish the exception into the walked
-        /// `exception_last_value` slot BEFORE it invokes the traceback
-        /// recorder.
+        /// `record_frame_traceback` roots `exc_value` on the shadow stack
+        /// across the recorder (`framework.py push_roots`) and returns the
+        /// (possibly forwarded) address; `route_to_catch` stores that into
+        /// the walked `exception_last_value` slot.
         ///
         /// The recorder allocates, and on this path — a `raise` inside an
-        /// inlined callee, caught by the caller — that slot is the exception's
-        /// only root: `handler_inline_call_nested_ext` reads
-        /// `callee.exception_last_value` after `callee.run()` popped the
-        /// callee's `push_bh_regs` entry, and a callee-local raise never went
-        /// through `BH_LAST_EXC_VALUE`.  The exception is a nursery object, so
-        /// the record moves it; an unrooted local there is stale.
+        /// inlined callee, caught by the caller — the caller's local is the
+        /// exception's only handle after `callee.run()` popped the callee's
+        /// `push_bh_regs` entry.  The exception is a nursery object, so the
+        /// record moves it; the shadow-stack slot is what the collector
+        /// rewrites, and the returned word is what we store.
         #[test]
         fn test_bh_route_to_catch_roots_the_exception_before_recording() {
             const EXC_VAL: i64 = 0xCAFE_F00D;
@@ -6599,15 +6618,23 @@ mod tests {
             bh.record_caught_exception = Some(probe_exception_slot_at_record_time);
 
             PROBE_SEEN.with(|c| c.set(-1));
-            PROBE_SLOT.with(|c| c.set(std::ptr::addr_of!(bh.exception_last_value) as usize));
+            PROBE_SHADOW.with(|c| c.set(-1));
             let _ = bh.run();
-            PROBE_SLOT.with(|c| c.set(0));
 
             assert_eq!(
                 PROBE_SEEN.with(|c| c.get()),
                 EXC_VAL,
-                "the recorder is a GC safepoint, so `exception_last_value` must \
-                 already carry the exception when it runs"
+                "the recorder receives the exception word"
+            );
+            assert_eq!(
+                PROBE_SHADOW.with(|c| c.get()),
+                EXC_VAL,
+                "the recorder is a GC safepoint, so the exception must ride \
+                 in a shadow-stack slot when it runs"
+            );
+            assert_eq!(
+                bh.exception_last_value, EXC_VAL,
+                "route_to_catch stores the forwarded address the record returns"
             );
         }
 

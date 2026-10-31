@@ -387,6 +387,45 @@ pub(crate) fn reconcile_load_global_method_shape(
     }
 }
 
+/// Box currently in the register the codewriter assigned to operand-stack
+/// slot `stack_slot` at `jit_pc`.
+///
+/// `pyopcode.py` `pushvalue` writes `locals_cells_stack_w`;
+/// `_opimpl_setarrayitem_vable` then names that box.  Pyre's walk-level
+/// mirror follows the same slot through the pcdep color map
+/// (`put_back_virtualizable_mapped_colors`).  A coalesced `LOAD_FAST` is a
+/// register move that executes no jitcode op, so `write_ref_reg` never
+/// stamps `vstack_last_ref`; this read is the box the pushed slot holds
+/// now.
+fn vstack_slot_box_from_pcdep_registers<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+    stack_slot: usize,
+) -> OpRef {
+    if ctx.fbw_mode.inline_subwalk {
+        return OpRef::NONE;
+    }
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return OpRef::NONE;
+    }
+    // SAFETY: pointer live for the full-body walk; read-only nlocals / jitcode.
+    let sym = unsafe { &*sym_ptr };
+    if !sym.owns_virtualizable_shadow() || sym.jitcode().is_null() {
+        return OpRef::NONE;
+    }
+    let jc = unsafe { &*sym.jitcode() };
+    let pcdep = jc.payload.pcdep_for_jitcode_pc(jit_pc).unwrap_or_default();
+    if pcdep.is_empty() {
+        return OpRef::NONE;
+    }
+    let slot = sym.nlocals() + stack_slot;
+    let Some(color) = crate::state::semantic_slot_color_for_ref_slot(&pcdep, slot) else {
+        return OpRef::NONE;
+    };
+    ctx.registers_r.get(color).unwrap_or(OpRef::NONE)
+}
+
 /// #73: reconcile the PREVIOUS Python opcode's stack effect into
 /// [`WalkFrameStateData::vstack_boxes`] at an opcode boundary, BEFORE the new
 /// opcode (`new_pypc`) is walked.  Running this before the new op means
@@ -396,7 +435,9 @@ pub(crate) fn reconcile_load_global_method_shape(
 /// `code` is the Python `CodeObject` of the outer (full-body) jitcode;
 /// `new_pypc` is the Python pc the walk is about to enter; `new_depth` is
 /// `depth_at_py_pc[new_pypc]` (stack-only).  The previous opcode is
-/// decoded from `code` at `ctx.vstack_cur_pypc`.
+/// decoded from `code` at `ctx.vstack_cur_pypc`.  `jit_pc` is the JitCode
+/// offset of that new opcode, used to read the pcdep color of the pushed
+/// stack slot.
 ///
 /// On any unmodeled effect (or a structurally impossible depth) the
 /// function latches `ctx.vstack_valid = false` so the `stack_sync`
@@ -408,6 +449,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     new_pypc: u32,
     new_depth: usize,
     after_residual_call: bool,
+    jit_pc: usize,
 ) {
     if !ctx.vstack_valid {
         return;
@@ -665,19 +707,29 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
                 let mut top = ctx.frame_state.borrow().vstack_last_ref;
+                // `pyopcode.py` `pushvalue` / `_opimpl_setarrayitem_vable`:
+                // the snapshot names the box the pushed slot holds now.
+                // Prefer the pcdep color at this py_pc over `vstack_last_ref`
+                // — a coalesced `LOAD_FAST` executes no op, so
+                // `write_ref_reg` never stamps the last-ref.
+                let from_reg = vstack_slot_box_from_pcdep_registers(ctx, jit_pc, new_depth - 1);
+                if from_reg != OpRef::NONE {
+                    top = from_reg;
+                }
                 // `LOAD_CONST` / `LOAD_SMALL_INT` / a prebuilt
                 // `LOAD_COMMON_CONSTANT` push that constant. A `ref_copy`
                 // renaming does not stamp `vstack_last_ref`, so the previous
                 // opcode's ref (the `None` a generator send pushed) would
                 // otherwise become this TOS and the yield would finish with
-                // it.
+                // it.  Skip this mint when the pcdep register already holds
+                // the pushed box, so the snapshot names that identity.
                 let const_result = matches!(
                     instr,
                     pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
                         | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
                         | pyre_interpreter::bytecode::Instruction::LoadCommonConstant { .. }
                 );
-                if top == OpRef::NONE || const_result {
+                if from_reg == OpRef::NONE && (top == OpRef::NONE || const_result) {
                     let from_const = loadconst_operand_ref(ctx, code, &instr, op_arg);
                     if !from_const.is_none() {
                         top = from_const;
@@ -1325,7 +1377,7 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         fbw_note_opcode_entry_effects(new_pypc as usize);
     }
     let code = unsafe { &*code_ptr };
-    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth, false);
+    reconcile_vstack_at_boundary(ctx, code, new_pypc, new_depth, false, jit_pc);
 }
 
 /// Advance the operand-stack mirror to the post-step resume coordinate.
@@ -1374,7 +1426,7 @@ pub(crate) fn reconcile_vstack_to_resume_pc<Sym: WalkSym>(
     if !ctx.fbw_mode.inline_subwalk {
         fbw_note_opcode_entry_effects(dest_py as usize);
     }
-    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth, false);
+    reconcile_vstack_at_boundary(ctx, unsafe { &*code_ptr }, dest_py, depth, false, jit_pc);
 }
 
 pub(crate) fn seed_callee_vstack_mirror<Sym: WalkSym>(

@@ -4347,19 +4347,22 @@ fn try_adopt_multi_frame_blackhole(
         mfdbg!("frame 0: {:#x} locals publish declined", frame_ptrs[0]);
         return false;
     }
-    for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
-    {
-        latched.framestack.frames[frame_index].set_forwarded_ref_value(reg_index, forwarded);
-    }
-    if let Some(index) = image_exception_root {
-        latched.last_exc_value = image_ref_roots[index];
-    }
     if !crate::state::publish_captured_frame_stack(frame_ptrs[0] as usize, &root_stack) {
         crate::state::restore_frame_locals(frame_ptrs[0] as usize, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(undo_depth);
         restore_links(&saved_links);
         mfdbg!("frame 0: active stack publish declined");
         return false;
+    }
+    // `publish_captured_frame_stack` can collect as well as
+    // `write_back_outer_locals`, so copy the forwarded values back only after
+    // both, while the roots are still registered.
+    for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
+    {
+        latched.framestack.frames[frame_index].set_forwarded_ref_value(reg_index, forwarded);
+    }
+    if let Some(index) = image_exception_root {
+        latched.last_exc_value = image_ref_roots[index];
     }
     // As in the single-frame path, locals publication is the final recoverable
     // gate. Once the roots are released and the chain starts running, adoption
@@ -6681,11 +6684,20 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
     };
     let code = pjc.jitcode.code.as_slice();
     let scan = pjc.loop_scan();
-    let Some(merge_point) = pjc
-        .merge_entry_for(start_pc)
-        .and_then(|entry| scan.merge_point_at_or_after(entry))
-        .or_else(|| pjc.first_loop_header_merge_point())
-    else {
+    // Instruction-start merges are not necessarily loop headers.
+    let start_pc_is_header = start_pc == 0
+        || pjc
+            .metadata
+            .loop_header_by_green
+            .binary_search_by_key(&(start_pc as u32), |&(py_pc, _)| py_pc)
+            .is_ok();
+    let Some(merge_point) = (if start_pc_is_header {
+        pjc.merge_entry_for(start_pc)
+            .and_then(|entry| scan.merge_point_at_or_after(entry))
+            .or_else(|| pjc.first_loop_header_merge_point())
+    } else {
+        pjc.first_loop_header_merge_point()
+    }) else {
         return None;
     };
     // A back edge jumps to the loop's header block, which opens at the

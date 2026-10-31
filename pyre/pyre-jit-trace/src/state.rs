@@ -5703,8 +5703,8 @@ pub(crate) fn flush_walk_loop_end_state_to_frame(
 /// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
 /// delivery (#32 S2).  When `push` is `Some((item, body_pc))` and the flush at
 /// `resume_py_pc` (a FOR_ITER header) commits, the consumed `item` is pushed
-/// one slot above the flushed operand stack and `last_instr` is repositioned to
-/// `body_pc - 1` so `next_instr()` re-enters the FOR_ITER body — delivering the
+/// one slot above the flushed operand stack and `last_instr` is repositioned so
+/// `next_instr()` is `body_pc` and re-enters the FOR_ITER body — delivering the
 /// already-advanced iteration exactly once (the FOR_ITER itself is NOT re-run).
 /// `push = None` is byte-identical to the plain flush.
 #[allow(dead_code)]

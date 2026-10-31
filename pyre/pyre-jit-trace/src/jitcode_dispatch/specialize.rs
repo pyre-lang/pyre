@@ -12760,7 +12760,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// loop re-reads.
 ///
 /// A level whose frame the seed block materialised is NOT excluded.  The
-/// `frame_materialized` flag governs STORES — `folded_store_is_observable_local`
+/// `frame_materialized` flag governs STORES — `folded_store_is_observable`
 /// demotes a `STORE_FAST` into a recorded `SETARRAYITEM_GC` so a frame reached
 /// later through a traceback, `f_locals` or `sys._getframe` sees the value —
 /// and that demoted store still re-seeds `opref`, so the shadow and the heap

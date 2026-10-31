@@ -4095,6 +4095,26 @@ pub fn trace_and_compile_from_bridge(
     // which returns `FinishedException` before the walk.
     allow_finish_direct_return: bool,
 ) -> BridgeResolution {
+    // `compile.py _trace_and_compile_from_bridge` traces each bridge on a
+    // fresh `MetaInterp`, so a guard that fails inside a residual call while
+    // another trace is recording opens a second, independent session.  The
+    // driver here owns a single `MetaInterp`, and its tracing session is not
+    // re-entrant (`enter_profiler_tracing`), so such a failure resumes in the
+    // blackhole instead; the bridge compiles on a later failure outside the
+    // trace.
+    //
+    // `trace_attempt_in_progress` also covers the window where the walk parks
+    // the recorder in `compile_tracing` (`with_trace_ctx_and_framestack`)
+    // while `enter_profiler_tracing` is still open, which `is_tracing()`
+    // misses. `trace_meta()` is the `active_trace_session` the outer walk
+    // installed (`begin_trace_session`) before the residual.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.trace_attempt_in_progress() || driver.meta_interp().trace_meta().is_some() {
+            return BridgeResolution::ResumeBlackhole;
+        }
+    }
+
     /// Publish the live callee frame's address to the handshake cells the CA
     /// slow path's back-to-back blackhole hook reads
     /// (`jit_blackhole_resume_from_guard`). Always re-read through
@@ -5605,28 +5625,6 @@ fn jit_ca_handle_guard_failure(
                 None => deadframe,
             };
         };
-    }
-    // `enter_profiler_tracing` is not re-entrant (`pyjitpl.py`
-    // `handle_guard_failure` — RPython unwinds to the top-level
-    // `execute_token` before any tracing decision, so a guard never fires
-    // while another trace is open). pyre's CALL_ASSEMBLER guard callback
-    // runs synchronously from the backend trampoline, so it CAN fire
-    // mid-trace: the self-recursion fold replays its CALL_ASSEMBLER
-    // concretely while the outer trace is still recording, and a deopt in
-    // that callee reaches here with the outer trace's profiler event still
-    // open. `with_trace_ctx_and_framestack` parks the recorder in
-    // `compile_tracing`, so `is_tracing` is false for that window;
-    // `trace_attempt_in_progress` still sees the open
-    // `profiler.start_tracing`. Starting a nested bridge would panic in
-    // `start_retrace_from_guard`'s `enter_profiler_tracing`. Bail to the
-    // blackhole resume (return false) so the callee completes in the
-    // interpreter and the outer trace keeps recording; the deferred bridge
-    // compiles later when this guard fails outside a trace.
-    {
-        let (driver, _) = crate::eval::driver_pair();
-        if driver.trace_attempt_in_progress() {
-            return None;
-        }
     }
 
     // compile.py _trace_and_compile_from_bridge.  Native CA code

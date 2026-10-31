@@ -1664,7 +1664,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
     frame: usize,
     resume_py_pc: usize,
 ) -> Option<(pyre_object::PyObjectRef, usize)> {
-    let body_pc = foriter_unit_at(frame, resume_py_pc)? + 1;
+    let body_pc = foriter_body_pc_at(frame, resume_py_pc)?;
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
         let at = stack.iter().position(|e| {
@@ -1703,10 +1703,9 @@ pub fn fbw_foriter_inflight_take_for_resume(
 /// consume could re-apply the failed attempt's effect) — same signals as the
 /// delivery selector above.
 pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usize) -> bool {
-    let Some(unit) = foriter_unit_at(frame, resume_py_pc) else {
+    let Some(body_pc) = foriter_body_pc_at(frame, resume_py_pc) else {
         return false;
     };
-    let body_pc = unit + 1;
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
         let Some(at) = stack.iter().position(|e| {
@@ -1919,10 +1918,9 @@ pub fn fbw_foriter_inflight_take(
     //
     let census_on = super::foriter_inflight_census_enabled();
     // The body coordinate of the FOR_ITER the frame is parked at, past any
-    // `EXTENDED_ARG` prefix ([`foriter_unit_at`]).  A resume pc that does
+    // `EXTENDED_ARG` prefix ([`foriter_body_pc_at`]).  A resume pc that does
     // not decode to a FOR_ITER keeps the plain `resume_py_pc + 1`.
-    let parked_body_pc =
-        foriter_unit_at(frame, resume_py_pc).map_or(resume_py_pc + 1, |unit| unit + 1);
+    let parked_body_pc = foriter_body_pc_at(frame, resume_py_pc).unwrap_or(resume_py_pc + 1);
     let (stash, dropped) = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
         let at = inflight_take_index(
@@ -2068,7 +2066,7 @@ mod foriter_delivery_tests {
 
     /// A live frame over code with an outer and an inner `for`, and the
     /// coordinates the take matches against: the pc the frame parks at for
-    /// the outer loop, and each loop's body pc (its FOR_ITER unit + 1).
+    /// the outer loop, and each loop's body pc (`semantic_fallthrough_pc` of its FOR_ITER unit).
     struct LoopFrame {
         frame: pyre_interpreter::pyframe::FrameBox,
         outer_header: usize,
@@ -2120,8 +2118,8 @@ mod foriter_delivery_tests {
             Some((pyre_interpreter::Instruction::ExtendedArg, _))
         ));
         let outer_header = outer;
-        let outer_body = outer + 1;
-        let inner_body = inner + 1;
+        let outer_body = crate::pyjitpl::semantic_fallthrough_pc(&code, outer);
+        let inner_body = crate::pyjitpl::semantic_fallthrough_pc(&code, inner);
         let not_a_header = 0;
         let frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let lf = LoopFrame {
@@ -2550,17 +2548,18 @@ mod foriter_delivery_tests {
         {
             start -= 1;
         }
+        let body = crate::pyjitpl::semantic_fallthrough_pc(&code, unit);
         let frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let addr = &*frame as *const pyre_interpreter::pyframe::PyFrame as usize;
         assert_eq!(super::super::foriter_unit_at(addr, start), Some(unit));
         reset();
         let item = 1usize as pyre_object::PyObjectRef;
         let other = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(unit + 1), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(body), false);
         fbw_foriter_inflight_capture(OWNER, other, InflightForiterBody::Py(9999), false);
         assert_eq!(
             fbw_foriter_inflight_take(0, addr, start),
-            Some((item, unit + 1))
+            Some((item, body))
         );
         reset();
     }

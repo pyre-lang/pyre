@@ -14910,7 +14910,7 @@ impl CodeWriter {
                         // `except Yield` is: the yielded value finishes
                         // the trace (`compile_done_with_this_frame`).
                         //
-                        // The pop and fresh ref run AFTER the marker. They
+                        // The pop and the slot reload run AFTER the marker. They
                         // are the sent value the following opcodes expect
                         // (`liveness.rs` net 0), not the value the suspension
                         // returns. Emitting them first would not change the
@@ -14920,7 +14920,31 @@ impl CodeWriter {
                         Instruction::YieldValue { .. } => {
                             emit_abort_permanent!(py_pc);
                             let _ = current_state.stack.pop();
-                            push_fresh_ref(&mut current_state, &mut graph);
+                            // `pyframe.py execute_frame` resumes with
+                            // `pushvalue(w_inputvalue)` and then `dispatch`es;
+                            // the next opcode's `popvalue` reads that slot of
+                            // `locals_cells_stack_w` (`jtransform.py
+                            // do_fixed_list_getitem`). Load it here so the sent
+                            // value is a graph result: a Variable with no
+                            // producer never interferes in `regalloc.py
+                            // make_dependencies` and can share a color with a
+                            // later merge's pycode reload.
+                            let sent_slot =
+                                (stack_base_absolute + current_depth as usize - 1) as i64;
+                            let v_sent_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(sent_slot).into();
+                            let sent = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_sent_idx.into(),
+                                ),
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            current_state.stack.push(sent.into());
                         }
 
                         // ReturnGenerator: pushes 1. Net: +1.

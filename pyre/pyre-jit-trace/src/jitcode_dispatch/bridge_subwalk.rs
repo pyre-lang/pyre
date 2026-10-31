@@ -1163,7 +1163,14 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     //     slot-indexed register file;
     //   * every other live color reads its semantic `locals_cells_stack_w` slot
     //     from the slot-indexed `registers_r` (the reconstruct decode);
-    //   * a live color with no slot reads the decoded color bank (`registers_r_color`).
+    //   * a live color with no slot reads the decoded color bank (`registers_r_color`);
+    //   * an empty slot is CONST_NULL (`pyjitpl.py get_list_of_active_boxes`
+    //     reads `registers_r[index]`; an UNINITIALIZED local and an `in_a_call`
+    //     operand `unreconstructable_operand_floor` skipped stay NULL there).
+    //     `collect_outer_active_boxes` already substitutes CONST_NULL for a
+    //     live color with no sourced box, including union-liveness colors a
+    //     shared `-live-` names at a shallower resume. Declining those as
+    //     `P2Parent::RefBankHole` aborts the bridge walk on every retry.
     for &color in &banks.ref_ {
         let c = color as usize;
         if result_register == Some(('r', c)) {
@@ -1187,12 +1194,15 @@ pub(crate) fn recipe_parent_frame_from_recipe(
                 ec_box
             }
         } else if let Some(slot) = semantic_idx {
-            recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE)
+            let filled = recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE);
+            if filled.is_none() { null_ref } else { filled }
         } else if let Some(&b) = recipe.registers_r_color.get(c).filter(|b| !b.is_none()) {
             b
         } else {
-            let slot = (c < recipe.valuestackdepth).then_some(c)?;
-            recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE)
+            let filled = (c < recipe.valuestackdepth)
+                .then(|| recipe.registers_r.get(c).copied().unwrap_or(OpRef::NONE))
+                .unwrap_or(OpRef::NONE);
+            if filled.is_none() { null_ref } else { filled }
         };
         boxes.push(opref);
         bh_ref.push((c, opref));

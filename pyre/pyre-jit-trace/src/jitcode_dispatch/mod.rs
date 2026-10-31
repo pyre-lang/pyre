@@ -7848,9 +7848,10 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     regs_r: &(impl RegisterValues + ?Sized),
     regs_f: &(impl RegisterValues + ?Sized),
     outer_jitcode_index: u32,
-    // The resume-carried coordinate remains the bank-liveness source. Entry
-    // metadata can be derived from an earlier raw operation coordinate, so it
-    // must travel independently rather than inheriting that marker word.
+    // Resume-carried coordinate: liveness banks, color→slot map, and stack
+    // depth all key here (`pyjitpl.py get_list_of_active_boxes` at the
+    // resume `-live-`; `resume.py ResumeDataLoopMemo.number`). `entry_jitcode_pc`
+    // is the fallback when no resume word is carried.
     carried_jitcode_pc: i32,
     entry_jitcode_pc: i32,
     entry_twin: OuterActiveBoxesEntryTwin,
@@ -7938,7 +7939,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
     // so for them `pcdep_opt` is `None`, `semantic_ref_slot_for_reg_color`
     // returns `None`, and every live color falls to the `regs_r[color]`
     // walk-bank read.
-    let pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
+    let entry_pcdep_entries: Vec<(u8, u16, u16)> = if sym.jitcode().is_null() {
         Vec::new()
     } else {
         unsafe {
@@ -7959,8 +7960,6 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             }
         }
     };
-    let pcdep_opt: Option<&[(u8, u16, u16)]> =
-        (!pcdep_entries.is_empty()).then(|| pcdep_entries.as_slice());
     let (carried_pcdep_entries, carried_stack_only) = if sym.jitcode().is_null() {
         (Vec::new(), 0usize)
     } else {
@@ -7986,6 +7985,27 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
             (entries, depth)
         }
     };
+    // Map, stack depth, and liveness banks share the encoded resume pc.
+    // `get_list_of_active_boxes` (`pyjitpl.py`) reads `registers_X[index]`
+    // at that `-live-`; `ResumeDataLoopMemo.number` (`resume.py`) encodes
+    // those boxes. A caller that passes a raw op/call pc as `entry` while
+    // carrying a later resume marker would otherwise invert the marker's
+    // live colors through the op-start map. Decode
+    // (`bridge_semantic_maps_at_with_jitcode_pc`) already keys Plain pcdep
+    // at the carried word.
+    let use_carried_map = carried_jitcode_pc >= 0;
+    let valid_stack_only = if use_carried_map {
+        carried_stack_only
+    } else {
+        valid_stack_only
+    };
+    let pcdep_entries_ref: &[(u8, u16, u16)] = if use_carried_map {
+        &carried_pcdep_entries
+    } else {
+        &entry_pcdep_entries
+    };
+    let pcdep_opt: Option<&[(u8, u16, u16)]> =
+        (!pcdep_entries_ref.is_empty()).then_some(pcdep_entries_ref);
     // Int / Float bank diagnostic panic: pyre's banks are sized to the
     // jitcode's `num_regs_X`, which the codewriter co-publishes with the
     // liveness side-table, so every liveness index is in range by
@@ -8270,31 +8290,19 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 // Ref color whose semantic slot is `None`.  Keep encode
                 // symmetric: substitute `CONST_NULL` (history.py) so the
                 // positional snapshot/liveness count stays aligned rather
-                // than failing loud on the unsourceable dead slot.  A color
-                // the trace DID produce here (e.g. an op hoisted ahead of its
-                // consumer block's marker so it is live-in at the resume
-                // marker) carries its real `registers_r` box — `regs_r[color]`
-                // is non-NONE precisely when the value is genuinely live, so
-                // this read is the same `get_list_of_active_boxes` parity the
-                // mapped arm above uses.  Under the walker (gate-off) each PC
-                // owns a depth-narrowed marker, so this arm never fires.
+                // than failing loud on the unsourceable dead slot.
+                // A live color the trace holds a box for is encoded as that
+                // box whether it was produced in this trace or is a bridge
+                // inputarg: `_get_list_of_active_boxes` (`pyjitpl.py`) reads
+                // `registers_r[index]` with no further test. A value computed
+                // but not yet pushed — a `FOR_ITER` next() result between the
+                // residual call and the stack push — is live here and its
+                // inputarg is the only source. Only a NONE register (a color
+                // dead at this pc under a shared marker) becomes `CONST_NULL`.
+                // Under the walker (gate-off) each PC owns a depth-narrowed
+                // marker, so this arm never fires.
                 None => match regs_r.get_box(color) {
-                    // A produced box is live at this marker even though the
-                    // color names no frame slot.
-                    Some(v) if v != OpRef::NONE && !v.is_input_arg() => v,
-                    // A bridge inputarg that the virtualizable shadow still
-                    // holds is one of the merge point's loop inputargs.
-                    // One the shadow has replaced is a stale color: the
-                    // decoder drops a slot-less color, and leaving the old
-                    // inputarg in the snapshot makes the loop cut decline
-                    // a box the entry contract does not carry.
-                    Some(v)
-                        if v.is_input_arg()
-                            && (0..trace_ctx.virtualizable_boxes_len().unwrap_or(0))
-                                .any(|i| trace_ctx.virtualizable_box_at(i) == Some(v)) =>
-                    {
-                        v
-                    }
+                    Some(v) if v != OpRef::NONE => v,
                     _ => OpRef::const_ptr(majit_ir::GcRef(0)),
                 },
                 _ => fallback(),
@@ -8427,12 +8435,14 @@ pub(crate) struct GuardCaptureScope {
     pub carried_resume_jit_pc: Option<usize>,
 
     /// Liveness window for [`collect_outer_active_boxes`].  When set, this
-    /// jitcode pc is the snapshot's entry coordinate instead of the
-    /// opcode-start floor (`first_floor_boundary_for_py`).  A guard inside
-    /// PUSH_EXC_INFO carries the walk's later `-live-` as resume
-    /// (`carried_resume_jit_pc`); using the opcode floor for boxes would
-    /// encode the landing's liveness, which omits the caught exception
-    /// (`blackhole.py` `bhimpl_last_exc_value` / `bhimpl_raise`).
+    /// jitcode pc is the snapshot's entry coordinate, matching
+    /// `carried_resume_jit_pc` so map, stack depth, and liveness banks share
+    /// one resume `-live-` (`pyjitpl.py get_list_of_active_boxes`;
+    /// `resume.py ResumeDataLoopMemo.number`).  A guard inside PUSH_EXC_INFO
+    /// carries the walk's later `-live-` as resume; using the opcode-start
+    /// floor for boxes would encode the landing's liveness, which omits the
+    /// caught exception (`blackhole.py` `bhimpl_last_exc_value` /
+    /// `bhimpl_raise`).
     pub liveness_jit_pc: Option<usize>,
 
     /// The result of a call recorded after its callee frame was finished
@@ -9621,9 +9631,8 @@ thread_local! {
 ///
 /// A frame parks at an instruction's first code unit, which for an oparg that
 /// needs `EXTENDED_ARG` is the first prefix, not the `FOR_ITER` itself.  The
-/// in-flight body coordinate is the `FOR_ITER` unit + 1, so the header the
-/// frame is parked at is found by skipping that prefix run.  `None` when the
-/// instruction at `resume_py_pc` is not a `FOR_ITER`.
+/// header the frame is parked at is found by skipping that prefix run.  `None`
+/// when the instruction at `resume_py_pc` is not a `FOR_ITER`.
 pub fn foriter_unit_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
     let raw_code = frame_raw_code(frame)?;
     let code = unsafe { &*raw_code };
@@ -9639,6 +9648,16 @@ pub fn foriter_unit_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
         Some((pyre_interpreter::Instruction::ForIter { .. }, _))
     )
     .then_some(unit)
+}
+
+/// The in-flight body coordinate of the `FOR_ITER` the live `frame` is parked
+/// at: `semantic_fallthrough_pc` of its unit, the coordinate
+/// `inflight_foriter_body_pc` resolves a stashed entry to.  `None` when the
+/// instruction at `resume_py_pc` is not a `FOR_ITER`.
+pub fn foriter_body_pc_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
+    let unit = foriter_unit_at(frame, resume_py_pc)?;
+    let code = unsafe { &*frame_raw_code(frame)? };
+    Some(crate::pyjitpl::semantic_fallthrough_pc(code, unit))
 }
 
 /// Whether an in-flight FOR_ITER continuation belongs to `frame` at this

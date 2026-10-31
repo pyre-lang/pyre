@@ -1601,28 +1601,19 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
 /// fdescr(VableArray) + 2B adescr(Array). No dst byte.
 ///
 /// A folded store lands in a slot whose value survives the trace: the inline
-/// level materialized a real callee `PyFrame` and `slot` is in its LOCAL
-/// region.  Such a slot is readable after the call through a traceback,
-/// `f_locals` or `sys._getframe`, so the store must be recorded rather than
-/// mirrored.  Slots at or above `nlocals` are operand-stack cells, which no
-/// Python-level read can reach and which the resume snapshot reconstructs.
-fn folded_store_is_observable_local<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    slot: i64,
-) -> bool {
-    {
-        let state = ctx.frame_state.borrow();
-        let Some(shadow) = state.callee_shadow.as_ref() else {
-            return false;
-        };
-        if !shadow.frame_materialized {
-            return false;
-        }
-    }
-    let Some(nlocals) = active_frame_nlocals(ctx) else {
+/// level materialized a real callee `PyFrame`.  A LOCAL slot is readable after
+/// the call through a traceback, `f_locals` or `sys._getframe`; an
+/// operand-stack slot is what the interpreter pops after the blackhole's
+/// `jit_merge_point` at the next instruction hands the frame back to it, since
+/// only greens and reds are live across that merge point.  Either way the
+/// store must be recorded rather than mirrored, as `setarrayitem_gc` on the
+/// frame's `locals_cells_stack_w`.
+fn folded_store_is_observable<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, slot: i64) -> bool {
+    let state = ctx.frame_state.borrow();
+    let Some(shadow) = state.callee_shadow.as_ref() else {
         return false;
     };
-    slot >= 0 && slot < nlocals
+    shadow.frame_materialized && slot >= 0
 }
 
 /// `CodeObject` of the frame a vable op names — the callee's inside an inline
@@ -1711,7 +1702,7 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let index = read_int_reg(code, op, 1, ctx)?;
         if let Some(majit_ir::Value::Int(slot)) = ctx.trace_ctx.concrete_of_opref(index)
-            && !folded_store_is_observable_local(ctx, slot)
+            && !folded_store_is_observable(ctx, slot)
         {
             let value = match value_bank {
                 'i' => read_int_reg(code, op, 2, ctx)?,

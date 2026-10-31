@@ -2839,11 +2839,11 @@ pub struct MetaInterp<M: Clone> {
     ///
     /// `resume.py finish` does `storage.rd_consts = self.memo.consts`, so each
     /// guard is handed the memo's own list and one GC object roots the pool for
-    /// the whole optimizer. Pyre copies the pool into a per-guard
-    /// [`majit_ir::SharedConstPool`], which the loop below only reaches once the
-    /// guard is attached to a compiled trace; until then the memo's live
-    /// `consts` — and the raw-address keys of its `refs` cache — name nothing
-    /// the collector forwards. Emptied by [`CompileSnapshotRootsGuard`].
+    /// the whole optimizer. Pyre shares that same [`majit_ir::SharedConstPool`]
+    /// with the guards. This weak memo root covers constants before any guard
+    /// owns them and rebuilds the memo's identity-hash lookup after moves;
+    /// published operations root their descriptors independently after the
+    /// optimizer dies. Emptied by [`CompileSnapshotRootsGuard`].
     pub(crate) compile_resume_memos: Vec<crate::resume::LiveResumeMemo>,
     /// `ConstPtr` index of the virtualizable for the in-flight compile.
     ///
@@ -3782,10 +3782,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         // `resume.py finish` hands each guard `self.memo.consts` itself, so
         // upstream roots the pool through the optimizer that owns it. Pyre
-        // copies the pool per guard, and a guard's copy is only reachable from
-        // `compiled_loops` once its trace is attached; the memo's own pool and
-        // its address-keyed `refs` cache need this separate root for the window
-        // an `Optimizer` holds them.
+        // shares the pool with the guards; this separate memo root covers
+        // constants before a guard owns them and rekeys the identity-hash
+        // cache while an `Optimizer` is alive. Published guard descriptors
+        // remain roots independently when that optimizer has been dropped.
         // The memos the in-flight optimizers still own. Reached through
         // `self`, which the registered root area derives from its `data`
         // pointer — a foreign collecting thread runs this walk during STW, so

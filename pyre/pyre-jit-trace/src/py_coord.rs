@@ -18,17 +18,6 @@ pub(crate) fn floor_boundary_at_or_after(
     table.get(idx).map(|&(off, py)| (off as usize, py))
 }
 
-pub(crate) fn first_floor_boundary_for_py(
-    metadata: &crate::PyJitCodeMetadata,
-    py_pc: u32,
-) -> Option<(usize, u32)> {
-    metadata
-        .py_floor_by_jit_pc
-        .iter()
-        .find(|&&(_, py)| py == py_pc)
-        .map(|&(off, py)| (off as usize, py))
-}
-
 /// Resolve a JitCode offset to the Python instruction coordinate containing it.
 ///
 /// Exact block-head marker matches win first. Otherwise the floor segment is
