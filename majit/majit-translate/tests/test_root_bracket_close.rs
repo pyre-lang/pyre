@@ -986,6 +986,39 @@ fn slice_unpack_erases_the_len_named_free_pin_bracket() {
     }
 }
 
+/// `long_rshift` captures the `pin_roots` index in closures
+/// (`|| shadow_stack_get(base)` / `|| shadow_stack_get(base + 1)`).
+/// Scalar replacement answers those calls as slot copies so the
+/// codewriter never sees the bracket (`gctransform` `push_roots` runs
+/// after `make_jitcodes`).
+#[test]
+fn long_rshift_erases_the_closure_capture_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "long_rshift");
+    for leaf in [
+        "push_roots",
+        "pin_roots",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "long_rshift still calls {leaf} after the closure capture was erased"
+        );
+    }
+}
+
 /// `__majit_wrap_cdata_call` pins the incoming `&[PyObjectRef]` and copies
 /// the tail through `shadow_stack_copy_range`. Production harvests
 /// pyre-object's root-stack effects before lowering pyre-module, the same

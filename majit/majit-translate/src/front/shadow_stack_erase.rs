@@ -46,8 +46,8 @@ use std::collections::{HashMap, VecDeque};
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
-    FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, SpanRef, StmtKind, TermKind, TyRef,
-    Unstructured, UnwindKind,
+    CallFunc, FunDecl, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, SpanRef,
+    StmtKind, TermKind, TyRef, Unstructured, UnwindKind,
 };
 use serde_json::{Value, json};
 
@@ -518,6 +518,339 @@ fn assert_is_slot_index_bounds_check(
     json_slot_array_len(len, specials, const_locals, llbc).is_some_and(|n| k < n)
 }
 
+/// How a closure body names the slot it reads.
+///
+/// `Capture` / `CapturePlusArg` are [`super::function_is_root_slot_getter`].
+/// `CapturePlusConst` is `|| shadow_stack_get(captured + k)`: the addend is a
+/// literal in the body, which that helper traces as opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotGetter {
+    Capture,
+    CapturePlusArg,
+    CapturePlusConst(u64),
+}
+
+/// Classify a callee as a root-slot getter.  Reuses
+/// [`super::function_is_root_slot_getter`] for the two kinds `RootBracketPlan`
+/// already answers, then ports `classify_root_slot_getter_body` for a
+/// `captured + const` body.
+fn slot_getter_of(
+    llbc: &Llbc,
+    fun_id: u64,
+    cache: &mut HashMap<u64, Option<SlotGetter>>,
+) -> Option<SlotGetter> {
+    if let Some(&cached) = cache.get(&fun_id) {
+        return cached;
+    }
+    let name_of = |reg: &RegularCall| super::regular_call_name_path(reg, llbc);
+    let got = match super::function_is_root_slot_getter(llbc, fun_id, &name_of) {
+        Some(super::RootSlotGetter::Capture) => Some(SlotGetter::Capture),
+        Some(super::RootSlotGetter::CapturePlusArg) => Some(SlotGetter::CapturePlusArg),
+        None => classify_capture_plus_const(llbc, fun_id, &name_of),
+    };
+    cache.insert(fun_id, got);
+    got
+}
+
+/// `classify_root_slot_getter_body` with a `Const` usize treated as an addend
+/// rather than an opaque leaf, so `|| shadow_stack_get(base + 1)` is a Get of
+/// slot `k + 1`.
+fn classify_capture_plus_const(
+    llbc: &Llbc,
+    fun_id: u64,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> Option<SlotGetter> {
+    let fd = llbc.fn_by_id(fun_id)?;
+    let raw = fd.body.as_ref()?;
+    if raw.get().len() > 16 * 1024 {
+        return None;
+    }
+    let body = fd.unstructured()?;
+    if body.body.len() > 8 || body.locals.arg_count != 2 {
+        return None;
+    }
+    let mut defs: HashMap<usize, Rvalue> = HashMap::new();
+    let mut getter_arg: Option<Operand> = None;
+    let mut getter_call: Option<(usize, usize)> = None;
+    let mut calls = 0usize;
+    let forward_blocks = super::forward_reachable_mask(llbc, &body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref().ok()? {
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::Borrowck(_)
+                | StmtKind::PlaceMention(_)
+                | StmtKind::Assert(_) => {}
+                StmtKind::Assign(place, value) => {
+                    let PlaceKind::Local(dest) = place.kind else {
+                        return None;
+                    };
+                    let dest = dest as usize;
+                    if dest <= 2 || defs.insert(dest, value.clone()).is_some() {
+                        return None;
+                    }
+                    if !super::root_slot_rvalue_is_traceable(&value) {
+                        return None;
+                    }
+                }
+                StmtKind::Unknown => return None,
+            }
+        }
+        let term = serde_json::from_str::<TermKind>(bb.terminator.kind.get()).ok()?;
+        match term {
+            TermKind::Assert { .. }
+            | TermKind::Goto { .. }
+            | TermKind::Return
+            | TermKind::UnwindResume
+            | TermKind::UnwindTerminate => {}
+            TermKind::Call { call, target, .. } => {
+                calls += 1;
+                if calls > 1 {
+                    return None;
+                }
+                let CallFunc::Regular(reg) = &call.func else {
+                    return None;
+                };
+                let path = name_of(&reg)?;
+                let leaf = path.rsplit("::").next().unwrap_or("");
+                if leaf != "shadow_stack_get"
+                    || !path
+                        .split("::")
+                        .any(|segment| segment == super::ROOT_SCOPE_MODULE)
+                    || call.args.len() != 1
+                    || !matches!(call.dest.kind, PlaceKind::Local(0))
+                {
+                    return None;
+                }
+                getter_call = Some((bb_idx, target as usize));
+                getter_arg = call.args.into_iter().next();
+            }
+            TermKind::Drop { .. }
+            | TermKind::Switch { .. }
+            | TermKind::Abort(_)
+            | TermKind::Panic { .. }
+            | TermKind::UndefinedBehavior
+            | TermKind::Unknown => return None,
+        }
+    }
+    let (getter_bb, normal_target) = getter_call?;
+    if !super::getter_returns_follow_call(llbc, &body, getter_bb, normal_target) {
+        return None;
+    }
+    let trace = const_slot_trace_operand(
+        llbc,
+        &defs,
+        getter_arg.as_ref()?,
+        &mut bit_set::BitSet::new(),
+    );
+    if trace.opaque || trace.env != 1 || trace.arg != 0 || trace.adds != 1 {
+        return None;
+    }
+    Some(SlotGetter::CapturePlusConst(trace.const_sum))
+}
+
+#[derive(Clone, Copy)]
+struct ConstSlotTrace {
+    env: u32,
+    arg: u32,
+    adds: u32,
+    const_sum: u64,
+    opaque: bool,
+}
+
+impl ConstSlotTrace {
+    fn env_leaf() -> Self {
+        Self {
+            env: 1,
+            arg: 0,
+            adds: 0,
+            const_sum: 0,
+            opaque: false,
+        }
+    }
+
+    fn arg_leaf() -> Self {
+        Self {
+            env: 0,
+            arg: 1,
+            adds: 0,
+            const_sum: 0,
+            opaque: false,
+        }
+    }
+
+    fn const_leaf(n: u64) -> Self {
+        Self {
+            env: 0,
+            arg: 0,
+            adds: 0,
+            const_sum: n,
+            opaque: false,
+        }
+    }
+
+    fn opaque() -> Self {
+        Self {
+            env: 0,
+            arg: 0,
+            adds: 0,
+            const_sum: 0,
+            opaque: true,
+        }
+    }
+
+    fn join_add(self, other: Self) -> Self {
+        Self {
+            env: self.env.saturating_add(other.env),
+            arg: self.arg.saturating_add(other.arg),
+            adds: self.adds.saturating_add(other.adds).saturating_add(1),
+            const_sum: self.const_sum.saturating_add(other.const_sum),
+            opaque: self.opaque || other.opaque,
+        }
+    }
+}
+
+fn const_slot_trace_operand(
+    llbc: &Llbc,
+    defs: &HashMap<usize, Rvalue>,
+    op: &Operand,
+    visiting: &mut bit_set::BitSet,
+) -> ConstSlotTrace {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => {
+            const_slot_trace_place(llbc, defs, place, visiting)
+        }
+        Operand::Const(_) => match const_usize(op, llbc) {
+            Some(n) => ConstSlotTrace::const_leaf(n as u64),
+            None => ConstSlotTrace::opaque(),
+        },
+    }
+}
+
+fn const_slot_trace_place(
+    llbc: &Llbc,
+    defs: &HashMap<usize, Rvalue>,
+    place: &Place,
+    visiting: &mut bit_set::BitSet,
+) -> ConstSlotTrace {
+    let Some(root) = super::place_root_through_deref_or_field(place) else {
+        return ConstSlotTrace::opaque();
+    };
+    const_slot_trace_local(llbc, defs, root, visiting)
+}
+
+fn const_slot_trace_local(
+    llbc: &Llbc,
+    defs: &HashMap<usize, Rvalue>,
+    local: usize,
+    visiting: &mut bit_set::BitSet,
+) -> ConstSlotTrace {
+    if local == 1 {
+        return ConstSlotTrace::env_leaf();
+    }
+    if local == 2 {
+        return ConstSlotTrace::arg_leaf();
+    }
+    if !visiting.insert(local) {
+        return ConstSlotTrace::opaque();
+    }
+    let Some(value) = defs.get(&local) else {
+        visiting.remove(local);
+        return ConstSlotTrace::opaque();
+    };
+    let trace = match value {
+        Rvalue::Use(op, _) => const_slot_trace_operand(llbc, defs, op, visiting),
+        Rvalue::BinaryOp(op, lhs, rhs) if super::root_slot_sum_is_checked(op).is_some() => {
+            const_slot_trace_operand(llbc, defs, lhs, visiting)
+                .join_add(const_slot_trace_operand(llbc, defs, rhs, visiting))
+        }
+        _ => ConstSlotTrace::opaque(),
+    };
+    visiting.remove(local);
+    trace
+}
+
+/// Peel a closure call of a [`SlotGetter`] down to the static slot index and
+/// the temporaries that only build the capture (`peel_closure_capture`,
+/// `peel_captured_index`, `peel_getter_addend`).
+fn try_slot_getter_call(
+    body: &Unstructured,
+    llbc: &Llbc,
+    call: &majit_charon_reader::ullbc::CallPayload,
+    specials: &HashMap<usize, Special>,
+    assigned: &HashMap<usize, usize>,
+    call_dests: &bit_set::BitSet,
+    forward_blocks: &[bool],
+    cache: &mut HashMap<u64, Option<SlotGetter>>,
+) -> Option<(usize, Vec<usize>)> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let fun_id = super::regular_call_fun_decl_id(&reg.kind)?;
+    let kind = slot_getter_of(llbc, fun_id, cache)?;
+    let receiver = call.args.first()?;
+    let mut bases = HashMap::new();
+    let mut candidates = bit_set::BitSet::new();
+    for (local, spec) in specials {
+        if matches!(spec, Special::Index(_) | Special::IndexPair(_)) {
+            bases.insert(*local, 0);
+            candidates.insert(0);
+        }
+    }
+    if bases.is_empty() {
+        return None;
+    }
+    let offsets: HashMap<usize, super::RootSlotSum> = HashMap::new();
+    let len_index: HashMap<usize, (usize, usize)> = HashMap::new();
+    let aliases: HashMap<usize, usize> = HashMap::new();
+    let index = super::RootGetterIndex {
+        assigned,
+        bases: &bases,
+        offsets: &offsets,
+        len_index: &len_index,
+        candidates: &candidates,
+        aliases: &aliases,
+        call_dests,
+        forward_blocks,
+    };
+    let peeled = match super::peel_closure_capture(llbc, body, &index, receiver) {
+        super::CapturePeel::Ready(peeled) => peeled,
+        _ => return None,
+    };
+    let (index_local, _, index_carriers) =
+        super::peel_captured_index(llbc, body, &index, &peeled.capture)?;
+    let k0 = match specials.get(&index_local) {
+        Some(Special::Index(k) | Special::IndexPair(k)) => *k,
+        _ => return None,
+    };
+    let peel_kind = match kind {
+        SlotGetter::Capture | SlotGetter::CapturePlusConst(_) => super::RootSlotGetter::Capture,
+        SlotGetter::CapturePlusArg => super::RootSlotGetter::CapturePlusArg,
+    };
+    let addend = super::peel_getter_addend(llbc, body, &index, peel_kind, &call.args)?;
+    let body_addend = match kind {
+        SlotGetter::CapturePlusConst(n) => n,
+        _ => 0,
+    };
+    let k = k0
+        .checked_add(usize::try_from(body_addend).ok()?)?
+        .checked_add(usize::try_from(addend.addend).ok()?)?;
+    let mut carriers = peeled.carriers;
+    carriers.extend(index_carriers);
+    carriers.extend(addend.carriers);
+    if carriers
+        .iter()
+        .any(|local| *local == index_local || specials.contains_key(local))
+    {
+        return None;
+    }
+    Some((k, carriers))
+}
+
 /// Build the rewrite, or say why this body keeps its bracket.
 fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let n_blocks = body.body.len();
@@ -585,8 +918,30 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
 
     let def_counts = local_def_counts(body, llbc, &forward_blocks);
     let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
+    let mut stmt_assigned: HashMap<usize, usize> = HashMap::new();
+    let mut call_dests = bit_set::BitSet::new();
+    for (bb, block) in body.body.iter().enumerate() {
+        if !forward_blocks[bb] {
+            continue;
+        }
+        for stmt in &block.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let Some(dest) = place_local(place)
+            {
+                *stmt_assigned.entry(dest).or_default() += 1;
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = block.term_ref(llbc)
+            && let Some(dest) = place_local(&call.dest)
+        {
+            call_dests.insert(dest);
+        }
+    }
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
+    let mut getter_cache: HashMap<u64, Option<SlotGetter>> = HashMap::new();
+    let mut getter_bbs = bit_set::BitSet::new();
+    let mut capture_temps = bit_set::BitSet::new();
     let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
     let mut queue: VecDeque<usize> = VecDeque::new();
     if n_blocks == 0 {
@@ -758,6 +1113,43 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
                 let Some(&(leaf, method)) = classified.get(&bb) else {
+                    // A closure whose body is `shadow_stack_get` of a captured
+                    // index (or `captured + const`) is a Get of that slot.
+                    // `RootBracketPlan.capture_temps` already answers this at
+                    // lowering; the codewriter must not see the bracket
+                    // (`gctransform` `push_roots` runs after `make_jitcodes`).
+                    if let Some((k, carriers)) = try_slot_getter_call(
+                        body,
+                        llbc,
+                        call,
+                        &plan.specials,
+                        &stmt_assigned,
+                        &call_dests,
+                        &forward_blocks,
+                        &mut getter_cache,
+                    ) {
+                        if k >= depth {
+                            return Err("get-above-depth");
+                        }
+                        let dest_json = &term_json["Call"]["call"]["dest"];
+                        let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
+                        plan.terms.insert(
+                            bb,
+                            TermRewrite {
+                                target: *target,
+                                stmts: vec![assign_json(
+                                    dest_json.clone(),
+                                    json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                                )],
+                            },
+                        );
+                        getter_bbs.insert(bb);
+                        for local in carriers {
+                            capture_temps.insert(local);
+                        }
+                        reach(&mut depth_in, &mut queue, *target, depth)?;
+                        continue;
+                    }
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
                     // become slot locals (`eval_slice_index` / `getindex_w`).
@@ -1023,6 +1415,29 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         Some(Special::Index(_) | Special::IndexPair(_))
     ) {
         return Err("returns-slot-index");
+    }
+
+    // Temporaries that only build a getter capture (borrow of the index, the
+    // closure aggregate, the receiver borrow, the argument tuple) bind
+    // nothing once the call is a slot copy.  Another use — passing the
+    // closure, storing it — would still run the real `shadow_stack_get`.
+    if !capture_temps.is_empty() {
+        if !super::capture_carriers_stay_inside(body, &capture_temps, &getter_bbs, &forward_blocks)
+        {
+            return Err("capture-escapes");
+        }
+        for (bb, block) in body.body.iter().enumerate() {
+            if !forward_blocks[bb] || !visited[bb] {
+                continue;
+            }
+            for (si, stmt) in block.statements.iter().enumerate() {
+                if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                    && place_local(place).is_some_and(|dest| capture_temps.contains(dest))
+                {
+                    plan.removed.entry(bb).or_default().push(si);
+                }
+            }
+        }
     }
 
     // Every surviving mention of a guard, borrow or index has to be one of the
@@ -3818,5 +4233,250 @@ mod tests {
             assert_is_slot_index_bounds_check(&assert, &specials, &HashMap::new(), &fixture_llbc()),
             "index 0 of a 3-slot erased array is true by construction"
         );
+    }
+
+    fn getter_llbc() -> Llbc {
+        let capture_body = json!({
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 2,
+                    "locals": (0..4).map(local_decl).collect::<Vec<_>>()
+                },
+                "body": [
+                    bb(call_fun(3, vec![json!({"Copy": place(1)})], 0, 1)),
+                    bb(json!("Return"))
+                ]
+            }
+        });
+        let field0 = json!({
+            "kind": {"Projection": [place(3), {"Field": [null, 0]}]},
+            "ty": ty()
+        });
+        let plus_const_body = json!({
+            "Unstructured": {
+                "span": span(),
+                "locals": {
+                    "arg_count": 2,
+                    "locals": (0..5).map(local_decl).collect::<Vec<_>>()
+                },
+                "body": [
+                    bb_stmts(
+                        vec![assign_local(
+                            3,
+                            json!({"BinaryOp": [
+                                "AddChecked",
+                                {"Copy": place(1)},
+                                usize_lit(1)
+                            ]}),
+                        )],
+                        json!({"Assert": {
+                            "assert": {
+                                "cond": {"Move": {
+                                    "kind": {"Projection": [place(3), {"Field": [null, 1]}]},
+                                    "ty": ty()
+                                }},
+                                "expected": false,
+                                "check_kind": {"Overflow": [
+                                    {"Add": "Wrap"},
+                                    {"Copy": place(1)},
+                                    usize_lit(1)
+                                ]}
+                            },
+                            "target": 1,
+                            "on_unwind": 99
+                        }}),
+                    ),
+                    bb_stmts(
+                        vec![assign_local(4, json!({"Use": [{"Move": field0}, "Yes"]}))],
+                        call_fun(3, vec![json!({"Move": place(4)})], 0, 2),
+                    ),
+                    bb(json!("Return"))
+                ]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["fixture", "capture", "call"], capture_body),
+                    opaque_fun(6, &["fixture", "plus_const", "call"], plus_const_body),
+                    opaque_fun(7, &["fixture", "other"], json!("Opaque"))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn copy_local(i: u64) -> Value {
+        json!({"Copy": place(i)})
+    }
+
+    fn move_local(i: u64) -> Value {
+        json!({"Move": place(i)})
+    }
+
+    fn borrow_local(dest: u64, src: u64) -> Value {
+        assign_local(
+            dest,
+            json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+        )
+    }
+
+    fn closure_aggregate(dest: u64, capture: u64) -> Value {
+        assign_local(
+            dest,
+            json!({"Aggregate": [{"Adt": [3026, null]}, [move_local(capture)]]}),
+        )
+    }
+
+    fn empty_unit(dest: u64) -> Value {
+        assign_local(dest, json!({"Aggregate": [{"Adt": [0, null]}, []]}))
+    }
+
+    fn pin_two_array_stmts() -> Vec<Value> {
+        vec![
+            assign_local(8, json!({"Use": [copy_local(0), "Yes"]})),
+            assign_local(9, json!({"Use": [copy_local(0), "Yes"]})),
+            assign_local(
+                6,
+                json!({"Aggregate": [
+                    {"Array": [ty(), {"Deduplicated": 1}, null]},
+                    [move_local(8), move_local(9)]
+                ]}),
+            ),
+            borrow_local(7, 6),
+        ]
+    }
+
+    fn capture_of_base(borrow: u64, closure: u64, recv: u64, unit: u64) -> Vec<Value> {
+        vec![
+            borrow_local(borrow, 4),
+            closure_aggregate(closure, borrow),
+            borrow_local(recv, closure),
+            empty_unit(unit),
+        ]
+    }
+
+    /// `long_rshift` shape: Open, `pin_roots(&[a, b])`, closures over the
+    /// base, `shadow_stack_get` of the captured index and of `captured + 1`.
+    fn long_rshift_shape_body(call_after_close: bool) -> Unstructured {
+        let mut blocks = vec![
+            bb(call_fun(1, vec![], 1, 1)),
+            bb_stmts(
+                pin_two_array_stmts(),
+                call_fun(2, vec![move_local(7)], 4, 2),
+            ),
+        ];
+        let capture_a = capture_of_base(12, 11, 18, 19);
+        if call_after_close {
+            blocks.push(bb_stmts(capture_a, drop_local(1, 3)));
+            blocks.push(bb(call_fun(5, vec![copy_local(18), copy_local(19)], 30, 4)));
+            blocks.push(bb(json!("Return")));
+        } else {
+            blocks.push(bb_stmts(
+                capture_a,
+                call_fun(5, vec![copy_local(18), copy_local(19)], 30, 3),
+            ));
+            blocks.push(bb_stmts(
+                capture_of_base(14, 13, 20, 21),
+                call_fun(6, vec![copy_local(20), copy_local(21)], 31, 4),
+            ));
+            blocks.push(bb(drop_local(1, 5)));
+            blocks.push(bb(json!("Return")));
+        }
+        body_of(32, blocks)
+    }
+
+    #[test]
+    fn analyze_erases_long_rshift_closure_capture() {
+        let llbc = getter_llbc();
+        let body = long_rshift_shape_body(false);
+        let plan = match analyze(&body, &llbc) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        let n_locals = 32;
+        let slot0 = local_place_json(n_locals, &ty());
+        let slot1 = local_place_json(n_locals + 1, &ty());
+        let rewrite0 = plan.terms.get(&2).expect("capture get rewritten");
+        assert_eq!(
+            rewrite0.stmts,
+            vec![json!({"Assign": [
+                place(30),
+                {"Use": [{"Copy": slot0}, "Yes"]}
+            ]})],
+            "|| shadow_stack_get(base) is a copy of slot 0"
+        );
+        let rewrite1 = plan.terms.get(&3).expect("plus-const get rewritten");
+        assert_eq!(
+            rewrite1.stmts,
+            vec![json!({"Assign": [
+                place(31),
+                {"Use": [{"Copy": slot1}, "Yes"]}
+            ]})],
+            "|| shadow_stack_get(base + 1) is a copy of slot 1"
+        );
+    }
+
+    #[test]
+    fn analyze_refuses_capture_escapes_when_closure_is_passed() {
+        let llbc = getter_llbc();
+        let blocks = vec![
+            bb(call_fun(1, vec![], 1, 1)),
+            bb_stmts(
+                pin_two_array_stmts(),
+                call_fun(2, vec![move_local(7)], 4, 2),
+            ),
+            bb_stmts(
+                capture_of_base(12, 11, 18, 19),
+                call_fun(5, vec![copy_local(18), copy_local(19)], 30, 3),
+            ),
+            bb(call_fun(7, vec![copy_local(11)], 31, 4)),
+            bb(drop_local(1, 5)),
+            bb(json!("Return")),
+        ];
+        let body = body_of(32, blocks);
+        match analyze(&body, &llbc) {
+            Err("capture-escapes") => {}
+            Ok(Some(_)) => panic!("expected capture-escapes, got accepted"),
+            Ok(None) => panic!("expected capture-escapes, got no bracket"),
+            Err(reason) => panic!("expected capture-escapes, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn analyze_refuses_closure_get_after_close() {
+        let llbc = getter_llbc();
+        let body = long_rshift_shape_body(true);
+        match analyze(&body, &llbc) {
+            Err("get-above-depth") => {}
+            Ok(Some(_)) => panic!("expected get-above-depth, got accepted"),
+            Ok(None) => panic!("expected get-above-depth, got no bracket"),
+            Err(reason) => panic!("expected get-above-depth, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn analyze_getter_body_still_refuses_index_not_static() {
+        let llbc = getter_llbc();
+        let fd = llbc.fn_by_id(5).expect("capture getter");
+        let body = fd.unstructured().expect("getter body");
+        match analyze(&body, &llbc) {
+            Err("index-not-static") => {}
+            Ok(Some(_)) => panic!("expected index-not-static, got accepted"),
+            Ok(None) => panic!("expected index-not-static, got no bracket"),
+            Err(reason) => panic!("expected index-not-static, got {reason}"),
+        }
     }
 }
