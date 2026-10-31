@@ -10128,22 +10128,6 @@ impl<M: Clone> MetaInterp<M> {
                 // carries it on `BridgeTraceInfo.source_descr`
                 // (populated by `start_retrace_from_guard`).  No
                 // `(trace_id, fail_index)` reverse lookup.
-                // Origin still present: leftover compiling
-                // `jitdriver_sd.warmstate` `BaseJitCell.get_procedure_token`.
-                if !self
-                    .get_procedure_token(origin_key)
-                    .is_some_and(|t| t.has_compiled_code())
-                {
-                    if crate::closedbg_enabled() {
-                        eprintln!("@@@CANCEL-SITE line={}", line!());
-                    }
-                    crate::mc_diag_bump(30); // compile_trace: origin loop gone
-                    if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
-                        ctx.cut_trace(cut_at);
-                    }
-                    self.jitlog_trace_aborted();
-                    return CompileOutcome::Cancelled;
-                }
                 let descr_arc = match self.bridge_info() {
                     Some(b) => b.source_descr.clone(),
                     None => {
@@ -31368,6 +31352,94 @@ mod tests {
         assert_eq!(meta.active_jitdriver_sd, Some(source_driver));
         assert_eq!(meta.pending_frontend_boxes_ref(), Some([42].as_slice()));
         meta.clear_trace_session();
+    }
+
+    /// `compile.py ResumeGuardDescr.compile_and_attach` attaches the
+    /// bridge to `metainterp.resumekey_original_loop_token`
+    /// (`resumedescr.rd_loop_token.loop_token_wref()` from
+    /// `handle_guard_failure`). `compile_done_with_this_frame` records
+    /// FINISH and does not consult the origin cell's
+    /// `BaseJitCell.get_procedure_token`.
+    #[test]
+    fn finish_bridge_compiles_with_invalidated_origin_cell() {
+        let mut meta = MetaInterp::<()>::new(1);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = gk(50);
+        start_hash_trace(&mut meta, &green_key, &[1]);
+        let sum = {
+            let ctx = meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+            sum
+        };
+        meta.compile_loop(&[sum]);
+        assert!(
+            meta.get_procedure_token(green_key.get_uhash()).is_some(),
+            "compile_loop must install a live origin token"
+        );
+
+        let origin_token = meta
+            .get_procedure_token(green_key.get_uhash())
+            .expect("compiled origin token");
+        let descr_arc = meta
+            .backend
+            .compiled_fail_descr_layouts(origin_token.as_ref())
+            .into_iter()
+            .flatten()
+            .find(|layout| layout.fail_index == 0 && !layout.is_finish)
+            .and_then(|layout| layout.descr)
+            .expect("compiled guard descr");
+        let (trace_id, fail_index) = {
+            let fail_descr = descr_arc.as_fail_descr().expect("compiled guard descr");
+            (fail_descr.trace_id(), fail_descr.fail_index_per_trace())
+        };
+        descr_arc
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_loop_token_clt(origin_token.compiled_loop_token_expect());
+
+        assert!(meta.start_retrace(descr_arc.clone(), green_key.get_uhash(), fail_index, &[0]));
+        {
+            let ctx = meta.trace_ctx().expect("should be tracing bridge");
+            let i0 = OpRef::input_arg_int(0);
+            let c2 = ctx.const_int(2);
+            ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+        }
+
+        meta.invalidate_loop(green_key.get_uhash());
+        assert!(
+            meta.get_procedure_token(green_key.get_uhash()).is_none(),
+            "invalidate_loop must drop BaseJitCell.get_procedure_token"
+        );
+        assert!(
+            majit_backend::descr_owning_jct(descr_arc.as_fail_descr().unwrap()).is_some(),
+            "rd_loop_token.loop_token_wref stays live through the kept origin token"
+        );
+
+        let finish_descr = meta
+            .staticdata
+            .done_with_this_frame_descr_from_types(&[Type::Int])
+            .expect("done_with_this_frame_descr_int");
+        let outcome = meta.compile_trace_finish(
+            green_key.get_uhash(),
+            &[OpRef::input_arg_int(0)],
+            Some((trace_id, fail_index)),
+            finish_descr,
+        );
+        assert!(
+            matches!(outcome, CompileOutcome::Compiled { .. }),
+            "FINISH bridge attaches via rd_loop_token, got {outcome:?}"
+        );
+        assert_eq!(meta.stats.bridges_compiled, 1);
+        assert!(
+            meta.backend
+                .bridge_was_compiled(&origin_token, trace_id, fail_index),
+            "the kept origin token must own the attached FINISH bridge"
+        );
     }
 
     extern "C" fn test_clear_vable_token(_gcref: *mut u8) {}
