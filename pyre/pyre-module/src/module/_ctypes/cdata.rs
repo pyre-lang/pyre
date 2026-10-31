@@ -10,6 +10,11 @@
 //! lazily from the single-char `_type_` class attribute via `host_env`, rather
 //! than cached in a per-type `StgInfo`.  Reading `_type_` off the class also
 //! transparently handles user subclasses (`class MyInt(c_int)`).
+//!
+//! Class, instance and dictionary words used after a metadata query or buffer
+//! allocation stay in `with_roots!` slots and are reloaded afterwards. This is
+//! the moving-GC live-variable rule from `framework.py get_livevars_for_roots`
+//! for the `_CData` / `_SimpleCData` paths in `lib_pypy/_ctypes`.
 
 use super::cfield;
 use super::stginfo::ParamFunc;
@@ -246,12 +251,12 @@ fn cdata_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     // hands back are raw words, so a collection between the read and the last
     // store would leave them behind.  Everything built after that is pinned as
     // it is built and read back out of its slot.
-    let d =
+    let mut d =
         pyre_object::with_roots!(cls, obj => pyre_interpreter::baseobjspace::getdict_native(obj));
     let attributes: Vec<(PyObjectRef, PyObjectRef)> = if d.is_null() {
         Vec::new()
     } else {
-        unsafe { pyre_object::dictmultiobject::w_dict_items(d) }
+        pyre_object::with_roots!(cls, obj, d => unsafe { pyre_object::dictmultiobject::w_dict_items(d) })
             .into_iter()
             .filter(|&(key, _)| {
                 !unsafe { pyre_object::is_str(key) }
@@ -324,14 +329,14 @@ fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
     pyre_object::with_roots!(obj, w_state => cdata_write(obj, 0, unsafe {
         pyre_object::bytesobject::bytes_like_data(source)
     }));
-    let d =
+    let mut d =
         pyre_object::with_roots!(w_state => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "ctypes instance has no instance dict",
         ));
     }
-    let items = unsafe { pyre_object::dictmultiobject::w_dict_items(w_state) };
+    let items = pyre_object::with_roots!(d => unsafe { pyre_object::dictmultiobject::w_dict_items(w_state) });
     let roots = pyre_object::gc_roots::push_roots();
     let mut live = Vec::with_capacity(1 + items.len() * 2);
     live.push(d);
@@ -788,9 +793,9 @@ fn simplecdata_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
             "_SimpleCData.__new__(): not enough arguments",
         ));
     }
-    let cls = args[0];
-    let tc =
-        type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
+    let mut cls = args[0];
+    let tc = pyre_object::with_roots!(cls => type_code_of(cls))
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     new_simplecdata_obj(cls, &tc, None)
 }
 
@@ -940,19 +945,22 @@ pub(super) fn new_cdata_obj_from_bytes(
     Ok(obj)
 }
 
-pub(super) fn ctype_size_of(cls: PyObjectRef) -> Option<usize> {
-    super::stginfo::stginfo_of(cls)
+pub(super) fn ctype_size_of(mut cls: PyObjectRef) -> Option<usize> {
+    pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls))
         .map(super::stginfo::stginfo_size)
-        .or_else(|| type_code_of(cls).and_then(|tc| cfield::simple_type_size(&tc)))
+        .or_else(|| {
+            pyre_object::with_roots!(cls => type_code_of(cls))
+                .and_then(|tc| cfield::simple_type_size(&tc))
+        })
         .or_else(|| super::funcptr::is_funcptr_type(cls).then(cfield::pointer_size))
 }
 
 /// `_SimpleCData.value` getter — `(descr, instance)`.
 fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let obj = args[1];
+    let mut obj = args[1];
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let tc =
-        type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
+    let tc = pyre_object::with_roots!(cls, obj => type_code_of(cls))
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     let bytes = pyre_object::with_roots!(cls => cdata_bytes(obj))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("ctypes instance has no buffer"))?;
     // A BSTR carries no swapped spelling — `X` has no entry in the byte-order
@@ -979,10 +987,13 @@ fn value_setter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 
 /// `Simple_set_value` — encode `value` under the instance's own type code and
 /// write it through the instance's buffer view.
-fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    let tc =
-        type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
+fn set_simple_value(
+    mut obj: PyObjectRef,
+    mut value: PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
+    let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let tc = pyre_object::with_roots!(cls, obj, value => type_code_of(cls))
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
     // `value` is an arbitrary object, so under `"O"` it can be a `list` or a
     // `dict`, both of which move, and `encode_value_into` can run Python: pin it
     // and read the slot back where it is stored.
@@ -1081,12 +1092,12 @@ pub(crate) fn cdata_bytes(mut obj: PyObjectRef) -> Option<&'static [u8]> {
 /// immediately, so the box happens inside the boundary and a single
 /// null-niche `Option<PyObjectRef>` crosses it.
 #[majit_macros::dont_look_inside]
-pub fn cdata_bytes_object(obj: PyObjectRef) -> Option<PyObjectRef> {
+pub fn cdata_bytes_object(mut obj: PyObjectRef) -> Option<PyObjectRef> {
     // PyPy's CData buffer path is reached only through a CData instance's
     // buffer implementation.  `buffer_as_bytes_like` probes this helper for
     // arbitrary objects, so preserve that owner check here before any CData
     // dict field (`_b_`, `_b_addr_`, ...) is read.
-    if !is_cdata_instance(obj) {
+    if !pyre_object::with_roots!(obj => is_cdata_instance(obj)) {
         return None;
     }
     cdata_bytes(obj).map(pyre_object::bytesobject::w_bytes_from_bytes)
@@ -1180,7 +1191,7 @@ fn ctype_shape(mut cls: PyObjectRef) -> Vec<usize> {
 }
 
 fn ctype_leaf(mut cls: PyObjectRef) -> PyObjectRef {
-    while let Some(mut info) = super::stginfo::stginfo_of(cls) {
+    while let Some(mut info) = pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls)) {
         if pyre_object::with_roots!(cls, info => super::stginfo::stginfo_paramfunc(info))
             != ParamFunc::Array
         {
@@ -1195,8 +1206,8 @@ fn ctype_leaf(mut cls: PyObjectRef) -> PyObjectRef {
     cls
 }
 
-pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -> String {
-    let info = super::stginfo::stginfo_of(cls);
+pub(super) fn ctype_pep3118_format(mut cls: PyObjectRef, forced_big: Option<bool>) -> String {
+    let info = pyre_object::with_roots!(cls => super::stginfo::stginfo_of(cls));
     let kind = info
         .map(super::stginfo::stginfo_paramfunc)
         .unwrap_or(ParamFunc::Other);
@@ -1233,7 +1244,7 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
         ParamFunc::Struct => struct_pep3118_format(cls),
         ParamFunc::Union => "B".to_string(),
         _ => {
-            let Some(tc) = type_code_of(cls) else {
+            let Some(tc) = pyre_object::with_roots!(cls => type_code_of(cls)) else {
                 return "B".to_string();
             };
             let pep = match tc.as_char() {
@@ -1662,7 +1673,7 @@ fn store_reference_target(anchor: PyObjectRef, base_key: &str) -> Option<(usize,
     let mut composite_key = base_key.to_string();
     loop {
         root = pyre_object::gc_roots::shadow_stack_get(root_slot);
-        let d = pyre_interpreter::baseobjspace::getdict_native(root);
+        let mut d = pyre_interpreter::baseobjspace::getdict_native(root);
         if d.is_null() {
             return None;
         }
@@ -1670,7 +1681,8 @@ fn store_reference_target(anchor: PyObjectRef, base_key: &str) -> Option<(usize,
             && unsafe { pyre_object::is_int(index) }
         {
             composite_key.push(':');
-            composite_key.push_str(&unsafe { pyre_object::w_int_get_value(index) }.to_string());
+            let text = pyre_object::with_roots!(d => unsafe { pyre_object::w_int_get_value(index) }.to_string());
+            composite_key.push_str(&text);
         }
         match unsafe { pyre_object::w_dict_getitem_str(d, BBASE_KEY) } {
             Some(base) if !base.is_null() && !unsafe { pyre_object::is_none(base) } => {
@@ -2218,12 +2230,13 @@ pub(super) fn pointer_word(mut obj: PyObjectRef) -> Result<usize, pyre_interpret
 /// destination that takes an *instance* copies byte-for-byte
 /// (`_PyCData_set`, the `PyObject_IsInstance` arm reached when the field
 /// carries no setfunc of its own).
-pub(super) fn same_type_bytes(tc: &str, obj: PyObjectRef) -> Option<Vec<u8>> {
-    if !is_simplecdata_instance(obj) {
+pub(super) fn same_type_bytes(tc: &str, mut obj: PyObjectRef) -> Option<Vec<u8>> {
+    if !pyre_object::with_roots!(obj => is_simplecdata_instance(obj)) {
         return None;
     }
-    let src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
-    (type_code_of(src_cls).as_deref() == Some(tc)).then(|| cdata_bytes(obj).unwrap_or(&[]).to_vec())
+    let mut src_cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    (pyre_object::with_roots!(obj, src_cls => type_code_of(src_cls)).as_deref() == Some(tc))
+        .then(|| cdata_bytes(obj).unwrap_or(&[]).to_vec())
 }
 
 /// Store into a destination that takes an instance — a struct field, an array
@@ -2234,11 +2247,11 @@ pub(super) fn same_type_bytes(tc: &str, obj: PyObjectRef) -> Option<Vec<u8>> {
 /// `c_long(c_long(42))` is a TypeError from `PyNumber_Index`.
 pub(super) fn encode_instance_or_value(
     tc: &str,
-    value: PyObjectRef,
-    dest: PyObjectRef,
+    mut value: PyObjectRef,
+    mut dest: PyObjectRef,
     key: &str,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
-    match same_type_bytes(tc, value) {
+    match pyre_object::with_roots!(value, dest => same_type_bytes(tc, value)) {
         Some(bytes) => Ok(bytes),
         None => encode_value_into(tc, value, dest, key),
     }
@@ -2249,12 +2262,12 @@ pub(super) fn encode_instance_or_value(
 /// whole-buffer reverse.
 pub(super) fn encode_instance_or_value_swapped(
     tc: &str,
-    value: PyObjectRef,
-    dest: PyObjectRef,
+    mut value: PyObjectRef,
+    mut dest: PyObjectRef,
     key: &str,
     swapped: bool,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
-    match same_type_bytes(tc, value) {
+    match pyre_object::with_roots!(value, dest => same_type_bytes(tc, value)) {
         Some(mut bytes) => {
             if swapped {
                 if cfield::simple_type_is_complex(tc) {
@@ -2459,8 +2472,7 @@ fn encode_value_into_endian(
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
         let raw = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
-        let copy =
-            pyre_object::bytesobject::w_bytes_from_bytes(&cfield::clone_as_null_terminated(raw));
+        let copy = pyre_object::with_roots!(dest, value => pyre_object::bytesobject::w_bytes_from_bytes(&cfield::clone_as_null_terminated(raw)));
         // Retain the copy before reading its address, so a GC triggered while
         // inserting the keepalive cannot leave the stored pointer stale.  Until
         // `keep_alive` links it into the root, only this frame holds the copy and

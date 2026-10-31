@@ -4175,7 +4175,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // residual when capacity is not constant. Bind the word-ABI
     // `__majit_call_target_*` adapter (`dont_look_inside` / `getfunctionptr`
     // residual entry), not the raw Rust `unsafe fn` — residual CondCall
-    // passes one i64 per slot.
+    // passes one i64 per slot. The dispatch wrapper's jitted branch
+    // residual-calls `<name>_trampoline`, which is published the same way.
     cpa3!(
         &mut entries,
         "pyre_object::listobject::ll_list_obj_resize_hint_really",
@@ -4199,6 +4200,36 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::listobject::ll_list_ascii_resize_hint_really",
         "pyre_object::ll_list_ascii_resize_hint_really",
         pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_obj_resize_hint_really_trampoline",
+        "pyre_object::ll_list_obj_resize_hint_really_trampoline",
+        pyre_object::listobject::__majit_call_target_ll_list_obj_resize_hint_really_trampoline,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_int_resize_hint_really_trampoline",
+        "pyre_object::ll_list_int_resize_hint_really_trampoline",
+        pyre_object::listobject::__majit_call_target_ll_list_int_resize_hint_really_trampoline,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_float_resize_hint_really_trampoline",
+        "pyre_object::ll_list_float_resize_hint_really_trampoline",
+        pyre_object::listobject::__majit_call_target_ll_list_float_resize_hint_really_trampoline,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::listobject::ll_list_ascii_resize_hint_really_trampoline",
+        "pyre_object::ll_list_ascii_resize_hint_really_trampoline",
+        pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really_trampoline,
+    );
+    cpa3!(
+        &mut entries,
+        "pyre_object::listobject::w_list_resync_allocated",
+        "pyre_object::w_list_resync_allocated",
+        pyre_object::listobject::__majit_call_target_w_list_resync_allocated,
     );
     up2!(
         &mut entries,

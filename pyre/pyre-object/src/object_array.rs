@@ -980,7 +980,7 @@ pub unsafe fn grow_list_items_block_gc(
 /// `count` is a non-negative capacity.
 #[inline(never)]
 #[majit_macros::oopspec("newlist_clear(count)")]
-unsafe fn ll_new_items_array(count: i64) -> *mut ItemsBlock {
+pub(crate) unsafe fn ll_new_items_array(count: i64) -> *mut ItemsBlock {
     let count = count as usize;
     unsafe {
         let (block, _) = alloc_items_block_gc(count);

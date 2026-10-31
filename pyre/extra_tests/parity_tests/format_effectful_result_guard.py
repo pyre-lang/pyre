@@ -14,7 +14,11 @@ except ImportError:
 if pypyjit is not None:
     pypyjit.set_param("threshold=1,function_threshold=1")
 
-N = 30000
+# Both JIT thresholds are 1: 4000 iterations still compile hundreds of
+# __format__ entries and cross the result-type transition after warmup.
+# At 30000 even PyPy records roughly 3760 entries; that repetition adds no
+# correctness coverage and can exhaust the runner's 30-second wall budget.
+N = 4000
 SWITCH = N // 2
 
 

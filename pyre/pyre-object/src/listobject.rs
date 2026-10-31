@@ -526,7 +526,22 @@ impl W_ListObject {
     }
 
     fn sync_allocated(&mut self, old_size: usize) {
-        self.allocated = self.resized_allocation(old_size, self.live_len()) as isize;
+        // `list_resize` keeps `allocated` while `allocated >> 1 <= new_size <=
+        // allocated`. The band test uses non-short-circuit `&` so a trace records
+        // no guard for it, and the recompute outside the band is a
+        // `jit.conditional_call` (`rlist.py _ll_list_resize_ge`).
+        let new_size = self.live_len();
+        let allocated = self.allocated;
+        let keep = (allocated >= 0)
+            & ((allocated as usize) >= new_size)
+            & (new_size >= ((allocated as usize) >> 1));
+        majit_rlib::jit::conditional_call3(
+            !keep,
+            w_list_resync_allocated,
+            self as *mut W_ListObject as PyObjectRef,
+            old_size as i64,
+            new_size as i64,
+        );
     }
 
     #[inline]
@@ -1064,6 +1079,15 @@ impl W_ListObject {
     }
 }
 
+/// Recompute the emulated `list_resize` `allocated` after a resize left its
+/// band; the residual target of `W_ListObject::sync_allocated`'s
+/// `jit.conditional_call`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_resync_allocated(obj: PyObjectRef, old_size: i64, new_size: i64) {
+    let list = &mut *(obj as *mut W_ListObject);
+    list.allocated = list.resized_allocation(old_size as usize, new_size as usize) as isize;
+}
+
 /// Publish an already-built `BytesArray` as this list's `bytes_items`,
 /// under [`W_ListObject::bytes_grow`]'s barrier discipline.
 ///
@@ -1377,8 +1401,17 @@ fn boxed_from_int_or_float(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectR
     items
 }
 
-/// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy.
-unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
+/// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy, fused
+/// with its `int_2_float_or_int` conversion.
+///
+/// Upstream's switch is traceable and only the looping `int_2_float_or_int`
+/// is left residual by the codewriter policy. Here conversion, storage
+/// installation and the strategy store are one residual: `IntArray::install`
+/// tears down the outgoing block, whose dealloc is a GC safepoint, so the
+/// installation stays out of traced code too.
+#[majit_macros::dont_look_inside]
+unsafe fn integer_to_int_or_float(obj: PyObjectRef) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
     let source = list.int_items.as_slice();
     let mut values = Vec::with_capacity(source.len());
     for &value in source {
@@ -1392,8 +1425,17 @@ unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
     true
 }
 
-/// listobject.py FloatListStrategy.switch_to_int_or_float_strategy.
-unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
+/// listobject.py FloatListStrategy.switch_to_int_or_float_strategy, fused
+/// with its `float_2_float_or_int` conversion.
+///
+/// Upstream's switch is traceable and only the looping `float_2_float_or_int`
+/// is left residual by the codewriter policy. Here conversion, storage
+/// installation and the strategy store are one residual: `IntArray::install`
+/// and `FloatArray::install` tear down the outgoing blocks, whose dealloc is a
+/// GC safepoint, so the installation stays out of traced code too.
+#[majit_macros::dont_look_inside]
+unsafe fn float_to_int_or_float(obj: PyObjectRef) -> bool {
+    let list = &mut *(obj as *mut W_ListObject);
     let source = list.float_items.as_slice();
     let mut values = Vec::with_capacity(source.len());
     for &value in source {
@@ -1777,13 +1819,20 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         let list = &mut *(obj as *mut W_ListObject);
         list.strategy = ListStrategy::Ascii;
     } else {
+        // `ObjectListStrategy.get_empty_storage(sizehint)` is
+        // `erase(newlist_hint(sizehint))`: `sizehint` fresh slots, or the
+        // prebuilt empty array (`ll_newemptylist`) for no hint.
+        let block = if sizehint == 0 {
+            crate::object_array::ll_prebuilt_empty_items_block()
+        } else {
+            crate::object_array::ll_new_items_array(sizehint as i64)
+        };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
+        list_write_barrier(obj);
         let list = &mut *(obj as *mut W_ListObject);
         list.set_length_relaxed(0);
-        // `ll_newemptylist`: `l.items = _ll_prebuilt_empty_array(...)`.
-        list.items = crate::object_array::ll_prebuilt_empty_items_block();
+        list.items = block;
         list.strategy = ListStrategy::Object;
-        let _ = W_ListObject::object_resize_capacity(obj, sizehint);
     }
     crate::gc_roots::shadow_stack_get(root_base)
 }
@@ -3723,14 +3772,55 @@ fn ll_list_obj_resize_hint_really_iff(obj: PyObjectRef, newsize: i64, _overalloc
     }
 }
 
-/// `rlist.py _ll_list_resize_hint_really` — grow `l.items` with the
-/// 0, 4, 8, 16, 25, … over-allocation. `W_ListObject::object_grow`
-/// already applies that formula.
+/// `rlist.py _ll_list_resize_hint_really` — reallocate `l.items` to
+/// `newsize` slots, over-allocated (0, 4, 8, 16, 25, …) when `overallocate`.
 #[majit_macros::look_inside_iff(ll_list_obj_resize_hint_really_iff)]
 pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: i64, overallocate: bool) {
-    let list = &*(obj as *const W_ListObject);
-    if overallocate || newsize > ll_list_obj_capacity(list) as i64 {
-        let _ = W_ListObject::object_grow(obj, newsize as usize);
+    // rlist.py `_ll_list_resize_hint_really`: malloc then `l.items = newitems`.
+    // `ll_new_items_array` allocates; pin the owner and reload it before the setfield.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    if newsize <= 0 {
+        debug_assert!(newsize == 0, "negative list length");
+        let list = &mut *(obj as *mut W_ListObject);
+        let old = list.items;
+        ll_list_obj_set_len(list, 0);
+        list.items = crate::object_array::ll_prebuilt_empty_items_block();
+        if !majit_rlib::jit::we_are_jitted() {
+            dealloc_list_items_block(old);
+        }
+        return;
+    }
+    let new_allocated = if overallocate {
+        crate::object_array::rlist_overallocate_signed(newsize)
+    } else {
+        newsize
+    };
+    // `newitems = malloc(LIST.items.TO, new_allocated)`: nothing between the
+    // malloc and `l.items = newitems` collects, so `newitems` needs no root.
+    let newitems = crate::object_array::ll_new_items_array(new_allocated);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    let old = list.items;
+    let before_len = ll_list_obj_length(&*list);
+    // `if before_len:` — an empty list's block may be the prebuilt empty array.
+    if before_len > 0 {
+        let p = if (before_len as i64) < newsize {
+            before_len
+        } else {
+            newsize as usize
+        };
+        // `rgc.ll_arraycopy(l.items, newitems, 0, 0, p)`.
+        crate::object_array::ll_arraycopy_items_block(old, newitems, 0, 0, p as i64);
+    }
+    // The barrier gctransform puts before `l.items = newitems`.
+    list_write_barrier(obj);
+    list.items = newitems;
+    // A block outside the collector's heap has no other owner to free it; a
+    // collector-owned one is left to the collector.
+    if !majit_rlib::jit::we_are_jitted() {
+        dealloc_list_items_block(old);
     }
 }
 
@@ -4325,7 +4415,9 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 let base = roots.base();
                 let _ = roots.pin_root(obj);
                 let _ = roots.pin_root(value);
-                if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                if is_float_strategy_item(value)
+                    && integer_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
+                {
                     w_list_setitem_inner(roots.get(base), index, roots.get(base + 1))
                 } else {
                     let obj = switch_to_object_strategy(list);
@@ -4367,7 +4459,7 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
                 let _ = roots.pin_root(value);
                 if is_plain_int1(value)
                     && int_or_float_encode_int(plain_int_w(value)).is_some()
-                    && float_to_int_or_float(list)
+                    && float_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
                 {
                     w_list_setitem_inner(roots.get(base), index, roots.get(base + 1))
                 } else {
@@ -4585,7 +4677,9 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 let base = roots.base();
                 let _ = roots.pin_root(obj);
                 let _ = roots.pin_root(value);
-                if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+                if is_float_strategy_item(value)
+                    && integer_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
+                {
                     w_list_append_inner(roots.get(base), roots.get(base + 1));
                 } else {
                     let obj = switch_to_object_strategy(list);
@@ -4620,7 +4714,7 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
                 let _ = roots.pin_root(value);
                 if is_plain_int1(value)
                     && int_or_float_encode_int(plain_int_w(value)).is_some()
-                    && float_to_int_or_float(list)
+                    && float_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
                 {
                     w_list_append_inner(roots.get(base), roots.get(base + 1));
                 } else {
@@ -5437,7 +5531,9 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
                 list.sync_allocated(old_size);
                 return;
             }
-            if is_float_strategy_item(value) && integer_to_int_or_float(list) {
+            if is_float_strategy_item(value)
+                && integer_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
+            {
                 w_list_insert(
                     crate::gc_roots::shadow_stack_get(root_base),
                     index,
@@ -5475,7 +5571,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             }
             if is_plain_int1(value)
                 && int_or_float_encode_int(plain_int_w(value)).is_some()
-                && float_to_int_or_float(list)
+                && float_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
             {
                 w_list_insert(
                     crate::gc_roots::shadow_stack_get(root_base),
@@ -6829,7 +6925,7 @@ unsafe fn w_list_setslice_inner(
                 other.strategy,
                 ListStrategy::Float | ListStrategy::IntOrFloat
             )
-            && integer_to_int_or_float(list)
+            && integer_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
         {
             return w_list_setslice_inner(obj, start, end, w_other, we_are_jitted);
         }
@@ -6838,7 +6934,7 @@ unsafe fn w_list_setslice_inner(
                 other.strategy,
                 ListStrategy::Integer | ListStrategy::IntOrFloat
             )
-            && float_to_int_or_float(list)
+            && float_to_int_or_float(list as *mut W_ListObject as PyObjectRef)
         {
             return w_list_setslice_inner(obj, start, end, w_other, we_are_jitted);
         }

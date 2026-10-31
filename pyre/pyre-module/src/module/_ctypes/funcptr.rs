@@ -1231,6 +1231,17 @@ fn validate_paramflags(
     let Some(argtypes) = argtypes else {
         return Ok(paramflags);
     };
+    // `function.py CFuncPtr._setparamflags` keeps the argtype sequence alive
+    // while validating each flag. Its borrowed Rust slice must keep forwarded
+    // words too when an out-parameter type check runs Python.
+    let roots = pyre_object::gc_roots::push_roots();
+    let flags_slot = roots.pin_roots(&[paramflags]);
+    let mut rooted_argtypes = pyre_object::gc_roots::RootedItems::new();
+    for &at in argtypes {
+        rooted_argtypes.push(at);
+    }
+    let argtypes = rooted_argtypes;
+    paramflags = roots.get(flags_slot);
     let len = unsafe { pyre_object::w_tuple_len(paramflags) };
     if len != argtypes.len() {
         return Err(pyre_interpreter::PyError::value_error(
@@ -1242,22 +1253,23 @@ fn validate_paramflags(
             "paramflags must be a sequence of (int [,string [,value]]) tuples",
         )
     };
-    for (i, &at) in argtypes.iter().enumerate() {
-        let item =
-            unsafe { pyre_object::w_tuple_getitem(paramflags, i as i64) }.ok_or_else(malformed)?;
+    for i in 0..argtypes.len() {
+        let mut at = argtypes.get(i);
+        let mut item =
+            pyre_object::with_roots!(paramflags, at => unsafe { pyre_object::w_tuple_getitem(paramflags, i as i64) }).ok_or_else(malformed)?;
         if !unsafe { pyre_object::is_tuple(item) } {
             return Err(malformed());
         }
         let item_len = unsafe { pyre_object::w_tuple_len(item) };
-        if !(1..=3).contains(&item_len) {
+        if !pyre_object::with_roots!(paramflags, at, item => (1..=3).contains(&item_len)) {
             return Err(malformed());
         }
-        let flag = unsafe { pyre_object::w_tuple_getitem(item, 0) }.ok_or_else(malformed)?;
+        let mut flag = pyre_object::with_roots!(paramflags, at, item => unsafe { pyre_object::w_tuple_getitem(item, 0) }).ok_or_else(malformed)?;
         if !unsafe { pyre_object::is_int(flag) } {
             return Err(malformed());
         }
         if item_len > 1 {
-            let name = unsafe { pyre_object::w_tuple_getitem(item, 1) }.ok_or_else(malformed)?;
+            let name = pyre_object::with_roots!(paramflags, at, flag => unsafe { pyre_object::w_tuple_getitem(item, 1) }).ok_or_else(malformed)?;
             if !unsafe { pyre_object::is_none(name) } && !unsafe { pyre_object::is_str(name) } {
                 return Err(malformed());
             }

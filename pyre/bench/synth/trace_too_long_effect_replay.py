@@ -41,12 +41,15 @@ while i < N:
     free_total = free_total + x
     i = i + 1
 
+# The 100/101 post-step cutoff differs between native and wasm: wasm
+# takes two extra aborts and one bridge. 96..99 exercises the same abort
+# path on all three backends; use 98 within that shared interval.
 # Phase B — the same shape with the limit raised past the body's own length,
 # so the check lands mid-body, and with one effect per rollback class: a list
 # slot store is journaled, a dict store and a list append historically were
 # not. Each counter must read exactly N; a replayed iteration shows up as
 # N + 1.
-set_trace_limit(100)
+set_trace_limit(98)
 
 box = [0]
 d = {"k": 0}
@@ -86,5 +89,12 @@ def function_entry_effects(n):
     return total, box[0], d["k"], len(obj)
 
 
-set_trace_limit(100)
+set_trace_limit(98)
 print(function_entry_effects(N))
+
+
+# Scope the small trace limit and threshold=1 to this fixture. Otherwise
+# importlib/weakref shutdown callbacks become unrelated, target-dependent
+# traces in its counters (rlib/jit.py set_user_param, "default").
+if pypyjit is not None:
+    pypyjit.set_param("default")
