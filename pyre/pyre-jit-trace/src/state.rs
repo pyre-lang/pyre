@@ -12387,70 +12387,16 @@ impl JitState for PyreJitState {
                 sym.bridge_registers_r.replace(bridge_registers_r.clone());
             }
         }
-        // pyjitpl.py `rebuild_state_after_failure` tail —
-        // `consume_virtualref_boxes` (resume.py):
-        //   for i in range(0, len(virtualref_boxes), 2):
-        //       virtual_box = virtualref_boxes[i]
-        //       vref_box    = virtualref_boxes[i + 1]
-        //   self.virtualref_boxes += [virtual_box, vref_box]
-        // The parent guard already encoded the resumed pair sequence into
-        // `rd_numb`'s vref section (resume.py `consume_vref_and_vable`
-        // → `consume_virtualref_info`), and `rebuild_from_numbering`
-        // (majit/majit-ir/src/resumedata.rs) decoded it into
-        // `resume_data.virtualref_values`. Materialize the OpRef + concrete
-        // pointer for each pair through the same `resolve` / `decode_concrete`
-        // callbacks used for `frames[0].values`, then hand the pairs to the
-        // trace's own `virtualref_boxes` — the single store, matching
-        // upstream's one `MetaInterp.virtualref_boxes` — so an inlined call's
-        // `virtual_ref_finish` and the residual-call bracket both observe the
-        // parent's still-open virtualref scope at bridge entry.
-        //
-        // For traces with no active `virtual_ref`, `virtualref_values` is
-        // empty and this loop is a no-op.
-        let vref_values = &resume_data.virtualref_values;
-        // resume.py:1397 `vrefinfo.continue_tracing(vref, virtual_val)` —
-        // restore `JitVirtualRef.forced = virtual` and clear
-        // `virtual_token` for every still-active pair. The runtime
-        // mutation lives on the live JitVirtualRef heap object, so the
-        // call is gated on a non-null concrete `vref_ptr`. Pyre's
-        // `VirtualRefInfo::new()` (majit-metainterp/src/virtualref.rs)
-        // is a cheap struct-only constructor — instantiate once outside
-        // the loop instead of per-pair.
-        let vrefinfo = majit_metainterp::virtualref::VirtualRefInfo::new();
+        // `consume_vref_and_vable_boxes` decoded the virtualref stream;
+        // `start_bridge_tracing` already ran
+        // `MetaInterp.rebuild_state_after_failure` reconnection
+        // (`self.virtualref_boxes = virtualref_boxes` then
+        // `vrefinfo.continue_tracing`) before this fill.
         assert_eq!(
             boxes.virtualref_boxes.len(),
-            vref_values.len(),
+            resume_data.virtualref_values.len(),
             "consume_vref_and_vable_boxes decoded the virtualref stream"
         );
-        let mut restored_virtualref_boxes: Vec<(OpRef, usize)> =
-            Vec::with_capacity(vref_values.len());
-        for pair in boxes.virtualref_boxes.chunks_exact(2) {
-            let (virt_opref, virt_val) = pair[0];
-            let (vref_opref, vref_val) = pair[1];
-            // `pyjitpl.py rebuild_state_after_failure`: `getref_base()` at
-            // reconnection. A box the BoxReader cache still roots is read
-            // there; a recording reader roots no failargs, so its box reads
-            // the concrete `consume_vref_and_vable_boxes` decoded.
-            let virt_ptr = majit_metainterp::live_bridge_ref_addr(ctx, virtuals_cache, virt_opref)
-                .unwrap_or_else(|| value_to_usize(&virt_val));
-            let vref_ptr = majit_metainterp::live_bridge_ref_addr(ctx, virtuals_cache, vref_opref)
-                .unwrap_or_else(|| value_to_usize(&vref_val));
-            restored_virtualref_boxes.push((virt_opref, virt_ptr));
-            restored_virtualref_boxes.push((vref_opref, vref_ptr));
-            // pyjitpl.py:3438 / resume.py:1397: continue_tracing is called
-            // unconditionally for every (vref, real_object) pair. The
-            // is_virtual_ref(vref) guard (virtualref.py) and the
-            // `assert real_object` invariant (virtualref.py, ported as
-            // debug_assert!) both live inside continue_tracing itself
-            // (in `virtualref.rs`) — the outer virt_ptr guard masked
-            // exactly the case RPython asserts on, so do not pre-gate here.
-            unsafe {
-                vrefinfo.continue_tracing(
-                    vref_ptr as majit_gc::header::GCREF,
-                    virt_ptr as majit_gc::header::GCREF,
-                );
-            }
-        }
         // `ExecutionContext.topframeref` is a live heap field, so unlike the
         // RPython locals `rebuild_state_after_failure` reconstructs, whatever
         // the dead trace last stored there is still in it.  A trace that
@@ -12461,13 +12407,13 @@ impl JitState for PyreJitState {
         // no armed `jf_force_descr`.
         //
         // The resume data says what the slot should hold: the innermost scope
-        // the guard still had open, whose vref the `continue_tracing` loop
-        // above has just repaired, or — with no scope open — the resumed frame
-        // itself.  Rewrite only when the slot holds some *other* vref; an
+        // the guard still had open, whose vref the reconnection
+        // `start_bridge_tracing` ran before `setup_bridge_sym` has just
+        // repaired, or — with no scope open — the resumed frame itself.
+        // Rewrite only when the slot holds some *other* vref; an
         // already-correct slot (every non-abandoning exit) is left alone.
-        let restored_top = restored_virtualref_boxes
-            .last()
-            .map(|&(_, vref_ptr)| vref_ptr)
+        let restored_top = ctx
+            .last_virtualref_ptr()
             .unwrap_or(resume_decoded_vable_addr(boxes));
         let live_ec = sym.concrete_execution_context as *mut pyre_interpreter::PyExecutionContext;
         if !live_ec.is_null() && restored_top != 0 {
@@ -12480,7 +12426,7 @@ impl JitState for PyreJitState {
             // and close the wrong concrete chain on leave.  With no scope open
             // `restored_top` is the resumed frame itself, and only a stale vref
             // in the slot is worth overwriting.
-            let stale_scope = !restored_virtualref_boxes.is_empty()
+            let stale_scope = ctx.virtualref_boxes_len() != 0
                 || unsafe {
                     majit_metainterp::virtualref::ptr_is_virtual_ref(
                         published as majit_gc::header::GCREF,
@@ -12492,8 +12438,6 @@ impl JitState for PyreJitState {
                 }
             }
         }
-        // `pyjitpl.py self.virtualref_boxes = virtualref_boxes`.
-        ctx.restore_virtualref_boxes(restored_virtualref_boxes);
 
         // `sync_virtualizable_after_guard_failure` runs before bridge setup,
         // but on the multi-frame inlined-callee path its resume-decoded array
@@ -16037,6 +15981,12 @@ mod tests {
             &fail_types,
             &mut reader,
         );
+        let virtualref_boxes: Vec<(OpRef, usize)> = boxes
+            .virtualref_boxes
+            .iter()
+            .map(|&(op, val)| (op, super::value_to_usize(&val)))
+            .collect();
+        majit_metainterp::reconnect_virtualrefs(&mut ctx, virtualref_boxes, &reader);
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
@@ -16159,6 +16109,12 @@ mod tests {
             &fail_types,
             &mut reader,
         );
+        let virtualref_boxes: Vec<(OpRef, usize)> = boxes
+            .virtualref_boxes
+            .iter()
+            .map(|&(op, val)| (op, super::value_to_usize(&val)))
+            .collect();
+        majit_metainterp::reconnect_virtualrefs(&mut ctx, virtualref_boxes, &reader);
         <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
             &mut sym,
             &mut ctx,
