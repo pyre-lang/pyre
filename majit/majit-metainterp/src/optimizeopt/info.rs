@@ -1238,8 +1238,9 @@ fn force_box_emit(
     // `force_direct` or `in_final_emission`: `Optimizer.emit_extra` →
     // `_emit_operation` (force each arg, then append).
     // Otherwise, with an optimizer: `Optimization.emit_extra` walks from the
-    // next pass immediately (`emit_extra_immediate`), same `OpRc`.
+    // next pass immediately (`emit_extra_immediate`) on this `OpRc`.
     // Without an optimizer the op stays on the `emit_extra` queue.
+    // The op that landed is `Optimizer.getlastop`'s question (`emit_forced`).
     fn emit_op_rc(
         ctx: &mut crate::optimizeopt::OptContext,
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
@@ -1276,19 +1277,89 @@ fn force_box_emit(
     ) -> majit_ir::OpRc {
         emit_op_rc(ctx, optimizer, majit_ir::OpRc::new(op))
     }
-    // info.py `AbstractVirtualPtrInfo.force_box`: `op.set_forwarded(None);
-    // optforce.emit_extra(op)` — the allocation is the virtual's own
-    // operation, so `newop is op` and no forwarding is needed.
+    // info.py `AbstractVirtualPtrInfo.force_box`:
+    //   op.set_forwarded(None)
+    //   optforce.emit_extra(op)
+    //   newop = optforce.optimizer.getlastop()
+    //   if newop is not op:
+    //       op.set_forwarded(newop)
+    // `Optimizer.getlastop` is the emitted list (`_really_emitted_operation`
+    // upstream; `new_operations.last()` here). No optimizer reads that same
+    // list. A queued `emit_extra` or a later `Remove` does not append this
+    // allocation, and `getlastop` would then name an unrelated earlier op, so
+    // it is read only once the allocation — or the `OpRc` a pass replaced it
+    // with — is in the list.
+    fn allocation_was_emitted(
+        ctx: &crate::optimizeopt::OptContext,
+        alloc: &majit_ir::OpRc,
+        len_before: usize,
+    ) -> bool {
+        let suffix = &ctx.new_operations[len_before..];
+        if suffix.iter().any(|rc| OpRc::ptr_eq(rc, alloc)) {
+            return true;
+        }
+        if let majit_ir::forwarding::Forwarded::Op(target) =
+            Operand::from_bound_op(alloc).get_forwarded()
+        {
+            return suffix.iter().any(|rc| OpRc::ptr_eq(rc, &target));
+        }
+        false
+    }
+
+    /// `newop = optforce.optimizer.getlastop()` once `emit_extra` appended.
+    fn emitted_newop(
+        ctx: &crate::optimizeopt::OptContext,
+        optimizer: &Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        alloc: &majit_ir::OpRc,
+        len_before: usize,
+    ) -> majit_ir::OpRc {
+        if !allocation_was_emitted(ctx, alloc, len_before) {
+            return alloc.clone();
+        }
+        let same = {
+            let via_getlastop = match optimizer {
+                Some(opt) => opt.getlastop(ctx).map(|op| op as *const Op),
+                None => ctx.new_operations.last().map(|rc| rc.as_ref() as *const Op),
+            };
+            let via_list = ctx.new_operations.last().map(|rc| rc.as_ref() as *const Op);
+            debug_assert_eq!(
+                via_getlastop, via_list,
+                "Optimizer.getlastop and new_operations.last() are one list"
+            );
+            match via_getlastop {
+                Some(ptr) => ptr == OpRc::as_ptr(alloc),
+                None => true,
+            }
+        };
+        if same {
+            alloc.clone()
+        } else {
+            ctx.new_operations
+                .last()
+                .cloned()
+                .expect("an appended allocation has a getlastop")
+        }
+    }
+
     fn emit_forced(
         ctx: &mut crate::optimizeopt::OptContext,
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         op: &Operand,
     ) -> majit_ir::OpRc {
-        let newop = op
+        let alloc = op
             .bound_op()
             .expect("a virtual is the result of an operation");
+        let len_before = ctx.new_operations.len();
+        // op.set_forwarded(None)
         op.clear_forwarded();
-        emit_op_rc(ctx, optimizer, newop)
+        // optforce.emit_extra(op) — returns this OpRc, not getlastop.
+        let alloc = emit_op_rc(ctx, optimizer, alloc);
+        let newop = emitted_newop(ctx, optimizer, &alloc, len_before);
+        // if newop is not op: op.set_forwarded(newop)
+        if !OpRc::ptr_eq(&newop, &alloc) {
+            op.set_forwarded_op(&newop);
+        }
+        newop
     }
 
     // Descr-derived view of the full fielddescr slot list, used by both
@@ -1399,7 +1470,7 @@ fn force_box_emit(
             });
             let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // info.py `newop.set_forwarded(self)` — unconditional.
-            ctx.set_ptr_info(op, preserved);
+            ctx.set_ptr_info(&Operand::from_bound_op(&alloc_rc), preserved);
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!(
                     "[jit][force-box] virtual-struct {:?} in_final_emission={} pass_idx={}",
@@ -1462,7 +1533,7 @@ fn force_box_emit(
             });
             let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // info.py `newop.set_forwarded(self)` — unconditional.
-            ctx.set_ptr_info(op, preserved);
+            ctx.set_ptr_info(&Operand::from_bound_op(&alloc_rc), preserved);
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!(
                     "[jit][force-box] virtual {:?} in_final_emission={} pass_idx={}",
@@ -1522,7 +1593,7 @@ fn force_box_emit(
             let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // Install before the item stores: a child that points back at
             // this box must see the non-virtual array.
-            ctx.set_ptr_info(op, preserved);
+            ctx.set_ptr_info(&Operand::from_bound_op(&alloc_rc), preserved);
 
             // info.py:542: const = optforce.optimizer.new_const_item(self.descr)
             // info.py:546-548: skip items equal to the default when _clear=True
@@ -1595,7 +1666,7 @@ fn force_box_emit(
             let alloc_rc = emit_forced(ctx, &mut optimizer, op);
             // Install before the interior stores: a child that points back
             // at this box must see the non-virtual array.
-            ctx.set_ptr_info(op, preserved);
+            ctx.set_ptr_info(&Operand::from_bound_op(&alloc_rc), preserved);
 
             // info.py:672: fielddescrs = op.getdescr().get_all_fielddescrs()
             let fielddescrs: Vec<majit_ir::DescrRef> = vinfo
@@ -1665,7 +1736,7 @@ fn force_box_emit(
             // from the check.py corpus, so that cascade is ungateable here.
             // nonnull() preserves nonnull-ness; a later RAW_LOAD/RAW_STORE just
             // residualizes (getrawptrinfo→None), which is the correct result.
-            ctx.set_ptr_info(op, PtrInfo::nonnull());
+            ctx.set_ptr_info(&Operand::from_bound_op(&alloc_rc), PtrInfo::nonnull());
 
             // info.py:425: CHECK_MEMORY_ERROR
             let arg_alloc = Operand::from_bound_op(&alloc_rc);
@@ -1722,9 +1793,9 @@ fn force_box_emit(
             let new_rc = emit_forced(ctx, &mut optimizer, op);
             // Preserve raw-slice identity; mark non-virtual via
             // `parent = OpRef::NONE` (RPython `self.parent = None`).
-            // info.py `newop.set_forwarded(self)`, unconditional.
+            // info.py `newop.set_forwarded(self)`, unconditional, on getlastop.
             ctx.set_ptr_info(
-                op,
+                &Operand::from_bound_op(&new_rc),
                 PtrInfo::VirtualRawSlice(RawSlicePtrInfo {
                     offset: slice.offset,
                     parent: Operand::None,
@@ -1787,7 +1858,6 @@ fn force_box_emit(
                 VStringVariant::Ptr => unreachable!(),
             };
 
-            // vstring.py:93-96: newop = ResOperation(mode.NEWSTR, [lengthbox])
             let new_opcode = if is_unicode {
                 OpCode::Newunicode
             } else {
@@ -1795,10 +1865,21 @@ fn force_box_emit(
             };
             let arg_length = lengthbox;
             let newstr_op = Op::new(new_opcode, std::slice::from_ref(&arg_length));
-            let newop_rc = emit_op(ctx, &mut optimizer, newstr_op);
+            // vstring.py `StrPtrInfo.force_box`:
+            //   newop = ResOperation(mode.NEWSTR, [lengthbox])
+            //   optforce.emit_extra(newop)
+            //   newop = optforce.optimizer.getlastop()
+            //   newop.set_forwarded(self)
+            // The fresh allocation is not the virtual's box, so this rebinds
+            // the local (there is no `if newop is not op` here). The original
+            // virtual is forwarded below. A queued emit or `Remove` leaves the
+            // fresh `OpRc`: `getlastop` would name an unrelated earlier op.
+            let len_before = ctx.new_operations.len();
+            let fresh_rc = emit_op(ctx, &mut optimizer, newstr_op);
+            let newop_rc = emitted_newop(ctx, &optimizer, &fresh_rc, len_before);
             let newop_box = Operand::from_bound_op(&newop_rc);
 
-            // vstring.py:98: newop.set_forwarded(self) — unconditional.
+            // vstring.py `newop.set_forwarded(self)` — unconditional, on getlastop.
             ctx.set_ptr_info(
                 &newop_box,
                 PtrInfo::Str(StrPtrInfo {
@@ -2391,6 +2472,186 @@ mod tests {
 
         assert_eq!(ops[0].opcode, OpCode::NewWithVtable);
         assert_eq!(setfield_offsets(&ops), vec![24, 16]);
+    }
+
+    /// `PassOn` so `emit_extra` has a later pass to reach and actually append.
+    struct PassOnOpt;
+
+    impl crate::optimizeopt::Optimization for PassOnOpt {
+        fn propagate_forward(
+            &mut self,
+            _op: &Op,
+            _op_rc: &OpRc,
+            _ctx: &mut OptContext,
+        ) -> crate::optimizeopt::OptimizationResult {
+            crate::optimizeopt::OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "passon"
+        }
+    }
+
+    /// Postprocess appends a marker after `NEW` is in `new_operations`, so
+    /// `Optimizer.getlastop` is not the allocation. Production `NEW*` passes
+    /// do not do this; the pass exists to exercise the forward.
+    struct EmitAfterNew;
+
+    impl crate::optimizeopt::Optimization for EmitAfterNew {
+        fn propagate_forward(
+            &mut self,
+            _op: &Op,
+            _op_rc: &OpRc,
+            _ctx: &mut OptContext,
+        ) -> crate::optimizeopt::OptimizationResult {
+            crate::optimizeopt::OptimizationResult::PassOn
+        }
+
+        fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+            opcode == OpCode::New
+        }
+
+        fn propagate_postprocess(&mut self, _op: &Op, _op_rc: &OpRc, ctx: &mut OptContext) {
+            ctx.emit(Op::new(
+                OpCode::IntAdd,
+                &[
+                    Operand::const_from_value(Value::Int(1)),
+                    Operand::const_from_value(Value::Int(2)),
+                ],
+            ));
+        }
+
+        fn name(&self) -> &'static str {
+            "emit-after-new"
+        }
+    }
+
+    fn one_field_virtual_struct(ctx: &mut OptContext) -> Operand {
+        let field: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+            name: "payload",
+        });
+        let descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![field],
+            gc_fields: vec![],
+            w_class: 0,
+        });
+        let mut info = PtrInfo::virtual_struct(descr.clone());
+        info.setfield(0, Operand::const_from_value(Value::Int(42)));
+        let new_rc = OpRc::new(Op::with_descr(OpCode::New, &[], descr));
+        let virtual_box = Operand::from_bound_op(&new_rc);
+        ctx.set_ptr_info(&virtual_box, info);
+        virtual_box
+    }
+
+    /// `AbstractVirtualPtrInfo.force_box`: the returned box is `getlastop`
+    /// at the allocation emit. `_force_elements` then emits `SETFIELD_GC`
+    /// on that box, so the tail of `new_operations` is the store.
+    #[test]
+    fn force_box_returned_box_is_emitted_allocation() {
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(PassOnOpt));
+        opt.add_pass(Box::new(PassOnOpt));
+        let mut ctx = OptContext::new(8);
+        ctx.current_pass_idx = 0;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
+        let virtual_box = one_field_virtual_struct(&mut ctx);
+
+        let forced = opt.force_box(&virtual_box, &mut ctx);
+
+        let returned = forced.bound_op().expect("forced box is an op");
+        assert_eq!(returned.opcode, OpCode::New);
+        let alloc = ctx
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::New)
+            .expect("allocation emitted");
+        assert!(
+            OpRc::ptr_eq(alloc, &returned),
+            "getlastop at the allocation is that NEW"
+        );
+        let setfield = ctx
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("payload SETFIELD_GC");
+        let arg0 = setfield.arg(0).bound_op().expect("SETFIELD_GC arg0");
+        assert!(
+            OpRc::ptr_eq(&arg0, &returned),
+            "SETFIELD_GC is built on newop"
+        );
+        assert!(
+            !OpRc::ptr_eq(ctx.new_operations.last().expect("emitted"), &returned),
+            "the store is emitted after getlastop"
+        );
+        assert!(
+            matches!(
+                virtual_box.get_forwarded(),
+                majit_ir::forwarding::Forwarded::Info(_)
+            ),
+            "newop is op, so the allocation is not forwarded elsewhere"
+        );
+        let info = ctx
+            .peek_ptr_info(&forced)
+            .expect("newop.set_forwarded(self)");
+        assert!(matches!(info, PtrInfo::Struct(_)));
+        assert!(!info.is_virtual());
+    }
+
+    /// A later pass's postprocess appends after the allocation, so
+    /// `getlastop` is that marker and `op.set_forwarded(newop)` is taken.
+    #[test]
+    fn force_box_forwards_when_later_pass_emits_after_alloc() {
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(PassOnOpt));
+        opt.add_pass(Box::new(EmitAfterNew));
+        let mut ctx = OptContext::new(8);
+        ctx.current_pass_idx = 0;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
+        let virtual_box = one_field_virtual_struct(&mut ctx);
+
+        let forced = opt.force_box(&virtual_box, &mut ctx);
+
+        assert_eq!(
+            ctx.new_operations
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>(),
+            vec![OpCode::New, OpCode::IntAdd, OpCode::SetfieldGc]
+        );
+        let returned = forced.bound_op().expect("forced box is getlastop");
+        assert_eq!(returned.opcode, OpCode::IntAdd);
+        let marker = ctx
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::IntAdd)
+            .expect("postprocess marker");
+        assert!(OpRc::ptr_eq(marker, &returned));
+        match virtual_box.get_forwarded() {
+            majit_ir::forwarding::Forwarded::Op(target) => {
+                assert!(
+                    OpRc::ptr_eq(&target, &returned),
+                    "op.set_forwarded(newop) targets getlastop"
+                );
+            }
+            _ => panic!("allocation must forward to getlastop"),
+        }
+        let setfield = ctx
+            .new_operations
+            .iter()
+            .find(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("payload SETFIELD_GC");
+        let arg0 = setfield.arg(0).bound_op().expect("SETFIELD_GC arg0");
+        assert!(OpRc::ptr_eq(&arg0, &returned));
+        let info = ctx
+            .peek_ptr_info(&forced)
+            .expect("newop.set_forwarded(self)");
+        assert!(matches!(info, PtrInfo::Struct(_)));
+        assert!(!info.is_virtual());
     }
 
     #[test]
