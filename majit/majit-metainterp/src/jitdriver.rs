@@ -8323,16 +8323,9 @@ impl<S: JitState> JitDriver<S> {
         // which resumes at the loop entry against state the recovery has
         // already rewound. The failing guard's own layout carries the same
         // header pc, so reading it first also answers without a lookup.
-        // The backend may have stamped its trace's header pc on the
-        // descr (`CompiledTraceInfo`); otherwise the pc is the one the
-        // guard's own `rd_numb` encodes for its outermost frame.
-        let guard_resume_pc = fd
-            .trace_info_any()
-            .and_then(|info| {
-                info.downcast_ref::<majit_backend::CompiledTraceInfo>()
-                    .map(|info| info.header_pc)
-            })
-            .or_else(|| crate::compile::guard_resume_pc(fd))
+        // The pc is the one the guard's own `rd_numb` encodes for its
+        // outermost frame.
+        let guard_resume_pc = crate::compile::guard_resume_pc(fd)
             .map(|pc| pc as usize)
             .unwrap_or(target_pc);
         state.recover_after_compiled_run();
@@ -12202,7 +12195,6 @@ mod tests {
     struct FrameMetadataState {
         seen_trace_id: Option<u64>,
         seen_header_pc: Option<u64>,
-        seen_source_guard: Option<(u64, u32)>,
         restored_values: Vec<Value>,
     }
 
@@ -12786,7 +12778,6 @@ mod tests {
         ) -> bool {
             self.seen_trace_id = frame.trace_id;
             self.seen_header_pc = frame.header_pc;
-            self.seen_source_guard = frame.source_guard;
             self.restored_values = values.to_vec();
             true
         }

@@ -227,19 +227,6 @@ pub struct RawExecResult {
     pub descr_arc: Arc<dyn Descr>,
 }
 
-/// Backend-neutral static metadata for a compiled trace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompiledTraceInfo {
-    /// Compiled trace identifier.
-    pub trace_id: u64,
-    /// Input types expected at this trace header.
-    pub input_types: Vec<Type>,
-    /// Interpreter header pc associated with this trace.
-    pub header_pc: u64,
-    /// Source guard this bridge is attached to, or `None` for a root trace.
-    pub source_guard: Option<(u64, u32)>,
-}
-
 /// Backend-neutral source of a reconstructed frame slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitValueSourceLayout {
@@ -3209,15 +3196,6 @@ pub trait Backend: Send {
     fn execute_token_ints_raw(&self, token: &JitCellToken, args: &[i64]) -> RawExecResult {
         let values: Vec<Value> = args.iter().map(|&v| Value::Int(v)).collect();
         self.execute_token_raw(token, &values)
-    }
-
-    /// Inspect static metadata for any compiled trace owned by this token.
-    fn compiled_trace_info(
-        &self,
-        _token: &JitCellToken,
-        _trace_id: u64,
-    ) -> Option<CompiledTraceInfo> {
-        None
     }
 
     /// Force a frame identified by a `FORCE_TOKEN` result.

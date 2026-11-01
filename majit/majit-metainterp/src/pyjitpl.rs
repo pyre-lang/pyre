@@ -10183,8 +10183,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 // `compile.py record_loop_or_bridge` already stamped
                 // `rd_loop_token` / `trace_id`. Stamp the per-trace
-                // `fail_index` and frontend `source_op_index` onto each
-                // resume-guard descr (`stamp_guard_descr_trace_positions`).
+                // `fail_index` onto each resume-guard descr
+                // (`stamp_guard_descr_trace_positions`).
                 compile::stamp_guard_descr_trace_positions(&compiled_ops);
                 self.take_back_all_descrs(std::mem::take(&mut unroll_opt.all_descrs));
                 // Box identity: raise the process-wide OpRef high-water so a
@@ -11729,7 +11729,6 @@ impl<M: Clone> MetaInterp<M> {
              compile_retrace passes down"
         );
         let fail_index = fail_descr.fail_index_per_trace();
-        let source_trace_id = fail_descr.trace_id();
         let bridge_trace_id = self.alloc_trace_id();
 
         let compiled_constants_typed =
@@ -11847,7 +11846,7 @@ impl<M: Clone> MetaInterp<M> {
                 // handed to the CPU and nothing is indexed in the
                 // frontend — its guards answer later failures off
                 // their own `ResumeGuardDescr`.  Only the per-trace
-                // `(fail_index, op index)` stamp the pyre readers key
+                // `fail_index` stamp the pyre readers key
                 // on is applied here.
                 compile::stamp_guard_descr_trace_positions(&combined_ops);
                 // Box identity: see compile_loop site.
@@ -16369,13 +16368,6 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // compile.py store_hash for bridge guards.
-                let source_trace_id = {
-                    // pyjitpl.py:1049 — fail_descr.trace_id() is the
-                    // bridge origin's real allocated id (`alloc_trace_id`
-                    // starts at 1).  RPython reaches the same value via
-                    // the resumekey object's identity.
-                    fail_descr.trace_id()
-                };
                 self.assign_guard_hashes(&optimized_ops);
                 // `compile.py propagate_original_jitcell_token`: every
                 // LABEL's TargetToken is rebound to
@@ -30297,7 +30289,7 @@ mod tests {
                 header_pc: 0,
                 vable_ptr: A,
             });
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == A {

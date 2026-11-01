@@ -9,14 +9,14 @@
 /// failures, execution transfers to the bridge instead of returning to
 /// the interpreter.
 //
-// Per-descr backend state slots (source_op_index, recovery_layout,
-// trace_info, external_jump_target, bridge caches,
+// Per-descr backend state slots (recovery_layout,
+// external_jump_target, bridge caches,
 // bridge_dispatch_cell) live on the metainterp
 // `ResumeGuardDescr` (Slices 7-Tβ6..12) — see `majit-backend::
 // resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py)
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
-use majit_ir::{DescrRef, InputArgRc, Op, Type};
+use majit_ir::{DescrRef, InputArgRc, Op};
 use std::sync::Arc;
 
 /// Inputs a later merged recompile (`assembler.py patch_jump_for_descr`)
@@ -70,12 +70,6 @@ pub struct RetainedConstPtr {
 pub struct BridgeData {
     /// Compiled trace identifier for this bridge.
     pub trace_id: u64,
-    /// Input types expected at the bridge header.
-    pub input_types: Vec<Type>,
-    /// Interpreter header pc associated with this bridge trace.
-    pub header_pc: u64,
-    /// Source guard this bridge is attached to.
-    pub source_guard: (u64, u32),
     /// Function pointer to the bridge's compiled code.
     /// Same calling convention as a compiled loop:
     ///   fn(inputs_ptr: *const i64, outputs_ptr: *mut i64, roots_ptr: *mut i64) -> i64
@@ -135,9 +129,6 @@ impl std::fmt::Debug for BridgeData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeData")
             .field("trace_id", &self.trace_id)
-            .field("input_types", &self.input_types)
-            .field("header_pc", &self.header_pc)
-            .field("source_guard", &self.source_guard)
             .field("code_ptr", &self.code_ptr)
             .field("num_inputs", &self.num_inputs)
             .field("num_ref_roots", &self.num_ref_roots)

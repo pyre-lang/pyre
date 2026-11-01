@@ -5476,32 +5476,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Pyre-only per-emission `CompiledTraceInfo` slot.  Returned as
-    /// `Arc<dyn Any + Send + Sync>` so the trait can live in
-    /// `majit-ir` without depending on `majit-backend`'s
-    /// `CompiledTraceInfo`; concrete callers downcast.  Per-emission
-    /// classification matches `record_loop_or_bridge`
-    /// (`compile.py:185-186`) which stamps the loop-token-equivalent
-    /// data on each emitted descr; copied descrs in the same trace
-    /// share the same `CompiledTraceInfo` value but write into their
-    /// own slot.  Default `None`.
-    fn trace_info_any(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-        None
-    }
-
-    /// Pyre-only per-emission `CompiledTraceInfo` slot write.  Caller
-    /// passes an `Arc<CompiledTraceInfo>` upcast to `Arc<dyn Any>`;
-    /// the impl downcasts.  Default panics — only Resume-family
-    /// guards own the slot.  Callers must gate by `is_resume_guard()
-    /// || is_resume_guard_copied()`.
-    fn set_trace_info_any(&self, _info: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
-        panic!(
-            "set_trace_info_any invoked on a FailDescr that does not \
-             carry the per-emission trace_info slot (only Resume-family \
-             guards reached by record_loop_or_bridge at compile.py:185)"
-        );
-    }
-
     /// Pyre-only cranelift bridge-attach cell addresses.  Returns
     /// `(code_ptr_addr, frame_depth_addr)` — heap-pinned `usize`
     /// addresses cranelift's `emit_attached_bridge_dispatch` bakes
@@ -5561,34 +5535,6 @@ pub trait FailDescr: Descr {
              carry the per-emission bridge_dispatch_cell (only \
              ResumeGuardDescr / ResumeGuardCopiedDescr own it); the \
              silent default would leak the supplied new_ptr"
-        );
-    }
-
-    /// Pyre-only per-emission slot: index of the trace op that produced
-    /// this guard at codegen.  Classified per-emission alongside
-    /// `history.py AbstractFailDescr._attrs_` `rd_locs` /
-    /// `adr_jump_offset` — `assembler.py:279`
-    /// `guardtok.faildescr.rd_locs = positions` writes onto the per-
-    /// emitted descr without chasing `prev`, and the source op index
-    /// shares that classification (one codegen emission = one op).
-    /// Default `None` for non-resume FailDescrs.  Overridden on both
-    /// `ResumeGuardDescr` and `ResumeGuardCopiedDescr` so the cranelift
-    /// backend never has to chase `prev_descr` to find the storage —
-    /// the chase would conflate multiple `ResumeGuardCopiedDescr`
-    /// siblings sharing a donor (optimizer.py:691 / optimizeopt/mod.rs).
-    fn source_op_index(&self) -> Option<usize> {
-        None
-    }
-
-    /// Pyre-only per-emission slot write.  See `source_op_index` for
-    /// the per-emission rationale.  Default panics — only Resume-family
-    /// guards own the slot.  Callers must gate by
-    /// `is_resume_guard() || is_resume_guard_copied()`.
-    fn set_source_op_index(&self, _source_op_index: usize) {
-        panic!(
-            "set_source_op_index invoked on a FailDescr that does not \
-             carry the per-emission source_op_index slot (only \
-             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
         );
     }
 

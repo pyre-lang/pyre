@@ -134,7 +134,6 @@ pub enum ResumeVirtualKind {
 pub struct ResumeFrameLayoutSummary {
     pub trace_id: Option<u64>,
     pub header_pc: Option<u64>,
-    pub source_guard: Option<(u64, u32)>,
     /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
     pub jitcode_index: i32,
     pub pc: u64,

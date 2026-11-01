@@ -14,14 +14,12 @@
 
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use smallvec::smallvec;
 
-use majit_backend::{
-    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, JitCellToken,
-};
+use majit_backend::{Backend, BackendError, CompiledLoopToken, DeadFrame, JitCellToken};
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
@@ -451,25 +449,19 @@ impl<'a> UnrolledLoopData<'a> {
     }
 }
 
-/// Pyre-only: stamp the per-trace `fail_index` and the trace-op index onto
-/// every guard's metainterp `ResumeGuardDescr`, so `(trace_id, fail_index)`
-/// readers resolve through the descr Arc directly.  The counter walks guards
+/// Pyre-only: stamp the per-trace `fail_index` onto every guard's
+/// metainterp `ResumeGuardDescr`, so `(trace_id, fail_index)` readers
+/// resolve through the descr Arc directly.  The counter walks guards
 /// and FINISH in trace order — the same numbering the assemblers'
 /// `fail_descrs` positions use.  Readers compare
 /// against `fail_index_per_trace()` (this slot), not `fail_index()` (the
 /// global `alloc_fail_index()` id).
 ///
-/// `ops` is the optimized frontend trace.  The backend GC rewriter inserts
-/// operations before code generation, so the assembler's prepared-op index
-/// is not an index into this slice; the descr is stamped from the frontend
-/// op, matching RPython where the `ResumeGuardDescr` stays attached to the
-/// live ResOperation rather than carrying an index into a rewritten array.
-///
 /// Non-resume FailDescrs are skipped: their `set_fail_index_per_trace`
 /// panics by default.
 pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T]) {
     let mut fail_index = 0u32;
-    for (op_idx, op) in ops.iter().enumerate() {
+    for op in ops.iter() {
         let op = op.as_ref();
         let is_guard = op.opcode.is_guard();
         if !is_guard && op.opcode != OpCode::Finish {
@@ -481,7 +473,6 @@ pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T
             && let Some(fd) = descr.as_fail_descr()
         {
             fd.set_fail_index_per_trace(fail_index);
-            fd.set_source_op_index(op_idx);
         }
         fail_index += 1;
     }
@@ -1497,15 +1488,11 @@ mod tests {
     }
 
     #[test]
-    fn test_stamp_guard_descr_restamps_frontend_source_op_index() {
+    fn test_stamp_guard_descr_trace_positions_numbers_guards() {
         let value = rooted_inputarg_operand(Type::Int, 0);
         let prefix = Op::new(OpCode::SameAsI, std::slice::from_ref(&value));
         let descr = make_fail_descr_with_index(0, 1);
         let fd = descr.as_fail_descr().unwrap();
-        // The GC-rewritten backend trace can insert operations before a
-        // guard and temporarily stamp its prepared-op index on the shared
-        // descr.  That index is not valid in the retained frontend trace.
-        fd.set_source_op_index(99);
         let mut guard = Op::with_descr(
             OpCode::GuardTrue,
             std::slice::from_ref(&value),
@@ -1516,7 +1503,6 @@ mod tests {
 
         stamp_guard_descr_trace_positions(&[prefix, guard]);
 
-        assert_eq!(fd.source_op_index(), Some(1));
         assert_eq!(fd.fail_index_per_trace(), 0);
     }
 
@@ -1969,9 +1955,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
-        source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
     })
@@ -2049,9 +2033,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
-        source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
     })
@@ -2292,18 +2274,6 @@ impl FailDescr for ResumeAtPositionDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn source_op_index(&self) -> Option<usize> {
-        FailDescr::source_op_index(&self.inner)
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        FailDescr::set_source_op_index(&self.inner, source_op_index);
-    }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -2346,9 +2316,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -2702,18 +2670,6 @@ impl FailDescr for ResumeGuardForcedDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn source_op_index(&self) -> Option<usize> {
-        FailDescr::source_op_index(&self.inner)
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        FailDescr::set_source_op_index(&self.inner, source_op_index);
-    }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -2756,9 +2712,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>, jitdriver_sd: usiz
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -2955,18 +2909,6 @@ impl FailDescr for ResumeGuardExcDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn source_op_index(&self) -> Option<usize> {
-        FailDescr::source_op_index(&self.inner)
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        FailDescr::set_source_op_index(&self.inner, source_op_index);
-    }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -3009,9 +2951,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -3081,32 +3021,17 @@ pub struct ResumeGuardCopiedDescr {
     /// Pyre-only per-trace fail-index — same role as on
     /// `ResumeGuardDescr`. Stamped by `stamp_guard_descr_trace_positions`.
     fail_index_per_trace: AtomicU32,
-    /// Pyre-only per-emission slot: codegen-time trace-op index.
-    /// Classified per-emission alongside `history.py:132
-    /// AbstractFailDescr._attrs_` `rd_locs` / `adr_jump_offset`
-    /// (`assembler.py:279` writes onto each emitted faildescr directly,
-    /// never chasing `prev`).  Owned per copied descr so multiple
-    /// copies of a single donor (optimizer.py:691 / optimizeopt/mod.rs)
-    /// do not clobber each other's op indices.
-    source_op_index: UnsafeCell<Option<usize>>,
     /// Pyre-only per-emission slot: GC-root classification for force-
     /// token producer slots.  PyPy bakes the equivalent GC map into
     /// machine code via `assembler.py:write_failure_recovery_description`
     /// per emission; cranelift has no inline encoding so the slot list
     /// lives on the descr.  Same per-emission scoping as
-    /// `source_op_index` / `rd_locs` — owned per copied descr.
+    /// `rd_locs` — owned per copied descr.
     /// Pyre-only per-emission slot: this guard is the eval-breaker word's
-    /// back-edge poll.  Same per-emission scoping as `source_op_index`; a
+    /// back-edge poll.  Same per-emission scoping as `rd_locs`; a
     /// copy guards the same back edge as its donor, so the optimizer stamps
     /// each copy as it emits it.
     back_edge_poll: std::sync::atomic::AtomicBool,
-    /// Pyre-only per-emission `CompiledTraceInfo` cell.  Same shape
-    /// and atomic-swap discipline as
-    /// `ResumeGuardDescr::trace_info`.  Per-emission because
-    /// `record_loop_or_bridge` (compile.py) stamps the
-    /// loop-token-equivalent metadata onto each emitted descr
-    /// individually; the cell is reclaimed in `Drop`.
-    trace_info: std::sync::atomic::AtomicPtr<CompiledTraceInfo>,
     /// Per-emission cranelift bridge cells; see
     /// `ResumeGuardDescr::bridge`.  Per-emission because each copied descr
     /// can have its own bridge attached (`compile.py handle_fail` applies
@@ -3124,22 +3049,6 @@ pub struct ResumeGuardCopiedDescr {
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
 unsafe impl Sync for ResumeGuardCopiedDescr {}
-
-impl Drop for ResumeGuardCopiedDescr {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        // Reclaim any published `Arc<CompiledTraceInfo>`; mirrors
-        // `ResumeGuardDescr::drop`.  Swap-to-null first so a concurrent
-        // reader either bumps the strong count on the live pointer or
-        // observes null.
-        let ptr = self.trace_info.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !ptr.is_null() {
-            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
-            // `set_trace_info_any`.
-            unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
-        }
-    }
-}
 
 impl ResumeGuardCopiedDescr {
     /// Read the current `prev` Arc.
@@ -3202,9 +3111,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
         }))
@@ -3415,17 +3322,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
-    /// Per-emission `source_op_index` (see field comment).  Owned per
-    /// copied descr — each copy in `optimizeopt/mod.rs`'s `emit_guard_operation`
-    /// records its own trace-op origin, matching how
-    /// `assembler.py:279` writes `rd_locs` onto each emitted descr
-    /// directly.
-    fn source_op_index(&self) -> Option<usize> {
-        unsafe { *self.source_op_index.get() }
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        unsafe { *self.source_op_index.get() = Some(source_op_index) };
-    }
     /// Per-emission, and deliberately NOT
     /// chased through `prev`: the classification describes this guard's own
     /// condition chain, which a sharer does not inherit from its donor.  A
@@ -3445,33 +3341,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_back_edge_poll(&self) {
         self.back_edge_poll
             .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    /// Per-emission `trace_info` (see field comment).  Same
-    /// atomic-swap discipline as `ResumeGuardDescr::set_trace_info` —
-    /// owning Arc reclaimed by `Drop`.
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        let ptr = self.trace_info.load(Ordering::Acquire);
-        if ptr.is_null() {
-            None
-        } else {
-            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
-            // `set_trace_info_any`.
-            unsafe {
-                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
-                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
-                Some(arc as Arc<dyn std::any::Any + Send + Sync>)
-            }
-        }
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        let typed: Arc<CompiledTraceInfo> = info
-            .downcast::<CompiledTraceInfo>()
-            .expect("set_trace_info_any expected Arc<CompiledTraceInfo>");
-        let new_ptr = Arc::into_raw(typed) as *mut CompiledTraceInfo;
-        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
-        }
     }
     /// Per-emission cranelift bridge cells; same contract as
     /// `ResumeGuardDescr`.
@@ -3565,9 +3434,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
-                source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge: std::sync::OnceLock::new(),
                 external_jump_target: std::sync::OnceLock::new(),
             },
@@ -3699,23 +3566,11 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
         self.inner.set_rd_loop_token_clt(clt)
     }
-    fn source_op_index(&self) -> Option<usize> {
-        self.inner.source_op_index()
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        self.inner.set_source_op_index(source_op_index);
-    }
     fn is_back_edge_poll(&self) -> bool {
         self.inner.is_back_edge_poll()
     }
     fn set_back_edge_poll(&self) {
         self.inner.set_back_edge_poll();
-    }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        self.inner.trace_info_any()
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        self.inner.set_trace_info_any(info);
     }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         self.inner.bridge_cache_addrs()
@@ -3780,9 +3635,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
-        source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge: std::sync::OnceLock::new(),
         external_jump_target: std::sync::OnceLock::new(),
     })
@@ -3816,9 +3669,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
         },
@@ -3960,9 +3811,8 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
 /// Modeled as a newtype wrapping `ResumeGuardDescr` so the subclass
 /// inherits the full `_attrs_` slot set (adr_jump_offset, rd_locs,
 /// status, rd_loop_token, plus the pyre-side per-emission cells:
-/// source_op_index, trace_info,
-/// external_jump_target, bridge_*) the cranelift codegen path reads
-/// off every guard descr at `collect_guards` / dispatch emission.
+/// external_jump_target, bridge_*) the cranelift codegen
+/// path reads off every guard descr at `collect_guards` / dispatch emission.
 /// Same shape as `ResumeAtPositionDescr` (compile.py).
 #[derive(Debug)]
 pub struct CompileLoopVersionDescr {
@@ -4013,9 +3863,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: AtomicBool::new(false),
-                source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
             },
@@ -4176,18 +4024,6 @@ impl FailDescr for CompileLoopVersionDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn source_op_index(&self) -> Option<usize> {
-        FailDescr::source_op_index(&self.inner)
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        FailDescr::set_source_op_index(&self.inner, source_op_index);
-    }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -4228,9 +4064,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -4302,7 +4136,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
 }
 
 // Guard resume payload stays on the descr (`ResumeGuardDescr.get_resumestorage`).
-// `stamp_guard_descr_trace_positions` records `source_op_index` on that descr.
+// `stamp_guard_descr_trace_positions` records the per-trace fail index on that descr.
 
 //
 // These are the **compile role** of `TraceCtx`, mirroring RPython's
@@ -4809,9 +4643,7 @@ mod fail_descr_tests {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: AtomicBool::new(false),
-                source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
             },

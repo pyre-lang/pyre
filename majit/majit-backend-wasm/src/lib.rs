@@ -4076,14 +4076,13 @@ impl WasmBackend {
 
     /// Cell address of each guard and `Finish`, in collect order.
     ///
-    /// `region_trace` is set for an inlined bridge. `owner_base` is the loop's
-    /// original cell array; only the owner's own exits are indexed into it.
+    /// `owner_base` is the loop's original cell array; only the owner's own
+    /// exits are indexed into it. It is `None` for an inlined bridge region.
     /// A failing guard that still has no cell gets one here. That is the
     /// descr's cell from this compile onward.
     fn reemit_guard_cells(
         source_loop: &CompiledWasmLoop,
         ops: &[Op],
-        region_trace: Option<u64>,
         owner_base: Option<u32>,
         owner_limit: usize,
         fresh: &mut Vec<Box<[u32]>>,
@@ -4101,16 +4100,7 @@ impl WasmBackend {
                 .and_then(|meta| Self::cell_for_meta(&descrs, meta))
                 .unwrap_or(0);
             if addr == 0 {
-                if let Some(trace_id) = region_trace {
-                    if let Some(found) = descrs.iter().find_map(|descr| {
-                        (descr.trace_id == trace_id
-                            && descr.fail_index == ordinal
-                            && descr.bridge_cell != 0)
-                            .then_some(descr.bridge_cell)
-                    }) {
-                        addr = found;
-                    }
-                } else if let Some(base) = owner_base.filter(|&base| base != 0) {
+                if let Some(base) = owner_base.filter(|&base| base != 0) {
                     if (ordinal as usize) < owner_limit {
                         addr = base + ordinal * std::mem::size_of::<u32>() as u32;
                     }
@@ -4431,7 +4421,6 @@ impl WasmBackend {
         let mut guard_cell_addrs = Self::reemit_guard_cells(
             compiled,
             &inputs.ops,
-            None,
             Some(compiled.bridge_cells_base.get()),
             own_guard_count,
             &mut fresh_cells,
@@ -4441,7 +4430,6 @@ impl WasmBackend {
             guard_cell_addrs.extend(Self::reemit_guard_cells(
                 compiled,
                 &region.ops,
-                Some(region.trace_id),
                 None,
                 0,
                 &mut fresh_cells,
@@ -6110,18 +6098,13 @@ impl majit_backend::Backend for WasmBackend {
             let is_direct = source_trace_id == source_loop.trace_id;
             let fail_ptr = fail_descr as *const dyn FailDescr as *const ();
             let descrs = source_loop.fail_descrs.borrow();
-            let by_meta = descrs.iter().find_map(|descr| {
+            let wasm_guard = descrs.iter().find_map(|descr| {
                 descr
                     .meta_descr
                     .as_ref()
                     .is_some_and(|meta| std::sync::Arc::as_ptr(meta) as *const () == fail_ptr)
                     .then(|| Arc::clone(descr))
             });
-            let by_key = descrs.iter().find_map(|descr| {
-                (descr.trace_id == source_trace_id && descr.fail_index == source_fail_index)
-                    .then(|| Arc::clone(descr))
-            });
-            let wasm_guard = by_meta.or(by_key);
             let source_used_homes = wasm_guard
                 .as_ref()
                 .filter(|_descr| !is_direct)
@@ -6184,12 +6167,12 @@ impl majit_backend::Backend for WasmBackend {
                     .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                     .and_then(|loop_| {
                         loop_.fail_descrs.borrow().iter().find_map(|descr| {
-                            let same_meta = descr.meta_descr.as_ref().is_some_and(|meta| {
-                                std::sync::Arc::as_ptr(meta) as *const () == fail_ptr
-                            });
-                            let same_key = descr.trace_id == source_trace_id
-                                && descr.fail_index == source_fail_index;
-                            (same_meta || same_key)
+                            descr
+                                .meta_descr
+                                .as_ref()
+                                .is_some_and(|meta| {
+                                    std::sync::Arc::as_ptr(meta) as *const () == fail_ptr
+                                })
                                 .then_some(descr.bridge_cell)
                                 .filter(|&addr| addr != 0)
                         })
@@ -7034,8 +7017,12 @@ impl majit_backend::Backend for WasmBackend {
                 .get()
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
             {
+                let fail_ptr = fail_descr as *const dyn FailDescr as *const ();
                 if let Some(descr) = source_loop.fail_descrs.borrow().iter().find(|descr| {
-                    descr.trace_id == source_trace_id && descr.fail_index == source_fail_index
+                    descr
+                        .meta_descr
+                        .as_ref()
+                        .is_some_and(|meta| std::sync::Arc::as_ptr(meta) as *const () == fail_ptr)
                 }) {
                     descr
                         .bridge_slot

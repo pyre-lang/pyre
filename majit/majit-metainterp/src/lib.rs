@@ -220,7 +220,6 @@ pub use jitdriver::{BackEdgeStageRepeats, back_edge_stage_passes, set_back_edge_
 // The compiled-run split, which reaches one crate further down than the rest of
 // this probe: the frame build it prices is the backend's, so the count for that
 // one arm is set through `majit_backend` and only its loop is in the backend.
-pub use majit_backend::CompiledTraceInfo;
 /// The object a door carries from its entry decision into the run.
 ///
 /// Re-exported because [`JitDriver::runnable_procedure_token`] and

@@ -1052,7 +1052,6 @@ impl ResumeLayoutSummary {
             .map(|frame| ReconstructedFrame {
                 trace_id: frame.trace_id,
                 header_pc: frame.header_pc,
-                source_guard: frame.source_guard,
                 pc: frame.pc,
                 jitcode_index: frame.jitcode_index,
                 slot_types: frame.slot_types.clone(),
@@ -1783,7 +1782,6 @@ impl EncodedResumeData {
                 .map(|frame| ResumeFrameLayoutSummary {
                     trace_id: None,
                     header_pc: None,
-                    source_guard: None,
                     jitcode_index: frame.jitcode_index,
                     pc: frame.pc,
                     slot_sources: Vec::new(),
@@ -1825,7 +1823,6 @@ impl EncodedResumeData {
             .map(|frame| ReconstructedFrame {
                 trace_id: None,
                 header_pc: None,
-                source_guard: None,
                 pc: frame.pc,
                 jitcode_index: frame.jitcode_index,
                 slot_types: None,
@@ -1977,7 +1974,6 @@ impl ResumeDataExt for ResumeData {
                 ReconstructedFrame {
                     trace_id: None,
                     header_pc: None,
-                    source_guard: None,
                     pc: frame.pc,
                     jitcode_index: frame.jitcode_index,
                     slot_types: None,
@@ -2094,8 +2090,6 @@ pub struct ReconstructedFrame {
     pub trace_id: Option<u64>,
     /// Trace header pc associated with this frame, when known.
     pub header_pc: Option<u64>,
-    /// Source guard this frame's trace is attached to, when known.
-    pub source_guard: Option<(u64, u32)>,
     /// Program counter for this frame.
     pub pc: u64,
     /// resume.py:1051: jitcode index for CodeObject lookup.
