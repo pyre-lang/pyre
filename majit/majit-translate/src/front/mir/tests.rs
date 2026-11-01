@@ -18656,6 +18656,49 @@ fn object_vec_deref_builds_the_gcarray() {
     );
 }
 
+/// Trait-impl `Vec<PyObjectRef>::deref` lowers as `alloc::vec::<Impl>::deref`.
+#[test]
+fn object_vec_trait_impl_deref_builds_the_gcarray() {
+    let (_llbc, graph) = object_vec_whole_list_fixture(
+        "view",
+        &[
+            "vec",
+            "Vec",
+            "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
+            "deref",
+        ],
+        1,
+        false,
+        false,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let leaves = object_vec_call_leaves(&graph);
+    assert!(
+        leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+        "trait-impl deref must copy into a gcarray: {leaves:?}"
+    );
+    let input = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("vec input");
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.exits.iter())
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .expect("return link");
+    assert!(
+        !matches!(returned, crate::model::LinkArg::Value(value) if value == input),
+        "trait-impl deref must not alias the header; graph: {graph:#?}"
+    );
+}
+
 /// `Vec<PyObjectRef>::deref_mut` (`&mut vec`) is the header address, the
 /// same `SomeList` as `&mut vec[..]`. A gcarray copy would drop stores.
 #[test]
@@ -18697,6 +18740,160 @@ fn object_vec_deref_mut_aliases_the_header() {
         matches!(returned, crate::model::LinkArg::Value(value) if value == input),
         "deref_mut must alias the vec header; graph: {graph:#?}"
     );
+}
+
+/// Trait-impl `Vec<PyObjectRef>::deref_mut` aliases the header, same as
+/// `alloc::vec::<Impl>::deref_mut`.
+#[test]
+fn object_vec_trait_impl_deref_mut_aliases_the_header() {
+    let (_llbc, graph) = object_vec_whole_list_fixture(
+        "view_mut",
+        &[
+            "vec",
+            "Vec",
+            "<impl core::ops::deref::DerefMut<alloc::vec::Vec<v0,v1>>>",
+            "deref_mut",
+        ],
+        1,
+        true,
+        true,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let leaves = object_vec_call_leaves(&graph);
+    assert!(
+        !leaves.iter().any(|l| l == "gcarray_from_pyobject_vec"),
+        "trait-impl deref_mut must not copy into a gcarray: {leaves:?}"
+    );
+    assert!(
+        !leaves.iter().any(|l| l == "ll_vec_items_r"),
+        "trait-impl deref_mut must not split the header into a pair: {leaves:?}"
+    );
+    let input = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .expect("vec input");
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.exits.iter())
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .expect("return link");
+    assert!(
+        matches!(returned, crate::model::LinkArg::Value(value) if value == input),
+        "trait-impl deref_mut must alias the vec header; graph: {graph:#?}"
+    );
+}
+
+fn one_word_vec_deref_leaves(item: serde_json::Value, callee_path: &[&str]) -> Vec<String> {
+    let span = fixture_span();
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let vec_ty = serde_json::json!({
+        "Adt": {"id": 0, "generics": {"types": [item.clone()]}}
+    });
+    let vec_ref = serde_json::json!({"Ref": ["'_", vec_ty, "Shared"]});
+    let slice_ty = serde_json::json!({
+        "Ref": ["'_", {"Slice": [item, null]}, "Shared"]
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+    let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
+    let body = serde_json::json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, Some("ret"), &slice_ty),
+            local(1, Some("vec"), &vec_ref),
+        ]},
+        "body": [
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Copy": place(1, &vec_ref)}],
+                    "dest": place(0, &slice_ty)
+                },
+                "target": 1,
+                "on_unwind": 2
+            }}}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]
+    }});
+    let fun = |id: u64,
+               path: &[&str],
+               inputs: Vec<serde_json::Value>,
+               output: serde_json::Value,
+               fun_body: serde_json::Value| {
+        serde_json::json!({
+            "def_id": id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+            "body": fun_body
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {"def_id": 0, "item_meta": meta(&["alloc", "vec", "Vec"]), "kind": {"Struct": []}},
+            ],
+            "fun_decls": [
+                fun(0, &["fixture", "view"], vec![vec_ref.clone()], slice_ty.clone(), body),
+                fun(1, callee_path, vec![vec_ref], slice_ty, serde_json::json!("Opaque")),
+            ],
+            "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph =
+        super::lower_function(&llbc, "view").unwrap_or_else(|err| panic!("lower view: {err}"));
+    object_vec_call_leaves(&graph)
+}
+
+/// One-word `Vec<i64>` / `Vec<f64>` deref: the trait-impl path emits the
+/// same `ll_vec_items_*` / `ll_vec_length_*` calls as `alloc::vec::<Impl>::deref`.
+#[test]
+fn trait_impl_vec_deref_matches_inherent_one_word_view() {
+    let inherent = &["alloc", "vec", "<Impl>", "deref"];
+    let trait_impl = &[
+        "vec",
+        "Vec",
+        "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
+        "deref",
+    ];
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+    for (item, items_leaf, len_leaf) in [
+        (i64_ty, "ll_vec_items_i", "ll_vec_length_i"),
+        (f64_ty, "ll_vec_items_f", "ll_vec_length_f"),
+    ] {
+        let inherent_leaves = one_word_vec_deref_leaves(item.clone(), inherent);
+        let trait_leaves = one_word_vec_deref_leaves(item, trait_impl);
+        assert_eq!(
+            inherent_leaves, trait_leaves,
+            "spellings diverged for {items_leaf}"
+        );
+        assert!(
+            trait_leaves.iter().any(|leaf| leaf == items_leaf),
+            "missing {items_leaf}: {trait_leaves:?}"
+        );
+        assert!(
+            trait_leaves.iter().any(|leaf| leaf == len_leaf),
+            "missing {len_leaf}: {trait_leaves:?}"
+        );
+        assert!(
+            !trait_leaves.iter().any(|leaf| leaf == "deref"),
+            "deref must not stay residual: {trait_leaves:?}"
+        );
+    }
 }
 
 /// `&mut vec` passed to `shadow_stack_copy_range` is that vec. The call

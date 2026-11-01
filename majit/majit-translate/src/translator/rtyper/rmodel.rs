@@ -879,7 +879,13 @@ pub trait Repr: Debug + std::any::Any {
             let s_obj = args_s
                 .first()
                 .ok_or_else(|| TyperError::message("getattr() missing object argument"))?;
-            if s_obj.find_method(attr).is_none() {
+            // Same shell as `erased_integer_positional_field`: the
+            // annotator bound the result to the receiver, so the
+            // low-level op is `same_as` of that word (`rtyper.py`
+            // `translate_hl_to_ll`), not a getfield.
+            let erased_field =
+                crate::annotator::model::erased_integer_positional_field(s_obj, attr);
+            if !erased_field && s_obj.find_method(attr).is_none() {
                 return Err(TyperError::message(format!(
                     "no method {attr} on {s_obj:?}"
                 )));

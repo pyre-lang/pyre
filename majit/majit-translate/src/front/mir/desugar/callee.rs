@@ -2229,16 +2229,17 @@ pub(in crate::front::mir) fn object_vec_whole_list_view(
     llbc: &Llbc,
 ) -> Option<ObjectVecWholeListView> {
     let path = regular_call_name_path(reg, llbc)?;
-    let leaf = path.rsplit("::").next()?;
     if nargs == 1 {
-        // `alloc::vec::<Impl>::deref` after monomorphization. A slice
-        // `as_slice` has a slice receiver, not a `Vec`.
-        let vec_method = path.starts_with("alloc::vec::");
-        return match leaf {
-            "deref" | "as_slice" if vec_method => Some(ObjectVecWholeListView::Shared),
-            "deref_mut" | "as_mut_slice" if vec_method => Some(ObjectVecWholeListView::Mut),
-            _ => None,
-        };
+        // Inherent `alloc::vec::<Impl>::deref` and the trait-impl residual
+        // `vec::Vec::<impl Deref<Vec<…>>>::deref` are one whole-list view
+        // (`rust_vec_slice_view`). A slice `as_slice` is not a `Vec` method.
+        return rust_vec_slice_view(&path).map(|view| {
+            if view.is_mut() {
+                ObjectVecWholeListView::Mut
+            } else {
+                ObjectVecWholeListView::Shared
+            }
+        });
     }
     if nargs == 2 && is_vec_rangefull_index_regular(reg, llbc) {
         return match vec_index_regular_unchecked_leaf(reg, llbc)? {

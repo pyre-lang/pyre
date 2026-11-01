@@ -579,6 +579,8 @@ pub unsafe fn walk_enrolled_code_roots(
         // managed string (`objspace.py newfilename`); `importing.py
         // update_code_filenames` may replace it. Trace and forward the slot.
         visitor(&mut *(&mut code.w_filename as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // `PyCode._signature` is the host box from `make_signature`, freed
+        // by `pycode_destructor`. It is not a GC reference.
         // `PyCode.co_consts_w` is a GCREF to a `GcArray(OBJECTPTR)` whose
         // own trace names the items. An item store barriers the array
         // (`FixedObjectArray::set_ref`), so an old array holding a young

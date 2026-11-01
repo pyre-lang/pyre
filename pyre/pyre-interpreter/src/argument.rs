@@ -1461,7 +1461,7 @@ impl Arguments {
                 if !pyre_object::gc_roots::shadow_stack_get(scope_base + i).is_null() {
                     continue;
                 }
-                let name = signature.argnames[i];
+                let name = signature.argnames[i].as_ref();
                 if w_kw_defs.is_null() {
                     if let Some(list) = missing_kwonly.as_mut() {
                         list.push(name.to_string());
@@ -2043,7 +2043,7 @@ impl ArgErr {
                 kwonly_given,
             } => format_too_many_method(
                 signature.num_argnames(),
-                signature.argnames.first().copied(),
+                signature.argnames.first().map(|name| name.as_ref()),
                 *num_defaults,
                 *given,
                 *kwonly_given,

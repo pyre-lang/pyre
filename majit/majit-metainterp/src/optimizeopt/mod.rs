@@ -1795,13 +1795,14 @@ pub struct OptContext {
     /// `_emit_operation`'s `self._last_guard_op = None`, raised for the
     /// `Optimizer`-owned chain.
     ///
-    /// RPython has a single emit funnel: `emit_extra` -> `emit` ->
+    /// RPython has a single emit funnel: `Optimizer.emit_extra` -> `emit` ->
     /// `_emit_operation`, so an op emitted while the Optimizer is mid-flight
     /// (a forced virtual's NEW/SETFIELD_GC, a flushed lazy set) still runs the
-    /// chain reset.  Pyre's `in_final_emission` shortcut emits those straight
-    /// into `new_operations`, bypassing `Optimizer::emit_operation`.  Record
-    /// the break here instead; `Optimizer::emit_guard_operation` takes it
-    /// before deciding whether the next guard may share.
+    /// chain reset. With an optimizer, `force_direct` / `in_final_emission`
+    /// takes that funnel and clears `last_guard_op_idx` in
+    /// `emit_operation_inner`. The no-optimizer direct branch still appends
+    /// through `emit_rc` and only records the break here;
+    /// `emit_guard_operation` takes it before the next guard may share.
     guard_chain_broken: bool,
     /// Last rd_resume_position with a valid snapshot. Used as fallback
     /// for optimizer-created guards that can't share from a previous guard.
@@ -3446,9 +3447,11 @@ impl OptContext {
     /// `emit_for_force` with the owning `Optimizer`, so a force-time STRLEN
     /// or string store follows `Optimization.emit_extra` immediately
     /// (`emit_extra_immediate`) instead of parking on `extra_operations_after`.
-    /// `force_direct` or `in_final_emission` appends via `Optimizer.emit_extra`
-    /// (`emit` / `emit_rc`) and does not force arguments here — arg forcing
-    /// stays in `force_box`'s `emit_op_rc`.
+    /// `force_direct` or `in_final_emission`, when an optimizer is present,
+    /// appends through `Optimizer.emit_extra` → `emit` → `emit_operation_inner`,
+    /// which forces every argument before the append. Without an optimizer
+    /// the direct branch still `emit_rc`s and does not force arguments
+    /// (`force_box_inline` / tests).
     pub(crate) fn emit_for_force_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
@@ -3470,7 +3473,18 @@ impl OptContext {
     ) -> OpRef {
         let direct = self.in_final_emission || self.force_direct;
         if direct {
-            self.emit_rc(op)
+            if let Some(opt) = optimizer.as_deref_mut() {
+                // optimizer.py `Optimizer.emit_extra` → `emit` →
+                // `_emit_operation`. `clone` is the same box; `emit`
+                // assigns `pos` before returning it.
+                if let Err(crate::optimize::InvalidLoop(reason)) = opt.emit_extra(op.clone(), self)
+                {
+                    self.signal_invalid_loop(reason);
+                }
+                op.pos().get()
+            } else {
+                self.emit_rc(op)
+            }
         } else if let Some(opt) = optimizer.as_deref_mut() {
             // `vstring.py` `optstring.emit_extra` / `Optimization.emit_extra`:
             // same entry index as `emit_extra_rc` (`current_pass_idx + 1`).

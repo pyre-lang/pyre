@@ -8211,6 +8211,17 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pycode.py` `PyCode.__init__` stores `_signature = make_signature(self)`.
+            // Raw host box, freed by `pycode_destructor`. Not immutable:
+            // `optimize_GETFIELD_GC_I` would fold it to a ConstInt and drop
+            // the `PyCode` out of `gcrefs_output_list` while the baked
+            // pointer remained. `code_ptr` stays pure because that body is
+            // not freed.
+            word_int(
+                "_signature",
+                std::mem::offset_of!(PyCode, _signature),
+                false,
+            ),
             (
                 "w_class",
                 W_CLASS_OFFSET,
@@ -10625,6 +10636,7 @@ mod tests {
                 "PyCode.mutate_w_globals",
                 "PyCode.mutate_w_globals_lock",
                 "PyCode.jit_shape",
+                "PyCode._signature",
             ]
         );
     }

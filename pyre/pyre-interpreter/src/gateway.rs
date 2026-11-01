@@ -4,6 +4,8 @@
 //! A `BuiltinCode` wraps a Rust function pointer that implements
 //! a Python builtin like `print`, `len`, etc.
 
+use std::borrow::Cow;
+
 use pyre_object::pyobject::*;
 
 /// pypy/interpreter/gateway.py `class SignatureBuilder`.
@@ -95,10 +97,12 @@ impl SignatureBuilder {
         } else {
             self.argnames.len() - self.kwonlystartindex as usize
         };
+        // `Signature.__init__` owns the names. Builder inputs are
+        // builtin literals, so they stay `Cow::Borrowed`.
         Signature {
-            argnames: self.argnames.clone(),
-            varargname: self.varargname,
-            kwargname: self.kwargname,
+            argnames: self.argnames.iter().copied().map(Cow::Borrowed).collect(),
+            varargname: self.varargname.map(Cow::Borrowed),
+            kwargname: self.kwargname.map(Cow::Borrowed),
             kwonlyargcount,
             posonlyargcount: self.posonlyargcount,
         }
@@ -119,17 +123,33 @@ impl SignatureBuilder {
 /// arguments; the count of positional-only arguments is
 /// `posonlyargcount`.  Keyword-only argument names live at the tail
 /// of `argnames` and are counted by `kwonlyargcount`.
+///
+/// `Signature.__init__` owns `argnames`, `varargname`, and `kwargname`.
+/// `Signature::new` borrows builtin literals (`Cow::Borrowed`).
+/// `pycode.py` `make_signature` owns names taken from `co_varnames`
+/// (`Cow::Owned`) and `PyCode.__init__` stores that value on
+/// `PyCode._signature`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signature {
-    pub argnames: Vec<&'static str>,
-    pub varargname: Option<&'static str>,
-    pub kwargname: Option<&'static str>,
+    pub argnames: Vec<Cow<'static, str>>,
+    pub varargname: Option<Cow<'static, str>>,
+    pub kwargname: Option<Cow<'static, str>>,
     pub posonlyargcount: usize,
     pub kwonlyargcount: usize,
 }
 
+/// Host box stored in `PyCode._signature` is `Box::into_raw` memory, not
+/// a GC object. `rclass.py` `getgcflavor` / `classdesc.py`
+/// `ClassDesc.get_param` read `_alloc_flavor_`.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_Signature: &str = "raw";
+
 impl Signature {
-    /// pypy/interpreter/signature.py `Signature.__init__`.
+    /// `signature.py` `Signature.__init__`.
+    ///
+    /// The parameters stay `&'static str` so each builtin `Signature::new`
+    /// call site is unchanged. The stored names are `Cow::Borrowed`.
     pub fn new(
         argnames: Vec<&'static str>,
         varargname: Option<&'static str>,
@@ -138,9 +158,9 @@ impl Signature {
         posonlyargcount: usize,
     ) -> Self {
         Self {
-            argnames,
-            varargname,
-            kwargname,
+            argnames: argnames.into_iter().map(Cow::Borrowed).collect(),
+            varargname: varargname.map(Cow::Borrowed),
+            kwargname: kwargname.map(Cow::Borrowed),
             posonlyargcount,
             kwonlyargcount,
         }
@@ -159,7 +179,7 @@ impl Signature {
     #[majit_macros::elidable]
     pub fn find_argname(&self, name: &str) -> isize {
         for (i, arg) in self.argnames.iter().enumerate() {
-            if *arg == name {
+            if arg.as_ref() == name {
                 return i as isize;
             }
         }
@@ -271,12 +291,15 @@ impl Signature {
     ///         argnames = argnames + [self.kwargname]
     ///     return argnames
     /// ```
-    pub fn getallvarnames(&self) -> Vec<&'static str> {
-        let mut argnames = self.argnames.clone();
-        if let Some(name) = self.varargname {
+    pub fn getallvarnames(&self) -> Vec<&str> {
+        let mut argnames = Vec::with_capacity(self.scope_length());
+        for name in &self.argnames {
+            argnames.push(name.as_ref());
+        }
+        if let Some(name) = self.varargname.as_deref() {
             argnames.push(name);
         }
-        if let Some(name) = self.kwargname {
+        if let Some(name) = self.kwargname.as_deref() {
             argnames.push(name);
         }
         argnames
@@ -1594,9 +1617,10 @@ pub unsafe fn builtin_code_binding_error(
     if !keyword_only_method {
         return err;
     }
+    let kwonly: Vec<&str> = sig.argnames[1..].iter().map(|name| name.as_ref()).collect();
     crate::builtins::clinic_keyword_only_error(
         code.name,
-        &sig.argnames[1..],
+        &kwonly,
         pos_args.len().saturating_sub(1),
         kw_names,
     )
@@ -1860,7 +1884,7 @@ fn starargs_constructor_type_name(
     receiver: Option<PyObjectRef>,
 ) -> Option<String> {
     let sig = unsafe { code.sig.as_ref() }?;
-    let vararg_is_args = matches!(sig.varargname, Some(name) if name == "args");
+    let vararg_is_args = sig.varargname.as_deref() == Some("args");
     if !vararg_is_args
         || sig.kwargname.is_some()
         || sig.num_kwonlyargnames() != 0
@@ -1868,7 +1892,7 @@ fn starargs_constructor_type_name(
     {
         return None;
     }
-    let Some(arg0) = sig.argnames.first().copied() else {
+    let Some(arg0) = sig.argnames.first().map(|name| name.as_ref()) else {
         return None;
     };
     if arg0 != "self" && arg0 != "cls" {
@@ -1889,7 +1913,7 @@ fn new_constructor_type_name(code: &BuiltinCode, receiver: Option<PyObjectRef>) 
         return None;
     }
     let sig = unsafe { code.sig.as_ref() }?;
-    if sig.argnames.first().copied() != Some("cls") {
+    if sig.argnames.first().map(|name| name.as_ref()) != Some("cls") {
         return None;
     }
     let receiver = receiver.filter(|receiver| !receiver.is_null())?;
@@ -3232,6 +3256,9 @@ mod tests {
         assert_eq!(sig.find_argname("a"), 0);
         assert_eq!(sig.find_argname("e"), 4);
         assert_eq!(sig.find_argname("missing"), -1);
+        assert!(matches!(sig.argnames[0], std::borrow::Cow::Borrowed("a")));
+        assert!(matches!(sig.varargname.as_deref(), Some("args")));
+        assert!(matches!(sig.kwargname.as_deref(), Some("kwargs")));
         // getallvarnames appends varargname + kwargname
         assert_eq!(
             sig.getallvarnames(),
@@ -3248,6 +3275,8 @@ mod tests {
         assert!(!sig.has_vararg());
         assert!(!sig.has_kwarg());
         assert_eq!(sig.scope_length(), 2);
+        assert!(matches!(sig.argnames[0], std::borrow::Cow::Borrowed("a")));
+        assert!(sig.varargname.is_none());
         assert_eq!(sig.getallvarnames(), vec!["a", "b"]);
     }
 }

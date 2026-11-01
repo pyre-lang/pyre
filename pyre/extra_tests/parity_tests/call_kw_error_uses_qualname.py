@@ -175,5 +175,86 @@ def exercise():
         raise AssertionError("calls did not run: %s != %s" % (total, expect))
 
 
+def exercise_scope():
+    # Outside the hot loop: keyword-only binding, **kwargs collection, and a
+    # bound-method keyword call. `PyCode.funcrun` → `Arguments.parse_into_scope`.
+    def kwonly(a, *, k):
+        return (a, k)
+
+    def kwdef(*, k=3):
+        return k
+
+    def collect(a, **kw):
+        return (a, kw["b"], tuple(sorted(kw)))
+
+    class Box:
+        def m(self, a, *, k):
+            return (self.n, a, k)
+
+    if kwonly(1, k=2) != (1, 2):
+        raise AssertionError(repr(kwonly(1, k=2)))
+    if kwdef() != 3:
+        raise AssertionError("kwdef")
+    if kwdef(k=4) != 4:
+        raise AssertionError("kwdef override")
+    got = collect(1, c=3, b=2)
+    if got != (1, 2, ("b", "c")):
+        raise AssertionError(repr(got))
+    obj = Box()
+    obj.n = 7
+    bound = obj.m
+    if bound(1, k=2) != (7, 1, 2):
+        raise AssertionError(repr(bound(1, k=2)))
+    if obj.m(1, k=2) != (7, 1, 2):
+        raise AssertionError(repr(obj.m(1, k=2)))
+
+    try:
+        kwonly(1)
+    except TypeError as exc:
+        check(
+            str(exc),
+            "exercise_scope.<locals>.kwonly() missing 1 required keyword-only argument: 'k'",
+        )
+    else:
+        raise AssertionError("kwonly missing")
+    try:
+        kwonly(1, a=2, k=3)
+    except TypeError as exc:
+        check(
+            str(exc),
+            "exercise_scope.<locals>.kwonly() got multiple values for argument 'a'",
+        )
+    else:
+        raise AssertionError("kwonly duplicate")
+    try:
+        kwonly(1, k=2, z=3)
+    except TypeError as exc:
+        check(
+            str(exc),
+            "exercise_scope.<locals>.kwonly() got an unexpected keyword argument 'z'",
+        )
+    else:
+        raise AssertionError("kwonly unexpected")
+    try:
+        collect()
+    except TypeError as exc:
+        check(
+            str(exc),
+            "exercise_scope.<locals>.collect() missing 1 required positional argument: 'a'",
+        )
+    else:
+        raise AssertionError("collect missing")
+    try:
+        bound(k=2)
+    except TypeError as exc:
+        check(
+            str(exc),
+            "exercise_scope.<locals>.Box.m() missing 1 required positional argument: 'a'",
+        )
+    else:
+        raise AssertionError("bound missing")
+
+
 exercise()
+exercise_scope()
 print("OK")
