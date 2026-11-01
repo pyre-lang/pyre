@@ -599,23 +599,27 @@ fn convert_link(graph: &FunctionGraph, link: &Link) {
 }
 
 fn convert_raise_link(graph: &FunctionGraph, link: &Link) {
+    // `rtyper.py _convert_link` / `setup_block_entry` stamp
+    // `lltype_of_exception_type` (`CLASSTYPE`) on `last_exception` /
+    // exceptblock[0]. `getkind` of a raw `Ptr(OBJECT_VTABLE)` is Signed.
+    // The annotator shell is `SomeTypeOf` (`annrpython.py follow_raise_link`
+    // typeof); `concrete_from_annotation` would project that to GcRef.
     if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
-        let _ = maybe_seed_concrete_type(value, ConcreteType::Signed);
+        let _ = force_concrete_type(value, ConcreteType::Signed);
     }
     if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
-        let _ = maybe_seed_concrete_type(value, ConcreteType::GcRef);
+        let _ = force_concrete_type(value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
     for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-        let src_ty = if Some(src) == link.last_exception.as_ref() {
-            ConcreteType::Signed
+        if Some(src) == link.last_exception.as_ref() {
+            let _ = force_concrete_type(dst, ConcreteType::Signed);
         } else if Some(src) == link.last_exc_value.as_ref() {
-            ConcreteType::GcRef
+            let _ = force_concrete_type(dst, ConcreteType::GcRef);
         } else {
-            link_arg_concrete_type(src)
-        };
-        let _ = maybe_seed_concrete_type(dst, src_ty);
+            let _ = maybe_seed_concrete_type(dst, link_arg_concrete_type(src));
+        }
     }
 }
 
@@ -647,22 +651,21 @@ fn converge_link(graph: &FunctionGraph, link: &Link) -> bool {
 fn converge_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
-        changed |= maybe_seed_concrete_type(value, ConcreteType::Signed);
+        changed |= force_concrete_type(value, ConcreteType::Signed);
     }
     if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
-        changed |= maybe_seed_concrete_type(value, ConcreteType::GcRef);
+        changed |= force_concrete_type(value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
     for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-        let src_ty = if Some(src) == link.last_exception.as_ref() {
-            ConcreteType::Signed
+        if Some(src) == link.last_exception.as_ref() {
+            changed |= force_concrete_type(dst, ConcreteType::Signed);
         } else if Some(src) == link.last_exc_value.as_ref() {
-            ConcreteType::GcRef
+            changed |= force_concrete_type(dst, ConcreteType::GcRef);
         } else {
-            link_arg_concrete_type(src)
-        };
-        changed |= maybe_seed_concrete_type(dst, src_ty);
+            changed |= maybe_seed_concrete_type(dst, link_arg_concrete_type(src));
+        }
         if let LinkArg::Value(src_var) = src {
             let dst_ty = FunctionGraph::concretetype_of(dst);
             changed |= maybe_seed_concrete_type(src_var, dst_ty);
@@ -754,6 +757,15 @@ fn maybe_seed_int_operand(dst: &Variable) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+fn force_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
+    if FunctionGraph::concretetype_of(dst) != src_ty {
+        FunctionGraph::set_concretetype_of_inline(dst, src_ty);
+        true
+    } else {
+        false
     }
 }
 

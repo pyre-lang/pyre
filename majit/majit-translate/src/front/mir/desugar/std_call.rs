@@ -910,7 +910,8 @@ impl<'a> Lowering<'a> {
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: Vec::new(),
-                                result_ty: ValueType::Ref(None),
+                                // `AbstractStringBuilderRepr.rtyper_new`.
+                                result_ty: ValueType::StringBuilder,
                             },
                         });
                         self.local_var[acc] = Some(LocalValue::One(fresh));

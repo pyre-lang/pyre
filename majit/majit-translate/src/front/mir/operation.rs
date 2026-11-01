@@ -4006,7 +4006,8 @@ impl<'a> Lowering<'a> {
                     specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![builder]),
-                result_ty: ValueType::Ref(None),
+                // `AbstractStringBuilderRepr.rtype_method_build`.
+                result_ty: ValueType::Str,
             },
         });
         Ok(result)
@@ -7458,6 +7459,29 @@ impl<'a> Lowering<'a> {
         if let Some(tag) = self.aggregate_fieldless_enum_discriminant(kind) {
             return Ok(AggregateShape::Discriminant(tag));
         }
+        // A one-word niche `Option` is represented by its payload
+        // pointer, so constructing it names either the null pointer
+        // (`None`) or the wrapped non-null pointer (`Some(p)`) directly
+        // — not a two-word aggregate with a `__discriminant` tag, and
+        // not `lltype.Void`. Charon may record a size-0 layout on the
+        // generic Option decl (the empty `None` variant); `tyref_is_void_zst`
+        // would then win and emit Void `ConstNone` (`rnone.py` `NoneRepr`)
+        // for `Option<PyObjectRef>::None`. That None is
+        // `bookkeeper.py` `immutablevalue(None)` = `s_None`, converted
+        // through `pairtype(NoneRepr, Repr).convert_from_to` to the null
+        // of the payload repr — `push_niche_null_ptr`, the same helper
+        // `option_try` `return_niche` uses. Pointer and string niches
+        // both go through `tyref_is_niche_option_ptr`.
+        if self.tyref_is_niche_option_ptr(dest_ty) {
+            return Ok(if n_operands == 0 {
+                AggregateShape::NicheNull
+            } else {
+                AggregateShape::Operand {
+                    index: 0,
+                    transparent: false,
+                }
+            });
+        }
         // A fieldless struct, unit `()`, or a borrow of one is
         // `lltype.Void` (`getkind == 'void'`): no constructor and no
         // register, only the `Constant(None, Void)` definition.
@@ -7500,33 +7524,6 @@ impl<'a> Lowering<'a> {
                 }),
                 n => Err(format!("Option<NonZero> aggregate has {n} operands")),
             };
-        }
-        // A one-word niche `Option` is represented by its payload
-        // pointer, so
-        // constructing it names either the null pointer (`None`) or
-        // the wrapped non-null pointer (`Some(p)`) directly — not a
-        // two-word aggregate with a `__discriminant` tag.  Fold `None`
-        // (zero-operand variant) to the `null_mut()` builtin call and
-        // `Some(p)` to the identity on its single pointer operand, so a
-        // constructed value is a maybe-null pointer end-to-end and both
-        // variants unify at the function return merge.  The null is a
-        // `null_mut()` call (a classdef-less nullable `SomeInstance`,
-        // the same lattice a `*mut T` value carries) rather than a
-        // `ConstRefNull` (a GCREF `_ptr`): the return merge unions the
-        // `None` value with the pointer-valued `Some` branch, and the
-        // two must share a universe — a bare `ConstRefNull` would
-        // annotate `SomePtr` and fail to union with the `SomeInstance`
-        // pointer.  (RPython has no `Option`; a maybe-null `Ptr` is the
-        // pointer itself, null for the absent case.)
-        if self.tyref_is_niche_option_ptr(dest_ty) {
-            return Ok(if n_operands == 0 {
-                AggregateShape::NicheNull
-            } else {
-                AggregateShape::Operand {
-                    index: 0,
-                    transparent: false,
-                }
-            });
         }
         // A `repr(transparent)` aggregate is its one sized field.
         // Zero-sized markers are not stored, so the operand is that

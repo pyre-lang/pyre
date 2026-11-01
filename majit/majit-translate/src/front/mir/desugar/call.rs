@@ -3101,10 +3101,13 @@ impl<'a> Lowering<'a> {
                 // the builder lives: a local or an instance attribute such as
                 // `rutf8.py` `Utf8StringBuilder._s`.
                 if let Some(method) = string_builder_method_leaf(self.llbc, &reg) {
+                    // `AbstractStringBuilderRepr.rtyper_new` yields the
+                    // builder (`SomeStringBuilder`); `rtype_method_build`
+                    // yields `SomeString` (`Ptr(STR)`).
                     let (marker, result_ty, concrete) = match method {
                         "new" => (
                             crate::runtime_names::shims::STRINGBUILDER_NEW,
-                            ValueType::Ref(None),
+                            ValueType::StringBuilder,
                             crate::model::ConcreteType::Unknown,
                         ),
                         "append" => (
@@ -3114,7 +3117,7 @@ impl<'a> Lowering<'a> {
                         ),
                         _ => (
                             crate::runtime_names::shims::STRINGBUILDER_BUILD,
-                            ValueType::Ref(None),
+                            ValueType::Str,
                             crate::model::ConcreteType::Unknown,
                         ),
                     };
@@ -3181,7 +3184,8 @@ impl<'a> Lowering<'a> {
                             } else {
                                 Vec::new()
                             },
-                            result_ty: ValueType::Ref(None),
+                            // `AbstractStringBuilderRepr.rtyper_new`.
+                            result_ty: ValueType::StringBuilder,
                         },
                     });
                     // `Wtf8Buf::from_string(initial)` and

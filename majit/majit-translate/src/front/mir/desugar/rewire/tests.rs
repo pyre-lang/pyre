@@ -452,6 +452,47 @@ fn option_ok_or_family_repr_switch() {
     }
 }
 
+/// Pointer-niche `ok_or_else` of `Option<PyObjectRef>`: the None test is
+/// `rnone.py` `rtype_is_None`. That `ConstNone` is the comparison RHS
+/// only; it must not flow as a payload value.
+/// `pairtype(NoneRepr, Repr).convert_from_to` is `inputconst(r_to, None)`,
+/// the same null `option_try` `return_niche` emits.
+#[test]
+fn option_ok_or_else_pointer_niche_none_is_not_a_void_value() {
+    let (mut graph, result) = build_two_arg_combinator("ok_or_else");
+    let mut site = option_ok_or_family_site(super::DiscCombinator::OptionOkOrElse, result);
+    site.recv_niche = true;
+    site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+    let rewritten = super::rewire_disc_combinator_sites(
+        &mut graph,
+        &[site],
+        crate::ErrorCarrierSpec::default(),
+    );
+    assert_eq!(rewritten, 1);
+    let mut const_none_vars = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if matches!(op.kind, OpKind::ConstNone)
+                && let Some(v) = &op.result
+            {
+                const_none_vars.push(v.clone());
+            }
+        }
+    }
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for arg in &link.args {
+                if let LinkArg::Value(v) = arg {
+                    assert!(
+                        !const_none_vars.iter().any(|c| c == v),
+                        "ConstNone must not be a link value on pointer-niche ok_or_else"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn result_ok_lowers_to_some_none_switch() {
     let mut graph = FunctionGraph::new("test_result_ok");

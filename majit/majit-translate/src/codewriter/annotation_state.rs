@@ -216,11 +216,25 @@ fn str_family_ref_shell(payload: Option<&str>) -> Option<SomeValue> {
 /// annotation-stage `SomeValue` to pyre's flat `ValueType` enum used by
 /// downstream `codewriter` consumers that haven't been ported to
 /// `SomeValue` directly.
+///
+/// `Unsigned` shells to `SomeInteger { unsigned: true }`
+/// (`SomeInteger::new`); this inverse returns `Unsigned` when
+/// `integer.unsigned` (the 128-bit knowntypes stay `Int128` /
+/// `UInt128`). `Str` shells to `SomeString` (`SomeString::new` /
+/// `SomeString.__init__` default). A str-family `Ref(Some(..))`
+/// (`is_str_family_class_root`) shells to the same `SomeString`
+/// (`s_str`); both read back as `Str` because `rstr.py` has one
+/// string type and `Str` is the dedicated discriminator. The legacy
+/// walker re-reads the slot via `read_binding`, so a second
+/// `Unsigned` / `Str` incoming is then the same-shell union
+/// (`binaryop.py` `pairtype(SomeInteger, SomeInteger).union` of two
+/// unsigned integers; `pairtype(SomeString, SomeString).union`).
 pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
     match s {
         SomeValue::Integer(integer) => match integer.base.knowntype {
             KnownType::LongLongLong => ValueType::Int128,
             KnownType::ULongLongLong => ValueType::UInt128,
+            _ if integer.unsigned => ValueType::Unsigned,
             _ => ValueType::Int,
         },
         SomeValue::Bool(_) => ValueType::Bool,
@@ -250,11 +264,14 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // the rtyper picks `StringBuilderRepr` rather than the generic
         // `Ref` fallback (which would erase the builder method surface).
         SomeValue::StringBuilder(_) => ValueType::StringBuilder,
-        // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
+        // Inverse of `valuetype_to_someshell(Str)` and of a str-family
+        // `Ref` (`s_str`). `rstr.py` has one string type.
+        SomeValue::String(_) => ValueType::Str,
+        // `SomeImpossibleValue` represents unreachable code (`model.py`),
         // which projects to `ValueType::Void` in pyre's flat enum just
         // like upstream `lltype.Void`.
         SomeValue::Impossible => ValueType::Void,
-        // Other variants (String / List / Tuple / Dict / Iterator /
+        // Other variants (List / Tuple / Dict / Iterator /
         // Exception / None_ / Property / InteriorPtr / LLADTMeth /
         // Builtin / BuiltinMethod / WeakRef / TypeOf / ByteArray /
         // Char / UnicodeCodePoint / UnicodeString / Type / Object) have
@@ -365,6 +382,41 @@ mod tests {
     fn function_pointer_someptr_projects_as_int() {
         let s = crate::annotator::bookkeeper::raw_fn_ptr_somevalue();
         assert_eq!(somevalue_to_valuetype(&s), ValueType::Int);
+    }
+
+    #[test]
+    fn unsigned_roundtrips_through_shell() {
+        // `valuetype_to_someshell(Unsigned)` is `SomeInteger(unsigned=True)`
+        // (`SomeInteger::new`); `binaryop.py`
+        // `pairtype(SomeInteger, SomeInteger).union` of two unsigned
+        // integers succeeds, so the inverse must report `Unsigned`.
+        let shell = valuetype_to_someshell(&ValueType::Unsigned).expect("Unsigned projects");
+        let SomeValue::Integer(integer) = &shell else {
+            panic!("Unsigned must project to SomeInteger, got {shell:?}");
+        };
+        assert!(integer.unsigned);
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::Unsigned);
+    }
+
+    #[test]
+    fn str_roundtrips_through_shell() {
+        // `valuetype_to_someshell(Str)` is `SomeString` (`SomeString.__init__`
+        // default). A str-family `Ref(Some(..))` (`is_str_family_class_root`)
+        // shells to the same `SomeString` (`s_str`); both read back as
+        // `Str` because `rstr.py` has one string type.
+        let shell = valuetype_to_someshell(&ValueType::Str).expect("Str projects");
+        assert!(
+            matches!(shell, SomeValue::String(_)),
+            "Str must project to SomeString, got {shell:?}"
+        );
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::Str);
+        let family =
+            valuetype_to_someshell(&ValueType::Ref(Some("Wtf8Buf".to_string()))).expect("family");
+        assert!(
+            matches!(family, SomeValue::String(_)),
+            "str-family Ref must project to SomeString, got {family:?}"
+        );
+        assert_eq!(somevalue_to_valuetype(&family), ValueType::Str);
     }
 
     #[test]

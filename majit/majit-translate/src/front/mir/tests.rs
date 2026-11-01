@@ -15736,7 +15736,7 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
 /// arm, so the resulting graph directly exposes whether the classifier
 /// chose aggregate construction or the nullable-pointer identities.
 fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, false, false, false)
+    lower_option_fn_retyped("option_source", payload, false, false, false, None)
 }
 
 fn lower_option_source_with_payload_ext(
@@ -15749,11 +15749,12 @@ fn lower_option_source_with_payload_ext(
         false,
         inject_layoutless_nominal,
         false,
+        None,
     )
 }
 
 fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, true, false, false)
+    lower_option_fn_retyped("option_source", payload, true, false, false, None)
 }
 
 fn lower_option_fn_retyped(
@@ -15762,6 +15763,7 @@ fn lower_option_fn_retyped(
     through_alias: bool,
     inject_layoutless_nominal: bool,
     inject_string: bool,
+    option_layout_size: Option<u64>,
 ) -> FunctionGraph {
     fn replace_dedup(
         value: &mut serde_json::Value,
@@ -15876,6 +15878,33 @@ fn lower_option_fn_retyped(
             })
         })
         .expect("Option type declaration in corpus");
+    if let Some(size) = option_layout_size {
+        let decls = translated
+            .get_mut("type_decls")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("corpus type_decls");
+        let decl = decls
+            .iter_mut()
+            .find(|decl| {
+                decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(option_def_id)
+            })
+            .expect("Option decl");
+        // One layout entry so `select_target_layout` accepts it regardless
+        // of `TARGET`. Size 0 is the empty `None` variant Charon may
+        // record on the generic Option decl.
+        decl["layout"] = serde_json::json!([{
+            "key": "",
+            "value": {
+                "size": size,
+                "align": 8,
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": [0]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]);
+    }
     if inject_layoutless_nominal {
         let decls = translated
             .get_mut("type_decls")
@@ -16282,6 +16311,118 @@ fn niche_option_nominal_pointers_none_is_null_some_is_identity() {
         assert_eq!(null_muts, 1, "case {name}: {none_msg}");
         assert_eq!(transparent_ctors, 0, "case {name}: {some_msg}");
     }
+}
+
+fn object_ref_payload() -> serde_json::Value {
+    // `type PyObjectRef = *mut PyObject`. Corpus Adt 4 is the sized
+    // nominal stand-in used by
+    // `niche_option_type_alias_of_raw_nominal_ptr_none_is_null`.
+    serde_json::json!({
+        "RawPtr": [
+            {
+                "Adt": {
+                    "id": 4,
+                    "generics": {
+                        "regions": [], "types": [],
+                        "const_generics": [], "trait_refs": []
+                    }
+                }
+            },
+            "Mut"
+        ]
+    })
+}
+
+fn const_none_link_args(graph: &FunctionGraph) -> Vec<(usize, crate::model::ConcreteType)> {
+    use crate::model::ConcreteType;
+    let mut const_nones = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for op in &block.operations {
+            if matches!(op.kind, OpKind::ConstNone) {
+                let ct = op
+                    .result
+                    .as_ref()
+                    .map(FunctionGraph::concretetype_of)
+                    .unwrap_or(ConcreteType::Unknown);
+                const_nones.push((bi, op.result.clone(), ct));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for arg in &link.args {
+                let Some(v) = arg.as_variable() else {
+                    continue;
+                };
+                for (bi, var, ct) in &const_nones {
+                    if var.as_ref() == Some(v) {
+                        out.push((*bi, ct.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Option<PyObjectRef>::None` through match (`option_source`) and `?`
+/// (`option_question_mark`). Size-0 Option layout is the empty `None`
+/// variant Charon may record on the generic Option decl; `aggregate_shape`
+/// classifies that dest as `NicheNull` before `tyref_is_void_zst`, so
+/// `option_source` constructs None with `push_niche_null_ptr`, never a Void
+/// `ConstNone` value. Option `?` is a regular call of the extracted
+/// `core::option::<Impl>::branch` body (`Try::branch`) plus a ControlFlow
+/// discriminant switch; the Break/None arm is
+/// `core::option::<Impl>::from_residual` (`FromResidual::from_residual`).
+/// The caller-side rewrite that inlined `push_niche_null_ptr` is gone.
+/// `bookkeeper.py` `immutablevalue(None)` is `s_None`; `rnone.py`
+/// `NoneRepr` Void is only for a variable that is only None.
+/// `pairtype(NoneRepr, Repr).convert_from_to` is `inputconst(r_to, None)`.
+/// `push_const_none` remains the `rtype_is_None` comparison RHS.
+#[test]
+fn option_object_ref_none_match_and_try_lowers_to_niche_null_not_void_constnone() {
+    let payload = object_ref_payload();
+    // Size-0 Option layout is the empty `None` variant Charon may
+    // record; `option_source` constructs `None` so that dest hits
+    // `aggregate_shape`.
+    for (fn_name, layout) in [("option_source", None), ("option_source", Some(0u64))] {
+        let graph = lower_option_fn_retyped(fn_name, payload.clone(), false, false, false, layout);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        let as_value = const_none_link_args(&graph);
+        assert!(
+            null_muts >= 1,
+            "{fn_name} layout={layout:?}: None is push_niche_null_ptr, got {null_muts} \
+             const_none_links={as_value:?} ctors={transparent_ctors}"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "{fn_name} layout={layout:?}: Some is the payload identity"
+        );
+        assert!(
+            as_value.is_empty(),
+            "{fn_name} layout={layout:?}: ConstNone must not be a link value \
+             (NoneRepr leak), got {as_value:?}"
+        );
+    }
+    let graph = lower_option_fn_retyped("option_question_mark", payload, false, false, false, None);
+    let (_null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+    let as_value = const_none_link_args(&graph);
+    let from_residuals = option_core_leaf_call_count(&graph, "from_residual");
+    assert!(
+        from_residuals >= 1,
+        "option_question_mark: None arm is from_residual, got {from_residuals} \
+         const_none_links={as_value:?} ctors={transparent_ctors}"
+    );
+    assert_eq!(
+        transparent_ctors, 0,
+        "option_question_mark: Some is the payload identity"
+    );
+    assert!(
+        as_value.is_empty(),
+        "option_question_mark: ConstNone must not be a link value \
+         (NoneRepr leak), got {as_value:?}"
+    );
 }
 
 /// `Rvalue::Discriminant` of `Option<&[u8]>` (and Charon's
@@ -17430,6 +17571,7 @@ fn niche_option_string_match_is_none_identity() {
         false,
         false,
         true,
+        None,
     );
     assert_eq!(
         option_core_leaf_call_count(&graph, "branch"),
@@ -21156,6 +21298,89 @@ fn owned_ctor_push_char_local_lowers() {
     assert!(
         has_path_leaf(&graph, crate::runtime_names::shims::UNICHAR_AS_UTF8),
         "a variable code point must go through unichr_as_utf8: {graph:#?}"
+    );
+}
+
+/// `String::new(); s.push_str(x); return s` — builder-mode ctor + append +
+/// terminal `move`. `AbstractStringBuilderRepr.rtyper_new` paints NEW
+/// `SomeStringBuilder`; `rtype_method_build` paints BUILD `SomeString`.
+#[test]
+fn owned_ctor_push_str_move_paints_stringbuilder_and_str() {
+    let string = string_adt();
+    let word = word_ty();
+    let unit = unit_ty();
+    let borrow = ref_string("Mut");
+    let graph = lower_owned_concat(
+        "ctor_push_str_move",
+        vec![string_decl()],
+        vec![
+            subject_decl(
+                "ctor_push_str_move",
+                1,
+                vec![word.clone()],
+                string.clone(),
+                vec![
+                    local_of(0, &string),
+                    local_of(1, &word),
+                    local_of(2, &string),
+                    local_of(3, &borrow),
+                    local_of(4, &unit),
+                ],
+                vec![
+                    bb(vec![], call_term(1, vec![], place_of(2, &string), 1, 4)),
+                    bb(
+                        vec![assign_stmt(
+                            place_of(3, &borrow),
+                            ref_rvalue(place_of(2, &string), "Mut"),
+                        )],
+                        call_term(
+                            2,
+                            vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                            place_of(4, &unit),
+                            2,
+                            4,
+                        ),
+                    ),
+                    bb(
+                        vec![assign_stmt(
+                            place_of(0, &string),
+                            use_move(place_of(2, &string)),
+                        )],
+                        json!("Return"),
+                    ),
+                    bb(vec![], json!("UnwindResume")),
+                ],
+            ),
+            string_new_decl(),
+            string_push_str_decl(),
+        ],
+    );
+    let marker_result_ty = |leaf: &str| -> Vec<&ValueType> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some(leaf) => Some(result_ty),
+                _ => None,
+            })
+            .collect()
+    };
+    let new_tys = marker_result_ty(crate::runtime_names::shims::STRINGBUILDER_NEW);
+    assert_eq!(
+        new_tys.as_slice(),
+        [&ValueType::StringBuilder],
+        "NEW is SomeStringBuilder (rtyper_new): {graph:#?}"
+    );
+    let build_tys = marker_result_ty(crate::runtime_names::shims::STRINGBUILDER_BUILD);
+    assert_eq!(
+        build_tys.as_slice(),
+        [&ValueType::Str],
+        "BUILD is SomeString (rtype_method_build): {graph:#?}"
     );
 }
 
