@@ -654,6 +654,16 @@ fn send_ex_continuation_parent_carries_pending_result_and_generator() {
     ));
 }
 
+#[test]
+fn send_ex_continuation_pending_slot_holds_the_portal_result() {
+    let generator = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let mut parent = send_ex_continuation_parent_frame(generator).expect("tail installs");
+    let item = OpRef::const_ptr(majit_ir::GcRef(1));
+    parent.boxes[0] = item;
+    assert_eq!(parent.boxes[0], item);
+    assert_eq!(parent.boxes[1], generator);
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,

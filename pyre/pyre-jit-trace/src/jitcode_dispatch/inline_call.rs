@@ -17887,6 +17887,128 @@ mod send_ex_continuation_tests {
     }
 }
 
+/// `_send_ex` after `_invoke_execute_frame`: `frame.frame_finished_execution`
+/// is `PyFrame.flags` masked with `FLAG_FRAME_FINISHED`. Guard failure
+/// resumes at the send_ex tail so `bh_send_ex_tail` returns the same
+/// null-or-item `jit_next` would. `item` is the portal result occupying the
+/// tail's pending slot (`boxes[0]`), including a CALL_ASSEMBLER dest.
+fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_box: OpRef,
+    frame_root: usize,
+    iter_op: OpRef,
+    item: OpRef,
+    mut caller_parent: InlineParentFrame,
+) -> Result<bool, DispatchError> {
+    let flags = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        frame_box,
+        crate::descr::pyframe_flags_descr(),
+    );
+    let finished_bit = ctx
+        .trace_ctx
+        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
+    let finished_bits = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAnd, &[flags, finished_bit]);
+    let gen_frame =
+        pyre_object::gc_roots::shadow_stack_get(frame_root) as *mut pyre_interpreter::PyFrame;
+    let finished = !gen_frame.is_null() && unsafe { (*gen_frame).frame_finished_execution() };
+    let bits_concrete = if finished {
+        i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED)
+    } else {
+        0
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(finished_bits, majit_ir::Value::Int(bits_concrete));
+    let opcode = if finished {
+        OpCode::GuardTrue
+    } else {
+        OpCode::GuardFalse
+    };
+    ctx.trace_ctx.record_guard(opcode, &[finished_bits], 0);
+
+    super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut caller_parent);
+    super::resume_snapshot::refresh_paused_parent_blackhole(&mut caller_parent);
+    let Some(mut send_ex_tail) = send_ex_continuation_parent_frame(iter_op) else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    match send_ex_tail.boxes.first_mut() {
+        Some(pending) => *pending = item,
+        None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
+    }
+    let mut parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    parent_frames.push(caller_parent);
+    parent_frames.push(send_ex_tail);
+
+    let saved_helper = ctx.fbw_mode.transparent_helper_subwalk;
+    ctx.fbw_mode.transparent_helper_subwalk = true;
+    let captured = walker_capture_multi_frame_inline_snapshot(
+        ctx,
+        op_pc,
+        false,
+        parent_frames,
+        GuardCaptureScope::default(),
+        GuardStampTarget::LastOp,
+    );
+    ctx.fbw_mode.transparent_helper_subwalk = saved_helper;
+    captured?;
+    Ok(finished)
+}
+
+/// FOR_ITER dest after a generator-resume sub-walk returns.
+///
+/// `_send_ex` returns the yielded item while the frame is still running;
+/// `jit_next` collapses a finished frame to a null dest. Both a `SubReturn`
+/// (yield or `return`) and a `do_recursive_call` assembler result feed this
+/// dest write after the same `frame_finished_execution` check.
+#[allow(clippy::too_many_arguments)]
+fn bind_generator_resume_foriter_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    item: OpRef,
+    concrete_item: pyre_object::PyObjectRef,
+    body_coord: InflightForiterBody,
+    frame_box: OpRef,
+    frame_root: usize,
+    iter_op: OpRef,
+    caller_parent: InlineParentFrame,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let finished = record_send_ex_finished_frame_guard(
+        ctx,
+        op.pc,
+        frame_box,
+        frame_root,
+        iter_op,
+        item,
+        caller_parent,
+    )?;
+    if finished {
+        let null_item = OpRef::const_ptr(majit_ir::GcRef::NULL);
+        write_ref_reg(ctx, op.pc, dst, null_item, ConcreteValue::Null)?;
+        ctx.frame_state.borrow_mut().vstack_last_ref = null_item;
+        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+    }
+    write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
+    fbw_foriter_inflight_capture(
+        InflightForiterOwner::current(ctx.session),
+        concrete_item,
+        body_coord,
+        false,
+    );
+    ctx.frame_state.borrow_mut().vstack_last_ref = item;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
 /// Walk the already-installed portal-shaped body of a suspended generator
 /// from `resume_execute_frame` to its next `yield`.
 fn walk_generator_resume<Sym: WalkSym>(
@@ -18211,13 +18333,16 @@ fn walk_generator_resume<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::PerFn(callee_perfn_descrs);
     ctx.sub_jitcode_lookup = callee_lookup;
 
-    let _inline_concrete = InlineConcreteFrameGuard::enter(gen_frame);
-    let walk_result = {
+    // Held through a SubReturn dest bind; dropped before CALL_ASSEMBLER
+    // (`finishframe` already ended the inlined portal).
+    let mut inline_concrete = Some(InlineConcreteFrameGuard::enter(gen_frame));
+    let (walk_result, deferred_portal_leave, is_being_profiled, caller_parent) = {
         // The image inside `parent_frame` was copied before the guards
         // and field reads above. Those recordings can minor-collect.
         super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
+        super::resume_snapshot::refresh_paused_parent_blackhole(&mut parent_frame);
+        let caller_parent = parent_frame.clone();
         let mut parents = vec![parent_frame];
-        super::resume_snapshot::refresh_paused_parent_blackhole(&mut parents[0]);
         parents.push(send_ex_tail);
         // CALL-site stamps before `enter`, matching `try_walker_inline_user_call`.
         let portal_site = python_portal_subwalk_site(ctx, op.pc, parent_inline_subwalk);
@@ -18245,7 +18370,12 @@ fn walk_generator_resume<Sym: WalkSym>(
         );
         if ctx.trace_ctx.is_too_long() {
             let ops = ctx.trace_ctx.num_recorded_ops();
-            Err(DispatchError::TraceTooLong { pc: op.pc, ops })
+            (
+                Err(DispatchError::TraceTooLong { pc: op.pc, ops }),
+                None,
+                is_being_profiled,
+                caller_parent,
+            )
         } else {
             let result = run_sub_jitcode_walk_from(
                 ctx,
@@ -18261,11 +18391,39 @@ fn walk_generator_resume<Sym: WalkSym>(
                 inline_w_code,
                 SubwalkFrameKind::PythonPortal(portal_site),
             );
-            if subwalk_jd_no.is_some() && !matches!(result, Err(DispatchError::TraceTooLong { .. }))
-            {
-                crate::state::note_inline_subwalk_end();
-            }
-            result
+            // `opimpl_jit_merge_point` (`portal_call_depth != 0`):
+            // `finishframe(None, leave_portal_frame=False)` pops the
+            // inlined portal without `LEAVE_PORTAL_FRAME`. `do_recursive_call`
+            // is recorded next, and `leave_portal_frame` follows that call.
+            let deferred_portal_leave = if let Some(jd_no) = subwalk_jd_no {
+                match &result {
+                    Err(DispatchError::TraceTooLong { .. }) => None,
+                    Ok(DispatchOutcome::SubLoopCalleeCallAssembler { .. }) => {
+                        if let Some((driver, _)) = crate::driver::try_driver_pair() {
+                            let meta = driver.meta_interp_mut();
+                            assert!(
+                                meta.framestack.frames.len() >= 2,
+                                "opimpl_jit_merge_point: recursive portal call needs a caller frame"
+                            );
+                            let _ = meta.finishframe(None, false);
+                        }
+                        ctx.clear_last_exc_value();
+                        Some(jd_no)
+                    }
+                    _ => {
+                        crate::state::note_inline_subwalk_end();
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (
+                result,
+                deferred_portal_leave,
+                is_being_profiled,
+                caller_parent,
+            )
         }
     };
 
@@ -18293,40 +18451,102 @@ fn walk_generator_resume<Sym: WalkSym>(
             return Ok(None);
         }
     };
-    let DispatchOutcome::SubReturn { result: Some(item) } = walk_result else {
-        if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[gen-resume] walk outcome pc={} resume_marker={} yield_marker={} outcome={walk_result:?}",
-                op.pc, resume_marker, yield_marker,
+    if gen_census_enabled() {
+        match &walk_result {
+            DispatchOutcome::SubReturn { .. } => {
+                eprintln!("[gen-resume] walk outcome SubReturn");
+            }
+            DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. } => {
+                eprintln!("[gen-resume] walk outcome CA target_pc={target_pc}");
+            }
+            other => {
+                eprintln!("[gen-resume] walk outcome {other:?}");
+            }
+        }
+    }
+    if matches!(
+        walk_result,
+        DispatchOutcome::SubLoopCalleeCallAssembler { .. }
+    ) {
+        drop(inline_concrete.take());
+    }
+    let (item, concrete_item) = match walk_result {
+        DispatchOutcome::SubReturn { result: Some(item) } => {
+            let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
+                fbw_durable_frame_rollback_one(gen_frame as usize);
+                if fbw_executed_effect_count() != executed_effects_before {
+                    return Err(DispatchError::callee_inline_unsupported(op.pc));
+                }
+                ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+                return Ok(None);
+            };
+            (item, concrete_item)
+        }
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+            // `do_recursive_call(..., assembler_call=True)`: reds are
+            // `[frame, ec]` (`PyPyJitDriver.reds`). The CALL_ASSEMBLER
+            // result is this portal frame's return, which continues into
+            // `_send_ex` and FOR_ITER the same way `SubReturn` does.
+            let w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
+            if !loop_callee_portal_call_can_record(ctx, frame_box, w_code, target_pc) {
+                record_deferred_portal_leave(deferred_portal_leave);
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            let token = match token {
+                Some(token) => Some(token),
+                None => super::portal_assembler_token(w_code, target_pc, is_being_profiled),
+            };
+            let emitted = emit_walker_loop_callee_call_assembler(
+                ctx,
+                op,
+                'r',
+                dst,
+                frame_box,
+                ec_box,
+                0,
+                token,
+                target_pc,
+                w_code,
+                is_being_profiled,
+                None,
             );
+            record_deferred_portal_leave(deferred_portal_leave);
+            match emitted? {
+                Some((DispatchOutcome::Continue, _)) => {}
+                Some(other) => return Ok(Some(other)),
+                None => return Err(DispatchError::callee_inline_unsupported(op.pc)),
+            }
+            let Some(item) = ctx.registers_r.get(dst) else {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            };
+            let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            };
+            (item, concrete_item)
         }
-        fbw_durable_frame_rollback_one(gen_frame as usize);
-        if fbw_executed_effect_count() != executed_effects_before {
-            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        _ => {
+            fbw_durable_frame_rollback_one(gen_frame as usize);
+            if fbw_executed_effect_count() != executed_effects_before {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
         }
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
     };
-    let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
-        fbw_durable_frame_rollback_one(gen_frame as usize);
-        if fbw_executed_effect_count() != executed_effects_before {
-            return Err(DispatchError::callee_inline_unsupported(op.pc));
-        }
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    };
-    write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
-    fbw_foriter_inflight_capture(
-        InflightForiterOwner::current(ctx.session),
+    bind_generator_resume_foriter_item(
+        ctx,
+        op,
+        dst,
+        item,
         concrete_item,
         body_coord,
-        false,
-    );
-    ctx.frame_state.borrow_mut().vstack_last_ref = item;
-    let _ = code_root;
-    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+        frame_box,
+        frame_root,
+        iter_op,
+        caller_parent,
+    )
 }
 
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
