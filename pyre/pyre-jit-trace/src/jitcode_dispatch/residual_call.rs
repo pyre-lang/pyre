@@ -4731,14 +4731,6 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                 && path.rsplit("::").next().is_some_and(|leaf| {
                     let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
                     match leaf {
-                        // `dict_get_plain_applies(dict, key, tail)` — `tail` is
-                        // `PY_NULL` for the two-word `d.get(k)` that
-                        // `__majit_wrap_dict_descr_get` pads to three words, and
-                        // `tail.is_null()` is the first thing the body reads it
-                        // with.  Declining it leaves the `bool` result unbound,
-                        // and the wrapper's own `goto_if_not` on that result
-                        // then aborts the walk with no complete image.
-                        "dict_get_plain_applies" => arg_index == 2 && nargs == 3,
                         // `dict_get_slow(dict, key, default, nargs)` — the same
                         // padding reaches `default`, and a concrete NULL there
                         // is itself the proof the word is unread: the wrapper
@@ -5015,7 +5007,6 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
             leaf,
             "tuple_from_exact_list"
                 | "dict_get_plain"
-                | "dict_get_plain_applies"
                 | "exc_init_one_positional"
                 | "value_error_one_arg"
                 | "extend_from_frame_locals_proxy"

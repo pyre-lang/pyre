@@ -54,6 +54,7 @@
 
 use std::sync::Arc;
 
+use majit_ir::forwarding::ForwardingHost;
 use majit_ir::{Const, ConstMap, InputArgRc, OpRc, Type, Value};
 
 use crate::{AsmInfo, Backend, BackendError, JitCellToken, RawExecResult};
@@ -119,6 +120,13 @@ impl<'backend> CompiledIr<'backend> {
             ));
         }
         let input_types = inputargs.iter().map(|arg| arg.tp.get()).collect();
+        // compile.py send_loop_to_backend: forget_optimization_info(operations/inputargs).
+        for iarg in inputargs {
+            iarg.clear_forwarded();
+        }
+        for op in operations {
+            op.clear_forwarded();
+        }
         backend.set_constants_pool(constants);
         let result = backend.compile_loop(inputargs, operations, &token);
         backend.set_constants_pool(ConstMap::default());

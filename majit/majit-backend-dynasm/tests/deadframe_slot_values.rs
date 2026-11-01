@@ -16,6 +16,7 @@
 //! jitframe slot index coincide, so every reader agrees no matter which of the
 //! two it is actually indexing by — the comparison would pass with the
 //! `rd_locs` decode removed entirely, and would be no control at all.
+mod common;
 use majit_backend::{Backend, JitCellToken};
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value, make_loop_target_descr};
@@ -143,6 +144,7 @@ fn finish_one_int() -> Case {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops: Vec<OpRc> = vec![add_op, finish_op].into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile_loop");
@@ -193,6 +195,7 @@ fn guard_one_int() -> Case {
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile_loop");
@@ -280,6 +283,7 @@ fn guard_float_and_int() -> Case {
     .into_iter()
     .map(OpRc::new)
     .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile_loop");
@@ -339,6 +343,7 @@ fn guard_with_hole() -> Case {
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile_loop");

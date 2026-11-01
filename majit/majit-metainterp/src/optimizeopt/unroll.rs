@@ -5397,7 +5397,7 @@ fn assemble_peeled_trace_with_jump_args(
         if op.opcode == OpCode::Jump {
             break;
         }
-        result.push(OpRc::new((**op).clone()));
+        result.push(op.clone());
     }
 
     // max_pos must account for ALL p1_ops positions, including SameAs

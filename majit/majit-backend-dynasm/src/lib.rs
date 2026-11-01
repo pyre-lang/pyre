@@ -19,7 +19,6 @@ pub mod callbuilder;
 pub mod codebuf;
 pub mod gcmap;
 pub mod guard;
-pub(crate) mod j2plan;
 pub use majit_backend::jitframe;
 pub use majit_backend::llmodel;
 pub(crate) mod jump;
@@ -77,13 +76,6 @@ pub fn majit_ops_log_enabled() -> bool {
 pub fn majit_dump_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DUMP").is_some());
-    *ENABLED
-}
-
-/// Whether `MAJIT_J2PLAN_LOG` is set, cached at first access.
-pub fn majit_j2plan_log_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_J2PLAN_LOG").is_some());
     *ENABLED
 }
 

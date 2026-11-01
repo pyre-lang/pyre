@@ -15,29 +15,23 @@ another runtime.
 
 ## What this can and cannot reproduce
 
-Verified 2026-08-13 against the image on this machine. Read this table before
+Verified 2026-10-31 against the image on this machine. Read this table before
 promising a repro:
 
 | target | works? | why |
 |---|---|---|
 | A crash / wrong answer from a bench or script | **yes** | run the binary directly |
 | `pyre/cpython_tests/run.py` — the `CPython suite (gate)` job | **yes** | the runner needs no oracle |
-| `pyre/check.py` ratio + jitstats gates | **no** | needs CPython **3.15** and `pypy3`; the image has python 3.12 and no pypy |
-| `pyre/extra_tests/parity_tests/run.py` | **no** | also needs CPython 3.15 as its oracle |
+| `pyre/check.py` ratio + jitstats gates | **yes** | the image pins CI's CPython 3.15.2 and PyPy 8.0.0; container timings remain diagnostic |
+| `pyre/extra_tests/parity_tests/run.py` | **yes** | the same pinned oracles are available |
 
-The parity gap will matter more than it does today: the runner supports a
-`# pyre-check: platforms=linux` header that *skips* a fixture on macOS, so the
-container would be the only place on this machine that runs it — and it is
-exactly where the oracle is missing. No fixture uses that header yet. Until one
-does, or until the image carries CPython 3.15, run the script directly against
-the Linux binary and diff its output against the macOS CPython by hand.
-
-`pyre/check.py` refuses up front with *"no CPython 3.15 to measure against …
-python3: 3.12. Name one with PYRE_CHECK_PYTHON3."* Do not work around it by
-pointing `PYRE_CHECK_PYTHON3` at 3.12 — the message explains why an older
-CPython disagrees on version-sensitive behaviour and timings. Closing that gap
-means adding CPython 3.15 and pypy3 to the image, which is a deliberate change
-to `tools/`, not something to improvise per run.
+The image sets `PYRE_CHECK_PYTHON3` and `PYRE_CHECK_PYPY3` without replacing
+Ubuntu's system Python. It also installs CPython 3.15.2t for free-threaded
+spec checks. Older containers can use the same reproducible installer:
+`bash tools/ubuntu24-amd64-repro/install-oracles.sh`, then export those
+variables to `/opt/pyre-oracles/bin/python3.15` and
+`/opt/pyre-oracles/bin/pypy3`, matching the image's container-local paths.
+Never substitute Ubuntu's Python 3.12 for the required oracle.
 
 ## Images
 

@@ -1,3 +1,4 @@
+mod common;
 use parking_lot::Mutex;
 /// Basic test: compile and execute a simple int_add loop via dynasm backend.
 ///
@@ -20,7 +21,7 @@ use majit_backend_dynasm::runner::DynasmBackend;
 
 static EXCEPTION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use majit_ir::forwarding::bound_operand_from_opref as rb;
+use majit_ir::forwarding::{ForwardingHost, bound_operand_from_opref as rb};
 
 #[test]
 fn test_just_finish() {
@@ -39,6 +40,7 @@ fn test_just_finish() {
     let ops = vec![finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -73,6 +75,7 @@ fn guard_not_forced_2_arms_returned_force_token_and_preserves_failargs() {
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile loop with GUARD_NOT_FORCED_2");
@@ -110,6 +113,7 @@ fn test_simple_int_add() {
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
     // Compile
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -147,6 +151,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -180,6 +185,7 @@ fn test_float_add() {
     let ops = vec![add_op, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -221,6 +227,7 @@ fn test_float_neg_keeps_the_sign_of_zero() {
     let ops = vec![neg_op, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -273,6 +280,7 @@ fn test_setarrayitem_raw_float_roundtrip() {
 
     let ops = vec![set_op, get_op, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -318,6 +326,7 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
 
     let ops = vec![set_op, get_op, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -378,6 +387,7 @@ fn test_guard_and_loop() {
     let ops = vec![label_op, add_op, lt_op, guard_op, jump_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -440,6 +450,7 @@ fn a_jump_that_carries_a_label_invariant_slot_compiles() {
         OpRc::new(guard_op),
         OpRc::new(jump_op),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -480,6 +491,7 @@ fn a_jump_shorter_than_its_label_is_rejected() {
     jump_op.setdescr(loop_descr);
 
     let ops_rc: Vec<OpRc> = vec![OpRc::new(label_op), OpRc::new(add_op), OpRc::new(jump_op)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let _ = backend.compile_loop(&inputargs, &ops_rc, &token);
 }
 
@@ -511,6 +523,7 @@ fn guard_value_gets_a_per_value_counter_when_its_operand_is_not_a_failarg() {
     jump_op.setdescr(loop_descr);
 
     let ops_rc: Vec<OpRc> = vec![OpRc::new(label_op), OpRc::new(guard_op), OpRc::new(jump_op)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -598,6 +611,7 @@ fn run_float_guard_value_loop(rhs: OpRef, f0: f64, f1: f64) -> (bool, i64) {
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     backend
         .compile_loop(&inputargs, &ops_rc, &token)
         .expect("compile loop with a float GUARD_VALUE");
@@ -688,6 +702,7 @@ fn cast_const_float_uses_cvttsd2si_and_cvtsd2ss() {
         .map(OpRc::new)
         .collect();
     let inputargs: Vec<InputArgRc> = vec![];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     backend
         .compile_loop(&inputargs, &ops_rc, &token)
         .expect("compile casts of ConstFloat");
@@ -760,6 +775,7 @@ fn float_frame_slots_rotated_across_jump() {
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     backend
         .compile_loop(&inputargs, &ops_rc, &token)
         .expect("compile a loop rotating float arguments");
@@ -843,6 +859,7 @@ fn test_float_loop_carried_across_jump() {
     ];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
 
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -909,6 +926,7 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
 
     let ops = vec![guard_gc_type, guard_is_object, guard_subclass, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -952,6 +970,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             .into_iter()
             .map(OpRc::new)
             .collect();
+        common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
         let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(root_obj)]);
@@ -990,6 +1009,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             .into_iter()
             .map(OpRc::new)
             .collect();
+        common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
         let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(raw_obj)]);
@@ -1035,6 +1055,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
             .into_iter()
             .map(OpRc::new)
             .collect();
+        common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
         let result = backend.compile_loop(&inputargs, &ops_rc, &token);
         assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
         let frame = backend.execute_token(&token, &[Value::Ref(root_b_obj)]);
@@ -1095,6 +1116,7 @@ fn guard_subclass_vtable_range_without_type_info() {
         .collect();
 
     let pass = JitCellToken::new(90);
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &pass);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     let child_ref = GcRef(&mut child_obj as *mut Obj as usize);
@@ -1104,7 +1126,15 @@ fn guard_subclass_vtable_range_without_type_info() {
         "a subclass must pass GUARD_SUBCLASS"
     );
 
+    for ia in &inputargs {
+        ia.clear_forwarded();
+    }
+    for op in &ops_rc {
+        op.clear_forwarded();
+    }
+
     let fail = JitCellToken::new(91);
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &fail);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     let other_ref = GcRef(&mut other_obj as *mut Obj as usize);
@@ -1142,6 +1172,7 @@ fn test_exception_guards_use_dynasm_emit() {
 
     let ops = vec![guard_exception, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -1181,6 +1212,7 @@ fn guard_exception_mismatch_saves_the_value_in_jf_guard_exc() {
     finish_op.setfailargs(vec![rb(OpRef::ref_op(0))].into());
 
     let ops_rc: Vec<OpRc> = vec![OpRc::new(guard_exception), OpRc::new(finish_op)];
+    common::rebind_trace_arg_boxes(&[], &ops_rc);
     backend
         .compile_loop(&[], &ops_rc, &token)
         .expect("compile loop with GUARD_EXCEPTION");
@@ -1221,6 +1253,7 @@ fn restore_exception_writes_both_cells() {
         finish_op.setfailargs(vec![].into());
 
         let ops_rc: Vec<OpRc> = vec![OpRc::new(restore), OpRc::new(finish_op)];
+        common::rebind_trace_arg_boxes(inputargs, &ops_rc);
         backend
             .compile_loop(inputargs, &ops_rc, &token)
             .expect("compile loop with RESTORE_EXCEPTION");
@@ -1284,6 +1317,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
 
     let ops = vec![guard_no_exception, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -1315,6 +1349,7 @@ fn test_guard_no_exception_and_always_fails_emit_side_exits() {
     finish_op.setfailargs(vec![].into());
     let ops = vec![guard_always_fails, finish_op];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&[], &ops_rc);
     let result = always_backend.compile_loop(&[], &ops_rc, &always_token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     let frame = always_backend.execute_token(&always_token, &[]);
@@ -1347,6 +1382,7 @@ fn test_int_binop_wide_immediate_is_not_truncated() {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops_rc: Vec<OpRc> = vec![OpRc::new(and_op), OpRc::new(finish_op)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -1380,6 +1416,7 @@ fn test_int_add_wide_immediate_is_not_truncated() {
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops_rc: Vec<OpRc> = vec![OpRc::new(add_op), OpRc::new(finish_op)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -1441,6 +1478,7 @@ fn gc_store_indexed_const_float_survives_ip0_index_combine() {
     finish.setfailargs(finish_args.clone().into());
 
     let ops_rc: Vec<OpRc> = vec![store, finish].into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     backend
         .compile_loop(&inputargs, &ops_rc, &token)
         .expect("compile GcStoreIndexed of ConstFloat");

@@ -31,6 +31,7 @@ pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
 pub mod rvec;
+pub mod tempvar;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod value;
@@ -66,6 +67,7 @@ pub use resoperation::{
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use resumecode::NumberingRef;
+pub use tempvar::{TempVar, TempVarRc};
 pub use value::{
     CallArgWord, CallResultWord, Const, FAILARGS_LIMIT, GREEN_INLINE, GREEN_UHASH_MULT,
     GREEN_UHASH_SEED, GcRef, GreenAsI64, GreenKey, GreenSlot, GreenSlotFloat, GreenSlotInt,

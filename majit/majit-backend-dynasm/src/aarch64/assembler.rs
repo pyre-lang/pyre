@@ -36,7 +36,7 @@ use crate::jitframe::{
     JF_GUARD_EXC_OFS,
 };
 use crate::jump::RegallocMoves;
-use crate::regalloc::{RegAlloc, RegAllocAssembler, park_float_const};
+use crate::regalloc::{RegAlloc, RegAllocAssembler, park_float_const, visit_boxes_with_frame_loc};
 use crate::regloc::{Loc, RegLoc};
 use crate::runner::GuardGcTypeInfo;
 
@@ -2456,12 +2456,6 @@ impl<'a> AssemblerARM64<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        if crate::majit_j2plan_log_enabled() {
-            let plan = crate::j2plan::TracePlan::build(inputargs, ops);
-            // Independent debug toggle — not gated by MAJIT_LOG.
-            eprintln!("[dynasm:j2plan] {}", plan.summary());
-        }
-
         // RegAlloc keeps the raw `i64` value map; project it from the
         // typed pool at this boundary (each Const carries its own type).
         let ra_constants: indexmap::IndexMap<u32, i64> = self
@@ -2522,12 +2516,10 @@ impl<'a> AssemblerARM64<'a> {
                 .insert(iarg.opref(), JITFRAME_FIXED_SIZE + position);
         }
         // Also sync any frame allocations from regalloc's FrameManager.
-        for (&opref, lifetime) in ra.longevity.lifetimes_iter() {
-            if let Some(floc) = lifetime.current_frame_loc {
-                self.opref_to_slot
-                    .insert(opref, JITFRAME_FIXED_SIZE + floc.get_position());
-            }
-        }
+        visit_boxes_with_frame_loc(inputargs, ops, &ra.fm, |opref, floc| {
+            self.opref_to_slot
+                .insert(opref, JITFRAME_FIXED_SIZE + floc.get_position());
+        });
         // frame_slot_depth is already absolute (see calculation above).
         self.next_slot = frame_slot_depth;
 
@@ -7743,6 +7735,7 @@ mod tests {
         make_loop_target_descr,
     };
 
+    use crate::regalloc::rebind_trace_arg_boxes;
     use crate::runner::DynasmBackend;
     use dynasmrt::{DynasmApi, dynasm};
 
@@ -7782,8 +7775,10 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
         finish.setfailargs(vec![].into());
         let token = JitCellToken::new(530);
+        let rebind_ops_1 = [OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_1);
         backend
-            .compile_loop(&[], &[OpRc::new(finish)], &token)
+            .compile_loop(&[], &rebind_ops_1, &token)
             .expect("compile a loop whose prologue includes the stack check");
 
         let compiled = token
@@ -7859,8 +7854,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(517);
+        let rebind_ops_2 = [malloc, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_2);
         backend
-            .compile_loop(&[], &[malloc, OpRc::new(finish)], &token)
+            .compile_loop(&[], &rebind_ops_2, &token)
             .expect("compile register-resident nursery result trace");
 
         let compiled = token
@@ -7899,8 +7896,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(522);
+        let rebind_ops_3 = [add, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &rebind_ops_3);
         backend
-            .compile_loop(&inputargs, &[add, OpRc::new(finish)], &token)
+            .compile_loop(&inputargs, &rebind_ops_3, &token)
             .expect("compile float-add constant");
 
         let frame = backend.execute_token(&token, &[Value::Float(2.0)]);
@@ -7972,6 +7971,7 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let ops = vec![word, armed, guard, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &ops);
         backend
             .compile_loop(&[], &ops, &token)
             .expect("compile eval-breaker poll IR");
@@ -8037,12 +8037,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let target_token = JitCellToken::new(520);
+        let rebind_ops_4 = [OpRc::new(label), word, armed, guard, OpRc::new(finish)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_4);
         backend
-            .compile_loop(
-                &[],
-                &[OpRc::new(label), word, armed, guard, OpRc::new(finish)],
-                &target_token,
-            )
+            .compile_loop(&[], &rebind_ops_4, &target_token)
             .expect("compile cross-trace bitmask target");
 
         test_word.fetch_or(majit_ir::eval_breaker_word::EB_STW, Ordering::Relaxed);
@@ -8053,8 +8051,10 @@ mod tests {
         jump.pos().set(OpRef::void_op(0));
         jump.setdescr(target_descr);
         let source_token = JitCellToken::new(521);
+        let rebind_ops_5 = [OpRc::new(jump)];
+        rebind_trace_arg_boxes(&[], &rebind_ops_5);
         backend
-            .compile_loop(&[], &[OpRc::new(jump)], &source_token)
+            .compile_loop(&[], &rebind_ops_5, &source_token)
             .expect("compile external JUMP source");
 
         let frame = backend.execute_token(&target_token, &[]);
@@ -8100,12 +8100,10 @@ mod tests {
             jump.pos().set(OpRef::void_op(4));
             jump.setdescr(target_descr);
             let token = JitCellToken::new(522);
+            let rebind_ops_6 = [OpRc::new(label), word, armed, guard, OpRc::new(jump)];
+            rebind_trace_arg_boxes(&[], &rebind_ops_6);
             backend
-                .compile_loop(
-                    &[],
-                    &[OpRc::new(label), word, armed, guard, OpRc::new(jump)],
-                    &token,
-                )
+                .compile_loop(&[], &rebind_ops_6, &token)
                 .expect("compile polling loop on worker");
 
             ready_tx.send(()).unwrap();
@@ -8233,8 +8231,10 @@ mod tests {
         finish.setfailargs(vec![].into());
 
         let token = JitCellToken::new(trace_id as i64);
+        let rebind_ops_7 = [OpRc::new(barrier), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &rebind_ops_7);
         backend
-            .compile_loop(&inputargs, &[OpRc::new(barrier), OpRc::new(finish)], &token)
+            .compile_loop(&inputargs, &rebind_ops_7, &token)
             .expect("compile COND_CALL_GC_WB_ARRAY trace");
         let frame = backend.execute_token(&token, &values);
         assert!(

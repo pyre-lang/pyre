@@ -27,6 +27,7 @@ use crate::forwarding::{
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::{OpRc, OpRef};
+use crate::tempvar::{TempVar, TempVarRc};
 use crate::value::{Const, GcRef, InputArgRc, Type, Value};
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
@@ -189,6 +190,7 @@ const OP_CONST: u64 = 2;
 const OP_SMALLINT: u64 = 3;
 const OP_SMALLWIDE: u64 = 4;
 const OP_NULLREF: u64 = 5;
+const OP_TEMPVAR: u64 = 6;
 
 /// Decoded view. Pointer variants borrow the operand's own reference without
 /// taking a count; the view must not outlive the operand it was read from.
@@ -200,6 +202,7 @@ enum Opnd {
     SmallWide(u64),
     NullRef,
     Const(ManuallyDrop<Rc<Cell<Value>>>),
+    TempVar(ManuallyDrop<TempVarRc>),
 }
 
 impl Operand {
@@ -254,6 +257,15 @@ impl Operand {
         }
     }
 
+    /// `regalloc.py TempVar()` as an operand.
+    pub fn temp_var(tv: TempVarRc) -> Operand {
+        let p = Rc::into_raw(tv) as u64;
+        debug_assert_eq!(p & OP_TAG, 0);
+        Operand {
+            packed: p | OP_TEMPVAR,
+        }
+    }
+
     fn view(&self) -> Opnd {
         if self.packed == 0 {
             return Opnd::None;
@@ -275,6 +287,9 @@ impl Operand {
             }
             OP_SMALLWIDE => Opnd::SmallWide(self.packed >> 3),
             OP_NULLREF => Opnd::NullRef,
+            OP_TEMPVAR => Opnd::TempVar(ManuallyDrop::new(unsafe {
+                Rc::from_raw((self.packed & !OP_TAG) as *const TempVar)
+            })),
             _ => Opnd::None,
         }
     }
@@ -335,12 +350,22 @@ impl Clone for Operand {
                     (self.packed & !OP_TAG) as *const Cell<Value>,
                 );
             },
+            OP_TEMPVAR => unsafe {
+                Rc::<TempVar>::increment_strong_count((self.packed & !OP_TAG) as *const TempVar);
+            },
             _ => {}
         }
         Operand {
             packed: self.packed,
         }
     }
+}
+
+/// TempVar operands exist only inside the backend register allocator.
+#[cold]
+#[inline(never)]
+fn drop_tempvar_operand(packed: u64) {
+    drop(unsafe { Rc::<TempVar>::from_raw((packed & !OP_TAG) as *const TempVar) });
 }
 
 impl Drop for Operand {
@@ -361,6 +386,9 @@ impl Drop for Operand {
             OP_CONST => {
                 drop(unsafe { Rc::from_raw((self.packed & !OP_TAG) as *const Cell<Value>) });
             }
+            OP_TEMPVAR => {
+                drop_tempvar_operand(self.packed);
+            }
             _ => {}
         }
     }
@@ -379,6 +407,7 @@ impl std::fmt::Debug for Operand {
             Opnd::SmallWide(id) => f.debug_tuple("SmallWide").field(&wide_value(id)).finish(),
             Opnd::NullRef => f.write_str("NullRef"),
             Opnd::Const(c) => f.debug_tuple("Const").field(&c.get()).finish(),
+            Opnd::TempVar(tv) => f.debug_tuple("TempVar").field(&tv.id).finish(),
         }
     }
 }
@@ -521,6 +550,7 @@ impl Operand {
                 Value::Ref(v) => OpRef::const_ptr(v),
                 Value::Void => OpRef::NONE,
             },
+            Opnd::TempVar(tv) => OpRef::TempVar(tv.id),
         }
     }
 
@@ -530,6 +560,7 @@ impl Operand {
         match self.view() {
             Opnd::Op(op) => Some(op.pos().get().raw()),
             Opnd::InputArg(ia) => Some(ia.index),
+            Opnd::TempVar(tv) => Some(tv.id),
             _ => None,
         }
     }
@@ -544,6 +575,7 @@ impl Operand {
             Opnd::NullRef => Type::Ref,
             Opnd::Const(cell) => cell.get().get_type(),
             Opnd::None => Type::Void,
+            Opnd::TempVar(_) => Type::Int,
         }
     }
 
@@ -555,7 +587,7 @@ impl Operand {
             Opnd::SmallWide(id) => Some(wide_value(id)),
             Opnd::NullRef => Some(Value::Ref(GcRef::NULL)),
             Opnd::Const(cell) => Some(cell.get()),
-            _ => None,
+            Opnd::Op(_) | Opnd::InputArg(_) | Opnd::TempVar(_) | Opnd::None => None,
         }
     }
 
@@ -572,7 +604,7 @@ impl Operand {
             Opnd::Const(cell) => Some(cell.get()),
             Opnd::Op(op) => op.get_value(),
             Opnd::InputArg(ia) => ia.get_value(),
-            Opnd::None => None,
+            Opnd::TempVar(_) | Opnd::None => None,
         }
     }
 
@@ -612,6 +644,15 @@ impl Operand {
         self.packed != 0 && self.packed & OP_TAG == OP_OP
     }
 
+    pub fn is_temp_var(&self) -> bool {
+        self.packed != 0 && self.packed & OP_TAG == OP_TEMPVAR
+    }
+
+    /// Pointer identity of the bound object: same tag and same pointer.
+    pub fn is_same_box(&self, other: &Operand) -> bool {
+        self.packed == other.packed
+    }
+
     /// True for the absent-slot sentinel — the mirror of `OpRef::is_none`.
     pub fn is_none(&self) -> bool {
         self.packed == 0
@@ -637,7 +678,10 @@ impl Operand {
     /// wrapper per producer, so its `Rc::ptr_eq` short-circuit and this
     /// producer-`Rc` `ptr_eq` agree), without re-minting a `Const` box.
     pub fn same_box(&self, other: &Operand) -> bool {
-        if (self.is_resop() && other.is_resop()) || (self.is_inputarg() && other.is_inputarg()) {
+        if (self.is_resop() && other.is_resop())
+            || (self.is_inputarg() && other.is_inputarg())
+            || (self.is_temp_var() && other.is_temp_var())
+        {
             return self.packed == other.packed;
         }
         if self.is_constant() && other.is_constant() {
@@ -675,7 +719,7 @@ impl Operand {
     /// Packed word of the `_forwarded` chain terminal, not counted: `self`
     /// or a hop's `_forwarded` slot keeps it alive.
     fn replacement_packed(&self, not_const: bool) -> u64 {
-        if !self.is_resop() && !self.is_inputarg() {
+        if !self.is_resop() && !self.is_inputarg() && !self.is_temp_var() {
             return self.packed;
         }
         // Packed-tag walk: `self` keeps the first producer alive, and each
@@ -687,6 +731,12 @@ impl Operand {
                 unsafe {
                     crate::resoperation::packed_forwarded_of_op(
                         cur as *const crate::resoperation::Op,
+                    )
+                }
+            } else if cur & OP_TAG == OP_TEMPVAR {
+                unsafe {
+                    crate::tempvar::packed_forwarded_of_tempvar(
+                        (cur & !OP_TAG) as *const crate::tempvar::TempVar,
                     )
                 }
             } else {
@@ -763,6 +813,7 @@ impl Operand {
         match self.view() {
             Opnd::Op(op) => f(&**op),
             Opnd::InputArg(ia) => f(&**ia),
+            Opnd::TempVar(tv) => f(&**tv),
             _ => default,
         }
     }
@@ -774,9 +825,10 @@ impl Operand {
         match self.view() {
             Opnd::Op(op) => f(&**op),
             Opnd::InputArg(ia) => f(&**ia),
+            Opnd::TempVar(tv) => f(&**tv),
             _ => panic!(
                 "Operand::{what} on a non-producer operand — only a bound \
-                 Op/InputArg carries a _forwarded slot (box identity precondition)"
+                 Op/InputArg/TempVar carries a _forwarded slot (box identity precondition)"
             ),
         }
     }
@@ -839,6 +891,49 @@ impl Operand {
         self.with_forwarding_host("set_forwarded_info", |h| h.set_forwarded_info(info));
     }
 
+    /// `regalloc.py get_lifetime` — clone only the `OpInfo::Lifetime` `Rc`.
+    #[inline]
+    pub fn get_lifetime_info(&self) -> Option<Rc<dyn std::any::Any>> {
+        if self.packed == 0 {
+            return None;
+        }
+        let packed_fwd = if self.packed & OP_TAG == OP_OP {
+            // SAFETY: `OP_OP` packs the producer `Op` pointer; this operand holds it.
+            unsafe {
+                crate::resoperation::packed_forwarded_of_op(
+                    self.packed as *const crate::resoperation::Op,
+                )
+            }
+        } else if self.packed & OP_TAG == OP_TEMPVAR {
+            // SAFETY: `OP_TEMPVAR` packs the `TempVar` pointer; this operand holds it.
+            unsafe {
+                crate::tempvar::packed_forwarded_of_tempvar(
+                    (self.packed & !OP_TAG) as *const crate::tempvar::TempVar,
+                )
+            }
+        } else if self.packed & OP_TAG == OP_INPUTARG {
+            // SAFETY: `OP_INPUTARG` packs the `InputArg` pointer; this operand holds it.
+            unsafe {
+                crate::resoperation::packed_forwarded_of_inputarg(
+                    (self.packed & !OP_TAG) as *const crate::value::InputArg,
+                )
+            }
+        } else {
+            return None;
+        };
+        crate::forwarding::lifetime_info_from_packed(packed_fwd)
+    }
+
+    /// `LifetimeManager.__setitem__` → `box.set_forwarded(lt)`.
+    pub fn set_lifetime_info(&self, info: Rc<dyn std::any::Any>) {
+        assert!(
+            !self.is_constant(),
+            "set_lifetime_info on Const violates the AbstractValue invariant \
+             (Const has no _forwarded slot)"
+        );
+        self.with_forwarding_host("set_lifetime_info", |h| h.set_lifetime_info(info));
+    }
+
     /// `_forwarded = None`. No-op on `Const` (no slot); routes to
     /// [`ForwardingHost::clear_forwarded`] on a bound producer.
     pub fn clear_forwarded(&self) {
@@ -892,7 +987,7 @@ impl Operand {
     /// renumbered producer (no snapshot rewrite needed); `Const` / `None`
     /// carry no position to remap.
     pub fn is_bound(&self) -> bool {
-        self.is_resop() || self.is_inputarg()
+        self.is_resop() || self.is_inputarg() || self.is_temp_var()
     }
 
     /// GC walk over any inline `ConstPtr` reachable from this operand
@@ -1415,5 +1510,17 @@ mod tests {
 
         #[cfg(target_pointer_width = "64")]
         assert_eq!(std::mem::size_of::<Operand>(), 8);
+    }
+
+    #[test]
+    fn temp_var_operand_is_bound_int_and_round_trips_to_opref() {
+        let tv = Operand::temp_var(crate::tempvar::TempVar::new_rc(0xFFFF_0003));
+        assert!(tv.is_temp_var());
+        assert!(tv.is_bound());
+        assert!(!tv.is_constant());
+        assert_eq!(tv.type_(), Type::Int);
+        assert_eq!(tv.to_opref(), OpRef::TempVar(0xFFFF_0003));
+        assert!(tv.is_same_box(&tv.clone()));
+        assert!(matches!(tv.get_forwarded(), Forwarded::None));
     }
 }

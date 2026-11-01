@@ -5199,8 +5199,8 @@ impl OptContext {
             // caller never stores an `Unknown` entry in `exported_infos`
             // (see `collect_exported_info`'s `None` return
             // in `unroll.rs`, mirroring unroll.py `if info:`).
-            OpInfo::Unknown | OpInfo::EmptyInfo(_) => unreachable!(
-                "exported_infos must never contain OpInfo::Unknown/EmptyInfo; \
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) | OpInfo::Lifetime(_) => unreachable!(
+                "exported_infos must never contain OpInfo::Unknown/EmptyInfo/Lifetime; \
                  the absent-entry branch (clear_forwarded) handles that case"
             ),
         }
@@ -5236,7 +5236,8 @@ impl OptContext {
             OpInfo::FloatConstInfo(f) => {
                 self.make_constant_box(&target, Value::Float(f.getconst()));
             }
-            OpInfo::Unknown | OpInfo::EmptyInfo(_) => {}
+            // Optimizer never sees `regalloc.py Lifetime(AbstractInfo)`.
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) | OpInfo::Lifetime(_) => {}
         }
     }
 

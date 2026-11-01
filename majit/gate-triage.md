@@ -307,13 +307,6 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
-### `MAJIT_J2PLAN_LOG`
-
-- Read sites: 2 — `majit/majit-backend-dynasm/src/aarch64/assembler.rs`, `majit/majit-backend-dynasm/src/lib.rs`
-- Accessor: `majit_j2plan_log_enabled()`; also read inline in `_assemble()`
-- What it does: Whether `MAJIT_J2PLAN_LOG` is set, cached at first access.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
 ### `MAJIT_JITFRAME_POOL`
 
 - Read sites: 1 — `majit/majit-backend/src/deadframe.rs`

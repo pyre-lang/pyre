@@ -3937,10 +3937,19 @@ pub fn clinic_arg_type_name(obj: PyObjectRef) -> String {
     if unsafe { pyre_object::is_none(obj) } {
         return "None".to_string();
     }
-    let mut name = arg_type_name(obj);
-    if name.len() > 50 {
-        let end = name.floor_char_boundary(50);
-        name.truncate(end);
+    let name = arg_type_name(obj);
+    let text = name.as_str();
+    let bytes = text.as_bytes();
+    if bytes.len() > 50 {
+        // Keep the immutable STR shape (`rstr.py`
+        // `LLHelpers.ll_stringslice_startstop`), not Rust String mutation.
+        // As in `rutf8.py` `prev_codepoint_pos`, skip continuation bytes
+        // before slicing so the %.50s limit cannot split a UTF-8 code point.
+        let mut end = 50;
+        while bytes[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+        return unsafe { std::str::from_utf8_unchecked(&bytes[..end]) }.to_string();
     }
     name
 }
@@ -6686,7 +6695,9 @@ pub fn __majit_wrap_dict_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 /// The dict's strategy is deliberately not tested here.  Reading it in this
 /// call and probing in the next is a time-of-check window, so
 /// [`dict_get_plain`] decides it under the lock that probes.
-#[majit_macros::dont_look_inside_cannot_raise]
+// `AbstractTypedStrategy.getitem` / `UnicodeDictStrategy.is_correct_type`
+// trace their type tests. Keep these visible too, so existing receiver and
+// key type facts eliminate the predicate before the lookup.
 fn dict_get_plain_applies(dict: PyObjectRef, key: PyObjectRef, _tail: PyObjectRef) -> bool {
     unsafe {
         pyre_object::is_exact_any_dict(dict)

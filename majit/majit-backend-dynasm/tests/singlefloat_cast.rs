@@ -4,6 +4,7 @@
 //! model.py's `False` and never sees these casts.
 #![cfg(target_arch = "x86_64")]
 
+mod common;
 use majit_backend::{Backend, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
 use majit_ir::forwarding::bound_operand_from_opref as rb;
@@ -20,6 +21,7 @@ fn float_to_singlefloat_bits(backend: &mut DynasmBackend, token_id: u64, input: 
     finish.set_fail_arg_types(vec![Type::Int]);
     finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
     let ops = vec![OpRc::new(cast), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile CAST_FLOAT_TO_SINGLEFLOAT: {err:?}"));
@@ -39,6 +41,7 @@ fn singlefloat_bits_to_float(backend: &mut DynasmBackend, token_id: u64, bits: i
     finish.set_fail_arg_types(vec![Type::Float]);
     finish.setfailargs(vec![rb(OpRef::float_op(1))].into());
     let ops = vec![OpRc::new(cast), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile CAST_SINGLEFLOAT_TO_FLOAT: {err:?}"));
@@ -60,6 +63,7 @@ fn chained_cast(backend: &mut DynasmBackend, token_id: u64, input: f64) -> f64 {
     finish.set_fail_arg_types(vec![Type::Float]);
     finish.setfailargs(vec![rb(OpRef::float_op(2))].into());
     let ops = vec![OpRc::new(to_sf), OpRc::new(to_f), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile chained singlefloat cast: {err:?}"));

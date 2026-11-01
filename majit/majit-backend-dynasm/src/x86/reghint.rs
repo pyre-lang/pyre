@@ -8,8 +8,10 @@ use crate::regalloc::{LifetimeManager, SAVE_ALL_REGS, SAVE_DEFAULT_REGS, SAVE_GC
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
 use indexmap::IndexMap;
+#[cfg(test)]
+use majit_ir::OpRef;
 use majit_ir::operand::Operand;
-use majit_ir::{Op, OpCode, OpRef, Type};
+use majit_ir::{Op, OpCode, Type};
 
 /// reghint.py X86RegisterHints.
 pub struct RegisterHints {
@@ -41,13 +43,16 @@ impl RegisterHints {
 
     /// Rust equivalent of `isinstance(arg, ConstInt) and arg.value`
     /// — returns the const int value if available.
-    fn get_const_int(&self, arg: OpRef) -> Option<i64> {
+    fn get_const_int(&self, arg: &Operand) -> Option<i64> {
         if !arg.is_constant() {
             return None;
         }
-        // history.py/268/314 — inline-Const variants carry value inline.
-        arg.inline_const_bits()
-            .or_else(|| self.constants.get(&arg.raw()).copied())
+        arg.const_int().or_else(|| {
+            let opref = arg.to_opref();
+            opref
+                .inline_const_bits()
+                .or_else(|| self.constants.get(&opref.raw()).copied())
+        })
     }
 
     /// reghint.py `add_hints` — main entry called from
@@ -56,27 +61,35 @@ impl RegisterHints {
         &self,
         longevity: &mut LifetimeManager,
         _inputargs: &[majit_ir::InputArgRc],
-        operations: &[impl AsRef<Op>],
+        operations: &[majit_ir::OpRc],
     ) {
-        for (i, op) in operations.iter().enumerate() {
-            let op = op.as_ref();
+        for (i, op_rc) in operations.iter().enumerate() {
+            let op = op_rc.as_ref();
+            let result = Operand::from_bound_op(op_rc);
             let position = i as i32;
             // reghint.py:34-35 skip dead no-side-effect ops.
-            if op.opcode.has_no_side_effect() && !longevity.contains(op.pos().get()) {
+            if op.opcode.has_no_side_effect() && !longevity.contains(&result) {
                 continue;
             }
-            self.dispatch(op.opcode, longevity, op, position);
+            self.dispatch(op.opcode, longevity, op, &result, position);
         }
     }
 
     /// reghint.py `oplist` dispatch.  Implemented as a match
     /// here because Rust cannot build a class-method oplist at
     /// import time the way Python can.
-    fn dispatch(&self, opcode: OpCode, longevity: &mut LifetimeManager, op: &Op, position: i32) {
+    fn dispatch(
+        &self,
+        opcode: OpCode,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        position: i32,
+    ) {
         match opcode {
             // reghint.py consider_int_neg
             OpCode::IntNeg | OpCode::IntInvert => {
-                self.consider_int_neg(longevity, op, position);
+                self.consider_int_neg(longevity, op, result, position);
             }
             // reghint.py _consider_binop_symm
             OpCode::IntMul
@@ -85,19 +98,19 @@ impl RegisterHints {
             | OpCode::IntXor
             | OpCode::IntMulOvf
             | OpCode::IntAddOvf => {
-                self._consider_binop_symm(longevity, op, position);
+                self._consider_binop_symm(longevity, op, result, position);
             }
             // reghint.py _consider_binop
             OpCode::IntSubOvf => {
-                self._consider_binop(longevity, op, position);
+                self._consider_binop(longevity, op, result, position);
             }
             // reghint.py consider_int_add + consider_nursery_ptr_increment
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
-                self.consider_int_add(longevity, op, position);
+                self.consider_int_add(longevity, op, result, position);
             }
             // reghint.py consider_int_sub
             OpCode::IntSub => {
-                self.consider_int_sub(longevity, op, position);
+                self.consider_int_sub(longevity, op, result, position);
             }
             // reghint.py _consider_float_op
             OpCode::FloatAdd
@@ -106,11 +119,11 @@ impl RegisterHints {
             | OpCode::FloatTrueDiv
             | OpCode::FloatNeg
             | OpCode::FloatAbs => {
-                self._consider_float_op(longevity, op, position);
+                self._consider_float_op(longevity, op, result, position);
             }
             // reghint.py consider_int_lshift / rshift / urshift
             OpCode::IntLshift | OpCode::IntRshift | OpCode::UintRshift => {
-                self.consider_int_lshift(longevity, op, position);
+                self.consider_int_lshift(longevity, op, result, position);
             }
             // reghint.py consider_uint_mul_high
             OpCode::UintMulHigh => {
@@ -122,7 +135,7 @@ impl RegisterHints {
             | OpCode::CallMallocNurseryVarsize
             | OpCode::CallMallocNurseryVarsizeHeaderless
             | OpCode::CallMallocNurseryVarsizeFrame => {
-                self.consider_call_malloc_nursery(longevity, op, position);
+                self.consider_call_malloc_nursery(longevity, op, result, position);
             }
             // reghint.py consider_call_{i,r,f,n} → _consider_real_call
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN => {
@@ -144,8 +157,14 @@ impl RegisterHints {
     }
 
     /// reghint.py consider_int_neg / consider_int_invert.
-    fn consider_int_neg(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
-        longevity.try_use_same_register(op.arg(0).to_opref(), op.pos().get());
+    fn consider_int_neg(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        _position: i32,
+    ) {
+        longevity.try_use_same_register(&op.arg(0), result);
     }
 
     /// reghint.py `_consider_binop_part`.
@@ -153,11 +172,12 @@ impl RegisterHints {
         &self,
         longevity: &mut LifetimeManager,
         op: &Op,
+        result: &Operand,
         position: i32,
         symm: bool,
     ) {
-        let mut x = op.arg(0).to_opref();
-        let mut y = op.arg(1).to_opref();
+        let mut x = op.arg(0);
+        let mut y = op.arg(1);
 
         // For symmetrical operations, if y won't be used after the
         // current operation finishes, but x will be, then swap the
@@ -166,8 +186,14 @@ impl RegisterHints {
             if x.is_constant() {
                 std::mem::swap(&mut x, &mut y);
             } else if !y.is_constant() {
-                let x_last = longevity.get(x).map(|lt| lt.last_usage).unwrap_or(-1);
-                let y_last = longevity.get(y).map(|lt| lt.last_usage).unwrap_or(-1);
+                let x_last = longevity
+                    .get(&x)
+                    .map(|lt| lt.last_usage.get())
+                    .unwrap_or(-1);
+                let y_last = longevity
+                    .get(&y)
+                    .map(|lt| lt.last_usage.get())
+                    .unwrap_or(-1);
                 if x_last > position && y_last == position {
                     std::mem::swap(&mut x, &mut y);
                 }
@@ -175,49 +201,79 @@ impl RegisterHints {
         }
 
         if !x.is_constant() {
-            longevity.try_use_same_register(x, op.pos().get());
+            longevity.try_use_same_register(&x, result);
         }
     }
 
     /// reghint.py `_consider_binop`.
-    fn _consider_binop(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        self._consider_binop_part(longevity, op, position, false);
+    fn _consider_binop(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        position: i32,
+    ) {
+        self._consider_binop_part(longevity, op, result, position, false);
     }
 
     /// reghint.py `_consider_binop_symm`.
-    fn _consider_binop_symm(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        self._consider_binop_part(longevity, op, position, true);
+    fn _consider_binop_symm(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        position: i32,
+    ) {
+        self._consider_binop_part(longevity, op, result, position, true);
     }
 
     /// reghint.py `consider_int_add`.
-    fn consider_int_add(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let y = op.arg(1).to_opref();
-        if let Some(val) = self.get_const_int(y) {
+    fn consider_int_add(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        position: i32,
+    ) {
+        let y = op.arg(1);
+        if let Some(val) = self.get_const_int(&y) {
             if fits_in_32bits(val) {
                 // nothing to be hinted
                 return;
             }
         }
-        self._consider_binop_symm(longevity, op, position);
+        self._consider_binop_symm(longevity, op, result, position);
     }
 
     /// reghint.py `consider_int_sub`.
-    fn consider_int_sub(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let y = op.arg(1).to_opref();
-        if let Some(val) = self.get_const_int(y) {
+    fn consider_int_sub(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        position: i32,
+    ) {
+        let y = op.arg(1);
+        if let Some(val) = self.get_const_int(&y) {
             // `-y.value` of `i64::MIN` is 2**63, which does not fit.
             if fits_in_32bits(val.wrapping_neg()) {
                 return;
             }
         }
-        self._consider_binop(longevity, op, position);
+        self._consider_binop(longevity, op, result, position);
     }
 
     /// reghint.py `_consider_float_op`.
-    fn _consider_float_op(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
-        let x = op.arg(0).to_opref();
+    fn _consider_float_op(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        _position: i32,
+    ) {
+        let x = op.arg(0);
         if !x.is_constant() {
-            longevity.try_use_same_register(x, op.pos().get());
+            longevity.try_use_same_register(&x, result);
         }
     }
 
@@ -227,14 +283,20 @@ impl RegisterHints {
     /// Shift amount must go in ecx (x86 `shl`/`shr` only accept cl).
     /// Fix `ecx` for `y` at this position, and bias the result to
     /// share with `x` via try_use_same_register.
-    fn consider_int_lshift(&self, longevity: &mut LifetimeManager, op: &Op, position: i32) {
-        let x = op.arg(0).to_opref();
-        let y = op.arg(1).to_opref();
+    fn consider_int_lshift(
+        &self,
+        longevity: &mut LifetimeManager,
+        op: &Op,
+        result: &Operand,
+        position: i32,
+    ) {
+        let x = op.arg(0);
+        let y = op.arg(1);
         if !y.is_constant() {
-            longevity.fixed_register(position, ECX, Some(y));
+            longevity.fixed_register(position, ECX, Some(&y));
         }
         if !x.is_constant() {
-            longevity.try_use_same_register(x, op.pos().get());
+            longevity.try_use_same_register(&x, result);
         }
     }
 
@@ -253,10 +315,11 @@ impl RegisterHints {
     fn consider_call_malloc_nursery(
         &self,
         longevity: &mut LifetimeManager,
-        op: &Op,
+        _op: &Op,
+        result: &Operand,
         position: i32,
     ) {
-        longevity.fixed_register(position, ECX, Some(op.pos().get()));
+        longevity.fixed_register(position, ECX, Some(result));
         longevity.fixed_register(position, EDX, None);
     }
 
@@ -308,28 +371,27 @@ impl RegisterHints {
     ) {
         let mut hinted_xmm: Vec<RegLoc> = Vec::new();
         let mut hinted_gpr: Vec<RegLoc> = Vec::new();
-        let mut hinted_args: Vec<OpRef> = Vec::new();
+        let mut hinted_args: Vec<Operand> = Vec::new();
         let mut next_arg_gpr = 0usize;
         let mut next_arg_xmm = 0usize;
 
         for (i, operand) in args.iter().enumerate() {
-            let arg = operand.to_opref();
             if operand.type_() == Type::Float || argtypes.get(i) == Some(&b'S') {
                 if next_arg_xmm < ARGUMENTS_XMM.len() {
                     let tgt = ARGUMENTS_XMM[next_arg_xmm];
-                    if !arg.is_constant() && !hinted_args.contains(&arg) {
-                        longevity.fixed_register(position, tgt, Some(arg));
+                    if !operand.is_constant() && !hinted_args.contains(operand) {
+                        longevity.fixed_register(position, tgt, Some(operand));
                         hinted_xmm.push(tgt);
-                        hinted_args.push(arg);
+                        hinted_args.push(operand.clone());
                     }
                     next_arg_xmm += 1;
                 }
             } else if next_arg_gpr < ARGUMENTS_GPR.len() {
                 let tgt = ARGUMENTS_GPR[next_arg_gpr];
-                if !arg.is_constant() && !hinted_args.contains(&arg) {
-                    longevity.fixed_register(position, tgt, Some(arg));
+                if !operand.is_constant() && !hinted_args.contains(operand) {
+                    longevity.fixed_register(position, tgt, Some(operand));
                     hinted_gpr.push(tgt);
-                    hinted_args.push(arg);
+                    hinted_args.push(operand.clone());
                 }
                 next_arg_gpr += 1;
             }
@@ -387,6 +449,7 @@ fn fits_in_32bits(value: i64) -> bool {
 mod tests {
     use super::*;
     use crate::regalloc::compute_vars_longevity;
+    use crate::regalloc::rebind_trace_arg_boxes;
     use majit_ir::effectinfo::{EffectInfo, ExtraEffect, OopSpecIndex};
     use majit_ir::forwarding::bound_operand_from_opref as rb;
     use majit_ir::{InputArg, OpRc};
@@ -396,12 +459,15 @@ mod tests {
     /// GPR slot, so the next integer argument still gets ARGUMENTS_GPR[0].
     #[test]
     fn call_hint_singlefloat_takes_xmm() {
-        let f = OpRef::input_arg_int(0);
-        let i = OpRef::input_arg_int(1);
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let f = Operand::from_bound_inputarg(&inputargs[0]);
+        let i = Operand::from_bound_inputarg(&inputargs[1]);
         let mut effect = EffectInfo::new(ExtraEffect::CannotRaise, OopSpecIndex::None);
         effect.can_collect = false;
-        let call = Op::new(OpCode::CallN, &[rb(OpRef::const_int(0x1000)), rb(f), rb(i)]);
+        let call = Op::new(
+            OpCode::CallN,
+            &[rb(OpRef::const_int(0x1000)), f.clone(), i.clone()],
+        );
         call.pos().set(OpRef::void_op(0));
         call.setdescr(majit_ir::descr::make_call_descr_full_with_classes(
             0,
@@ -416,17 +482,18 @@ mod tests {
         let finish = Op::new(OpCode::Finish, &[]);
         finish.pos().set(OpRef::void_op(1));
         let ops: Vec<OpRc> = vec![OpRc::new(call), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
         RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
             &mut longevity,
             &inputargs,
             &ops,
         );
-        let fixed = |v: OpRef| longevity.get(v).unwrap().find_fixed_register(0, &longevity);
-        assert_eq!(fixed(f), Some(ARGUMENTS_XMM[0]));
+        let fixed = |v: &Operand| longevity.get(v).unwrap().find_fixed_register(0);
+        assert_eq!(fixed(&f), Some(ARGUMENTS_XMM[0]));
         // The separate GPR/XMM counters are the SysV numbering.
         #[cfg(not(target_os = "windows"))]
-        assert_eq!(fixed(i), Some(ARGUMENTS_GPR[0]));
+        assert_eq!(fixed(&i), Some(ARGUMENTS_GPR[0]));
     }
 
     /// `consider_int_sub` negates the constant. `i64::MIN` has no
@@ -441,6 +508,7 @@ mod tests {
         let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(0))]);
         finish.pos().set(OpRef::void_op(1));
         let ops: Vec<OpRc> = vec![OpRc::new(sub), OpRc::new(finish)];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
         RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
             &mut longevity,

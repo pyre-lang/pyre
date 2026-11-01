@@ -4936,6 +4936,7 @@ impl Backend for DynasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::regalloc::rebind_trace_arg_boxes;
 
     #[test]
     fn id_or_identityhash_without_collector_returns_bitwise_not() {
@@ -5068,7 +5069,7 @@ mod tests {
         );
     }
 
-    use majit_ir::forwarding::bound_operand_from_opref as rb;
+    use majit_ir::forwarding::{ForwardingHost, bound_operand_from_opref as rb};
 
     #[derive(Debug)]
     struct TestPlainCallDescr {
@@ -5318,6 +5319,7 @@ mod tests {
         )];
 
         let token = JitCellToken::new(1499);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         assert_eq!(token.inputarg_types().to_vec(), vec![Type::Ref, Type::Int]);
@@ -5338,6 +5340,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1500);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(4), Value::Int(5)]);
@@ -5372,12 +5375,10 @@ mod tests {
                 ),
             ];
             let token = JitCellToken::new(1501);
+            let rebind_inputargs_1 = [InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+            rebind_trace_arg_boxes(&rebind_inputargs_1, &ops);
             backend
-                .compile_loop(
-                    &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
-                    &ops,
-                    &token,
-                )
+                .compile_loop(&rebind_inputargs_1, &ops, &token)
                 .unwrap();
             let frame = backend.execute_token(&token, &[Value::Int(a), Value::Int(b)]);
             backend.get_int_value(&frame, 0)
@@ -5449,6 +5450,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1500);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -5514,6 +5516,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1501);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
         let frame = backend.execute_token(&token, &[Value::Int(3)]);
         let obj = backend.get_ref_value(&frame, 0);
@@ -5610,6 +5613,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1501);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -5694,6 +5698,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1502);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(64)]);
@@ -5751,6 +5756,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1503);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
@@ -5809,6 +5815,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let passed = backend.execute_token(&token, &[Value::Ref(payload)]);
@@ -5831,6 +5838,10 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
+        for ia in &inputargs {
+            ia.clear_forwarded();
+        }
+        rebind_trace_arg_boxes(&inputargs, &bridge_ops);
         backend
             .compile_bridge(
                 guard_descr.as_fail_descr().unwrap(),
@@ -5899,12 +5910,17 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(&token, &[Value::Ref(payload)]);
         let _guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
+
+        for ia in &inputargs {
+            ia.clear_forwarded();
+        }
 
         let mut bridge_constants: indexmap::IndexMap<u32, i64, rustc_hash::FxBuildHasher> =
             indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
@@ -5921,6 +5937,7 @@ mod tests {
             bridge_value,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
+        rebind_trace_arg_boxes(&inputargs, &bridge_ops);
         backend
             .compile_bridge(
                 guard_descr.as_fail_descr().unwrap(),
@@ -5993,6 +6010,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let failed = backend.execute_token(
@@ -6002,6 +6020,10 @@ mod tests {
         let _guard_fail_index = backend.get_latest_descr(&failed).fail_index();
         let _guard_trace_id = backend.get_latest_descr(&failed).trace_id();
         let guard_descr = backend.get_latest_descr_arc(&failed);
+
+        for ia in &inputargs {
+            ia.clear_forwarded();
+        }
 
         backend.set_constants(indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher));
         let field_descr: DescrRef =
@@ -6021,6 +6043,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
+        rebind_trace_arg_boxes(&inputargs, &bridge_ops);
         backend
             .compile_bridge(
                 guard_descr.as_fail_descr().unwrap(),
@@ -6108,6 +6131,7 @@ mod tests {
         ];
 
         let token = JitCellToken::new(1617);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
@@ -6159,6 +6183,7 @@ mod tests {
             ),
         ];
         let hit_token = JitCellToken::new(1620);
+        rebind_trace_arg_boxes(&inputargs, &hit_ops);
         backend
             .compile_loop(&inputargs, &hit_ops, &hit_token)
             .unwrap();
@@ -6167,6 +6192,10 @@ mod tests {
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_int_value(&frame, 0), 22);
         assert_eq!(COND_CALL_VALUE_I_CALLS.load(Ordering::SeqCst), 0);
+
+        for ia in &inputargs {
+            ia.clear_forwarded();
+        }
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
@@ -6200,6 +6229,7 @@ mod tests {
             ),
         ];
         let miss_token = JitCellToken::new(1621);
+        rebind_trace_arg_boxes(&inputargs, &miss_ops);
         backend
             .compile_loop(&inputargs, &miss_ops, &miss_token)
             .unwrap();
@@ -6246,6 +6276,7 @@ mod tests {
             ),
         ];
         let hit_token = JitCellToken::new(1622);
+        rebind_trace_arg_boxes(&inputargs, &hit_ops);
         backend
             .compile_loop(&inputargs, &hit_ops, &hit_token)
             .unwrap();
@@ -6256,6 +6287,10 @@ mod tests {
         assert!(backend.get_latest_descr(&frame).is_finish());
         assert_eq!(backend.get_ref_value(&frame, 0), value);
         assert_eq!(COND_CALL_VALUE_R_CALLS.load(Ordering::SeqCst), 0);
+
+        for ia in &inputargs {
+            ia.clear_forwarded();
+        }
 
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
@@ -6280,6 +6315,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
         let miss_token = JitCellToken::new(1623);
+        rebind_trace_arg_boxes(&inputargs, &miss_ops);
         backend
             .compile_loop(&inputargs, &miss_ops, &miss_token)
             .unwrap();
@@ -6328,6 +6364,7 @@ mod tests {
             passthrough,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(payload)]);
@@ -6366,6 +6403,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
         let token = JitCellToken::new(1612);
+        rebind_trace_arg_boxes(&[], &ops);
         backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -6411,6 +6449,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
         ];
         let token = JitCellToken::new(1613);
+        rebind_trace_arg_boxes(&[], &ops);
         backend.compile_loop(&[], &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -6468,6 +6507,7 @@ mod tests {
             ),
         ];
         let token = JitCellToken::new(1618);
+        rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let raw = match backend.execute_token_done_ref_raw(&token, &[root.0 as i64]) {

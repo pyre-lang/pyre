@@ -14,6 +14,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+mod common;
 use std::arch::naked_asm;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -25,7 +26,7 @@ use majit_backend_dynasm::runner::DynasmBackend;
 use majit_gc::GcFlags;
 use majit_gc::collector::MiniMarkGC;
 use majit_gc::header::{GcHeader, header_of};
-use majit_ir::forwarding::bound_operand_from_opref as rb;
+use majit_ir::forwarding::{ForwardingHost, bound_operand_from_opref as rb};
 use majit_ir::operand::Operand;
 use majit_ir::{
     CallDescr, Descr, DescrRef, EffectInfo, ExtraEffect, GcRef, InputArg, InputArgRc,
@@ -49,6 +50,7 @@ fn compile_and_run_int(opcode: OpCode, extra: Option<i64>, input: i64, token_id:
     finish.set_fail_arg_types(vec![Type::Int]);
     finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
     let ops = vec![OpRc::new(body), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile {opcode:?}: {err:?}"));
@@ -70,6 +72,7 @@ fn compile_float(opcode: OpCode, token_id: u64) -> (DynasmBackend, JitCellToken)
     finish.set_fail_arg_types(vec![Type::Float]);
     finish.setfailargs(vec![rb(OpRef::float_op(1))].into());
     let ops = vec![OpRc::new(body), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile {opcode:?}: {err:?}"));
@@ -129,6 +132,7 @@ fn gc_world(token_id: u64) -> (GcWorld, JitCellToken) {
 fn guard_finished(world: &mut GcWorld, token: &JitCellToken, ops: Vec<Op>, obj: GcRef) -> bool {
     let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     world
         .backend
         .compile_loop(&inputargs, &ops_rc, token)
@@ -195,6 +199,7 @@ fn load_effective_address_folds_a_constant_base() {
         finish.set_fail_arg_types(vec![Type::Int]);
         finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
         let ops = vec![OpRc::new(lea), OpRc::new(finish)];
+        common::rebind_trace_arg_boxes(&inputargs, &ops);
         backend
             .compile_loop(&inputargs, &ops, &token)
             .expect("compile LOAD_EFFECTIVE_ADDRESS");
@@ -391,6 +396,7 @@ fn compile_float_binop(
     finish.set_fail_arg_types(vec![Type::Float]);
     finish.setfailargs(vec![rb(OpRef::float_op(1))].into());
     let ops = vec![OpRc::new(body), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| {
@@ -510,6 +516,7 @@ fn compile_float_cmp(
     finish.set_fail_arg_types(vec![Type::Int]);
     finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
     let ops = vec![OpRc::new(body), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| {
@@ -604,6 +611,7 @@ fn guard_nonnull_class_forward_jump_is_rel8() {
     finish.set_fail_arg_types(vec![]);
     finish.setfailargs(vec![].into());
     let ops = vec![OpRc::new(guard), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile GUARD_NONNULL_CLASS: {err:?}"));
@@ -730,6 +738,7 @@ fn compile_may_force(helper: extern "C" fn(i64)) -> (DynasmBackend, JitCellToken
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile CALL_MAY_FORCE: {err:?}"));
@@ -797,6 +806,7 @@ fn guard_not_forced_2_constant_failarg_is_hole() {
         .into_iter()
         .map(OpRc::new)
         .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .expect("compile GUARD_NOT_FORCED_2");
@@ -865,6 +875,7 @@ fn compile_cond_call_no_exception(
     finish.set_fail_arg_types(vec![]);
     finish.setfailargs(vec![].into());
     let ops = vec![OpRc::new(call), OpRc::new(guard), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile COND_CALL + GUARD_NO_EXCEPTION: {err:?}"));
@@ -999,6 +1010,7 @@ fn compile_fused_cond_call(func: i64) -> (DynasmBackend, JitCellToken) {
         OpRc::new(call),
         OpRc::new(finish_of(i0, Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile fused COND_CALL: {err:?}"));
@@ -1029,6 +1041,7 @@ fn compile_unfused_cond_call(
         finish_of(i0, Type::Int, 2)
     };
     let ops = vec![OpRc::new(call), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile unfused COND_CALL: {err:?}"));
@@ -1049,6 +1062,7 @@ fn compile_cond_call_value(opcode: OpCode, func: i64, ty: Type) -> (DynasmBacken
     call.pos().set(result);
     call.setdescr(call_descr(vec![], ty, true, 8));
     let ops = vec![OpRc::new(call), OpRc::new(finish_of(result, ty, 2))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile {opcode:?}: {err:?}"));
@@ -1205,6 +1219,7 @@ fn compile_caller_saved_cond_call(func: i64) -> (DynasmBackend, JitCellToken, us
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     let info = backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile caller-saved COND_CALL: {err:?}"));
@@ -1267,6 +1282,7 @@ fn compile_callee_saved_cond_call(func: i64) -> (DynasmBackend, JitCellToken, us
     guard.setfailargs(live.into());
     ops.push(guard);
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     let info = backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile callee-saved COND_CALL: {err:?}"));
@@ -1559,6 +1575,7 @@ fn compile_cond_call_three_extras(predicate: i64, func: i64) -> (DynasmBackend, 
         LIVE_ADD_COUNT + 2,
     ));
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile COND_CALL extras: {err:?}"));
@@ -1599,6 +1616,7 @@ fn compile_cond_call_value_three_extras(func: i64) -> (DynasmBackend, JitCellTok
         LIVE_ADD_COUNT + 3,
     ));
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile COND_CALL_VALUE extras: {err:?}"));
@@ -1685,6 +1703,7 @@ fn compile_eax_live_across_cond_call(func: i64) -> (DynasmBackend, JitCellToken)
         OpRc::new(cond),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile eax-live COND_CALL: {err:?}"));
@@ -1837,6 +1856,7 @@ fn compile_guard_fail_with_float(exc: bool) -> (DynasmBackend, JitCellToken) {
     ops.push(guard);
     ops.push(finish(5));
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile guard failure exc={exc}: {err:?}"));
@@ -1928,6 +1948,7 @@ fn compile_call(
         OpRc::new(call),
         OpRc::new(finish_of(result, result_type, 2)),
     ];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile {opcode:?}: {err:?}"));
@@ -2085,6 +2106,7 @@ fn call_singlefloat_movd_does_not_clobber_a_double_source() {
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::float_op(2), Type::Float, 3)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile ('S', 'f') call: {err:?}"));
@@ -2185,6 +2207,7 @@ fn call_stack_arguments_from_frame_slots_and_constants() {
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::int_op(10), Type::Int, 11)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile 18-argument call: {err:?}"));
@@ -2213,6 +2236,7 @@ fn finish_const_float_bits(value: f64, token_id: i64) -> u64 {
     let finish = finish_of(OpRef::const_float(value), Type::Float, 0);
     let ops = vec![OpRc::new(finish)];
     let inputargs: Vec<InputArgRc> = vec![];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile FINISH(ConstFloat({value})): {err:?}"));
@@ -2270,6 +2294,7 @@ fn compile_threadlocalref_get(
         OpRc::new(call),
         OpRc::new(finish_of(result, result_type, 2)),
     ];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile threadlocalref_get {opcode:?}: {err:?}"));
@@ -2327,6 +2352,7 @@ fn compile_identity_loop(backend: &mut DynasmBackend, ty: Type) -> Arc<JitCellTo
     let inputargs = vec![InputArg::from_type_rc(ty, 0)];
     let i0 = inputargs[0].opref();
     let ops = vec![OpRc::new(finish_of(i0, ty, 1))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile identity {ty:?}: {err:?}"));
@@ -2390,6 +2416,7 @@ fn call_assembler_returns_int_and_float_from_the_dead_frame() {
         OpRc::new(int_call),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&int_inputs, &int_ops);
     backend
         .compile_loop(&int_inputs, &int_ops, &int_token)
         .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER_I: {err:?}"));
@@ -2409,6 +2436,7 @@ fn call_assembler_returns_int_and_float_from_the_dead_frame() {
         OpRc::new(float_call),
         OpRc::new(finish_of(OpRef::float_op(1), Type::Float, 2)),
     ];
+    common::rebind_trace_arg_boxes(&float_inputs, &float_ops);
     backend
         .compile_loop(&float_inputs, &float_ops, &float_token)
         .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER_F: {err:?}"));
@@ -2464,6 +2492,7 @@ fn compile_call_assembler_force_callee(
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER callee: {err:?}"));
@@ -2499,6 +2528,7 @@ fn compile_call_assembler_force_caller(
     .into_iter()
     .map(OpRc::new)
     .collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER caller: {err:?}"));
@@ -2609,6 +2639,7 @@ fn compile_release_gil(flags: i64, new_value: i64) -> (DynasmBackend, JitCellTok
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL: {err:?}"));
@@ -2664,6 +2695,7 @@ fn call_release_gil_saves_last_error() {
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL: {err:?}"));
@@ -2704,6 +2736,7 @@ fn call_release_gil_saves_last_error_float_result() {
         OpRc::new(call),
         OpRc::new(finish_of(OpRef::float_op(1), Type::Float, 2)),
     ];
+    common::rebind_trace_arg_boxes(&[], &ops);
     backend
         .compile_loop(&[], &ops, &token)
         .unwrap_or_else(|err| panic!("compile CALL_RELEASE_GIL_F: {err:?}"));
@@ -2823,6 +2856,7 @@ fn run_wb_trace(
 ) -> majit_backend::DeadFrame {
     let token = JitCellToken::new(next_token_id());
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile write barrier: {err:?}"));
@@ -3073,6 +3107,7 @@ fn compile_check_memory_error() -> (DynasmBackend, JitCellToken) {
     let check = Op::new(OpCode::CheckMemoryError, &[rb(i0)]);
     check.pos().set(OpRef::void_op(1));
     let ops = vec![OpRc::new(check), OpRc::new(finish_of(i0, Type::Int, 2))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile CHECK_MEMORY_ERROR: {err:?}"));
@@ -3347,6 +3382,7 @@ fn compile_guarded_loop(live_across: u32) -> (DynasmBackend, JitCellToken, Vec<I
     ops.push(guard);
     ops.push(finish_many(&finished, 4));
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile guarded loop: {err:?}"));
@@ -3379,6 +3415,10 @@ fn attach_bridge(
     drop(failed);
     SEEN_FRAME.with(|cell| cell.set(0));
     let bridge_ops: Vec<OpRc> = bridge_ops.into_iter().map(OpRc::new).collect();
+    for ia in inputargs {
+        ia.clear_forwarded();
+    }
+    common::rebind_trace_arg_boxes(inputargs, &bridge_ops);
     backend
         .compile_bridge(
             guard_descr.as_fail_descr().unwrap(),
@@ -3788,6 +3828,7 @@ fn compile_input_finish(backend: &mut DynasmBackend) -> JitCellToken {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
     let ops = vec![OpRc::new(finish_of(i0, Type::Int, 1))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile finish loop: {err:?}"));
@@ -3956,6 +3997,10 @@ fn compile_ops(
 ) -> JitCellToken {
     let token = JitCellToken::new(next_token_id());
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    for ia in inputargs {
+        ia.clear_forwarded();
+    }
+    common::rebind_trace_arg_boxes(inputargs, &ops);
     backend
         .compile_loop(inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile malloc nursery: {err:?}"));
@@ -4517,6 +4562,7 @@ fn run_zero_array_at(nbytes: i64, start: i64, start_in_reg: bool, base_const: bo
     zero.pos().set(OpRef::void_op(1));
     zero.setdescr(zero_array_descr());
     let ops = vec![OpRc::new(zero), OpRc::new(finish(2))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile ZERO_ARRAY nbytes={nbytes}: {err:?}"));
@@ -4634,6 +4680,7 @@ fn run_zero_array_variable_length(
         x
     };
     ops.push(OpRc::new(finish_of(result, Type::Int, 6)));
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile variable ZERO_ARRAY: {err:?}"));
@@ -4841,6 +4888,7 @@ fn compile_add_regs(lhs: i64, rhs: i64) -> i64 {
         OpRc::new(add),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile reg/reg INT_ADD: {err:?}"));
@@ -4874,6 +4922,7 @@ fn compile_add_fresh(imm: i64, input: i64) -> (i64, i64) {
         OpRc::new(guard),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 4)),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile fresh INT_ADD: {err:?}"));
@@ -4978,6 +5027,7 @@ fn write_barrier_immediate_base_checks_the_flag_byte() {
         ];
         let token = JitCellToken::new(next_token_id());
         let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+        common::rebind_trace_arg_boxes(&[], &ops);
         backend
             .compile_loop(&[], &ops, &token)
             .unwrap_or_else(|err| panic!("compile immediate write barrier: {err:?}"));
@@ -5010,6 +5060,7 @@ fn finish_returns_ref_and_float() {
     let token = JitCellToken::new(next_token_id());
     let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let ops = vec![OpRc::new(finish_of(inputargs[0].opref(), Type::Ref, 1))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile FINISH ref: {err:?}"));
@@ -5021,6 +5072,7 @@ fn finish_returns_ref_and_float() {
     let token = JitCellToken::new(next_token_id());
     let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
     let ops = vec![OpRc::new(finish_of(inputargs[0].opref(), Type::Float, 1))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile FINISH float: {err:?}"));
@@ -5040,8 +5092,10 @@ fn jump_to_another_loop_target_token() {
     jump.pos().set(OpRef::void_op(1));
     jump.setdescr(unresolved);
     let token = JitCellToken::new(next_token_id());
+    let rebind_ops_1 = [OpRc::new(jump)];
+    common::rebind_trace_arg_boxes(&[], &rebind_ops_1);
     let err = backend
-        .compile_loop(&[], &[OpRc::new(jump)], &token)
+        .compile_loop(&[], &rebind_ops_1, &token)
         .expect_err("unrelocated JUMP must fail to compile");
     assert!(
         err.to_string()
@@ -5057,6 +5111,7 @@ fn jump_to_another_loop_target_token() {
     label.pos().set(OpRef::void_op(1));
     label.setdescr(descr.clone());
     let ops = vec![OpRc::new(label), OpRc::new(finish_of(i0, Type::Int, 2))];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &target)
         .unwrap_or_else(|err| panic!("compile jump target: {err:?}"));
@@ -5065,8 +5120,13 @@ fn jump_to_another_loop_target_token() {
     let jump = Op::new(OpCode::Jump, &[rb(i0)]);
     jump.pos().set(OpRef::void_op(1));
     jump.setdescr(descr);
+    let rebind_ops_2 = [OpRc::new(jump)];
+    for ia in &inputargs {
+        ia.clear_forwarded();
+    }
+    common::rebind_trace_arg_boxes(&inputargs, &rebind_ops_2);
     backend
-        .compile_loop(&inputargs, &[OpRc::new(jump)], &source)
+        .compile_loop(&inputargs, &rebind_ops_2, &source)
         .unwrap_or_else(|err| panic!("compile JUMP: {err:?}"));
     let frame = backend.execute_token(&source, &[Value::Int(42)]);
     assert!(backend.get_latest_descr(&frame).is_finish());
@@ -5639,6 +5699,7 @@ fn call_assembler_frame_goes_straight_into_arg0() {
         OpRc::new(int_call),
         OpRc::new(finish_of(OpRef::int_op(1), Type::Int, 2)),
     ];
+    common::rebind_trace_arg_boxes(&int_inputs, &int_ops);
     backend
         .compile_loop(&int_inputs, &int_ops, &int_token)
         .unwrap_or_else(|err| panic!("compile CALL_ASSEMBLER_I: {err:?}"));
@@ -5808,6 +5869,7 @@ fn compile_indirect_call(
     }
     ops.push(OpRc::new(call));
     ops.push(OpRc::new(finish_of(result, Type::Int, 3)));
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile indirect call: {err:?}"));
@@ -6198,6 +6260,7 @@ fn uint_mul_high_with_every_operand_register() {
             finish.setfailargs(vec![].into());
             ops.push(finish);
             let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+            common::rebind_trace_arg_boxes(&inputargs, &ops);
             backend
                 .compile_loop(&inputargs, &ops, &token)
                 .unwrap_or_else(|err| panic!("compile uint_mul_high({p}, {q}): {err:?}"));
@@ -6240,6 +6303,7 @@ fn increment_debug_counter_increments_the_word() {
     }
     ops.push(finish(3));
     let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile increment_debug_counter: {err:?}"));
@@ -6262,6 +6326,7 @@ fn removed_operation_reaching_the_backend_is_not_implemented() {
     op.pos().set(OpRef::void_op(1));
     let ops: Vec<OpRc> = vec![op, finish(2)].into_iter().map(OpRc::new).collect();
     let payload = catch_unwind(AssertUnwindSafe(|| {
+        common::rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token)
     }))
     .expect_err("ASSERT_NOT_NONE must not compile");

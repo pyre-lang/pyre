@@ -66,6 +66,10 @@ pub enum OpInfo {
     /// Known constant float value.
     /// info.py FloatConstInfo — Float constant carrier.
     FloatConstInfo(FloatConstInfo),
+    /// `regalloc.py Lifetime(AbstractInfo)` stored by `get_lifetime` /
+    /// `LifetimeManager.__setitem__` (`box.set_forwarded(lt)`). Packed
+    /// through `FW_INFO_OTHER`. Not optimizer information.
+    Lifetime(std::rc::Rc<dyn std::any::Any>),
 }
 
 impl std::fmt::Debug for OpInfo {
@@ -79,6 +83,7 @@ impl std::fmt::Debug for OpInfo {
                 .finish(),
             OpInfo::Ptr(p) => f.debug_tuple("OpInfo::Ptr").field(&*p.borrow()).finish(),
             OpInfo::FloatConstInfo(v) => f.debug_tuple("OpInfo::FloatConstInfo").field(v).finish(),
+            OpInfo::Lifetime(_) => f.write_str("Lifetime"),
         }
     }
 }
@@ -100,7 +105,7 @@ impl OpInfo {
             OpInfo::FloatConstInfo(v) => v.is_constant(),
             OpInfo::Ptr(p) => matches!(&*p.borrow(), PtrInfo::Constant(_)),
             OpInfo::IntBound(b) => b.borrow().is_constant(),
-            OpInfo::Unknown | OpInfo::EmptyInfo(_) => false,
+            OpInfo::Unknown | OpInfo::EmptyInfo(_) | OpInfo::Lifetime(_) => false,
         }
     }
 

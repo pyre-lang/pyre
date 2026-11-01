@@ -4,12 +4,13 @@
 //! card-marking branch, and hand back the live core and float registers.
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
+mod common;
 use majit_backend::{Backend, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
 use majit_gc::GcFlags;
 use majit_gc::collector::MiniMarkGC;
 use majit_gc::header::{GcHeader, header_of};
-use majit_ir::forwarding::bound_operand_from_opref as rb;
+use majit_ir::forwarding::{ForwardingHost, bound_operand_from_opref as rb};
 use majit_ir::{GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 /// Same card-carrying large array as x86/assembler.rs `CARD_ARRAY_LENGTH`.
@@ -108,6 +109,10 @@ fn cond_call_gc_wb_slowpath_reaches_the_gc_and_keeps_live_registers() {
         ];
         let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
         let token = JitCellToken::new(trace_id as i64);
+        for ia in &inputargs {
+            ia.clear_forwarded();
+        }
+        common::rebind_trace_arg_boxes(&inputargs, &ops);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
         let frame = backend.execute_token(
             &token,

@@ -45,6 +45,7 @@
 //! with the rest of the owner roots. That test walks the roots to show the
 //! frame is named there and walks the JF shadow stack to show it is in nothing
 //! else, and only then collects.
+mod common;
 use parking_lot::Mutex;
 use std::cell::{Cell, UnsafeCell};
 use std::sync::Arc;
@@ -354,6 +355,7 @@ impl Fixture {
             .map(OpRc::new)
             .collect();
         let token = JitCellToken::new(token_number as i64);
+        common::rebind_trace_arg_boxes(&inputargs, &ops);
         backend
             .compile_loop(&inputargs, &ops, &token)
             .expect("compile_loop");

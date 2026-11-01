@@ -5309,7 +5309,14 @@ pub fn walk<Sym: WalkSym>(
         let opcode_position = pc;
         let effects_at_step = fbw_executed_effect_count();
         let (outcome, next_pc) = match step(code, pc, ctx) {
-            Ok(stepped) => stepped,
+            Ok(stepped) => {
+                // `MetaInterp._interpret` checks the trace limit after
+                // `run_one_step` returns normally. A helper error recovered
+                // by this step no longer carries a callee coordinate: the
+                // completed opcode's own frame owns the post-step handoff.
+                ctx.session.borrow_mut().crossed_inline_subwalk = false;
+                stepped
+            }
             // Not an abort: a nested inline_call asked the heap-owned
             // sub-walk driver to push its callee.  Preserve this frame at the
             // CALL coordinate and let the driver resume it after the callee

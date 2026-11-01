@@ -265,6 +265,20 @@ pub trait ForwardingHost {
         self.store_forwarded(Forwarded::Info(info));
     }
 
+    /// Packed `_forwarded` word without cloning the slot.
+    fn packed_forwarded_word(&self) -> u64;
+
+    /// `regalloc.py get_lifetime` read: peek `FW_INFO_OTHER` and clone only
+    /// the `OpInfo::Lifetime` `Rc`, not the boxed `OpInfo`.
+    fn get_lifetime_info(&self) -> Option<Rc<dyn std::any::Any>> {
+        lifetime_info_from_packed(self.packed_forwarded_word())
+    }
+
+    /// `LifetimeManager.__setitem__` → `box.set_forwarded(lt)`.
+    fn set_lifetime_info(&self, info: Rc<dyn std::any::Any>) {
+        self.set_forwarded_info(OpInfo::Lifetime(info));
+    }
+
     /// `_forwarded = None` (optimizer state reset).
     fn clear_forwarded(&self) {
         self.store_forwarded(Forwarded::None);
@@ -328,6 +342,9 @@ impl ForwardingHost for Op {
     fn store_forwarded(&self, value: Forwarded) {
         self.forwarded.set(value);
     }
+    fn packed_forwarded_word(&self) -> u64 {
+        self.forwarded.packed_word()
+    }
     fn is_same_op(&self, op: &crate::resoperation::OpRc) -> bool {
         std::ptr::eq(self, crate::resoperation::OpRc::as_ptr(op))
     }
@@ -339,6 +356,9 @@ impl ForwardingHost for InputArg {
     }
     fn store_forwarded(&self, value: Forwarded) {
         self.forwarded.set(value);
+    }
+    fn packed_forwarded_word(&self) -> u64 {
+        self.forwarded.packed_word()
     }
     fn is_same_inputarg(&self, ia: &crate::value::InputArgRc) -> bool {
         std::ptr::eq(self, crate::value::InputArgRc::as_ptr(ia))
@@ -515,6 +535,21 @@ pub(crate) fn pack_forwarded(v: Forwarded) -> u64 {
             FW_SMALL_WIDE | (id << 3)
         }
         Forwarded::Info(info) => pack_info(info),
+    }
+}
+
+/// Peek a packed `_forwarded` word for `OpInfo::Lifetime` and clone only
+/// that `Rc`. Does not clone the boxed `OpInfo`.
+#[inline]
+pub(crate) fn lifetime_info_from_packed(w: u64) -> Option<Rc<dyn std::any::Any>> {
+    if w == 0 || w & FW_TAG != FW_INFO_OTHER {
+        return None;
+    }
+    // SAFETY: `FW_INFO_OTHER` payload is `Box<OpInfo>` owned by the slot.
+    let info = unsafe { &*(fwd_ptr(w) as *const OpInfo) };
+    match info {
+        OpInfo::Lifetime(rc) => Some(Rc::clone(rc)),
+        _ => None,
     }
 }
 

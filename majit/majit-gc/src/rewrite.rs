@@ -889,6 +889,7 @@ impl<'a> RewriteState<'a> {
     }
 
     fn emit_rc(&mut self, op: OpRc) -> Operand {
+        self.replace_args_in_place(&op, true);
         self.remove_constptrs_in(&op);
         let rt = op.result_type();
         let pos = if rt == Type::Void {
@@ -917,6 +918,7 @@ impl<'a> RewriteState<'a> {
     }
 
     fn emit_result_rc(&mut self, op: OpRc, preferred_pos: OpRef) -> Operand {
+        self.replace_args_in_place(&op, true);
         self.remove_constptrs_in(&op);
         let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
@@ -940,16 +942,14 @@ impl<'a> RewriteState<'a> {
         result
     }
 
-    /// rewrite.py `emit_op` — append `op` itself unless an arg (or a
-    /// guard failarg) was replaced, in which case `copy_and_change`.
-    fn emit_op(&mut self, op: &OpRc) -> Operand {
-        let keep = op.opcode == OpCode::JitDebug;
+    /// rewrite.py `emit_op` arg/failarg walk: `get_box_replacement` on every
+    /// arg, then `remove_constptr` unless `keep_constptrs`.
+    fn replace_args_in_place(&mut self, out: &OpRc, keep_constptrs: bool) -> bool {
         let mut replaced = false;
-        let out = op.clone();
         for i in 0..out.num_args() {
             let orig = out.arg(i);
             let mut arg = self.get_box_replacement(orig.clone());
-            if !keep
+            if !keep_constptrs
                 && let Some(Value::Ref(gcref)) = arg.const_value()
                 && !gcref.is_null()
             {
@@ -975,6 +975,14 @@ impl<'a> RewriteState<'a> {
                 replaced = true;
             }
         }
+        replaced
+    }
+
+    /// rewrite.py `emit_op` — append `op` itself unless an arg (or a
+    /// guard failarg) was replaced, in which case `copy_and_change`.
+    fn emit_op(&mut self, op: &OpRc) -> Operand {
+        let out = op.clone();
+        let replaced = self.replace_args_in_place(&out, op.opcode == OpCode::JitDebug);
         let rt = out.result_type();
         let pos = if replaced {
             if rt == Type::Void {
@@ -1154,7 +1162,7 @@ impl<'a> RewriteState<'a> {
     }
 
     /// Emit the lowered op `original` is forwarded to, at `original`'s
-    /// position.
+    /// position. Arg resolution happens in `emit_rc` / `emit_result_rc`.
     fn emit_forwarded(&mut self, original: &OpRc, lowered: OpRc) -> Operand {
         if original.result_type() == Type::Void {
             return self.emit_rc(lowered);

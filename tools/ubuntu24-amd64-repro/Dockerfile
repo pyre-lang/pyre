@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 ubuntu:24.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CARGO_HOME=/cargo
@@ -23,6 +23,11 @@ RUN apt-get update \
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain stable
+
+COPY install-oracles.sh /usr/local/bin/pyre-install-oracles
+RUN bash /usr/local/bin/pyre-install-oracles
+ENV PYRE_CHECK_PYTHON3=/opt/pyre-oracles/bin/python3.15
+ENV PYRE_CHECK_PYPY3=/opt/pyre-oracles/bin/pypy3
 
 WORKDIR /workspace/pyre
 

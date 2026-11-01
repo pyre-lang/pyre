@@ -22795,27 +22795,11 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
 
     // The registered-leaf leg: an untagged `dont_look_inside*` body carries no
     // `RuntimeHelperKind`, so its funcbox is the coordinate.
-    // `dict_get_plain_applies(dict, key, tail)` checks `tail` with
-    // `tail.is_null()`, and `__majit_wrap_dict_descr_get` pads the two-word
-    // `d.get(k)` to three words with `PY_NULL` there.
     // The registry spells an entry either module-qualified or as the crate-root
     // re-export, so match on the leaf the table itself reads.
     let leaf_of = |path: &'static str| path.rsplit("::").next().unwrap_or(path);
-    let (_, applies) = pyre_interpreter::jit_trace_fnaddrs()
-        .into_iter()
-        .find(|&(path, _)| leaf_of(path) == "dict_get_plain_applies")
-        .expect("dict_get_plain_applies is a registered leaf");
-    for i in 0..3 {
-        assert_eq!(
-            is_sentinel(K::None, applies, i, 3),
-            i == 2,
-            "dict_get_plain_applies arg {i} of 3"
-        );
-    }
-    // That arity only: a longer call puts the caller's third word in `tail`.
-    assert!(!is_sentinel(K::None, applies, 2, 4));
-    // `dict_get_slow(dict, key, default, nargs)` pads the same slot, one word
-    // wider, and forwards `default` only on its `nargs >= 3` arms.
+    // `dict_get_slow(dict, key, default, nargs)` receives `PY_NULL` in
+    // `default` for `d.get(k)`, and forwards it only on its `nargs >= 3` arms.
     let (_, slow) = pyre_interpreter::jit_trace_fnaddrs()
         .into_iter()
         .find(|&(path, _)| leaf_of(path) == "dict_get_slow")
@@ -22872,7 +22856,7 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
         .into_iter()
         .filter(|&(_, addr)| is_sentinel(K::None, addr, 2, 3))
         .map(|(path, _)| leaf_of(path))
-        .filter(|&leaf| leaf != "dict_get_plain_applies" && leaf != "sort_list_in_place_obj")
+        .filter(|&leaf| leaf != "sort_list_in_place_obj")
         .collect();
     assert!(
         exempted.is_empty(),

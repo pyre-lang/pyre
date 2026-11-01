@@ -15,6 +15,7 @@
 //! has a bridge attached to it".  The list is emptied by the walk, so a second
 //! call has nothing to write.
 
+mod common;
 use majit_backend::{Backend, JitCellToken, make_resume_guard_descr_typed};
 #[cfg(target_arch = "x86_64")]
 use majit_ir::make_loop_target_descr;
@@ -48,6 +49,7 @@ fn compile_guarded_add(backend: &mut DynasmBackend, token: &JitCellToken) -> maj
     finish_op.setfailargs(vec![rb(OpRef::int_op(1))].into());
 
     let ops_rc: Vec<OpRc> = vec![OpRc::new(guard_op), OpRc::new(add_op), OpRc::new(finish_op)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
     guard_descr
@@ -146,6 +148,7 @@ fn every_recorded_position_in_a_trace_is_written() {
         OpRc::new(second),
         OpRc::new(finish_op),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 
@@ -251,6 +254,7 @@ fn a_label_immediately_after_the_guard_is_at_least_five_bytes_later() {
         OpRc::new(label_op),
         OpRc::new(finish_op),
     ];
+    common::rebind_trace_arg_boxes(&inputargs, &ops_rc);
     let result = backend.compile_loop(&inputargs, &ops_rc, &token);
     assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
 

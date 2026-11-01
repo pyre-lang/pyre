@@ -3102,6 +3102,11 @@ impl ForwardedSlot {
     }
 
     #[inline]
+    pub(crate) fn packed_word(&self) -> u64 {
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
     pub fn borrow(&self) -> crate::forwarding::Forwarded {
         crate::forwarding::unpack_forwarded(unsafe { *self.0.get() })
     }

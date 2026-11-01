@@ -1,5 +1,6 @@
 //! Host-arch `int_signext` against `support.py int_signext` (byte count 1/2/4).
 
+mod common;
 use majit_backend::{Backend, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;
 use majit_ir::forwarding::bound_operand_from_opref as rb;
@@ -24,6 +25,7 @@ fn compiled_signext(backend: &mut DynasmBackend, token_id: u64, numbytes: i64, v
     finish.set_fail_arg_types(vec![Type::Int]);
     finish.setfailargs(vec![rb(OpRef::int_op(1))].into());
     let ops = vec![OpRc::new(sign), OpRc::new(finish)];
+    common::rebind_trace_arg_boxes(&inputargs, &ops);
     backend
         .compile_loop(&inputargs, &ops, &token)
         .unwrap_or_else(|err| panic!("compile int_signext({numbytes}): {err:?}"));
