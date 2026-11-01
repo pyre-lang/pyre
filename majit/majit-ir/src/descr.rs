@@ -476,6 +476,26 @@ fn descr_carries_collector_tid(descr: &DescrRef) -> bool {
     })
 }
 
+fn simple_size_carries_collector_tid(sd: &SimpleSizeDescr) -> bool {
+    let key = sd.cache_key();
+    let tid = sd.type_id();
+    key > u32::MAX as u64 && tid != 0 && !struct_tid_is_unresolved(key, tid)
+}
+
+/// Whether `init_size_descr` should ask the collector for a tid.
+///
+/// A fieldless `get_size_descr` shell still waits for
+/// `heaptracker.all_fielddescrs` (`register_keyed_size` assigns that list
+/// onto the same Arc). Stamping empty offsets here would publish the wrong
+/// `encode_type_shape`.
+fn simple_size_needs_mint_tid(sd: &SimpleSizeDescr) -> bool {
+    sd.is_gc_managed()
+        && !sd.headerless()
+        && sd.cache_key() != 0
+        && !simple_size_carries_collector_tid(sd)
+        && !(sd.fieldless_shell_mint && sd.all_fielddescrs().is_empty())
+}
+
 /// Descriptor-cache identity for a named low-level struct.
 ///
 /// RPython treats `GcStruct(T)` and raw `Struct(T)` as distinct lltypes even
@@ -1748,7 +1768,26 @@ pub struct GcCache {
     /// process that mints the descr. Value `0` means the collector has
     /// not assigned one yet; a later register upgrades only that half.
     pub _cache_gcstruct2vtable: IndexMap<u64, (usize, u32)>,
+
+    /// `gc.py GcLLDescr_framework.init_size_descr` collector half.
+    ///
+    /// majit-ir does not depend on majit-gc. `register_unresolved_struct_tids`
+    /// already takes this callback; mint-time stamping stores the same `fn`
+    /// once a collector exists. `None` keeps the unstamped placeholder.
+    struct_tid_register: Option<RegisterStructTidFn>,
+    /// `gc.py GcLLDescr_framework.init_array_descr` collector half.
+    array_tid_register: Option<RegisterArrayTidFn>,
 }
+
+/// `TypeLayoutBuilder.get_type_id(S)` then `encode_type_shape` for a STRUCT.
+/// `(size, gc-pointer offsets)` is what `register_unresolved_struct_tids`
+/// already passes to `gc.register_type`.
+pub type RegisterStructTidFn = fn(usize, Vec<usize>) -> u32;
+
+/// `TypeLayoutBuilder.get_type_id(A)` for an ARRAY.
+/// `(base_size, item_size, len_offset, item_gc_offsets, is_ptr)` is what
+/// `register_unresolved_array_tids` already passes to `gc.register_type`.
+pub type RegisterArrayTidFn = fn(usize, usize, usize, Vec<usize>, bool) -> u32;
 
 impl Default for GcCache {
     fn default() -> Self {
@@ -1772,6 +1811,8 @@ impl GcCache {
             _external_interiorfield_order: Vec::new(),
             _size_keepalive: Vec::new(),
             _cache_gcstruct2vtable: IndexMap::new(),
+            struct_tid_register: None,
+            array_tid_register: None,
         }
     }
 
@@ -2038,17 +2079,60 @@ impl GcCache {
         }
     }
 
-    /// `gc.py GcLLDescr_framework.init_size_descr` analog.
+    /// Install the collector half of `init_size_descr` / `init_array_descr`.
+    ///
+    /// Same callbacks `register_unresolved_struct_tids` /
+    /// `register_unresolved_array_tids` already take. Stored on this cache
+    /// so a later mint can stamp without a census walk.
+    pub fn set_collector_tid_register(
+        &mut self,
+        structs: Option<RegisterStructTidFn>,
+        arrays: Option<RegisterArrayTidFn>,
+    ) {
+        self.struct_tid_register = structs;
+        self.array_tid_register = arrays;
+    }
+
+    fn stamp_simple_size_descr(&self, sd: &SimpleSizeDescr) {
+        if !simple_size_needs_mint_tid(sd) {
+            return;
+        }
+        let Some(register) = self.struct_tid_register else {
+            return;
+        };
+        let offsets: Vec<usize> = sd
+            .gc_fielddescrs()
+            .iter()
+            .map(|field| field.offset())
+            .collect();
+        let tid = register(sd.size(), offsets);
+        if tid != 0 && !struct_tid_is_unresolved(sd.cache_key(), tid) {
+            sd.set_type_id(tid);
+        }
+    }
+
+    fn stamp_cached_size_descr(&self, descr: &DescrRef) {
+        if let Some(sd) = descr
+            .as_any()
+            .and_then(|descr| descr.downcast_ref::<SimpleSizeDescr>())
+        {
+            self.stamp_simple_size_descr(sd);
+        }
+    }
+
+    /// `gc.py GcLLDescr_framework.init_size_descr`.
     ///
     /// Upstream asks `TypeLayoutBuilder.get_type_id` here and stores that
-    /// collector id on the SizeDescr. majit-ir does not own the collector,
-    /// so the id stays the unstamped `0` placeholder until
-    /// `register_unresolved_struct_tids` runs (`gctypelayout.py
-    /// get_type_id`). An analyzer-side `next_type_id` counter would mint
-    /// dense ids that collide with the collector's (`W_BufferedRWPairUser`
-    /// is 209); `gen_initialize_tid` then stamps that foreign layout onto
-    /// a vtable-0 `new`.
-    pub fn init_size_descr(&mut self, _key: &LLType, _sizedescr: &mut SimpleSizeDescr) {}
+    /// collector id on the SizeDescr. majit-ir does not own the collector;
+    /// [`Self::set_collector_tid_register`] is the same callback the census
+    /// (`register_unresolved_struct_tids`) already uses for `gc.register_type`.
+    /// An analyzer-side `next_type_id` counter would mint dense ids that
+    /// collide with the collector's (`W_BufferedRWPairUser` is 209);
+    /// `gen_initialize_tid` then stamps that foreign layout onto a vtable-0
+    /// `new`.
+    pub fn init_size_descr(&mut self, _key: &LLType, sizedescr: &mut SimpleSizeDescr) {
+        self.stamp_simple_size_descr(sizedescr);
+    }
 
     /// `gc.py GcLLDescr_framework.init_array_descr`.
     ///
@@ -2057,11 +2141,11 @@ impl GcCache {
     /// (`descr.py` `_cache_array[ARRAY]` / `id_of_type[TYPE]`), so this
     /// miss arm is `get_type_id`'s `KeyError`. `descr.py` attaches
     /// `all_interiorfielddescrs` before `init_array_descr`; pyre attaches
-    /// them after the Arc wrap, so the collector half
-    /// ([`Self::register_unresolved_array_tids`]) runs once interiors
-    /// exist — the SizeDescr twin of `register_unresolved_struct_tids`.
-    /// A later `get_array_descr` of a new key is another `KeyError`:
-    /// stamp it by calling `register_unresolved_array_tids` again while
+    /// them after the Arc wrap, so a struct array still waits for
+    /// [`Self::register_unresolved_array_tids`] once interiors exist.
+    /// Pointer and primitive arrays stamp here when a collector is
+    /// installed. A later `get_array_descr` of a new key is another
+    /// `KeyError`: stamp it by calling this again while
     /// `can_add_new_types` (`TypeRegistry::register`). After
     /// `freeze_types` that callback panics, matching
     /// `get_type_id`'s `assert self.can_add_new_types`.
@@ -2075,6 +2159,25 @@ impl GcCache {
         }
         if let Some(existing) = self._cache_array.get(key).and_then(|d| d.as_array_descr()) {
             let tid = existing.type_id();
+            if !array_tid_is_unresolved(tid) {
+                arraydescr.set_type_id(tid);
+                return;
+            }
+        }
+        if arraydescr.is_array_of_structs() && arraydescr.get_all_interiorfielddescrs().is_none() {
+            arraydescr.set_type_id(UNSET_GC_TYPE_ID);
+            return;
+        }
+        if let Some(register) = self.array_tid_register {
+            let is_ptr = arraydescr.is_array_of_pointers();
+            let offsets = array_var_gc_ptr_offsets(arraydescr);
+            let tid = register(
+                arraydescr.base_size(),
+                arraydescr.item_size(),
+                array_len_offset(arraydescr),
+                offsets,
+                is_ptr,
+            );
             if !array_tid_is_unresolved(tid) {
                 arraydescr.set_type_id(tid);
                 return;
@@ -2141,14 +2244,12 @@ impl GcCache {
     /// `vtable` is a payload/assertion parameter, not part of the key.
     /// `immutable_flag`: descr.py heaptracker.is_immutable_struct(STRUCT).
     ///
-    /// The numeric `tid` on the returned SizeDescr stays the unstamped
-    /// `0` placeholder until `register_unresolved_struct_tids` asks
-    /// `gctypelayout.py TypeLayoutBuilder.get_type_id` (`gc.py
-    /// init_size_descr`). majit-ir does not own the collector, so
-    /// `init_size_descr` is a no-op here. A registered collector tid
-    /// from `_cache_gcstruct2vtable` is the exception: that is the value
-    /// `init_size_descr` would have stamped had the collector been in
-    /// the same process as the mint.
+    /// The numeric `tid` on the returned SizeDescr is stamped by
+    /// `init_size_descr` when a collector is installed (`gc.py`
+    /// `GcLLDescr_framework.init_size_descr` / `gctypelayout.py
+    /// TypeLayoutBuilder.get_type_id`). A fieldless shell waits for
+    /// `heaptracker.all_fielddescrs`. A registered collector tid from
+    /// `_cache_gcstruct2vtable` is the vtable object's TypeIdCell.
     pub fn get_size_descr(
         &mut self,
         key: LLType,
@@ -2168,10 +2269,9 @@ impl GcCache {
         // then get_size_descr(gccache, STRUCT, vtable). Analyzer callers pass 0.
         let (vtable, registered_tid) = self.object_shape_for_struct(cache_key, vtable, 0);
         // descr.py: SizeDescr(size, vtable=vtable, immutable_flag=immutable_flag)
-        // `type_id` placeholder 0 — stamped later by
-        // `register_unresolved_struct_tids` (`gc.py init_size_descr` sets
-        // `descr.tid`) or by the registered collector tid when
-        // `_cache_gcstruct2vtable` already has one.
+        // `type_id` placeholder 0 — `init_size_descr` stamps a collector
+        // tid when the layout is complete; a fieldless shell stays 0 until
+        // `register_keyed_size` assigns `all_fielddescrs`.
         let mut sd = if vtable != 0 {
             SimpleSizeDescr::with_vtable(u32::MAX, size, 0, vtable)
         } else {
@@ -3565,6 +3665,7 @@ impl GcCache {
                     FIELD_MINT
                         .fieldless_size_shell_upgrades
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.stamp_simple_size_descr(sd);
                     return;
                 }
             }
@@ -3720,6 +3821,7 @@ impl GcCache {
                     field.set_parent_descr(&descr);
                 }
             }
+            self.stamp_cached_size_descr(&descr);
         }
     }
 
@@ -7384,8 +7486,8 @@ impl SimpleSizeDescr {
 
     /// Stamp the `gc_cache._cache_size[LLType::Struct(...)]` identity
     /// onto this descr.  Called by `gc_cache.get_size_descr` cache-miss
-    /// path; the collector tid is stamped later by
-    /// `register_unresolved_struct_tids`.
+    /// path; the collector tid is stamped by `init_size_descr` when a
+    /// collector is installed.
     pub fn set_cache_key(&mut self, key: u64) {
         self.cache_key = key;
     }
@@ -9488,6 +9590,96 @@ mod register_keyed_size_authority_tests {
         assert_eq!(observed, vec![(16, vec![0, 8])]);
         assert_eq!(descr.as_size_descr().unwrap().type_id(), 42);
         assert_eq!(gc.resolve_struct_tid(cache_key), Some(42));
+    }
+
+    fn test_mint_struct_tid(_size: usize, _offsets: Vec<usize>) -> u32 {
+        42
+    }
+
+    fn test_mint_array_tid(
+        _base: usize,
+        _item: usize,
+        _len: usize,
+        _offs: Vec<usize>,
+        _is_ptr: bool,
+    ) -> u32 {
+        99
+    }
+
+    #[test]
+    fn init_size_descr_stamps_tid_at_mint_without_a_census() {
+        let mut gc = GcCache::new();
+        gc.set_collector_tid_register(Some(test_mint_struct_tid), None);
+        let cache_key = 0x1234_5678_9abc_def1;
+        let fields: Vec<Arc<dyn FieldDescr>> = [0usize, 8]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                Arc::new(
+                    SimpleFieldDescr::new_with_name(
+                        index as u32,
+                        offset,
+                        8,
+                        Type::Ref,
+                        false,
+                        ArrayFlag::Pointer,
+                        format!("ref{index}"),
+                        format!("ref{index}"),
+                    )
+                    .with_index_in_parent(index),
+                ) as Arc<dyn FieldDescr>
+            })
+            .collect();
+        let mut sd = SimpleSizeDescr::new(u32::MAX, 16, 0);
+        sd.set_cache_key(cache_key);
+        let descr: DescrRef = Arc::new(sd.with_all_fielddescrs(fields));
+        gc.register_keyed_size(LLType::Struct(cache_key), descr.clone());
+
+        assert_eq!(descr.as_size_descr().unwrap().type_id(), 42);
+        let count = gc.register_unresolved_struct_tids(|_, _| {
+            panic!("mint-time stamp leaves the census with no per-entry work")
+        });
+        assert_eq!(count, 0);
+        let again = gc.register_unresolved_struct_tids(|_, _| {
+            panic!("a second census on the same cache does no per-entry work")
+        });
+        assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn init_size_descr_leaves_a_fieldless_shell_unstamped() {
+        let mut gc = GcCache::new();
+        gc.set_collector_tid_register(Some(test_mint_struct_tid), None);
+        let key = LLType::Struct(0xaaaabbbbccccddd1);
+        let shell = gc.get_size_descr(key, 24, 0, false);
+        assert_eq!(
+            shell.as_size_descr().expect("SizeDescr").type_id(),
+            0,
+            "a fieldless get_size_descr shell waits for all_fielddescrs"
+        );
+    }
+
+    #[test]
+    fn init_array_descr_stamps_tid_at_mint_without_a_census() {
+        let mut gc = GcCache::new();
+        gc.set_collector_tid_register(None, Some(test_mint_array_tid));
+        let cache_key = 0xfeed_face_caf1_u64;
+        let descr = gc.get_array_descr(
+            LLType::Array(cache_key),
+            8,
+            8,
+            ArrayFlag::Pointer,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), 99);
+        let count = gc.register_unresolved_array_tids(|_, _, _, _, _| {
+            panic!("mint-time array stamp leaves the census with no per-entry work")
+        });
+        assert_eq!(count, 0);
     }
 
     #[test]

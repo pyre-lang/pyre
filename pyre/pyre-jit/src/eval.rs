@@ -5894,11 +5894,11 @@ pub fn init_gc_subsystem() {
         install_gc_into_backend();
         GC_TLS_INSTALLED.with(|c| c.set(true));
     }
-    // `ensure_type_registry_closed` runs this before `freeze_types`, so the
-    // synthetic struct tids are registered whichever comes first — a rehydrate
-    // or a close.
+    // `ensure_type_registry_closed` drains unresolved tids before
+    // `freeze_types`, so a descr minted while the registry was open is
+    // stamped whichever comes first — a rehydrate or a close.
     majit_gc::set_type_registry_close_hook(
-        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs,
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_before_freeze,
     );
     // rbigint.py constructs `_parts_cache_10` at module import.  Force pyre's
     // translated prebuilt equivalent before any collector root walk rather
@@ -9383,7 +9383,8 @@ fn drive_unpack_iterable_trace(
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
 /// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
 /// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// The first call with a live collector stamps unresolved tids; later
+/// calls on the same collector skip the census (`LAST_GC`).
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -9430,9 +9431,11 @@ pub fn init_jit_hooks() {
     init_gc_subsystem();
     // Kind-0 Size tids are published on the first trace by
     // `publish_kind0_descrs_before_trace` before `force_start_tracing` /
-    // `bound_reached`. The type-registry close hook runs the same `Once`
-    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` / `PYRE_NO_JIT`
-    // never reach those callers.
+    // `bound_reached`. The first live collector stamps unresolved tids;
+    // later calls on that collector skip the census (`LAST_GC`). The
+    // type-registry close hook drains leftovers before `freeze_types`,
+    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` /
+    // `PYRE_NO_JIT` never reach those callers.
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
