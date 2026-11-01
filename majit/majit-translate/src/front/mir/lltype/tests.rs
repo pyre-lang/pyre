@@ -9481,3 +9481,39 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
         "*mut *mut GCREFOpaque slot token"
     );
 }
+
+/// `heaptracker.all_fielddescrs` and `_reccopy` walk the whole finite by-value
+/// structure. A Rust struct cannot contain itself by value, so twenty nested
+/// levels still yield every leaf.
+#[test]
+fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
+    let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+    let mut decls = vec![type_decl_struct(
+        0,
+        &["fixture", "N0"],
+        vec![field("x", i64_ty())],
+    )];
+    for k in 1..=20u64 {
+        let name = format!("N{k}");
+        decls.push(type_decl_struct(
+            k,
+            &["fixture", name.as_str()],
+            vec![field("inner", named_adt(k - 1, vec![]))],
+        ));
+    }
+    let llbc = window_llbc(decls, vec![]);
+    let outer = llbc.type_by_id(20).expect("N20 decl");
+    let outer_ty = TyRef::Other(named_adt(20, vec![]));
+    let leaves = super::collect_by_value_struct_leaves(
+        outer,
+        &outer_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(leaves.len(), 1, "one scalar leaf at the innermost struct");
+    let dotted = format!("{}{}", leaves[0].super_path, leaves[0].field.name);
+    let expected = format!("{}x", "inner.".repeat(20));
+    assert_eq!(dotted, expected);
+}

@@ -5186,15 +5186,11 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    depth: usize,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<InlineLeaf> {
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return Vec::new();
     };
-    if depth == 0 {
-        return Vec::new();
-    }
     let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
     let owner_node = tyref_node(instantiated, llbc).and_then(|n| strip_ty_wrappers(n, llbc));
     let transparent_payload_idx =
@@ -5233,13 +5229,15 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
             gc_struct_ids,
             raw_alloc_flavor_structs,
         ) {
+            // `heaptracker.all_fielddescrs`: by-value nesting is finite (a
+            // self-containing by-value struct is impossible), so there is no
+            // cutoff.
             let nested_leaves = collect_by_value_struct_leaves(
                 nested,
                 &field_ty,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
-                depth - 1,
                 raw_alloc_flavor_structs,
             );
             if transparent_payload_idx == Some(i) {
@@ -5312,7 +5310,6 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
             llbc,
             tombstoned,
             gc_struct_ids,
-            16,
             raw_alloc_flavor_structs,
         ),
     })

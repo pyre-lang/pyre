@@ -1720,7 +1720,6 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
-            16,
             &self.raw_alloc_flavor_structs,
         );
         let bb_id = self.emit_bb(mir_bb);

@@ -28466,7 +28466,6 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         &llbc,
         tomb,
         &gc_struct_ids,
-        16,
         &raw_alloc,
     );
     assert_eq!(
@@ -28482,7 +28481,6 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         &llbc,
         tomb,
         &gc_struct_ids,
-        16,
         &raw_alloc,
     );
     assert_eq!(
