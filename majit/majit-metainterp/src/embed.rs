@@ -223,10 +223,10 @@ impl Census {
             LAST_HAS_JUMP.store(shape.has_jump, Ordering::Relaxed);
             LAST_ALWAYS_FAILS.store(shape.has_always_fails, Ordering::Relaxed);
         });
-        driver.set_on_compile_bridge(|_green_key, _fail_index, _num_ops| {
+        driver.set_on_compile_bridge(|_green_key, _descr_id, _num_ops| {
             BRIDGES.fetch_add(1, Ordering::Relaxed);
         });
-        driver.set_on_guard_failure(|_green_key, _fail_index, _count| {
+        driver.set_on_guard_failure(|_green_key, _descr_id, _count| {
             GUARD_FAILURES.fetch_add(1, Ordering::Relaxed);
         });
         driver.set_on_trace_abort(|_green_key, _permanent| {

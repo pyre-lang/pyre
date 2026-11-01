@@ -2964,10 +2964,12 @@ pub struct JitHooks {
     /// shape questions (`Jump` present? `GuardAlwaysFails` absent?) and the
     /// full `Op` carries a `ResumeGuardDescr` whose `Debug` is enormous.
     pub on_compile_loop: Option<Box<dyn Fn(u64, usize, usize, &[OpCode]) + Send>>,
-    /// Called when a bridge is compiled. Args: (green_key, fail_index, num_ops).
-    pub on_compile_bridge: Option<Box<dyn Fn(u64, u32, usize) + Send>>,
-    /// Called on guard failure. Args: (green_key, fail_index, fail_count).
-    pub on_guard_failure: Option<Box<dyn Fn(u64, u32, u32) + Send>>,
+    /// Called when a bridge is compiled. Args: (green_key, descr_id, num_ops).
+    /// Upstream `JitHookInterface.after_compile_bridge(debug_info)` receives
+    /// the fail descr.
+    pub on_compile_bridge: Option<Box<dyn Fn(u64, usize, usize) + Send>>,
+    /// Called on guard failure. Args: (green_key, descr_id, count).
+    pub on_guard_failure: Option<Box<dyn Fn(u64, usize, u32) + Send>>,
     /// Called when tracing starts. Args: (green_key).
     pub on_trace_start: Option<Box<dyn Fn(u64) + Send>>,
     /// Called when tracing is aborted. Args: (green_key, permanent).
@@ -4472,28 +4474,22 @@ impl<M: Clone> MetaInterp<M> {
     /// attribution still apply to the poll.
     #[inline]
     ///
-    /// `trace_id` names the trace the failing descr belongs to, and it is not
-    /// redundant with `fail_index`: an index is allocated per trace, so a
-    /// bridge's own guards re-use the numbers of the loop they hang off.
-    /// Without it an event log cannot say whether a coordinate that keeps
-    /// arriving is the ORIGINAL guard — which `send_bridge_to_backend` should
-    /// have patched away once a bridge attached (`compile.py`) — or a fresh
-    /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
-    /// measurement that made the distinction load-bearing.
+    /// The descr identity distinguishes the original guard from each new
+    /// bridge's guards.
     pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
+        descr: &dyn majit_ir::FailDescr,
         back_edge_poll: bool,
     ) {
+        let descr_id = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         if guardlog_enabled() {
-            eprintln!("@@@GUARD key={green_key} tid={trace_id} fail={fail_index}");
+            eprintln!("@@@GUARD key={green_key} descr=0x{descr_id:x}");
         }
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] guard failure at key={}, tid={}, guard={}",
-                green_key, trace_id, fail_index
+                "[jit] guard failure at key={}, descr=0x{:x}",
+                green_key, descr_id
             );
         }
         let tally = if back_edge_poll {
@@ -4502,12 +4498,12 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.stats.guard_failures
         };
         *tally += 1;
-        crate::guard_census_record(green_key, trace_id, fail_index);
+        crate::guard_census_record(green_key, descr_id);
         // logger.py has no per-fail IndexMap; jitprof.py counts
         // Counters.OPS / ABORT_* as integers. The integer
         // `stats.guard_failures` tally above is the port of that.
         if let Some(ref hook) = self.hooks.on_guard_failure {
-            hook(green_key, fail_index, 0);
+            hook(green_key, descr_id, 0);
         }
     }
 
@@ -6483,12 +6479,14 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Set a callback for bridge compilation events.
-    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, u32, usize) + Send + 'static) {
+    /// `f` receives `(green_key, descr_id, num_ops)`.
+    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, usize, usize) + Send + 'static) {
         self.hooks.on_compile_bridge = Some(Box::new(f));
     }
 
     /// Set a callback for guard failure events.
-    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
+    /// `f` receives `(green_key, descr_id, count)`.
+    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, usize, u32) + Send + 'static) {
         self.hooks.on_guard_failure = Some(Box::new(f));
     }
 
@@ -11888,7 +11886,11 @@ impl<M: Clone> MetaInterp<M> {
                 self.staticdata.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
-                    hook(green_key, fail_index, num_combined_ops);
+                    hook(
+                        green_key,
+                        majit_ir::descr_identity(&bridge.source_descr),
+                        num_combined_ops,
+                    );
                 }
                 true
             }
@@ -13452,11 +13454,9 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         if Self::should_record_guard_failure(effective_is_finish, fail_index) {
-            let back_edge_poll = result
-                .descr_arc
-                .as_fail_descr()
-                .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
+            if let Some(fd) = result.descr_arc.as_fail_descr() {
+                self.record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
+            }
         }
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
         let exc_class = if result.exception_value.is_null() {
@@ -13565,10 +13565,9 @@ impl<M: Clone> MetaInterp<M> {
         Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            let back_edge_poll = descr_arc
-                .as_fail_descr()
-                .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
+            if let Some(fd) = descr_arc.as_fail_descr() {
+                self.record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
+            }
         }
 
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
@@ -14001,7 +14000,9 @@ impl<M: Clone> MetaInterp<M> {
         // in handle_fail → must_compile (compile.py).
         // must_compile handles tick.
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
+            if let Some(fd) = descr_arc.as_fail_descr() {
+                self.record_guard_failure_event(green_key, fd, back_edge_poll);
+            }
         }
 
         // The guard arm in `jitdriver` reads the descr, as
@@ -16438,7 +16439,11 @@ impl<M: Clone> MetaInterp<M> {
                 // (x86/runner.py, model.py:309-314 parity).  allow-line-citation
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
-                    hook(green_key, fail_index, num_optimized_ops);
+                    hook(
+                        green_key,
+                        majit_ir::descr_identity(fail_descr_arc),
+                        num_optimized_ops,
+                    );
                 }
                 true
             }
@@ -34961,7 +34966,7 @@ mod tests {
         // when a bridge is compiled.
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let bridge_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         meta.set_on_compile_bridge(move |gk, fi, nops| {
             ev.lock().push((gk, fi, nops));
@@ -35014,7 +35019,7 @@ mod tests {
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.
         if let Some(ref hook) = meta.hooks.on_compile_bridge {
-            hook(green_key.get_uhash(), 3, 5);
+            hook(green_key.get_uhash(), 3usize, 5);
         }
         let events = bridge_events.lock();
         assert_eq!(events.len(), 1);
@@ -35028,7 +35033,7 @@ mod tests {
         // Parity with test_get_stats: guard failure hook fires with correct args.
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let failure_events: Arc<Mutex<Vec<(u64, u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let failure_events: Arc<Mutex<Vec<(u64, usize, u32)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = failure_events.clone();
         meta.set_on_guard_failure(move |gk, fi, fc| {
             ev.lock().push((gk, fi, fc));
@@ -35036,9 +35041,9 @@ mod tests {
 
         // Verify the hook is correctly installed and callable
         if let Some(ref hook) = meta.hooks.on_guard_failure {
-            hook(42, 3, 1);
-            hook(42, 3, 2);
-            hook(42, 5, 1);
+            hook(42, 3usize, 1);
+            hook(42, 3usize, 2);
+            hook(42, 5usize, 1);
         }
         let events = failure_events.lock();
         assert_eq!(events.len(), 3);

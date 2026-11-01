@@ -385,7 +385,7 @@ pub mod loop_census {
     ///
     /// The guard census is keyed by the same green key this map is, so a
     /// consumer that has one has the other -- see `guard_census_summary`,
-    /// which spells a guard as `<name>/<fail_index>` when both censuses are
+    /// which spells a guard as `<name>/0x<descr_id>` when both censuses are
     /// armed and as the bare hash when only the guard one is.
     pub fn name_for(green_key: u64) -> Option<String> {
         let raw = KEYS.with(|keys| keys.borrow().get(&green_key).copied())?;
@@ -2091,7 +2091,7 @@ pub fn mc_diag_summary() -> String {
         .join(" ")
 }
 
-/// Per-guard deopt census, keyed by `(green_key, fail_index)`.
+/// Per-guard deopt census, keyed by `(green_key, descr_id)`.
 ///
 /// `guard_failures` alone cannot tell a guard that keeps returning to the
 /// runtime because no bridge was ever attached to it from a wide spread of
@@ -2101,12 +2101,10 @@ pub fn mc_diag_summary() -> String {
 /// Off unless `MAJIT_GUARD_CENSUS` is set: the map write sits on the deopt
 /// path, which is exactly the path under study.
 ///
-/// The key carries `trace_id` beside `fail_index` because an index is
-/// allocated per trace: a bridge's guards re-use the numbers of the loop they
-/// hang off, so without it one row sums the original guard and every bridge
-/// guard that landed on the same number, and the sum reads as a guard that no
-/// bridge ever covered.
-static GUARD_CENSUS: parking_lot::Mutex<Option<Vec<((u64, u64, u32), u64)>>> =
+/// The key carries the guard's descr identity beside the green key, so a
+/// bridge's guards and the loop guard they hang off are distinct rows
+/// (upstream names a guard by `compute_unique_id(faildescr)`).
+static GUARD_CENSUS: parking_lot::Mutex<Option<Vec<((u64, usize), u64)>>> =
     parking_lot::Mutex::new(None);
 
 /// Turn the census on where `MAJIT_GUARD_CENSUS` cannot be read.
@@ -2145,19 +2143,19 @@ pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildH
 pub(crate) type FxIndexSet<K> = indexmap::IndexSet<K, rustc_hash::FxBuildHasher>;
 
 #[inline]
-pub fn guard_census_record(green_key: u64, trace_id: u64, fail_index: u32) {
+pub fn guard_census_record(green_key: u64, descr_id: usize) {
     if !guard_census_enabled() {
         return;
     }
-    guard_census_record_slow(green_key, trace_id, fail_index)
+    guard_census_record_slow(green_key, descr_id)
 }
 
 #[cold]
 #[inline(never)]
-fn guard_census_record_slow(green_key: u64, trace_id: u64, fail_index: u32) {
+fn guard_census_record_slow(green_key: u64, descr_id: usize) {
     let mut slot = GUARD_CENSUS.lock();
     let rows = slot.get_or_insert_with(Vec::new);
-    let key = (green_key, trace_id, fail_index);
+    let key = (green_key, descr_id);
     match rows.iter_mut().find(|(k, _)| *k == key) {
         Some((_, count)) => *count += 1,
         None => rows.push((key, 1)),
@@ -2176,7 +2174,7 @@ pub fn guard_census_summary(top: usize) -> String {
     let heaviest = rows
         .iter()
         .take(top)
-        .map(|((key, trace_id, fail_index), count)| {
+        .map(|((key, descr_id), count)| {
             // `<code name> #<pc>` only: `get_printable_location` continues with
             // the decoded instruction, whose `{ .. }` debug spelling carries
             // spaces and would run two entries of this space-separated list
@@ -2184,7 +2182,7 @@ pub fn guard_census_summary(top: usize) -> String {
             let name = loop_census::name_for(*key)
                 .map(|line| line.split_whitespace().take(2).collect::<Vec<_>>().join(""))
                 .unwrap_or_else(|| key.to_string());
-            format!("{name}/t{trace_id}/{fail_index}:{count}")
+            format!("{name}/0x{descr_id:x}:{count}")
         })
         .collect::<Vec<_>>()
         .join(" ");

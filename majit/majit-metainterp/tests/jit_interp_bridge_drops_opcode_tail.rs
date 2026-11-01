@@ -92,7 +92,7 @@ pub fn mainloop(program: &Bytecode, iterations: i64, threshold: u32, chain: usiz
     driver.set_on_compile_loop(|_green_key, _before, _after, _opcodes| {
         COMPILES.fetch_add(1, Ordering::Relaxed);
     });
-    driver.set_on_compile_bridge(|_green_key, _fail_index, _num_ops| {
+    driver.set_on_compile_bridge(|_green_key, _descr_id, _num_ops| {
         BRIDGES.fetch_add(1, Ordering::Relaxed);
     });
     let mut pc: usize = 0;

@@ -234,14 +234,14 @@ impl Matcher {
             LAST_OPS_AFTER.store(ops_after, Relaxed);
             *LAST_BODY.lock().unwrap() = opcodes.to_vec();
         });
-        driver.set_on_compile_bridge(|_gk, _fail_index, _num_ops| {
+        driver.set_on_compile_bridge(|_gk, _descr_id, _num_ops| {
             BRIDGES.fetch_add(1, Relaxed);
         });
         driver.set_on_trace_abort(|_gk, _permanent| {
             ABORTS.fetch_add(1, Relaxed);
         });
         if GUARD_FAILURE_PROBE.load(Relaxed) {
-            driver.set_on_guard_failure(|_gk, _trace_id, _fail_index| {
+            driver.set_on_guard_failure(|_gk, _descr_id, _fail_index| {
                 GUARD_FAILURES.fetch_add(1, Relaxed);
             });
         }

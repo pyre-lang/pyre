@@ -7253,12 +7253,8 @@ impl<S: JitState> JitDriver<S> {
         let trace_id = fd.trace_id();
         let guard_value_operand = self.meta.resolve_guard_value_operand(fd, &deadframe);
         let descr_owning_key = majit_backend::descr_owning_green_key(fd);
-        self.meta.record_guard_failure_event(
-            green_key,
-            trace_id,
-            fail_index,
-            fd.is_back_edge_poll(),
-        );
+        self.meta
+            .record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
         // must_compile tick for bridge threshold counting.
         if crate::majit_log_enabled() {
             let descr_addr = fd as *const dyn majit_ir::FailDescr as *const () as usize;
@@ -9210,16 +9206,20 @@ impl<S: JitState> JitDriver<S> {
 
     /// Set a callback for bridge compilation events.
     ///
-    /// `f` receives `(green_key, fail_index, num_ops)`. The loop sibling above
+    /// `f` receives `(green_key, descr_id, num_ops)`. The loop sibling above
     /// cannot stand in for it: a guard that declines to bridge still deopts
     /// through the blackhole and the loop keeps running, so only this count
     /// distinguishes a bridge that was built from one that was passed over.
-    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, u32, usize) + Send + 'static) {
+    /// Upstream `JitHookInterface.after_compile_bridge(debug_info)` receives
+    /// the fail descr.
+    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, usize, usize) + Send + 'static) {
         self.meta.set_on_compile_bridge(f);
     }
 
     /// Set a callback for guard failure events.
-    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
+    ///
+    /// `f` receives `(green_key, descr_id, count)`.
+    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, usize, u32) + Send + 'static) {
         self.meta.set_on_guard_failure(f);
     }
 
@@ -15958,11 +15958,13 @@ mod tests {
 
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
-        let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let bridge_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
-        driver.meta.set_on_compile_bridge(move |gk, fi, nops| {
-            ev.lock().push((gk, fi, nops));
-        });
+        driver
+            .meta
+            .set_on_compile_bridge(move |gk, descr_id, nops| {
+                ev.lock().push((gk, descr_id, nops));
+            });
 
         let key = gk(50);
 
@@ -16024,7 +16026,7 @@ mod tests {
             key.get_uhash(),
             "bridge green_key should match"
         );
-        assert_eq!(events[0].1, fail_index, "bridge fail_index should match");
+        assert!(events[0].1 != 0, "bridge descr id should be non-zero");
         assert!(events[0].2 > 0, "bridge num_ops should be positive");
 
         // Stats should reflect 1 loop + 1 bridge.
