@@ -4717,62 +4717,6 @@ impl Backend for DynasmBackend {
         unsafe { majit_backend::llmodel::write_float_at_mem_sized(ptr, 0, size, value) }
     }
 
-    fn compiled_fail_descr_layouts(
-        &self,
-        token: &JitCellToken,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let compiled = Self::get_compiled(token);
-        let trace_id = compiled.trace_id;
-        Some(
-            compiled
-                .fail_descrs
-                .iter()
-                .enumerate()
-                .map(|(idx, d)| crate::guard::layout_for_fail_descr(&d.descr, idx as u32, trace_id))
-                .collect(),
-        )
-    }
-
-    fn compiled_trace_fail_descr_layouts(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let compiled = Self::get_compiled(token);
-        if compiled.trace_id == trace_id {
-            return Some(
-                compiled
-                    .fail_descrs
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, d)| {
-                        crate::guard::layout_for_fail_descr(&d.descr, idx as u32, trace_id)
-                    })
-                    .collect(),
-            );
-        }
-        // Search bridge fail_descrs in asmmemmgr_blocks.
-        let blocks_clt = token.compiled_loop_token_expect();
-        let blocks = blocks_clt.asmmemmgr_blocks.lock();
-        for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
-                && bridge.trace_id == trace_id
-            {
-                return Some(
-                    bridge
-                        .fail_descrs
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, d)| {
-                            crate::guard::layout_for_fail_descr(&d.descr, idx as u32, trace_id)
-                        })
-                        .collect(),
-                );
-            }
-        }
-        None
-    }
-
     /// `pyjitpl.py self.cpu.setup_once()` parity, dispatched by
     /// `MetaInterpStaticData::_setup_once` under the
     /// `globaldata.initialized` gate (`pyjitpl.py`).  All

@@ -4998,8 +4998,8 @@ impl<'a> AssemblerARM64<'a> {
         );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
-        // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
-        // via `fd.source_op_index()` so no side-table is needed.
+        // resume_guard_descr.rs); readers use `fd.source_op_index()` so
+        // no side-table is needed.
         // Production deopt decodes the descr's `rd_numb`
         // (`ResumeGuardDescr.get_resumestorage`); the backend keeps no
         // recovery-layout cache.

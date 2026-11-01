@@ -15060,7 +15060,7 @@ pub(crate) fn decode_and_restore_guard_failure(
     // RPython parity: every guard reaching this path MUST carry rd_numb.
     // `store_final_boxes_in_guard` (optimizeopt/mod.rs) populates
     // it for tracer-origin guards; backend-origin layouts propagate it
-    // via `FailDescrLayout.rd_numb`. An empty
+    // via the descr's `rd_numb`. An empty
     // `rd_numb` here indicates an unported guard-emission site — hard
     // assert so the gap surfaces rather than silently degrade via a
     // pyre-only single-frame synthesis.

@@ -5694,8 +5694,8 @@ impl<'a> Assembler386<'a> {
         );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
-        // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
-        // via `fd.source_op_index()` so no side-table is needed.
+        // resume_guard_descr.rs); readers use `fd.source_op_index()` so
+        // no side-table is needed.
         if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
             descr_fd.set_source_op_index(op_index);
         }

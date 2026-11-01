@@ -19,8 +19,7 @@ use std::borrow::Cow;
 /// * `RdVirtualInfo` variants (resoperation.rs).  `PartialEq`
 ///   (resoperation.rs) uses `opt_descr_ptr_eq` (Arc::ptr_eq),
 ///   matching `history.py:125 id(descr)`.
-/// * `ExitVirtualLayout` (`majit-backend/src/lib.rs`) and
-///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs`) compare
+/// * `ExitPendingFieldLayout` (`majit-backend/src/lib.rs`) compares
 ///   descrs via `opt_descr_ptr_eq` for the same reason.
 /// * `ResolvedPendingFieldWrite` / `EncodedPendingFieldWrite`
 ///   (`majit-metainterp/src/resume.rs`) and

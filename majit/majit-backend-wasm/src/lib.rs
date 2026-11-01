@@ -7058,52 +7058,6 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    /// `compile.py` store_hash relies on a per-guard fail-descr layout
-    /// to know which exits are real guards (vs FINISH) and to count them.
-    /// `assign_guard_hashes` fetches one jitcounter hash per non-finish guard
-    /// from this list, so without it no guard ever gets a hash, `must_compile`
-    /// never fires, and a hot guard exit round-trips to the host forever instead
-    /// of triggering a bridge. Build one layout per exit from the metainterp
-    /// `ResumeGuardDescr` the optimizer stamped on the guard (`meta_descr`); the
-    /// wasm backend keeps no machine-code recovery metadata (resume runs through
-    /// `get_resumestorage` on that descr), so the
-    /// recovery / rd_* / gc-slot fields stay empty. Consumers read
-    /// `is_finish` and `source_op_index` from this list and the resume
-    /// payload from the descr Arc.
-    fn compiled_fail_descr_layouts(
-        &self,
-        token: &JitCellToken,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())?;
-        let trace_id = compiled.trace_id;
-        let descrs = compiled.fail_descrs.borrow();
-        let layouts = descrs
-            .iter()
-            .enumerate()
-            .map(|(position, wfd)| {
-                let meta = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
-                majit_backend::FailDescrLayout {
-                    fail_index: position as u32,
-                    source_op_index: meta.and_then(|fd| fd.source_op_index()),
-                    trace_id,
-                    trace_info: None,
-                    fail_arg_types: wfd.fail_arg_types.clone(),
-                    is_finish: wfd.is_finish,
-                    is_exception_exit: meta
-                        .map(|fd| fd.is_exit_frame_with_exception())
-                        .unwrap_or(false),
-                    recovery_layout: None,
-                    frame_stack: None,
-                    descr: wfd.meta_descr.clone(),
-                }
-            })
-            .collect();
-        Some(layouts)
-    }
-
     /// `compile_bridge` records each attach in the source loop's
     /// `bridge_descr_ranges`; the host build does not clear
     /// `adr_jump_offset` ("patched"), so read the record for this descr.

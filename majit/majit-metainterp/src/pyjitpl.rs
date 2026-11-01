@@ -29425,6 +29425,7 @@ mod tests {
             key.get_uhash()
         );
     }
+
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use crate::test_greens::{gk, gk_with_uhash};
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect, LoopTargetDescr};
@@ -31478,14 +31479,7 @@ mod tests {
         let origin_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("compiled origin token");
-        let descr_arc = meta
-            .backend
-            .compiled_fail_descr_layouts(origin_token.as_ref())
-            .into_iter()
-            .flatten()
-            .find(|layout| layout.fail_index == 0 && !layout.is_finish)
-            .and_then(|layout| layout.descr)
-            .expect("compiled guard descr");
+        let descr_arc = crate::jitdriver::compiled_token_guard_descr(origin_token.as_ref(), 0);
         let (trace_id, fail_index) = {
             let fail_descr = descr_arc.as_fail_descr().expect("compiled guard descr");
             (fail_descr.trace_id(), fail_descr.fail_index_per_trace())

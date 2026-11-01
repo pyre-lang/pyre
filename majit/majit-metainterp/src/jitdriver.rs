@@ -1,4 +1,4 @@
-use majit_backend::{Backend, ExitValueSourceLayout};
+use majit_backend::Backend;
 
 use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
@@ -11849,6 +11849,39 @@ fn abort_blackhole_restore_banks<'a>(
     )
 }
 
+/// First non-finish fail descr at `fail_index` on the compiled token.
+/// Walks `asmmemmgr_gcreftracers` the way `assembler.py
+/// get_asmmemmgr_gcreftracers` keeps the descrs: dynasm registers a
+/// `FailDescrStore`, cranelift a `Vec<DescrRef>`.
+#[cfg(test)]
+pub(crate) fn compiled_token_guard_descr(
+    token: &majit_backend::JitCellToken,
+    fail_index: u32,
+) -> majit_ir::DescrRef {
+    let clt = token.compiled_loop_token_expect();
+    let tracers = clt.asmmemmgr_gcreftracers.lock();
+    for tracer in tracers.iter() {
+        if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+            if let Some(descr) = store.iter().enumerate().find_map(|(idx, cell)| {
+                (idx as u32 == fail_index
+                    && cell.descr.as_fail_descr().is_some_and(|fd| !fd.is_finish()))
+                .then(|| cell.descr.clone())
+            }) {
+                return descr;
+            }
+        } else if let Some(descrs) = tracer.downcast_ref::<Vec<majit_ir::DescrRef>>()
+            && let Some(descr) = descrs.iter().enumerate().find_map(|(idx, descr)| {
+                (idx as u32 == fail_index
+                    && descr.as_fail_descr().is_some_and(|fd| !fd.is_finish()))
+                .then(|| descr.clone())
+            })
+        {
+            return descr;
+        }
+    }
+    panic!("compiled guard descr")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11899,13 +11932,7 @@ mod tests {
         fail_index: u32,
     ) -> majit_ir::DescrRef {
         let token = meta.get_procedure_token(green_key).expect("compiled token");
-        meta.backend
-            .compiled_fail_descr_layouts(token.as_ref())
-            .into_iter()
-            .flatten()
-            .find(|layout| layout.fail_index == fail_index && !layout.is_finish)
-            .and_then(|layout| layout.descr)
-            .expect("compiled guard descr")
+        compiled_token_guard_descr(token.as_ref(), fail_index)
     }
 
     fn start_hash_trace(meta: &mut MetaInterp<()>, key: &majit_ir::GreenKey, live: &[i64]) {

@@ -13,9 +13,7 @@ use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use majit_backend::{
-    ExitFrameLayout, ExitPendingFieldLayout, ExitValueSourceLayout, FailArgSource,
-};
+use majit_backend::{ExitPendingFieldLayout, ExitValueSourceLayout, FailArgSource};
 use majit_ir::operand::Operand;
 use majit_ir::{Const, GcRef, OpRef, Type};
 
@@ -872,40 +870,9 @@ fn resume_frame_layout_to_frame_info(layout: &ResumeFrameLayoutSummary) -> Frame
     }
 }
 
-/// Build a `ResumeFrameLayoutSummary` from a backend-origin `ExitFrameLayout`.
-///
-/// Each `ExitValueSourceLayout` slot is converted to the corresponding
-/// `ResumeValueLayoutSummary`, preserving slot types when present.
-/// Free function — `ResumeFrameLayoutSummary` lives in `majit-ir`
-/// (orphan rule prevents inherent impl outside of that crate).
-pub fn resume_frame_layout_from_exit_frame_layout(
-    exit_frame: &ExitFrameLayout,
-) -> ResumeFrameLayoutSummary {
-    let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
-        .slots
-        .iter()
-        .map(majit_backend::resume_value_layout_summary_from_exit_value_source)
-        .collect();
-
-    ResumeFrameLayoutSummary {
-        trace_id: exit_frame.trace_id,
-        header_pc: exit_frame.header_pc,
-        source_guard: exit_frame.source_guard,
-        jitcode_index: exit_frame.jitcode_index,
-        pc: exit_frame.pc,
-        slot_sources: Vec::new(),
-        slot_layouts,
-        slot_types: exit_frame.slot_types.clone(),
-    }
-}
-
-// `from_exit_value_source` constructor moved to
-// majit-backend::resume_value as
-// `resume_value_layout_summary_from_exit_value_source` (cross-crate
-// orphan rule prevents inherent impl on the foreign type).
-// `to_virtual_info` / `to_exit_virtual_layout` extracted as free
-// functions after `ResumeVirtualLayoutSummary` moved to
-// `majit-ir::resumedata` (cross-crate orphan rule).
+// `to_virtual_info` extracted as a free function after
+// `ResumeVirtualLayoutSummary` moved to `majit-ir::resumedata`
+// (cross-crate orphan rule).
 fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) -> VirtualInfo {
     let s = layout;
     {

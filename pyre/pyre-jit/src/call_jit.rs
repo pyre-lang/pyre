@@ -9023,9 +9023,7 @@ pub extern "C" fn bh_clear_in_flight_exception() {
 }
 
 /// On-demand resume callback (pyre-jit side).  Registered into cranelift
-/// via `register_resumedata_deopt` (eval.rs:init_callbacks) and called
-/// from the `recovery_layout_ref()` consumer sites that have migrated off
-/// the pre-baked `ExitRecoveryLayout` cache.
+/// via `register_resumedata_deopt` (eval.rs:init_callbacks).
 ///
 /// PyPy parity target: `pyjitpl.py rebuild_state_after_failure
 /// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
