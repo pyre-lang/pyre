@@ -14648,35 +14648,32 @@ fn reached_loop_header<Sym: WalkSym>(
     if ctx.is_top_level && ctx.is_authoritative_executor {
         let (driver, _) = crate::driver::driver_pair();
         let has_partial = driver.meta_interp().partial_trace().is_some();
-        let bridge_origin = driver
-            .meta_interp()
-            .bridge_info()
-            .map(|b| (b.trace_id, b.fail_index));
+        let from_guard = driver.meta_interp().bridge_info().is_some();
         let has_targets = driver.meta_interp().has_compiled_targets(key);
         // pyjitpl.py `if not self.partial_trace` is the only compile_trace gate.
         if !has_partial && has_targets {
-            let outcome = match bridge_origin {
-                Some(_) => driver
-                    .meta_interp_mut()
-                    .compile_trace(key, &live_args, bridge_origin),
-                None => {
+            let outcome =
+                if from_guard {
+                    driver
+                        .meta_interp_mut()
+                        .compile_trace(key, &live_args, true)
+                } else {
                     match driver.compile_trace_entry_data() {
                         Some(original_green_key) => driver
                             .meta_interp_mut()
                             .compile_trace_from_interp(key, &live_args, original_green_key),
                         // No `ResumeFromInterpDescr` payload: `compile_trace` with
-                        // a `None` origin answers `Cancelled` after cloning the
-                        // trace. Decline here instead.
+                        // `from_guard=false` and no entry data answers `Cancelled`
+                        // after cloning the trace. Decline here instead.
                         None => majit_metainterp::CompileOutcome::Cancelled,
                     }
-                }
-            };
+                };
             match driver.meta_interp().classify_compile_outcome(outcome) {
                 majit_metainterp::BridgeCompileResult::Compiled => {
                     if majit_metainterp::majit_log_enabled() {
                         eprintln!(
                             "[jit][walker-reached-loop-header] compile_trace success: \
-                             key={key} pc={next_instr} bridge={bridge_origin:?}"
+                             key={key} pc={next_instr} from_guard={from_guard}"
                         );
                     }
                     driver.note_compile_trace_success();

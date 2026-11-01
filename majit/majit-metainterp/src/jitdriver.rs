@@ -4419,16 +4419,10 @@ impl<S: JitState> JitDriver<S> {
                             // ResumeGuardDescr (`close_bridge` patches the failing guard); no bridge
                             // origin is a ResumeFromInterpDescr entry bridge
                             // (`compile_trace_from_interp`, compile.py:1002-1021).
-                            let bridge_origin =
-                                self.meta.bridge_info().map(|b| (b.trace_id, b.fail_index));
-                            result = match bridge_origin {
-                                Some((trace_id, fail_index)) => self.meta.close_bridge(
-                                    target_key,
-                                    trace_id,
-                                    fail_index,
-                                    &live_arg_boxes,
-                                ),
-                                None => match self.compile_trace_entry_data() {
+                            result = if self.meta.bridge_info().is_some() {
+                                self.meta.close_bridge(target_key, &live_arg_boxes)
+                            } else {
+                                match self.compile_trace_entry_data() {
                                     Some(original_green_key) => {
                                         let outcome = self.meta.compile_trace_from_interp(
                                             target_key,
@@ -4438,7 +4432,7 @@ impl<S: JitState> JitDriver<S> {
                                         self.meta.classify_compile_outcome(outcome)
                                     }
                                     None => crate::pyjitpl::BridgeCompileResult::Declined,
-                                },
+                                }
                             };
                         }
                         match result {
@@ -4522,8 +4516,6 @@ impl<S: JitState> JitDriver<S> {
                         && let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace)
                     {
                         let bridge_key = bridge.green_key;
-                        let bridge_trace_id = bridge.trace_id;
-                        let bridge_fail_index = bridge.fail_index;
                         // pyjitpl.py:2981-2982:
                         //     ptoken = self.get_procedure_token(greenboxes)
                         //     if has_compiled_targets(ptoken): ...
@@ -4625,8 +4617,8 @@ impl<S: JitState> JitDriver<S> {
                         if has_targets {
                             if crate::majit_log_enabled() {
                                 eprintln!(
-                                    "[bridge] CloseLoop -> close_bridge target_key={} (bridge_origin={}) trace={} fail={}",
-                                    target_key, bridge_key, bridge_trace_id, bridge_fail_index
+                                    "[bridge] CloseLoop -> close_bridge target_key={} (bridge_origin={})",
+                                    target_key, bridge_key
                                 );
                             }
                             if self.sym.is_some() {
@@ -4651,12 +4643,7 @@ impl<S: JitState> JitDriver<S> {
                                         _ => None,
                                     }
                                 };
-                                let result = self.meta.close_bridge(
-                                    target_key,
-                                    bridge_trace_id,
-                                    bridge_fail_index,
-                                    &finish_args,
-                                );
+                                let result = self.meta.close_bridge(target_key, &finish_args);
                                 match result {
                                     crate::pyjitpl::BridgeCompileResult::Compiled => {
                                         self.sym = None;
@@ -4888,8 +4875,6 @@ impl<S: JitState> JitDriver<S> {
                     let has_partial_trace = self.meta.partial_trace().is_some();
                     if let Some(bridge) = self.meta.bridge_info().filter(|_| !has_partial_trace) {
                         let bridge_key = bridge.green_key;
-                        let bridge_trace_id = bridge.trace_id;
-                        let bridge_fail_index = bridge.fail_index;
                         let bridge_code_ptr = bridge.code_ptr;
                         // pyjitpl.py: ptoken = self.get_procedure_token(greenboxes)
                         // Use the TARGET loop header's green key, not the bridge origin.
@@ -4909,12 +4894,7 @@ impl<S: JitState> JitDriver<S> {
                                     _ => None,
                                 }
                             };
-                            let result = self.meta.close_bridge(
-                                target_key,
-                                bridge_trace_id,
-                                bridge_fail_index,
-                                &jump_args,
-                            );
+                            let result = self.meta.close_bridge(target_key, &jump_args);
                             match result {
                                 crate::pyjitpl::BridgeCompileResult::Compiled => {
                                     self.sym = None;
@@ -9208,12 +9188,9 @@ impl<S: JitState> JitDriver<S> {
     pub fn send_bridge_to_backend(
         &mut self,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
         finish_args: &[OpRef],
     ) -> crate::pyjitpl::BridgeCompileResult {
-        self.meta
-            .close_bridge(green_key, trace_id, fail_index, finish_args)
+        self.meta.close_bridge(green_key, finish_args)
     }
 
     /// Set the trace eagerness (guard failure threshold for bridge tracing).
@@ -11257,8 +11234,6 @@ impl<S: JitState> JitDriver<S> {
             return false;
         };
         let green_key = jct.green_key();
-        let trace_id = descr_fd.trace_id();
-        let fail_index = descr_fd.fail_index_per_trace();
         // `pyjitpl.py` `raise_continue_running_normally` leaves this
         // path once a bridge is attached. A later `must_compile` FIRED
         // here is a pyre re-entry; walking again can abort setup and
@@ -11297,16 +11272,14 @@ impl<S: JitState> JitDriver<S> {
         // `cpu.grab_exc_value(deadframe)` itself. The bridge entry parked
         // that word in `GUARD_EXC_VALUE` (`GuardExcRoot`); this call does
         // not take a copied `i64`.
-        let retrace = match self.meta.handle_guard_failure(
-            descr_arc.clone(),
-            green_key,
-            trace_id,
-            fail_index,
-            frontend_fail_values,
-        ) {
-            Some(r) => r,
-            None => return false,
-        };
+        let retrace =
+            match self
+                .meta
+                .handle_guard_failure(descr_arc.clone(), green_key, frontend_fail_values)
+            {
+                Some(r) => r,
+                None => return false,
+            };
 
         // resume.py rebuild_from_resumedata parity: decode rd_numb
         // to reconstruct the complete frame for bridge tracing.
@@ -11826,8 +11799,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta
             .set_bridge_trace_info(crate::pyjitpl::BridgeTraceInfo {
                 green_key,
-                trace_id,
-                fail_index,
                 code_ptr,
                 // `pyjitpl.py` `handle_guard_failure(self,
                 // resumedescr, deadframe)` parity: thread the source
@@ -15606,8 +15577,6 @@ mod tests {
             .meta
             .set_bridge_trace_info(crate::pyjitpl::BridgeTraceInfo {
                 green_key: bridge_key.get_uhash(),
-                trace_id: 1,
-                fail_index: 0,
                 code_ptr: 0,
                 source_descr: std::sync::Arc::new(BridgeOriginDescr),
             });
@@ -15922,7 +15891,7 @@ mod tests {
         assert!(
             driver
                 .meta
-                .start_retrace(descr_arc, key_b.get_uhash(), fail_index, &[0])
+                .start_retrace(descr_arc, key_b.get_uhash(), &[0])
         );
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
@@ -15938,17 +15907,10 @@ mod tests {
              previously compiled trace's high-water (a={high_a}, b={high_b})"
         );
 
-        let trace_id = compiled_guard_descr(&driver.meta, key_b.get_uhash(), fail_index)
-            .as_fail_descr()
-            .expect("compiled guard descr")
-            .trace_id();
         assert_eq!(
-            driver.meta.close_bridge(
-                key_b.get_uhash(),
-                trace_id,
-                fail_index,
-                &[OpRef::input_arg_int(0)]
-            ),
+            driver
+                .meta
+                .close_bridge(key_b.get_uhash(), &[OpRef::input_arg_int(0)]),
             crate::pyjitpl::BridgeCompileResult::Compiled,
         );
         assert!(
@@ -16033,11 +15995,7 @@ mod tests {
         let descr_arc = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index);
 
         // Step 2: Start bridge tracing via start_retrace (simulates guard failure path).
-        assert!(
-            driver
-                .meta
-                .start_retrace(descr_arc, key.get_uhash(), fail_index, &[0])
-        );
+        assert!(driver.meta.start_retrace(descr_arc, key.get_uhash(), &[0]));
 
         // Step 3: Record a bridge trace and compile it via close_bridge.
         {
@@ -16046,19 +16004,9 @@ mod tests {
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
-        // The fail descr carries the owning-trace stamp from
-        // `record_loop_or_bridge`. RPython has no numeric normalize
-        // step; tests pass the same descr identity.
-        let trace_id = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index)
-            .as_fail_descr()
-            .expect("compiled guard descr")
-            .trace_id();
-        let result = driver.meta.close_bridge(
-            key.get_uhash(),
-            trace_id,
-            fail_index,
-            &[OpRef::input_arg_int(0)],
-        );
+        let result = driver
+            .meta
+            .close_bridge(key.get_uhash(), &[OpRef::input_arg_int(0)]);
         assert_eq!(
             result,
             crate::pyjitpl::BridgeCompileResult::Compiled,
@@ -16138,28 +16086,17 @@ mod tests {
 
         let fail_index = 0u32;
         let descr_arc = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index);
-        assert!(
-            driver
-                .meta
-                .start_retrace(descr_arc, key.get_uhash(), fail_index, &[0])
-        );
+        assert!(driver.meta.start_retrace(descr_arc, key.get_uhash(), &[0]));
         {
             let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
             let i0 = OpRef::input_arg_int(0);
             let c2 = ctx.const_int(2);
             ctx.record_op(OpCode::IntAdd, &[i0, c2]);
         }
-        let trace_id = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index)
-            .as_fail_descr()
-            .expect("compiled guard descr")
-            .trace_id();
         assert_eq!(
-            driver.meta.close_bridge(
-                key.get_uhash(),
-                trace_id,
-                fail_index,
-                &[OpRef::input_arg_int(0)]
-            ),
+            driver
+                .meta
+                .close_bridge(key.get_uhash(), &[OpRef::input_arg_int(0)]),
             crate::pyjitpl::BridgeCompileResult::Compiled,
         );
 

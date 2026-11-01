@@ -3910,35 +3910,26 @@ fn handle_blackhole_result(bh_result: BlackholeResult) -> Option<i64> {
     }
 }
 
-/// Derive the (`green_key`, `trace_id`, `fail_index`) bridge-source identity
-/// strictly from the failing guard's descr Arc.
+/// Derive the bridge-source green key from the failing guard's descr Arc.
 ///
 /// `pyjitpl.py handle_guard_failure(self, resumedescr, deadframe)`
 /// reads identity from `resumedescr` directly: `resumedescr.rd_loop_token
-/// .loop_token_wref()` (line 2897) yields the owning `JitCellToken`,
-/// `resumedescr.get_resumestorage()` (line 2893) yields the `ResumeGuardDescr`
-/// carrying the per-trace `fail_index`, and `record_loop_or_bridge`
-/// (`compile.py`) stamps `trace_id` onto each `ResumeDescr`.
-/// Pyre's `descr_owning_jct(arc).green_key`, `arc.fail_index_per_trace()`
-/// and `arc.trace_id()` are the line-by-line equivalents — together they
-/// constitute the canonical bridge-source identity.
+/// .loop_token_wref()` yields the owning `JitCellToken`.
+/// Pyre's `descr_owning_jct(arc).green_key` is the line-by-line equivalent.
 ///
 /// Returns `None` when the owning loop's `JitCellToken` weakref is dead
 /// (the loop was evicted by the memory manager): RPython raises
 /// `compile.giveup()` from `_trace_and_compile_from_bridge`
-/// (`compile.py:725-729`) in the same case, falling through to
-/// `resume_in_blackhole`.  Pyre's caller signals the same intent by
-/// returning `false` to drop into blackhole resume.
+/// (`compile.py _trace_and_compile_from_bridge`) in the same case, falling
+/// through to `resume_in_blackhole`.  Pyre's caller signals the same intent
+/// by returning `false` to drop into blackhole resume.
 // dont_look_inside: bridge-compile identity machinery the tracer must not enter.
 #[majit_macros::dont_look_inside]
-pub(crate) fn bridge_source_identity_from_descr(
+pub(crate) fn bridge_source_green_key_from_descr(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-) -> Option<(u64, u64, u32)> {
+) -> Option<u64> {
     let descr_fd = descr_arc.as_fail_descr()?;
-    let green_key = majit_backend::descr_owning_jct(descr_fd)?.green_key();
-    let trace_id = descr_fd.trace_id();
-    let fail_index = descr_fd.fail_index_per_trace();
-    Some((green_key, trace_id, fail_index))
+    majit_backend::descr_owning_jct(descr_fd).map(|jct| jct.green_key())
 }
 
 /// Outcome of `trace_and_compile_from_bridge`.
@@ -4045,18 +4036,14 @@ pub fn trace_and_compile_from_bridge(
     // threads `resumedescr` (the descr) as the canonical identity source
     // through the entire bridge tracer.  Pyre's backend FailDescr Arc
     // plays the same role: `descr_owning_jct(arc).green_key` (mirroring
-    // `pyjitpl.py MetaInterp.handle_guard_failure resumedescr.rd_loop_token.loop_token_wref()`),
-    // `arc.fail_index_per_trace()` (mirroring `compile.py:854
-    // ResumeGuardDescr._attrs_`), and `arc.trace_id()` (mirroring the
-    // `compile.py record_loop_or_bridge` stamp) are the line-by-
-    // line readers.  Both production callers — the general guard path
-    // (eval.rs `handle_fail`) and the CALL_ASSEMBLER bridge entry
-    // (call_jit.rs `jit_ca_handle_guard_failure`) — have an Arc available
-    // before reaching this function (both backends recover it from
-    // `FailDescrCell` thin pointers via
+    // `pyjitpl.py MetaInterp.handle_guard_failure resumedescr.rd_loop_token.loop_token_wref()`)
+    // is the green-key reader.  Both production callers — the general
+    // guard path (eval.rs `handle_fail`) and the CALL_ASSEMBLER bridge
+    // entry (call_jit.rs `jit_ca_handle_guard_failure`) — have an Arc
+    // available before reaching this function (both backends recover it
+    // from `FailDescrCell` thin pointers via
     // `Backend::fail_descr_arc_from_addr`), so this function takes only
-    // the descr Arc and derives `(green_key, trace_id, fail_index)`
-    // itself.
+    // the descr Arc and derives the green key itself.
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     // Virtualizable live object for `pypyjit`. `None` when the failing
     // loop's `jitdriver_sd.virtualizable_info` is None
@@ -4129,9 +4116,13 @@ pub fn trace_and_compile_from_bridge(
     // and the `is_tracing()` checks below see only the bridge walk.
     let _nested = crate::eval::NestedTracePark::enter();
 
-    let Some((green_key, trace_id, fail_index)) = bridge_compile_preflight(descr_arc) else {
+    let Some(green_key) = bridge_compile_preflight(descr_arc) else {
         return BridgeResolution::ResumeBlackhole;
     };
+    let (trace_id, fail_index) = descr_arc
+        .as_fail_descr()
+        .map(|fd| (fd.trace_id(), fd.fail_index_per_trace()))
+        .unwrap_or((0, 0));
     // compile.py `_trace_and_compile_from_bridge`: `jitdriver_sd` is the
     // failing loop's `rd_loop_token.outermost_jitdriver_sd`.
     let jd_index = failing_loop_jitdriver_index(descr_arc);
@@ -4143,9 +4134,7 @@ pub fn trace_and_compile_from_bridge(
         if jd_index != Some(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX) {
             return BridgeResolution::ResumeBlackhole;
         }
-        return trace_bridge_via_interpret(
-            descr_arc, green_key, trace_id, fail_index, raw_values, guard_exc,
-        );
+        return trace_bridge_via_interpret(descr_arc, green_key, raw_values, guard_exc);
     }
     if bridge_bail_stage() == 1 {
         return BridgeResolution::ResumeBlackhole;
@@ -4862,9 +4851,7 @@ pub fn trace_and_compile_from_bridge(
 
 /// compile.py `ResumeGuardForcedDescr.handle_fail` / `giveup` / `no_bridge`
 /// / `MAJIT_MAX_BRIDGES`. Shared by every jitdriver.
-fn bridge_compile_preflight(
-    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-) -> Option<(u64, u64, u32)> {
+fn bridge_compile_preflight(descr_arc: &std::sync::Arc<dyn majit_ir::Descr>) -> Option<u64> {
     {
         let (driver, _) = crate::eval::driver_pair();
         driver.clear_last_compiled_artifact_token();
@@ -4875,11 +4862,11 @@ fn bridge_compile_preflight(
     if majit_metainterp::no_bridge_enabled() {
         return None;
     }
-    let identity = bridge_source_identity_from_descr(descr_arc)?;
+    let green_key = bridge_source_green_key_from_descr(descr_arc)?;
     if !majit_metainterp::bridge_fuel_take() {
         return None;
     }
-    Some(identity)
+    Some(green_key)
 }
 
 fn failing_loop_jitdriver_index(descr_arc: &std::sync::Arc<dyn majit_ir::Descr>) -> Option<usize> {
@@ -5114,8 +5101,6 @@ fn abort_active_bridge_trace() {
 fn trace_bridge_via_interpret(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
     raw_values: &[i64],
     guard_exc: i64,
 ) -> BridgeResolution {
@@ -5156,8 +5141,6 @@ fn trace_bridge_via_interpret(
         driver.meta_interp_mut().handle_guard_failure(
             descr_arc.clone(),
             green_key,
-            trace_id,
-            fail_index,
             frontend_fail_values,
         )
     };
@@ -5326,22 +5309,12 @@ fn trace_bridge_via_interpret(
         let (driver, _) = crate::eval::driver_pair();
         driver.meta_interp_mut().interpret(&mut sym, portal_pc)
     };
-    apply_bridge_interpret_action(
-        action,
-        green_key,
-        trace_id,
-        fail_index,
-        &sym,
-        &mainjitcode,
-        portal_pc,
-    )
+    apply_bridge_interpret_action(action, green_key, &sym, &mainjitcode, portal_pc)
 }
 
 fn apply_bridge_interpret_action(
     action: majit_metainterp::TraceAction,
     green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
     sym: &pyre_jit_trace::genentry_state::GenEntrySym,
     mainjitcode: &majit_metainterp::JitCode,
     portal_pc: usize,
@@ -5435,10 +5408,10 @@ fn apply_bridge_interpret_action(
         }
         majit_metainterp::TraceAction::CloseLoop => {
             let jump_args = jump_args_from_frame();
-            compile_bridge_jump(green_key, trace_id, fail_index, &jump_args, sym.pycode)
+            compile_bridge_jump(green_key, &jump_args, sym.pycode)
         }
         majit_metainterp::TraceAction::CloseLoopWithArgs { jump_args, .. } => {
-            compile_bridge_jump(green_key, trace_id, fail_index, &jump_args, sym.pycode)
+            compile_bridge_jump(green_key, &jump_args, sym.pycode)
         }
         // `pyjitpl.py _create_segmented_trace_and_blackhole` ends in
         // `SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
@@ -5531,8 +5504,6 @@ fn cancel_novable_bridge_walk(stb: majit_metainterp::SwitchToBlackhole) -> Bridg
 
 fn compile_bridge_jump(
     green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
     jump_args: &[majit_ir::OpRef],
     pycode: PyObjectRef,
 ) -> BridgeResolution {
@@ -5540,7 +5511,7 @@ fn compile_bridge_jump(
         let (driver, _) = crate::eval::driver_pair();
         driver
             .meta_interp_mut()
-            .compile_trace(green_key, jump_args, Some((trace_id, fail_index)))
+            .compile_trace(green_key, jump_args, true)
     };
     match outcome {
         majit_metainterp::CompileOutcome::Compiled { .. } => {
@@ -5566,10 +5537,9 @@ fn compile_bridge_jump(
 ///
 /// pyjitpl.py `handle_guard_failure(self, resumedescr, deadframe)`
 /// — descr identity is the only argument crossing the C-ABI boundary;
-/// the receiver derives `(green_key, trace_id, fail_index)` from the
-/// recovered Arc, mirroring `compile.py:706-708 _trace_and_compile_
-/// from_bridge` which walks `resumedescr.rd_loop_token.loop_token_wref()`
-/// for the owning JCT.
+/// the receiver derives the green key from the recovered Arc, mirroring
+/// `compile.py _trace_and_compile_from_bridge` which walks
+/// `resumedescr.rd_loop_token.loop_token_wref()` for the owning JCT.
 fn jit_ca_handle_guard_failure(
     deadframe: *mut majit_backend::jitframe::JitFrame,
     descr_addr: usize,
@@ -5634,9 +5604,7 @@ fn jit_ca_handle_guard_failure(
             .backend()
             .fail_descr_arc_from_addr(descr_addr)
     };
-    let Some((source_green_key, source_trace_id, source_fail_index)) =
-        bridge_source_identity_from_descr(&descr_arc)
-    else {
+    let Some(source_green_key) = bridge_source_green_key_from_descr(&descr_arc) else {
         return None;
     };
     let descr_fd = descr_arc
@@ -5718,7 +5686,9 @@ fn jit_ca_handle_guard_failure(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][ca-bridge] must_compile fired: key={} trace={} fail={}",
-            source_green_key, source_trace_id, source_fail_index,
+            source_green_key,
+            descr_fd.trace_id(),
+            descr_fd.fail_index_per_trace(),
         );
     }
 
@@ -5782,8 +5752,8 @@ fn jit_ca_handle_guard_failure(
                 BridgeResolution::CompiledContinue | BridgeResolution::CompiledContinueLive(_)
             ),
             source_green_key,
-            source_trace_id,
-            source_fail_index,
+            descr_fd.trace_id(),
+            descr_fd.fail_index_per_trace(),
         );
     }
 
@@ -5866,7 +5836,7 @@ fn try_compile_ca_bridge(
     // word rooted; it is rewritten to the forwarded address before return.
     guard_exc: &mut i64,
 ) -> Option<CaFrameCompletion> {
-    let Some((source_green_key, _, _)) = bridge_source_identity_from_descr(descr_arc) else {
+    let Some(source_green_key) = bridge_source_green_key_from_descr(descr_arc) else {
         return None;
     };
     let (must_compile, owning_key) = {
