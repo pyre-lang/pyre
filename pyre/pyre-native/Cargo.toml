@@ -27,6 +27,8 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 
 # Wasm stays on the base dependency and does not link libffi.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+majit-rlib = { workspace = true }
+majit-macros = { workspace = true }
 rustpython-host_env = { workspace = true, features = ["rustls"] }
 rustls = { workspace = true }
 rustls-webpki = { workspace = true }
@@ -44,4 +46,5 @@ rustpython-host_env = { workspace = true, features = ["ctypes"] }
 
 [build-dependencies]
 cc = "1.2"
+majit-eci = { workspace = true }
 lz4_flex = { version = "0.13", default-features = false, optional = true }

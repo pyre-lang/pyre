@@ -1,48 +1,15 @@
-//! Build Python-runtime ABI shims and target-layout probes.
-//!
-//! Runtime-independent libraries and generated assets belong to
-//! `pyre-native`; this script remains only where the interpreter ABI itself
-//! determines the generated C symbols or cfg values.
+//! `majit_eci::build::compile_crate_ecis` compiles each ECI's C sources
+//! (`cbuild.py` `compile_shared_lib`), including `cpyext` `api.py build_eci`.
+//! The `_MSC_VER` probe stays here: `sys.version` names the C compiler the
+//! build used.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     let target = std::env::var("TARGET").unwrap_or_default();
-
-    // The variadic C-API entry points cannot have Rust bodies -- no Rust
-    // compiler walks a `va_list` -- so they are C translation units compiled
-    // into the interpreter, which is what `pypy/module/cpyext/src/` is.  The
-    // predicate is the one `lib.rs` gates `mod cpyext` with, and `pyrex`'s
-    // build script exports the symbols a loaded extension resolves against.
-    if std::env::var_os("CARGO_FEATURE_CPYEXT").is_some()
-        && std::env::var_os("CARGO_FEATURE_SANDBOX").is_none()
-        && matches!(
-            std::env::var("CARGO_CFG_TARGET_OS")
-                .unwrap_or_default()
-                .as_str(),
-            "macos" | "linux"
-        )
-    {
-        let cpyext_sources = [
-            "src/cpyext/src/abstract.c",
-            "src/cpyext/src/getargs.c",
-            "src/cpyext/src/modsupport.c",
-            "src/cpyext/src/mysnprintf.c",
-            "src/cpyext/src/pyerrors.c",
-            "src/cpyext/src/unicodeobject.c",
-        ];
-        for source in cpyext_sources {
-            println!("cargo:rerun-if-changed={source}");
-        }
-        let include = Path::new("../../include/pyre3.15t");
-        println!("cargo:rerun-if-changed={}", include.display());
-        cc::Build::new()
-            .files(cpyext_sources)
-            .include(include)
-            .compile("pyre_cpyext_c");
-    }
 
     // `sys.version` names the C compiler the build used, and on an MSVC target
     // that name is the `MSC v.<_MSC_VER>` token

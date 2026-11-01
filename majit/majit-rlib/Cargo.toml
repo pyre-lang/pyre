@@ -37,3 +37,4 @@ malachite-bigint = { workspace = true }
 
 [build-dependencies]
 cc = "1.2"
+majit-eci = { workspace = true }

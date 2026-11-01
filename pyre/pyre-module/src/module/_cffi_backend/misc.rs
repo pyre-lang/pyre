@@ -10,26 +10,142 @@ use pyre_interpreter::PyError;
 use pyre_object::PyObjectRef;
 use std::ffi::{c_char, c_double, c_int};
 
-// `misc.py`'s `long double` shims.  Every one of them is C because Rust has
-// no `long double` type at all.
-unsafe extern "C" {
-    pub fn pyre_cffi_sizeof_long_double() -> usize;
-    pub fn pyre_cffi_alignof_long_double() -> usize;
-    pub fn pyre_cffi_sizeof_wchar() -> usize;
-    pub fn pyre_cffi_alignof_wchar() -> usize;
-    pub fn pyre_cffi_sizeof_fast8() -> usize;
-    pub fn pyre_cffi_alignof_fast8() -> usize;
-    pub fn pyre_cffi_sizeof_fast16() -> usize;
-    pub fn pyre_cffi_alignof_fast16() -> usize;
-    pub fn pyre_cffi_sizeof_fast32() -> usize;
-    pub fn pyre_cffi_alignof_fast32() -> usize;
-    pub fn pyre_cffi_sizeof_fast64() -> usize;
-    pub fn pyre_cffi_alignof_fast64() -> usize;
-    pub fn pyre_cffi_read_long_double(p: *const c_char) -> c_double;
-    pub fn pyre_cffi_write_long_double(p: *mut c_char, v: c_double);
-    pub fn pyre_cffi_nonnull_long_double(p: *const c_char) -> c_int;
-    pub fn pyre_cffi_str_long_double(p: *const c_char, out: *mut c_char, n: usize);
+// `misc.py`'s `long double` shims (`pypy__is_nonnull_longdouble` ECI snippet).
+// Every one of them is C because Rust has no `long double` type at all.
+majit_rlib::rffi::external_compilation_info! {
+    const LONGDOUBLE_ECI = {
+        separate_module_files: ["src/module/_cffi_backend/src/longdouble.c"],
+    };
 }
+
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_sizeof_long_double = "pyre_cffi_sizeof_long_double",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_alignof_long_double = "pyre_cffi_alignof_long_double",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_sizeof_wchar = "pyre_cffi_sizeof_wchar",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_alignof_wchar = "pyre_cffi_alignof_wchar",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_sizeof_fast8 = "pyre_cffi_sizeof_fast8",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_alignof_fast8 = "pyre_cffi_alignof_fast8",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_sizeof_fast16 = "pyre_cffi_sizeof_fast16",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_alignof_fast16 = "pyre_cffi_alignof_fast16",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_sizeof_fast32 = "pyre_cffi_sizeof_fast32",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_alignof_fast32 = "pyre_cffi_alignof_fast32",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_sizeof_fast64 = "pyre_cffi_sizeof_fast64",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_alignof_fast64 = "pyre_cffi_alignof_fast64",
+    [],
+    usize,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_read_long_double = "pyre_cffi_read_long_double",
+    [*const c_char],
+    c_double,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_write_long_double = "pyre_cffi_write_long_double",
+    [*mut c_char, c_double],
+    (),
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_nonnull_long_double = "pyre_cffi_nonnull_long_double",
+    [*const c_char],
+    c_int,
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pyre_cffi_str_long_double = "pyre_cffi_str_long_double",
+    [*const c_char, *mut c_char, usize],
+    (),
+    compilation_info = LONGDOUBLE_ECI,
+    _nowrapper = true,
+    sandboxsafe = true
+);
 
 /// `sizeof(long double)`.
 pub fn sizeof_long_double() -> i64 {

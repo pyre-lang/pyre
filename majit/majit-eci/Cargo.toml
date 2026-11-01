@@ -1,0 +1,13 @@
+[package]
+name = "majit-eci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ExternalCompilationInfo and the C build step ll2ctypes runs for it"
+
+[dependencies]
+syn = { workspace = true, features = ["full", "parsing", "printing"] }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+cc = "1.2"

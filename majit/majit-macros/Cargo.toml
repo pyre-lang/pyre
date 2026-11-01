@@ -18,6 +18,7 @@ syn = { workspace = true, features = ["visit", "visit-mut", "extra-traits"] }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
 majit-jitcode = { workspace = true }
+majit-eci = { workspace = true }
 
 [dev-dependencies]
 linkme = { workspace = true }

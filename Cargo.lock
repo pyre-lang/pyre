@@ -2023,6 +2023,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "majit-eci"
+version = "0.0.2"
+dependencies = [
+ "cc",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "majit-gc"
 version = "0.0.2"
 dependencies = [
@@ -2069,6 +2079,7 @@ version = "0.0.2"
 dependencies = [
  "ctor",
  "linkme",
+ "majit-eci",
  "majit-gc",
  "majit-ir",
  "majit-jitcode",
@@ -2118,6 +2129,7 @@ dependencies = [
  "libc",
  "libffi-sys",
  "linkme",
+ "majit-eci",
  "majit-gc",
  "majit-ir",
  "majit-jitcode",
@@ -2797,6 +2809,7 @@ dependencies = [
  "indexmap",
  "libc",
  "linkme",
+ "majit-eci",
  "majit-gc",
  "majit-ir",
  "majit-macros",
@@ -2913,6 +2926,7 @@ dependencies = [
  "ctor",
  "libc",
  "linkme",
+ "majit-eci",
  "majit-gc",
  "majit-ir",
  "majit-jitcode",
@@ -2946,6 +2960,9 @@ dependencies = [
  "der",
  "libc",
  "lz4_flex 0.13.1",
+ "majit-eci",
+ "majit-macros",
+ "majit-rlib",
  "parking_lot",
  "pem-rfc7468",
  "pkcs8",

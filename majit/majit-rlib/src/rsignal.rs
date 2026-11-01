@@ -28,6 +28,23 @@ pub const SIG_IGN: libc::sighandler_t = libc::SIG_IGN;
 crate::rffi::external_compilation_info! {
     const SIGNAL_ECI = {
         includes: ["stdlib.h", "signal.h", "sys/time.h"],
+        separate_module_sources: [
+            r#"RPY_EXTERN int pypysig_siginterrupt(int sig, int flag)
+{
+#ifdef SA_RESTART
+    struct sigaction act;
+    if (sigaction(sig, NULL, &act) < 0)
+        return -1;
+    if (flag)
+        act.sa_flags &= ~SA_RESTART;
+    else
+        act.sa_flags |= SA_RESTART;
+    return sigaction(sig, &act, NULL);
+#else
+    return siginterrupt(sig, flag);
+#endif
+}"#,
+        ],
     };
 }
 
@@ -134,31 +151,14 @@ crate::rffi::llexternal!(
     save_err = crate::rffi::RFFI_SAVE_ERRNO
 );
 
-// `rsignal.c_siginterrupt` is `pypysig_siginterrupt` (`signals.c`).
-// `siginterrupt(2)` is deprecated on glibc 2.21+; the helper uses
-// `sigaction` + `SA_RESTART` instead. `rsignal.external` is
-// `sandboxsafe=True` and this call also saves errno.
-unsafe fn pypysig_siginterrupt(sig: INT, flag: INT) -> INT {
-    let mut act = unsafe { std::mem::zeroed::<libc::sigaction>() };
-    if unsafe { libc::sigaction(sig, std::ptr::null(), &mut act) } < 0 {
-        return -1;
-    }
-    if flag != 0 {
-        act.sa_flags &= !libc::SA_RESTART;
-    } else {
-        act.sa_flags |= libc::SA_RESTART;
-    }
-    unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) }
-}
-
+// `signals.c pypysig_siginterrupt`, compiled from `SIGNAL_ECI`.
 crate::rffi::llexternal!(
     pub c_siginterrupt = "pypysig_siginterrupt",
     [INT, INT],
     INT,
     compilation_info = SIGNAL_ECI,
     sandboxsafe = true,
-    save_err = crate::rffi::RFFI_SAVE_ERRNO,
-    macro = pypysig_siginterrupt
+    save_err = crate::rffi::RFFI_SAVE_ERRNO
 );
 
 // `rsignal.c_sigpending`.

@@ -21,8 +21,67 @@ pub fn expand_llexternal(input: TokenStream) -> syn::Result<TokenStream> {
 }
 
 pub fn expand_external_compilation_info(input: TokenStream) -> syn::Result<TokenStream> {
-    let parsed: EciInput = syn::parse2(input)?;
-    parsed.expand()
+    let parsed: majit_eci::parse::EciInput = syn::parse2(input)?;
+    let eci = parsed.to_eci()?;
+    let vis = &parsed.vis;
+    let name = &parsed.name;
+    let field_inits = majit_eci::_ATTRIBUTES.iter().map(|field| {
+        let ident = Ident::new(field, Span::call_site());
+        let values = eci_field(&eci, field);
+        quote! { #ident: &[#(#values),*] }
+    });
+    let use_cpp = eci.use_cpp_linker;
+    let mut links = TokenStream::new();
+    for lib in &eci.libraries {
+        links.extend(quote! {
+            #[link(name = #lib)]
+            unsafe extern "C" {}
+        });
+    }
+    for framework in &eci.frameworks {
+        links.extend(quote! {
+            #[link(name = #framework, kind = "framework")]
+            unsafe extern "C" {}
+        });
+    }
+    let build_guard = if !eci.separate_module_sources.is_empty()
+        || !eci.separate_module_files.is_empty()
+    {
+        quote! {
+            #[cfg(not(majit_eci_build))]
+            compile_error!("`external_compilation_info!` with C sources needs `majit_eci::build::compile_crate_ecis` in this crate's build.rs");
+        }
+    } else {
+        quote! {}
+    };
+    Ok(quote! {
+        #vis const #name: ::majit_rlib::rffi::ExternalCompilationInfo =
+            ::majit_rlib::rffi::ExternalCompilationInfo {
+                #(#field_inits,)*
+                use_cpp_linker: #use_cpp,
+            };
+        #links
+        #build_guard
+    })
+}
+
+fn eci_field<'a>(eci: &'a majit_eci::ExternalCompilationInfo, field: &str) -> &'a [String] {
+    match field {
+        "pre_include_bits" => &eci.pre_include_bits,
+        "includes" => &eci.includes,
+        "include_dirs" => &eci.include_dirs,
+        "post_include_bits" => &eci.post_include_bits,
+        "libraries" => &eci.libraries,
+        "library_dirs" => &eci.library_dirs,
+        "separate_module_sources" => &eci.separate_module_sources,
+        "separate_module_files" => &eci.separate_module_files,
+        "compile_extra" => &eci.compile_extra,
+        "link_extra" => &eci.link_extra,
+        "frameworks" => &eci.frameworks,
+        "link_files" => &eci.link_files,
+        "testonly_libraries" => &eci.testonly_libraries,
+        other => panic!("unknown ExternalCompilationInfo field `{other}`"),
+    }
 }
 
 struct LlexternalInput {
@@ -37,7 +96,7 @@ struct LlexternalInput {
     nowrapper: bool,
     calling_conv: Option<String>,
     elidable: bool,
-    macro_path: Option<syn::Path>,
+    macro_name: Option<String>,
     random_effects: Tri,
     save_err: Expr,
     natural_arity: i64,
@@ -79,7 +138,7 @@ impl Parse for LlexternalInput {
         let mut nowrapper = false;
         let mut calling_conv = None;
         let mut elidable = false;
-        let mut macro_path = None;
+        let mut macro_name = None;
         let mut random_effects = Tri::Auto;
         let mut save_err = None;
         let mut natural_arity = -1i64;
@@ -100,7 +159,26 @@ impl Parse for LlexternalInput {
                     calling_conv = Some(input.parse::<LitStr>()?.value());
                 }
                 "elidable_function" => elidable = input.parse::<LitBool>()?.value(),
-                "macro" => macro_path = Some(input.parse()?),
+                "macro" => {
+                    if input.peek(LitBool) {
+                        let lit: LitBool = input.parse()?;
+                        if !lit.value() {
+                            return Err(syn::Error::new(
+                                lit.span(),
+                                "`macro` is `true` or the C macro's name (`rffi.py llexternal`)",
+                            ));
+                        }
+                        macro_name = Some(c_name.value());
+                    } else if input.peek(LitStr) {
+                        macro_name = Some(input.parse::<LitStr>()?.value());
+                    } else {
+                        let expr: Expr = input.parse()?;
+                        return Err(syn::Error::new_spanned(
+                            expr,
+                            "`macro` is `true` or the C macro's name (`rffi.py llexternal`)",
+                        ));
+                    }
+                }
                 "random_effects_on_gcobjs" => random_effects = parse_tri(input, &key)?,
                 "save_err" => save_err = Some(input.parse()?),
                 "natural_arity" => natural_arity = parse_signed_int(input)?,
@@ -108,7 +186,7 @@ impl Parse for LlexternalInput {
                 "_callable" => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "`_callable` is the ll2ctypes stand-in; pass `macro = <path>` for a Rust funcptr",
+                        "`_callable` is the ll2ctypes stand-in; declare the C function (or `macro = true`)",
                     ));
                 }
                 other => {
@@ -132,10 +210,10 @@ impl Parse for LlexternalInput {
                 "calling_conv must be \"c\", \"unknown\", or \"win\"",
             ));
         }
-        if macro_path.is_some() && !link_attrs.is_empty() {
+        if macro_name.is_some() && !link_attrs.is_empty() {
             return Err(syn::Error::new_spanned(
                 &link_attrs[0].attr,
-                "link_name attributes apply to the generated extern funcptr; remove them when `macro` replaces that funcptr",
+                "link_name attributes apply to the generated extern funcptr; remove them when `macro` names `pypy_macro_wrapper_<name>`",
             ));
         }
         Ok(LlexternalInput {
@@ -150,7 +228,7 @@ impl Parse for LlexternalInput {
             nowrapper,
             calling_conv,
             elidable,
-            macro_path,
+            macro_name,
             random_effects,
             save_err: save_err
                 .unwrap_or_else(|| syn::parse_quote!(::majit_rlib::rffi::RFFI_ERR_NONE)),
@@ -365,7 +443,7 @@ impl LlexternalInput {
         };
         let save_err_value = rffi_flag(&self.save_err);
         let save_err_nonzero = save_err_value.unwrap_or(1) != 0;
-        let register_funcptr = invoke && self.macro_path.is_none() && self.natural_arity == -1;
+        let register_funcptr = invoke && self.macro_name.is_none() && self.natural_arity == -1;
 
         let name = &self.name;
         let deriv = self.derivation_consts(has_callback, invoke, random_effects);
@@ -467,7 +545,7 @@ impl LlexternalInput {
             None => (quote! { #save_err }, quote! {}),
         };
 
-        let around_attr = if invoke && self.macro_path.is_none() && self.natural_arity == -1 {
+        let around_attr = if invoke && self.macro_name.is_none() && self.natural_arity == -1 {
             let Some(lit) = save_err_value else {
                 return Err(syn::Error::new_spanned(
                         &self.save_err,
@@ -513,10 +591,10 @@ impl LlexternalInput {
         // non-around body depends on `calling_conv`: the default is `"c"`
         // except on windows when a wrapper exists, where `llexternal` uses
         // `"unknown"` and forces `need_wrapper`.
-        let direct_on_c = !invoke && !self.macro_path.is_some() && !save_err_nonzero;
+        let direct_on_c = !invoke && !self.macro_name.is_some() && !save_err_nonzero;
         let specified_not_c = self.calling_conv.as_deref().is_some_and(|c| c != "c");
         let need_wrapper =
-            !invoke && (self.macro_path.is_some() || save_err_nonzero || specified_not_c);
+            !invoke && (self.macro_name.is_some() || save_err_nonzero || specified_not_c);
 
         if invoke || need_wrapper {
             let header = if invoke {
@@ -532,7 +610,7 @@ impl LlexternalInput {
                 quote! { #[::majit_macros::dont_look_inside] }
             };
             let vis = &self.vis;
-            let funcptr_fnaddr = if invoke && self.macro_path.is_none() && self.natural_arity == -1
+            let funcptr_fnaddr = if invoke && self.macro_name.is_none() && self.natural_arity == -1
             {
                 self.funcptr_fnaddr_registration()
             } else {
@@ -549,6 +627,8 @@ impl LlexternalInput {
                 #funcptr_fnaddr
                 #ccall_fnaddr
                 #header
+                // `ccall_` + an upstream name with a leading `_` (`rposix._c_set_inheritable`) is `ccall__...`.
+                #[allow(non_snake_case)]
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
                     #identity
                     #body
@@ -574,6 +654,7 @@ impl LlexternalInput {
                 }
                 #[cfg(windows)]
                 #[inline(never)]
+                #[allow(non_snake_case)]
                 #vis unsafe fn #call_name(#(#params),*) -> #result {
                     unsafe { #call_expr }
                 }
@@ -617,7 +698,7 @@ impl LlexternalInput {
         } else {
             quote! {}
         };
-        let abi = if self.nowrapper && self.macro_path.is_none() {
+        let abi = if self.nowrapper && self.macro_name.is_none() {
             let abi = self.extern_abi();
             quote! { extern #abi }
         } else {
@@ -632,7 +713,7 @@ impl LlexternalInput {
                 let _ = #save_err;
                 ::majit_rlib::rffi::sandbox_stub_panic(#fnname)
             }
-            #[allow(unused_variables)]
+            #[allow(unused_variables, non_snake_case)]
             #vis unsafe fn #call_name(#(#params),*) -> #result {
                 #[doc(hidden)]
                 #[allow(non_upper_case_globals, dead_code)]
@@ -720,12 +801,11 @@ impl LlexternalInput {
         }
     }
 
-    /// Graphless leaf the wrapper calls: `__rffi_fp_{name}`, `{name}` when
-    /// `_nowrapper`, the `macro = <path>` target when `macro` is given.
+    /// Graphless leaf the wrapper calls: `__rffi_fp_{name}`, or `{name}` when
+    /// `_nowrapper`. A `macro` llexternal is an ordinary extern funcptr whose
+    /// link name is `pypy_macro_wrapper_<c_name>` (`rffi.py generate_macro_wrapper`).
     fn graphless_leaf(&self) -> TokenStream {
-        if let Some(path) = &self.macro_path {
-            quote! { #path }
-        } else if self.nowrapper {
+        if self.nowrapper {
             let name = &self.name;
             quote! { #name }
         } else {
@@ -736,7 +816,7 @@ impl LlexternalInput {
 
     /// `rffi.py llexternal` stores `random_effects_on_gcobjs` on the graphless
     /// C functionptr. Named after the llexternal `{name}`; the initializer is
-    /// that leaf as a raw pointer so a variadic or `macro =` target typechecks.
+    /// that leaf as a raw pointer so a variadic or `macro` funcptr typechecks.
     fn random_effects_funcptr_marker(&self, random_effects: bool) -> TokenStream {
         if !random_effects {
             return quote! {};
@@ -894,12 +974,8 @@ impl LlexternalInput {
     }
 
     fn funcptr_path(&self) -> TokenStream {
-        if let Some(path) = &self.macro_path {
-            quote! { #path }
-        } else {
-            let fp = format_ident!("__rffi_fp_{}", self.name);
-            quote! { #fp }
-        }
+        let fp = format_ident!("__rffi_fp_{}", self.name);
+        quote! { #fp }
     }
 
     fn call_expr(&self, arg_names: &[Ident]) -> TokenStream {
@@ -908,15 +984,6 @@ impl LlexternalInput {
     }
 
     fn funcptr_item(&self, nowrapper: bool) -> TokenStream {
-        if let Some(path) = &self.macro_path {
-            let name = &self.name;
-            let vis = &self.vis;
-            return if nowrapper {
-                quote! { #vis use #path as #name; }
-            } else {
-                quote! {}
-            };
-        }
         let result = &self.result;
         let rust_name = if nowrapper {
             self.name.clone()
@@ -964,7 +1031,11 @@ impl LlexternalInput {
     /// link name is copied through, and `c_name` applies only where none of
     /// those predicates hold, so two `link_name` attributes are never both active.
     fn extern_link_attrs(&self) -> TokenStream {
-        let c_name = &self.c_name;
+        let c_name = if self.macro_name.is_some() {
+            format!("pypy_macro_wrapper_{}", self.c_name)
+        } else {
+            self.c_name.clone()
+        };
         if self.link_attrs.is_empty() {
             return quote! { #[link_name = #c_name] };
         }
@@ -1006,123 +1077,6 @@ impl LlexternalInput {
             self.params().0
         };
         (fixed, variadic)
-    }
-}
-
-const FORBIDDEN_NONEMPTY: &[&str] = &[
-    "library_dirs",
-    "link_extra",
-    "separate_module_sources",
-    "separate_module_files",
-    "compile_extra",
-];
-
-struct EciInput {
-    vis: Visibility,
-    name: Ident,
-    fields: Vec<(Ident, EciValue)>,
-}
-
-enum EciValue {
-    Strs(Vec<LitStr>),
-    Bool(bool),
-}
-
-impl Parse for EciInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let vis = input.parse()?;
-        input.parse::<Token![const]>()?;
-        let name: Ident = input.parse()?;
-        input.parse::<Token![=]>()?;
-        let body;
-        syn::braced!(body in input);
-        let mut fields = Vec::new();
-        while !body.is_empty() {
-            let key: Ident = body.parse()?;
-            body.parse::<Token![:]>()?;
-            let value = if body.peek(LitBool) {
-                EciValue::Bool(body.parse::<LitBool>()?.value())
-            } else {
-                let list;
-                syn::bracketed!(list in body);
-                let mut strs = Vec::new();
-                while !list.is_empty() {
-                    strs.push(list.parse::<LitStr>()?);
-                    if list.is_empty() {
-                        break;
-                    }
-                    list.parse::<Token![,]>()?;
-                }
-                EciValue::Strs(strs)
-            };
-            fields.push((key, value));
-            let _ = body.parse::<Token![,]>();
-        }
-        let _ = input.parse::<Token![;]>();
-        Ok(EciInput { vis, name, fields })
-    }
-}
-
-impl EciInput {
-    fn expand(&self) -> syn::Result<TokenStream> {
-        let mut strings: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        let mut use_cpp = false;
-        for (key, value) in &self.fields {
-            let name = key.to_string();
-            match value {
-                EciValue::Bool(value) => {
-                    if name != "use_cpp_linker" {
-                        return Err(syn::Error::new(key.span(), "only use_cpp_linker is a bool"));
-                    }
-                    use_cpp = *value;
-                }
-                EciValue::Strs(strs) => {
-                    if !ECI_FIELDS.contains(&name.as_str()) {
-                        return Err(syn::Error::new(
-                            key.span(),
-                            format!("unknown ExternalCompilationInfo field `{name}`"),
-                        ));
-                    }
-                    let values: Vec<String> = strs.iter().map(LitStr::value).collect();
-                    if FORBIDDEN_NONEMPTY.contains(&name.as_str()) && !values.is_empty() {
-                        let message = format!(
-                            "`{name}` needs a C build step or a Cargo search path; it must be empty"
-                        );
-                        return Ok(syn::Error::new(key.span(), message).to_compile_error());
-                    }
-                    strings.insert(name, values);
-                }
-            }
-        }
-        let vis = &self.vis;
-        let name = &self.name;
-        let field_inits = ECI_FIELDS.iter().map(|field| {
-            let ident = Ident::new(field, Span::call_site());
-            let values = strings.get(*field).cloned().unwrap_or_default();
-            quote! { #ident: &[#(#values),*] }
-        });
-        let mut links = TokenStream::new();
-        for lib in strings.get("libraries").into_iter().flatten() {
-            links.extend(quote! {
-                #[link(name = #lib)]
-                unsafe extern "C" {}
-            });
-        }
-        for framework in strings.get("frameworks").into_iter().flatten() {
-            links.extend(quote! {
-                #[link(name = #framework, kind = "framework")]
-                unsafe extern "C" {}
-            });
-        }
-        Ok(quote! {
-            #vis const #name: ::majit_rlib::rffi::ExternalCompilationInfo =
-                ::majit_rlib::rffi::ExternalCompilationInfo {
-                    #(#field_inits,)*
-                    use_cpp_linker: #use_cpp,
-                };
-            #links
-        })
     }
 }
 
@@ -1252,22 +1206,6 @@ fn aroundstate_marker(attr: TokenStream, item: TokenStream) -> syn::Result<Token
     })
 }
 
-const ECI_FIELDS: &[&str] = &[
-    "pre_include_bits",
-    "includes",
-    "include_dirs",
-    "post_include_bits",
-    "libraries",
-    "library_dirs",
-    "separate_module_sources",
-    "separate_module_files",
-    "compile_extra",
-    "link_extra",
-    "frameworks",
-    "link_files",
-    "testonly_libraries",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,12 +1226,22 @@ mod tests {
             r#"c_memcpy = "memcpy", [*mut u8, *const u8, usize], *mut u8, releasegil = false"#,
         );
         assert!(!no_gil.contains("_random_effects_on_gcobjs_"), "{no_gil}");
-        let foreign = expand(r#"c_stat = "stat", [i32], i32, macro = libc::stat"#);
+        let foreign = expand(r#"c_stat = "stat", [i32], i32, macro = true"#);
         assert!(
             foreign.contains("_random_effects_on_gcobjs_c_stat"),
             "{foreign}"
         );
-        assert!(foreign.contains("libc :: stat as * const ()"), "{foreign}");
+        assert!(foreign.contains("pypy_macro_wrapper_stat"), "{foreign}");
+        let path_err = expand_llexternal(
+            r#"c_stat = "stat", [i32], i32, macro = libc::stat"#
+                .parse()
+                .unwrap(),
+        );
+        let msg = path_err.unwrap_err().to_string();
+        assert!(
+            msg.contains("`macro` is `true` or the C macro's name (`rffi.py llexternal`)"),
+            "{msg}"
+        );
     }
 
     #[test]

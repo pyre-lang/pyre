@@ -1075,12 +1075,11 @@ mod tests {
             keys.contains(&"clibffi::__rffi_fp_c_ffi_call"),
             "gc_effects keys: {keys:?}"
         );
-        // `rposix_stat.c_stat` is `macro = libc::stat`; the foreign leaf
-        // keeps its crate. `rposix_stat` is `#[cfg(unix)]`.
+        // `rposix_stat.c_stat` is `macro = true`: its leaf is the
+        // `pypy_macro_wrapper_stat` funcptr. `rposix_stat` is `#[cfg(unix)]`.
         if cfg!(unix) {
             assert!(
-                keys.iter()
-                    .any(|k| k.starts_with("libc::") && k.ends_with("::stat")),
+                keys.contains(&"rposix_stat::__rffi_fp_c_stat"),
                 "gc_effects keys: {keys:?}"
             );
         }

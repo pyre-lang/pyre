@@ -34,15 +34,24 @@ mod msvc {
         ninfo: u32,
     }
 
-    unsafe extern "C" {
-        /// `seh.c` — `__try { body(arg); } __except (filter) {}`, returning 1
-        /// when the filter took an exception and filling `out` with it.
-        fn pyre_seh_guard(
-            body: extern "C" fn(*mut c_void),
-            arg: *mut c_void,
-            out: *mut Record,
-        ) -> i32;
+    #[cfg(all(windows, target_env = "msvc"))]
+    majit_rlib::rffi::external_compilation_info! {
+        const SEH_ECI = {
+            separate_module_files: ["src/module/_ctypes/seh.c"],
+        };
     }
+
+    // `seh.c` — `__try { body(arg); } __except (filter) {}`, returning 1
+    // when the filter took an exception and filling `out` with it.
+    #[cfg(all(windows, target_env = "msvc"))]
+    majit_rlib::rffi::llexternal!(
+        pyre_seh_guard = "pyre_seh_guard",
+        [unsafe extern "C" fn(*mut c_void), *mut c_void, *mut Record],
+        i32,
+        compilation_info = SEH_ECI,
+        _nowrapper = true,
+        sandboxsafe = true
+    );
 
     /// The exception the fence would have made of a read at `address` that
     /// faulted, for a read that is refused before it is attempted rather than
@@ -70,7 +79,7 @@ mod msvc {
             out: Option<T>,
         }
 
-        extern "C" fn trampoline<F: FnOnce() -> T, T>(arg: *mut c_void) {
+        unsafe extern "C" fn trampoline<F: FnOnce() -> T, T>(arg: *mut c_void) {
             let cell = unsafe { &mut *arg.cast::<Cell<F, T>>() };
             let body = cell.body.take().expect("the fence calls its body once");
             cell.out = Some(body());

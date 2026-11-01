@@ -296,17 +296,18 @@ pub type WINSIZE = libc::winsize;
 // `rposix.external` for the fd and path calls below. `c_open` on darwin is
 // variadic (`natural_arity=2`, mode is `rffi.INT`); everywhere else the mode
 // is `rffi.MODE_T`. `c_close` is `releasegil=False`. `c_lseek` is
-// `macro=_MACRO_ON_POSIX` (true here), so the call is `libc::lseek`, which
-// already carries the 64-bit `off_t` symbol. `gnu_file_offset_bits64`
-// redirects (`open64`, `lseek64`) are 32-bit and are not copied.
-// `c_access` and `c_isatty` leave `save_err` at `RFFI_ERR_NONE`. `c_mkdir`'s
-// mode is `rffi.MODE_T`. `c_strerror` is `releasegil=False`. `c_readdir` is
-// `macro=True` with `save_err=RFFI_FULL_ERRNO_ZERO`, so the dirent matches
-// `libc::readdir` and errno is cleared before the call. `c_closedir` is
-// `releasegil=False`. `c_opendir` on macOS x86_64 links `opendir$INODE64`
-// (x86 adds `$UNIX2003`). This include list is the headers these calls need,
-// not the whole `rposix.eci`.
-#[cfg(unix)]
+// `macro=_MACRO_ON_POSIX` (true here); `rffi.py generate_macro_wrapper` emits
+// `pypy_macro_wrapper_lseek`. `gnu_file_offset_bits64` redirects (`open64`,
+// `lseek64`) are 32-bit and are not copied. `c_access` and `c_isatty` leave
+// `save_err` at `RFFI_ERR_NONE`. `c_mkdir`'s mode is `rffi.MODE_T`.
+// `c_strerror` is `releasegil=False`. `c_readdir` is `macro=True` with
+// `save_err=RFFI_FULL_ERRNO_ZERO` (`generate_macro_wrapper` / errno cleared
+// before the call). `c_closedir` is `releasegil=False`. `c_opendir` on macOS
+// x86_64 links `opendir$INODE64` (x86 adds `$UNIX2003`). This include list is
+// the headers these calls need, not the whole `rposix.eci`. On Linux
+// `rposix.eci` also includes `sys/sysmacros.h`, where glibc declares
+// `major`/`minor`/`makedev`.
+#[cfg(all(unix, not(target_os = "linux")))]
 crate::rffi::external_compilation_info! {
     const POSIX_ECI = {
         includes: [
@@ -318,6 +319,23 @@ crate::rffi::external_compilation_info! {
             "string.h",
             "signal.h",
             "stdio.h",
+        ],
+    };
+}
+
+#[cfg(target_os = "linux")]
+crate::rffi::external_compilation_info! {
+    const POSIX_ECI = {
+        includes: [
+            "fcntl.h",
+            "unistd.h",
+            "sys/types.h",
+            "sys/stat.h",
+            "dirent.h",
+            "string.h",
+            "signal.h",
+            "stdio.h",
+            "sys/sysmacros.h",
         ],
     };
 }
@@ -393,7 +411,7 @@ crate::rffi::llexternal!(
     crate::rffi::LONGLONG,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::lseek
+    macro = true
 );
 
 /// `rposix.handle_posix_error` — `widen` then `result < 0` reads
@@ -620,9 +638,9 @@ pub fn mkdir(path: &[u8], mode: i32) -> Result<(), i32> {
     handle_posix_error(unsafe { c_mkdir(c_path.as_ptr(), mode as libc::mode_t) } as i64).map(|_| ())
 }
 
-// `rposix_stat.c_fstat` is `macro=True` and saves errno. The call is
-// `libc::fstat`, which already carries the inode64 symbol. Includes are
-// `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
+// `rposix_stat.c_fstat` is `macro=True` and saves errno;
+// `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_fstat`. Includes
+// are `rposix_stat.compilation_info` (`sys/statvfs.h` is in that list; this
 // call does not use it). `c_stat` / `c_lstat` / `c_fstat` live in `rposix_stat`.
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
@@ -800,7 +818,7 @@ crate::rffi::llexternal!(
     *mut libc::dirent,
     compilation_info = POSIX_ECI,
     save_err = RFFI_FULL_ERRNO_ZERO,
-    macro = libc::readdir
+    macro = true
 );
 
 #[cfg(unix)]
@@ -818,9 +836,9 @@ crate::rffi::llexternal!(
 
 // `rposix.c_pread`, `c_pwrite`, `c_lockf`, `c_fsync`, `c_fdatasync`,
 // `c_ftruncate`, `c_sync`, `c_chdir`, `c_fchdir`, `c_readlink`, `c_rmdir`.
-// `c_ftruncate` is `macro=_MACRO_ON_POSIX` (`_os_support._MACRO_ON_POSIX`),
-// so the call is `libc::ftruncate`, which already carries the 64-bit `off_t`
-// symbol. `gnu_file_offset_bits64` redirects (`pread64`, `pwrite64`,
+// `c_ftruncate` is `macro=_MACRO_ON_POSIX` (`_os_support._MACRO_ON_POSIX`);
+// `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_ftruncate`.
+// `gnu_file_offset_bits64` redirects (`pread64`, `pwrite64`,
 // `ftruncate64`, `lockf64`) are 32-bit and are not copied. `c_pread` and
 // `c_pwrite` on macOS x86 link `pread$UNIX2003` / `pwrite$UNIX2003`.
 // `c_fsync` on macOS x86 links `fsync$UNIX2003`. `c_sync` returns void and
@@ -921,7 +939,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::ftruncate
+    macro = true
 );
 
 #[cfg(unix)]
@@ -1229,7 +1247,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::mknod
+    macro = true
 );
 
 #[cfg(unix)]
@@ -1621,8 +1639,8 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix_stat.c_fstatat` is `macro=True` and saves errno, so the call is
-// `libc::fstatat` and carries the inode64 symbol.
+// `rposix_stat.c_fstatat` is `macro=True` and saves errno;
+// `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_fstatat`.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_fstatat = "fstatat",
@@ -1635,13 +1653,14 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = STAT_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::fstatat
+    macro = true
 );
 
 // `rposix.c_fdopendir` saves errno. On macOS it links `fdopendir$INODE64`
 // so the `DIR*` matches `libc::readdir`. `rposix.c_rewinddir` returns void
 // and is `releasegil=False`; the same inode64 alias applies.
-// `rposix.c_dirfd` is `macro=True` and `releasegil=False`.
+// `rposix.c_dirfd` is `macro=True` (`rffi.py generate_macro_wrapper`) and
+// `releasegil=False`.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     #[cfg_attr(
@@ -1683,7 +1702,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     releasegil = false,
-    macro = libc::dirfd
+    macro = true
 );
 
 /// `rposix._listdir`. Closes `dirp`. `rewind` is `c_rewinddir` before close
@@ -1868,7 +1887,8 @@ crate::rffi::llexternal!(
     compilation_info = POSIX_ECI
 );
 
-// `rposix.c_chroot` is `macro=_MACRO_ON_POSIX` and saves errno.
+// `rposix.c_chroot` is `macro=_MACRO_ON_POSIX` (`rffi.py generate_macro_wrapper`)
+// and saves errno.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_chroot = "chroot",
@@ -1876,7 +1896,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::chroot
+    macro = true
 );
 
 // `rposix.c_uname` saves errno. The buffer is `struct utsname`.
@@ -1996,17 +2016,17 @@ pub fn getloadavg() -> Result<[f64; 3], ()> {
     if r != 3 { Err(()) } else { Ok(load) }
 }
 
-// `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`. The libc
-// const fn's signature is not the same on every target, so each group
-// names the signature that target's `libc::major` has. `rposix` spells
-// every argument `rffi.INT`.
+// `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`
+// (`rffi.py generate_macro_wrapper`). Each group names the signature that
+// target's `major` / `minor` / `makedev` has. `rposix` spells every
+// argument `rffi.INT`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 crate::rffi::llexternal!(
     pub c_major = "major",
     [libc::dev_t],
     i32,
     compilation_info = POSIX_ECI,
-    macro = libc::major
+    macro = true
 );
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -2015,7 +2035,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     i32,
     compilation_info = POSIX_ECI,
-    macro = libc::minor
+    macro = true
 );
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -2024,7 +2044,7 @@ crate::rffi::llexternal!(
     [i32, i32],
     libc::dev_t,
     compilation_info = POSIX_ECI,
-    macro = libc::makedev
+    macro = true
 );
 
 #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
@@ -2033,7 +2053,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_uint,
     compilation_info = POSIX_ECI,
-    macro = libc::major
+    macro = true
 );
 
 #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
@@ -2042,7 +2062,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_uint,
     compilation_info = POSIX_ECI,
-    macro = libc::minor
+    macro = true
 );
 
 #[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
@@ -2051,7 +2071,7 @@ crate::rffi::llexternal!(
     [libc::c_uint, libc::c_uint],
     libc::dev_t,
     compilation_info = POSIX_ECI,
-    macro = libc::makedev
+    macro = true
 );
 
 #[cfg(all(
@@ -2069,7 +2089,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_int,
     compilation_info = POSIX_ECI,
-    macro = libc::major
+    macro = true
 );
 
 #[cfg(all(
@@ -2087,7 +2107,7 @@ crate::rffi::llexternal!(
     [libc::dev_t],
     libc::c_int,
     compilation_info = POSIX_ECI,
-    macro = libc::minor
+    macro = true
 );
 
 #[cfg(all(
@@ -2105,7 +2125,7 @@ crate::rffi::llexternal!(
     [libc::c_uint, libc::c_uint],
     libc::dev_t,
     compilation_info = POSIX_ECI,
-    macro = libc::makedev
+    macro = true
 );
 
 // `rposix.c_sysconf`, `c_pathconf`, `c_fpathconf`, and `c_confstr` use
@@ -2431,184 +2451,181 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix.rpy_set_inheritable` / `rpy_get_inheritable` /
-// `rpy_dup_noninheritable` / `rpy_dup2_noninheritable`. The C bodies are
-// generated `separate_module_sources` and are not libc symbols, so the
-// `llexternal` wrappers (`_c_set_inheritable`, `_c_get_inheritable`,
-// `c_dup_noninheritable`, `c_dup2_noninheritable`) call these private
-// functions under the same GIL+errno sequence `releasegil=True` +
-// `save_err=RFFI_SAVE_ERRNO` expands to. Inner calls use `libc::ioctl` /
-// `libc::fcntl` / `libc::dup` / `libc::dup2` / `libc::dup3` / `libc::close`
-// rather than the saving `c_*` wrappers.
+// `rposix.eci_inheritable` is `eci.merge(...)`: POSIX_ECI includes plus
+// the inheritable `separate_module_sources`. `%(HAVE_DUP3)d` is the
+// `rffi_platform` probe; `majit-rlib/build.rs` probes `dup3` (`rffi_platform.Has`)
+// and defines `HAVE_DUP3` to 0 or 1.
+// [3.15-spec] `rpy_set_inheritable` returns -1 on an O_PATH descriptor's EBADF;
+// `set_inheritable` in `Python/fileutils.c` falls through to `fcntl` (bpo-44849).
+// Observable: `lib-python/3/test/test_os/test_os.py` `test_get_set_inheritable_o_path`.
 #[cfg(unix)]
-mod inheritable_c {
-    use super::_get_errno;
-    use std::sync::atomic::{AtomicI32, Ordering};
+crate::rffi::external_compilation_info! {
+    const INHERITABLE_ECI = {
+        includes: [
+            "fcntl.h",
+            "unistd.h",
+            "sys/types.h",
+            "sys/stat.h",
+            "dirent.h",
+            "string.h",
+            "signal.h",
+            "stdio.h",
+        ],
+        separate_module_sources: [r#"
+#include <errno.h>
+#include <sys/ioctl.h>
 
-    /// `rposix.rpy_set_inheritable`. `ioctl_works` is `-1` unknown, `0` no,
-    /// `1` yes.
-    pub(super) unsafe fn rpy_set_inheritable(
-        fd: libc::c_int,
-        inheritable: libc::c_int,
-    ) -> libc::c_int {
-        static IOCTL_WORKS: AtomicI32 = AtomicI32::new(-1);
-        if IOCTL_WORKS.load(Ordering::Relaxed) != 0 {
-            let request = if inheritable != 0 {
-                libc::FIONCLEX
-            } else {
-                libc::FIOCLEX
-            };
-            let err = unsafe { libc::ioctl(fd, request, std::ptr::null_mut::<libc::c_void>()) };
-            if err == 0 {
-                IOCTL_WORKS.store(1, Ordering::Relaxed);
-                return 0;
-            }
-            let errno = _get_errno();
-            // O_PATH descriptors fail ioctl(FIOCLEX/FIONCLEX) with EBADF.
-            // `rposix.rpy_set_inheritable` returns -1 unless errno is ENOTTY
-            // or EACCES. `set_inheritable` (fileutils.c, bpo-44849) falls
-            // through to fcntl and leaves ioctl_works set. Observable:
-            // lib-python/3/test/test_os.py
-            // FDInheritanceTests.test_get_set_inheritable_o_path. No @jit /
-            // _immutable_ / dont_look_inside on `rpy_set_inheritable` or
-            // `_c_set_inheritable`.
-            let o_path_ioctl_ebadf = cfg!(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "freebsd",
-                target_os = "fuchsia",
-            )) && errno == libc::EBADF;
-            if !o_path_ioctl_ebadf {
-                if errno != libc::ENOTTY && errno != libc::EACCES {
-                    return -1;
-                }
-                IOCTL_WORKS.store(0, Ordering::Relaxed);
-            }
+RPY_EXTERN
+int rpy_set_inheritable(int fd, int inheritable)
+{
+    static int ioctl_works = -1;
+    int flags;
+
+    if (ioctl_works != 0) {
+        int request = inheritable ? FIONCLEX : FIOCLEX;
+        int err = ioctl(fd, request, NULL);
+        if (!err) {
+            ioctl_works = 1;
+            return 0;
         }
 
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 {
+#ifdef O_PATH
+        if (errno == EBADF) {
+            /* ioctl(FIOCLEX) fails with EBADF on O_PATH descriptors on
+               Linux and FreeBSD: fall through to fcntl() */
+        }
+        else
+#endif
+        if (errno != ENOTTY && errno != EACCES) {
             return -1;
         }
-        let flags = if inheritable != 0 {
-            flags & !libc::FD_CLOEXEC
-        } else {
-            flags | libc::FD_CLOEXEC
-        };
-        unsafe { libc::fcntl(fd, libc::F_SETFD, flags) }
+        else {
+            /* ENOTTY: The ioctl is declared but not supported by the
+               kernel.  EACCES: SELinux policy, this can be the case on
+               Android. */
+            ioctl_works = 0;
+        }
+        /* fallback to fcntl() if ioctl() does not work */
     }
 
-    /// `rposix.rpy_get_inheritable`.
-    pub(super) unsafe fn rpy_get_inheritable(fd: libc::c_int) -> libc::c_int {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
-        if flags == -1 {
+    flags = fcntl(fd, F_GETFD);
+    if (flags < 0)
+        return -1;
+
+    if (inheritable)
+        flags &= ~FD_CLOEXEC;
+    else
+        flags |= FD_CLOEXEC;
+    return fcntl(fd, F_SETFD, flags);
+}
+
+RPY_EXTERN
+int rpy_get_inheritable(int fd)
+{
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags == -1)
+        return -1;
+    return !(flags & FD_CLOEXEC);
+}
+
+RPY_EXTERN
+int rpy_dup_noninheritable(int fd)
+{
+#ifdef F_DUPFD_CLOEXEC
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+#else
+    fd = dup(fd);
+    if (fd >= 0) {
+        if (rpy_set_inheritable(fd, 0) != 0) {
+            close(fd);
             return -1;
         }
-        libc::c_int::from(flags & libc::FD_CLOEXEC == 0)
     }
+    return fd;
+#endif
+}
 
-    /// `rposix.rpy_dup_noninheritable`. `#ifdef F_DUPFD_CLOEXEC`.
-    pub(super) unsafe fn rpy_dup_noninheritable(fd: libc::c_int) -> libc::c_int {
-        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+RPY_EXTERN
+int rpy_dup2_noninheritable(int fd, int fd2)
+{
+#ifdef F_DUP2FD_CLOEXEC
+    return fcntl(fd, F_DUP2FD_CLOEXEC, fd2);
+
+#else
+# if HAVE_DUP3
+    static int dup3_works = -1;
+    if (dup3_works != 0) {
+        if (dup3(fd, fd2, O_CLOEXEC) >= 0)
+            return 0;
+        if (dup3_works == -1)
+            dup3_works = (errno != ENOSYS);
+        if (dup3_works)
+            return -1;
     }
-
-    /// `rposix.rpy_dup2_noninheritable`. `#ifdef F_DUP2FD_CLOEXEC` first;
-    /// else `HAVE_DUP3` then `dup2` + `rpy_set_inheritable`. The HAVE_DUP3
-    /// arm returns 0 on success.
-    pub(super) unsafe fn rpy_dup2_noninheritable(fd: libc::c_int, fd2: libc::c_int) -> libc::c_int {
-        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
-        {
-            return unsafe { libc::fcntl(fd, libc::F_DUP2FD_CLOEXEC, fd2) };
-        }
-        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
-        {
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "android",
-                target_os = "netbsd",
-                target_os = "openbsd"
-            ))]
-            {
-                static DUP3_WORKS: AtomicI32 = AtomicI32::new(-1);
-                if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
-                    if unsafe { libc::dup3(fd, fd2, libc::O_CLOEXEC) } >= 0 {
-                        return 0;
-                    }
-                    if DUP3_WORKS.load(Ordering::Relaxed) == -1 {
-                        DUP3_WORKS
-                            .store(i32::from(_get_errno() != libc::ENOSYS), Ordering::Relaxed);
-                    }
-                    if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
-                        return -1;
-                    }
-                }
-            }
-            if unsafe { libc::dup2(fd, fd2) } < 0 {
-                return -1;
-            }
-            if unsafe { rpy_set_inheritable(fd2, 0) } != 0 {
-                unsafe {
-                    libc::close(fd2);
-                }
-                return -1;
-            }
-            0
-        }
+# endif
+    if (dup2(fd, fd2) < 0)
+        return -1;
+    if (rpy_set_inheritable(fd2, 0) != 0) {
+        close(fd2);
+        return -1;
     }
+    return 0;
+#endif
+}
+"#],
+        post_include_bits: [
+            "RPY_EXTERN int rpy_set_inheritable(int, int);",
+            "RPY_EXTERN int rpy_get_inheritable(int);",
+            "RPY_EXTERN int rpy_dup_noninheritable(int);",
+            "RPY_EXTERN int rpy_dup2_noninheritable(int, int);",
+        ],
+    };
 }
 
-/// `rposix._c_set_inheritable`.
 #[cfg(unix)]
-#[inline(never)]
-pub unsafe fn _c_set_inheritable(
-    fd: crate::rffi::INT,
-    inheritable: crate::rffi::INT,
-) -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    _errno_before(RFFI_SAVE_ERRNO);
-    let __res = unsafe { inheritable_c::rpy_set_inheritable(fd, inheritable) };
-    _errno_after(RFFI_SAVE_ERRNO);
-    drop(__guard);
-    __res
+crate::rffi::llexternal!(
+    pub _c_set_inheritable = "rpy_set_inheritable",
+    [crate::rffi::INT, crate::rffi::INT],
+    crate::rffi::INT,
+    save_err = RFFI_SAVE_ERRNO,
+    compilation_info = INHERITABLE_ECI
+);
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub _c_get_inheritable = "rpy_get_inheritable",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    save_err = RFFI_SAVE_ERRNO,
+    compilation_info = INHERITABLE_ECI
+);
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_dup_noninheritable = "rpy_dup_noninheritable",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    save_err = RFFI_SAVE_ERRNO,
+    compilation_info = INHERITABLE_ECI
+);
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_dup2_noninheritable = "rpy_dup2_noninheritable",
+    [crate::rffi::INT, crate::rffi::INT],
+    crate::rffi::INT,
+    save_err = RFFI_SAVE_ERRNO,
+    compilation_info = INHERITABLE_ECI
+);
+
+/// `rposix.set_inheritable`.
+#[cfg(unix)]
+pub fn set_inheritable(fd: crate::rffi::INT, inheritable: bool) -> Result<(), i32> {
+    handle_posix_error(unsafe { _c_set_inheritable(fd, inheritable as crate::rffi::INT) } as i64)
+        .map(|_| ())
 }
 
-/// `rposix._c_get_inheritable`.
+/// `rposix.get_inheritable`.
 #[cfg(unix)]
-#[inline(never)]
-pub unsafe fn _c_get_inheritable(fd: crate::rffi::INT) -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    _errno_before(RFFI_SAVE_ERRNO);
-    let __res = unsafe { inheritable_c::rpy_get_inheritable(fd) };
-    _errno_after(RFFI_SAVE_ERRNO);
-    drop(__guard);
-    __res
-}
-
-/// `rposix.c_dup_noninheritable`.
-#[cfg(unix)]
-#[inline(never)]
-pub unsafe fn c_dup_noninheritable(fd: crate::rffi::INT) -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    _errno_before(RFFI_SAVE_ERRNO);
-    let __res = unsafe { inheritable_c::rpy_dup_noninheritable(fd) };
-    _errno_after(RFFI_SAVE_ERRNO);
-    drop(__guard);
-    __res
-}
-
-/// `rposix.c_dup2_noninheritable`.
-#[cfg(unix)]
-#[inline(never)]
-pub unsafe fn c_dup2_noninheritable(
-    fd: crate::rffi::INT,
-    fd2: crate::rffi::INT,
-) -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    _errno_before(RFFI_SAVE_ERRNO);
-    let __res = unsafe { inheritable_c::rpy_dup2_noninheritable(fd, fd2) };
-    _errno_after(RFFI_SAVE_ERRNO);
-    drop(__guard);
-    __res
+pub fn get_inheritable(fd: crate::rffi::INT) -> Result<bool, i32> {
+    handle_posix_error(unsafe { _c_get_inheritable(fd) } as i64).map(|res| res != 0)
 }
 
 /// `rposix.SetNonInheritableCache`. `cached_inheritable` is `-1` unknown,
@@ -2645,128 +2662,132 @@ impl SetNonInheritableCache {
     }
 }
 
-// `rposix.rpy_cpu_count` / `_cpu_count`. `save_err` stays `RFFI_ERR_NONE`.
-// linux/android: `sysconf(_SC_NPROCESSORS_ONLN)`; dragonfly/openbsd/freebsd/
-// netbsd/macos/ios (`__APPLE__`): `sysctl(CTL_HW, HW_NCPU)`; elsewhere 0.
-#[cfg(unix)]
-unsafe fn rpy_cpu_count() -> libc::c_int {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        return unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as libc::c_int };
-    }
-    #[cfg(any(
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
-    {
-        let mut ncpu: libc::c_int = 0;
-        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_NCPU];
-        let mut len = core::mem::size_of::<libc::c_int>();
-        let rc = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                2,
-                (&mut ncpu as *mut libc::c_int).cast(),
-                &mut len,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 { 0 } else { ncpu }
-    }
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    )))]
-    {
-        0
-    }
-}
-
-// win32: `GetSystemInfo(&sysinfo)`, then `sysinfo.dwNumberOfProcessors`.
+// `rposix.cpucount_eci` / `_cpu_count`. Python picks the source per
+// platform: `win32` vs `startswith(('linux', 'gnu'))` vs else. The else
+// body's `#if`s stay in the C.
 #[cfg(windows)]
-unsafe fn rpy_cpu_count() -> libc::c_int {
-    #[repr(C)]
-    #[allow(non_snake_case)]
-    struct SYSTEM_INFO {
-        wProcessorArchitecture: u16,
-        wReserved: u16,
-        dwPageSize: u32,
-        lpMinimumApplicationAddress: *mut core::ffi::c_void,
-        lpMaximumApplicationAddress: *mut core::ffi::c_void,
-        dwActiveProcessorMask: usize,
-        dwNumberOfProcessors: u32,
-        dwProcessorType: u32,
-        dwAllocationGranularity: u32,
-        wProcessorLevel: u16,
-        wProcessorRevision: u16,
+crate::rffi::external_compilation_info! {
+    const CPU_COUNT_ECI = {
+        includes: ["Windows.h"],
+        separate_module_sources: [r#"
+        RPY_EXTERN int rpy_cpu_count(void) {
+            SYSTEM_INFO sysinfo;
+            GetSystemInfo(&sysinfo);
+            return sysinfo.dwNumberOfProcessors;
+        }
+        "#],
+        post_include_bits: ["RPY_EXTERN int rpy_cpu_count(void);"],
+    };
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+crate::rffi::external_compilation_info! {
+    const CPU_COUNT_ECI = {
+        includes: ["unistd.h"],
+        separate_module_sources: [r#"
+            RPY_EXTERN int rpy_cpu_count(void) {
+                return sysconf(_SC_NPROCESSORS_ONLN);
+            }
+            "#],
+        post_include_bits: ["RPY_EXTERN int rpy_cpu_count(void);"],
+    };
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+crate::rffi::external_compilation_info! {
+    const CPU_COUNT_ECI = {
+        includes: ["sys/types.h", "sys/sysctl.h"],
+        separate_module_sources: [r#"
+            RPY_EXTERN int rpy_cpu_count(void) {
+                int ncpu = 0;
+            #if defined(__DragonFly__) || \
+                defined(__OpenBSD__)   || \
+                defined(__FreeBSD__)   || \
+                defined(__NetBSD__)    || \
+                defined(__APPLE__)
+                int mib[2];
+                size_t len = sizeof(ncpu);
+                mib[0] = CTL_HW;
+                mib[1] = HW_NCPU;
+                if (sysctl(mib, 2, &ncpu, &len, NULL, 0) != 0)
+                    ncpu = 0;
+            #endif
+                return ncpu;
+            }
+            "#],
+        post_include_bits: ["RPY_EXTERN int rpy_cpu_count(void);"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub _cpu_count = "rpy_cpu_count",
+    [],
+    crate::rffi::INT,
+    compilation_info = CPU_COUNT_ECI
+);
+#[cfg(windows)]
+crate::rffi::llexternal!(
+    pub _cpu_count = "rpy_cpu_count",
+    [],
+    crate::rffi::INT,
+    compilation_info = CPU_COUNT_ECI
+);
+
+// `rposix.eci_status_flags`.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const STATUS_FLAGS_ECI = {
+        includes: [
+            "fcntl.h",
+            "unistd.h",
+            "sys/types.h",
+            "sys/stat.h",
+            "dirent.h",
+            "string.h",
+            "signal.h",
+            "stdio.h",
+        ],
+        separate_module_sources: [r#"
+    RPY_EXTERN
+    int rpy_get_status_flags(int fd)
+    {
+        int flags;
+        flags = fcntl(fd, F_GETFL, 0);
+        return flags;
     }
-    unsafe extern "system" {
-        fn GetSystemInfo(lpSystemInfo: *mut SYSTEM_INFO);
+
+    RPY_EXTERN
+    int rpy_set_status_flags(int fd, int flags)
+    {
+        int res;
+        res = fcntl(fd, F_SETFL, flags);
+        return res;
     }
-    let mut sysinfo = core::mem::MaybeUninit::<SYSTEM_INFO>::zeroed();
-    unsafe { GetSystemInfo(sysinfo.as_mut_ptr()) };
-    unsafe { sysinfo.assume_init() }.dwNumberOfProcessors as libc::c_int
-}
-
-/// `rposix._cpu_count`.
-#[cfg(any(unix, windows))]
-#[inline(never)]
-pub unsafe fn _cpu_count() -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    let __res = unsafe { rpy_cpu_count() };
-    drop(__guard);
-    __res
-}
-
-// `rposix.rpy_get_status_flags` / `rpy_set_status_flags`. The wrappers
-// `c_get_status_flags` / `c_set_status_flags` save errno.
-#[cfg(unix)]
-unsafe fn rpy_get_status_flags(fd: libc::c_int) -> libc::c_int {
-    unsafe { libc::fcntl(fd, libc::F_GETFL, 0) }
+    "#],
+        post_include_bits: [
+            "RPY_EXTERN int rpy_get_status_flags(int);",
+            "RPY_EXTERN int rpy_set_status_flags(int, int);",
+        ],
+    };
 }
 
 #[cfg(unix)]
-unsafe fn rpy_set_status_flags(fd: libc::c_int, flags: libc::c_int) -> libc::c_int {
-    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }
-}
-
-/// `rposix.c_get_status_flags`.
+crate::rffi::llexternal!(
+    pub c_get_status_flags = "rpy_get_status_flags",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    save_err = RFFI_SAVE_ERRNO,
+    compilation_info = STATUS_FLAGS_ECI
+);
 #[cfg(unix)]
-#[inline(never)]
-pub unsafe fn c_get_status_flags(fd: crate::rffi::INT) -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    _errno_before(RFFI_SAVE_ERRNO);
-    let __res = unsafe { rpy_get_status_flags(fd) };
-    _errno_after(RFFI_SAVE_ERRNO);
-    drop(__guard);
-    __res
-}
-
-/// `rposix.c_set_status_flags`.
-#[cfg(unix)]
-#[inline(never)]
-pub unsafe fn c_set_status_flags(
-    fd: crate::rffi::INT,
-    flags: crate::rffi::INT,
-) -> crate::rffi::INT {
-    let __guard = majit_gc::gc_sync::before_external_block();
-    _errno_before(RFFI_SAVE_ERRNO);
-    let __res = unsafe { rpy_set_status_flags(fd, flags) };
-    _errno_after(RFFI_SAVE_ERRNO);
-    drop(__guard);
-    __res
-}
+crate::rffi::llexternal!(
+    pub c_set_status_flags = "rpy_set_status_flags",
+    [crate::rffi::INT, crate::rffi::INT],
+    crate::rffi::INT,
+    save_err = RFFI_SAVE_ERRNO,
+    compilation_info = STATUS_FLAGS_ECI
+);
 
 // `rposix.c_pipe2` saves errno where `pipe2` exists. macOS has no `pipe2`.
 #[cfg(any(

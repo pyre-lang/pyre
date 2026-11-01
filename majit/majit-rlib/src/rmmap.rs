@@ -41,7 +41,8 @@ pub const MAP_TPRO: libc::c_int = 0x80000;
 
 pub type Ptr = *mut libc::c_void;
 
-// `rmmap.external('mmap', macro=True)`: on linux32 `mmap` is a macro calling `mmap64`.
+// `rmmap.external('mmap', macro=True)`: on linux32 `mmap` is a macro calling
+// `mmap64`. `rffi.py generate_macro_wrapper` emits `pypy_macro_wrapper_mmap`.
 // `c_mmap` is the unsafe half.
 crate::rffi::llexternal!(
     pub c_mmap = "mmap",
@@ -49,7 +50,7 @@ crate::rffi::llexternal!(
     Ptr,
     compilation_info = ECI,
     save_err = RFFI_SAVE_ERRNO,
-    macro = libc::mmap
+    macro = true
 );
 
 // libc private build-script cfgs (`gnu_time_bits64`, `gnu_file_offset_bits64`,

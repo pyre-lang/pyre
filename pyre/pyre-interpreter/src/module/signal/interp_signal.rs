@@ -1650,7 +1650,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let tid = (unsafe { pyre_object::w_int_get_value(args[0]) }) as u64;
                         let signum = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                         let ret =
-                            unsafe { majit_rlib::rthread::c_pthread_kill(tid as i64, signum) };
+                            unsafe { majit_rlib::rthread::c_pthread_kill(tid as majit_rlib::rffi::SIGNED, signum) };
                         if ret != 0 {
                             // interp_signal.py `pthread_kill` raises
                             // `exception_from_saved_errno`; `RPyThread_kill`

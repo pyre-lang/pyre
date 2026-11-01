@@ -259,13 +259,6 @@ mod tests {
         _nowrapper = true
     );
     llexternal!(
-        gil_probe_macro = "majit_rffi_t1_gil_probe",
-        [],
-        i32,
-        macro = majit_rffi_t1_gil_probe,
-        sandboxsafe = true
-    );
-    llexternal!(
         set_errno_ext = "majit_rffi_t1_set_errno",
         [i32],
         i32,
@@ -303,14 +296,6 @@ mod tests {
         assert_eq!(value, 7);
         assert!(HELD_DURING.load(Ordering::SeqCst));
         assert!(majit_gc::rgil::am_i_holding_the_gil());
-    }
-
-    #[test]
-    fn macro_path_calls_that_function() {
-        let (_lock, _hold) = hold_gil();
-        let value = unsafe { gil_probe_macro() };
-        assert_eq!(value, 7);
-        assert!(HELD_DURING.load(Ordering::SeqCst));
     }
 
     #[test]

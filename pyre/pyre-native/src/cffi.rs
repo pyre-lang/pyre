@@ -4,10 +4,11 @@
 //!
 //! The parser itself is `cffi_backend/src/parse_c_type.c`, taken verbatim from
 //! the same place PyPy takes it (`pypy/module/_cffi_backend/src/`) and compiled
-//! by `build.rs`.  It is the one piece of `_cffi_backend` that is C on both
-//! interpreters: the opcode stream it writes is the format a compiled cffi
-//! extension module embeds, so re-spelling the grammar in another language
-//! would be a second implementation of a wire format rather than a port.
+//! from `PARSE_C_TYPE_ECI` (`parse_c_type.py` `eci`).  It is the one piece of
+//! `_cffi_backend` that is C on both interpreters: the opcode stream it writes
+//! is the format a compiled cffi extension module embeds, so re-spelling the
+//! grammar in another language would be a second implementation of a wire
+//! format rather than a port.
 //!
 //! Every declaration here mirrors `src/parse_c_type.h`.  The layouts are
 //! `#[repr(C)]` because the same structs are read straight out of a loaded
@@ -225,25 +226,57 @@ pub struct ExternPyS {
     pub reserved2: *mut c_void,
 }
 
-// The parser reads `info->ctx` unconditionally — `search_in_typenames` asks
-// for `ctx->num_typenames` before it can conclude there is nothing to search —
-// so a caller hands it a zeroed context, never a null one.  That is what
-// `parse_c_type.py:allocate_ctxobj` builds when it has no source context.
-unsafe extern "C" {
-    pub fn pypy_parse_c_type(info: *mut ParseInfoS, input: *const c_char) -> c_int;
-    pub fn pypy_search_in_globals(
-        ctx: *const TypeContextS,
-        search: *const c_char,
-        search_len: usize,
-    ) -> c_int;
-    pub fn pypy_search_in_struct_unions(
-        ctx: *const TypeContextS,
-        search: *const c_char,
-        search_len: usize,
-    ) -> c_int;
-    pub fn pypy_set_cdl_realize_global_int(target: *mut GlobalS);
-    pub fn pypy_enum_common_types(index: c_int) -> *mut c_char;
+// `parse_c_type.py eci`: `includes`/`pre_include_bits` matter for a generated
+// header; ll2ctypes does not compile them for a `separate_module_files` ECI.
+// `cdir` is added by majit-eci. The parser reads `info->ctx` unconditionally —
+// `search_in_typenames` asks for `ctx->num_typenames` before it can conclude
+// there is nothing to search — so a caller hands it a zeroed context, never a
+// null one.  That is what `parse_c_type.py allocate_ctxobj` builds when it has
+// no source context.
+majit_rlib::rffi::external_compilation_info! {
+    const PARSE_C_TYPE_ECI = {
+        pre_include_bits: ["#define _CFFI_INTERNAL"],
+        includes: ["parse_c_type.h"],
+        include_dirs: ["src/cffi_backend/src"],
+        separate_module_files: ["src/cffi_backend/src/parse_c_type.c"],
+    };
 }
+
+majit_rlib::rffi::llexternal!(
+    pub pypy_parse_c_type = "pypy_parse_c_type",
+    [*mut ParseInfoS, *const c_char],
+    c_int,
+    compilation_info = PARSE_C_TYPE_ECI,
+    _nowrapper = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pypy_search_in_globals = "pypy_search_in_globals",
+    [*const TypeContextS, *const c_char, usize],
+    c_int,
+    compilation_info = PARSE_C_TYPE_ECI,
+    _nowrapper = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pypy_search_in_struct_unions = "pypy_search_in_struct_unions",
+    [*const TypeContextS, *const c_char, usize],
+    c_int,
+    compilation_info = PARSE_C_TYPE_ECI,
+    _nowrapper = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pypy_set_cdl_realize_global_int = "pypy_set_cdl_realize_global_int",
+    [*mut GlobalS],
+    (),
+    compilation_info = PARSE_C_TYPE_ECI,
+    _nowrapper = true
+);
+majit_rlib::rffi::llexternal!(
+    pub pypy_enum_common_types = "pypy_enum_common_types",
+    [c_int],
+    *mut c_char,
+    compilation_info = PARSE_C_TYPE_ECI,
+    _nowrapper = true
+);
 
 /// `FFI_COMPLEXITY_OUTPUT` — the shared scratch the parser writes its opcode
 /// stream into.  One buffer for the whole interpreter, as in

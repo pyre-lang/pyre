@@ -17,7 +17,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = STAT_ECI,
     save_err = crate::rffi::RFFI_SAVE_ERRNO,
-    macro = libc::stat
+    macro = true
 );
 
 crate::rffi::llexternal!(
@@ -26,7 +26,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = STAT_ECI,
     save_err = crate::rffi::RFFI_SAVE_ERRNO,
-    macro = libc::lstat
+    macro = true
 );
 
 crate::rffi::llexternal!(
@@ -35,7 +35,7 @@ crate::rffi::llexternal!(
     crate::rffi::INT,
     compilation_info = STAT_ECI,
     save_err = crate::rffi::RFFI_SAVE_ERRNO,
-    macro = libc::fstat
+    macro = true
 );
 
 /// `rposix_stat.STAT_FIELDS` on unix: the portable 10, then `st_blksize` /

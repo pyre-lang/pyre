@@ -10,23 +10,18 @@ use super::interp_kevent::W_Kevent;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 use pyre_object::PyObjectRef;
 
-/// `interp_kqueue.py` `eci` plus the `fcntl.h` the cloexec fallback needs.
-/// `rposix.rpy_set_inheritable` is a separate C file
-/// (`separate_module_sources`); until that builds, `__new__` uses the fcntl
-/// fallback in that function (`F_GETFD`, then `F_SETFD` with `FD_CLOEXEC`).
+/// `interp_kqueue.py` `eci`.
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 mod ll {
     use majit_rlib::rffi::{INT, RFFI_SAVE_ERRNO};
 
     majit_rlib::rffi::external_compilation_info! {
         const ECI = {
-            includes: ["sys/types.h", "sys/event.h", "sys/time.h", "fcntl.h"],
+            includes: ["sys/types.h", "sys/event.h", "sys/time.h"],
         };
     }
 
-    // `gnu_time_bits64` and `gnu_file_offset_bits64` on `fcntl` name the 32-bit
-    // redirect `__fcntl_time64`. Native targets are 64-bit, so that `link_name`
-    // is not copied. This module is macOS-only; NetBSD `__kevent50` is not.
+    // This module is macOS-only; NetBSD `__kevent50` is not.
     majit_rlib::rffi::llexternal!(
         pub(super) syscall_kqueue = "kqueue",
         [],
@@ -48,31 +43,6 @@ mod ll {
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO
     );
-    // macOS `fcntl` is variadic. `_rsocket_rffi.fcntl` uses `natural_arity = 2`.
-    majit_rlib::rffi::llexternal!(
-        #[cfg_attr(
-            all(target_os = "macos", target_arch = "x86"),
-            link_name = "fcntl$UNIX2003"
-        )]
-        pub(super) c_fcntl = "fcntl",
-        [INT, INT, INT],
-        INT,
-        compilation_info = ECI,
-        natural_arity = 2,
-        save_err = RFFI_SAVE_ERRNO
-    );
-
-    /// `rposix.set_inheritable(fd, False)` via the fcntl fallback.
-    pub(super) fn clear_inheritable(fd: i32) -> Result<(), i32> {
-        let flags = unsafe { c_fcntl(fd, libc::F_GETFD, 0) };
-        if flags < 0 {
-            return Err(majit_rlib::rposix::get_saved_errno());
-        }
-        if unsafe { c_fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            return Err(majit_rlib::rposix::get_saved_errno());
-        }
-        Ok(())
-    }
 
     /// `interp_kqueue.py fill_timespec`: `int(time_float)` and
     /// `int(1e9 * (time_float - sec))`.
@@ -153,7 +123,7 @@ impl W_Kqueue {
                 "kqueue",
             ));
         }
-        if let Err(errno) = ll::clear_inheritable(kqfd) {
+        if let Err(errno) = majit_rlib::rposix::set_inheritable(kqfd, false) {
             return Err(kqueue_oserror(errno, "kqueue"));
         }
         Ok(W_Kqueue::allocate(W_Kqueue {
@@ -344,8 +314,8 @@ mod tests {
             "kqueue errno {}",
             majit_rlib::rposix::get_saved_errno()
         );
-        super::ll::clear_inheritable(fd).expect("cloexec");
-        let flags = unsafe { super::ll::c_fcntl(fd, libc::F_GETFD, 0) };
+        majit_rlib::rposix::set_inheritable(fd, false).expect("cloexec");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert!(flags >= 0, "F_GETFD");
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         unsafe { majit_rlib::_rsocket_rffi::socketclose_no_errno(fd) };

@@ -9,7 +9,7 @@
 use std::mem::size_of;
 use std::sync::OnceLock;
 
-use crate::rffi::{self, INT, RFFI_ALT_ERRNO, RFFI_ERR_ALL, SIZE_T, UINT, VOIDP};
+use crate::rffi::{self, DOUBLE, INT, RFFI_ALT_ERRNO, RFFI_ERR_ALL, SIZE_T, UINT, VOIDP};
 
 pub use libffi_sys::{ffi_abi, ffi_arg, ffi_cif, ffi_closure, ffi_type};
 
@@ -284,35 +284,110 @@ crate::rffi::llexternal!(
     compilation_info = ECI
 );
 
-unsafe extern "C" {
-    fn clibffi_f64_to_longdouble(x: f64, dst: *mut u8);
-    fn clibffi_longdouble_to_f64(src: *const u8) -> f64;
+// `cfield.c g_set` / `g_get` — convert through C `long double` so the
+// buffer width is `sizeof(long double)` on every target.
+crate::rffi::external_compilation_info! {
+    const LONGDOUBLE_ECI = {
+        includes: ["string.h"],
+        separate_module_sources: [
+            r#"RPY_EXTERN void clibffi_f64_to_longdouble(double x, void *dst) {
+    long double y = x;
+    memcpy(dst, &y, sizeof(y));
+}"#,
+            r#"RPY_EXTERN double clibffi_longdouble_to_f64(const void *src) {
+    long double y;
+    memcpy(&y, src, sizeof(y));
+    return (double)y;
+}"#,
+        ],
+    };
+}
+
+crate::rffi::llexternal!(
+    c_f64_to_longdouble = "clibffi_f64_to_longdouble",
+    [DOUBLE, VOIDP],
+    (),
+    sandboxsafe = true,
+    releasegil = false,
+    compilation_info = LONGDOUBLE_ECI
+);
+
+crate::rffi::llexternal!(
+    c_longdouble_to_f64 = "clibffi_longdouble_to_f64",
+    [VOIDP],
+    DOUBLE,
+    sandboxsafe = true,
+    releasegil = false,
+    compilation_info = LONGDOUBLE_ECI
+);
+
+// Return the libffi `ffi_type_complex_*` statics by pointer so `elements`
+// and `type = FFI_TYPE_COMPLEX` survive. Apple's `ffi.h` makes
+// `ffi_type_complex_longdouble` a macro for `ffi_type_complex_double` on
+// non-x86, so naming the symbol from Rust would fail to link.
+#[cfg(not(windows))]
+crate::rffi::external_compilation_info! {
+    const COMPLEX_ECI = {
+        separate_module_sources: [r#"
+#if defined(__APPLE__)
+#include <ffi/ffi.h>
+#else
+#include <ffi.h>
+#endif
+RPY_EXTERN ffi_type *clibffi_type_complex_float(void) { return &ffi_type_complex_float; }
+RPY_EXTERN ffi_type *clibffi_type_complex_double(void) { return &ffi_type_complex_double; }
+RPY_EXTERN ffi_type *clibffi_type_complex_longdouble(void) { return &ffi_type_complex_longdouble; }
+"#],
+    };
 }
 
 #[cfg(not(windows))]
-unsafe extern "C" {
-    fn clibffi_type_complex_float() -> FFI_TYPE_P;
-    fn clibffi_type_complex_double() -> FFI_TYPE_P;
-    fn clibffi_type_complex_longdouble() -> FFI_TYPE_P;
-}
+crate::rffi::llexternal!(
+    c_type_complex_float = "clibffi_type_complex_float",
+    [],
+    FFI_TYPE_P,
+    sandboxsafe = true,
+    releasegil = false,
+    compilation_info = COMPLEX_ECI
+);
+
+#[cfg(not(windows))]
+crate::rffi::llexternal!(
+    c_type_complex_double = "clibffi_type_complex_double",
+    [],
+    FFI_TYPE_P,
+    sandboxsafe = true,
+    releasegil = false,
+    compilation_info = COMPLEX_ECI
+);
+
+#[cfg(not(windows))]
+crate::rffi::llexternal!(
+    c_type_complex_longdouble = "clibffi_type_complex_longdouble",
+    [],
+    FFI_TYPE_P,
+    sandboxsafe = true,
+    releasegil = false,
+    compilation_info = COMPLEX_ECI
+);
 
 /// libffi `ffi_type_complex_float` static (`TABLE_ENTRY` `pffi_type`).
 #[cfg(not(windows))]
 pub fn ffi_type_complex_float() -> FFI_TYPE_P {
-    unsafe { clibffi_type_complex_float() }
+    unsafe { c_type_complex_float() }
 }
 
 /// libffi `ffi_type_complex_double` static (`TABLE_ENTRY` `pffi_type`).
 #[cfg(not(windows))]
 pub fn ffi_type_complex_double() -> FFI_TYPE_P {
-    unsafe { clibffi_type_complex_double() }
+    unsafe { c_type_complex_double() }
 }
 
 /// libffi `ffi_type_complex_longdouble` static. On Apple arm64 this is the
 /// `ffi_type_complex_double` object (`ffi.h` macro alias).
 #[cfg(not(windows))]
 pub fn ffi_type_complex_longdouble() -> FFI_TYPE_P {
-    unsafe { clibffi_type_complex_longdouble() }
+    unsafe { c_type_complex_longdouble() }
 }
 
 /// Width of the immortal `ffi_type_longdouble` record.
@@ -329,7 +404,7 @@ pub fn longdouble_align() -> usize {
 pub fn f64_to_longdouble_bytes(x: f64) -> Vec<u8> {
     let n = longdouble_size();
     let mut buf = vec![0u8; n];
-    unsafe { clibffi_f64_to_longdouble(x, buf.as_mut_ptr()) };
+    unsafe { c_f64_to_longdouble(x, buf.as_mut_ptr() as VOIDP) };
     buf
 }
 
@@ -339,7 +414,7 @@ pub fn longdouble_bytes_to_f64(bytes: &[u8]) -> f64 {
     if bytes.len() < n {
         return 0.0;
     }
-    unsafe { clibffi_longdouble_to_f64(bytes.as_ptr()) }
+    unsafe { c_longdouble_to_f64(bytes.as_ptr() as VOIDP) }
 }
 
 /// `clibffi.LibFFIError`.

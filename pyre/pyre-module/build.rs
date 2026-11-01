@@ -1,9 +1,5 @@
-//! Compile the `_ctypes` SEH fence and, when the host can link it, the
-//! `_minimal_curses` wrappers.
-//!
-//! `__try`/`__except` is the only thing that reaches a structured exception
-//! and no Rust compiler emits one, so the fence a foreign call is made
-//! inside (`src/module/_ctypes/seh.rs`) is a C translation unit of its own.
+//! Compile crate ECIs (`seh.c`, `longdouble.c`) and, when the host can
+//! link it, the `_minimal_curses` wrappers.
 //!
 //! `fficurses.py guess_eci` compiles a probe that references `setupterm`
 //! and keeps the first `ExternalCompilationInfo` that links. The same
@@ -231,27 +227,11 @@ const CURSES_NAMES: &[&str] = &[
     "REPORT_MOUSE_POSITION",
 ];
 
-/// One `ExternalCompilationInfo` from `try_eci`.
-struct Candidate {
-    compile_args: Vec<String>,
-    library_dirs: Vec<String>,
-    libraries: Vec<String>,
-    link_extra: Vec<String>,
-    /// `includes=['ncurses/curses.h', 'ncurses/term.h']`.
-    ncurses_prefix: bool,
-}
-
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(pyre_minimal_curses)");
     println!("cargo:rerun-if-changed=src/module/_minimal_curses/fficurses.c");
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if target.ends_with("-pc-windows-msvc") {
-        println!("cargo:rerun-if-changed=src/module/_ctypes/seh.c");
-        cc::Build::new()
-            .file("src/module/_ctypes/seh.c")
-            .compile("pyre_ctypes_seh");
-    }
+    majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     if curses_probe_enabled() {
         configure_minimal_curses();
     }
@@ -282,18 +262,25 @@ fn out_dir() -> PathBuf {
     PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
 }
 
-fn record_failure(candidate: &Candidate, detail: &[u8]) {
+fn record_failure(eci: &majit_eci::ExternalCompilationInfo, detail: &[u8]) {
     let mut buf = format!(
-        "libs={:?} dirs={:?} prefix={} compile={:?} link_extra={:?}\n",
-        candidate.libraries,
-        candidate.library_dirs,
-        candidate.ncurses_prefix,
-        candidate.compile_args,
-        candidate.link_extra
+        "libs={:?} dirs={:?} includes={:?} compile={:?} link_extra={:?}\n",
+        eci.libraries, eci.library_dirs, eci.includes, eci.compile_extra, eci.link_extra
     )
     .into_bytes();
     buf.extend_from_slice(detail);
     let _ = fs::write(out_dir().join("curses_probe_last_stderr.txt"), buf);
+}
+
+/// `fficurses.py` prefix includes: `ncurses/curses.h` plus
+/// `-DPYRE_CURSES_INCLUDE_NCURSES_PREFIX`, or `curses.h` / `term.h`.
+fn apply_ncurses_prefix(compile_extra: &mut Vec<String>, ncurses_prefix: bool) -> Vec<String> {
+    if ncurses_prefix {
+        compile_extra.push("-DPYRE_CURSES_INCLUDE_NCURSES_PREFIX".to_string());
+        vec!["ncurses/curses.h".into(), "ncurses/term.h".into()]
+    } else {
+        vec!["curses.h".into(), "term.h".into()]
+    }
 }
 
 /// `try_tools` then `try_cflags` × `try_ldflags`. The first candidate
@@ -327,13 +314,13 @@ fn configure_minimal_curses() {
     }
 }
 
-fn config_tool(name: &str) -> Option<Candidate> {
+fn config_tool(name: &str) -> Option<majit_eci::ExternalCompilationInfo> {
     let cflags = command_stdout(name, &["--cflags"])?;
     let libs = command_stdout(name, &["--libs"])?;
     candidate_from_flags(&cflags, &libs, false)
 }
 
-fn pkg_config_ncursesw() -> Option<Candidate> {
+fn pkg_config_ncursesw() -> Option<majit_eci::ExternalCompilationInfo> {
     let exists = Command::new("pkg-config")
         .args(["ncursesw", "--exists"])
         .status()
@@ -356,22 +343,27 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
 
 /// `from_compiler_flags` / `from_linker_flags`. A flag in the wrong
 /// group drops the candidate, as those parsers raise `ValueError`.
-fn candidate_from_flags(cflags: &str, libs: &str, ncurses_prefix: bool) -> Option<Candidate> {
-    let mut compile_args = Vec::new();
+fn candidate_from_flags(
+    cflags: &str,
+    libs: &str,
+    ncurses_prefix: bool,
+) -> Option<majit_eci::ExternalCompilationInfo> {
+    let mut include_dirs = Vec::new();
+    let mut compile_extra = Vec::new();
     for arg in cflags.split_whitespace() {
-        if arg.starts_with("-I") {
-            compile_args.push(arg.to_string());
+        if let Some(dir) = arg.strip_prefix("-I") {
+            include_dirs.push(dir.to_string());
         } else if let Some(macro_def) = arg.strip_prefix("-D") {
             let macro_name = macro_def.split('=').next().unwrap_or(macro_def);
             // `from_compiler_flags` skips `_XOPEN_SOURCE`.
             if macro_name == "_XOPEN_SOURCE" {
                 continue;
             }
-            compile_args.push(arg.to_string());
+            compile_extra.push(arg.to_string());
         } else if arg.starts_with("-L") || arg.starts_with("-l") {
             return None;
         } else {
-            compile_args.push(arg.to_string());
+            compile_extra.push(arg.to_string());
         }
     }
     let mut library_dirs = Vec::new();
@@ -388,20 +380,23 @@ fn candidate_from_flags(cflags: &str, libs: &str, ncurses_prefix: bool) -> Optio
             link_extra.push(arg.to_string());
         }
     }
-    Some(Candidate {
-        compile_args,
+    let includes = apply_ncurses_prefix(&mut compile_extra, ncurses_prefix);
+    Some(majit_eci::ExternalCompilationInfo {
+        include_dirs,
+        compile_extra,
         library_dirs,
         libraries,
         link_extra,
-        ncurses_prefix,
+        includes,
+        ..majit_eci::ExternalCompilationInfo::default()
     })
 }
 
-fn cflags_ldflags_grid() -> Vec<Candidate> {
+fn cflags_ldflags_grid() -> Vec<majit_eci::ExternalCompilationInfo> {
     let cflags: [(Vec<String>, bool); 4] = [
         (Vec::new(), false),
-        (vec!["-I/usr/include/ncurses".to_string()], false),
-        (vec!["-I/usr/include/ncursesw".to_string()], false),
+        (vec!["/usr/include/ncurses".to_string()], false),
+        (vec!["/usr/include/ncursesw".to_string()], false),
         (Vec::new(), true),
     ];
     let ldflags: [(Vec<String>, Vec<String>); 6] = [
@@ -413,51 +408,47 @@ fn cflags_ldflags_grid() -> Vec<Candidate> {
         (vec!["ncursesw".to_string()], vec!["/usr/lib64".to_string()]),
     ];
     let mut out = Vec::new();
-    for (compile_args, ncurses_prefix) in cflags {
+    for (include_dirs, ncurses_prefix) in cflags {
         for (libraries, library_dirs) in &ldflags {
-            out.push(Candidate {
-                compile_args: compile_args.clone(),
+            let mut compile_extra = Vec::new();
+            let includes = apply_ncurses_prefix(&mut compile_extra, ncurses_prefix);
+            out.push(majit_eci::ExternalCompilationInfo {
+                include_dirs: include_dirs.clone(),
+                compile_extra,
                 library_dirs: library_dirs.clone(),
                 libraries: libraries.clone(),
-                link_extra: Vec::new(),
-                ncurses_prefix,
+                includes,
+                ..majit_eci::ExternalCompilationInfo::default()
             });
         }
     }
     out
 }
 
-fn accept(candidate: &Candidate) -> bool {
-    let stdout = match run_probe(candidate) {
+fn accept(eci: &majit_eci::ExternalCompilationInfo) -> bool {
+    let stdout = match run_probe(eci) {
         Ok(stdout) => stdout,
         Err(detail) => {
-            record_failure(candidate, &detail);
+            record_failure(eci, &detail);
             return false;
         }
     };
     let Some(body) = constants_body(&stdout) else {
-        record_failure(candidate, stdout.as_bytes());
+        record_failure(eci, stdout.as_bytes());
         return false;
     };
     let path = out_dir().join("curses_ints.c");
     if fs::write(&path, body).is_err() {
         return false;
     }
-    if !compile_wrapper(candidate) {
-        record_failure(candidate, b"fficurses.c failed to compile\n");
+    if !compile_wrapper(eci) {
+        record_failure(eci, b"fficurses.c failed to compile\n");
         return false;
     }
-    for dir in &candidate.library_dirs {
-        println!("cargo:rustc-link-search=native={dir}");
-    }
-    for lib in &candidate.libraries {
-        println!("cargo:rustc-link-lib={lib}");
-    }
+    majit_eci::build::link_eci(eci);
     // `_link_args_from_eci` appends `link_extra` to the final link line.
-    // `rustc-link-arg` reaches this package's tests. Numbered metadata is
-    // what a dependent binary passes to its own link.
-    for (index, extra) in candidate.link_extra.iter().enumerate() {
-        println!("cargo:rustc-link-arg={extra}");
+    // Numbered metadata is what a dependent binary passes to its own link.
+    for (index, extra) in eci.link_extra.iter().enumerate() {
         // `cargo::metadata=KEY=VALUE` is `DEP_PYRE_MINIMAL_CURSES_KEY`.
         println!("cargo::metadata=LINK_ARG_{index}={extra}");
     }
@@ -466,27 +457,27 @@ fn accept(candidate: &Candidate) -> bool {
     true
 }
 
-fn run_probe(candidate: &Candidate) -> Result<String, Vec<u8>> {
+fn run_probe(eci: &majit_eci::ExternalCompilationInfo) -> Result<String, Vec<u8>> {
     let dir = out_dir();
     let src = dir.join("curses_const_probe.c");
     let bin = dir.join("curses_const_probe");
     fs::write(&src, probe_source()).map_err(|err| err.to_string().into_bytes())?;
     let mut cmd = cc::Build::new().get_compiler().to_command();
     cmd.arg("-o").arg(&bin);
-    for arg in &candidate.compile_args {
-        cmd.arg(arg);
+    for dir in &eci.include_dirs {
+        cmd.arg(format!("-I{dir}"));
     }
-    if candidate.ncurses_prefix {
-        cmd.arg("-DPYRE_CURSES_INCLUDE_NCURSES_PREFIX");
-    }
-    cmd.arg(&src);
-    for library_dir in &candidate.library_dirs {
-        cmd.arg(format!("-L{library_dir}"));
-    }
-    for extra in &candidate.link_extra {
+    for extra in &eci.compile_extra {
         cmd.arg(extra);
     }
-    for lib in &candidate.libraries {
+    cmd.arg(&src);
+    for library_dir in &eci.library_dirs {
+        cmd.arg(format!("-L{library_dir}"));
+    }
+    for extra in &eci.link_extra {
+        cmd.arg(extra);
+    }
+    for lib in &eci.libraries {
         cmd.arg(format!("-l{lib}"));
     }
     let compiled = cmd
@@ -641,25 +632,18 @@ fn parse_const_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.to_string()))
 }
 
-fn compile_wrapper(candidate: &Candidate) -> bool {
-    let mut build = cc::Build::new();
-    build.file("src/module/_minimal_curses/fficurses.c");
-    build.file(out_dir().join("curses_ints.c"));
-    if candidate.ncurses_prefix {
-        build.define("PYRE_CURSES_INCLUDE_NCURSES_PREFIX", None);
-    }
-    for arg in &candidate.compile_args {
-        if let Some(dir) = arg.strip_prefix("-I") {
-            build.include(dir);
-        } else if let Some(def) = arg.strip_prefix("-D") {
-            if let Some((key, value)) = def.split_once('=') {
-                build.define(key, value);
-            } else {
-                build.define(def, None);
-            }
-        } else {
-            build.flag(arg);
-        }
-    }
-    build.try_compile("pyre_minimal_curses").is_ok()
+fn compile_wrapper(eci: &majit_eci::ExternalCompilationInfo) -> bool {
+    let ints = out_dir().join("curses_ints.c");
+    let Some(ints) = ints.to_str() else {
+        return false;
+    };
+    let files = majit_eci::ExternalCompilationInfo {
+        separate_module_files: vec![
+            "src/module/_minimal_curses/fficurses.c".into(),
+            ints.to_string(),
+        ],
+        ..majit_eci::ExternalCompilationInfo::default()
+    };
+    let eci = eci.merge(&[&files]);
+    majit_eci::build::compile_eci(&eci, "pyre_minimal_curses").is_ok()
 }

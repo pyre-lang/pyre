@@ -104,6 +104,7 @@ widestring = "1.2"
 
 [build-dependencies]
 cc = "1.2"
+majit-eci = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,10 +1,17 @@
-//! `rffi_platform` probes `clibffi` reads off the target's C compiler.
+//! `rffi_platform` probes `clibffi` and `dup3` (`rposix.py` `HAVE_DUP3`) read
+//! off the target's C compiler, and `majit_eci::build::compile_crate_ecis`
+//! compiles each ECI's C sources (`cbuild.py` `compile_shared_lib`).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    let have_dup3 = have_dup3();
+    majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo {
+        pre_include_bits: vec![format!("#define HAVE_DUP3 {}", have_dup3 as i32)],
+        ..Default::default()
+    });
 
     // `clibffi.py configure_simple_type('ffi_type_longdouble')` reads the
     // symbol's size/alignment/type. libffi defines that symbol only where its
@@ -13,85 +20,13 @@ fn main() {
     // naming the absent symbol is a link error. Ask the target's compiler the
     // same question libffi's configure asked.
     println!("cargo:rustc-check-cfg=cfg(clibffi_longdouble)");
-    if target_has_clibffi() {
-        compile_longdouble_helpers();
-        if !target_is_windows() {
-            compile_complex_type_helpers();
-        }
-        if long_double_is_its_own_type() {
-            println!("cargo:rustc-cfg=clibffi_longdouble");
-        }
+    if target_has_clibffi() && long_double_is_its_own_type() {
+        println!("cargo:rustc-cfg=clibffi_longdouble");
     }
-}
-
-fn target_is_windows() -> bool {
-    std::env::var("CARGO_CFG_WINDOWS").is_ok()
 }
 
 fn target_has_clibffi() -> bool {
     std::env::var("CARGO_CFG_UNIX").is_ok() || std::env::var("CARGO_CFG_WINDOWS").is_ok()
-}
-
-/// `cfield.c g_set` / `g_get` — convert through C `long double` so the
-/// buffer width is `sizeof(long double)` on every target.
-fn compile_longdouble_helpers() {
-    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("ld-helpers");
-    if std::fs::create_dir_all(&out).is_err() {
-        return;
-    }
-    let source = out.join("ld.c");
-    let body = r#"
-#include <string.h>
-void clibffi_f64_to_longdouble(double x, void *dst) {
-    long double y = x;
-    memcpy(dst, &y, sizeof(y));
-}
-double clibffi_longdouble_to_f64(const void *src) {
-    long double y;
-    memcpy(&y, src, sizeof(y));
-    return (double)y;
-}
-"#;
-    if std::fs::write(&source, body).is_err() {
-        return;
-    }
-    cc::Build::new()
-        .file(&source)
-        .out_dir(&out)
-        .warnings(false)
-        .cargo_warnings(false)
-        .compile("clibffi_ld");
-}
-
-/// Return the libffi `ffi_type_complex_*` statics by pointer so `elements`
-/// and `type = FFI_TYPE_COMPLEX` survive. Apple's `ffi.h` makes
-/// `ffi_type_complex_longdouble` a macro for `ffi_type_complex_double` on
-/// non-x86, so naming the symbol from Rust would fail to link.
-fn compile_complex_type_helpers() {
-    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("complex-helpers");
-    if std::fs::create_dir_all(&out).is_err() {
-        return;
-    }
-    let source = out.join("complex.c");
-    let body = r#"
-#if defined(__APPLE__)
-#include <ffi/ffi.h>
-#else
-#include <ffi.h>
-#endif
-ffi_type *clibffi_type_complex_float(void) { return &ffi_type_complex_float; }
-ffi_type *clibffi_type_complex_double(void) { return &ffi_type_complex_double; }
-ffi_type *clibffi_type_complex_longdouble(void) { return &ffi_type_complex_longdouble; }
-"#;
-    if std::fs::write(&source, body).is_err() {
-        return;
-    }
-    cc::Build::new()
-        .file(&source)
-        .out_dir(&out)
-        .warnings(false)
-        .cargo_warnings(false)
-        .compile("clibffi_complex");
 }
 
 /// Whether the target's `long double` is wider than its `double`, which is
@@ -115,5 +50,36 @@ fn long_double_is_its_own_type() -> bool {
         .cargo_metadata(false)
         .cargo_warnings(false)
         .try_compile("clibffi_longdouble_probe")
+        .is_ok()
+}
+
+/// `rposix.py` `HAVE_DUP3 = rffi_platform.Has('dup3')`. Compile-only: an undeclared `dup3` is a
+/// compile error.
+fn have_dup3() -> bool {
+    if std::env::var("CARGO_CFG_UNIX").is_err() {
+        return false;
+    }
+    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("dup3-probe");
+    if std::fs::create_dir_all(&out).is_err() {
+        return false;
+    }
+    let source = out.join("probe.c");
+    let eci = majit_eci::ExternalCompilationInfo {
+        includes: vec!["unistd.h".into(), "fcntl.h".into()],
+        ..Default::default()
+    };
+    let mut body = String::new();
+    eci.write_c_header(&mut body);
+    body.push_str("void *rpy_probe_dup3 = (void *)dup3;\n");
+    if std::fs::write(&source, &body).is_err() {
+        return false;
+    }
+    cc::Build::new()
+        .file(&source)
+        .out_dir(&out)
+        .warnings(false)
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .try_compile("dup3_probe")
         .is_ok()
 }

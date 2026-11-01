@@ -15,6 +15,23 @@
     any(target_os = "macos", target_os = "linux")
 ))]
 
+// `api.py build_eci`: the variadic C-API entry points are C translation units
+// (no Rust body walks a `va_list`); `pyrex`'s build script exports the symbols
+// an extension resolves against.
+majit_rlib::rffi::external_compilation_info! {
+    pub(crate) const CPYEXT_ECI = {
+        include_dirs: ["../../include/pyre3.15t"],
+        separate_module_files: [
+            "src/cpyext/src/abstract.c",
+            "src/cpyext/src/getargs.c",
+            "src/cpyext/src/modsupport.c",
+            "src/cpyext/src/mysnprintf.c",
+            "src/cpyext/src/pyerrors.c",
+            "src/cpyext/src/unicodeobject.c",
+        ],
+    };
+}
+
 mod address_table;
 pub mod buffer;
 pub mod bytearrayobject;

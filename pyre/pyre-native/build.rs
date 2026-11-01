@@ -1,5 +1,7 @@
 //! Build native-only library assets outside `pyre-interpreter`.
+//! `compile_crate_ecis` compiles `_cffi_backend` `parse_c_type.py`'s ECI.
 
+#[cfg(feature = "wasm_vfs")]
 use std::path::Path;
 
 /// Pure-Python files for the browser VFS.  Seeded from the modules a
@@ -120,41 +122,11 @@ const STDLIB_CLOSURE: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if !target.starts_with("wasm32-") && std::env::var_os("CARGO_FEATURE_SANDBOX").is_none() {
-        build_cffi_parser();
-    }
+    majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     #[cfg(feature = "wasm_vfs")]
     if std::env::var_os("CARGO_FEATURE_WASM_VFS").is_some() {
         build_stdlib_vfs();
     }
-}
-
-fn build_cffi_parser() {
-    // PyPy `parse_c_type.py` compiles this exact translation unit: the opcode
-    // stream is the ABI consumed by CFFI extension metadata, not interpreter
-    // behavior. `longdouble.c` likewise asks the target C compiler about the
-    // representation Rust must not guess.
-    let root = Path::new("src/cffi_backend");
-    let sources = [
-        "src/cffi_backend/src/parse_c_type.c",
-        "src/cffi_backend/src/longdouble.c",
-    ];
-    for source in sources {
-        println!("cargo:rerun-if-changed={source}");
-    }
-    for header in [
-        "src/precommondefs.h",
-        "src/parse_c_type.h",
-        "src/commontypes.c",
-    ] {
-        println!("cargo:rerun-if-changed={}", root.join(header).display());
-    }
-    cc::Build::new()
-        .files(sources)
-        .include(root)
-        .warnings(false)
-        .compile("pyre_cffi_parse_c_type");
 }
 
 /// Pack the browser wasm stdlib closure beside the native decoder that owns

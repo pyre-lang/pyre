@@ -6,8 +6,7 @@
 //! `c_dup_noninheritable` / `c_dup2_noninheritable` (no Windows `rposix.c_dup`
 //! / `c_dup2` yet), and the `winhelpers.c` externals (`os_readlink_impl`,
 //! `os_symlink_impl`, `os_unlink_impl`, `os_createdirectory_impl`,
-//! `os_removedirectory_impl`): `eci.separate_module_files` needs a C build
-//! step `external_compilation_info!` refuses.
+//! `os_removedirectory_impl`): `eci.separate_module_files` are not ported yet.
 
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 

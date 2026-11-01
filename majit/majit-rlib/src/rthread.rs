@@ -134,22 +134,26 @@ pub fn get_ident() -> i64 {
     threadlocalref_get_int(TLFIELD_THREAD_IDENT_OFS, true)
 }
 
-/// `RPyThread_kill` (`thread_pthread.c`).
+// `thread_pthread.c RPyThread_kill`. `rthread.llexternal` defaults to
+// `sandboxsafe=True`.
 #[cfg(unix)]
-unsafe fn rpythread_kill(id: i64, signal: crate::rffi::INT) -> crate::rffi::INT {
-    unsafe { libc::pthread_kill(id as libc::pthread_t, signal) }
+crate::rffi::external_compilation_info! {
+    const THREAD_KILL_ECI = {
+        includes: ["pthread.h", "signal.h"],
+        separate_module_sources: [
+            "RPY_EXTERN int RPyThread_kill(Signed id, int signal) { return pthread_kill((pthread_t)id, signal); }",
+        ],
+    };
 }
 
-// `rthread.c_pthread_kill`. `rthread.llexternal` defaults to
-// `sandboxsafe=True`.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_pthread_kill = "RPyThread_kill",
-    [i64, crate::rffi::INT],
+    [crate::rffi::SIGNED, crate::rffi::INT],
     crate::rffi::INT,
+    compilation_info = THREAD_KILL_ECI,
     sandboxsafe = true,
-    save_err = crate::rffi::RFFI_SAVE_ERRNO,
-    macro = rpythread_kill
+    save_err = crate::rffi::RFFI_SAVE_ERRNO
 );
 
 /// `ThreadLocalField.getraw()` for an `rffi.INT` field.

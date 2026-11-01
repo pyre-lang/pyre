@@ -34,6 +34,7 @@ mod sandbox_replace;
 mod virtualizable;
 
 /// `llexternal` (`rffi.py`): funcptr, `ccall_<name>`, and the forwarding wrapper.
+/// `macro = true` or `macro = "NAME"` is `rffi.py generate_macro_wrapper`.
 #[proc_macro]
 pub fn llexternal(input: TokenStream) -> TokenStream {
     match rffi_expand::expand_llexternal(input.into()) {
@@ -43,9 +44,8 @@ pub fn llexternal(input: TokenStream) -> TokenStream {
 }
 
 /// `ExternalCompilationInfo` (`cbuild.py`) plus the link directives genc hands
-/// to the linker. Non-empty `library_dirs`, `link_extra`,
-/// `separate_module_sources`, `separate_module_files`, and `compile_extra`
-/// are a compile error.
+/// to the linker. C sources are compiled by `majit_eci::build::compile_crate_ecis`,
+/// which the crate's build.rs runs.
 #[proc_macro]
 pub fn external_compilation_info(input: TokenStream) -> TokenStream {
     match rffi_expand::expand_external_compilation_info(input.into()) {

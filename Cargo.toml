@@ -19,6 +19,7 @@ members = [
     "majit/majit-backend-wasm-host",
     "majit/majit-gc",
     "majit/majit-macros",
+    "majit/majit-eci",
     "majit/majit-metainterp",
     "majit/majit-rlib",
     "majit/majit-translate",
@@ -156,6 +157,7 @@ majit-backend-dynasm = { version = "0.0.2", path = "majit/majit-backend-dynasm" 
 majit-backend-wasm-host = { version = "0.0.2", path = "majit/majit-backend-wasm-host" }
 majit-gc = { version = "0.0.2", path = "majit/majit-gc" }
 majit-macros = { version = "0.0.2", path = "majit/majit-macros" }
+majit-eci = { version = "0.0.2", path = "majit/majit-eci" }
 majit-rlib = { version = "0.0.2", path = "majit/majit-rlib" }
 majit-translate = { version = "0.0.2", path = "majit/majit-translate" }
 majit-jitcode = { version = "0.0.2", path = "majit/majit-jitcode" }

@@ -85,20 +85,15 @@ mod posix {
         save_err = RFFI_SAVE_ERRNO
     );
 
-    // `external_c` `FD_CLR` / `FD_ISSET` / `FD_SET` / `FD_ZERO` is `macro=True`.
-    // `libc`'s `FD_ISSET` returns `bool`; upstream's result is `rffi.INT`.
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-    unsafe fn fd_isset(fd: INT, set: fd_set) -> INT {
-        unsafe { libc::FD_ISSET(fd, set) as INT }
-    }
-
+    // `external_c` `FD_CLR` / `FD_ISSET` / `FD_SET` / `FD_ZERO` is `macro=True`
+    // (`rffi.py generate_macro_wrapper`).
     crate::rffi::llexternal!(
         pub FD_CLR = "FD_CLR",
         [INT, fd_set],
         (),
         compilation_info = ECI,
         calling_conv = "c",
-        macro = libc::FD_CLR
+        macro = true
     );
     crate::rffi::llexternal!(
         pub FD_ISSET = "FD_ISSET",
@@ -106,7 +101,7 @@ mod posix {
         INT,
         compilation_info = ECI,
         calling_conv = "c",
-        macro = fd_isset
+        macro = true
     );
     crate::rffi::llexternal!(
         pub FD_SET = "FD_SET",
@@ -114,7 +109,7 @@ mod posix {
         (),
         compilation_info = ECI,
         calling_conv = "c",
-        macro = libc::FD_SET
+        macro = true
     );
     crate::rffi::llexternal!(
         pub FD_ZERO = "FD_ZERO",
@@ -122,7 +117,7 @@ mod posix {
         (),
         compilation_info = ECI,
         calling_conv = "c",
-        macro = libc::FD_ZERO
+        macro = true
     );
 
     // `socketclose_no_errno`: `close`, `releasegil=False`, no `save_err`.
@@ -274,39 +269,76 @@ mod posix {
         save_err = RFFI_SAVE_ERRNO
     );
     // `htons` / `ntohs` / `htonl` / `ntohl` (`releasegil=False`). Darwin and
-    // OpenBSD publish these as macros; the libc crate exposes the same
-    // functions on every unix target.
+    // OpenBSD publish these as macros (`macro = true`; `rffi.py
+    // generate_macro_wrapper` emits `pypy_macro_wrapper_{htons,ntohs,htonl,ntohl}`);
+    // other POSIX hosts declare them as functions (`external` without `macro`).
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub htons = "htons",
         [USHORT],
         USHORT,
         compilation_info = ECI,
         releasegil = false,
-        macro = libc::htons
+        macro = true
     );
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub ntohs = "ntohs",
         [USHORT],
         USHORT,
         compilation_info = ECI,
         releasegil = false,
-        macro = libc::ntohs
+        macro = true
     );
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub htonl = "htonl",
         [UINT],
         UINT,
         compilation_info = ECI,
         releasegil = false,
-        macro = libc::htonl
+        macro = true
     );
+    #[cfg(any(target_os = "macos", target_os = "openbsd"))]
     crate::rffi::llexternal!(
         pub ntohl = "ntohl",
         [UINT],
         UINT,
         compilation_info = ECI,
         releasegil = false,
-        macro = libc::ntohl
+        macro = true
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub htons = "htons",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub ntohs = "ntohs",
+        [USHORT],
+        USHORT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub htonl = "htonl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        releasegil = false
+    );
+    #[cfg(not(any(target_os = "macos", target_os = "openbsd")))]
+    crate::rffi::llexternal!(
+        pub ntohl = "ntohl",
+        [UINT],
+        UINT,
+        compilation_info = ECI,
+        releasegil = false
     );
     crate::rffi::llexternal!(
         #[cfg_attr(target_os = "espidf", link_name = "lwip_setsockopt")]
@@ -823,8 +855,11 @@ mod winsock {
 
     pub type fd_set_p = *mut fd_set;
 
+    // `FD_SETSIZE` is defined before WinSock so the `FD_*` macro wrappers use the same 512-entry
+    // `fd_set` as `FD_SETSIZE` below.
     crate::rffi::external_compilation_info! {
         const ECI = {
+            pre_include_bits: ["#define FD_SETSIZE 512"],
             includes: ["winsock2.h", "ws2tcpip.h"],
             libraries: ["ws2_32"],
         };
@@ -846,69 +881,16 @@ mod winsock {
         crate::rwin32::GetLastError_saved() as i32
     }
 
-    // `winsock2.h` spells `FD_ISSET` as this call.
-    crate::rffi::llexternal!(
-        __WSAFDIsSet = "__WSAFDIsSet",
-        [usize, fd_set_p],
-        INT,
-        compilation_info = ECI,
-        calling_conv = "win",
-        _nowrapper = true
-    );
-
-    // `external_c` `FD_ZERO` / `FD_SET` / `FD_ISSET` / `FD_CLR` is `macro=True`.
-    // The bodies match
-    // the WinSock headers: scan `fd_array`, append under `FD_SETSIZE`.
-    // `FD_*` take `rffi.INT` on Windows too (`external_c`). The WinSock
-    // array stores `SOCKET` (`uintptr`), so the body sign-extends that int.
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-    unsafe fn fd_zero(set: fd_set_p) {
-        unsafe { (*set).fd_count = 0 };
-    }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-    unsafe fn fd_set_insert(fd: INT, set: fd_set_p) {
-        let fd = fd as usize;
-        unsafe {
-            let count = (*set).fd_count as usize;
-            for slot in 0..count {
-                if (*set).fd_array[slot] == fd {
-                    return;
-                }
-            }
-            if count < FD_SETSIZE {
-                (*set).fd_array[count] = fd;
-                (*set).fd_count += 1;
-            }
-        }
-    }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-    unsafe fn fd_isset(fd: INT, set: fd_set_p) -> INT {
-        unsafe { __WSAFDIsSet(fd as usize, set) }
-    }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-    unsafe fn fd_clr(fd: INT, set: fd_set_p) {
-        let fd = fd as usize;
-        unsafe {
-            let count = (*set).fd_count as usize;
-            let mut kept = 0usize;
-            for slot in 0..count {
-                let cur = (*set).fd_array[slot];
-                if cur != fd {
-                    (*set).fd_array[kept] = cur;
-                    kept += 1;
-                }
-            }
-            (*set).fd_count = kept as u32;
-        }
-    }
-
+    // `external_c` `FD_ZERO` / `FD_SET` / `FD_ISSET` / `FD_CLR` is `macro=True`
+    // (`rffi.py generate_macro_wrapper`). `winsock2.h` spells `FD_ISSET` as
+    // `__WSAFDIsSet`; the wrapper calls the macro.
     crate::rffi::llexternal!(
         pub FD_ZERO = "FD_ZERO",
         [fd_set_p],
         (),
         compilation_info = ECI,
         calling_conv = "c",
-        macro = fd_zero
+        macro = true
     );
     crate::rffi::llexternal!(
         pub FD_SET = "FD_SET",
@@ -916,7 +898,7 @@ mod winsock {
         (),
         compilation_info = ECI,
         calling_conv = "c",
-        macro = fd_set_insert
+        macro = true
     );
     crate::rffi::llexternal!(
         pub FD_ISSET = "FD_ISSET",
@@ -924,7 +906,7 @@ mod winsock {
         INT,
         compilation_info = ECI,
         calling_conv = "c",
-        macro = fd_isset
+        macro = true
     );
     crate::rffi::llexternal!(
         pub FD_CLR = "FD_CLR",
@@ -932,7 +914,7 @@ mod winsock {
         (),
         compilation_info = ECI,
         calling_conv = "c",
-        macro = fd_clr
+        macro = true
     );
 
     // `external('select', ..., save_err=RFFI_SAVE_WSALASTERROR)` with
