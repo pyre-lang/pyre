@@ -1373,7 +1373,8 @@ pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bo
     if alloc_flavor_raw_identity_matches(raw, path) {
         return true;
     }
-    // `MapNode::Terminator` inherits `_alloc_flavor_MapNode`.
+    // An enum variant owner `X::Variant` inherits `_alloc_flavor_` of `X`
+    // (`ClassDesc.get_param` walks the MRO).
     if let Some((enum_owner, _)) = path.rsplit_once("::")
         && !enum_owner.is_empty()
         && alloc_flavor_raw_identity_matches(raw, enum_owner)

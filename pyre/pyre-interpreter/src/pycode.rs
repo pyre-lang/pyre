@@ -724,8 +724,9 @@ pub struct PyCode {
     /// of the map and attr (`mapdict.py CacheEntry` / `_fill_cache`) plus
     /// `version_tag`. A monomorphic re-read skips the type lookup + map
     /// walk. LOAD_METHOD fill additionally stores `w_method`.
-    /// `walk_mapdict_method_cache_gc` strong-traces the WEAKREF structs
-    /// and `w_method`.
+    /// `walk_enrolled_code_roots` (managed wrappers) and
+    /// `walk_mapdict_method_cache_gc` (bootstrap wrappers) strong-trace
+    /// the WEAKREF structs and `w_method`.
     ///
     /// Owned via `Box::into_raw`, sized to `code.names.len()` at construction,
     /// never resized; `null` when `code_ptr` is null or unaligned.
@@ -5474,30 +5475,42 @@ pub unsafe fn w_code_mapdict_caches_set(
     if code.mapdict_caches.is_null() {
         return;
     }
-    let vec = unsafe { &mut *code.mapdict_caches };
+    let vec = unsafe { &*code.mapdict_caches };
+    if nameindex >= vec.len() {
+        return;
+    }
+    // mapdict.py CacheEntry / `_fill_cache`: `map_wref`, `attr_wref`,
+    // and `w_method` are GC fields. A managed wrapper's custom trace
+    // (`walk_enrolled_code_roots`) names them; a bootstrap wrapper is
+    // reached only by `walk_mapdict_method_cache_gc`. Barrier the
+    // PyCode before the store (`transform_generic_set`) and reload the
+    // three words: the barrier is a collection point.
+    if !pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF) {
+        mapdict_method_cache_codes().lock().insert(obj as usize);
+    }
+    let published = publish_code_slot_store_rooting(
+        obj,
+        &[
+            entry.map_wref as PyObjectRef,
+            entry.attr_wref as PyObjectRef,
+            entry.w_method,
+        ],
+    );
+    entry.map_wref = published.get(0) as *mut pyre_object::weakref::Weakref;
+    entry.attr_wref = published.get(1) as *mut pyre_object::weakref::Weakref;
+    entry.w_method = published.get(2);
+    let vec = unsafe { &mut *(*(published.owner() as *const PyCode)).mapdict_caches };
     if let Some(slot) = vec.get_mut(nameindex) {
-        // The LOAD_METHOD fill (mapdict.py:1474) stores a movable
-        // `w_method` reference; register this code object so
-        // `walk_mapdict_method_cache_gc` forwards the slot.
-        if !entry.w_method.is_null() {
-            if !pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF) {
-                mapdict_method_cache_codes().lock().insert(obj as usize);
-            }
-            // The slot is reached only by `walk_mapdict_method_cache_gc`,
-            // skipped on clean minors; record it before the store.
-            let published = publish_code_slot_store_rooting(obj, &[entry.w_method]);
-            entry.w_method = published.get(0);
-        }
         *slot = Some(entry);
     }
 }
 
-/// Code objects whose `_mapdict_caches` hold (or once held) a filled
-/// `w_method` slot.  In PyPy `CacheEntry.w_method` (mapdict.py)
-/// is traced through the GC-managed `PyCode`; a managed wrapper's custom
-/// trace reaches the slot the same way, so only a bootstrap wrapper minted
-/// before the collector exists enters this registry and the extra-root
-/// walker forwards it from here (same family as `walk_method_cache_gc`).
+/// Bootstrap code objects whose `_mapdict_caches` hold CacheEntry GC
+/// fields (`mapdict.py` `CacheEntry.map_wref` / `attr_wref` / `w_method`).
+/// A managed wrapper's custom trace (`walk_enrolled_code_roots`) reaches
+/// those slots, so only a bootstrap wrapper minted before the collector
+/// exists enters this registry and the extra-root walker forwards it
+/// (same family as `walk_method_cache_gc`).
 static MAPDICT_METHOD_CACHE_CODES: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::OnceLock::new();
@@ -5564,6 +5577,17 @@ pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRe
     }
 }
 
+/// mapdict.py `CacheEntry` GC fields hanging off a raw `_mapdict_caches`
+/// Vec: `map_wref`, `attr_wref` (`_fill_cache` `weakref.ref`), `w_method`.
+pub fn walk_one_mapdict_cache_entry(
+    entry: &mut crate::objspace::std::mapdict::MapdictCacheEntry,
+    forward: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    forward(unsafe { &mut *(std::ptr::addr_of_mut!(entry.map_wref) as *mut PyObjectRef) });
+    forward(unsafe { &mut *(std::ptr::addr_of_mut!(entry.attr_wref) as *mut PyObjectRef) });
+    forward(&mut entry.w_method);
+}
+
 /// Forward every filled CacheEntry GC edge during collection
 /// (`mapdict.py CacheEntry`): the WEAKREF structs (`map_wref` /
 /// `attr_wref`) and `w_method`. A dead weakref is a cache miss
@@ -5583,19 +5607,7 @@ pub fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
         let vec = unsafe { &mut *code.mapdict_caches };
         for slot in vec.iter_mut() {
             if let Some(entry) = slot.as_mut() {
-                if !entry.map_wref.is_null() {
-                    forward(unsafe {
-                        &mut *(std::ptr::addr_of_mut!(entry.map_wref) as *mut PyObjectRef)
-                    });
-                }
-                if !entry.attr_wref.is_null() {
-                    forward(unsafe {
-                        &mut *(std::ptr::addr_of_mut!(entry.attr_wref) as *mut PyObjectRef)
-                    });
-                }
-                if !entry.w_method.is_null() {
-                    forward(&mut entry.w_method);
-                }
+                walk_one_mapdict_cache_entry(entry, forward);
             }
         }
     }

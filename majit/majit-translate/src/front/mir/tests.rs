@@ -2746,12 +2746,14 @@ fn identity_registered_gc_ptr_cast_does_not_emit_instance() {
     );
 }
 
-/// `SomePtr.getattr` of a raw-owner GCREF field stays SomePtr
-/// (`lltype.py`). The front end then `cast_base_ptr_to_instance`s onto
-/// the declared class (`CastBasePtrToInstanceEntry`).
+/// The raw-owner recast (`SomePtr.getattr`, `lltype.py`,
+/// `CastBasePtrToInstanceEntry`) applies only to RAW owners, and none
+/// with a GC-pointer field remains in pyre-object. A GC owner's field
+/// is already typed by its declared class (`rclass.py`
+/// `InstanceRepr.getfield`, no `cast_base_ptr_to_instance`).
 #[test]
-fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
-    use crate::model::OpKind;
+fn gc_owner_registered_gc_ptr_field_read_needs_no_cast_instance() {
+    use crate::model::{OpKind, ValueType};
     let graph = lower_object_fn("pyre_object::mapdict::map_terminator_w_cls");
     let ops: Vec<_> = graph
         .blocks
@@ -2759,18 +2761,29 @@ fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
         .flat_map(|block| &block.operations)
         .collect();
     let w_cls = ops.iter().find_map(|op| match &op.kind {
-        OpKind::FieldRead { field, .. } if field.name == "w_cls" => op.result.clone(),
+        OpKind::FieldRead { field, ty, .. } if field.name == "w_cls" => {
+            assert_eq!(
+                field.owner_declared_gc,
+                Some(true),
+                "GC-owner w_cls FieldRead owner_declared_gc; graph={}",
+                graph.dump()
+            );
+            assert!(
+                matches!(ty, ValueType::Ref(_)),
+                "GC-owner w_cls FieldRead is Ref; ty={ty:?} graph={}",
+                graph.dump()
+            );
+            op.result.clone()
+        }
         _ => None,
     });
     let Some(w_cls) = w_cls else {
         panic!("FieldRead w_cls; graph={}", graph.dump());
     };
     assert!(
-        ops.iter().any(|op| {
-            crate::model::cast_instance_of(&op.kind, &w_cls)
-                .is_some_and(|root| root.contains("PyObject"))
-        }),
-        "raw-owner w_cls FieldRead then cast_base_ptr_to_instance; graph={}",
+        ops.iter()
+            .all(|op| crate::model::cast_instance_of(&op.kind, &w_cls).is_none()),
+        "GC-owner w_cls FieldRead is not followed by cast_instance_of; graph={}",
         graph.dump()
     );
 }

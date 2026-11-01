@@ -1813,6 +1813,7 @@ impl<'a> Lowering<'a> {
         let oopspec_fns = OopspecFns::new(oopspec_fn_paths(llbc), program_oopspec);
         let cell_plan = collect_cell_scalar_locals(
             llbc,
+            gc_struct_ids,
             body,
             arg_count,
             &forward_reached,
@@ -1821,6 +1822,7 @@ impl<'a> Lowering<'a> {
         );
         let function_scope_plan = collect_function_scope_spill_cells(
             llbc,
+            gc_struct_ids,
             body,
             arg_count,
             &forward_reached,

@@ -4332,8 +4332,8 @@ impl<'a> Transformer<'a> {
     /// `TYPE.TO._gckind`). `history.getkind` of a raw `Ptr` is `'int'`.
     /// Harvested `_alloc_flavor_ = raw` is the classdesc fact for the
     /// owner; it is the fallback when no `concretetype` cell is present
-    /// and also when the owner itself is raw (`MapNode::Terminator`
-    /// inherits `MapNode`).
+    /// and also when the owner itself is raw (an enum variant owner
+    /// `X::Variant` inherits `X`, `ClassDesc.get_param`).
     fn malloc_result_is_raw_flavored(
         &self,
         result: Option<&crate::flowspace::model::Variable>,

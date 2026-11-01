@@ -863,9 +863,6 @@ impl<'a> Lowering<'a> {
             _ => return None,
         };
         let (_, leaf_name, _, _, _) = self.resolve_adt_field(&inner.ty, leaf_payload)?;
-        if !matches!(leaf_name.as_str(), "block" | "len") {
-            return None;
-        }
         let mut cur = inner;
         loop {
             match &cur.kind {
@@ -874,12 +871,50 @@ impl<'a> Lowering<'a> {
                 }
                 PlaceKind::Projection(nested_base, ProjectionElem::Tagged(v)) => {
                     let nested_payload = v.as_object().and_then(|m| m.get("Field"))?;
-                    let (owner, nested_name, _, owner_id, _) =
+                    let (owner, nested_name, nested_ty, owner_id, _) =
                         self.resolve_adt_field(&nested_base.ty, nested_payload)?;
                     if is_flattened_storage_leaf(&owner, &nested_name, &leaf_name) {
                         return Some((owner, format!("{nested_name}.{leaf_name}"), owner_id));
                     }
-                    return None;
+                    // `heaptracker.py all_fielddescrs` recurses into an
+                    // inlined `lltype.Struct`; `lltype.Struct._note_inlined_into`
+                    // gives the nested field the outer `_gckind`. A first-field
+                    // header (`ob_header` at offset 0) keeps the nested
+                    // `FieldRead` whose base is the outer object. A non-first
+                    // inlined struct must not intern `obj+offset` as a GCREF
+                    // (`jtransform.py rewrite_op_getsubstruct`).
+                    //
+                    // The nested *field's* declared type is the gate. A Deref
+                    // of a pointer field has `inner.ty` of the pointee STRUCT,
+                    // which would flatten `(*obj.field).leaf` into
+                    // `obj.field.leaf`; that second getfield is
+                    // `jtransform.py rewrite_op_getfield` on the loaded
+                    // pointer, not `_note_inlined_into`.
+                    tyref_by_value_struct_decl(
+                        &nested_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )?;
+                    // `all_fielddescrs` walks a GcStruct. An enum variant
+                    // payload (`Result::Err.__pos_0`) is a nested getfield
+                    // on that variant, not an inlined GC substructure.
+                    if tyref_is_enum_free(&nested_base.ty, self.llbc) {
+                        return None;
+                    }
+                    if !owner_id
+                        .as_ref()
+                        .is_some_and(|id| self.gc_struct_ids.contains(id))
+                    {
+                        return None;
+                    }
+                    let nested_off =
+                        self.struct_field_offset_from_payload(&nested_base.ty, nested_payload)?;
+                    if nested_off == 0 {
+                        return None;
+                    }
+                    return Some((owner, format!("{nested_name}.{leaf_name}"), owner_id));
                 }
                 _ => return None,
             }
@@ -1423,9 +1458,24 @@ impl<'a> Lowering<'a> {
                     // An integer newtype (`VersionTag(u64)`) is one word
                     // (`history.getkind`): leaf-copy would GETFIELD
                     // `__pos_0` with that Int as the base.
+                    //
+                    // `lltype.Struct._note_inlined_into` inlines a GcStruct
+                    // only as the first field of another GcStruct;
+                    // `heaptracker.all_fielddescrs` recurses only into
+                    // `lltype.Struct` fields. An enum variant payload is a
+                    // nested getfield of `__pos_0` on that variant, not an
+                    // inlined Struct of the variant owner — the same skip
+                    // `flatten_list_storage_field` takes via
+                    // `tyref_is_enum_free`. `struct_field_offset_from_payload`
+                    // returns None when `variant_idx.is_some()`; that is
+                    // "not an inlined struct field", not a nonzero inlined
+                    // offset for `nest_inline_leaf`.
                     if !store_rstr_attr
                         && !store_list_of_str
                         && !store_raw_owned
+                        && !tyref_is_enum_free(&field_base_ty, self.llbc)
+                        && indexed_field_parts(field_payload)
+                            .is_none_or(|(variant_idx, _)| variant_idx.is_none())
                         && let Some(nested) = tyref_by_value_struct_decl(
                             dest_ty,
                             self.llbc,
@@ -4846,9 +4896,8 @@ impl<'a> Lowering<'a> {
     /// / `*const MapNodeTerminatorView`). `ann_cast_int_to_ptr` returns
     /// `SomePtr(PTRTYPE)`; `SomePtr.getattr` resolves on the example fields.
     /// Decide by GC-ness, not class root: a raw (non-GC) `lltype.Struct` is
-    /// never an instance (`lltype.py` `ann_cast_int_to_ptr`). A GC struct
-    /// stays on [`Self::instance_narrow_for_type`]. `MapNode` is an Enum, so
-    /// `as MapRef` stays 1-arg Opaque.
+    /// never an instance (`lltype.py` `ann_cast_int_to_ptr`). A declared-GC
+    /// ADT stays on [`Self::instance_narrow_for_type`].
     pub(in crate::front::mir) fn dest_overlay_ptr_lltype(
         &self,
         dest_ty: &TyRef,
@@ -9510,7 +9559,7 @@ impl<'a> Lowering<'a> {
         // makes `eq` compare that instance with a `ConstInt` tag
         // (`pair(rtype_eq) not implemented for (InstanceRepr, IntegerRepr)`).
         let (ty, size, signed) = if json_ty_is_copy_scalar(place, self.llbc) {
-            json_ty_raw_store_descr(place, self.llbc)?
+            json_ty_raw_store_descr(place, self.llbc, self.gc_struct_ids)?
         } else {
             fieldless_enum_raw_store_descr(place_ty, self.llbc)?
         };
@@ -10866,11 +10915,12 @@ pub(in crate::front::mir) fn int_binop_needs_ptr_to_int(
         && (matches!(lhs, Some(ValueType::Ref(_))) || matches!(rhs, Some(ValueType::Ref(_))))
 }
 
-/// Overlay field lltype. A raw pointer to a GC struct is GCREF
-/// (`pointer_field_lltype` of a GC pointee). A raw pointer to a non-GC
-/// ADT (`MapRef` / `*const MapNode`) is `_NONGCREF` (`llmemory.py`):
-/// `SomePtr.getattr` then returns `SomePtr`, so a later dest-overlay
-/// recast can `rtype_cast_ptr_to_int` (`rbuiltin.py` requires `PtrRepr`).
+/// Overlay field lltype. A raw pointer to a declared-GC ADT is GCREF
+/// (`pointer_field_lltype` of a GC pointee; `history.getkind` of
+/// `Ptr(TO)` follows `TO._gckind`). A raw pointer to a non-GC ADT is
+/// `_NONGCREF` (`llmemory.py`): `SomePtr.getattr` then returns
+/// `SomePtr`, so a later dest-overlay recast can
+/// `rtype_cast_ptr_to_int` (`rbuiltin.py` requires `PtrRepr`).
 /// `tyref_to_external_lltype` maps every raw pointer to Address (the
 /// residual-call ABI); Address annotates as `SomeAddress` and that
 /// recast Skips. Scalars keep `tyref_to_external_lltype`.

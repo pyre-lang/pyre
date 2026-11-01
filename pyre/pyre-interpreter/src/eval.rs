@@ -611,12 +611,15 @@ pub unsafe fn walk_enrolled_code_roots(
             &mut *(&mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),
         );
-        // mapdict.py CacheEntry.w_method is the cache's sole GC
-        // reference. PyPy traces it as part of the live PyCode; do the same
-        // here now that managed code wrappers reach this direct-field walker.
+        // mapdict.py CacheEntry: `_fill_cache` stores `map_wref` /
+        // `attr_wref` (`weakref.ref`) and `w_method`. The CacheEntry
+        // hangs off `PyCode._mapdict_caches` as a raw Vec, so this
+        // custom trace names those three GC fields.
         if !code.mapdict_caches.is_null() {
             for entry in (&mut *code.mapdict_caches).iter_mut().flatten() {
-                visitor(&mut *(&mut entry.w_method as *mut PyObjectRef as *mut majit_ir::GcRef));
+                crate::pycode::walk_one_mapdict_cache_entry(entry, &mut |slot| {
+                    visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                });
             }
         }
     }

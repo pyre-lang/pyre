@@ -40,7 +40,8 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "mapdict_offset",
     "weakref_offset",
     "user_subclass",
-    "user_base"
+    "user_base",
+    "mapdict_access"
 )]
 pub struct PyType {
     pub subclassrange_min: AtomicI64,
@@ -81,6 +82,11 @@ pub struct PyType {
     /// share that class's typedef and payload layout.  Null for every other
     /// class.
     pub user_base: *const PyType,
+    /// Per-class `MapdictStorageMixin` field accessors
+    /// (`typedef.py` `_getusercls` `import_from_mixin`). Null when the
+    /// class has no mixin, or when a looked-inside match already names
+    /// the carrier.
+    pub mapdict_access: Option<&'static crate::mapdict::MapdictMixinAccess>,
 }
 
 /// Common header for all Python objects.
@@ -200,6 +206,7 @@ const fn new_pytype_kind(
         weakref_offset,
         user_subclass: std::ptr::null(),
         user_base: std::ptr::null(),
+        mapdict_access: None,
     }
 }
 
@@ -256,6 +263,55 @@ pub const fn new_user_pytype_with_lifeline(
     assert!(weakref_offset != 0);
     let mut tp = new_pytype_kind(name, mapdict_offset, weakref_offset);
     tp.user_base = base;
+    tp
+}
+
+/// [`new_pytype_with_mapdict_mixin`] with the generated class's typed
+/// `self.map` / `self.storage` accessors (`import_from_mixin`).
+pub const fn new_pytype_with_mapdict_mixin_access(
+    name: &'static str,
+    mapdict_offset: usize,
+    access: &'static crate::mapdict::MapdictMixinAccess,
+) -> PyType {
+    let mut tp = new_pytype_with_mapdict_mixin(name, mapdict_offset);
+    tp.mapdict_access = Some(access);
+    tp
+}
+
+/// [`new_pytype_with_mapdict_and_weakref`] with typed mixin accessors.
+pub const fn new_pytype_with_mapdict_and_weakref_access(
+    name: &'static str,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+    access: &'static crate::mapdict::MapdictMixinAccess,
+) -> PyType {
+    let mut tp = new_pytype_with_mapdict_and_weakref(name, mapdict_offset, weakref_offset);
+    tp.mapdict_access = Some(access);
+    tp
+}
+
+/// [`new_user_pytype`] with typed mixin accessors.
+pub const fn new_user_pytype_with_access(
+    name: &'static str,
+    base: &'static PyType,
+    mapdict_offset: usize,
+    access: &'static crate::mapdict::MapdictMixinAccess,
+) -> PyType {
+    let mut tp = new_user_pytype(name, base, mapdict_offset);
+    tp.mapdict_access = Some(access);
+    tp
+}
+
+/// [`new_user_pytype_with_lifeline`] with typed mixin accessors.
+pub const fn new_user_pytype_with_lifeline_access(
+    name: &'static str,
+    base: &'static PyType,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+    access: &'static crate::mapdict::MapdictMixinAccess,
+) -> PyType {
+    let mut tp = new_user_pytype_with_lifeline(name, base, mapdict_offset, weakref_offset);
+    tp.mapdict_access = Some(access);
     tp
 }
 

@@ -13050,7 +13050,7 @@ fn walker_guard_class<Sym: WalkSym>(
 /// (`mapdict.py MapdictStorageMixin._get_mapdict_map`) pins both the storage
 /// coordinates and the Python class (`BaseUserClassMapdict.getclass` /
 /// `terminator.w_cls`). Same promote `walker_pin_stamped_instance_class`
-/// emits for a user instance; a later GETFIELD of this descr is a ConstInt.
+/// emits for a user instance; a later GETFIELD of this descr is a ConstPtr.
 fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -13098,16 +13098,15 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // storage access is reused.
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
-    // guard_value(getfield_gc_i(obj, map), C_map): `jit.promote(self.map)`
-    // (`mapdict.py`).  The map nodes are interned + immortal, so the
-    // pointer is a stable identity guarded as an opaque word (object_map_descr
-    // is Int-typed).
+    // guard_value(getfield_gc_r(obj, map), C_map): `jit.promote(self.map)`
+    // (`mapdict.py`).  The map is a GCREF (`MapdictStorageMixin.map`);
+    // `object_map_descr` is Ref-typed and the constant is a ConstPtr.
     //
     // The guard may only be elided when the map read is ALREADY a compile-time
     // constant — i.e. a prior promotion in this trace pinned it via
     // `replace_box`.  It must NOT be elided merely because `box_value(map_op)`
     // reports the concrete map: every traced getfield op carries its live value
-    // (`opimpl_getfield_gc_i` -> `set_opref_concrete`, `history.py`
+    // (`opimpl_getfield_gc_r` -> `set_opref_concrete`, `history.py`
     // FrontendOp), so `box_value == map` holds for the very first read and
     // would drop the guard on the trace's entry.  A trace whose map guard is
     // dropped reads `storage[storageindex]` off any same-class receiver whose
@@ -13119,16 +13118,7 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // `concrete_obj` is a copy; the receiver box is `obj`
     // (`RefFrontendOp` / `getref_base`).
     let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);
-    let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
-        crate::descr::mapdict_map_descr(concrete_obj)
-    });
-    if !map_op.is_constant() {
-        let map_const = ctx.trace_ctx.const_int(map as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(map_op, map_const);
-    }
+    specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map)?;
     Ok(())
 }
 
@@ -13223,7 +13213,7 @@ fn walker_guard_exception_attr_slot<Sym: WalkSym>(
                 w_type,
             )
         {
-            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map as usize)?;
+            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map)?;
         } else {
             let live_w_class = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
@@ -13496,13 +13486,7 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 let map =
                     unsafe { pyre_interpreter::objspace::std::mapdict::instance_map_word(w_value) };
                 if !map.is_null() {
-                    specialize::walker_promote_instance_map(
-                        ctx,
-                        op_pc,
-                        value_const,
-                        w_value,
-                        map as usize,
-                    )?;
+                    specialize::walker_promote_instance_map(ctx, op_pc, value_const, w_value, map)?;
                     return walker_flush_guard_not_invalidated(ctx, op_pc);
                 }
             }
@@ -13630,12 +13614,12 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
 /// reach the gcref table because `OptHeap` consumes `QUASIIMMUT_FIELD` before
 /// the GC rewriter runs, exactly as `walker_pin_namespace_version` relies on.
 ///
-/// Walker `QUASIIMMUT_FIELD` arg0 is the `MapNode` variant payload
-/// (`*const Terminator` / `*const PlainAttribute`) or the standalone
-/// `CachedAttributeHolder`, never the enum start. `MapNode` is `repr(C)`
-/// (tag then payload); descr offsets are `offset_of!` on those structs so
-/// `quasiimmut.py get_current_qmut_instance` (`struct_ptr + mutate offset`)
-/// lands on the mutate word.
+/// Walker `QUASIIMMUT_FIELD` arg0 is the GC object start: a `MapRef`
+/// (`mapdict.py AbstractAttribute`) or a `CachedAttributeHolder`. Inlined
+/// `Terminator` / `PlainAttribute` payloads are not interned; their
+/// descr offsets include `MAP_NODE_TERMINATOR_OFFSET` /
+/// `MAP_NODE_PLAIN_OFFSET` so `quasiimmut.py get_current_qmut_instance`
+/// (`struct_ptr + mutate offset`) lands on the mutate word.
 ///
 /// `walker_flush_guard_not_invalidated` drains a pending flag, so consecutive
 /// markers at one fold site emit exactly one `GUARD_NOT_INVALIDATED`.
@@ -13692,10 +13676,14 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
     op_pc: usize,
     term: *const pyre_interpreter::objspace::std::mapdict::Terminator,
 ) -> Result<(), DispatchError> {
+    if term.is_null() {
+        return Ok(());
+    }
+    let map = (term as usize).wrapping_sub(pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET);
     walker_pin_mapdict_quasi_field(
         ctx,
         op_pc,
-        term as i64,
+        map as i64,
         crate::descr::terminator_allow_unboxing_descr(),
     )
 }
@@ -13918,7 +13906,7 @@ fn walker_pin_instance_w_class<Sym: WalkSym>(
             // and can collect. The ConstPtr is what `push_roots` /
             // `pop_roots` (`shadowstack.py`) forwards.
             let expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
-            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete, map as usize)?;
+            specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete, map)?;
             return Ok(expected);
         }
     }
@@ -14026,13 +14014,7 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
             // and can collect. The ConstPtr is what `push_roots` /
             // `pop_roots` (`shadowstack.py`) forwards.
             let _expected = ctx.trace_ctx.const_ref(expected_typeobj as i64);
-            return specialize::walker_promote_instance_map(
-                ctx,
-                op_pc,
-                obj,
-                concrete,
-                map as usize,
-            );
+            return specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete, map);
         }
     }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,

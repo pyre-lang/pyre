@@ -5545,8 +5545,9 @@ fn dict_strategy_ref_field_descr(field_key: &str) -> DescrRef {
 /// `quasiimmut.py get_mutate_field_name`). The cache_key is the
 /// crate-stripped STRUCT spelling `canonical_struct_name` yields for
 /// `pyre_object::mapdict::<Struct>` (`mapdict::Terminator` and siblings).
-/// Nodes are raw immortal allocations (`lltype.malloc` flavor=`raw`), so
-/// the SizeDescr is headerless and has no vtable.
+/// SizeDescr is headerless (no vtable). `MapNode` / `CachedAttributeHolder`
+/// are GC objects (`mapdict.py AbstractAttribute`); walker pins intern
+/// the object start. `CellFamily` remains a headerless leak.
 fn make_mapdict_quasi_descr_group(
     struct_name: &str,
     cache_path: &str,
@@ -5629,19 +5630,20 @@ fn make_mapdict_quasi_descr_group(
 }
 
 /// `mapdict.py Terminator._immutable_fields_ = ['w_cls', 'allow_unboxing?']`.
-/// Walker `QUASIIMMUT_FIELD` arg0 is `*const Terminator` (the `MapNode`
-/// variant payload after the enum tag); offsets are relative to that
-/// address.
+/// `MapNode` is the GC object (`AbstractAttribute`); the Terminator
+/// payload is inlined (`lltype.Struct._note_inlined_into`). Walker
+/// `QUASIIMMUT_FIELD` arg0 is the node start (`MapRef`); offsets include
+/// `MAP_NODE_TERMINATOR_OFFSET`.
 static TERMINATOR_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
-    use pyre_object::mapdict::Terminator;
+    use pyre_object::mapdict::{MAP_NODE_TERMINATOR_OFFSET, MapNode, Terminator};
     make_mapdict_quasi_descr_group(
         "Terminator",
         "mapdict::Terminator",
-        core::mem::size_of::<Terminator>(),
+        core::mem::size_of::<MapNode>(),
         "allow_unboxing",
-        core::mem::offset_of!(Terminator, allow_unboxing),
+        MAP_NODE_TERMINATOR_OFFSET + core::mem::offset_of!(Terminator, allow_unboxing),
         core::mem::size_of::<std::cell::Cell<bool>>(),
-        core::mem::offset_of!(Terminator, mutate_allow_unboxing),
+        MAP_NODE_TERMINATOR_OFFSET + core::mem::offset_of!(Terminator, mutate_allow_unboxing),
     )
 });
 
@@ -5657,19 +5659,20 @@ pub fn terminator_mutate_allow_unboxing_descr() -> DescrRef {
     terminator_field_descr("mutate_allow_unboxing")
 }
 
-/// `mapdict.py PlainAttribute._immutable_fields_` `ever_mutated?`. Walker
-/// arg0 is `*const PlainAttribute` (variant payload).
+/// `mapdict.py PlainAttribute._immutable_fields_` `ever_mutated?`.
+/// Walker arg0 is the `MapNode` start; offsets include
+/// `MAP_NODE_PLAIN_OFFSET`.
 static PLAIN_ATTRIBUTE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
     LazyLock::new(|| {
-        use pyre_object::mapdict::PlainAttribute;
+        use pyre_object::mapdict::{MAP_NODE_PLAIN_OFFSET, MapNode, PlainAttribute};
         make_mapdict_quasi_descr_group(
             "PlainAttribute",
             "mapdict::PlainAttribute",
-            core::mem::size_of::<PlainAttribute>(),
+            core::mem::size_of::<MapNode>(),
             "ever_mutated",
-            core::mem::offset_of!(PlainAttribute, ever_mutated),
+            MAP_NODE_PLAIN_OFFSET + core::mem::offset_of!(PlainAttribute, ever_mutated),
             core::mem::size_of::<std::cell::Cell<bool>>(),
-            core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
+            MAP_NODE_PLAIN_OFFSET + core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
         )
     });
 
@@ -5725,8 +5728,8 @@ const _: () = assert!(matches!(
 ));
 
 /// `mapdict.py CachedAttributeHolder._immutable_fields_ = ['attr?', 'typ?']`.
-/// The holder is a standalone `repr(C)` struct; walker arg0 is the holder
-/// pointer itself.
+/// `attr` is a GC `PlainAttribute` (`descr.py get_field_descr` FLAG_POINTER).
+/// Walker arg0 is the holder pointer itself.
 static HOLDER_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     use pyre_object::mapdict::CachedAttributeHolder;
@@ -5767,9 +5770,9 @@ static HOLDER_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             "attr",
             attr_offset,
             core::mem::size_of::<usize>(),
-            Type::Int,
+            Type::Ref,
             true,
-            ArrayFlag::Unsigned,
+            ArrayFlag::Pointer,
             0,
         ),
         field(
@@ -6093,16 +6096,6 @@ pub fn property_mutate_fdel_descr() -> DescrRef {
     property_field_descr("mutate_fdel")
 }
 
-/// `MapdictStorageMixin.map` is a GCREF (`mapdict.py`), so
-/// `rewrite.py clear_gc_fields` delayed-zeros it. pyre stores a
-/// `malloc_raw` intern_node address (`intern_node`) in a `Type::Int` word
-/// that MiniMark must not scan; stamp the offset so the birth zero still
-/// happens. `instance_walk_boxed_storage` loads the word, and recycled
-/// nursery bytes are a non-null pointer.
-fn stamp_mapdict_map_birth_zero(size_descr: &majit_ir::descr::SimpleSizeDescr, map_offset: usize) {
-    size_descr.set_extra_clear_field_offsets(vec![map_offset]);
-}
-
 /// `W_ObjectObject` SizeDescr group (`objectobject.rs`) — the instance
 /// layout `[ob_type | w_class | map | storage]`.  Built with a parent SizeDescr
 /// (unlike a bare [`make_field_descr`]) so a `getfield_gc` on `map` / `storage`
@@ -6110,9 +6103,9 @@ fn stamp_mapdict_map_birth_zero(size_descr: &majit_ir::descr::SimpleSizeDescr, m
 /// `ensure_ptr_info_arg0` (`optimizer.py`); the LOAD_ATTR fold reads these
 /// fields inline, so they must carry the owning struct's SizeDescr.
 ///
-/// `map` is an opaque `Int` word (interned immortal map nodes — not a GC ref,
-/// stays off `gc_fielddescrs`); `storage` is a `Ref` block pointer (enters
-/// `gc_fielddescrs` so a `setfield_gc` emits the write barrier).
+/// `map` is a GCREF (`MapdictStorageMixin.map`); `clear_gc_fields` zeros
+/// it. `storage` is a `Ref` block pointer (enters `gc_fielddescrs` so a
+/// `setfield_gc` emits the write barrier).
 ///
 /// The inherited header `w_class` is a member of the group — not just the
 /// standalone `w_class_descr` — because the instantiation emit
@@ -6136,14 +6129,10 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
             (
                 "map",
                 core::mem::offset_of!(pyre_object::W_ObjectObject, map),
-                // `map` is a `*const MapNode` erased to an opaque Int word, so
-                // its width is one machine word — 4 bytes on wasm32, 8 on
-                // 64-bit. Hardcoding 8 would read/write past the field on
-                // wasm32, folding the adjacent `storage` pointer into the high
-                // half of a `guard_value(map)` load (and clobbering it on a
-                // `setfield_gc(map)` store).
-                core::mem::size_of::<usize>(),
-                Type::Int,
+                // `map` is a GCREF (`MapdictStorageMixin.map`). Width is one
+                // machine word — 4 bytes on wasm32, 8 on 64-bit.
+                WORD,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -6176,10 +6165,6 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     // (`rewrite.rs` `handle_new_fixedsize` / `SizeDescr.non_moving`), matching
     // HEAD's descr flag.
     group.size_descr.set_non_moving(true);
-    stamp_mapdict_map_birth_zero(
-        &group.size_descr,
-        core::mem::offset_of!(pyre_object::W_ObjectObject, map),
-    );
     group
 });
 
@@ -6211,7 +6196,6 @@ static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
     sd.set_cache_key(cache_key);
     let sd = sd.with_all_fielddescrs(fields);
     sd.set_non_moving(true);
-    stamp_mapdict_map_birth_zero(&sd, core::mem::offset_of!(pyre_object::W_ObjectObject, map));
     let descr = Arc::new(sd) as DescrRef;
     majit_ir::descr_registry::register_keyed_size(
         majit_ir::descr::LLType::Struct(cache_key),
@@ -6264,15 +6248,7 @@ fn build_native_user_mapdict_group_with_parent(
     parent_fields: &[ObjectFieldSpec],
 ) -> PyreObjectDescrGroup {
     let mut fields: Vec<ObjectFieldSpec> = parent_fields.to_vec();
-    fields.push((
-        "map",
-        map_offset,
-        core::mem::size_of::<usize>(),
-        Type::Int,
-        false,
-        false,
-        false,
-    ));
+    fields.push(("map", map_offset, WORD, Type::Ref, false, false, false));
     fields.push((
         "storage",
         storage_offset,
@@ -6312,7 +6288,6 @@ fn build_native_user_mapdict_group_with_parent(
     // cannot alias map and storage through that placeholder.
     map.set_index(tag);
     storage.set_index(tag | 1);
-    stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage],
@@ -6346,15 +6321,7 @@ fn build_native_user_mapdict_group_inlining(
             .all(|fd| { fd.offset() != map_offset && fd.offset() != storage_offset })
     );
     let fields: [ObjectFieldSpec; 2] = [
-        (
-            "map",
-            map_offset,
-            core::mem::size_of::<usize>(),
-            Type::Int,
-            false,
-            false,
-            false,
-        ),
+        ("map", map_offset, WORD, Type::Ref, false, false, false),
         (
             "storage",
             storage_offset,
@@ -6392,7 +6359,6 @@ fn build_native_user_mapdict_group_inlining(
         .clone();
     map.set_index(tag);
     storage.set_index(tag | 1);
-    stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage],
@@ -6424,8 +6390,8 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
             (
                 "map",
                 std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
-                core::mem::size_of::<usize>(),
-                Type::Int,
+                WORD,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -6478,10 +6444,6 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     map.set_index(tag);
     storage.set_index(tag | 1);
     intval.set_index(tag | 2);
-    stamp_mapdict_map_birth_zero(
-        &group.size_descr,
-        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
-    );
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage, intval],
@@ -6553,8 +6515,8 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
             (
                 "map",
                 std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
-                core::mem::size_of::<usize>(),
-                Type::Int,
+                WORD,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -6607,10 +6569,6 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     map.set_index(tag);
     storage.set_index(tag | 1);
     floatval.set_index(tag | 2);
-    stamp_mapdict_map_birth_zero(
-        &group.size_descr,
-        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
-    );
     PyreObjectDescrGroup {
         size_descr: group.size_descr,
         field_descrs: vec![map, storage, floatval],
@@ -7495,13 +7453,11 @@ unsafe fn module_user_layout_mapdict_descr(
 }
 
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
-/// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
-/// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
-/// (`jit.promote(self.map)`, mapdict.py), after which the resolved
-/// `storageindex` is a green constant. The map nodes are interned + immortal,
-/// so the address is a stable identity and the guard need not treat it as a GC
-/// ref — the field is declared `usize` so the translator lowers its reads to
-/// the same `Int` kind rather than the `Ref` a pointer type would imply.
+/// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). A GCREF so
+/// the LOAD_ATTR fast path can `getfield_gc_r` then `guard_value` it to a
+/// `ConstPtr` (`jit.promote(self.map)`, mapdict.py), after which the
+/// resolved `storageindex` is a green constant. `clear_gc_fields` zeros
+/// the field at malloc.
 pub fn object_map_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 0)
 }
@@ -9203,7 +9159,7 @@ fn finish_exception_descr_group(
                 "map",
                 EXC_EXTENDED_USER_MAP_OFFSET,
                 WORD,
-                Type::Int,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -9222,7 +9178,7 @@ fn finish_exception_descr_group(
                 "map",
                 EXC_USER_MAP_OFFSET,
                 WORD,
-                Type::Int,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -9302,14 +9258,6 @@ fn finish_exception_descr_group(
         false,
         &inlined_parent,
     );
-    if user {
-        let map_offset = if extended {
-            EXC_EXTENDED_USER_MAP_OFFSET
-        } else {
-            EXC_USER_MAP_OFFSET
-        };
-        stamp_mapdict_map_birth_zero(&group.size_descr, map_offset);
-    }
     group
 }
 
@@ -11706,20 +11654,15 @@ mod tests {
         user_actual.sort_unstable();
         user_actual.dedup();
         let mut user_expected = W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec();
+        user_expected.push(EXC_USER_MAP_OFFSET);
         user_expected.push(EXC_USER_STORAGE_OFFSET);
         user_expected.push(W_CLASS_OFFSET);
         user_expected.sort_unstable();
         user_expected.dedup();
         assert_eq!(user_actual, user_expected);
         assert!(
-            !user_actual.contains(&EXC_USER_MAP_OFFSET),
-            "map is a malloc_raw intern_node address, not a MiniMark edge"
-        );
-        assert!(
-            user.extra_clear_field_offsets()
-                .contains(&EXC_USER_MAP_OFFSET),
-            "rewrite.py clear_gc_fields delayed-zeros MapdictStorageMixin.map; \
-             the Type::Int intern_node word still needs that birth zero"
+            user.extra_clear_field_offsets().is_empty(),
+            "MapdictStorageMixin.map is a GCREF; clear_gc_fields zeros it"
         );
     }
 
@@ -12218,22 +12161,27 @@ mod tests {
             &str,
             usize,
             usize,
+            Type,
             &'static majit_ir::descr::SimpleDescrGroup,
         )] = &[
             (
                 terminator_allow_unboxing_descr(),
                 terminator_mutate_allow_unboxing_descr(),
                 "allow_unboxing",
-                core::mem::offset_of!(Terminator, allow_unboxing),
+                pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
+                    + core::mem::offset_of!(Terminator, allow_unboxing),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
+                Type::Int,
                 &*TERMINATOR_DESCR_GROUP,
             ),
             (
                 plain_attribute_ever_mutated_descr(),
                 plain_attribute_mutate_ever_mutated_descr(),
                 "ever_mutated",
-                core::mem::offset_of!(PlainAttribute, ever_mutated),
+                pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET
+                    + core::mem::offset_of!(PlainAttribute, ever_mutated),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
+                Type::Int,
                 &*PLAIN_ATTRIBUTE_DESCR_GROUP,
             ),
             (
@@ -12242,6 +12190,7 @@ mod tests {
                 "attr",
                 core::mem::offset_of!(CachedAttributeHolder, attr),
                 core::mem::size_of::<std::cell::Cell<pyre_object::mapdict::MapRef>>(),
+                Type::Ref,
                 &*HOLDER_DESCR_GROUP,
             ),
             (
@@ -12250,10 +12199,11 @@ mod tests {
                 "typ",
                 core::mem::offset_of!(CachedAttributeHolder, typ),
                 core::mem::size_of::<std::cell::Cell<Option<UnboxType>>>(),
+                Type::Int,
                 &*HOLDER_DESCR_GROUP,
             ),
         ];
-        for (field, expected_mutate, key, offset, field_size, group) in cases {
+        for (field, expected_mutate, key, offset, field_size, field_type, group) in cases {
             let mutate = mutate_descr_for_quasi_field(field)
                 .unwrap_or_else(|| panic!("mapdict ? field {key} has mutate_{key}"));
             assert!(
@@ -12281,7 +12231,7 @@ mod tests {
             assert!(!mutate.is_quasi_immutable());
             assert_eq!(field_fd.offset(), *offset);
             assert_eq!(field_fd.field_size(), *field_size);
-            assert_eq!(field_fd.field_type(), Type::Int);
+            assert_eq!(field_fd.field_type(), *field_type);
             assert_eq!(field_fd.field_key(), *key);
             for (i, descr) in group.field_descrs.iter().enumerate() {
                 assert_eq!(descr.index_in_parent(), i, "{}", descr.field_key());
@@ -12312,10 +12262,12 @@ mod tests {
             devolved_dict_terminator: Cell::new(std::ptr::null()),
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         };
+        let node = pyre_object::mapdict::MapNode::Terminator(term);
         let mutate = terminator_mutate_allow_unboxing_descr();
         let off = mutate.as_field_descr().expect("mutate descr").offset();
-        let via = (&term as *const Terminator as *const u8).wrapping_add(off);
-        let direct = &term.mutate_allow_unboxing as *const _ as *const u8;
+        let via = (&node as *const pyre_object::mapdict::MapNode as *const u8).wrapping_add(off);
+        let term = unsafe { (*(&node as *const pyre_object::mapdict::MapNode)).as_terminator() };
+        let direct = std::ptr::addr_of!(term.mutate_allow_unboxing) as *const u8;
         assert_eq!(via, direct);
 
         let plain = PlainAttribute {
@@ -12332,10 +12284,12 @@ mod tests {
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
             unboxed: None,
         };
+        let node = pyre_object::mapdict::MapNode::Plain(plain);
         let mutate = plain_attribute_mutate_ever_mutated_descr();
         let off = mutate.as_field_descr().expect("mutate descr").offset();
-        let via = (&plain as *const PlainAttribute as *const u8).wrapping_add(off);
-        let direct = &plain.mutate_ever_mutated as *const _ as *const u8;
+        let via = (&node as *const pyre_object::mapdict::MapNode as *const u8).wrapping_add(off);
+        let plain = unsafe { (*(&node as *const pyre_object::mapdict::MapNode)).as_plain() };
+        let direct = std::ptr::addr_of!(plain.mutate_ever_mutated) as *const u8;
         assert_eq!(via, direct);
 
         let holder = CachedAttributeHolder {
@@ -15262,7 +15216,8 @@ mod tests {
                     "objspace::std::mapdict::Terminator",
                 ],
                 "allow_unboxing",
-                core::mem::offset_of!(Terminator, allow_unboxing),
+                pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
+                    + core::mem::offset_of!(Terminator, allow_unboxing),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
                 Type::Int,
                 true,
@@ -15275,7 +15230,8 @@ mod tests {
                     "objspace::std::mapdict::Terminator",
                 ],
                 "mutate_allow_unboxing",
-                core::mem::offset_of!(Terminator, mutate_allow_unboxing),
+                pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
+                    + core::mem::offset_of!(Terminator, mutate_allow_unboxing),
                 WORD,
                 Type::Ref,
                 false,
@@ -15287,7 +15243,8 @@ mod tests {
                     "pyre_object::mapdict::PlainAttribute",
                 ],
                 "ever_mutated",
-                core::mem::offset_of!(PlainAttribute, ever_mutated),
+                pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET
+                    + core::mem::offset_of!(PlainAttribute, ever_mutated),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
                 Type::Int,
                 true,
@@ -15299,7 +15256,8 @@ mod tests {
                     "pyre_object::mapdict::PlainAttribute",
                 ],
                 "mutate_ever_mutated",
-                core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
+                pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET
+                    + core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
                 WORD,
                 Type::Ref,
                 false,
@@ -15313,7 +15271,7 @@ mod tests {
                 "attr",
                 core::mem::offset_of!(CachedAttributeHolder, attr),
                 core::mem::size_of::<std::cell::Cell<pyre_object::mapdict::MapRef>>(),
-                Type::Int,
+                Type::Ref,
                 true,
                 holder_attr_descr(),
             ),
@@ -15384,7 +15342,8 @@ mod tests {
         }
 
         let nested = make_descr_from_bh(&BhDescr::Field {
-            offset: core::mem::offset_of!(Terminator, mutate_allow_unboxing),
+            offset: pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
+                + core::mem::offset_of!(Terminator, mutate_allow_unboxing),
             field_size: 2 * WORD,
             field_type: Type::Ref,
             field_flag: ArrayFlag::Struct,

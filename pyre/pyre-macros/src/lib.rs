@@ -1845,6 +1845,8 @@ fn expand_pyre_class(
     let user_descriptor_slice_elem = format_ident!("W_{}_USER_PYRE_CLASS_DESCRIPTOR_SLICE", suffix);
     let user_descriptor_ctor_fn =
         format_ident!("__register_w_{}_user_pyre_class_descriptor", suffix);
+    let mapdict_access_static = format_ident!("W_{}_MAPDICT_ACCESS", suffix);
+    let user_mapdict_access_static = format_ident!("W_{}_USER_MAPDICT_ACCESS", suffix);
     // `user_layout` builds the `_getusercls` typeptr itself and feeds it
     // through the same `from_obj` / `new_pytype_with_user_subclass` path as
     // an explicit `user_subclass` ident.
@@ -1864,6 +1866,14 @@ fn expand_pyre_class(
     // omitted `type_id`, the cell starts unassigned and the legacy
     // const is not emitted — callers must read the cell at runtime via
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
+    let mixin_access_items = if has_mapdict_mixin {
+        quote! {
+            #st_vis static #mapdict_access_static: ::pyre_object::mapdict::MapdictMixinAccess =
+                ::pyre_object::mapdict_mixin_access!(#st_name);
+        }
+    } else {
+        quote! {}
+    };
     let mapdict_adjacency_assert = if has_mapdict_mixin {
         quote! {
             const _: () = {
@@ -1974,16 +1984,18 @@ fn expand_pyre_class(
             ::pyre_object::pyobject::new_pytype_with_user_subclass(#name_lit, &#ident)
         },
         (None, Some(field)) if has_mapdict_mixin => quote! {
-            ::pyre_object::pyobject::new_pytype_with_mapdict_and_weakref(
+            ::pyre_object::pyobject::new_pytype_with_mapdict_and_weakref_access(
                 #name_lit,
                 ::std::mem::offset_of!(#st_name, map),
                 ::std::mem::offset_of!(#st_name, #field),
+                &#mapdict_access_static,
             )
         },
         (None, None) if has_mapdict_mixin => quote! {
-            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin(
+            ::pyre_object::pyobject::new_pytype_with_mapdict_mixin_access(
                 #name_lit,
                 ::std::mem::offset_of!(#st_name, map),
+                &#mapdict_access_static,
             )
         },
         (None, Some(field)) => quote! {
@@ -1998,18 +2010,20 @@ fn expand_pyre_class(
     };
     let user_pytype_init = match &weakref_field {
         Some(field) => quote! {
-            ::pyre_object::pyobject::new_user_pytype_with_lifeline(
+            ::pyre_object::pyobject::new_user_pytype_with_lifeline_access(
                 #name_lit,
                 &#pytype_static,
                 ::std::mem::offset_of!(#user_struct_name, map),
                 ::std::mem::offset_of!(#st_name, #field),
+                &#user_mapdict_access_static,
             )
         },
         None => quote! {
-            ::pyre_object::pyobject::new_user_pytype(
+            ::pyre_object::pyobject::new_user_pytype_with_access(
                 #name_lit,
                 &#pytype_static,
                 ::std::mem::offset_of!(#user_struct_name, map),
+                &#user_mapdict_access_static,
             )
         },
     };
@@ -2078,6 +2092,9 @@ fn expand_pyre_class(
                                 + ::std::mem::size_of::<::pyre_object::mapdict::MapRef>()
                     );
                 };
+
+                #st_vis static #user_mapdict_access_static: ::pyre_object::mapdict::MapdictMixinAccess =
+                    ::pyre_object::mapdict_mixin_access!(#user_struct_name);
 
                 #st_vis static #user_pytype_static: ::pyre_object::PyType =
                     #user_pytype_init;
@@ -2209,6 +2226,8 @@ fn expand_pyre_class(
         #st
 
         #mapdict_adjacency_assert
+
+        #mixin_access_items
 
         #user_layout_items
 

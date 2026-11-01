@@ -10175,10 +10175,14 @@ pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     op_pc: usize,
     plain: *const pyre_interpreter::objspace::std::mapdict::PlainAttribute,
 ) -> Result<(), DispatchError> {
+    if plain.is_null() {
+        return Ok(());
+    }
+    let map = (plain as usize).wrapping_sub(pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET);
     super::walker_pin_mapdict_quasi_field(
         ctx,
         op_pc,
-        plain as i64,
+        map as i64,
         crate::descr::plain_attribute_ever_mutated_descr(),
     )
 }
