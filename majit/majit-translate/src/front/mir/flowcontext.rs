@@ -371,6 +371,8 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     pub(in crate::front::mir) multi_assigned_locals: std::collections::HashSet<usize>,
+    /// Parameter locals the body assigns again. See [`compute_reassigned_param_locals`].
+    pub(in crate::front::mir) reassigned_param_locals: Vec<usize>,
     /// String variables whose Rust source obtained a `&[u8]` through
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
@@ -1517,6 +1519,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
+            reassigned_param_locals: compute_reassigned_param_locals(llbc, body),
             string_byte_view_locals: str_view_locals
                 .iter()
                 .enumerate()

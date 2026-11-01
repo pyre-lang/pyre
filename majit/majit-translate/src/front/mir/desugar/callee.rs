@@ -374,6 +374,23 @@ pub(in crate::front::mir) fn compute_binop_result_locals(
     set
 }
 
+fn for_each_assigned_place(llbc: &Llbc, body: &Unstructured, mut visit: impl FnMut(&Place)) {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
+                visit(place);
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
+            visit(&call.dest);
+        }
+    }
+}
+
 /// MIR locals assigned more than once anywhere in `body` — statement
 /// assigns plus call destinations.  See
 /// [`Lowering::multi_assigned_locals`].
@@ -382,30 +399,41 @@ pub(in crate::front::mir) fn compute_multi_assigned_locals(
     body: &Unstructured,
 ) -> std::collections::HashSet<usize> {
     let mut counts: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
-    let mut bump = |place: &Place| {
+    let bump = |place: &Place| {
         if let PlaceKind::Local(i) = place.kind {
             *counts.entry(i as usize).or_insert(0) += 1;
         }
     };
-    let forward_blocks = forward_reachable_mask(llbc, body);
-    for (bb_idx, bb) in body.body.iter().enumerate() {
-        if !forward_blocks[bb_idx] {
-            continue;
-        }
-        for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
-                bump(place);
-            }
-        }
-        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
-            bump(&call.dest);
-        }
-    }
+    for_each_assigned_place(llbc, body, bump);
     counts
         .into_iter()
         .filter(|(_, c)| *c > 1)
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Parameter locals (`1..=arg_count`) the body assigns again — statement
+/// assigns plus call destinations.  The incoming binding is the
+/// parameter's first definition, so one such assignment gives it two
+/// definitions.  [`Lowering::multi_assigned_locals`] counts only the
+/// assignments the body makes; this list carries the parameter case for
+/// the users that need every definition counted.
+pub(in crate::front::mir) fn compute_reassigned_param_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> Vec<usize> {
+    let arg_count = body.locals.arg_count as usize;
+    let mut out = Vec::new();
+    for_each_assigned_place(llbc, body, |place| {
+        if let PlaceKind::Local(i) = place.kind {
+            let i = i as usize;
+            if (1..=arg_count).contains(&i) && !out.contains(&i) {
+                out.push(i);
+            }
+        }
+    });
+    out.sort_unstable();
+    out
 }
 
 /// The owning type of a functional-concat string builder: `Wtf8Buf` (the

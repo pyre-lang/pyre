@@ -2079,6 +2079,13 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// One reaching definition for the whole body: not assigned twice by the
+    /// body, and not a parameter the body assigns again.
+    fn local_has_one_definition(&self, local: usize) -> bool {
+        !self.multi_assigned_locals.contains(&local)
+            && !self.reassigned_param_locals.contains(&local)
+    }
+
     /// The Acquire load re-reads the borrowed place at the load site. That
     /// equals the Rust reference only when every pointer the place goes
     /// through is fixed between the borrow and the load: single-assigned
@@ -2092,7 +2099,7 @@ impl<'a> Lowering<'a> {
         let Some(local) = arg_locals.first().copied().flatten() else {
             return false;
         };
-        if self.multi_assigned_locals.contains(&local) {
+        if !self.local_has_one_definition(local) {
             return false;
         }
         let Some(place) = self.atomic_ref_place.get(&local) else {
@@ -2104,7 +2111,7 @@ impl<'a> Lowering<'a> {
     fn recorded_place_is_stable(&self, place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Global { .. } => true,
-            PlaceKind::Local(l) => !self.multi_assigned_locals.contains(&(*l as usize)),
+            PlaceKind::Local(l) => self.local_has_one_definition(*l as usize),
             PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
                 if v.as_object().is_some_and(|obj| obj.contains_key("Field")) =>
             {
@@ -2115,7 +2122,7 @@ impl<'a> Lowering<'a> {
                     return false;
                 };
                 let l = *l as usize;
-                if self.multi_assigned_locals.contains(&l) {
+                if !self.local_has_one_definition(l) {
                     return false;
                 }
                 match self.atomic_ref_place.get(&l) {
