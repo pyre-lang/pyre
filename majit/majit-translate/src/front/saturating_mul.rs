@@ -7,10 +7,10 @@
 //! reachable sites (`W_ListObject` / unicode grow, `str::repeat`, buffer
 //! nbytes, `_ast` offsets) are the 8-byte JIT int bank.  Wrapping mul in
 //! that bank plus a high-half test is the overflow check.  `uint_mul_high`
-//! is the high 64 bits of a 64×64 product.  A 4-byte word is not that
-//! bank (`(lo >> 32) | hi` leaves the low product unmasked), so the
-//! rewrite declines and the residual call stays.  The overflow arm yields
-//! the max of the op's `Unsigned` lowleveltype (`unsigned_word_max`).
+//! is the high 64 bits of a 64×64 product.  Signed narrower than 8 is
+//! not that bank (`(lo >> 32) | hi` leaves the low product unmasked), so
+//! the rewrite declines and the residual call stays.  The overflow arm
+//! yields the max of the op's `Unsigned` lowleveltype (`unsigned_word_max`).
 //!
 //! A narrow `u16`/`u32` saturating mul is **not** that test: `u32::MAX *
 //! u32::MAX` fits in a u64, so the high word stays zero and the rewrite would
@@ -44,7 +44,7 @@ pub(crate) fn rewire_saturating_mul_call_sites(
     graph: &mut FunctionGraph,
     result_vars: &[Variable],
 ) -> usize {
-    rewire_saturating_mul_call_sites_for(graph, result_vars, crate::layout::target_word_size())
+    rewire_saturating_mul_call_sites_for(graph, result_vars, crate::layout::target_signed_size())
 }
 
 pub(crate) fn rewire_saturating_mul_call_sites_for(
@@ -76,10 +76,10 @@ fn rewire_one_saturating_mul_site(
     word_bytes: usize,
 ) -> Result<(), String> {
     let name = graph.name.clone();
-    // `uint_mul_high` is bits [64, 128) of a 64×64 product. A narrower
-    // word is not that bank: `(lo >> 32) | hi` still leaves `lo` unmasked,
-    // the same miss as `u32` on an 8-byte target. The capture gate keeps
-    // a 4-byte `usize` residual.
+    // `uint_mul_high` is bits [64, 128) of a 64×64 product. Signed
+    // narrower than 8 is not that bank: `(lo >> 32) | hi` still leaves
+    // `lo` unmasked, the same miss as `u32` on an 8-byte Signed. The
+    // capture gate keeps a 4-byte `usize` residual (`target_word_size`).
     if word_bytes != 8 {
         return Err(format!(
             "{name}: saturating_mul word of {word_bytes} bytes is not the JIT int bank"
@@ -302,8 +302,9 @@ mod tests {
             2,
             "A branches to MAX / product arms"
         );
-        let word_max =
-            crate::front::checked_arith_uint::unsigned_word_max(crate::layout::target_word_size());
+        let word_max = crate::front::checked_arith_uint::unsigned_word_max(
+            crate::layout::target_signed_size(),
+        );
         let maxes = g
             .blocks
             .iter()

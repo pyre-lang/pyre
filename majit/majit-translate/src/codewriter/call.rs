@@ -4069,9 +4069,10 @@ pub struct CallControl {
 
     /// RPython: `symbolic.get_array_token(ARRAY, tsc)[0]` — array base size.
     /// Offset from the array object pointer to the first element.
-    /// RPython GcArray layout: `[length (WORD)] [items...]`, so
-    /// `basesize = carray.items.offset = sizeof(Signed) = WORD`.
-    /// Default: WORD (8 on 64-bit) matching RPython's standard GcArray.
+    /// A Rust GcArray is `[length (usize)] [items...]`, so the header is
+    /// the pointer word. (RPython's length field is `lltype.Signed` and
+    /// `WORD = sizeof(Signed)` there; those stay equal only when Signed
+    /// and the pointer share a width.)
     pub array_header_size: usize,
 
     /// RPython: `symbolic.get_field_token(STRUCT, fieldname, tsc)` / `symbolic.get_size()`.
@@ -4765,8 +4766,8 @@ impl CallControl {
             trait_family_registrations: Vec::new(),
             struct_storage: HashMap::new(),
             exc_pytype_rows: Vec::new(),
-            // RPython: symbolic.get_array_token(GcArray(T))[0] = carray.items.offset
-            // = sizeof(Signed) = WORD. Standard GcArray has a length field before items.
+            // `symbolic.get_array_token(GcArray(T))[0]`: items sit past the
+            // length prefix. Rust's prefix is `usize` (pointer word).
             //
             array_header_size: crate::layout::target_word_size(),
             struct_layouts: Default::default(),
@@ -15411,14 +15412,21 @@ fn effect_value_type_of(var: &crate::flowspace::model::Variable) -> crate::model
 }
 
 /// `lltype.build_number` identity: it caches by the Python integer class,
-/// and on a 64-bit host `rarithmetic.r_longlong is r_int` /
+/// and when `lltype.Signed` is 8 bytes `rarithmetic.r_longlong is r_int` /
 /// `r_ulonglong is r_uint`, so `lltype.SignedLongLong is lltype.Signed`
 /// and `lltype.UnsignedLongLong is lltype.Unsigned`.
 fn array_of_lltype_identity(
     of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    array_of_lltype_identity_for(of, crate::layout::target_signed_size())
+}
+
+fn array_of_lltype_identity_for(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    signed_size: usize,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    if crate::layout::target_word_size() == 8 {
+    if signed_size == 8 {
         match of {
             LowLevelType::SignedLongLong => LowLevelType::Signed,
             LowLevelType::UnsignedLongLong => LowLevelType::Unsigned,
@@ -16505,13 +16513,13 @@ mod tests {
         );
     }
 
-    /// On a 64-bit host `lltype.SignedLongLong is lltype.Signed`, so both
-    /// ARRAY lltypes share `LIST_INT_ITEMS_ARRAY`.
+    /// When Signed is 8 bytes `lltype.SignedLongLong is lltype.Signed`, so
+    /// both ARRAY lltypes share `LIST_INT_ITEMS_ARRAY`.
     #[test]
     fn array_type_id_gc_signed_longlong_is_signed() {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
         use majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
-        assert_eq!(crate::layout::target_word_size(), 8);
+        assert_eq!(crate::layout::target_signed_size(), 8);
         assert_eq!(
             array_type_id_of_lltype(&Array::gc(LowLevelType::Signed)),
             LIST_INT_ITEMS_ARRAY
@@ -16535,6 +16543,29 @@ mod tests {
         assert_eq!(
             array_type_id_of_lltype(&rffi::CArray(LowLevelType::UnsignedLongLong)),
             "Vec<usize>"
+        );
+    }
+
+    /// wasm32 Signed is 8 so longlong collapses; a native 4-byte Signed
+    /// keeps the distinct longlong ARRAY identity.
+    #[test]
+    fn array_of_lltype_identity_follows_signed_size() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        assert_eq!(
+            array_of_lltype_identity_for(&LowLevelType::SignedLongLong, 8),
+            LowLevelType::Signed
+        );
+        assert_eq!(
+            array_of_lltype_identity_for(&LowLevelType::UnsignedLongLong, 8),
+            LowLevelType::Unsigned
+        );
+        assert_eq!(
+            array_of_lltype_identity_for(&LowLevelType::SignedLongLong, 4),
+            LowLevelType::SignedLongLong
+        );
+        assert_eq!(
+            array_of_lltype_identity_for(&LowLevelType::Signed, 4),
+            LowLevelType::Signed
         );
     }
 

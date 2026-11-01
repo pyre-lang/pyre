@@ -2580,7 +2580,7 @@ fn mask_to_i64(low128: u128, word: usize, signed: bool) -> i64 {
 
 /// `lltype.py Number._cast` over an exact integer.
 ///
-/// * `Signed` → `intmask` (wrap to `LONG_BIT` via `layout::target_word_size`)
+/// * `Signed` → `intmask` (wrap to `LONG_BIT` via `layout::target_signed_size`)
 /// * `Unsigned` → `unsigned_int.__new__` / `r_uint` (mask to `LONG_BIT`)
 /// * `SignedLongLong` → `longlongmask` (wrap 64); on a 64-bit host this IS `Signed`
 /// * `UnsignedLongLong` → `unsigned_int.__new__` / `r_ulonglong` (mask 64)
@@ -2599,7 +2599,7 @@ fn number_cast(TGT: &LowLevelType, v: ExactInt) -> Result<LLValue, TaskError> {
             let signed = matches!(TGT, LowLevelType::Signed);
             Ok(LLValue::Int(mask_to_i64(
                 low128,
-                crate::layout::target_word_size(),
+                crate::layout::target_signed_size(),
                 signed,
             )))
         }
@@ -3219,6 +3219,15 @@ mod tests {
     fn fixture_typer() -> Rc<RPythonTyper> {
         let ann = RPythonAnnotator::new(None, None, None, false);
         Rc::new(RPythonTyper::new(&ann))
+    }
+
+    #[test]
+    fn mask_to_i64_follows_signed_width() {
+        // wasm32 Signed is 8; a native 4-byte Signed truncates.
+        assert_eq!(mask_to_i64(0xffff_ffff, 8, true), 0xffff_ffff);
+        assert_eq!(mask_to_i64(0xffff_ffff, 4, true), -1);
+        assert_eq!(mask_to_i64(0x1_0000_0000, 8, false), 0x1_0000_0000);
+        assert_eq!(mask_to_i64(0x1_0000_0000, 4, false), 0);
     }
 
     #[test]

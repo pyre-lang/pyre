@@ -294,11 +294,12 @@ impl Repr for IntegerRepr {
                     | LowLevelType::Unsigned
                     | LowLevelType::SignedLongLong
                     | LowLevelType::UnsignedLongLong => {
-                        // `intmask` / `r_uint` mask to the target word,
-                        // `longlongmask` / `r_ulonglong` to 64 bits.
+                        // `intmask` / `r_uint` mask to `LONG_BIT`
+                        // (`target_signed_size * 8`), `longlongmask` /
+                        // `r_ulonglong` to 64 bits.
                         let bits = match self.lltype {
                             LowLevelType::Signed | LowLevelType::Unsigned => {
-                                crate::layout::target_word_size() as u32 * 8
+                                crate::layout::target_signed_size() as u32 * 8
                             }
                             _ => 64,
                         };

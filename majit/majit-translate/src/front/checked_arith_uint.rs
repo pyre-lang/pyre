@@ -121,14 +121,21 @@ impl UintArith {
 ///
 /// The bank is 8 bytes. `int_add` / `uint_lt` / `uint_mul_high` lower to
 /// the wasm `I64Add` / `I64LtU` / 64×64 high half, with no `intmask`
-/// back to a 4-byte target word (`rarithmetic.intmask` / `r_uint` at
-/// `LONG_BIT`). A 4-byte `usize` is the same width as `u32` and must
-/// keep the residual call. `u64` matches the bank only when the target
-/// word is 8 bytes; on a 4-byte target it is `UnsignedLongLong`
-/// (`unsignedlonglong_repr`, `ullong_*`), not this `uint_*` op.
-pub(crate) fn is_word_sized_uint_atom_for(atom: &str, word_bytes: usize) -> bool {
+/// back to a 4-byte `usize` (`rarithmetic.intmask` / `r_uint` at
+/// `LONG_BIT`). `U64` is a bank op when `lltype.Signed` is 8
+/// (`target_signed_size`). `Usize` is a bank op only when the pointer is
+/// 8 (`target_word_size`). wasm32: Signed 8, pointer 4 → `U64` true,
+/// `Usize` false (same width as `u32`, residual). Native i686: Signed 4
+/// → `U64` is `UnsignedLongLong` (`unsignedlonglong_repr`, `ullong_*`),
+/// not this `uint_*` op.
+pub(crate) fn is_word_sized_uint_atom_for(
+    atom: &str,
+    signed_bytes: usize,
+    pointer_bytes: usize,
+) -> bool {
     match atom {
-        "Usize" | "U64" => word_bytes == 8,
+        "U64" => signed_bytes == 8,
+        "Usize" => pointer_bytes == 8,
         _ => false,
     }
 }
@@ -153,9 +160,9 @@ pub(crate) fn is_jit_bank_int_atom(atom: &str, word_bytes: usize) -> bool {
 
 /// Bit width of a Charon integer atom.
 ///
-/// `Isize` / `Usize` are the target word (`lltype.Signed` /
-/// `lltype.Unsigned`), not [`JIT_BANK_BITS`]. A 4-byte word is 32 bits
-/// so casts and wrapping ops truncate (`jtransform.py` `_int_to_int_cast`).
+/// `Isize` / `Usize` are the pointer width, not [`JIT_BANK_BITS`]. A
+/// 4-byte pointer is 32 bits so casts and wrapping ops truncate
+/// (`jtransform.py` `_int_to_int_cast` when `size2 < sizeof(Signed)`).
 pub(crate) fn literal_int_atom_bits(atom: &str, word_bytes: usize) -> Option<u32> {
     match atom {
         "I8" | "U8" => Some(8),
@@ -304,7 +311,11 @@ pub(crate) fn unsigned_word_max(word_bytes: usize) -> u64 {
 }
 
 pub(crate) fn is_word_sized_uint_atom(atom: &str) -> bool {
-    is_word_sized_uint_atom_for(atom, crate::layout::target_word_size())
+    is_word_sized_uint_atom_for(
+        atom,
+        crate::layout::target_signed_size(),
+        crate::layout::target_word_size(),
+    )
 }
 
 /// Destination `Option<Self>` payload first (covers both-const
@@ -317,6 +328,7 @@ pub(crate) fn unsigned_word_atom<'a>(
     unsigned_word_atom_for(
         dest_payload_atom,
         operand_atoms,
+        crate::layout::target_signed_size(),
         crate::layout::target_word_size(),
     )
 }
@@ -324,10 +336,11 @@ pub(crate) fn unsigned_word_atom<'a>(
 pub(crate) fn unsigned_word_atom_for<'a>(
     dest_payload_atom: Option<&'a str>,
     operand_atoms: impl IntoIterator<Item = Option<&'a str>>,
-    word_bytes: usize,
+    signed_bytes: usize,
+    pointer_bytes: usize,
 ) -> Option<&'a str> {
     let atom = dest_payload_atom.or_else(|| operand_atoms.into_iter().flatten().next())?;
-    is_word_sized_uint_atom_for(atom, word_bytes).then_some(atom)
+    is_word_sized_uint_atom_for(atom, signed_bytes, pointer_bytes).then_some(atom)
 }
 
 fn rewire_one_checked_arith_uint_site(
@@ -536,24 +549,33 @@ mod tests {
         assert!(is_word_sized_uint_atom("Usize"));
         assert_eq!(
             is_word_sized_uint_atom("U64"),
-            crate::layout::target_word_size() == 8
+            crate::layout::target_signed_size() == 8
         );
     }
 
     #[test]
     fn word_sized_uint_follows_unsigned_lowleveltype() {
-        assert!(is_word_sized_uint_atom_for("Usize", 8));
-        assert!(is_word_sized_uint_atom_for("U64", 8));
-        assert!(!is_word_sized_uint_atom_for("U32", 8));
+        assert!(is_word_sized_uint_atom_for("Usize", 8, 8));
+        assert!(is_word_sized_uint_atom_for("U64", 8, 8));
+        assert!(!is_word_sized_uint_atom_for("U32", 8, 8));
         assert!(
-            !is_word_sized_uint_atom_for("Usize", 4),
+            !is_word_sized_uint_atom_for("Usize", 4, 4),
             "4-byte usize is u32-wide; the JIT int bank does not wrap there"
         );
         assert!(
-            !is_word_sized_uint_atom_for("U64", 4),
-            "u64 on a 4-byte target is UnsignedLongLong, not the uint_* word op"
+            !is_word_sized_uint_atom_for("U64", 4, 4),
+            "u64 on a 4-byte Signed is UnsignedLongLong, not the uint_* word op"
         );
-        assert!(!is_word_sized_uint_atom_for("U32", 4));
+        assert!(!is_word_sized_uint_atom_for("U32", 4, 4));
+        // wasm32: Signed 8, pointer 4.
+        assert!(
+            is_word_sized_uint_atom_for("U64", 8, 4),
+            "u64 follows Signed; wasm32 Signed is 8 so it is the uint_* bank op"
+        );
+        assert!(
+            !is_word_sized_uint_atom_for("Usize", 8, 4),
+            "usize follows the pointer; wasm32 pointer is 4 so it stays residual"
+        );
     }
 
     #[test]
@@ -842,15 +864,20 @@ mod tests {
 
     #[test]
     fn four_byte_usize_checked_add_is_not_an_unchecked_bank_op() {
-        assert!(!is_word_sized_uint_atom_for("Usize", 4));
+        assert!(!is_word_sized_uint_atom_for("Usize", 8, 4));
         assert_eq!(
-            unsigned_word_atom_for(Some("Usize"), [None, None], 4),
+            unsigned_word_atom_for(Some("Usize"), [None, None], 8, 4),
             None,
-            "usize::checked_add on a 4-byte word must stay a residual call"
+            "usize::checked_add on a 4-byte pointer must stay a residual call"
         );
         assert_eq!(
-            unsigned_word_atom_for(Some("Usize"), [None, None], 8),
+            unsigned_word_atom_for(Some("Usize"), [None, None], 8, 8),
             Some("Usize")
+        );
+        assert_eq!(
+            unsigned_word_atom_for(Some("U64"), [None, None], 8, 4),
+            Some("U64"),
+            "u64::checked_add on wasm32 (Signed 8, pointer 4) is a bank op"
         );
     }
 
@@ -1117,7 +1144,7 @@ mod tests {
         );
         assert_eq!(
             unsigned_word_atom(Some("U64"), [None, None]).is_some(),
-            crate::layout::target_word_size() == 8
+            crate::layout::target_signed_size() == 8
         );
     }
 

@@ -70,7 +70,7 @@ pub const TWOWAY_TABLE_MASK: i64 = TWOWAY_TABLE_SIZE - 1;
 
 /// `rpython/rlib/rarithmetic.py` `LONG_BIT`, bound as `BLOOM_WIDTH`.
 fn bloom_width() -> i64 {
-    (crate::layout::target_word_size() * 8) as i64
+    (crate::layout::target_signed_size() * 8) as i64
 }
 
 /// Char-width specialisation of one `@specialize.argtype` helper.
@@ -6655,6 +6655,20 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn bloom_width_is_signed_bit_width() {
+        // `rstring.py` `BLOOM_WIDTH = LONG_BIT`.
+        assert_eq!(
+            bloom_width(),
+            crate::layout::target_signed_size() as i64 * 8
+        );
+        assert_eq!(
+            crate::layout::signed_size_for("wasm32", 4) * 8,
+            64,
+            "wasm32 Signed is 8 so BLOOM_WIDTH is 64"
+        );
     }
 
     #[test]

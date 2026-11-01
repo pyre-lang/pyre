@@ -9665,10 +9665,10 @@ mod tests {
     }
 
     #[test]
-    fn lowleveltype_to_concrete_longlong_follows_target_word_size() {
-        // history.py:55-58 — `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed):
+    fn lowleveltype_to_concrete_longlong_follows_target_signed_size() {
+        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed):
         //   if supports_longlong and TYPE is not lltype.LongFloat: return 'float'`
-        let expected = if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
+        let expected = if 8 > crate::layout::target_signed_size() {
             ConcreteType::Float
         } else {
             ConcreteType::Signed

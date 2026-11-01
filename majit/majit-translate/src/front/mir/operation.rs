@@ -1993,7 +1993,7 @@ impl<'a> Lowering<'a> {
                     if let (Some(src), Some(dst)) =
                         (src_int, int_cast_size_and_sign(dest_ty, self.llbc))
                         && let Some(IntToIntCast::And(mask)) =
-                            int_to_int_cast(src, dst, crate::layout::target_word_size() as u64)
+                            int_to_int_cast(src, dst, crate::layout::target_signed_size() as u64)
                     {
                         let bb_id = self.emit_bb(mir_bb);
                         // `and_(r_uint, r_uint)` keeps the Unsigned
@@ -3611,7 +3611,7 @@ impl<'a> Lowering<'a> {
         }
         let target = std::env::var("TARGET").unwrap_or_default();
         let tag = td.layout_for_target(self.llbc, &target)?.tag()?;
-        let word_bits = (crate::layout::target_word_size() * 8) as u32;
+        let word_bits = (crate::layout::target_signed_size() * 8) as u32;
         if tag.bits == 0 || tag.bits > word_bits || tag.bits % 8 != 0 {
             return None;
         }
@@ -8173,8 +8173,8 @@ impl<'a> Lowering<'a> {
     /// Bit width and unsignedness of a literal integer `TyRef`.
     /// `I128` / `U128` stay `None` so the 128-bit carrier is left alone.
     ///
-    /// `Isize` / `Usize` are the target word, not the i64 box. A 4-byte
-    /// word is 32 bits so `as usize` truncates (`jtransform.py`
+    /// `Isize` / `Usize` are the pointer width, not the i64 box. A 4-byte
+    /// pointer is 32 bits so `as usize` truncates (`jtransform.py`
     /// `_int_to_int_cast` when `size2 < sizeof(Signed)`).
     pub(in crate::front::mir) fn literal_int_width(&self, ty: &TyRef) -> Option<(u32, bool)> {
         let word_bytes = crate::layout::target_word_size();
@@ -9604,15 +9604,15 @@ pub(crate) fn lltype_for_direct_ptradd_pointer(
 
 /// Item type whose `llmemory.sizeof` is `n` bytes, so
 /// `rewrite_op_direct_ptradd` can read `TO.OF`.  One byte is `Char`
-/// (`CCHARP` skips the multiply).
+/// (`CCHARP` skips the multiply). `n == sizeof(Signed)` is `Signed`.
 pub(in crate::front::mir) fn item_lltype_for_size(
     n: i64,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArray, LowLevelType};
-    let word = crate::layout::target_word_size() as i64;
+    let signed = crate::layout::target_signed_size() as i64;
     if n == 1 {
         LowLevelType::Char
-    } else if n == word {
+    } else if n == signed {
         LowLevelType::Signed
     } else if n == 4 {
         LowLevelType::UniChar

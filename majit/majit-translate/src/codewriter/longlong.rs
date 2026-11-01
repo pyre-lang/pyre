@@ -7,14 +7,18 @@
 //! public helper names still belong in `codewriter::longlong` so
 //! ports of `jtransform.py` / backend code can refer to the same module
 //! and symbol names.
+//!
+//! `is_64_bit` / `supports_longlong` follow the target's `Signed` width.
 
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
-#[allow(non_upper_case_globals)]
-pub const is_64_bit: bool = cfg!(target_pointer_width = "64");
+pub fn is_64_bit() -> bool {
+    crate::layout::target_signed_size() == 8
+}
 
-#[allow(non_upper_case_globals)]
-pub const supports_longlong: bool = !is_64_bit;
+pub fn supports_longlong() -> bool {
+    !is_64_bit()
+}
 
 #[cfg(target_pointer_width = "64")]
 #[allow(non_camel_case_types)]
@@ -87,7 +91,7 @@ pub fn extract_bits(x: r_float_storage) -> i64 {
 }
 
 pub fn is_longlong(ty: &LowLevelType) -> bool {
-    if is_64_bit {
+    if is_64_bit() {
         false
     } else {
         matches!(
@@ -188,6 +192,8 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn platform_constants_match_longlong_py_branch() {
+        assert!(is_64_bit());
+        assert!(!supports_longlong());
         assert_eq!(FLOATSTORAGE, LowLevelType::Float);
         assert!(!is_longlong(&LowLevelType::SignedLongLong));
         assert_eq!(ZEROF, 0.0);
@@ -196,8 +202,8 @@ mod tests {
     #[test]
     #[cfg(not(target_pointer_width = "64"))]
     fn platform_constants_match_longlong_py_branch() {
-        assert!(!is_64_bit);
-        assert!(supports_longlong);
+        assert!(!is_64_bit());
+        assert!(supports_longlong());
         assert_eq!(FLOATSTORAGE, LowLevelType::SignedLongLong);
         assert!(is_longlong(&LowLevelType::SignedLongLong));
         assert!(is_longlong(&LowLevelType::UnsignedLongLong));

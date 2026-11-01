@@ -38,6 +38,30 @@ pub fn target_word_size() -> usize {
     })
 }
 
+/// Byte width of `lltype.Signed` for `target_arch` (`rffi.sizeof(lltype.Signed)`
+/// / `rarithmetic.LONG_BIT // 8`).
+///
+/// Pointers stay [`target_word_size`]. wasm32 has native i64 ops and pyre's
+/// Python int is `i64`, so Signed is 8 while the pointer is 4. wasm64 is also
+/// 8. A native 32-bit target (i686) keeps Signed equal to `word`. Precedent:
+/// `is_emulated_long` / `_get_long_bit` widen Signed past C `long` on Win64
+/// (the inverse split).
+pub fn signed_size_for(target_arch: &str, word: usize) -> usize {
+    if matches!(target_arch, "wasm32" | "wasm64") {
+        8
+    } else {
+        word
+    }
+}
+
+/// Cached [`signed_size_for`] for the layout target. Arch is
+/// `CARGO_CFG_TARGET_ARCH`, falling back to the host `std::env::consts::ARCH`
+/// (same channel as [`target_arch`]).
+pub fn target_signed_size() -> usize {
+    static SIGNED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIGNED.get_or_init(|| signed_size_for(target_arch(), target_word_size()))
+}
+
 fn host_target_env() -> &'static str {
     if cfg!(target_env = "msvc") {
         "msvc"
@@ -443,5 +467,13 @@ mod tests {
                 .offset,
             0
         );
+    }
+
+    #[test]
+    fn signed_size_for_widens_wasm32_and_follows_word_elsewhere() {
+        assert_eq!(signed_size_for("wasm32", 4), 8);
+        assert_eq!(signed_size_for("x86", 4), 4);
+        assert_eq!(signed_size_for("x86_64", 8), 8);
+        assert_eq!(signed_size_for("aarch64", 8), 8);
     }
 }

@@ -12,6 +12,8 @@ majit-jitcode = { workspace = true }
 majit-gc = { workspace = true }
 indexmap = { workspace = true }
 parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
 
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 libc = { workspace = true }

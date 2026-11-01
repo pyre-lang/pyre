@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use majit_backend::{Backend, JitCellToken};
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
+use majit_ir::forwarding::bound_operand_from_opref as rb;
+use majit_ir::operand::Operand;
 use majit_ir::test_support::{RecordedTrace, Trace};
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef,
@@ -56,8 +58,6 @@ fn make_descr(_index: u32) -> DescrRef {
     majit_backend::make_resume_guard_descr_typed(Vec::new())
 }
 
-use majit_ir::forwarding::bound_operand_from_opref as rb;
-
 /// Stamp the guard's recovery list. `runner_test.py` uses
 /// `op.setfailargs(...)` the same way `compile.py`
 /// `ResumeGuardDescr.store_final_boxes` does after numbering.
@@ -67,7 +67,65 @@ fn set_guard_failargs(trace: &RecordedTrace, guard: OpRef, args: &[OpRef]) {
         .iter()
         .find(|op| op.pos().get() == guard)
         .expect("recorded guard");
-    op.setfailargs(args.iter().copied().map(rb).collect());
+    op.setfailargs(
+        args.iter()
+            .copied()
+            .map(|r| bind_trace_box(trace, r))
+            .collect(),
+    );
+}
+
+fn bind_trace_box(trace: &RecordedTrace, opref: OpRef) -> Operand {
+    if opref.is_none() || opref.is_constant() {
+        return Operand::from_opref(opref);
+    }
+    if matches!(
+        opref,
+        OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_)
+    ) {
+        if let Some(ia) = trace.inputargs.iter().find(|ia| ia.opref() == opref) {
+            return Operand::from_bound_inputarg(ia);
+        }
+    }
+    if let Some(op) = trace.ops.iter().find(|op| op.pos().get() == opref) {
+        return Operand::from_bound_op(op);
+    }
+    Operand::from_opref(opref)
+}
+
+fn rebind_trace_arg_boxes(inputargs: &[InputArgRc], operations: &[OpRc]) {
+    let mut map: Vec<(OpRef, Operand)> = Vec::new();
+    for ia in inputargs {
+        map.push((ia.opref(), Operand::from_bound_inputarg(ia)));
+    }
+    for op in operations {
+        if op.opcode.result_type() != Type::Void {
+            map.push((op.pos().get(), Operand::from_bound_op(op)));
+        }
+    }
+    let lookup = |opref: OpRef| -> Option<Operand> {
+        map.iter()
+            .find(|(k, _)| *k == opref)
+            .map(|(_, v)| v.clone())
+    };
+    for op in operations {
+        for slot in op.args_slice_mut() {
+            if slot.is_constant() || slot.is_none() {
+                continue;
+            }
+            if let Some(mapped) = lookup(slot.to_opref()) {
+                *slot = mapped;
+            }
+        }
+        op.map_failargs_in_place(|slot| {
+            if slot.is_constant() || slot.is_none() {
+                return;
+            }
+            if let Some(mapped) = lookup(slot.to_opref()) {
+                *slot = mapped;
+            }
+        });
+    }
 }
 
 // Test 1: Simple arithmetic (trace -> optimize -> compile -> execute)
@@ -2174,6 +2232,7 @@ fn test_compiled_callee_guard_failure_preserves_fail_args() {
     assign_positions(&mut callee_ops, 0);
     callee_ops[2].setfailargs(vec![rb(OpRef::input_arg_int(0))].into());
     let callee_ops_rc: Vec<OpRc> = callee_ops.into_iter().map(OpRc::new).collect();
+    rebind_trace_arg_boxes(&callee_inputargs, &callee_ops_rc);
 
     let mut backend = CraneliftBackend::new();
 

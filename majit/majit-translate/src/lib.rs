@@ -2935,7 +2935,7 @@ fn analyze_pipeline_from_module_paths(
     policy.state_mut().set_supports_floats(true);
     policy
         .state_mut()
-        .set_supports_longlong(crate::codewriter::longlong::supports_longlong);
+        .set_supports_longlong(crate::codewriter::longlong::supports_longlong());
     policy.state_mut().set_supports_singlefloats(false);
     if helper_roots.is_empty() {
         call_control.find_all_graphs(policy);

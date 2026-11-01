@@ -150,6 +150,7 @@ pub mod libc_deadframe;
 pub mod llmodel;
 pub mod model;
 pub mod rd_payload;
+pub mod regalloc;
 pub mod resume_guard_descr;
 pub mod resume_value;
 pub mod synthetic_cpu;

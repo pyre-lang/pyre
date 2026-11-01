@@ -32,7 +32,7 @@ pub(crate) fn rewire_saturating_add_call_sites(
     graph: &mut FunctionGraph,
     sites: &[SaturatingAddSite],
 ) -> usize {
-    rewire_saturating_add_call_sites_for(graph, sites, crate::layout::target_word_size())
+    rewire_saturating_add_call_sites_for(graph, sites, crate::layout::target_signed_size())
 }
 
 pub(crate) fn rewire_saturating_add_call_sites_for(
@@ -273,9 +273,9 @@ fn rewire_one_saturating_add_site(
     }
     let result_var = &site.result_var;
     let name = graph.name.clone();
-    // `uint_lt(sum, x)` sees a carry in the 8-byte JIT bank. A 4-byte
-    // `usize::MAX + 1` is `4294967296` there, not a wrap, so the clamp
-    // never fires. Decline, the same as a narrow `u32`.
+    // `uint_lt(sum, x)` sees a carry in the 8-byte JIT bank (`Signed`
+    // width 8). A 4-byte `usize::MAX + 1` is `4294967296` there, not a
+    // wrap, so the clamp never fires. Decline, the same as a narrow `u32`.
     if word_bytes != 8 {
         return Err(format!(
             "{name}: saturating_add word of {word_bytes} bytes is not the JIT int bank"

@@ -711,7 +711,7 @@ mod tests {
             ("Vec<isize>", false, LowLevelType::Signed),
             ("*mut Vec<isize>", false, LowLevelType::Signed),
         ];
-        if crate::layout::target_word_size() == 8 {
+        if crate::layout::target_signed_size() == 8 {
             cases.push(("Vec<u64>", true, LowLevelType::Unsigned));
             cases.push(("Vec<i64>", false, LowLevelType::Signed));
         }

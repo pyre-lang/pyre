@@ -25840,8 +25840,8 @@ mod tests {
         );
     }
 
-    /// A 4-byte target word sizes a `Signed` item as 4. The host `usize`
-    /// is 8; the layout's word is what `sizeof` resolves.
+    /// A 4-byte pointer word does not size `Signed`: Signed follows
+    /// `target_signed_size` (8 on this host / wasm32).
     #[test]
     fn direct_ptradd_signed_item_uses_layout_word_bytes() {
         use crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout;
@@ -25862,8 +25862,8 @@ mod tests {
         let ty = crate::front::mir::lltype_for_direct_ptradd_pointer(None, &LowLevelType::Signed);
         assert_eq!(
             Transformer::direct_ptradd_item_bytes(&ty, &Word4),
-            Some(4),
-            "Signed item on a 4-byte target is 4, not the host word"
+            Some(crate::layout::target_signed_size() as i64),
+            "Signed item follows signed size, not the 4-byte pointer word"
         );
     }
 
@@ -25935,11 +25935,11 @@ mod tests {
 
         let transformed = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &transformed.graph.block(graph.startblock).operations;
-        let scale = crate::layout::target_word_size() as i64;
+        let scale = crate::layout::target_signed_size() as i64;
         assert!(
             ops.iter()
                 .any(|op| matches!(op.kind, OpKind::ConstInt(n) if n == scale)),
-            "same_as item type Signed must scale by {scale}; ops={ops:?}"
+            "same_as item type Signed must scale by sizeof(Signed)={scale}; ops={ops:?}"
         );
         assert!(
             ops.iter()
@@ -34190,7 +34190,7 @@ mod tests {
             panic!("non-Char residual takes n, basesize, itemsize, got {args_i:?}");
         };
         assert_eq!(n_arg, &n);
-        let word = crate::layout::target_word_size() as i64;
+        let signed = crate::layout::target_signed_size() as i64;
         assert!(
             ops.iter().any(|op| {
                 op.result.as_ref() == Some(basesize_arg) && matches!(op.kind, OpKind::ConstInt(0))
@@ -34200,9 +34200,9 @@ mod tests {
         assert!(
             ops.iter().any(|op| {
                 op.result.as_ref() == Some(itemsize_arg)
-                    && matches!(op.kind, OpKind::ConstInt(size) if size == word)
+                    && matches!(op.kind, OpKind::ConstInt(size) if size == signed)
             }),
-            "Signed itemsize is WORD, ops {ops:?}"
+            "Signed itemsize is sizeof(Signed), ops {ops:?}"
         );
         assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::None);
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
@@ -34372,6 +34372,7 @@ mod tests {
         };
         assert_eq!(n_arg, &n);
         let word = crate::layout::target_word_size() as i64;
+        let signed = crate::layout::target_signed_size() as i64;
         assert!(
             ops.iter().any(|op| {
                 op.result.as_ref() == Some(basesize_arg)
@@ -34382,9 +34383,9 @@ mod tests {
         assert!(
             ops.iter().any(|op| {
                 op.result.as_ref() == Some(itemsize_arg)
-                    && matches!(op.kind, OpKind::ConstInt(size) if size == word)
+                    && matches!(op.kind, OpKind::ConstInt(size) if size == signed)
             }),
-            "Signed itemsize is WORD, ops {ops:?}"
+            "Signed itemsize is sizeof(Signed), ops {ops:?}"
         );
         assert!(
             ops.iter().any(|op| {

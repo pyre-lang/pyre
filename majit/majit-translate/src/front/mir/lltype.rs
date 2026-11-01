@@ -3690,11 +3690,12 @@ pub(in crate::front::mir) fn nonzero_leaf_word_kind(
     payload: &serde_json::Value,
     llbc: &Llbc,
 ) -> Option<ValueType> {
-    // A niche wider than the machine word stays an aggregate. 128-bit
-    // values never fit. On a 32-bit target, `NonZeroU64` / `NonZeroI64`
-    // are eight bytes, the same split `scalar_lltype` uses for `i64`.
+    // A niche wider than Signed stays an aggregate. 128-bit values never
+    // fit. `NonZeroU64` / `NonZeroI64` are eight bytes, the same split
+    // `scalar_lltype` uses for `i64`; they are aggregate only when Signed
+    // is 4.
     if matches!(leaf, "NonZeroU128" | "NonZeroI128")
-        || (crate::layout::target_word_size() == 4 && matches!(leaf, "NonZeroU64" | "NonZeroI64"))
+        || (crate::layout::target_signed_size() == 4 && matches!(leaf, "NonZeroU64" | "NonZeroI64"))
     {
         return None;
     }
@@ -3802,7 +3803,7 @@ pub(in crate::front::mir) fn adt_type_arg_wider_than_word(
         return false;
     };
     matches!(kind, "I128" | "U128")
-        || (crate::layout::target_word_size() == 4 && matches!(kind, "I64" | "U64"))
+        || (crate::layout::target_signed_size() == 4 && matches!(kind, "I64" | "U64"))
 }
 
 /// The `TypeDecl` behind `ty` when it resolves to a fieldless (C-like)

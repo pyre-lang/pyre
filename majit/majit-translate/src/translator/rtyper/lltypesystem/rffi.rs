@@ -312,7 +312,10 @@ pub fn sizeof(tp: &LowLevelType) -> Result<ConstValue, TyperError> {
                 llmemory::sizeof(tp, None).map_err(TyperError::message)
             }
         },
-        LowLevelType::Signed | LowLevelType::Ptr(_) | LowLevelType::Address => {
+        LowLevelType::Signed | LowLevelType::Unsigned => {
+            Ok(ConstValue::Int(crate::layout::target_signed_size() as i64))
+        }
+        LowLevelType::Ptr(_) | LowLevelType::Address => {
             Ok(ConstValue::Int(crate::layout::target_word_size() as i64))
         }
         LowLevelType::Char | LowLevelType::Bool => Ok(ConstValue::Int(1)),
@@ -325,7 +328,6 @@ pub fn sizeof(tp: &LowLevelType) -> Result<ConstValue, TyperError> {
         LowLevelType::Float => Ok(ConstValue::Int(8)),
         LowLevelType::SingleFloat => Ok(ConstValue::Int(4)),
         LowLevelType::LongFloat => Ok(ConstValue::Int(llmemory::sizeof_longfloat())),
-        LowLevelType::Unsigned => Ok(ConstValue::Int(crate::layout::target_word_size() as i64)),
         LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => Ok(ConstValue::Int(8)),
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => {
             Ok(ConstValue::Int(16))
@@ -1333,17 +1335,22 @@ mod tests {
     #[test]
     fn size_and_sign_raw_ptr_is_word_signed() {
         // `rffi.py size_and_sign`: a `Ptr` is `(LONG_BIT/8, unsigned=False)`.
+        // Signed follows `target_signed_size` (8 on wasm32); pointers stay word.
         let word = crate::layout::target_word_size();
+        let signed = crate::layout::target_signed_size();
         assert_eq!(size_and_sign(&*CCHARP).unwrap(), (word, false));
         assert_eq!(
             size_and_sign(&CArrayPtr(LowLevelType::Signed)).unwrap(),
             (word, false)
         );
-        assert_eq!(size_and_sign(&LowLevelType::Signed).unwrap(), (word, false));
+        assert_eq!(
+            size_and_sign(&LowLevelType::Signed).unwrap(),
+            (signed, false)
+        );
         assert_eq!(size_and_sign(&LowLevelType::Char).unwrap(), (1, true));
         assert_eq!(
             size_and_sign(&LowLevelType::Unsigned).unwrap(),
-            (word, true)
+            (signed, true)
         );
         assert_eq!(
             size_and_sign(&LowLevelType::SignedLongLong).unwrap(),
@@ -1353,9 +1360,9 @@ mod tests {
             LowLevelType::FixedSizeArray(Box::new(CFixedArray(LowLevelType::Signed, 4)));
         assert_eq!(
             sizeof(&four_signed).unwrap(),
-            ConstValue::Int((4 * word) as i64)
+            ConstValue::Int((4 * signed) as i64)
         );
-        assert_eq!(size_and_sign(&four_signed).unwrap(), (4 * word, false));
+        assert_eq!(size_and_sign(&four_signed).unwrap(), (4 * signed, false));
         assert!(sizeof(&LowLevelType::Void).is_err());
         assert!(size_and_sign(&LowLevelType::Void).is_err());
     }

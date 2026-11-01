@@ -5682,10 +5682,25 @@ fn number_cast_truncated(
     t: TruncatedInt,
 ) -> Result<ConstValue, CastWhateverError> {
     match tgt {
-        // `Number._cast` for Signed is `intmask` (machine word).
-        LowLevelType::Signed => Ok(ConstValue::Int((t.low as usize) as isize as i64)),
-        // `Unsigned = build_number("Unsigned", r_uint)`: wrap to word bits.
-        LowLevelType::Unsigned => Ok(ConstValue::UInt(t.low as usize as u64)),
+        // `Number._cast` for Signed is `intmask` (`LONG_BIT` =
+        // `target_signed_size * 8`).
+        LowLevelType::Signed => {
+            let n = if crate::layout::target_signed_size() == 8 {
+                t.low as i64
+            } else {
+                t.low as u32 as i32 as i64
+            };
+            Ok(ConstValue::Int(n))
+        }
+        // `Unsigned = build_number("Unsigned", r_uint)`: wrap to `LONG_BIT`.
+        LowLevelType::Unsigned => {
+            let n = if crate::layout::target_signed_size() == 8 {
+                t.low as u64
+            } else {
+                t.low as u32 as u64
+            };
+            Ok(ConstValue::UInt(n))
+        }
         // `longlongmask` / `r_longlong` are 64-bit.
         LowLevelType::SignedLongLong => Ok(ConstValue::Int(t.low as i64)),
         LowLevelType::UnsignedLongLong => Ok(ConstValue::UInt(t.low as u64)),
@@ -9762,10 +9777,10 @@ mod tests {
     }
 
     #[test]
-    fn number_cast_word_size_follows_signed_and_longlong() {
+    fn number_cast_signed_size_follows_signed_and_longlong() {
         let u32max = ConstValue::UInt(0xffff_ffff);
         let signed = cast_primitive(&LowLevelType::Signed, &u32max).expect("Unsigned → Signed");
-        if cfg!(target_pointer_width = "32") {
+        if crate::layout::target_signed_size() == 4 {
             assert_eq!(signed, ConstValue::Int(-1));
         } else {
             assert_eq!(signed, ConstValue::Int(0xffff_ffff));
@@ -9773,12 +9788,14 @@ mod tests {
         let longlong =
             cast_primitive(&LowLevelType::SignedLongLong, &u32max).expect("→ SignedLongLong");
         assert_eq!(longlong, ConstValue::Int(0xffff_ffff));
-        let word_max = cast_primitive(&LowLevelType::Signed, &ConstValue::UInt(u64::MAX))
-            .expect("word-max → Signed");
-        assert_eq!(
-            word_max,
-            ConstValue::Int((u64::MAX as usize) as isize as i64)
-        );
+        let signed_max = cast_primitive(&LowLevelType::Signed, &ConstValue::UInt(u64::MAX))
+            .expect("u64::MAX → Signed");
+        let expect = if crate::layout::target_signed_size() == 8 {
+            u64::MAX as i64
+        } else {
+            -1
+        };
+        assert_eq!(signed_max, ConstValue::Int(expect));
     }
 
     #[test]

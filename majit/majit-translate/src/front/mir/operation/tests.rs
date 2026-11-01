@@ -1,4 +1,6 @@
-use super::{cast_call_segments, cast_kind_is_raw_ptr, int_binop_needs_ptr_to_int};
+use super::{
+    cast_call_segments, cast_kind_is_raw_ptr, int_binop_needs_ptr_to_int, item_lltype_for_size,
+};
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
@@ -105,6 +107,20 @@ fn int_to_int_cast_follows_the_force_cast_table() {
     }
     // A 128-bit operand is the longlong leg, not covered here.
     assert_eq!(int_to_int_cast((16, false), UCHAR, 8), None);
+}
+
+#[test]
+fn item_lltype_for_signed_size_is_signed() {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    assert_eq!(
+        item_lltype_for_size(crate::layout::target_signed_size() as i64),
+        LowLevelType::Signed
+    );
+    // wasm32 Signed is 8; pointer 4 is UniChar (`sizeof` wchar).
+    if crate::layout::target_signed_size() == 8 {
+        assert_eq!(item_lltype_for_size(8), LowLevelType::Signed);
+        assert_eq!(item_lltype_for_size(4), LowLevelType::UniChar);
+    }
 }
 
 #[test]

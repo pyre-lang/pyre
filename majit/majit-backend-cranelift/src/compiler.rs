@@ -32,6 +32,8 @@ use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter};
 #[cfg(test)]
 use majit_ir::InputArg;
+use majit_ir::forwarding::ForwardingHost;
+use majit_ir::operand::Operand;
 use majit_ir::{
     AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArgRc, OopSpecIndex, Op,
     OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
@@ -1055,7 +1057,7 @@ fn is_vec_float_producing(opcode: OpCode) -> bool {
 }
 
 /// Pre-scan ops to find positions that produce vector values.
-fn build_vec_oprefs(ops: &[Op], num_inputs: usize) -> IndexSet<u32> {
+fn build_vec_oprefs(ops: &[OpRc], num_inputs: usize) -> IndexSet<u32> {
     if !USE_NATIVE_SIMD {
         return IndexSet::new();
     }
@@ -1070,7 +1072,7 @@ fn build_vec_oprefs(ops: &[Op], num_inputs: usize) -> IndexSet<u32> {
 }
 
 /// Pre-scan to find which vector-producing positions have float type (F64X2).
-fn build_vec_float_oprefs(ops: &[Op], num_inputs: usize) -> IndexSet<u32> {
+fn build_vec_float_oprefs(ops: &[OpRc], num_inputs: usize) -> IndexSet<u32> {
     if !USE_NATIVE_SIMD {
         return IndexSet::new();
     }
@@ -4962,28 +4964,89 @@ fn invert_condition(cc: IntCC) -> IntCC {
     cc.complement()
 }
 
-/// `llsupport/regalloc.py` `compute_vars_longevity` — `Lifetime.last_usage`
-/// for every non-constant box used as an op arg or guard failarg.
-/// Iteration is monotonic in `i`, so a later visit supersedes any earlier
-/// `last_usage`. Missing entries behave as `0` for the
-/// `last_usage > i + 1` test (`next_op_can_accept_cc`).
-fn compute_vars_longevity(ops: &[Op]) -> IndexMap<u32, usize> {
-    let mut longevity: IndexMap<u32, usize> = IndexMap::new();
-    for (i, op) in ops.iter().enumerate() {
+/// `regalloc.py get_lifetime(box).last_usage`. `None` when the box has
+/// no Lifetime or `last_usage < 0` (unused inputarg `(-1, -1)`).
+fn last_usage_of(box_: &Operand) -> Option<i32> {
+    majit_backend::regalloc::get_lifetime::<(), ()>(box_)
+        .map(|lt| lt.last_usage.get())
+        .filter(|&u| u >= 0)
+}
+
+/// Test-only: rebind every arg/failarg box to this trace's own
+/// `InputArgRc`/`OpRc` producers. `mk_op` builds args via
+/// `bound_from_opref`; last_usage lives on the producer box.
+///
+/// Key by SSA raw `op_var_index` under every typed `OpRef` variant.
+/// Fixtures that leave `pos` as `None`, or that name an Int producer
+/// with `ref_op` (same raw), still attach Finish/arg uses so the
+/// emit skip sees the same live boxes the reverse walk would.
+#[cfg(test)]
+fn rebind_trace_arg_boxes(inputargs: &[InputArgRc], operations: &[OpRc]) {
+    let mut map = IndexMap::<OpRef, Operand>::new();
+    fn insert_op_raw(map: &mut IndexMap<OpRef, Operand>, raw: u32, box_: &Operand) {
+        map.insert(OpRef::int_op(raw), box_.clone());
+        map.insert(OpRef::float_op(raw), box_.clone());
+        map.insert(OpRef::ref_op(raw), box_.clone());
+        map.insert(OpRef::void_op(raw), box_.clone());
+    }
+    for ia in inputargs {
+        let box_ = Operand::from_bound_inputarg(ia);
+        map.insert(ia.opref(), box_.clone());
+        map.insert(OpRef::input_arg_int(ia.opref().raw()), box_.clone());
+        map.insert(OpRef::input_arg_float(ia.opref().raw()), box_.clone());
+        map.insert(OpRef::input_arg_ref(ia.opref().raw()), box_.clone());
+        insert_op_raw(&mut map, ia.opref().raw(), &box_);
+    }
+    let num_inputs = inputargs.len();
+    for (op_idx, op) in operations.iter().enumerate() {
+        if op.opcode.result_type() != Type::Void {
+            let box_ = Operand::from_bound_op(op);
+            let pos = op.pos().get();
+            if !pos.is_none() {
+                map.insert(pos, box_.clone());
+            }
+            let vi = op_var_index(op, op_idx, num_inputs) as u32;
+            insert_op_raw(&mut map, vi, &box_);
+        }
+    }
+    for op in operations {
+        for slot in op.args_slice_mut() {
+            if slot.is_constant() || slot.is_none() {
+                continue;
+            }
+            if let Some(mapped) = map.get(&slot.to_opref()) {
+                *slot = mapped.clone();
+            }
+        }
+        op.map_failargs_in_place(|slot| {
+            if slot.is_constant() || slot.is_none() {
+                return;
+            }
+            if let Some(mapped) = map.get(&slot.to_opref()) {
+                *slot = mapped.clone();
+            }
+        });
+    }
+}
+
+/// `forget_optimization_info` on inputargs, ops, and bound args/failargs
+/// so `compute_vars_longevity` sees `Forwarded::None`.
+fn clear_compile_forwarded(inputargs: &[InputArgRc], ops: &[OpRc]) {
+    for ia in inputargs {
+        ia.clear_forwarded();
+    }
+    for op in ops {
+        op.clear_forwarded();
         for arg in op
             .args_slice()
             .iter()
-            .chain(op.guard_fail_args().into_iter().flatten())
+            .chain(op.guard_fail_args().unwrap_or(&[]))
         {
-            // Const operands carry value inline (history.py/268/314);
-            // failarg holes (`None`) are not boxes (`regalloc.py` skip).
-            if arg.is_constant() || arg.is_none() {
-                continue;
+            if arg.is_bound() {
+                arg.clear_forwarded();
             }
-            longevity.insert(arg.to_opref().raw(), i);
         }
     }
-    longevity
 }
 
 /// `llsupport/regalloc.py` `next_op_can_accept_cc`: the comparison at
@@ -4991,16 +5054,12 @@ fn compute_vars_longevity(ops: &[Op]) -> IndexMap<u32, usize> {
 /// materialising a boolean, when `operations[i + 1]` is a
 /// `GUARD_TRUE` / `GUARD_FALSE` / `COND_CALL` whose only use of the
 /// result is that predicate (`longevity[op].last_usage > i + 1`).
-fn next_op_can_accept_cc(
-    ops: &[Op],
-    i: usize,
-    result: OpRef,
-    longevity: &IndexMap<u32, usize>,
-) -> bool {
+fn next_op_can_accept_cc(ops: &[OpRc], i: usize) -> bool {
     if i + 1 >= ops.len() {
         return false;
     }
-    if result.is_none() || result.is_constant() {
+    let result_box = Operand::from_bound_op(&ops[i]);
+    if result_box.is_none() || result_box.is_constant() {
         return false;
     }
     let next_op = &ops[i + 1];
@@ -5015,18 +5074,18 @@ fn next_op_can_accept_cc(
     // op-result identities; comparison via raw position is invalid.
     if next_op.num_args() == 0
         || next_op.arg(0).is_constant()
-        || next_op.arg(0).to_opref().raw() != result.raw()
+        || !next_op.arg(0).is_same_box(&result_box)
     {
         return false;
     }
     // regalloc.py: `self.longevity[op].last_usage > i + 1`
-    if longevity.get(&result.raw()).copied().unwrap_or(0) > i + 1 {
+    if last_usage_of(&result_box).unwrap_or(0) > (i + 1) as i32 {
         return false;
     }
     if opnum != OpCode::CondCallN {
         if next_op
             .guard_fail_args()
-            .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+            .is_some_and(|fa| fa.iter().any(|a| a.is_same_box(&result_box)))
         {
             return false;
         }
@@ -5034,7 +5093,7 @@ fn next_op_can_accept_cc(
         .args_slice()
         .iter()
         .skip(1)
-        .any(|a| a.to_opref() == result)
+        .any(|a| a.is_same_box(&result_box))
     {
         return false;
     }
@@ -5044,83 +5103,238 @@ fn next_op_can_accept_cc(
 #[cfg(test)]
 mod longevity_last_usage_tests {
     use super::*;
-    use majit_ir::forwarding::bound_operand_from_opref as rb;
-    use majit_ir::operand::Operand;
+    use majit_ir::InputArg;
 
-    fn mk(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let bx: Vec<Operand> = args.iter().map(|&a| rb(a)).collect();
-        let o = Op::new(opcode, &bx);
-        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
-        o
+    fn ia(tp: Type, index: u32) -> (InputArgRc, Operand) {
+        let ia = InputArg::from_type_rc(tp, index);
+        let box_ = Operand::from_bound_inputarg(&ia);
+        (ia, box_)
     }
 
-    /// The retired per-call walk: last op index that reads `result` as an
-    /// arg or failarg. The table must match this for `next_op_can_accept_cc`.
-    fn walk_last_usage(ops: &[Op], result: OpRef) -> usize {
-        let mut last = 0;
+    fn mk_rc(opcode: OpCode, args: &[Operand], pos: u32) -> OpRc {
+        let o = Op::new(opcode, args);
+        o.pos().set(OpRef::op_typed(pos, opcode.result_type()));
+        OpRc::new(o)
+    }
+
+    /// Retired forward-scan last-write-wins table, keyed by box identity.
+    /// Used as the oracle for a used box's `last_usage_of`.
+    fn walk_last_usage(ops: &[OpRc], box_: &Operand) -> Option<i32> {
+        let mut last = None;
         for (idx, op) in ops.iter().enumerate() {
             if op
                 .args_slice()
                 .iter()
-                .any(|a| !a.is_constant() && !a.is_none() && a.to_opref() == result)
+                .any(|a| !a.is_constant() && !a.is_none() && a.is_same_box(box_))
                 || op
                     .guard_fail_args()
-                    .is_some_and(|fa| fa.iter().any(|a| a.to_opref() == result))
+                    .is_some_and(|fa| fa.iter().any(|a| a.is_same_box(box_)))
             {
-                last = idx;
+                last = Some(idx as i32);
             }
         }
         last
     }
 
+    fn install_longevity(inputargs: &[InputArgRc], ops: &[OpRc]) {
+        clear_compile_forwarded(inputargs, ops);
+        let _ = majit_backend::regalloc::compute_vars_longevity::<(), ()>(inputargs, ops);
+    }
+
     #[test]
     fn last_usage_table_matches_arg_and_failarg_walk() {
-        let cmp = mk(
-            OpCode::IntLt,
-            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-            2,
-        );
-        let result = cmp.pos().get();
-        let guard = mk(OpCode::GuardTrue, &[result], 3);
+        let (i0, b0) = ia(Type::Int, 0);
+        let (i1, b1) = ia(Type::Int, 1);
+        let cmp = mk_rc(OpCode::IntLt, &[b0.clone(), b1.clone()], 2);
+        let result = Operand::from_bound_op(&cmp);
+        let guard = mk_rc(OpCode::GuardTrue, &[result.clone()], 3);
         guard.setfailargs(vec![].into());
-        let finish = mk(OpCode::Finish, &[], 4);
+        let finish = mk_rc(OpCode::Finish, &[], 4);
 
         let ops = [cmp.clone(), guard, finish.clone()];
-        let longevity = compute_vars_longevity(&ops);
-        assert_eq!(
-            longevity.get(&result.raw()).copied().unwrap_or(0),
-            walk_last_usage(&ops, result)
-        );
-        assert_eq!(longevity.get(&result.raw()).copied(), Some(1));
-        assert!(next_op_can_accept_cc(&ops, 0, result, &longevity));
+        let inputargs = [i0.clone(), i1.clone()];
+        install_longevity(&inputargs, &ops);
+        assert_eq!(last_usage_of(&result), walk_last_usage(&ops, &result));
+        assert_eq!(last_usage_of(&result), Some(1));
+        assert!(next_op_can_accept_cc(&ops, 0));
 
-        let guard_fa = mk(OpCode::GuardTrue, &[result], 3);
-        guard_fa.setfailargs(smallvec::smallvec![rb(result)]);
+        let guard_fa = mk_rc(OpCode::GuardTrue, &[result.clone()], 3);
+        guard_fa.setfailargs(smallvec::smallvec![result.clone()]);
         let ops_fa = [cmp.clone(), guard_fa, finish];
-        let longevity_fa = compute_vars_longevity(&ops_fa);
-        assert_eq!(
-            longevity_fa.get(&result.raw()).copied().unwrap_or(0),
-            walk_last_usage(&ops_fa, result)
-        );
-        assert_eq!(longevity_fa.get(&result.raw()).copied(), Some(1));
-        assert!(!next_op_can_accept_cc(&ops_fa, 0, result, &longevity_fa));
+        install_longevity(&inputargs, &ops_fa);
+        assert_eq!(last_usage_of(&result), walk_last_usage(&ops_fa, &result));
+        assert_eq!(last_usage_of(&result), Some(1));
+        assert!(!next_op_can_accept_cc(&ops_fa, 0));
 
-        let add = mk(OpCode::IntAdd, &[result, OpRef::input_arg_int(0)], 5);
-        let guard_only = mk(OpCode::GuardTrue, &[result], 3);
+        // Shared reverse walk skips unused-result pure ops without
+        // visiting their args, so the IntAdd must be live: Finish
+        // consumes it. last_usage of the comparison result is still
+        // the IntAdd (index 2).
+        let add = mk_rc(OpCode::IntAdd, &[result.clone(), b0.clone()], 5);
+        let add_box = Operand::from_bound_op(&add);
+        let guard_only = mk_rc(OpCode::GuardTrue, &[result.clone()], 3);
         guard_only.setfailargs(vec![].into());
-        let ops_later = [cmp, guard_only, add];
-        let longevity_later = compute_vars_longevity(&ops_later);
-        assert_eq!(
-            longevity_later.get(&result.raw()).copied().unwrap_or(0),
-            walk_last_usage(&ops_later, result)
+        let finish_later = mk_rc(OpCode::Finish, &[add_box], 6);
+        let ops_later = [cmp, guard_only, add, finish_later];
+        install_longevity(&inputargs, &ops_later);
+        assert_eq!(last_usage_of(&result), walk_last_usage(&ops_later, &result));
+        assert_eq!(last_usage_of(&result), Some(2));
+        assert!(!next_op_can_accept_cc(&ops_later, 0));
+        let _ = (i0, i1, b1);
+    }
+
+    #[test]
+    fn jump_args_count_in_last_usage_only() {
+        let (i0, b0) = ia(Type::Int, 0);
+        let add = mk_rc(OpCode::IntAdd, &[b0.clone(), b0.clone()], 1);
+        let add_box = Operand::from_bound_op(&add);
+        let jump = mk_rc(OpCode::Jump, &[add_box.clone()], 2);
+        let ops = [add, jump];
+        let inputargs = [i0];
+        install_longevity(&inputargs, &ops);
+        assert_eq!(last_usage_of(&add_box), Some(1));
+        let lt = majit_backend::regalloc::get_lifetime::<(), ()>(&add_box).unwrap();
+        assert!(
+            lt.real_usages
+                .borrow()
+                .as_ref()
+                .is_none_or(|u| !u.contains(&1))
         );
-        assert_eq!(longevity_later.get(&result.raw()).copied(), Some(2));
-        assert!(!next_op_can_accept_cc(
-            &ops_later,
-            0,
-            result,
-            &longevity_later
-        ));
+    }
+
+    #[test]
+    fn guard_not_forced_failargs_extend_last_usage_past_call() {
+        let (i0, b0) = ia(Type::Ref, 0);
+        let call = mk_rc(OpCode::CallAssemblerR, &[b0.clone()], 1);
+        let gnf = mk_rc(OpCode::GuardNotForced, &[], 2);
+        gnf.setfailargs(smallvec::smallvec![b0.clone()]);
+        let ops = [call, gnf];
+        let inputargs = [i0];
+        install_longevity(&inputargs, &ops);
+        assert_eq!(last_usage_of(&b0), Some(1));
+    }
+
+    #[test]
+    fn unused_inputarg_last_usage_is_none() {
+        let (unused, unused_box) = ia(Type::Int, 0);
+        let (used, used_box) = ia(Type::Int, 1);
+        let finish = mk_rc(OpCode::Finish, &[used_box.clone()], 0);
+        let ops = [finish];
+        let inputargs = [unused, used];
+        install_longevity(&inputargs, &ops);
+        assert_eq!(last_usage_of(&unused_box), None);
+        assert_eq!(last_usage_of(&used_box), Some(0));
+    }
+
+    #[test]
+    fn used_box_last_usage_matches_forward_scan_oracle() {
+        let (i0, b0) = ia(Type::Int, 0);
+        let (i1, b1) = ia(Type::Int, 1);
+        let add = mk_rc(OpCode::IntAdd, &[b0.clone(), b1.clone()], 2);
+        let add_box = Operand::from_bound_op(&add);
+        let sub = mk_rc(OpCode::IntSub, &[add_box.clone(), b0.clone()], 3);
+        let sub_box = Operand::from_bound_op(&sub);
+        let finish = mk_rc(OpCode::Finish, &[sub_box.clone()], 4);
+        let ops = [add, sub, finish];
+        let inputargs = [i0, i1];
+        install_longevity(&inputargs, &ops);
+        for box_ in [&b0, &b1, &add_box, &sub_box] {
+            assert_eq!(last_usage_of(box_), walk_last_usage(&ops, box_));
+        }
+    }
+
+    #[test]
+    fn unused_pure_op_has_no_lifetime() {
+        let (i0, b0) = ia(Type::Int, 0);
+        let add = mk_rc(OpCode::IntAdd, &[b0.clone(), b0.clone()], 1);
+        let add_box = Operand::from_bound_op(&add);
+        let finish = mk_rc(OpCode::Finish, &[b0.clone()], 2);
+        let ops = [add, finish];
+        let inputargs = [i0];
+        install_longevity(&inputargs, &ops);
+        assert!(majit_backend::regalloc::get_lifetime::<(), ()>(&add_box).is_none());
+        assert_eq!(last_usage_of(&add_box), None);
+    }
+
+    fn clif_has_imm(clif: &str, value: i64) -> bool {
+        let dec = value.to_string();
+        let hex: String = format!("{value:x}")
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        clif.lines().any(|line| {
+            let t = line.trim();
+            if !t.contains("iconst") {
+                return false;
+            }
+            if t.split(|c: char| !c.is_ascii_digit() && c != '-')
+                .any(|tok| tok == dec)
+            {
+                return true;
+            }
+            let compact: String = t
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect::<String>()
+                .to_ascii_lowercase();
+            compact.contains(&hex)
+        })
+    }
+
+    #[test]
+    fn unused_pure_intadd_is_absent_from_clif() {
+        use majit_backend::Backend;
+        use majit_ir::Const;
+
+        const K0: i64 = 0x00ab_c123;
+        const K1: i64 = 0x007e_57ed;
+        let c0 = Operand::const_(Const::Int(K0));
+        let c1 = Operand::const_(Const::Int(K1));
+
+        let (i0, b0) = ia(Type::Int, 0);
+        let unused_add = mk_rc(OpCode::IntAdd, &[c0.clone(), c1.clone()], 1);
+        let finish = mk_rc(OpCode::Finish, &[b0.clone()], 2);
+        let unused_ops = [unused_add, finish];
+        let unused_inputs = [i0];
+        let mut unused_backend = CraneliftBackend::new();
+        let unused_token = JitCellToken::new(1_500_801);
+        unused_backend
+            .compile_loop(&unused_inputs, &unused_ops, &unused_token)
+            .expect("unused IntAdd compiles");
+        let unused_clif = unused_backend.last_body_clif.clone();
+        assert!(
+            !clif_has_imm(&unused_clif, K0) && !clif_has_imm(&unused_clif, K1),
+            "unused IntAdd immediates must not appear in CLIF:\n{unused_clif}"
+        );
+        let unused_frame = unused_backend.execute_token(&unused_token, &[Value::Int(3)]);
+        assert_eq!(unused_backend.get_int_value(&unused_frame, 0), 3);
+
+        let (i1, b1) = ia(Type::Int, 0);
+        let used_add = mk_rc(OpCode::IntAdd, &[c0, c1], 1);
+        let used_box = Operand::from_bound_op(&used_add);
+        let used_finish = mk_rc(OpCode::Finish, &[used_box], 2);
+        let used_ops = [used_add, used_finish];
+        let used_inputs = [i1];
+        let _ = b1;
+        let mut used_backend = CraneliftBackend::new();
+        let used_token = JitCellToken::new(1_500_802);
+        used_backend
+            .compile_loop(&used_inputs, &used_ops, &used_token)
+            .expect("used IntAdd compiles");
+        let used_clif = used_backend.last_body_clif.clone();
+        assert!(
+            clif_has_imm(&used_clif, K0) && clif_has_imm(&used_clif, K1),
+            "used IntAdd immediates must appear in CLIF:\n{used_clif}"
+        );
+        assert!(
+            used_clif.lines().any(|line| {
+                let t = line.trim();
+                t.contains(" = iadd ") && !t.contains("iadd_imm")
+            }),
+            "used IntAdd must emit iadd:\n{used_clif}"
+        );
+        let used_frame = used_backend.execute_token(&used_token, &[Value::Int(3)]);
+        assert_eq!(used_backend.get_int_value(&used_frame, 0), K0 + K1);
     }
 }
 
@@ -5134,9 +5348,8 @@ fn emit_icmp(
     cc: IntCC,
     op: &Op,
     vi: u32,
-    ops: &[Op],
+    ops: &[OpRc],
     op_idx: usize,
-    longevity: &IndexMap<u32, usize>,
     guard_success_cc: &mut Option<GuardSuccessCc>,
 ) {
     let (a, b) = resolve_binop(builder, opref_vars, constants, op);
@@ -5146,7 +5359,7 @@ fn emit_icmp(
         guard_success_cc.is_none(),
         "flush_cc: guard_success_cc already set"
     );
-    if next_op_can_accept_cc(ops, op_idx, op.pos().get(), longevity) {
+    if next_op_can_accept_cc(ops, op_idx) {
         *guard_success_cc = Some(GuardSuccessCc { cc, lhs: a, rhs: b });
         return;
     }
@@ -5366,7 +5579,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
 
 fn validate_oprefs_for_compile(
     inputargs: &[InputArgRc],
-    ops: &[Op],
+    ops: &[OpRc],
     constants: &majit_ir::ConstMap<majit_ir::Const>,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
@@ -5460,7 +5673,7 @@ fn unsupported_semantics(opcode: OpCode, detail: &str) -> BackendError {
 /// post-call materialization would leave fail_args pointing at boxes
 /// the force path cannot read coherently.
 fn check_paired_guard_not_forced(
-    ops: &[Op],
+    ops: &[OpRc],
     op_idx: usize,
     opcode: OpCode,
     label: &str,
@@ -5629,7 +5842,7 @@ fn expected_call_assembler_result_kind(call_descr: &dyn CallDescr) -> Result<u64
     }
 }
 
-fn build_known_values_set(inputargs: &[InputArgRc], ops: &[Op]) -> IndexSet<u32> {
+fn build_known_values_set(inputargs: &[InputArgRc], ops: &[OpRc]) -> IndexSet<u32> {
     let mut known = IndexSet::new();
     for input in inputargs {
         known.insert(input.index);
@@ -5642,7 +5855,7 @@ fn build_known_values_set(inputargs: &[InputArgRc], ops: &[Op]) -> IndexSet<u32>
     known
 }
 
-fn build_used_vars_set(ops: &[Op]) -> IndexSet<u32> {
+fn build_used_vars_set(ops: &[OpRc]) -> IndexSet<u32> {
     let mut used = IndexSet::new();
     for op in ops {
         for arg in op.getarglist() {
@@ -5661,7 +5874,7 @@ fn build_used_vars_set(ops: &[Op]) -> IndexSet<u32> {
     used
 }
 
-fn build_force_token_set(_inputargs: &[InputArgRc], _ops: &[Op]) -> IndexSet<u32> {
+fn build_force_token_set(_inputargs: &[InputArgRc], _ops: &[OpRc]) -> IndexSet<u32> {
     // FORCE_TOKEN is a GCREF to the active JITFRAME
     // (`virtualizable.py:315-318`, `resoperation.py:1090`). Keep its in-frame
     // copies in the ordinary Ref root set so moving collectors update them.
@@ -5686,8 +5899,8 @@ fn build_force_token_set(_inputargs: &[InputArgRc], _ops: &[Op]) -> IndexSet<u32
 /// "guard fired before redefinition → use original inputarg type"
 /// fallback in `resolve_fail_arg_types`.
 fn build_type_overrides(
-    ops: &[Op],
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    ops: &[OpRc],
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
 ) -> (IndexMap<u32, Type>, IndexMap<u32, usize>) {
     let mut overrides: IndexMap<u32, Type> = IndexMap::new();
     let mut op_def_positions: IndexMap<u32, usize> = IndexMap::new();
@@ -5786,7 +5999,7 @@ fn build_type_overrides(
 
 #[inline]
 fn lookup_type_at(
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     opref: OpRef,
     op_index: usize,
@@ -5818,7 +6031,7 @@ fn lookup_type_at(
 /// as an SSA block param only wastes registers and forces the register
 /// allocator to spill the hot induction variables. The x86 backend applies
 /// this test at every LABEL, so do the same here.
-fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize, Vec<bool>> {
+fn compute_loop_phi_keep(ops: &[OpRc], label_indices: &[usize]) -> IndexMap<usize, Vec<bool>> {
     let mut last_real_use: IndexMap<u32, usize> = IndexMap::new();
     for (op_idx, op) in ops.iter().enumerate() {
         if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
@@ -6002,7 +6215,7 @@ fn compute_loop_phi_keep(ops: &[Op], label_indices: &[usize]) -> IndexMap<usize,
 fn nonref_demoted_positions(
     label_idx: usize,
     keep: &[bool],
-    ops: &[Op],
+    ops: &[OpRc],
     ref_root_slots: &[(u32, usize)],
 ) -> Vec<(usize, u32)> {
     let label_args = ops[label_idx].getarglist();
@@ -6037,11 +6250,11 @@ fn label_ref_arg_raw(arg: &majit_ir::operand::Operand) -> Option<u32> {
 
 fn build_ref_root_slots(
     inputargs: &[InputArgRc],
-    ops: &[Op],
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    ops: &[OpRc],
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     force_tokens: &IndexSet<u32>,
-) -> Result<Vec<(u32, usize)>, BackendError> {
+) -> Result<Vec<(Operand, usize)>, BackendError> {
     let mut seen = IndexSet::new();
     let mut slots = Vec::new();
 
@@ -6112,7 +6325,7 @@ fn build_ref_root_slots(
                     ),
                 );
             }
-            slots.push((input.index, slots.len()));
+            slots.push((Operand::from_bound_inputarg(input), slots.len()));
         } else if input.tp.get() == Type::Ref
             && !used_inputargs.contains(&input.index)
             && majit_log_enabled()
@@ -6135,7 +6348,7 @@ fn build_ref_root_slots(
                     && !force_tokens.contains(&raw)
                     && seen.insert(raw)
                 {
-                    slots.push((raw, slots.len()));
+                    slots.push((arg, slots.len()));
                 }
             }
         }
@@ -6148,7 +6361,7 @@ fn build_ref_root_slots(
                         op_idx, op.opcode, vi
                     );
                 }
-                slots.push((vi, slots.len()));
+                slots.push((Operand::from_bound_op(op), slots.len()));
             }
         }
     }
@@ -6168,8 +6381,8 @@ fn build_ref_root_slots(
 ///
 /// Debug-only: this reports, it does not compensate.
 fn log_internal_jump_type_mismatches(
-    ops: &[Op],
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    ops: &[OpRc],
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
 ) {
     // Key by `descr_identity` (Arc allocation address) per `history.py:477`
@@ -6461,7 +6674,7 @@ fn resolve_rewriter_immediate_i64(
 }
 
 fn type_for_opref(
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     known_values: &IndexSet<u32>,
     opcode: OpCode,
@@ -6962,9 +7175,8 @@ fn get_gcmap(
     position: usize,
     ref_root_gcmap_base: usize,
     always_live_bit_positions: &[usize],
-    dense_ref_bindings: &IndexMap<usize, u32>,
-    ref_root_slots: &[(u32, usize)],
-    longevity: &IndexMap<u32, usize>,
+    dense_ref_bindings: &IndexMap<usize, Operand>,
+    ref_root_slots: &[(Operand, usize)],
     defined_ref_vars: &IndexSet<u32>,
     demoted_failarg_slots: &IndexMap<u32, i32>,
 ) -> i64 {
@@ -6978,14 +7190,13 @@ fn get_gcmap(
     // here — otherwise the very next collecting call (an inline nursery bump is
     // enough) leaves the published words holding pre-collection addresses that
     // `force_token_to_dead_frame` then hands to the resume machinery.
-    for (&slot, &var_idx) in dense_ref_bindings {
-        if let Some(&last_usage) = longevity.get(&var_idx)
-            && last_usage >= position
-        {
-            live_bit_positions.push(slot);
+    for (slot, box_) in dense_ref_bindings {
+        if last_usage_of(box_).is_some_and(|u| u >= position as i32) {
+            live_bit_positions.push(*slot);
         }
     }
-    for &(var_idx, slot) in ref_root_slots {
+    for (box_, slot) in ref_root_slots {
+        let var_idx = box_.to_opref().raw();
         // A demoted loop-invariant Ref has no loop-body SSA definition, so it
         // never enters `defined_ref_vars`, and its `longevity` entry ends at
         // its last regular use. Both filters below would therefore drop it from
@@ -7007,9 +7218,7 @@ fn get_gcmap(
         }
         // regalloc.py/1102: box.type == REF and self.rm.is_still_alive(box)
         // is_still_alive: longevity[v].last_usage >= position
-        if let Some(&last_usage) = longevity.get(&var_idx)
-            && last_usage >= position
-        {
+        if last_usage_of(box_).is_some_and(|u| u >= position as i32) {
             live_bit_positions.push(ref_root_gcmap_base + slot);
         }
     }
@@ -7056,11 +7265,11 @@ fn allocate_gcmap(live_bit_positions: &[usize]) -> i64 {
 /// the newest writer owns it; a Const fail-arg carries its value inline
 /// (history.py:227/268/314) and binds nothing.
 fn bind_published_dense_refs(
-    dense_ref_bindings: &mut IndexMap<usize, u32>,
+    dense_ref_bindings: &mut IndexMap<usize, Operand>,
     info: &GuardInfo,
     constants: &IndexMap<u32, i64>,
 ) {
-    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+    for (index, arg_box) in info.fail_arg_boxes.iter().enumerate() {
         // An arg read from its call spill slot is not published here, so
         // this publish neither binds nor unbinds anything for it.
         if info
@@ -7072,6 +7281,7 @@ fn bind_published_dense_refs(
             continue;
         }
         let slot = info.fail_locs[index];
+        let arg_ref = arg_box.to_opref();
         // regalloc.py `FrameManager.bind`: publishing a new box into a
         // frame location replaces the location's previous occupant.  The raw
         // dense store does the same even when the new value is Int or Float,
@@ -7084,25 +7294,22 @@ fn bind_published_dense_refs(
             dense_ref_bindings.swap_remove(&slot);
             continue;
         }
-        dense_ref_bindings.insert(slot, arg_ref.raw());
+        dense_ref_bindings.insert(slot, arg_box.clone());
     }
 }
 
 fn live_ref_root_slots_at(
     position: usize,
-    ref_root_slots: &[(u32, usize)],
-    longevity: &IndexMap<u32, usize>,
+    ref_root_slots: &[(Operand, usize)],
     defined_ref_vars: &IndexSet<u32>,
-) -> Vec<(u32, usize)> {
+) -> Vec<(Operand, usize)> {
     ref_root_slots
         .iter()
-        .filter(|(var_idx, _)| {
-            defined_ref_vars.contains(var_idx)
-                && longevity
-                    .get(var_idx)
-                    .is_some_and(|last_usage| *last_usage >= position)
+        .filter(|(box_, _)| {
+            defined_ref_vars.contains(&box_.to_opref().raw())
+                && last_usage_of(box_).is_some_and(|u| u >= position as i32)
         })
-        .copied()
+        .cloned()
         .collect()
 }
 
@@ -8341,7 +8548,7 @@ struct MergedBridgePiece {
     source_guard_op: usize,
     source_guard: usize,
     inputargs: Vec<InputArgRc>,
-    ops: Vec<Op>,
+    ops: Vec<OpRc>,
     invalidation_flag_ptr: usize,
     noexc_above: bool,
 }
@@ -8353,8 +8560,8 @@ struct MergedBridgePiece {
 /// LABEL's arguments.
 struct FamilyMember {
     token: Arc<JitCellToken>,
-    entry_args: Vec<OpRef>,
-    ops: Vec<Op>,
+    entry_args: Vec<Operand>,
+    ops: Vec<OpRc>,
     bridges: Vec<MergedBridgePiece>,
     invalidation_flag_ptr: usize,
 }
@@ -8365,7 +8572,7 @@ struct FamilyMember {
 /// self.target_tokens_currently_compiling`: object identity. `Descr::index` is
 /// the per-loop token id, which every loop numbers from the same values, so it
 /// can name another loop's LABEL.
-fn label_arity_by_identity(ops: &[Op]) -> Vec<(usize, usize)> {
+fn label_arity_by_identity(ops: &[OpRc]) -> Vec<(usize, usize)> {
     ops.iter()
         .filter(|op| op.opcode == OpCode::Label)
         .filter_map(|op| {
@@ -8411,7 +8618,7 @@ fn jump_is_external(op: &Op, label_arity: &[(usize, usize)]) -> bool {
 /// only registers (`_push_all_regs_to_frame`) and leaves a fail arg that
 /// already lives in the frame where it is.
 fn record_entry_resident_failargs(
-    ops: &[Op],
+    ops: &[OpRc],
     inputargs: &[InputArgRc],
     max_output_slots: usize,
     guaranteed_frame_depth: i64,
@@ -9123,57 +9330,67 @@ fn merge_source_eligible(constants_nonempty: bool, ops: &[OpRc]) -> bool {
 }
 
 fn snapshot_inputargs(inputargs: &[InputArgRc]) -> Vec<InputArgRc> {
-    inputargs
-        .iter()
-        .map(|ia| {
-            let copy = majit_ir::InputArg::from_type_rc(ia.tp.get(), ia.index);
-            if let Some(value) = ia.get_value() {
-                copy.set_value(value);
-            }
-            copy
-        })
-        .collect()
+    inputargs.to_vec()
 }
 
-fn snapshot_operand(arg: &majit_ir::operand::Operand) -> majit_ir::operand::Operand {
-    let opref = arg.to_opref();
-    if arg.is_none() || arg.is_constant() {
-        majit_ir::operand::Operand::from_opref(opref)
-    } else {
-        majit_ir::operand::Operand::bound_from_opref(opref)
-    }
-}
-
-fn snapshot_op(op: &Op) -> Op {
-    let args: Vec<majit_ir::operand::Operand> = (0..op.num_args())
-        .map(|i| snapshot_operand(&op.arg(i)))
-        .collect();
-    let fresh = match op.getdescr() {
-        Some(descr) => Op::with_descr(op.opcode, &args, descr),
-        None => Op::new(op.opcode, &args),
-    };
-    fresh.pos().set(op.pos().get());
-    if let Some(fail_args) = op.getfailargs() {
-        let copied: majit_ir::resoperation::OpArgVec =
-            fail_args.iter().map(snapshot_operand).collect();
-        fresh.setfailargs(copied);
-    }
-    fresh
-}
-
-/// Fresh `Op`s from each source op's opcode, argument `OpRef`s, descr,
-/// `pos()`, and fail-arg `OpRef`s. Inline `Const` operands stay constants.
-/// The result does not alias the metainterp's `OpRc`s.
-fn snapshot_ops(ops: &[Op]) -> Vec<Op> {
-    ops.iter().map(snapshot_op).collect()
-}
-
-fn snapshot_trace_ops(ops: &[OpRc]) -> Vec<Op> {
-    let mut out = Vec::with_capacity(ops.len());
+/// Copy `ops` into new `OpRc` producers. Each consumer arg/failarg that
+/// named an input `OpRc` (or an `input_map` old box) is rebound to that
+/// copy's box so last_usage lives on the producer the compile walks.
+/// `remap_raws` assigns fresh result positions when splicing traces whose
+/// raws would collide (`opref_var_map`).
+fn copy_ops_rebound(
+    ops: &[OpRc],
+    input_map: &[(Operand, Operand)],
+    mut remap_raws: Option<&mut u32>,
+) -> Vec<OpRc> {
+    let mut result_map: Vec<(Operand, Operand)> = Vec::new();
+    let mut out: Vec<OpRc> = Vec::with_capacity(ops.len());
     for op in ops {
-        out.extend(snapshot_ops(std::slice::from_ref(op.as_ref())));
+        let fresh = op.copy_and_change(op.opcode, None, None);
+        let old_pos = op.pos().get();
+        if let Some(next_raw) = remap_raws.as_deref_mut() {
+            if is_value_position(old_pos) {
+                fresh.pos().set(old_pos.with_raw(*next_raw));
+                *next_raw = next_raw.saturating_add(1);
+            } else {
+                fresh.pos().set(old_pos);
+            }
+        } else {
+            fresh.pos().set(old_pos);
+        }
+        let rc = OpRc::new(fresh);
+        if is_value_position(old_pos) {
+            result_map.push((Operand::from_bound_op(op), Operand::from_bound_op(&rc)));
+        }
+        out.push(rc);
+    }
+    let lookup = |arg: &Operand| -> Operand {
+        if arg.is_none() || arg.is_constant() {
+            return arg.clone();
+        }
+        for (old, new) in input_map.iter().chain(result_map.iter()) {
+            if arg.is_same_box(old) {
+                return new.clone();
+            }
+        }
+        arg.clone()
+    };
+    for rc in &out {
+        for i in 0..rc.num_args() {
+            let rewritten = lookup(&rc.arg(i));
+            rc.args_slice_mut()[i] = rewritten;
+        }
+        rc.map_failargs_in_place(|slot| {
+            *slot = lookup(slot);
+        });
     }
     out
+}
+
+/// Frozen `OpRc`s that do not alias the metainterp's objects (rewrite
+/// mutates those in place). Args point at the frozen producers.
+fn snapshot_ops(ops: &[OpRc]) -> Vec<OpRc> {
+    copy_ops_rebound(ops, &[], None)
 }
 
 /// The trace id is assigned by `do_compile`; the caller fills it in once the
@@ -9182,7 +9399,7 @@ fn retained_merge_source(inputargs: &[InputArgRc], ops: &[OpRc]) -> MergeSource 
     MergeSource {
         trace_id: 0,
         inputargs: snapshot_inputargs(inputargs),
-        ops: snapshot_trace_ops(ops),
+        ops: snapshot_ops(ops),
         constptrs: Vec::new(),
     }
 }
@@ -9217,7 +9434,7 @@ fn note_opref_raw(max_raw: &mut u32, opref: OpRef) {
     }
 }
 
-fn max_opref_raw(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
+fn max_opref_raw(inputargs: &[InputArgRc], ops: &[OpRc]) -> u32 {
     let mut max_raw = 0u32;
     for ia in inputargs {
         max_raw = max_raw.max(ia.index);
@@ -9236,10 +9453,10 @@ fn max_opref_raw(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
     max_raw
 }
 
-/// Non-hole fail-arg `OpRef`s in fail-arg order. A hole is `OpRef::NONE` or
+/// Non-hole fail-arg boxes in fail-arg order. A hole is `OpRef::NONE` or
 /// the `0xFFFF` marker `rebuild_faillocs_from_descr` skips. An empty
 /// `rd_locs` is the identity fast path: every present fail arg is live.
-fn nonhole_fail_args(op: &Op) -> Vec<OpRef> {
+fn nonhole_fail_args(op: &Op) -> Vec<Operand> {
     let fail_args = op
         .getfailargs()
         .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode));
@@ -9262,117 +9479,60 @@ fn nonhole_fail_args(op: &Op) -> Vec<OpRef> {
             if rd.get(index).copied() == Some(0xFFFF) {
                 return None;
             }
-            Some(arg.to_opref())
+            Some(arg.clone())
         })
         .collect()
 }
 
-/// Codegen keys a value by its raw position (`opref_var_map`), so an
-/// operand names a bridge inputarg or result by raw, whatever its variant.
-fn remap_opref(opref: OpRef, input_map: &[(OpRef, OpRef)], result_map: &[(OpRef, OpRef)]) -> OpRef {
-    if opref.is_none() || opref.is_constant() {
-        return opref;
-    }
-    let raw = opref.raw();
-    if let Some((_, mapped)) = input_map.iter().find(|(old, _)| old.raw() == raw) {
-        return *mapped;
-    }
-    if let Some((_, mapped)) = result_map.iter().find(|(old, _)| old.raw() == raw) {
-        return *mapped;
-    }
-    opref
-}
-
-fn rewrite_operand(arg: &majit_ir::operand::Operand, mapped: OpRef) -> majit_ir::operand::Operand {
-    if mapped == arg.to_opref() {
-        return snapshot_operand(arg);
-    }
-    if mapped.is_none() || mapped.is_constant() {
-        majit_ir::operand::Operand::from_opref(mapped)
-    } else {
-        majit_ir::operand::Operand::bound_from_opref(mapped)
-    }
-}
-
-/// Renumber `ops` above `next_raw`. `input_map` replaces inputarg `OpRef`s
-/// (bridge inputs become the source guard's fail args; a member loop's
-/// inputs become fresh op-result positions). Op results take the following
-/// raws, same variant. Constants stay. Descrs stay, so a bridge exit still
-/// stores that bridge's descr pointer.
-fn renumber_ops(ops: &[Op], input_map: &[(OpRef, OpRef)], mut next_raw: u32) -> (Vec<Op>, u32) {
-    let mut result_map: Vec<(OpRef, OpRef)> = Vec::new();
-    for op in ops {
-        let old = op.pos().get();
-        if !is_value_position(old) {
-            continue;
-        }
-        let new = old.with_raw(next_raw);
-        next_raw = next_raw.saturating_add(1);
-        result_map.push((old, new));
-    }
-    let map = |opref| remap_opref(opref, input_map, &result_map);
-    let mut out = Vec::with_capacity(ops.len());
-    for op in ops {
-        let fresh = snapshot_op(op);
-        let argc = fresh.num_args();
-        for i in 0..argc {
-            let mapped = map(fresh.arg(i).to_opref());
-            let arg = fresh.arg(i);
-            let rewritten = rewrite_operand(&arg, mapped);
-            fresh.args_slice_mut()[i] = rewritten;
-        }
-        let rewritten_fails = fresh.getfailargs().map(|fail_args| {
-            fail_args
-                .iter()
-                .map(|arg| rewrite_operand(arg, map(arg.to_opref())))
-                .collect::<majit_ir::resoperation::OpArgVec>()
-        });
-        if let Some(copied) = rewritten_fails {
-            fresh.setfailargs(copied);
-        }
-        let old_pos = fresh.pos().get();
-        fresh.pos().set(map(old_pos));
-        out.push(fresh);
-    }
+/// Renumber `ops` above `next_raw`. `input_map` replaces boxes
+/// (bridge inputs become the source guard's failarg boxes; a member loop's
+/// inputs become freshly minted producers). Op results take the following
+/// raws. Constants stay. Descrs stay, so a bridge exit still stores that
+/// bridge's descr pointer.
+fn renumber_ops(
+    ops: &[OpRc],
+    input_map: &[(Operand, Operand)],
+    mut next_raw: u32,
+) -> (Vec<OpRc>, u32) {
+    let out = copy_ops_rebound(ops, input_map, Some(&mut next_raw));
     (out, next_raw)
 }
 
 /// Renumber `bridge_ops` above `next_raw` and replace each bridge inputarg
-/// with the source guard's non-hole fail arg.
+/// box with the source guard's non-hole failarg box.
 fn renumber_bridge_ops(
-    bridge_ops: &[Op],
+    bridge_ops: &[OpRc],
     bridge_inputargs: &[InputArgRc],
-    fail_args: &[OpRef],
-    next_raw: u32,
-) -> Option<(Vec<Op>, u32)> {
+    fail_args: &[Operand],
+    mut next_raw: u32,
+) -> Option<(Vec<OpRc>, u32)> {
     if bridge_inputargs.len() != fail_args.len() {
         return None;
     }
-    let input_map: Vec<(OpRef, OpRef)> = bridge_inputargs
+    let input_map: Vec<(Operand, Operand)> = bridge_inputargs
         .iter()
         .enumerate()
-        .map(|(index, ia)| {
-            (
-                OpRef::input_arg_typed(ia.index, ia.tp.get()),
-                fail_args[index],
-            )
-        })
+        .map(|(index, ia)| (Operand::from_bound_inputarg(ia), fail_args[index].clone()))
         .collect();
-    Some(renumber_ops(bridge_ops, &input_map, next_raw))
+    let out = copy_ops_rebound(bridge_ops, &input_map, Some(&mut next_raw));
+    Some((out, next_raw))
 }
 
-/// Fresh op-result positions, one per argument of the member's first LABEL,
+/// Fresh producers, one per argument of the member's first LABEL,
 /// int/ref/float matching the argument. Those arguments were defined by ops
 /// the merge does not copy (or were the loop's inputargs), so they cannot
-/// keep their old raws.
-fn member_input_map(entry_args: &[OpRef], next_raw: &mut u32) -> Vec<(OpRef, OpRef)> {
+/// keep their old raws. Each producer is minted once and shared.
+fn member_input_map(entry_args: &[Operand], next_raw: &mut u32) -> Vec<(Operand, Operand)> {
     entry_args
         .iter()
-        .map(|&old| {
-            let tp = old.ty().expect("member entry argument is a typed value");
-            let new = OpRef::op_typed(*next_raw, tp);
+        .map(|old| {
+            let tp = old
+                .to_opref()
+                .ty()
+                .expect("member entry argument is a typed value");
+            let new_ref = OpRef::op_typed(*next_raw, tp);
             *next_raw = next_raw.saturating_add(1);
-            (old, new)
+            (old.clone(), Operand::bound_from_opref(new_ref))
         })
         .collect()
 }
@@ -9392,7 +9552,7 @@ fn constptr_stays_inline(opcode: OpCode) -> bool {
 /// and the table slot, so match either. `None` when a constant is not in
 /// the table, which refuses the merge.
 fn bind_retained_constptrs(
-    ops: &[Op],
+    ops: &[OpRc],
     table: Option<&majit_gc::GcTable>,
 ) -> Option<Vec<RetainedConstPtr>> {
     let bind = |arg: &majit_ir::operand::Operand| -> Option<Option<usize>> {
@@ -9441,7 +9601,7 @@ fn bind_retained_constptrs(
 /// forwards that slot (`gcreftracer.py`); the intern slot the op was
 /// retained with has no holder once the compile returned.
 fn refresh_retained_constptrs(
-    ops: &[Op],
+    ops: &[OpRc],
     first_op: usize,
     constptrs: &[RetainedConstPtr],
     table: Option<&majit_gc::GcTable>,
@@ -9483,7 +9643,7 @@ fn guard_shape_refuses_merge(op: &Op) -> bool {
 /// be the anchor loop or an earlier member segment. A missing or duplicated
 /// descr identity refuses the merge.
 fn resolve_merged_source_guards(
-    ops: &[Op],
+    ops: &[OpRc],
     segments: &[MergeSegment],
 ) -> Result<Vec<Option<usize>>, BackendError> {
     let mut resolved = Vec::with_capacity(segments.len());
@@ -9553,7 +9713,7 @@ fn bridge_segment_flag(bridge: &BridgeData, owner: &JitCellToken) -> usize {
         .unwrap_or_else(|| token_invalidation_flag_ptr(owner))
 }
 
-fn push_label_ids(ops: &[Op], ids: &mut Vec<usize>) {
+fn push_label_ids(ops: &[OpRc], ids: &mut Vec<usize>) {
     for op in ops {
         if op.opcode != OpCode::Label {
             continue;
@@ -9568,7 +9728,7 @@ fn push_label_ids(ops: &[Op], ids: &mut Vec<usize>) {
     }
 }
 
-fn push_jump_descrs(ops: &[Op], work: &mut Vec<DescrRef>) {
+fn push_jump_descrs(ops: &[OpRc], work: &mut Vec<DescrRef>) {
     for op in ops {
         if op.opcode != OpCode::Jump || !op.has_descr() {
             continue;
@@ -9583,7 +9743,7 @@ fn push_jump_descrs(ops: &[Op], work: &mut Vec<DescrRef>) {
 /// and every value the rest of `ops` reads is one of them or a result of an
 /// op in `ops`. `None` when a read reaches past the LABEL into ops the merge
 /// does not copy.
-fn member_entry_args(ops: &[Op]) -> Option<Vec<OpRef>> {
+fn member_entry_args(ops: &[OpRc]) -> Option<Vec<Operand>> {
     let label = ops.first()?;
     if label.opcode != OpCode::Label {
         return None;
@@ -9591,11 +9751,12 @@ fn member_entry_args(ops: &[Op]) -> Option<Vec<OpRef>> {
     let mut known: Vec<u32> = Vec::new();
     let mut entry_args = Vec::with_capacity(label.num_args());
     for i in 0..label.num_args() {
-        let arg = label.arg(i).to_opref();
-        if !is_value_position(arg) || arg.ty().is_none() || known.contains(&arg.raw()) {
+        let arg = label.arg(i);
+        let opref = arg.to_opref();
+        if !is_value_position(opref) || opref.ty().is_none() || known.contains(&opref.raw()) {
             return None;
         }
-        known.push(arg.raw());
+        known.push(opref.raw());
         entry_args.push(arg);
     }
     for op in ops {
@@ -9619,7 +9780,7 @@ fn member_entry_args(ops: &[Op]) -> Option<Vec<OpRef>> {
 /// kept bridge's reference constants cannot be refreshed. `owner_ops` is a
 /// loop or a spliced bridge; `inherited_noexc` is that bridge's `noexc_above`.
 fn collect_merged_bridges(
-    owner_ops: &[Op],
+    owner_ops: &[OpRc],
     owner: &JitCellToken,
     inherited_noexc: bool,
 ) -> Option<Vec<MergedBridgePiece>> {
@@ -9693,11 +9854,11 @@ fn collect_merged_bridges(
     Some(pieces)
 }
 
-fn ops_refuse_merge(ops: &[Op]) -> bool {
-    ops.iter().any(guard_shape_refuses_merge)
+fn ops_refuse_merge(ops: &[OpRc]) -> bool {
+    ops.iter().any(|op| guard_shape_refuses_merge(op))
 }
 
-fn bridge_fail_arity_matches(owner_ops: &[Op], bridge: &MergedBridgePiece) -> bool {
+fn bridge_fail_arity_matches(owner_ops: &[OpRc], bridge: &MergedBridgePiece) -> bool {
     owner_ops
         .get(bridge.source_guard_op)
         .is_some_and(|guard| nonhole_fail_args(guard).len() == bridge.inputargs.len())
@@ -9773,7 +9934,7 @@ fn try_accept_family_member(
 }
 
 fn append_renumbered_bridge(
-    combined: &mut Vec<Op>,
+    combined: &mut Vec<OpRc>,
     segments: &mut Vec<MergeSegment>,
     next_raw: &mut u32,
     source_guard_op: usize,
@@ -9810,7 +9971,7 @@ const MERGED_NESTED_ATTACH_MAX_OPS: usize = 768;
 /// only a failing top-level piece refuses the merge. Each spliced source
 /// guard is pushed onto `spliced`.
 fn append_bridge_tree(
-    combined: &mut Vec<Op>,
+    combined: &mut Vec<OpRc>,
     segments: &mut Vec<MergeSegment>,
     next_raw: &mut u32,
     owner_base: usize,
@@ -9876,7 +10037,7 @@ fn append_bridge_tree(
 fn prepare_merged_recompile(
     token: &JitCellToken,
     source_fail_descr: &dyn FailDescr,
-) -> Option<(Vec<InputArgRc>, Vec<Op>, MergePlan)> {
+) -> Option<(Vec<InputArgRc>, Vec<OpRc>, MergePlan)> {
     if token.is_invalidated() {
         return None;
     }
@@ -10864,6 +11025,10 @@ struct GuardInfo {
     /// keep publishing every value themselves (identity locations).
     redirect_resident_failargs: bool,
     fail_arg_refs: Vec<OpRef>,
+    /// Producer boxes parallel to `fail_arg_refs` (guard failargs or
+    /// FINISH / external JUMP args). `get_gcmap` dense bindings read these;
+    /// packing still uses `fail_arg_refs`.
+    fail_arg_boxes: Vec<Operand>,
     /// Parallel to `fail_arg_refs`. Types name which failargs are Refs
     /// the recovery / bridge-entry gcmap must root. Written at collect
     /// time; the 2-arg patched HIT path loads from `rd_locs` instead of
@@ -10939,7 +11104,7 @@ struct GuardInfo {
 
 fn infer_fail_arg_types(
     fail_arg_refs: &[OpRef],
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
@@ -10980,7 +11145,7 @@ fn infer_fail_arg_types(
 fn resolve_fail_arg_types(
     fail_arg_refs: &[OpRef],
     fd: Option<&dyn majit_ir::descr::FailDescr>,
-    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
+    type_index: &OpTypeIndex<'_, OpRc, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     op_def_positions: &IndexMap<u32, usize>,
     guard_op_index: usize,
@@ -11587,18 +11752,16 @@ impl CraneliftBackend {
         &mut self,
         inputargs: &[InputArgRc],
         ops: &[OpRc],
-    ) -> (Vec<Op>, Vec<GcRef>) {
+    ) -> (Vec<OpRc>, Vec<GcRef>) {
         // rewrite.py assemble_loop mutates the same ResOperation objects.
         normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(ops);
         {
             let rewriter = self.gc_rewriter();
             // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
-            // the borrowed pool is not extended.
-            let (result, gcrefs) = rewriter.rewrite_for_gc_with_constants(ops, &self.constants);
-            // Cranelift owns a `Vec<Op>` past this boundary.
-            let result: Vec<Op> = result.iter().map(|rc| (**rc).clone()).collect();
-            (result, gcrefs)
+            // the borrowed pool is not extended. The rewriter emits `OpRc`
+            // producers whose consumers' args point at them.
+            rewriter.rewrite_for_gc_with_constants(ops, &self.constants)
         }
     }
 
@@ -11611,7 +11774,7 @@ impl CraneliftBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         segments: &[MergeSegment],
-    ) -> Result<(Vec<Op>, Vec<GcRef>, Vec<usize>), BackendError> {
+    ) -> Result<(Vec<OpRc>, Vec<GcRef>, Vec<usize>), BackendError> {
         normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(ops);
         let mut parts: Vec<&[OpRc]> = Vec::with_capacity(segments.len() + 1);
@@ -11639,7 +11802,7 @@ impl CraneliftBackend {
             if index > 0 {
                 starts.push(out.len());
             }
-            out.extend(part.iter().map(|rc| (**rc).clone()));
+            out.extend(part.iter().cloned());
         }
         Ok((out, gcrefs, starts))
     }
@@ -12025,7 +12188,8 @@ impl CraneliftBackend {
         // entry overhead.  `MAJIT_DUMP_CLIF` prints it as `[jit][disasm-entry]`.
         let body_call_conv = cranelift_codegen::isa::CallConv::Tail;
         let is_bridge = is_bridge && merge.is_none();
-        let _has_dispatchable_label = is_bridge && ops.iter().any(op_is_dispatchable_label);
+        let _has_dispatchable_label =
+            is_bridge && ops.iter().any(|op| op_is_dispatchable_label(op));
         let bridge_arg_types: Vec<Type> = if is_bridge {
             inputargs.iter().map(|ia| ia.tp.get()).collect()
         } else {
@@ -12100,8 +12264,15 @@ impl CraneliftBackend {
         let num_inputs = inputargs.len();
         let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
-        let mut ref_root_slots =
+        let mut ref_root_boxes =
             build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
+        let project_ref_root_slots = |boxes: &[(Operand, usize)]| -> Vec<(u32, usize)> {
+            boxes
+                .iter()
+                .map(|(box_, slot)| (box_.to_opref().raw(), *slot))
+                .collect()
+        };
+        let mut ref_root_slots = project_ref_root_slots(&ref_root_boxes);
         // `prepare_bridge` / `_update_bindings`: a bridge inputarg starts
         // bound to the location the parent guard left it in. Loops keep
         // `_set_initial_bindings` identity (`i*8`) and a ref-root tail.
@@ -12173,7 +12344,9 @@ impl CraneliftBackend {
                             continue;
                         }
                     };
-                    let is_ref = ref_root_slots.iter().any(|(idx, _)| *idx == raw);
+                    let is_ref = ref_root_boxes
+                        .iter()
+                        .any(|(box_, _)| box_.to_opref().raw() == raw);
                     if is_ref {
                         if input_idxs.contains(&raw) {
                             *keep = true;
@@ -12226,11 +12399,12 @@ impl CraneliftBackend {
                 &demoted_vars,
                 fixed_area.max(identity_floor),
             );
-            for (var_idx, slot) in ref_root_slots.iter_mut() {
-                if let Some(&home) = var_slots.get(var_idx) {
+            for (box_, slot) in ref_root_boxes.iter_mut() {
+                if let Some(&home) = var_slots.get(&box_.to_opref().raw()) {
                     *slot = home;
                 }
             }
+            ref_root_slots = project_ref_root_slots(&ref_root_boxes);
             let mut demoted = IndexMap::new();
             for &var in &demoted_vars {
                 if let Some(&home) = var_slots.get(&var) {
@@ -12261,11 +12435,12 @@ impl CraneliftBackend {
                     &demoted_vars,
                     0,
                 );
-                for (var_idx, slot) in ref_root_slots.iter_mut() {
-                    if let Some(&home) = var_slots.get(var_idx) {
+                for (box_, slot) in ref_root_boxes.iter_mut() {
+                    if let Some(&home) = var_slots.get(&box_.to_opref().raw()) {
                         *slot = home;
                     }
                 }
+                ref_root_slots = project_ref_root_slots(&ref_root_boxes);
                 let mut packed = IndexMap::new();
                 for raw in demoted.keys().copied() {
                     if let Some(&home) = var_slots.get(&raw) {
@@ -12501,12 +12676,12 @@ impl CraneliftBackend {
         // the dense `jf_frame` area: slot index → the box living there. Read by
         // `get_gcmap` so the published words keep being forwarded for as long
         // as `is_still_alive` holds, not only across the call that wrote them.
-        let mut dense_ref_bindings: IndexMap<usize, u32> = IndexMap::new();
+        let mut dense_ref_bindings: IndexMap<usize, Operand> = IndexMap::new();
 
-        // regalloc.py compute_vars_longevity — last_usage for every
-        // non-constant box. get_gcmap reads the Ref-root subset;
-        // next_op_can_accept_cc looks up the comparison result in O(1).
-        let longevity = compute_vars_longevity(ops);
+        // regalloc.py compute_vars_longevity — last_usage lives on each
+        // producer box. get_gcmap / next_op_can_accept_cc read it there.
+        clear_compile_forwarded(inputargs, ops);
+        let _longevity = majit_backend::regalloc::compute_vars_longevity::<(), ()>(inputargs, ops);
 
         // pyjitpl.py `cpu.propagate_exception_descr` — snapshot the
         // attached descr pointer at compile time so the OpCode::CheckMemoryError
@@ -12811,11 +12986,20 @@ impl CraneliftBackend {
         let ref_root_gcmap_base = if absolute_homes { 0 } else { max_output_slots };
         let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (ref_root_gcmap_base as i32) * 8;
         if majit_log_enabled() {
+            let longevity_dump: Vec<(i32, i32)> = inputargs
+                .iter()
+                .map(|ia| Operand::from_bound_inputarg(ia))
+                .chain(ops.iter().map(Operand::from_bound_op))
+                .filter_map(|box_| {
+                    majit_backend::regalloc::get_lifetime::<(), ()>(&box_)
+                        .map(|lt| (lt.definition_pos.get(), lt.last_usage.get()))
+                })
+                .collect();
             eprintln!(
                 "[codegen] max_output={} ref_roots={} longevity={:?}",
                 max_output_slots,
                 ref_root_slots.len(),
-                longevity,
+                longevity_dump,
             );
         }
         let debug_declares = std::env::var_os("MAJIT_DEBUG_DECLARES").is_some();
@@ -13290,6 +13474,7 @@ impl CraneliftBackend {
             entry_block
         };
 
+        let mut skipped_dead_ops: usize = 0;
         let mut guard_idx: usize = 0;
         let mut guard_exit_shares = GuardExitShares::default();
         let mut last_ovf_flag: Option<CValue> = None;
@@ -13515,7 +13700,7 @@ impl CraneliftBackend {
             defined_ref_vars: IndexSet<u32>,
             synced_ref_vars: IndexSet<u32>,
             stale_ref_vars: IndexSet<u32>,
-            dense_ref_bindings: IndexMap<usize, u32>,
+            dense_ref_bindings: IndexMap<usize, Operand>,
             demoted_failarg_slots: IndexMap<u32, i32>,
             preamble_phase: bool,
         }
@@ -13886,6 +14071,22 @@ impl CraneliftBackend {
                 builder.ins().set_pinned_reg(jf_ptr);
             }
             let op = &ops[op_idx];
+            // `_walk_operations`: skip a `has_no_side_effect` op whose
+            // result is not in longevity. Same predicate as
+            // `compute_vars_longevity`'s dead-op `continue`.
+            // `possibly_free_vars_for_op`: cranelift has no `rm.reg_bindings`.
+            if op.opcode.result_type() != Type::Void && op.opcode.has_no_side_effect() {
+                let result = Operand::from_bound_op(op);
+                debug_assert_eq!(
+                    last_usage_of(&result).is_none(),
+                    majit_backend::regalloc::get_lifetime::<(), ()>(&result).is_none(),
+                    "dead-op skip: last_usage_of and get_lifetime must agree"
+                );
+                if last_usage_of(&result).is_none() {
+                    skipped_dead_ops += 1;
+                    continue;
+                }
+            }
             let vi = op_var_index(op, op_idx, num_inputs) as u32;
 
             let needs_jf_ptr = matches!(
@@ -13931,7 +14132,11 @@ impl CraneliftBackend {
                     | OpCode::CallAssemblerN
             );
             let live_ref_root_slots =
-                live_ref_root_slots_at(op_idx, &ref_root_slots, &longevity, &defined_ref_vars);
+                live_ref_root_slots_at(op_idx, &ref_root_boxes, &defined_ref_vars);
+            let live_ref_root_raw: Vec<(u32, usize)> = live_ref_root_slots
+                .iter()
+                .map(|(box_, slot)| (box_.to_opref().raw(), *slot))
+                .collect();
             // Every path of these calls runs `spill_ref_roots` over
             // `live_ref_root_slots` before the call; a CALL_MAY_FORCE does so
             // only when its callee can collect (`emit_indirect_call_from_parts`).
@@ -13961,7 +14166,7 @@ impl CraneliftBackend {
             {
                 let spilled: IndexSet<u32> = live_ref_root_slots
                     .iter()
-                    .map(|&(var_idx, _)| var_idx)
+                    .map(|(box_, _)| box_.to_opref().raw())
                     .filter(|&var_idx| var_idx != vi)
                     .chain(stale_ref_vars.iter().copied())
                     .collect();
@@ -13998,8 +14203,7 @@ impl CraneliftBackend {
                 ref_root_gcmap_base,
                 pre_call_failarg_slots,
                 &dense_ref_bindings,
-                &ref_root_slots,
-                &longevity,
+                &ref_root_boxes,
                 &defined_ref_vars,
                 &demoted_failarg_slots,
             );
@@ -14182,7 +14386,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntLe => emit_icmp(
@@ -14194,7 +14397,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntEq => emit_icmp(
@@ -14206,7 +14408,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntNe => emit_icmp(
@@ -14218,7 +14419,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntGt => emit_icmp(
@@ -14230,7 +14430,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::IntGe => emit_icmp(
@@ -14242,7 +14441,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintLt => emit_icmp(
@@ -14254,7 +14452,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintLe => emit_icmp(
@@ -14266,7 +14463,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintGt => emit_icmp(
@@ -14278,7 +14474,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::UintGe => emit_icmp(
@@ -14290,7 +14485,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
 
@@ -14304,7 +14498,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
                 OpCode::PtrNe | OpCode::InstancePtrNe => emit_icmp(
@@ -14316,7 +14509,6 @@ impl CraneliftBackend {
                     vi,
                     ops,
                     op_idx,
-                    &longevity,
                     &mut guard_success_cc,
                 ),
 
@@ -15691,7 +15883,7 @@ impl CraneliftBackend {
                         call_conv,
                         ptr_type,
                         jf_ptr,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -15934,7 +16126,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -16003,12 +16195,12 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
-                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
+                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_raw);
                         // _call_assembler_check_descr (assembler.py):
                         //   CMP [eax + jf_descr_ofs], done_with_this_frame_descr
                         let fail_idx_raw = builder.ins().load(
@@ -16073,7 +16265,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -16135,12 +16327,12 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
-                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
+                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_raw);
                         builder
                             .ins()
                             .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
@@ -16169,7 +16361,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -16205,12 +16397,12 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
-                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
+                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_raw);
 
                         let outcome_kind =
                             builder
@@ -16264,7 +16456,7 @@ impl CraneliftBackend {
                     if op.result_type() != Type::Void {
                         builder.def_var(var(&opref_var_map, vi), merged_result);
                     }
-                    mark_ref_roots_synced(&mut synced_ref_vars, &live_ref_root_slots);
+                    mark_ref_roots_synced(&mut synced_ref_vars, &live_ref_root_raw);
                 }
 
                 OpCode::CallMayForceI
@@ -16330,7 +16522,7 @@ impl CraneliftBackend {
                         call_conv,
                         ptr_type,
                         call_jf,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -16415,7 +16607,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         call_jf,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -16542,7 +16734,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         jf_ptr,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
@@ -16603,7 +16795,7 @@ impl CraneliftBackend {
                             call_conv,
                             ptr_type,
                             call_jf,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -16680,7 +16872,7 @@ impl CraneliftBackend {
                             call_conv,
                             ptr_type,
                             call_jf,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -16796,7 +16988,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -16824,7 +17016,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr_slow,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
@@ -16869,7 +17061,7 @@ impl CraneliftBackend {
                             ptr_type,
                             call_conv,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -17010,7 +17202,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -17042,7 +17234,7 @@ impl CraneliftBackend {
                             &mut builder,
                             &opref_var_map,
                             jf_ptr_slow,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
@@ -17204,7 +17396,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         jf_ptr,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -17228,7 +17420,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         jf_ptr_slow,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
@@ -17341,7 +17533,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         jf_ptr,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -17368,7 +17560,7 @@ impl CraneliftBackend {
                         &mut builder,
                         &opref_var_map,
                         jf_ptr_slow,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
@@ -19622,7 +19814,7 @@ impl CraneliftBackend {
                             ptr_type,
                             call_conv,
                             cur_jf,
-                            &live_ref_root_slots,
+                            &live_ref_root_raw,
                             &defined_ref_vars,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
@@ -19717,7 +19909,7 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         jf_ptr,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -19947,7 +20139,7 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         jf_ptr,
-                        &live_ref_root_slots,
+                        &live_ref_root_raw,
                         &defined_ref_vars,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
@@ -20004,6 +20196,10 @@ impl CraneliftBackend {
             // shows that.
             ctx.set_disasm(true);
             // Independent debug toggle — not gated by MAJIT_LOG.
+            eprintln!(
+                "[jit][dead-op-skip] trace_id={trace_id} skipped={skipped_dead_ops} num_ops={}",
+                ops.len()
+            );
             eprintln!(
                 "[jit][clif-dump] trace_id={trace_id} header_pc={header_pc} num_inputs={} num_ops={}\n{}",
                 inputargs.len(),
@@ -20495,7 +20691,7 @@ const FAIL_LOC_REF_ROOT: usize = 1 << 30;
 const FAIL_LOC_DEMOTED: usize = 1 << 31;
 const FAIL_LOC_PAYLOAD: usize = (1 << 30) - 1;
 
-fn max_finish_arity(ops: &[Op]) -> usize {
+fn max_finish_arity(ops: &[OpRc]) -> usize {
     ops.iter()
         .filter(|op| op.opcode == OpCode::Finish)
         .map(|op| op.num_args())
@@ -20506,7 +20702,7 @@ fn max_finish_arity(ops: &[Op]) -> usize {
 /// Widest LABEL in this function. The loader still reads `ITEM0 + i*8`
 /// for `0..arity` (item 4); the dense region has to cover those slots so
 /// a packed guard cannot slide the ref-root tail over a carried value.
-fn max_label_arity(ops: &[Op]) -> usize {
+fn max_label_arity(ops: &[OpRc]) -> usize {
     ops.iter()
         .filter(|op| op.opcode == OpCode::Label)
         .map(|op| op.num_args())
@@ -20566,7 +20762,7 @@ fn find_frame_location(occupied: &IndexSet<usize>, start: usize) -> usize {
 /// used in the loop survives the back edge.
 fn compute_bridge_home_intervals(
     inputargs: &[InputArgRc],
-    ops: &[Op],
+    ops: &[OpRc],
     home_vars: &IndexSet<u32>,
 ) -> IndexMap<u32, (usize, usize)> {
     let num_inputs = inputargs.len();
@@ -20860,7 +21056,7 @@ fn pack_fail_locs(
 
 fn demoted_home_index_map(
     loop_phi_keep_by_label: &IndexMap<usize, Vec<bool>>,
-    ops: &[Op],
+    ops: &[OpRc],
     ref_root_slots: &[(u32, usize)],
     mut occupied: Option<&mut IndexSet<usize>>,
     start: usize,
@@ -20889,7 +21085,7 @@ fn demoted_home_index_map(
 
 fn resolve_fail_locs_and_stamp(
     guard_infos: &mut [GuardInfo],
-    ops: &[Op],
+    ops: &[OpRc],
     fail_descrs: &[DescrRef],
     max_output_slots: usize,
     _num_ref_roots: usize,
@@ -21004,7 +21200,7 @@ fn stamp_guard_value_counter(info: &GuardInfo, op: &Op, fd: &dyn FailDescr) {
 /// (`llmodel.py get_value_direct`); it does not need to sit past `rd_locs.len()`.
 fn counter_slot_for(
     inputargs: &[InputArgRc],
-    ops: &[Op],
+    ops: &[OpRc],
     homes: &FailArgHomes<'_>,
     finish_arity: usize,
 ) -> Option<usize> {
@@ -21025,7 +21221,7 @@ fn counter_slot_for(
 
 fn precompute_max_output_slots(
     inputargs: &[InputArgRc],
-    ops: &[Op],
+    ops: &[OpRc],
     homes: &FailArgHomes<'_>,
     finish_arity: usize,
 ) -> usize {
@@ -21089,7 +21285,7 @@ fn precompute_max_output_slots(
 }
 
 fn collect_guards(
-    ops: &[Op],
+    ops: &[OpRc],
     inputargs: &[InputArgRc],
     counter_slot: Option<usize>,
     fail_descrs: &mut Vec<DescrRef>,
@@ -21131,8 +21327,9 @@ fn collect_guards(
 
         let fail_index = fail_descrs.len() as u32;
 
-        let (fail_arg_refs, fail_arg_types) = if is_finish || is_external_jump {
-            let refs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        let (fail_arg_refs, fail_arg_boxes, fail_arg_types) = if is_finish || is_external_jump {
+            let boxes: Vec<Operand> = op.getarglist().iter().cloned().collect();
+            let refs: Vec<OpRef> = boxes.iter().map(|a| a.to_opref()).collect();
             // Use the descriptor's explicit types for FINISH args — these are
             // set by the tracer and represent the caller's view of the return
             // type, which may differ from the op's inferred type (e.g. New
@@ -21146,7 +21343,7 @@ fn collect_guards(
             } else {
                 infer_fail_arg_types(&refs, &type_index, &type_overrides, op_idx)?
             };
-            (refs, types)
+            (refs, boxes, types)
         } else {
             // x86/regalloc.py locs_for_fail iterates guard_op.getfailargs()
             // directly. Production stamps the list in compile.py
@@ -21156,7 +21353,8 @@ fn collect_guards(
             let fa = op
                 .getfailargs()
                 .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode));
-            let refs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
+            let boxes: Vec<Operand> = fa.iter().cloned().collect();
+            let refs: Vec<OpRef> = boxes.iter().map(|a| a.to_opref()).collect();
             let __descr_arc_descr_fd = op.getdescr();
             let descr_fd = __descr_arc_descr_fd
                 .as_ref()
@@ -21184,7 +21382,7 @@ fn collect_guards(
                     op_idx,
                 )?,
             };
-            (refs, types)
+            (refs, boxes, types)
         };
 
         // The counter slot sits past the whole value area, so reserving it
@@ -21553,6 +21751,7 @@ fn collect_guards(
             stub_addr: 0,
             redirect_resident_failargs: !preserve_descrs && is_guard,
             fail_arg_refs,
+            fail_arg_boxes,
             fail_arg_types,
             fail_locs,
             counter_value_spill,
@@ -21802,16 +22001,10 @@ impl CraneliftBackend {
         else {
             return;
         };
-        let op_rcs: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let Ok(mut merged) = self.do_compile(
-            &inputargs,
-            &op_rcs,
-            Some(flag_ptr),
-            false,
-            Some(&plan),
-            None,
-        ) else {
+        let Ok(mut merged) =
+            self.do_compile(&inputargs, &ops, Some(flag_ptr), false, Some(&plan), None)
+        else {
             return;
         };
         // `x86/assembler.py gcreftracers.append(tracer)` +
@@ -22070,6 +22263,8 @@ impl majit_backend::Backend for CraneliftBackend {
         // instead of once per entry into one.
         slice_x2_probe::arm_reporter();
         token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
+        #[cfg(test)]
+        rebind_trace_arg_boxes(inputargs, ops);
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
@@ -22212,6 +22407,8 @@ impl majit_backend::Backend for CraneliftBackend {
         // Same close as `compile_loop`: bridge lowering reads `type_info_group`.
         majit_gc::ensure_type_registry_closed();
         let _writing = majit_backend::AssemblerWriting::enter();
+        #[cfg(test)]
+        rebind_trace_arg_boxes(inputargs, ops);
         // `x86/runner.py:100-101` parity — bump this backend's
         // tracker and the per-loop bridges_count before assembling.
         if let Some(clt) = original_token.compiled_loop_token() {
@@ -24674,7 +24871,6 @@ mod tests {
             mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
         ];
 
-        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         assert_eq!(
             compute_loop_phi_keep(&ops, &[1]).get(&1),
             Some(&vec![false])
@@ -24694,7 +24890,6 @@ mod tests {
             mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
         ];
 
-        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         assert_eq!(
             compute_loop_phi_keep(&ops, &[2]).get(&2),
             Some(&vec![false])
@@ -24720,7 +24915,6 @@ mod tests {
             mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), outer),
         ];
 
-        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         assert_eq!(
             compute_loop_phi_keep(&ops, &[1, 2]).get(&1),
             Some(&vec![false])
@@ -26154,7 +26348,6 @@ mod tests {
             mk_op(OpCode::Jump, &[inv, inv], OpRef::NONE.raw()),
         ];
 
-        let ops: Vec<Op> = ops.iter().map(|op| (**op).clone()).collect();
         assert_eq!(
             compute_loop_phi_keep(&ops, &[2]).get(&2),
             None,
@@ -27088,8 +27281,11 @@ mod tests {
                 label.clone(),
             ),
         ];
-        let closed: Vec<Op> = closed.iter().map(|op| snapshot_op(op)).collect();
-        assert_eq!(member_entry_args(&closed), Some(vec![OpRef::int_op(5)]));
+        assert_eq!(
+            member_entry_args(&closed)
+                .map(|args| args.iter().map(|a| a.to_opref()).collect::<Vec<_>>()),
+            Some(vec![OpRef::int_op(5)])
+        );
         let leaking = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -27100,7 +27296,6 @@ mod tests {
             mk_op(OpCode::IntAdd, &[OpRef::int_op(5), OpRef::int_op(6)], 1),
             mk_op_with_descr(OpCode::Jump, &[n], OpRef::NONE.raw(), label),
         ];
-        let leaking: Vec<Op> = leaking.iter().map(|op| snapshot_op(op)).collect();
         assert_eq!(member_entry_args(&leaking), None);
     }
 
@@ -28813,12 +29008,12 @@ mod tests {
         let _const_ptr_guard = const_ptr_gc_test_guard();
         let ptr = majit_ir::GcRef(0x93_0000_A000);
         let const_op = |opcode| {
-            Op::new(
+            OpRc::new(Op::new(
                 opcode,
                 &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
                     ptr,
                 ))],
-            )
+            ))
         };
         for opcode in [OpCode::DebugMergePoint, OpCode::JitDebug] {
             let op = const_op(opcode);
@@ -28862,12 +29057,12 @@ mod tests {
         let root = gc.alloc_with_type(type_id, 16);
         let table = majit_gc::GcTable::from_gcrefs(&[root]);
         gc.remember_gc_table(&table);
-        let used = Op::new(
+        let used = OpRc::new(Op::new(
             OpCode::SameAsR,
             &[majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
                 root,
             ))],
-        );
+        ));
         gc.collect_nursery();
         let moved = table.slot(0);
         assert_ne!(moved, root);
@@ -35801,13 +35996,10 @@ mod tests {
     fn demoted_home_index_map_one_slot_per_box_across_labels() {
         let i0 = OpRef::input_arg_int(0);
         let i1 = OpRef::input_arg_int(1);
-        let ops: Vec<Op> = vec![
+        let ops = vec![
             mk_op(OpCode::Label, &[i0, i1], 0),
             mk_op(OpCode::Label, &[i0, i1], 1),
-        ]
-        .into_iter()
-        .map(|o| o.as_ref().clone())
-        .collect();
+        ];
         let mut keep = IndexMap::new();
         keep.insert(0, vec![false, false]);
         keep.insert(1, vec![false, false]);
@@ -35829,7 +36021,6 @@ mod tests {
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 3),
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let mut home_vars = IndexSet::new();
         home_vars.insert(1);
         home_vars.insert(3);
@@ -35900,7 +36091,6 @@ mod tests {
             mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 6),
             mk_op(OpCode::Finish, &[OpRef::ref_op(6)], OpRef::NONE.raw()),
         ];
-        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let mut home_vars = IndexSet::new();
         for ia in &inputargs {
             home_vars.insert(ia.index);
@@ -35948,7 +36138,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let mut home_vars = IndexSet::new();
         home_vars.insert(0);
         home_vars.insert(1);
@@ -35979,7 +36168,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let mut home_vars = IndexSet::new();
         home_vars.insert(0);
         home_vars.insert(1);

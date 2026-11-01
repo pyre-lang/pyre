@@ -1086,14 +1086,20 @@ fn niche_word_lltype(
 pub(crate) fn scalar_lltype(
     spelling: &str,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    scalar_lltype_for(spelling, crate::layout::target_signed_size())
+}
+
+fn scalar_lltype_for(
+    spelling: &str,
+    signed_size: usize,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     Some(match spelling {
         "i8" | "i16" | "i32" | "isize" => LowLevelType::Signed,
         "u8" | "u16" | "u32" | "usize" => LowLevelType::Unsigned,
-        // A 32-bit target's machine word is not `i64`. RPython uses
-        // `SignedLongLong` / `UnsignedLongLong` for those fields.
-        "i64" if crate::layout::target_word_size() == 4 => LowLevelType::SignedLongLong,
-        "u64" if crate::layout::target_word_size() == 4 => LowLevelType::UnsignedLongLong,
+        // SignedLongLong is used only when the target's Signed is 4 bytes.
+        "i64" if signed_size == 4 => LowLevelType::SignedLongLong,
+        "u64" if signed_size == 4 => LowLevelType::UnsignedLongLong,
         "i64" => LowLevelType::Signed,
         "u64" => LowLevelType::Unsigned,
         "i128" => LowLevelType::SignedLongLongLong,
@@ -6694,6 +6700,21 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    #[test]
+    fn scalar_lltype_i64_follows_signed_size() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        assert_eq!(scalar_lltype_for("i64", 8), Some(LowLevelType::Signed));
+        assert_eq!(
+            scalar_lltype_for("i64", 4),
+            Some(LowLevelType::SignedLongLong)
+        );
+        assert_eq!(scalar_lltype_for("u64", 8), Some(LowLevelType::Unsigned));
+        assert_eq!(
+            scalar_lltype_for("u64", 4),
+            Some(LowLevelType::UnsignedLongLong)
+        );
     }
 
     #[test]

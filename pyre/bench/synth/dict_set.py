@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=58
+# pyre-check: max-pypy-ratio=33.6
+# Widest CI cranelift 29.2x (ubuntu); macOS cranelift 12.8x sits above the
+# 8.4x floor. Ceiling = 29.2 x 1.15.
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they

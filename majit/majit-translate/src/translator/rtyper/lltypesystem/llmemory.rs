@@ -899,28 +899,34 @@ pub trait OffsetLayout {
     fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64>;
     /// `symbolic.get_size(STRUCT)` — total struct byte size.
     fn struct_size(&self, struct_name: &str) -> Option<i64>;
-    /// `symbolic.get_size(lltype.Signed)` — the target word
-    /// (`layout::target_word_size`), not the host `usize`.
-    /// `Signed` / `Unsigned` / `Address` item sizes read this. A layout
-    /// aimed at another word (a 4-byte target while this process is
-    /// 8-byte) overrides it; every other layout uses the target word.
+    /// Pointer / Address width (`layout::target_word_size`), not the host
+    /// `usize`. Pointer items and length-prefixed array headers read this.
+    /// `Signed` / `Unsigned` use [`crate::layout::target_signed_size`]. A
+    /// layout aimed at another pointer width (a 4-byte target while this
+    /// process is 8-byte) overrides it; every other layout uses the target
+    /// pointer size.
     fn word_bytes(&self) -> i64 {
         crate::layout::target_word_size() as i64
     }
 }
 
 /// Byte size of a primitive `LowLevelType`. Mirrors
-/// `symbolic.get_size(TYPE)` (symbolic.py:24), which resolves to
-/// `ctypes.sizeof(ll2ctypes.get_ctypes_type(TYPE))`. `Signed` /
-/// `Unsigned` / `Address` are the target word (`word`, from
-/// [`OffsetLayout::word_bytes`]). `long long` and `double` stay 8 on
-/// every target this codewriter emits; the host `usize` is not their
-/// width. `UniChar` is [`sizeof_wchar_t`] (`r_wchar_t.BITS/8`);
-/// `LongFloat` is the target-derived `long double` width
-/// ([`sizeof_longfloat`]).
+/// `symbolic.get_size(TYPE)`, which resolves to
+/// `ctypes.sizeof(ll2ctypes.get_ctypes_type(TYPE))`. `Address` is the
+/// target pointer width (`word`, from [`OffsetLayout::word_bytes`]).
+/// `Signed` / `Unsigned` are `signed` ([`crate::layout::target_signed_size`]).
+/// `long long` and `double` stay 8 on every target this codewriter emits;
+/// the host `usize` is not their width. `UniChar` is [`sizeof_wchar_t`]
+/// (`r_wchar_t.BITS/8`); `LongFloat` is the target-derived `long double`
+/// width ([`sizeof_longfloat`]).
 fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
+    primitive_byte_size_for(ty, word, crate::layout::target_signed_size() as i64)
+}
+
+fn primitive_byte_size_for(ty: &LowLevelType, word: i64, signed: i64) -> Result<i64, String> {
     match ty {
-        LowLevelType::Signed | LowLevelType::Unsigned | LowLevelType::Address => Ok(word),
+        LowLevelType::Signed | LowLevelType::Unsigned => Ok(signed),
+        LowLevelType::Address => Ok(word),
         LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong | LowLevelType::Float => {
             Ok(8)
         }
@@ -1667,6 +1673,17 @@ mod tests {
             name,
             vec![("f".to_string(), LowLevelType::Signed)],
         )))
+    }
+
+    #[test]
+    fn primitive_byte_size_splits_signed_from_pointer() {
+        assert_eq!(primitive_byte_size_for(&LowLevelType::Signed, 4, 8), Ok(8));
+        assert_eq!(
+            primitive_byte_size_for(&LowLevelType::Unsigned, 4, 8),
+            Ok(8)
+        );
+        assert_eq!(primitive_byte_size_for(&LowLevelType::Address, 4, 8), Ok(4));
+        assert_eq!(primitive_byte_size_for(&LowLevelType::Signed, 4, 4), Ok(4));
     }
 
     #[test]

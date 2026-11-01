@@ -905,10 +905,10 @@ fn transduce_op(
                 _ => unreachable!(),
             };
             // 32-bit longlong is the float bank (`f64` bits). 64-bit stays
-            // an int. The registered helper uses the same split. This
-            // lowering runs in the host prepass, so the width is the
-            // cargo target's, not `size_of::<usize>()`.
-            let longlong_is_float = crate::layout::target_word_size() < 8;
+            // an int. `rewrite_op_cast_int_to_longlong` residualizes to
+            // `llong_from_*`; the result kind follows `is_64_bit`
+            // (`longlong.py`): Signed width 8 is int, otherwise float.
+            let longlong_is_float = !crate::codewriter::longlong::is_64_bit();
             let result_kind = if longlong_is_float { 'f' } else { 'i' };
             let result_ll = if longlong_is_float {
                 majit_ir::value::Type::Float

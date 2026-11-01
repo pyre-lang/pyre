@@ -8525,6 +8525,11 @@ pub enum ConcreteType {
     Unknown,
 }
 
+/// `rffi.sizeof(SignedLongLong) > rffi.sizeof(lltype.Signed)`.
+fn longlong_wider_than_signed(signed_size: usize) -> bool {
+    8 > signed_size
+}
+
 /// `rpython/jit/metainterp/history.py getkind(TYPE, ...)`.
 ///
 /// Direct line-by-line port — the canonical
@@ -8600,12 +8605,13 @@ pub fn try_getkind(
         //          assert rffi.sizeof(TYPE) == 8
         //          return 'float'
         //      raise NotImplementedError("type %s is too large" % TYPE)`
-        // On 64-bit `Signed` is 8 bytes, so SignedLongLong does not
-        // exceed it and falls through to `"int"` even when
-        // `supports_longlong` is false. On 32-bit the 8-byte longlong
-        // takes the `'float'` slot only when the flag is set.
+        // The comparison is against the target's Signed size. When Signed
+        // is 8 bytes, SignedLongLong does not exceed it and falls through
+        // to `"int"` even when `supports_longlong` is false. When Signed
+        // is 4, the 8-byte longlong takes the `'float'` slot only when
+        // the flag is set.
         LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
-            if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
+            if longlong_wider_than_signed(crate::layout::target_signed_size()) {
                 if supports_longlong {
                     Ok(ConcreteType::Float)
                 } else {
@@ -11320,6 +11326,12 @@ impl FunctionGraph {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn longlong_wider_than_signed_compares_against_signed_size() {
+        assert!(!longlong_wider_than_signed(8));
+        assert!(longlong_wider_than_signed(4));
+    }
 
     /// `merge_from`'s contract is that every set flag in `other` wins and that
     /// registration order does not matter. Each boolean is folded by hand, so

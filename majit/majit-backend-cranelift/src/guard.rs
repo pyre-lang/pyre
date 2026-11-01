@@ -16,17 +16,18 @@
 // resume_guard_descr`.  PyPy `AbstractFailDescr._attrs_` (history.py)
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
-use majit_ir::{DescrRef, InputArgRc, Op};
+use majit_ir::{DescrRef, InputArgRc, OpRc};
 use std::sync::Arc;
 
 /// Inputs a later merged recompile (`assembler.py patch_jump_for_descr`)
-/// needs from one already-compiled function. The `Op`s are a fresh snapshot:
-/// they do not alias the `OpRc`s the metainterp keeps mutating. `None` on
-/// the owner when `merge_source_eligible` refuses the trace.
+/// needs from one already-compiled function. The `OpRc`s are a frozen copy
+/// whose args point at those copied producers, so rewrite of the caller's
+/// originals cannot alias them. `None` on the owner when
+/// `merge_source_eligible` refuses the trace.
 pub struct MergeSource {
     pub trace_id: u64,
     pub inputargs: Vec<InputArgRc>,
-    pub ops: Vec<Op>,
+    pub ops: Vec<OpRc>,
     /// Every reference constant of `ops` that the compile put in its
     /// `GcTable`, bound to that table slot once the compile returns.
     /// Nothing traces the `ConstPtr` an op was retained with, so a major
