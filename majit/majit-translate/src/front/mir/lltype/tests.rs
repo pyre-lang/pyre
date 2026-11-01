@@ -9112,3 +9112,45 @@ fn transparent_handle_over_gctype_header_pointer_is_ref() {
         "transparent handle over the GC pointer is Ref, not Int"
     );
 }
+
+#[test]
+fn registered_gc_ptr_gcrefopaque_has_no_class_root() {
+    // `GCREFOpaque` has no class root (`llmemory.GCREF`). A `PyObjectRef`
+    // residual stays `"ref"` + class root.
+    let llbc = kwargs_unerase_cast_llbc(true);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    let fd = llbc.fn_by_id(0).expect("unerase");
+    let input = fd.signature.inputs.first().expect("dstorage");
+    assert_eq!(
+        super::registered_gc_ptr_class_root_with(
+            input,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            &gc,
+            &empty,
+        ),
+        None
+    );
+    assert_eq!(
+        dont_look_inside_return_token(
+            input,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+        )
+        .as_deref(),
+        Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE)
+    );
+    assert_eq!(
+        super::dont_look_inside_return_class_root(
+            input,
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+            &gc,
+            &empty,
+        ),
+        None
+    );
+}

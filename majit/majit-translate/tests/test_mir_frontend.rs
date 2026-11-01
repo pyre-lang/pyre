@@ -3489,6 +3489,11 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
 /// `FrameBox::new` stores the operand of `OwnerRootGuard::new(r)` in
 /// `owner_root`. `frame_ptr`'s `Some` arm returns that word, and
 /// `deref_mut` passes it on as the frame.
+///
+/// The owner_root FieldRead is a classdef-less `Ref` (`llmemory.GCREF`).
+/// `cast_gcref_to_instance` (`rgc.py`) / `annotationoftype` then names
+/// the dest `PyFrame`. That CAST is not the identity recast
+/// `result_narrow_root` used to emit (`rclass.py` `getinstancerepr`).
 #[test]
 fn frame_box_owner_root_word_roundtrips() {
     use majit_translate::front::mir::{LowerContext, lower_fun_decl};
@@ -3545,17 +3550,35 @@ fn frame_box_owner_root_word_roundtrips() {
             .collect()
     }
 
-    /// Field read reached only by forwarding block arguments.
+    /// Field read reached only by forwarding block arguments and at
+    /// most one `__cast_instance_intrinsic` of that word onto the dest
+    /// class. The Some arm's operand must be the `owner_root` FieldRead.
     fn pure_field_read<'a>(
         graph: &'a FunctionGraph,
         id: u64,
         seen: &mut Vec<u64>,
+        through_instance: &mut bool,
     ) -> &'a majit_translate::model::FieldDescriptor {
         assert!(!seen.contains(&id), "cycle at v{id}");
         seen.push(id);
         if let Some(op) = op_result(graph, id) {
             match &op.kind {
                 OpKind::FieldRead { field, .. } => field,
+                OpKind::Call {
+                    target,
+                    args,
+                    result_ty,
+                } if call_target_text(target) == "__cast_instance_intrinsic" => {
+                    assert!(
+                        !*through_instance,
+                        "v{id} is a second __cast_instance_intrinsic, result_ty={result_ty:?}"
+                    );
+                    *through_instance = true;
+                    let operand = args.first().and_then(value_id).unwrap_or_else(|| {
+                        panic!("__cast_instance_intrinsic has no operand: {args:?}")
+                    });
+                    pure_field_read(graph, operand, seen, through_instance)
+                }
                 other => panic!("v{id} is {other:?}, not the owner_root word"),
             }
         } else {
@@ -3565,7 +3588,7 @@ fn frame_box_owner_root_word_roundtrips() {
                 1,
                 "v{id} is not a forward of one field read: {srcs:?}"
             );
-            pure_field_read(graph, srcs[0], seen)
+            pure_field_read(graph, srcs[0], seen, through_instance)
         }
     }
 
@@ -3647,7 +3670,14 @@ fn frame_box_owner_root_word_roundtrips() {
                 .and_then(value_id)
                 .unwrap_or_else(|| panic!("frame_ptr return link has no value"));
             let mut seen = Vec::new();
-            let field = pure_field_read(&frame_ptr, arg, &mut seen);
+            let mut through_instance = false;
+            let field = pure_field_read(&frame_ptr, arg, &mut seen, &mut through_instance);
+            if field.name == "owner_root" {
+                assert!(
+                    through_instance,
+                    "Some arm recasts the GCREF owner_root word onto PyFrame"
+                );
+            }
             arms.push((field.name.clone(), field.taken_by_address));
         }
     }

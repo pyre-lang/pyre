@@ -1,5 +1,6 @@
 use super::{
-    cast_call_segments, cast_kind_is_raw_ptr, int_binop_needs_ptr_to_int, item_lltype_for_size,
+    cast_call_segments, cast_kind_is_raw_ptr, instance_roots_match, int_binop_needs_ptr_to_int,
+    item_lltype_for_size,
 };
 
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
@@ -30,6 +31,16 @@ fn int_cast_action_narrows_inside_the_64_bit_int_box() {
         Some(super::IntCastAction::RUint)
     );
     assert_eq!(super::int_cast_action(128, false, 64, false), None);
+}
+
+#[test]
+fn instance_roots_match_equates_leaf_and_qualified_spellings() {
+    assert!(instance_roots_match("pyframe::PyFrame", "pyframe::PyFrame"));
+    assert!(instance_roots_match("pyframe::PyFrame", "PyFrame"));
+    assert!(!instance_roots_match(
+        "pyframe::PyFrame",
+        "pyobject::PyObject"
+    ));
 }
 
 #[test]

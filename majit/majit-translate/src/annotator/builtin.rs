@@ -2263,7 +2263,8 @@ fn cast_instance_intrinsic(
     };
     let can_be_none = match operand {
         SomeValue::Instance(_) | SomeValue::None_(_) => operand_can_be_none,
-        SomeValue::Ptr(_) | SomeValue::Address(_) => false,
+        // CastBasePtrToInstanceEntry.compute_result_annotation
+        SomeValue::Ptr(_) | SomeValue::Address(_) => true,
         // `addr_of_mut!((*entries).items).cast()` reads `[Entry; 0]`.
         // The field projects as a list of `Impossible`. The cast target
         // is `*mut Entry`, the address of that tail.
@@ -5496,6 +5497,54 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_ptr_source_is_nullable() {
+        // CastBasePtrToInstanceEntry.compute_result_annotation
+        // returns SomeInstance(classdef, can_be_None=True) for a pointer source.
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+
+        let bk = bk();
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("PyObject"))
+            .expect("PyObject root constant");
+        let s_ptr = lltype_to_annotation((*GCREF).clone());
+        assert!(
+            matches!(s_ptr, SomeValue::Ptr(_)),
+            "GCREF is SomePtr, got {s_ptr:?}"
+        );
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root.clone())],
+            &no_kwds(),
+        )
+        .expect("Ptr → instance is cast_base_ptr_to_instance");
+        let SomeValue::Instance(inst) = out else {
+            panic!("Ptr source must be SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "CastBasePtrToInstanceEntry.compute_result_annotation is can_be_None=True"
+        );
+
+        let s_addr = SomeValue::Address(crate::annotator::model::SomeAddress::new());
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_addr), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("Address → instance is cast_base_ptr_to_instance");
+        let SomeValue::Instance(inst) = out else {
+            panic!("Address source must be SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "CastBasePtrToInstanceEntry.compute_result_annotation is can_be_None=True"
+        );
     }
 
     #[test]

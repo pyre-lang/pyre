@@ -1101,6 +1101,263 @@ fn gcref_cast_to_lowlevel_string_header_emits_cast_instance_str() {
     );
 }
 
+/// `usize as PyObjectRef` is UnaryOp Cast `PtrWithExposedProvenance`.
+/// 1-arg `ann_cast_int_to_ptr` is SomePtr(GCREF); the registered dest
+/// is then `cast_gcref_to_instance` / `annotationoftype`. A GCREFOpaque
+/// dest stays the GCREF word.
+#[test]
+fn int_to_registered_gc_ptr_emits_cast_int_to_ptr_then_instance() {
+    use crate::model::{CallTarget, OpKind};
+    let span = fixture_span();
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {
+                "id": id,
+                "generics": {
+                    "regions": [], "types": [],
+                    "const_generics": [], "trait_refs": []
+                },
+                "builtin": null
+            }
+        })
+    };
+    let object_decl = struct_decl(
+        0,
+        ident_path(&["pyobject", "PyObject"]),
+        serde_json::json!([]),
+        false,
+    );
+    let gcref = struct_decl(
+        1,
+        ident_path(&["header", "GCREFOpaque"]),
+        serde_json::json!([]),
+        false,
+    );
+    let src_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+    let py_ptr = serde_json::json!({"RawPtr": [adt(0), "Mut"]});
+    let gcref_ptr = serde_json::json!({"RawPtr": [adt(1), "Mut"]});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let cast_fn = |def_id: u64, name: &str, dest_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "addr", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, dest_ty),
+                            {"UnaryOp": [
+                                {"Cast": {"PtrWithExposedProvenance": dest_ty.clone()}},
+                                {"Move": place(1, &src_ty)}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    });
+    let impl_row = |self_id: u64| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [{"Value": [self_id, adt(self_id)]}]}}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [object_decl, gcref],
+            "fun_decls": [
+                cast_fn(0, "as_pyobject", &py_ptr),
+                cast_fn(1, "as_gcref", &gcref_ptr)
+            ],
+            "global_decls": [],
+            "trait_decls": [gctype],
+            "trait_impls": [impl_row(0), impl_row(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_cast_int_to_ptr = |kind: &OpKind| match kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+        _ => false,
+    };
+    let py = super::lower_function(&llbc, "as_pyobject").expect("lower as_pyobject");
+    assert!(
+        py.blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| is_cast_int_to_ptr(&op.kind)),
+        "int→PyObjectRef keeps ann_cast_int_to_ptr; graph={}",
+        py.dump()
+    );
+    assert!(
+        py.blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                crate::model::cast_instance_root(&op.kind)
+                    .is_some_and(|root| root.contains("PyObject"))
+            }),
+        "int→PyObjectRef then cast_gcref_to_instance; graph={}",
+        py.dump()
+    );
+    let gcref_graph = super::lower_function(&llbc, "as_gcref").expect("lower as_gcref");
+    assert!(
+        gcref_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| is_cast_int_to_ptr(&op.kind)),
+        "int→GCREF keeps ann_cast_int_to_ptr; graph={}",
+        gcref_graph.dump()
+    );
+    assert!(
+        !gcref_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                crate::model::cast_instance_root(&op.kind)
+                    .is_some_and(|root| root.contains("GCREF") || root.contains("GCREFOpaque"))
+            }),
+        "GCREF dest is not narrowed to an instance; graph={}",
+        gcref_graph.dump()
+    );
+}
+
+/// `*mut PyObject as *mut PyObject` is already `Ref(Some(root))` of the
+/// dest class (`rclass.py` `getinstancerepr`). The identity recast
+/// `result_narrow_root` used to emit is omitted.
+#[test]
+fn identity_registered_gc_ptr_cast_does_not_emit_instance() {
+    let span = fixture_span();
+    let adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let object_decl = struct_decl(
+        0,
+        ident_path(&["pyobject", "PyObject"]),
+        serde_json::json!([]),
+        false,
+    );
+    let py_ptr = serde_json::json!({"RawPtr": [adt.clone(), "Mut"]});
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let id_fn = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "id_pyobject"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [py_ptr.clone()],
+            "output": py_ptr.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": py_ptr.clone()},
+                {"index": 1, "name": "p", "span": span, "ty": py_ptr.clone()}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(0, &py_ptr),
+                        {"UnaryOp": [
+                            {"Cast": {"RawPtr": [py_ptr.clone(), py_ptr.clone()]}},
+                            {"Move": place(1, &py_ptr)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let gctype = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["majit_gc", "header", "GcType"]))
+    });
+    let impl_row = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": [{"Value": [0, adt]}]} }
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [object_decl],
+            "fun_decls": [id_fn],
+            "global_decls": [],
+            "trait_decls": [gctype],
+            "trait_impls": [impl_row]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "id_pyobject").expect("lower id_pyobject");
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| { crate::model::cast_instance_root(&op.kind).is_some() }),
+        "identity *mut PyObject recast is omitted; graph={}",
+        graph.dump()
+    );
+}
+
+/// `SomePtr.getattr` of a raw-owner GCREF field stays SomePtr
+/// (`lltype.py`). The front end then `cast_base_ptr_to_instance`s onto
+/// the declared class (`CastBasePtrToInstanceEntry`).
+#[test]
+fn raw_owner_registered_gc_ptr_field_read_emits_cast_instance() {
+    use crate::model::OpKind;
+    let graph = lower_object_fn("pyre_object::mapdict::map_terminator_w_cls");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let w_cls = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldRead { field, .. } if field.name == "w_cls" => op.result.clone(),
+        _ => None,
+    });
+    let Some(w_cls) = w_cls else {
+        panic!("FieldRead w_cls; graph={}", graph.dump());
+    };
+    assert!(
+        ops.iter().any(|op| {
+            crate::model::cast_instance_of(&op.kind, &w_cls)
+                .is_some_and(|root| root.contains("PyObject"))
+        }),
+        "raw-owner w_cls FieldRead then cast_base_ptr_to_instance; graph={}",
+        graph.dump()
+    );
+}
+
 /// Lower one `pyre_object` function by its full `name_path`.
 pub(in crate::front::mir) fn lower_object_fn(name_path: &str) -> crate::model::FunctionGraph {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
@@ -23843,6 +24100,15 @@ fn prebuilt_strategy_holder_keeps_its_instance_repr() {
                 OpKind::Call { result_ty: ValueType::Ref(Some(owner)), .. }
                     if owner.contains("OnceLock")))
     );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| root.contains("PyObject"))),
+        "prebuilt None is cast_gcref_to_instance onto PyObject"
+    );
 }
 
 /// `baseobjspace.py newbool` is a branch on the value and a prebuilt
@@ -23882,6 +24148,11 @@ fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
             segments.last().map(String::as_str),
             Some("get_or_init" | "cast_int_to_ptr")
         ))));
+    assert!(
+        ops().any(|op| crate::model::cast_instance_root(&op.kind)
+            .is_some_and(|root| root.contains("PyObject"))),
+        "prebuilt bool is cast_gcref_to_instance onto PyObject"
+    );
 }
 
 /// `policy.py look_inside_graph` reads `_jit_look_inside_` first and

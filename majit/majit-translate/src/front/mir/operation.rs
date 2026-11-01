@@ -1546,6 +1546,95 @@ impl<'a> Lowering<'a> {
         LinkArg::Value(narrowed)
     }
 
+    /// Narrow a GCREF word onto a registered GC pointer dest (`PyObjectRef`).
+    /// `cast_gcref_to_instance` (`rgc.py`) / `annotationoftype`
+    /// (`signature.py`) of the class: `SomeInstance(class, can_be_None)`.
+    /// A GCREF / GCREFOpaque dest stays SomePtr (`ann_cast_int_to_ptr`).
+    ///
+    /// An identity recast (`Ref(Some(root))` onto the same root) is
+    /// omitted: `rclass.py` `getinstancerepr` of that class is already
+    /// the dest, so `result_narrow_root` does not emit a second CAST.
+    pub(in crate::front::mir) fn recast_gcref_word_to_registered_dest(
+        &mut self,
+        bb_id: BlockId,
+        dest_ty: &TyRef,
+        value: Variable,
+    ) -> Variable {
+        let Some(root) = registered_gc_ptr_class_root_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) else {
+            return value;
+        };
+        if self
+            .source_named_instance_root(&value)
+            .is_some_and(|src| instance_roots_match(&src, &root))
+        {
+            return value;
+        }
+        match self.narrow_value_to_instance_root(bb_id, LinkArg::Value(value.clone()), &root) {
+            LinkArg::Value(narrowed) => narrowed,
+            _ => value,
+        }
+    }
+
+    /// Named instance class of `value`, walking a `cast_int_to_ptr` to
+    /// its operand so a later identity recast sees the round-trip source
+    /// (`FieldRead` / call dest), not the GCREF word `ann_cast_int_to_ptr`
+    /// produced. `None` for an integer, a GCREF spelling, a classdef-less
+    /// `Ref`, or a raw-owner FieldRead: `SomePtr.getattr` (`lltype.py`)
+    /// stays SomePtr even when the load's `ty` already names the dest
+    /// class, and `cast_base_ptr_to_instance` still recasts.
+    pub(in crate::front::mir) fn source_named_instance_root(
+        &self,
+        value: &Variable,
+    ) -> Option<String> {
+        let (block_id, idx) = resolve_to_producer_op(&self.graph, value)?;
+        let op = self.graph.block(block_id).operations.get(idx)?;
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("cast_int_to_ptr") => args
+                .first()
+                .and_then(LinkArg::as_variable)
+                .and_then(|src| self.source_named_instance_root(src)),
+            OpKind::UnaryOp {
+                op: name, operand, ..
+            } if name == "cast_int_to_ptr" => self.source_named_instance_root(operand),
+            OpKind::Input {
+                class_root: Some(root),
+                ..
+            } if !root.is_empty()
+                && !crate::annotator::bookkeeper::is_gcref_type_spelling(root) =>
+            {
+                Some(root.clone())
+            }
+            OpKind::FieldRead {
+                field,
+                ty: ValueType::Ref(Some(root)),
+                ..
+            } if field.owner_declared_gc != Some(false)
+                && !crate::annotator::bookkeeper::is_gcref_type_spelling(root) =>
+            {
+                Some(root.clone())
+            }
+            OpKind::Call {
+                result_ty: ValueType::Ref(Some(root)),
+                ..
+            }
+            | OpKind::Input {
+                ty: ValueType::Ref(Some(root)),
+                ..
+            } if !crate::annotator::bookkeeper::is_gcref_type_spelling(root) => Some(root.clone()),
+            _ => None,
+        }
+    }
+
     /// Extract the `offset` operand from an `Index { offset, from_end }`
     /// projection element and resolve it to a Variable. `from_end` is
     /// ignored: backwards-from-end indexing only appears in slice patterns
@@ -2388,14 +2477,24 @@ impl<'a> Lowering<'a> {
                                 {
                                     self.cast_ptr_to_int_src.insert(res.clone(), arg.clone());
                                 }
-                                (
-                                    Some(OpKind::Call {
-                                        target: CallTarget::function_path(segments),
-                                        args: crate::model::call_args(vec![arg]),
-                                        result_ty: dst_kind,
-                                    }),
-                                    res,
-                                )
+                                let op = OpKind::Call {
+                                    target: CallTarget::function_path(segments),
+                                    args: crate::model::call_args(vec![arg]),
+                                    result_ty: dst_kind.clone(),
+                                };
+                                // 1-arg `ann_cast_int_to_ptr` is SomePtr(GCREF).
+                                // A registered GC dest (`PyObjectRef`) is
+                                // `cast_gcref_to_instance` / `annotationoftype`.
+                                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                                    && matches!(dst_kind, ValueType::Ref(_))
+                                {
+                                    let bb_id = self.emit_bb(mir_bb);
+                                    self.graph.push_op_with_result_var(bb_id, op, res.clone());
+                                    let recast = self
+                                        .recast_gcref_word_to_registered_dest(bb_id, dest_ty, res);
+                                    return Ok((None, recast));
+                                }
+                                (Some(op), res)
                             }
                             // Same bank (or a bank pair with no host cast
                             // callable): alias the operand — except a
@@ -2930,7 +3029,7 @@ impl<'a> Lowering<'a> {
                         }
                         Ok(self.retag_error_carrier(dest_ty, value))
                     }
-                    AggregateShape::Ctor(ctor) => {
+                    AggregateShape::Ctor(mut ctor) => {
                         // A pair-slice operand is its pointer here and its
                         // length beside it; the field stores both words.
                         // Owner → window is only for a window field
@@ -3023,6 +3122,25 @@ impl<'a> Lowering<'a> {
                             );
                             if let Some(value) = coerced.as_variable() {
                                 *arg = value.clone();
+                            }
+                        }
+                        for arg in arg_vars.iter_mut() {
+                            // The ctor store lands on the carrier's inner class like the FieldWrite store.
+                            let recast = self.recast_error_carrier_field_store(
+                                bb_id,
+                                dest_ty,
+                                LinkArg::Value(arg.clone()),
+                            );
+                            if let Some(value) = recast.as_variable() {
+                                *arg = value.clone();
+                            }
+                        }
+                        // `ctor_ccharp_field_store` then narrows to the declared
+                        // `PyObjectRef` class; keep the inner class as that root
+                        // so the FieldWrite store is not recast back off it.
+                        if let Some(inner) = self.error_carrier_inner_class_root(dest_ty) {
+                            for field in ctor.fields.iter_mut() {
+                                field.narrow_root = Some(inner.clone());
                             }
                         }
                         for (i, arg) in arg_vars.iter_mut().enumerate() {
@@ -4008,6 +4126,15 @@ impl<'a> Lowering<'a> {
             // `result_ty` is the crate-relative layout owner when that path
             // is longer (`function::Function`): `cast_instance_layout_owner`
             // / `registered_struct_layout` (`heaptracker.py` `all_fielddescrs`).
+            // Same-root source is already `getinstancerepr` of that class
+            // (`rclass.py`); do not emit a second CAST.
+            if src_root.is_some_and(|src| instance_roots_match(src, &root))
+                || self
+                    .source_named_instance_root(arg)
+                    .is_some_and(|src| instance_roots_match(&src, &root))
+            {
+                return None;
+            }
             let result_ty = match self.cast_dest_layout_owner(dest_ty) {
                 Some(owner) if owner != root => ValueType::Ref(Some(owner)),
                 _ => ValueType::Ref(Some(root.clone())),
@@ -6226,6 +6353,12 @@ impl<'a> Lowering<'a> {
                         return Ok(narrowed);
                     }
                     // `W_BytesObject.data` is the `rstr.py` `STR` owner.
+                    // `SomePtr.getattr` (`lltype.py`) of a pointer field stays
+                    // SomePtr. A registered GC pointer dest is
+                    // `cast_base_ptr_to_instance`.
+                    if owner_declared_gc == Some(false) {
+                        return Ok(self.recast_gcref_word_to_registered_dest(bb_id, &place_ty, res));
+                    }
                     return Ok(res);
                 }
                 // `xs[i]` element read — the symmetric counterpart of
@@ -9069,6 +9202,13 @@ pub(in crate::front::mir) fn int_cast_size_and_sign(
         _ => return None,
     };
     Some((size, unsigned))
+}
+
+/// Intern leaf equality for a pair of class-root spellings
+/// (`pyframe::PyFrame` and `PyFrame` name one class).
+fn instance_roots_match(left: &str, right: &str) -> bool {
+    left == right
+        || majit_ir::descr::class_root_leaf(left) == majit_ir::descr::class_root_leaf(right)
 }
 
 /// The operation `jtransform.py _int_to_int_cast` rewrites an integer
