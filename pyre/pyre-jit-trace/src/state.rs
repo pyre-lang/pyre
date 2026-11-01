@@ -1188,6 +1188,7 @@ pub fn jitcode_is_transparent_helper(jitcode_index: i32) -> bool {
     pyjitcode_for_jitcode_index(jitcode_index).is_some_and(|pjc| pjc.code_ptr.is_null())
         && !crate::operator_continuation::is_installed_level(jitcode_index)
         && !crate::ctor_continuation::is_installed_level(jitcode_index)
+        && !crate::jitcode_dispatch::send_ex_continuation_is_installed_level(jitcode_index)
 }
 
 /// `PyFrame.frame_finished_execution = True` for a blackhole level that has
@@ -8922,15 +8923,20 @@ pub(crate) fn reconstruct_inline_recipe(
             rebuilt_ec: None,
         });
     }
-    // An operator's tail (`crate::operator_continuation`) reconstructs no
-    // Python frame either. `capture_resumedata` keeps `operation.py len` on
-    // the framestack. This level is that tail: no code object, applied after
-    // `__len__` returns.
-    if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
+    // An operator's tail (`crate::operator_continuation`) or the generator
+    // `_send_ex` tail reconstructs no Python frame either. `capture_resumedata`
+    // keeps `operation.py len` / `_send_ex` on the framestack. This level is
+    // that tail: no code object, applied after `__len__` / `_send_ex` returns.
+    // Decode this level's registers from its resume section and mark
+    // `len_tail` so the drain walks the residual (`bh_len_tail` /
+    // `bh_send_ex_tail`) after the inlined callee returns.
+    if crate::operator_continuation::is_installed_level(frame.jitcode_index)
+        || crate::jitcode_dispatch::send_ex_continuation_is_installed_level(frame.jitcode_index)
+    {
         // `resume.py rebuild_from_resumedata` fills this level's registers
-        // from its section like any other frame's. The resume `-live-` names
-        // r0 alone, the pending dunder result, so a `capture_resumedata`
-        // through the level hands that box back (`get_list_of_active_boxes`).
+        // from its section like any other frame's. The resume `-live-`
+        // names r0 (pending result) and any extra live refs the tail
+        // keeps (Format's receiver, `_send_ex`'s generator).
         let mut registers_r = Vec::with_capacity(frame.values.len());
         for value in &frame.values {
             let (boxed, _) = bridge_decode_box(

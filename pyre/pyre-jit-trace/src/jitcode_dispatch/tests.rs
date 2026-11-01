@@ -640,6 +640,20 @@ fn reconstruct_inline_recipe_fills_ctor_tail_registers_from_the_section() {
     assert_eq!(assembler.registers_r, vec![instance, init_result]);
 }
 
+#[test]
+fn send_ex_continuation_parent_carries_pending_result_and_generator() {
+    let generator = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let parent = send_ex_continuation_parent_frame(generator).expect("tail installs");
+    assert_eq!(
+        parent.boxes.len(),
+        2,
+        "resume-pc liveness names the pending result and the generator",
+    );
+    assert!(send_ex_continuation_is_installed_level(
+        parent.jitcode_index as i32
+    ));
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
