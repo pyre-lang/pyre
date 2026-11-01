@@ -30289,7 +30289,7 @@ mod tests {
                 header_pc: 0,
                 vable_ptr: A,
             });
-        meta.tracing = Some(trace_ctx);
+        meta.tracing = Some(Box::new(trace_ctx));
 
         meta.walk_active_trace_refs(|slot| {
             if slot.0 == A {
