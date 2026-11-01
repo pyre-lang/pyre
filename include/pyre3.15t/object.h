@@ -325,26 +325,8 @@ struct PyType_Spec {
     PyType_Slot *slots;
 };
 
-/* `PySlot` — one entry of the identifier-keyed array `PyType_FromSlots` reads,
-   which carries what a `PyType_Spec`'s fixed fields carry and points at a
-   `PyType_Slot` array for the rest.  A zero `sl_id` ends the array. */
-struct PySlot {
-    uint16_t sl_id;
-    uint16_t sl_flags;
-    uint32_t sl_reserved;
-    union {
-        void *sl_ptr;
-        void (*sl_func)(void);
-        Py_ssize_t sl_size;
-        int64_t sl_int64;
-        uint64_t sl_uint64;
-    };
-};
-
-/* `PySlot.sl_flags`. */
-#define PySlot_OPTIONAL 0x01
-#define PySlot_STATIC 0x02
-#define PySlot_INTPTR 0x04
+/* The `Py_tp_token` value asking for the spec's own address as the token. */
+#define Py_TP_USE_SPEC NULL
 
 /* `PyType_GetModuleByDef` needs `PyModuleDef`, so it is declared with it. */
 

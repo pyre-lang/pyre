@@ -4021,6 +4021,19 @@ macro_rules! mapping_slot {
     };
 }
 
+macro_rules! buffer_slot {
+    ($field:ident) => {
+        (|tp| unsafe {
+            let table = (*tp).tp_as_buffer;
+            if table.is_null() {
+                std::ptr::null()
+            } else {
+                (*table).$field
+            }
+        }) as fn(*mut CPyTypeObject) -> *const c_void
+    };
+}
+
 /// Run a `(PyObject *, PyObject *) -> PyObject *` slot.
 fn call_binary(
     slot: *const c_void,
@@ -5848,12 +5861,12 @@ pub struct CPyTypeSpec {
     pub slots: *mut CPyTypeSlot,
 }
 
-/// The `typeslots.h` identifiers.
+/// The `slots_generated.h` type-slot identifiers.
 mod slot_id {
     use std::ffi::c_int;
 
     /// Declare each identifier once, so the constant and the name the test
-    /// looks up in `Python.h` cannot drift apart.
+    /// looks up in `slots_generated.h` cannot drift apart.
     macro_rules! slot_ids {
         ($($name:ident = $value:expr,)*) => {
             $(pub const $name: c_int = $value;)*
@@ -5864,10 +5877,10 @@ mod slot_id {
     }
 
     slot_ids! {
-        BF_GETBUFFER = 1,
-        BF_RELEASEBUFFER = 2,
-        MP_ASS_SUBSCRIPT = 3,
-        MP_LENGTH = 4,
+        BF_GETBUFFER = 88,
+        BF_RELEASEBUFFER = 89,
+        MP_ASS_SUBSCRIPT = 90,
+        MP_LENGTH = 91,
         MP_SUBSCRIPT = 5,
         NB_ABSOLUTE = 6,
         NB_ADD = 7,
@@ -5949,6 +5962,22 @@ mod slot_id {
         AM_SEND = 81,
         TP_VECTORCALL = 82,
         TP_TOKEN = 83,
+    }
+}
+
+/// Map a `PyType_Slot.slot` id onto the current numbering.
+///
+/// `_PySlot_resolve_type_slot`: a pre-3.15 id 1..4 becomes the matching
+/// `Py_bf_*` / `Py_mp_*`; an id that is already a current type slot is kept;
+/// anything else is invalid.
+fn resolve_type_slot(id: c_int) -> Option<c_int> {
+    match id {
+        1 => Some(slot_id::BF_GETBUFFER),
+        2 => Some(slot_id::BF_RELEASEBUFFER),
+        3 => Some(slot_id::MP_ASS_SUBSCRIPT),
+        4 => Some(slot_id::MP_LENGTH),
+        5..=83 | 88..=91 => Some(id),
+        _ => None,
     }
 }
 
@@ -6295,16 +6324,23 @@ fn from_spec(
         if unsafe { (*spec).slots.is_null() } || unsafe { (*entry).slot } == 0 {
             break;
         }
+        let raw = unsafe { (*entry).slot };
+        let Some(id) = resolve_type_slot(raw) else {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("PyType_FromSpec() does not support slot {raw}"),
+            ));
+        };
         // `Py_tp_token` names no slot: it declares the type's identity, and
         // the null it may carry is `Py_TP_USE_SPEC`, which asks for the spec's
         // own address rather than for no token at all.
-        if unsafe { (*entry).slot } == slot_id::TP_TOKEN {
+        if id == slot_id::TP_TOKEN {
             token = match unsafe { (*entry).pfunc } {
                 pfunc if pfunc.is_null() => spec as *mut c_void,
                 pfunc => pfunc,
             };
         } else {
-            apply_slot(tp, unsafe { (*entry).slot }, unsafe { (*entry).pfunc })?;
+            apply_slot(tp, id, unsafe { (*entry).pfunc })?;
         }
         index += 1;
     }
@@ -6385,7 +6421,7 @@ pub struct CPySlot {
 }
 
 bitflags::bitflags! {
-    /// The `object.h` flags a `PySlot` entry carries in `sl_flags`.
+    /// The `slots.h` flags a `PySlot` entry carries in `sl_flags`.
     ///
     /// `OPTIONAL` is the one the readers act on -- an entry they may skip
     /// rather than refuse.  The names are the header's, prefix and all; the
@@ -6510,6 +6546,9 @@ pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *m
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
+    let Some(id) = resolve_type_slot(id) else {
+        return std::ptr::null_mut();
+    };
     macro_rules! number {
         ($field:ident) => {
             (number_slot!($field))(tp)
@@ -6525,7 +6564,14 @@ pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *m
             (mapping_slot!($field))(tp)
         };
     }
+    macro_rules! buffer {
+        ($field:ident) => {
+            (buffer_slot!($field))(tp)
+        };
+    }
     let value: *const c_void = match id {
+        BF_GETBUFFER => buffer!(bf_getbuffer),
+        BF_RELEASEBUFFER => buffer!(bf_releasebuffer),
         MP_ASS_SUBSCRIPT => mapping!(mp_ass_subscript),
         MP_LENGTH => mapping!(mp_length),
         MP_SUBSCRIPT => mapping!(mp_subscript),
@@ -6875,6 +6921,16 @@ pub unsafe extern "C" fn PyType_GetModule(tp: *mut CPyTypeObject) -> *mut CPyObj
     module
 }
 
+/// `PyType_GetModule_DuringGC` — no exception when the type is not a heap
+/// type or has no module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModule_DuringGC(tp: *mut CPyTypeObject) -> *mut CPyObject {
+    if tp.is_null() || !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
+        return std::ptr::null_mut();
+    }
+    own_module(tp)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_GetModuleState(tp: *mut CPyTypeObject) -> *mut c_void {
     let module = unsafe { PyType_GetModule(tp) };
@@ -6884,29 +6940,75 @@ pub unsafe extern "C" fn PyType_GetModuleState(tp: *mut CPyTypeObject) -> *mut c
     unsafe { super::modsupport::PyModule_GetState(module) }
 }
 
-/// The nearest module along `tp`'s MRO built from `def`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModuleState_DuringGC(tp: *mut CPyTypeObject) -> *mut c_void {
+    let module = unsafe { PyType_GetModule_DuringGC(tp) };
+    if module.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { super::modsupport::PyModule_GetState_DuringGC(module) }
+}
+
+/// Borrowed module of the first heap-type along `tp`'s MRO whose token is
+/// `token`.  Never sets an exception (`PyType_GetModuleByToken_DuringGC`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModuleByToken_DuringGC(
+    tp: *mut CPyTypeObject,
+    token: *const c_void,
+) -> *mut CPyObject {
+    if tp.is_null() || !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
+        return std::ptr::null_mut();
+    }
+    for base in c_bases(interpreter_type(tp)) {
+        if !unsafe { (*base).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
+            continue;
+        }
+        let module = own_module(base);
+        if !module.is_null()
+            && unsafe { super::modsupport::module_token(module) } as usize == token as usize
+        {
+            return module;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// The nearest module along `tp`'s MRO whose token is `def`.
 ///
-/// Borrowed for the same reason [`PyType_GetModule`] is.
+/// Borrowed for the same reason [`PyType_GetModule`] is.  Compared by token
+/// (`PyType_GetModuleByToken_DuringGC`), not by `PyModule_GetDef`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyType_GetModuleByDef(
     tp: *mut CPyTypeObject,
     def: *mut super::modsupport::CPyModuleDef,
 ) -> *mut CPyObject {
-    if tp.is_null() || def.is_null() {
+    if tp.is_null() {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    for base in c_bases(interpreter_type(tp)) {
-        let module = own_module(base);
-        if !module.is_null() && unsafe { super::modsupport::PyModule_GetDef(module) } == def {
-            return module;
-        }
+    let module = unsafe { PyType_GetModuleByToken_DuringGC(tp, def as *const c_void) };
+    if module.is_null() {
+        super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
+            "PyType_GetModuleByDef: No superclass of '{}' has the given module",
+            type_name_of(tp)
+        )));
+        return std::ptr::null_mut();
     }
-    super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
-        "PyType_GetModuleByDef: No superclass of '{}' has the given module",
-        type_name_of(tp)
-    )));
-    std::ptr::null_mut()
+    module
+}
+
+/// Owned (`Py_XNewRef` of [`PyType_GetModuleByDef`]).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyType_GetModuleByToken(
+    tp: *mut CPyTypeObject,
+    token: *const c_void,
+) -> *mut CPyObject {
+    let module =
+        unsafe { PyType_GetModuleByDef(tp, token as *mut super::modsupport::CPyModuleDef) };
+    if !module.is_null() {
+        unsafe { pyobject::incref(module) };
+    }
+    module
 }
 
 /// `PyType_GetBaseByToken` — 1 with `result` filled, 0 for no match, -1 on a
@@ -7298,8 +7400,12 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyErr_NewExceptionWithDoc as *const ());
     std::hint::black_box(PyType_FromMetaclass as *const ());
     std::hint::black_box(PyType_GetModule as *const ());
+    std::hint::black_box(PyType_GetModule_DuringGC as *const ());
     std::hint::black_box(PyType_GetModuleState as *const ());
+    std::hint::black_box(PyType_GetModuleState_DuringGC as *const ());
     std::hint::black_box(PyType_GetModuleByDef as *const ());
+    std::hint::black_box(PyType_GetModuleByToken as *const ());
+    std::hint::black_box(PyType_GetModuleByToken_DuringGC as *const ());
     std::hint::black_box(PyType_GetModuleName as *const ());
     std::hint::black_box(PyType_GetFullyQualifiedName as *const ());
     std::hint::black_box(PyType_GetBaseByToken as *const ());
@@ -7396,41 +7502,47 @@ mod tests {
     }
 
     /// `PyType_FromSpec` reads the numbers an extension compiled against
-    /// `typeslots.h` wrote into its slot array, so the two tables are one ABI
-    /// in two places.  This walks the header and rejects any identifier whose
-    /// number the Rust side spells differently, or does not spell at all.
+    /// `slots_generated.h` wrote into its slot array, so the two tables are one
+    /// ABI in two places.  This walks the header and rejects any identifier
+    /// whose number the Rust side spells differently, or does not spell at
+    /// all.  A `_Py_SLOT_COMPAT_VALUE(OLD, NEW)` body is the non-limited
+    /// expansion, NEW.
     #[test]
     fn every_slot_id_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.15t/typeslots.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/slots_generated.h");
 
-        let mut checked = 0;
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
         for line in HEADER.lines() {
             let Some(rest) = line.strip_prefix("#define Py_") else {
                 continue;
             };
-            let Some((name, value)) = rest.split_once(' ') else {
+            let Some((name, body)) = rest.split_once(' ') else {
                 continue;
             };
             // The identifiers are `Py_<table>_<slot>`; nothing else in the
-            // header is named that way with a bare integer for a body.
+            // header is named that way with a slot-id body.
             let Some((table, _)) = name.split_once('_') else {
                 continue;
             };
             if !matches!(table, "tp" | "nb" | "sq" | "mp" | "am" | "bf") {
                 continue;
             }
-            let Ok(value) = value.trim().parse::<std::ffi::c_int>() else {
+            let Some(value) = slot_define_value(body) else {
                 continue;
             };
+            header.push((name, value));
+        }
 
-            let upper = name.to_ascii_uppercase();
-            let found = super::slot_id::ALL.iter().find(|(n, _)| *n == upper);
-            let Some((_, ours)) = found else {
-                panic!("Python.h defines Py_{name} = {value}, slot_id has no {upper}");
+        let mut checked = 0;
+        for &(upper, ours) in super::slot_id::ALL {
+            let name = upper.to_ascii_lowercase();
+            let found = header.iter().find(|(theirs, _)| *theirs == name);
+            let Some((_, theirs)) = found else {
+                panic!("slot_id has {upper} = {ours}, slots_generated.h has no Py_{name}");
             };
             assert_eq!(
-                *ours, value,
-                "Py_{name} is {value} in Python.h and {ours} in slot_id"
+                ours, *theirs,
+                "Py_{name} is {theirs} in slots_generated.h and {ours} in slot_id"
             );
             checked += 1;
         }
@@ -7441,6 +7553,35 @@ mod tests {
             "the header defines {checked} slot identifiers and slot_id has {}",
             super::slot_id::ALL.len()
         );
+
+        let new_of = |name: &str| {
+            header
+                .iter()
+                .find(|(theirs, _)| *theirs == name)
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| panic!("slots_generated.h declares no Py_{name}"))
+        };
+        assert_eq!(super::resolve_type_slot(1), Some(new_of("bf_getbuffer")));
+        assert_eq!(
+            super::resolve_type_slot(2),
+            Some(new_of("bf_releasebuffer"))
+        );
+        assert_eq!(
+            super::resolve_type_slot(3),
+            Some(new_of("mp_ass_subscript"))
+        );
+        assert_eq!(super::resolve_type_slot(4), Some(new_of("mp_length")));
+    }
+
+    fn slot_define_value(body: &str) -> Option<std::ffi::c_int> {
+        let body = body.trim();
+        if let Some(args) = body.strip_prefix("_Py_SLOT_COMPAT_VALUE(") {
+            let args = args.strip_suffix(')')?;
+            let (_, new) = args.split_once(',')?;
+            new.trim().parse().ok()
+        } else {
+            body.parse().ok()
+        }
     }
 
     /// A member's `flags` word is one thing two places spell: an extension
@@ -7499,14 +7640,14 @@ mod tests {
     }
 
     /// A `PySlot`'s `sl_flags` is one thing two places spell: an extension
-    /// compiled against `include/pyre3.15t/object.h` builds it, and the two
+    /// compiled against `include/pyre3.15t/slots.h` builds it, and the two
     /// slot-array readers test it.  This walks the header and rejects any flag
     /// whose bit the Rust side spells differently.
     #[test]
     fn every_slot_flag_is_the_bit_the_header_gives_it() {
         use bitflags::Flags as _;
 
-        const HEADER: &str = include_str!("../../../../include/pyre3.15t/object.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/slots.h");
 
         let mut header: Vec<(&str, u16)> = Vec::new();
         for line in HEADER.lines() {
@@ -7529,7 +7670,7 @@ mod tests {
         assert_eq!(
             header.len(),
             super::SlotFlags::FLAGS.len(),
-            "object.h declares {} PySlot_ flags and this file declares {}",
+            "slots.h declares {} PySlot_ flags and this file declares {}",
             header.len(),
             super::SlotFlags::FLAGS.len()
         );
@@ -7543,10 +7684,10 @@ mod tests {
             let (_, theirs) = header
                 .iter()
                 .find(|(known, _)| known.eq_ignore_ascii_case(name))
-                .unwrap_or_else(|| panic!("object.h declares no PySlot_{name}"));
+                .unwrap_or_else(|| panic!("slots.h declares no PySlot_{name}"));
             assert_eq!(
                 ours, *theirs,
-                "PySlot_{name} is {theirs} in object.h and {ours} here"
+                "PySlot_{name} is {theirs} in slots.h and {ours} here"
             );
         }
     }

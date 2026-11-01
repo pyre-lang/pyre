@@ -1,7 +1,7 @@
 {
   "modules": {
     "test.test___all__": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test__colorize": {
       "cranelift": "PASS",
@@ -632,8 +632,7 @@
     },
     "test.test_import": {
       "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "ModexportTests and test_testmultiphase_exec_multiple need the 3.15 _testmultiphase entry points and PEP 793 PyModExport in cpyext; lib_pypy/_testmultiphase.c predates them"
+      "dynasm": "PASS"
     },
     "test.test_importlib": {
       "cranelift": "FAIL",
@@ -696,7 +695,8 @@
       "dynasm": "PASS"
     },
     "test.test_kqueue": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "test_fork needs select's kqueue_tracking_after_fork (open kqueues invalidated in a forked child)"
     },
     "test.test_largefile": {
       "dynasm": "SKIP",
@@ -724,7 +724,7 @@
       "dynasm": "PASS"
     },
     "test.test_logging": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_long": {
       "dynasm": "PASS"
@@ -743,7 +743,8 @@
       "dynasm": "FAIL"
     },
     "test.test_math": {
-      "dynasm": "FAIL"
+      "dynasm": "TIMEOUT",
+      "reason": "test_sumprod_stress exceeds the 600s budget on ubuntu: Decimal arithmetic through _pydecimal runs ~50x slower than PyPy because BINARY_OP on Decimal residualizes the whole __mul__ (ContextVar.get has no jitcode; type-call with overridden __new__ and loop-bearing callees decline)"
     },
     "test.test_math_property": {
       "cranelift": "SKIP",
@@ -901,7 +902,7 @@
       "dynasm": "FAIL"
     },
     "test.test_poll": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_popen": {
       "cranelift": "PASS",
@@ -1188,7 +1189,7 @@
       "dynasm": "PASS"
     },
     "test.test_termios": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_textwrap": {
       "cranelift": "PASS",
@@ -1327,7 +1328,7 @@
       "dynasm": "PASS"
     },
     "test.test_unpack": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_unpack_ex": {
       "dynasm": "PASS"

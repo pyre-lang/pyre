@@ -2195,11 +2195,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     super::interp_socket_wasm::register_names(ns);
 
     // `socket.py` defines `socketpair` only when `_socket` carries one and
-    // falls back to `_fallback_socketpair`'s own AF_INET pair otherwise, and
-    // `fromfd` is built out of `dup` at app level everywhere else.  Both stay
-    // with the POSIX calls they are made of; `dup` itself is registered for
-    // Windows too, further down, out of the WinSock calls that stand in for
-    // it.
+    // falls back to `_fallback_socketpair`'s own AF_INET pair otherwise.
+    // `socketpair` and `dup` stay with the POSIX calls they are made of;
+    // `dup` itself is registered for Windows too, further down, out of the
+    // WinSock calls that stand in for it.
     #[cfg(unix)]
     {
         // socketpair(family=AF_UNIX, type=SOCK_STREAM, proto=0)
@@ -2265,47 +2264,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 },
                 1,
             )
-        );
-
-        // fromfd(fd, family, type, proto=0) — `interp_func.py:75
-        // fromfd_w`: dup() the supplied fd (so the caller still owns the
-        // original) and wrap it in a fresh `_socket.socket`.  CPython
-        // requires the dup so close() on the returned socket leaves the
-        // input descriptor intact.
-        pyre_interpreter::__pyre_store!(
-            ns,
-            "fromfd",
-            pyre_interpreter::make_builtin_function("fromfd", |args| {
-                if args.len() < 3 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "fromfd() requires fd, family and type",
-                    ));
-                }
-                for (idx, label) in [(0, "fd"), (1, "family"), (2, "type")] {
-                    if !unsafe { pyre_object::is_int(args[idx]) } {
-                        return Err(pyre_interpreter::PyError::type_error(format!(
-                            "fromfd: {label} must be an integer"
-                        )));
-                    }
-                }
-                let fd = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                let family = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
-                let ty = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
-                let proto = if args.len() >= 4 {
-                    if !unsafe { pyre_object::is_int(args[3]) } {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "fromfd: proto must be an integer",
-                        ));
-                    }
-                    (unsafe { pyre_object::w_int_get_value(args[3]) }) as libc::c_int
-                } else {
-                    0
-                };
-                let new_fd = majit_rlib::rsocket::dup(fd).map_err(|error| {
-                    socket_io_err(std::io::Error::from_raw_os_error(error.errno))
-                })?;
-                socket_from_fd(new_fd, family, ty, proto)
-            })
         );
     }
 

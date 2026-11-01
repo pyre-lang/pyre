@@ -1125,29 +1125,40 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ns_slot,
         "formatter_parser",
         crate::make_builtin_function("formatter_parser", |args| {
-            use rustpython_common::format::{FormatPart, FormatString, FromTemplate};
-
             let arg = require_string_module_str(args)?;
             let body = unsafe { pyre_object::w_str_get_wtf8(arg) }.to_wtf8_buf();
-            let parsed = FormatString::from_str(&body)
-                .map_err(|_| crate::PyError::value_error("bad format string"))?;
+            let mut parts = crate::type_methods::parse_format_parts(&body)?;
 
             // Every tuple, and every string inside it, is a nursery object
             // and the next mint can collect, so they all sit on one bracket.
             let _roots = pyre_object::gc_roots::push_roots();
             let mut tuple_slots = Vec::new();
-            let mut pending: Option<Wtf8Buf> = None;
-            for part in parsed.format_parts {
+            let mut i = 0usize;
+            while i < parts.len() {
+                let next_is_field = matches!(
+                    parts.get(i + 1),
+                    Some(crate::type_methods::PyPyFormatPart::Field { .. })
+                );
+                let part = std::mem::replace(
+                    &mut parts[i],
+                    crate::type_methods::PyPyFormatPart::Literal(Wtf8Buf::new()),
+                );
                 match part {
-                    FormatPart::Literal(text) => pending = Some(text),
-                    FormatPart::Field {
-                        field_name,
-                        conversion_spec,
-                        format_spec,
-                    } => {
-                        let literal = pending.take().unwrap_or_default();
+                    crate::type_methods::PyPyFormatPart::Literal(text) if next_is_field => {
+                        let field = std::mem::replace(
+                            &mut parts[i + 1],
+                            crate::type_methods::PyPyFormatPart::Literal(Wtf8Buf::new()),
+                        );
+                        let crate::type_methods::PyPyFormatPart::Field {
+                            field_name,
+                            conversion_spec,
+                            format_spec,
+                        } = field
+                        else {
+                            unreachable!("next_is_field")
+                        };
                         let lit = pyre_object::gc_roots::pin_root(
-                            pyre_object::w_str_from_wtf8_managed(literal),
+                            pyre_object::w_str_from_wtf8_managed(text),
                         );
                         let field = pyre_object::gc_roots::pin_root(
                             pyre_object::w_str_from_wtf8_managed(field_name),
@@ -1166,27 +1177,37 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                             lit, field, spec, conv,
                         ]));
                         tuple_slots.push(slot);
+                        i += 2;
+                    }
+                    crate::type_methods::PyPyFormatPart::Literal(text) => {
+                        if !text.is_empty() {
+                            let lit = pyre_object::gc_roots::pin_root(
+                                pyre_object::w_str_from_wtf8_managed(text),
+                            );
+                            let slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ =
+                                pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
+                                    lit,
+                                    pyre_object::w_none(),
+                                    pyre_object::w_none(),
+                                    pyre_object::w_none(),
+                                ]));
+                            tuple_slots.push(slot);
+                        }
+                        i += 1;
+                    }
+                    crate::type_methods::PyPyFormatPart::Field { .. } => {
+                        unreachable!("parse_format_parts precedes every Field with a Literal")
                     }
                 }
             }
-            if let Some(text) = pending {
-                let lit =
-                    pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(text));
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                    lit,
-                    pyre_object::w_none(),
-                    pyre_object::w_none(),
-                    pyre_object::w_none(),
-                ]));
-                tuple_slots.push(slot);
-            }
-            Ok(pyre_object::w_list_new(
+            let list = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(
                 tuple_slots
                     .into_iter()
                     .map(pyre_object::gc_roots::shadow_stack_get)
                     .collect(),
-            ))
+            ));
+            crate::baseobjspace::iter(list)
         })
     );
     crate::__pyre_put_new!(

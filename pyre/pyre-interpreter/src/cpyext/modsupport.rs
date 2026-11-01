@@ -9,13 +9,14 @@ use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-/// The `moduleobject.h` slot identifiers a `PyModuleDef_Slot` array carries.
+/// The `slots_generated.h` identifiers a `PyModuleDef_Slot` array carries.
 ///
 /// A slot names one identifier rather than a set of bits, so these stay
 /// numbers.  Declaring each once mints the table
 /// `every_module_slot_is_the_number_the_header_gives_it` walks, so a slot
 /// added here is compared against the header without anyone remembering to
-/// list it.
+/// list it.  The values are the non-limited numbering (`_Py_SLOT_COMPAT_VALUE`
+/// expands to NEW).
 macro_rules! module_slots {
     ($($name:ident = $value:expr,)*) => {
         $(const $name: c_int = $value;)*
@@ -26,10 +27,33 @@ macro_rules! module_slots {
 }
 
 module_slots! {
-    PY_MOD_CREATE = 1,
-    PY_MOD_EXEC = 2,
-    PY_MOD_MULTIPLE_INTERPRETERS = 3,
-    PY_MOD_GIL = 4,
+    PY_MOD_CREATE = 84,
+    PY_MOD_EXEC = 85,
+    PY_MOD_MULTIPLE_INTERPRETERS = 86,
+    PY_MOD_GIL = 87,
+    PY_MOD_ABI = 109,
+    PY_MOD_TOKEN = 110,
+}
+
+/// Map a `PyModuleDef_Slot.slot` id onto the current numbering.
+///
+/// `_PySlot_resolve_mod_slot`: a pre-3.15 id 1..4 becomes the matching
+/// `Py_mod_*`; an id that is already a current module slot is kept; anything
+/// else is invalid.
+fn resolve_mod_slot(id: c_int) -> Option<c_int> {
+    match id {
+        1 => Some(PY_MOD_CREATE),
+        2 => Some(PY_MOD_EXEC),
+        3 => Some(PY_MOD_MULTIPLE_INTERPRETERS),
+        4 => Some(PY_MOD_GIL),
+        PY_MOD_CREATE
+        | PY_MOD_EXEC
+        | PY_MOD_MULTIPLE_INTERPRETERS
+        | PY_MOD_GIL
+        | PY_MOD_ABI
+        | PY_MOD_TOKEN => Some(id),
+        _ => None,
+    }
 }
 
 /// The two versions a module may declare: the full API version an extension
@@ -38,8 +62,8 @@ module_slots! {
 const PYTHON_API_VERSION: c_int = 1013;
 const PYTHON_ABI_VERSION: c_int = 3;
 
-/// The `md_def` and `md_state` CPython keeps in the module object's own C
-/// struct.
+/// The `md_def`, `md_state` and token CPython keeps in the module object's
+/// own C struct (`pycore_moduleobject.h` `PyModuleObject`).
 ///
 /// Pyre's module has no such fields.  The module dictionary is not a place to
 /// put them: it is the module's Python-visible namespace, so `vars(mod)` and
@@ -51,6 +75,8 @@ const PYTHON_ABI_VERSION: c_int = 3;
 struct ModuleFields {
     md_def: usize,
     md_state: usize,
+    md_token: usize,
+    md_token_is_def: bool,
 }
 
 type ModuleTable = super::address_table::HeldMap<ModuleFields>;
@@ -246,6 +272,125 @@ pub struct CPyModuleDef {
     pub m_free: *const c_void,
 }
 
+/// `PyABIInfo` — `modsupport.h`.
+#[repr(C)]
+pub struct CPyABIInfo {
+    pub abiinfo_major_version: u8,
+    pub abiinfo_minor_version: u8,
+    pub flags: u16,
+    pub build_version: u32,
+    pub abi_version: u32,
+}
+
+/// Packed the same way `patchlevel.h` `_Py_PACK_FULL_VERSION` packs
+/// `PY_VERSION_HEX`.
+const fn pack_full_version(x: u32, y: u32, z: u32, level: u32, serial: u32) -> u32 {
+    ((x & 0xff) << 24)
+        | ((y & 0xff) << 16)
+        | ((z & 0xff) << 8)
+        | ((level & 0xf) << 4)
+        | (serial & 0xf)
+}
+
+const PY_VERSION_HEX: u32 = pack_full_version(3, 15, 0, 0xf, 0);
+const PY_PACK_VERSION_3_2: u32 = pack_full_version(3, 2, 0, 0, 0);
+const XY_MASK: u32 = 0xffff0000;
+
+const PYABIINFO_STABLE: u16 = 0x0001;
+const PYABIINFO_GIL: u16 = 0x0002;
+const PYABIINFO_FREETHREADED: u16 = 0x0004;
+const PYABIINFO_INTERNAL: u16 = 0x0008;
+
+/// `_abiinfo_raise`: ImportError `"{name}: {msg}"` when a name is given.
+fn abiinfo_raise(module_name: Option<&str>, msg: String) -> crate::PyError {
+    let text = match module_name {
+        Some(name) => format!("{name}: {msg}"),
+        None => msg,
+    };
+    crate::PyError::new(crate::PyErrorKind::ImportError, text)
+}
+
+fn abi_xy(version: u32) -> String {
+    format!("{}.{}", (version >> 24) & 0xff, (version >> 16) & 0xff)
+}
+
+/// `Python/modsupport.c` `PyABIInfo_Check`.  pyre's `pyconfig.h` does not
+/// define `Py_GIL_DISABLED`, so the GIL-build branch applies.
+fn abiinfo_check(info: *mut CPyABIInfo, module_name: Option<&str>) -> Result<(), crate::PyError> {
+    let raise = |msg: String| Err(abiinfo_raise(module_name, msg));
+    if info.is_null() {
+        return raise("NULL PyABIInfo".to_owned());
+    }
+    let info = unsafe { &*info };
+    if info.abiinfo_major_version == 0 {
+        return Ok(());
+    }
+    if info.abiinfo_major_version > 1 {
+        return raise("PyABIInfo version too high".to_owned());
+    }
+    if info.flags & PYABIINFO_INTERNAL != 0
+        && info.abi_version != 0
+        && info.abi_version != PY_VERSION_HEX
+    {
+        return raise(format!(
+            "incompatible internal ABI (0x{:x} != 0x{:x})",
+            info.abi_version, PY_VERSION_HEX
+        ));
+    }
+    if info.flags & PYABIINFO_STABLE != 0 {
+        if info.abi_version != 0 {
+            if (info.abi_version & XY_MASK) > (PY_VERSION_HEX & XY_MASK) {
+                return raise(format!(
+                    "incompatible future stable ABI version ({})",
+                    abi_xy(info.abi_version)
+                ));
+            }
+            if info.abi_version < PY_PACK_VERSION_3_2 {
+                return raise(format!(
+                    "invalid stable ABI version ({})",
+                    abi_xy(info.abi_version)
+                ));
+            }
+        }
+        if info.flags & PYABIINFO_INTERNAL != 0 {
+            return raise("cannot use both internal and stable ABI".to_owned());
+        }
+    } else if info.abi_version != 0 && (info.abi_version & XY_MASK) != (PY_VERSION_HEX & XY_MASK) {
+        return raise(format!(
+            "incompatible ABI version ({})",
+            abi_xy(info.abi_version)
+        ));
+    }
+    let gilflags = info.flags & (PYABIINFO_GIL | PYABIINFO_FREETHREADED);
+    if gilflags == PYABIINFO_FREETHREADED {
+        return raise("only compatible with free-threaded CPython".to_owned());
+    }
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyABIInfo_Check(
+    info: *mut CPyABIInfo,
+    module_name: *const c_char,
+) -> c_int {
+    let owned = if module_name.is_null() {
+        None
+    } else {
+        Some(
+            unsafe { CStr::from_ptr(module_name) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    match abiinfo_check(info, owned.as_deref()) {
+        Ok(()) => 0,
+        Err(err) => {
+            pyerrors::set_pending_error(err);
+            -1
+        }
+    }
+}
+
 fn text_or_empty(pointer: *const c_char) -> String {
     if pointer.is_null() {
         String::new()
@@ -366,7 +511,11 @@ fn populate_module(
     let _ = roots.pin_root(module);
     let reload = |slot| pyre_object::gc_roots::shadow_stack_get(slot);
 
-    set_field(reload(module_slot), |fields| fields.md_def = def as usize);
+    set_field(reload(module_slot), |fields| {
+        fields.md_def = def as usize;
+        fields.md_token = def as usize;
+        fields.md_token_is_def = true;
+    });
 
     if let Some(path) = path {
         let value = crate::gateway::fsdecode_os_str(path.as_os_str());
@@ -495,14 +644,19 @@ pub unsafe extern "C" fn PyModule_Create2(
     pyobject::make_ref(module)
 }
 
-/// The `PySlot` identifiers a module export array carries.  They are a
-/// separate range from the `PyModuleDef_Slot` numbers the create phase reads,
-/// and the four they overlap in meaning are renumbered on the way in.
+/// The `PySlot` identifiers a module export array carries.  The four that a
+/// `PyModuleDef_Slot` array also names, plus `Py_mod_abi` / `Py_mod_token`,
+/// reuse `PY_MOD_*` so both readers share one numbering.
 mod export_id {
-    pub const MOD_CREATE: u16 = 84;
-    pub const MOD_EXEC: u16 = 85;
-    pub const MOD_MULTIPLE_INTERPRETERS: u16 = 86;
-    pub const MOD_GIL: u16 = 87;
+    use super::{
+        PY_MOD_ABI, PY_MOD_CREATE, PY_MOD_EXEC, PY_MOD_GIL, PY_MOD_MULTIPLE_INTERPRETERS,
+        PY_MOD_TOKEN,
+    };
+
+    pub const MOD_CREATE: u16 = PY_MOD_CREATE as u16;
+    pub const MOD_EXEC: u16 = PY_MOD_EXEC as u16;
+    pub const MOD_MULTIPLE_INTERPRETERS: u16 = PY_MOD_MULTIPLE_INTERPRETERS as u16;
+    pub const MOD_GIL: u16 = PY_MOD_GIL as u16;
     pub const MOD_NAME: u16 = 100;
     pub const MOD_DOC: u16 = 101;
     pub const MOD_STATE_SIZE: u16 = 102;
@@ -510,8 +664,8 @@ mod export_id {
     pub const MOD_STATE_TRAVERSE: u16 = 104;
     pub const MOD_STATE_CLEAR: u16 = 105;
     pub const MOD_STATE_FREE: u16 = 106;
-    pub const MOD_ABI: u16 = 109;
-    pub const MOD_TOKEN: u16 = 110;
+    pub const MOD_ABI: u16 = PY_MOD_ABI as u16;
+    pub const MOD_TOKEN: u16 = PY_MOD_TOKEN as u16;
 }
 
 /// `PyModExport_*`'s answer, read into the definition the create phase takes.
@@ -532,8 +686,22 @@ pub(super) fn create_module_from_export_slots(
             message,
         ))
     };
+    // `import_run_modexport`: a NULL answer keeps the hook's exception, or
+    // reports that none was set; a non-NULL answer with an exception set
+    // is an unreported raise.
     if slots.is_null() {
-        return refuse(format!("module {name}: PyModExport_* returned NULL"));
+        if let Some(pending) = pyerrors::take_pending_error() {
+            return Err(pending);
+        }
+        return refuse(format!(
+            "module export hook for module '{name}' failed without setting an exception"
+        ));
+    }
+    if let Some(pending) = pyerrors::take_pending_error() {
+        return Err(crate::error::system_error_from_cause(
+            format!("module export hook for module '{name}' raised unreported exception"),
+            pending,
+        ));
     }
     let mut def = Box::new(CPyModuleDef {
         m_base: CPyModuleDefBase {
@@ -557,6 +725,8 @@ pub(super) fn create_module_from_export_slots(
         m_free: std::ptr::null(),
     });
     let mut def_slots: Vec<CPyModuleDefSlot> = Vec::new();
+    let mut saw_abi = false;
+    let mut export_token: usize = 0;
     let mut entry = slots;
     loop {
         let slot = unsafe { &*entry };
@@ -572,10 +742,11 @@ pub(super) fn create_module_from_export_slots(
             export_id::MOD_STATE_TRAVERSE => def.m_traverse = value as *const c_void,
             export_id::MOD_STATE_CLEAR => def.m_clear = value as *const c_void,
             export_id::MOD_STATE_FREE => def.m_free = value as *const c_void,
-            // Reported for the host to check the extension against itself.
-            // Every ABI this interpreter offers is the one it just handed the
-            // extension, so there is nothing here to reject.
-            export_id::MOD_ABI | export_id::MOD_TOKEN => {}
+            export_id::MOD_ABI => {
+                saw_abi = true;
+                abiinfo_check(value as *mut CPyABIInfo, Some(name))?;
+            }
+            export_id::MOD_TOKEN => export_token = value as usize,
             export_id::MOD_CREATE => def_slots.push(CPyModuleDefSlot {
                 slot: PY_MOD_CREATE,
                 value,
@@ -604,9 +775,9 @@ pub(super) fn create_module_from_export_slots(
         }
         entry = unsafe { entry.add(1) };
     }
-    if def.m_name.is_null() {
+    if !saw_abi {
         return refuse(format!(
-            "module {name}: PyModExport_* returned no Py_mod_name"
+            "module {name} does not define Py_mod_abi, which is mandatory for modules defined from slots only."
         ));
     }
     // The create phase reads the array until a zero, and takes both arrays by
@@ -619,7 +790,27 @@ pub(super) fn create_module_from_export_slots(
     let def = Box::leak(def);
     // Stamps the header the create phase reads the definition back through.
     unsafe { PyModuleDef_Init(def) };
-    create_module_from_def_and_spec(def, spec, name, path)
+    // `original_def` is NULL for slots-only creation (`moduleobject.c`
+    // `module_from_slots_and_spec`), so a create slot sees NULL rather than
+    // the synthetic definition kept for exec/state.
+    let created = create_module_from_def_like(def, spec, name, path, std::ptr::null_mut())?;
+    if !unsafe { pyre_object::module::is_module(created) } {
+        return Ok(created);
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let module = roots.pin_root(created);
+    // `import_run_modexport`: if no `Py_mod_token` was given, the slots array
+    // pointer is the token.
+    let token = if export_token != 0 {
+        export_token
+    } else {
+        slots as usize
+    };
+    set_field(module, |fields| {
+        fields.md_token = token;
+        fields.md_token_is_def = false;
+    });
+    Ok(module)
 }
 
 /// `modsupport.py:create_module_from_def_and_spec` — the PEP 489 create phase.
@@ -629,16 +820,29 @@ pub(super) fn create_module_from_def_and_spec(
     name: &str,
     path: Option<&std::path::Path>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Every module definition names itself, so a NULL here is not a definition
-    // read at the offsets it was written at.  It is the one field that says so
-    // before anything else goes wrong: a definition laid out against a
-    // `PyObject` header one word wider than this interpreter's puts its
-    // `m_copy` where `m_name` is read, its `m_name` where `m_doc` is, and its
-    // `m_methods` where `m_slots` is.  Reading it that way is not an error
-    // anywhere: the module is created, `__doc__` holds the name, no execution
-    // slot is found, and the module an extension spent its whole init filling
-    // comes back empty.
-    if unsafe { (*def).m_name.is_null() } {
+    create_module_from_def_like(def, spec, name, path, def)
+}
+
+/// `moduleobject.c` `module_from_slots_and_spec`.  `original_def` is the
+/// pointer handed to a create slot and the token of a def-created module;
+/// NULL for a slots-only export.
+fn create_module_from_def_like(
+    def: *mut CPyModuleDef,
+    spec: PyObjectRef,
+    name: &str,
+    path: Option<&std::path::Path>,
+    original_def: *mut CPyModuleDef,
+) -> Result<PyObjectRef, crate::PyError> {
+    // Every module definition the extension supplied names itself, so a NULL
+    // here is not a definition read at the offsets it was written at.  It is
+    // the one field that says so before anything else goes wrong: a definition
+    // laid out against a `PyObject` header one word wider than this
+    // interpreter's puts its `m_copy` where `m_name` is read, its `m_name`
+    // where `m_doc` is, and its `m_methods` where `m_slots` is.  Reading it
+    // that way is not an error anywhere: the module is created, `__doc__`
+    // holds the name, no execution slot is found, and the module an extension
+    // spent its whole init filling comes back empty.
+    if !original_def.is_null() && unsafe { (*def).m_name.is_null() } {
         return Err(crate::PyError::new(
             crate::PyErrorKind::SystemError,
             format!(
@@ -667,13 +871,20 @@ pub(super) fn create_module_from_def_and_spec(
     let mut declared_gil = false;
     let mut slot = unsafe { (*def).m_slots };
     while !slot.is_null() && unsafe { (*slot).slot } != 0 {
+        let raw = unsafe { (*slot).slot };
+        let Some(id) = resolve_mod_slot(raw) else {
+            return Err(crate::PyError::new(
+                crate::PyErrorKind::SystemError,
+                format!("module {name} uses unknown slot ID {raw}"),
+            ));
+        };
         let repeated = |what: &str| {
             Err(crate::PyError::new(
                 crate::PyErrorKind::SystemError,
                 format!("module {name} has multiple {what} slots"),
             ))
         };
-        match unsafe { (*slot).slot } {
+        match id {
             PY_MOD_CREATE => {
                 if !create.is_null() {
                     return repeated("create");
@@ -692,6 +903,21 @@ pub(super) fn create_module_from_def_and_spec(
                     return repeated("Py_mod_gil");
                 }
                 declared_gil = true;
+            }
+            PY_MOD_ABI => {
+                abiinfo_check(unsafe { (*slot).value as *mut CPyABIInfo }, Some(name))?;
+            }
+            PY_MOD_TOKEN => {
+                if !original_def.is_null()
+                    && unsafe { (*slot).value } != original_def as *mut c_void
+                {
+                    return Err(crate::PyError::new(
+                        crate::PyErrorKind::SystemError,
+                        format!(
+                            "module {name}: arbitrary Py_mod_token not allowed with PyModuleDef"
+                        ),
+                    ));
+                }
             }
             other => {
                 return Err(crate::PyError::new(
@@ -724,7 +950,7 @@ pub(super) fn create_module_from_def_and_spec(
         let result = unsafe {
             let call: unsafe extern "C" fn(*mut CPyObject, *mut CPyModuleDef) -> *mut CPyObject =
                 std::mem::transmute(create);
-            call(spec_ref, def)
+            call(spec_ref, original_def)
         };
         unsafe { pyobject::decref(spec_ref) };
         // `moduleobject.c PyModule_FromDefAndSpec2`: a create slot that answered
@@ -813,7 +1039,7 @@ fn exec_def_of(module: PyObjectRef, def: *mut CPyModuleDef) -> Result<(), crate:
     }
     let mut slot = unsafe { (*def).m_slots };
     while !slot.is_null() && unsafe { (*slot).slot } != 0 {
-        if unsafe { (*slot).slot } == PY_MOD_EXEC {
+        if resolve_mod_slot(unsafe { (*slot).slot }) == Some(PY_MOD_EXEC) {
             let module = pyre_object::gc_roots::shadow_stack_get(module_slot);
             let module_ref = pyobject::make_ref(module);
             let result = unsafe {
@@ -862,6 +1088,33 @@ fn module_argument(raw: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     Some(module)
 }
 
+fn as_module(raw: *mut CPyObject) -> Option<PyObjectRef> {
+    let module = unsafe { pyobject::from_ref(raw) };
+    if module.is_null() || !unsafe { pyre_object::module::is_module(module) } {
+        None
+    } else {
+        Some(module)
+    }
+}
+
+/// `_PyModule_GetToken` — the stored token, or NULL when `raw` is not a module.
+pub(super) unsafe fn module_token(raw: *mut CPyObject) -> *mut c_void {
+    match as_module(raw) {
+        Some(module) => fields(module).md_token as *mut c_void,
+        None => std::ptr::null_mut(),
+    }
+}
+
+fn expected_module_got(raw: *mut CPyObject) -> String {
+    if raw.is_null() {
+        return "expected module, got NULL".to_owned();
+    }
+    format!(
+        "expected module, got {}",
+        crate::type_methods::arg_type_name(unsafe { pyobject::from_ref(raw) })
+    )
+}
+
 /// Borrowed, exactly as upstream marks it `result_borrowed=True`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyModule_GetDict(module: *mut CPyObject) -> *mut CPyObject {
@@ -881,12 +1134,54 @@ pub unsafe extern "C" fn PyModule_GetState(module: *mut CPyObject) -> *mut c_voi
     fields(module).md_state as *mut c_void
 }
 
+/// `PyModule_GetState_DuringGC` — no exception on a non-module.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetState_DuringGC(module: *mut CPyObject) -> *mut c_void {
+    match as_module(module) {
+        Some(module) => fields(module).md_state as *mut c_void,
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `_PyModule_GetDefOrNull`: the def only when the token *is* the def.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyModule_GetDef(module: *mut CPyObject) -> *mut CPyModuleDef {
     let Some(module) = module_argument(module, "PyModule_GetDef") else {
         return std::ptr::null_mut();
     };
-    fields(module).md_def as *mut CPyModuleDef
+    let stored = fields(module);
+    if stored.md_token_is_def {
+        stored.md_def as *mut CPyModuleDef
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetToken_DuringGC(
+    module: *mut CPyObject,
+    token_p: *mut *mut c_void,
+) -> c_int {
+    unsafe { *token_p = std::ptr::null_mut() };
+    let Some(module) = as_module(module) else {
+        return -1;
+    };
+    unsafe { *token_p = fields(module).md_token as *mut c_void };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyModule_GetToken(
+    module: *mut CPyObject,
+    token_p: *mut *mut c_void,
+) -> c_int {
+    unsafe { *token_p = std::ptr::null_mut() };
+    let Some(module) = as_module(module) else {
+        pyerrors::set_pending_error(crate::PyError::type_error(expected_module_got(module)));
+        return -1;
+    };
+    unsafe { *token_p = fields(module).md_token as *mut c_void };
+    0
 }
 
 /// Steals a reference to `value` on success, which is `PyModule_AddObject`'s
@@ -1306,6 +1601,10 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyModule_Create2 as *const ());
     std::hint::black_box(PyModule_GetDict as *const ());
     std::hint::black_box(PyModule_GetState as *const ());
+    std::hint::black_box(PyModule_GetState_DuringGC as *const ());
+    std::hint::black_box(PyModule_GetToken as *const ());
+    std::hint::black_box(PyModule_GetToken_DuringGC as *const ());
+    std::hint::black_box(PyABIInfo_Check as *const ());
     std::hint::black_box(PyState_AddModule as *const ());
     std::hint::black_box(PyState_FindModule as *const ());
     std::hint::black_box(PyState_RemoveModule as *const ());
@@ -1332,63 +1631,110 @@ pub(super) fn ensure_linked() {
 #[cfg(test)]
 mod tests {
     /// A `PyModuleDef_Slot.slot` is the number an extension compiled against
-    /// `include/pyre3.15t/moduleobject.h` wrote, so the identifiers are one
+    /// `include/pyre3.15t/slots_generated.h` wrote, so the identifiers are one
     /// table in two places.  This walks the header and rejects any identifier
-    /// whose number the Rust side spells differently, or does not spell at
-    /// all; `_Py_mod_LAST_SLOT` is what the reader refuses past, so it is held
-    /// to the highest of them.
+    /// this file spells whose number differs.  A `_Py_SLOT_COMPAT_VALUE(OLD,
+    /// NEW)` body is the non-limited expansion, NEW.
     #[test]
     fn every_module_slot_is_the_number_the_header_gives_it() {
-        const HEADER: &str = include_str!("../../../../include/pyre3.15t/moduleobject.h");
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/slots_generated.h");
 
         let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
-        let mut last_slot = None;
         for line in HEADER.lines() {
-            if let Some(body) = line.strip_prefix("#define _Py_mod_LAST_SLOT ") {
-                last_slot = body.trim().parse::<std::ffi::c_int>().ok();
-                continue;
-            }
             let Some(rest) = line.strip_prefix("#define Py_mod_") else {
                 continue;
             };
             let Some((name, body)) = rest.split_once(' ') else {
                 continue;
             };
-            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+            let Some(value) = slot_define_value(body) else {
                 continue;
             };
             header.push((name, value));
         }
 
-        assert_eq!(
-            header.len(),
-            super::ALL_MODULE_SLOTS.len(),
-            "moduleobject.h declares {} module slots and this file declares {}",
-            header.len(),
-            super::ALL_MODULE_SLOTS.len()
-        );
-
-        for (name, theirs) in &header {
-            let upper = format!("PY_MOD_{}", name.to_ascii_uppercase());
-            let found = super::ALL_MODULE_SLOTS
-                .iter()
-                .find(|(known, _)| *known == upper);
-            let Some((_, ours)) = found else {
+        for &(known, ours) in super::ALL_MODULE_SLOTS {
+            let name = known
+                .strip_prefix("PY_MOD_")
+                .expect("every module slot is declared under the header's own name")
+                .to_ascii_lowercase();
+            let found = header.iter().find(|(theirs, _)| *theirs == name);
+            let Some((_, theirs)) = found else {
                 panic!(
-                    "moduleobject.h defines Py_mod_{name} = {theirs}, and this file has no {upper}"
+                    "this file declares {known} = {ours}, and slots_generated.h has no Py_mod_{name}"
                 );
             };
             assert_eq!(
-                ours, theirs,
-                "Py_mod_{name} is {theirs} in moduleobject.h and {ours} here"
+                ours, *theirs,
+                "Py_mod_{name} is {theirs} in slots_generated.h and {ours} here"
             );
         }
 
-        let highest = header.iter().map(|(_, value)| *value).max().unwrap();
+        let new_of = |name: &str| {
+            header
+                .iter()
+                .find(|(theirs, _)| *theirs == name)
+                .map(|(_, value)| *value)
+                .unwrap_or_else(|| panic!("slots_generated.h declares no Py_mod_{name}"))
+        };
+        assert_eq!(super::resolve_mod_slot(1), Some(new_of("create")));
+        assert_eq!(super::resolve_mod_slot(2), Some(new_of("exec")));
         assert_eq!(
-            last_slot,
-            Some(highest),
-            "moduleobject.h's highest slot is {highest} and its _Py_mod_LAST_SLOT is {last_slot:?}"
+            super::resolve_mod_slot(3),
+            Some(new_of("multiple_interpreters"))
+        );
+        assert_eq!(super::resolve_mod_slot(4), Some(new_of("gil")));
+    }
+
+    fn slot_define_value(body: &str) -> Option<std::ffi::c_int> {
+        let body = body.trim();
+        if let Some(args) = body.strip_prefix("_Py_SLOT_COMPAT_VALUE(") {
+            let args = args.strip_suffix(')')?;
+            let (_, new) = args.split_once(',')?;
+            new.trim().parse().ok()
+        } else {
+            body.parse().ok()
+        }
+    }
+
+    /// `PY_VERSION_HEX` is `patchlevel.h`'s `_Py_PACK_FULL_VERSION` of the
+    /// five version macros, which is what `PyABIInfo_Check` compares against.
+    #[test]
+    fn py_version_hex_is_the_number_the_header_packs() {
+        const HEADER: &str = include_str!("../../../../include/pyre3.15t/patchlevel.h");
+        let define = |name: &str| -> u32 {
+            HEADER
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(&format!("#define {name} "))
+                        .and_then(|body| {
+                            let token = body.split_whitespace().next()?;
+                            if let Some(hex) = token.strip_prefix("0x") {
+                                u32::from_str_radix(hex, 16).ok()
+                            } else {
+                                token.parse().ok()
+                            }
+                        })
+                })
+                .unwrap_or_else(|| panic!("patchlevel.h declares no {name}"))
+        };
+        let level_name = HEADER
+            .lines()
+            .find_map(|line| line.strip_prefix("#define PY_RELEASE_LEVEL "))
+            .map(str::trim)
+            .expect("patchlevel.h declares PY_RELEASE_LEVEL");
+        let packed = super::pack_full_version(
+            define("PY_MAJOR_VERSION"),
+            define("PY_MINOR_VERSION"),
+            define("PY_MICRO_VERSION"),
+            define(level_name),
+            define("PY_RELEASE_SERIAL"),
+        );
+        assert_eq!(
+            super::PY_VERSION_HEX,
+            packed,
+            "PY_VERSION_HEX is {packed:#x} in patchlevel.h and {:#x} here",
+            super::PY_VERSION_HEX
         );
     }
 

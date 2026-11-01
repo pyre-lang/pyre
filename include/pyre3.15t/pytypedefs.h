@@ -30,6 +30,7 @@ typedef int (*converter)(PyObject *, void *);
 typedef struct PyVarObject PyVarObject;
 typedef struct PyModuleDef PyModuleDef;
 typedef struct PyModuleDef_Slot PyModuleDef_Slot;
+typedef struct PyABIInfo PyABIInfo;
 typedef struct PyMethodDef PyMethodDef;
 typedef struct PyMemberDef PyMemberDef;
 typedef struct PyGetSetDef PyGetSetDef;

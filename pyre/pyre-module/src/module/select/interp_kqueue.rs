@@ -120,6 +120,24 @@ fn kqueue_oserror(errno: i32, what: &str) -> pyre_interpreter::PyError {
     pyre_interpreter::PyError::os_error_with_errno(errno, format!("{what}: {e}"))
 }
 
+/// `kqueue_queue_internal_close`: mark `kqfd = -1` first, then close.
+/// Returns the saved errno, or 0. A finalizer swallows this; the
+/// Python `close` method reports it.
+#[cfg(all(target_os = "macos", feature = "host_env"))]
+fn kqueue_queue_internal_close(self_: &mut W_Kqueue) -> i32 {
+    if self_.kqfd < 0 {
+        return 0;
+    }
+    let kqfd = self_.kqfd;
+    self_.kqfd = -1;
+    let rc = unsafe { majit_rlib::_rsocket_rffi::socketclose(kqfd) };
+    if rc < 0 {
+        majit_rlib::rposix::get_saved_errno()
+    } else {
+        0
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 #[pyre_interpreter::pyre_methods(doc = "kqueue() -> kqueue object")]
 impl W_Kqueue {
@@ -167,16 +185,16 @@ impl W_Kqueue {
         Ok(self.kqfd as i64)
     }
 
-    /// `W_Kqueue.close`: stash the fd, mark it closed, then
-    /// `socketclose_no_errno`.
-    fn close(&mut self) {
-        if self.kqfd >= 0 {
-            let kqfd = self.kqfd;
-            self.kqfd = -1;
-            unsafe {
-                majit_rlib::_rsocket_rffi::socketclose_no_errno(kqfd);
-            }
+    /// [3.15-spec] `select_kqueue_close_impl` reports OSError from
+    /// `kqueue_queue_internal_close` ↔ PyPy `W_Kqueue.close` uses
+    /// `socketclose_no_errno` (silent) — `os.close` then `kqueue.close`
+    /// raises `OSError(EBADF)`; evidence: select_kqueue_close_impl
+    fn close(&mut self) -> Result<(), pyre_interpreter::PyError> {
+        let err = kqueue_queue_internal_close(self);
+        if err != 0 {
+            return Err(pyre_interpreter::PyError::os_error_with_errno(err, ""));
         }
+        Ok(())
     }
 
     /// `interp_kqueue.py descr_control` — apply `changelist` (a list
@@ -229,8 +247,7 @@ impl W_Kqueue {
             None
         } else {
             // `descr_control` — `space.float_w` honours `__float__`.
-            let w_secs = pyre_interpreter::builtins::builtin_float(&[w_timeout])?;
-            let secs = unsafe { pyre_object::w_float_get_value(w_secs) };
+            let secs = pyre_interpreter::baseobjspace::float_w(w_timeout)?;
             if secs < 0.0 {
                 return Err(pyre_interpreter::PyError::value_error(format!(
                     "Timeout must be None or >= 0, got {secs}"

@@ -22,16 +22,6 @@ struct PyModuleDef_Slot {
     void *value;
 };
 
-#define Py_mod_create 1
-#define Py_mod_exec 2
-#define Py_mod_multiple_interpreters 3
-#define Py_mod_gil 4
-
-/* The highest slot number defined above, so that anything past it is a slot
-   no reader claims.  `PyModule_FromDefAndSpec` rejects one, and a def that
-   wants to be rejected names `_Py_mod_LAST_SLOT + 1`. */
-#define _Py_mod_LAST_SLOT 4
-
 /* for Py_mod_multiple_interpreters: */
 #define Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED ((void *)0)
 #define Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED ((void *)1)

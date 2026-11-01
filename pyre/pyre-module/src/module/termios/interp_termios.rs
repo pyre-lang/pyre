@@ -174,41 +174,37 @@ fn tcsetattr(
     let ospeed = pyre_interpreter::baseobjspace::int_w(fields[5])? as isize;
     let cc_obj = fields[6];
 
-    // `interp_termios.tcsetattr`: `c_cc` is any iterable. An int goes
-    // through `bytes([x])` (range 0..=255); a bytes element keeps its
-    // first byte. `rtermios.tcsetattr` indexes every `NCCS` entry, so a
-    // shorter list keeps the bytes `tcgetattr` currently reports.
-    let cc_items = pyre_interpreter::baseobjspace::unpackiterable(cc_obj, -1)?;
+    // [3.15-spec] exact NCCS list; bytes of length 1 or int truncated as
+    // `cc_t` ↔ interp_termios.tcsetattr (any iterable, `bytes_w`) — a
+    // short/long cc list, empty/long bytes, or non-int is TypeError; a
+    // value outside C long is OverflowError; evidence: termios_tcsetattr_impl
     let nccs = rtermios::NCCS;
-    let mut cc = if cc_items.len() < nccs {
-        match rtermios::tcgetattr(fd) {
-            Ok(current) => current.cc,
-            Err(e) => return Err(termios_converted_error(e.errno)),
-        }
-    } else {
-        [[0u8; 1]; rtermios::NCCS]
-    };
+    if !unsafe { pyre_object::is_list(cc_obj) }
+        || unsafe { pyre_object::w_list_len(cc_obj) } != nccs
+    {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "tcsetattr: attributes[6] must be {nccs} element list"
+        )));
+    }
+    let cc_items = pyre_interpreter::baseobjspace::unpackiterable(cc_obj, nccs as isize)?;
+    let mut cc = [[0u8; 1]; rtermios::NCCS];
     for (i, &item) in cc_items.iter().enumerate() {
-        if i >= nccs {
-            break;
-        }
-        let byte = unsafe {
-            if pyre_object::is_int(item) {
-                let v = pyre_object::w_int_get_value(item);
-                if !(0..=255).contains(&v) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "bytes must be in range(0, 256)",
-                    ));
-                }
-                v as u8
-            } else if pyre_object::bytesobject::is_bytes_like(item) {
-                let data = pyre_object::bytesobject::bytes_like_data(item);
-                if data.is_empty() { 0 } else { data[0] }
-            } else {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "tcsetattr: c_cc element must be int or bytes",
-                ));
-            }
+        let byte = if unsafe {
+            pyre_object::bytesobject::is_bytes(item)
+                && pyre_object::bytesobject::w_bytes_len(item) == 1
+        } {
+            unsafe { pyre_object::bytesobject::w_bytes_data(item)[0] }
+        // [3.15-spec] an int control character is truncated to `cc_t`
+        // (`termios_tcsetattr_impl`: `PyLong_AsLong` then `(cc_t)num`;
+        // measured on 3.15.0: 256 stores b'\x00', -1 stores b'\xff'); only a
+        // value outside the C long range raises OverflowError, which `int_w`
+        // reports. PyPy builds `bytes([value])` and rejects 256/-1.
+        } else if unsafe { pyre_object::is_int_or_long(item) } {
+            pyre_interpreter::baseobjspace::int_w(item)? as u8
+        } else {
+            return Err(pyre_interpreter::PyError::type_error(
+                "tcsetattr: elements of attributes must be bytes objects of length 1 or integers",
+            ));
         };
         cc[i] = [byte];
     }

@@ -1281,6 +1281,10 @@ pub fn trunc(args: &[PyObjectRef]) -> PyResult {
 /// two arms also state their refusal differently — an integer can be
 /// arbitrarily large, so its message carries no value — and which spelling a
 /// program sees says which arm read the operand.
+///
+/// `loghelper`: a non-integer whose float conversion raises OverflowError, and
+/// whose type defines `__index__` (`PyIndex_Check` / `space.lookup`), continues
+/// on the integer from `space.index` — `math.log(MyIndexable(10**1000))`.
 fn loghelper(mut w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::PyError> {
     unsafe {
         if pyre_object::is_bool(w_x) || pyre_object::is_int(w_x) || pyre_object::is_long(w_x) {
@@ -1336,7 +1340,21 @@ fn loghelper(mut w_x: PyObjectRef, base: f64) -> Result<f64, pyre_interpreter::P
             };
         }
     }
-    let x = try_get_double(w_x)?;
+    // `loghelper`: OverflowError from the float conversion, with `__index__`
+    // on the type, is dropped; `space.index` is then the live integer and
+    // `w_x` is dead.
+    let x = match pyre_object::with_roots!(w_x => try_get_double(w_x)) {
+        Ok(x) => x,
+        Err(err)
+            if err.kind == pyre_interpreter::PyErrorKind::OverflowError
+                && unsafe { pyre_interpreter::baseobjspace::lookup(w_x, "__index__") }
+                    .is_some() =>
+        {
+            let w_x = pyre_interpreter::baseobjspace::space_index(w_x)?;
+            return loghelper(w_x, base);
+        }
+        Err(err) => return Err(err),
+    };
     // NaN propagates through log.
     if x.is_nan() {
         return Ok(f64::NAN);
@@ -2338,8 +2356,13 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
             "nextafter() takes exactly 2 positional arguments",
         ));
     };
+    // [3.15-spec] an explicit `steps=None` is the one-step call
+    // (`math_nextafter_impl`, whose clinic default is `steps: object = None`;
+    // measured on 3.15.0: `math.nextafter(1.0, 2.0, steps=None) ==
+    // 1.0000000000000002`) ↔ PyPy `nextafter` takes no `steps`. The kw-only
+    // default binds `None`, so a bound None is also the omitted slot.
     let steps = match bound(2) {
-        Some(s) => {
+        Some(s) if unsafe { !pyre_object::is_none(s) } => {
             let b = RBigIntGcRoot::new(pyre_object::with_roots!(w_x, w_y => get_bigint(s))?);
             if pyre_object::with_roots!(w_x, w_y => b.int_lt(0)) {
                 return Err(pyre_interpreter::PyError::value_error(
@@ -2352,7 +2375,7 @@ pub fn nextafter(args: &[PyObjectRef]) -> PyResult {
                 u64::MAX
             })
         }
-        None => None,
+        _ => None,
     };
     let x = pyre_object::with_roots!(w_y => try_get_double(w_x))?;
     let y = try_get_double(w_y)?;

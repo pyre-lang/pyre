@@ -163,6 +163,7 @@ STRUCTS = {
     "CPyUnicodeWriter": "PyUnicodeWriter",
     "CPyDateTimeCAPI": "PyDateTime_CAPI",
     "CPySlot": "PySlot",
+    "CPyABIInfo": "PyABIInfo",
 }
 
 

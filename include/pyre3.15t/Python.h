@@ -50,7 +50,8 @@
 #include "pymacro.h"
 #include "pytypedefs.h"
 #include "object.h"
-#include "typeslots.h"
+#include "slots.h"
+#include "slots_generated.h"
 /* Name the types entry points below take and answer with by value:
    `PyThreadState` and `PyGILState_STATE`, and `Py_complex`. */
 #include "pystate.h"

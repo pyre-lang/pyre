@@ -155,8 +155,31 @@ impl Poll {
             } else {
                 t as i32
             }
+        } else if unsafe { pyre_object::is_long(w_timeout) } {
+            let big = unsafe { pyre_object::w_long_get_value(w_timeout) };
+            if big.get_sign() < 0 {
+                -1
+            } else if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                let t = pyre_object::longobject::jit_bigint_to_i64_value(big);
+                if t > i32::MAX as i64 {
+                    return Err(pyre_interpreter::PyError::overflow_error(
+                        "expected a 32-bit integer",
+                    ));
+                }
+                t as i32
+            } else {
+                return Err(pyre_interpreter::PyError::overflow_error(
+                    "expected a 32-bit integer",
+                ));
+            }
         } else if unsafe { pyre_object::is_float(w_timeout) } {
             let t = unsafe { pyre_object::w_float_get_value(w_timeout) };
+            // [3.15-spec] `_PyTime_FromMillisecondsObject` message; PyPy `space.int` raises ValueError "cannot convert float NaN to integer".
+            if t.is_nan() {
+                return Err(pyre_interpreter::PyError::value_error(
+                    "Invalid value NaN (not a number)",
+                ));
+            }
             if t < 0.0 {
                 -1
             } else {

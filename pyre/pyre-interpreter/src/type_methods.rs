@@ -2350,7 +2350,12 @@ fn format_render(
     }
     let parsed = parse_format_parts(fmt)?;
     // Read once, before the loop the field emission below tests it in.
-    let sole_field = parsed.len() == 1 && matches!(parsed[0], PyPyFormatPart::Field { .. });
+    // `parse_format_parts` plants an (empty) Literal before every Field, so a
+    // template that is exactly one replacement field is that pair.
+    let sole_field = matches!(
+        parsed.as_slice(),
+        [PyPyFormatPart::Literal(literal), PyPyFormatPart::Field { .. }] if literal.is_empty()
+    );
     let mut result = Wtf8Buf::new();
     for part in &parsed {
         let (field_name, conversion_spec, format_spec) = match part {
@@ -2567,7 +2572,7 @@ fn format_render(
     Ok(TemplateRender::Text(result))
 }
 
-enum PyPyFormatPart {
+pub(crate) enum PyPyFormatPart {
     Literal(Wtf8Buf),
     Field {
         field_name: Wtf8Buf,
@@ -2588,7 +2593,13 @@ fn codepoint_slice(codepoints: &[CodePoint], start: usize, end: usize) -> Wtf8Bu
 /// the way `unicode_format.h parse_field` does.  Braces inside the
 /// first-part item lookup (`{[{]}`) are ordinary key text; braces after `:`
 /// are recursive format markup.
-fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
+///
+/// Each escaped `{{` / `}}` pushes a Literal that ends with the brace, as
+/// `_do_build_string` appends one literal entry per escape.  A Field is
+/// always preceded by its own leading Literal — empty when the field starts
+/// the string or follows another field — so the Literal immediately before a
+/// Field is that field's leading text.  A trailing non-empty Literal is kept.
+pub(crate) fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError> {
     let s: Vec<CodePoint> = fmt.code_points().collect();
     let end = s.len();
     let mut parts = Vec::new();
@@ -2609,6 +2620,7 @@ fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError>
             }
             literal.push(c);
             i += 2;
+            parts.push(PyPyFormatPart::Literal(std::mem::take(&mut literal)));
             continue;
         }
         if i + 1 == end {
@@ -2619,11 +2631,10 @@ fn parse_format_parts(fmt: &Wtf8) -> Result<Vec<PyPyFormatPart>, crate::PyError>
         if s[i + 1] == '{' {
             literal.push(c);
             i += 2;
+            parts.push(PyPyFormatPart::Literal(std::mem::take(&mut literal)));
             continue;
         }
-        if !literal.is_empty() {
-            parts.push(PyPyFormatPart::Literal(std::mem::take(&mut literal)));
-        }
+        parts.push(PyPyFormatPart::Literal(std::mem::take(&mut literal)));
 
         i += 1;
         parts.push(parse_field(&s, &mut i, end)?);

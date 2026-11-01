@@ -431,7 +431,7 @@ header declaring it wrongly.
   `tp_setattro`, `tp_descr_get` and `tp_descr_set`;
 - heap types: `PyType_FromSpec`, `PyType_FromSpecWithBases`,
   `PyType_FromModuleAndSpec`, `PyType_GetSlot`, `PyType_GetName` and
-  `PyType_GetQualName`, with every `typeslots.h` identifier, `Py_tp_token` and
+  `PyType_GetQualName`, with every `slots_generated.h` identifier, `Py_tp_token` and
   `Py_tp_vectorcall` included -- the latter answering `Type(...)` ahead of
   `__new__`/`__init__` the way `PyType_Type`'s own
   `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` arrange for it;

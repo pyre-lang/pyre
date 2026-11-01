@@ -66,16 +66,24 @@ PyAPI_DATA(const unsigned long) Py_Version;
 #define PYPY_CPYEXT_GC 1
 #define PyPy_Borrow(a, b) ((void)0)
 
+#define _Py_PACK_FULL_VERSION(X, Y, Z, LEVEL, SERIAL) ( \
+    (((X) & 0xff) << 24) |                              \
+    (((Y) & 0xff) << 16) |                              \
+    (((Z) & 0xff) << 8) |                               \
+    (((LEVEL) & 0xf) << 4) |                            \
+    (((SERIAL) & 0xf) << 0))
+
 /* Version as a single 4-byte hex number, e.g. 0x030F00F0 == 3.15.0 final.
    Use this for numeric comparisons, e.g. #if PY_VERSION_HEX >= ...
    The release-level nibble is 0xF for a final release, so a value ending in
    0x00 would put every `#if PY_VERSION_HEX >= 0x030F00F0` extension on its
    pre-release branch. */
-#define PY_VERSION_HEX ((PY_MAJOR_VERSION << 24) | \
-                        (PY_MINOR_VERSION << 16) | \
-                        (PY_MICRO_VERSION <<  8) | \
-                        (PY_RELEASE_LEVEL <<  4) | \
-                        (PY_RELEASE_SERIAL << 0))
+#define PY_VERSION_HEX _Py_PACK_FULL_VERSION( \
+    PY_MAJOR_VERSION,                         \
+    PY_MINOR_VERSION,                         \
+    PY_MICRO_VERSION,                         \
+    PY_RELEASE_LEVEL,                         \
+    PY_RELEASE_SERIAL)
 
 #define PYTHON_API_VERSION 1013
 #define PYTHON_ABI_VERSION 3
