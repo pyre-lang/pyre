@@ -4892,8 +4892,8 @@ impl<'a> Lowering<'a> {
         (!owner.is_empty()).then_some(owner)
     }
 
-    /// Dest PTRTYPE for a raw overlay struct (`*const MapNodeAbstractAttribute`
-    /// / `*const MapNodeTerminatorView`). `ann_cast_int_to_ptr` returns
+    /// Dest PTRTYPE for a raw overlay struct (`*const raw_overlay::PrefixView`).
+    /// `ann_cast_int_to_ptr` returns
     /// `SomePtr(PTRTYPE)`; `SomePtr.getattr` resolves on the example fields.
     /// Decide by GC-ness, not class root: a raw (non-GC) `lltype.Struct` is
     /// never an instance (`lltype.py` `ann_cast_int_to_ptr`). A declared-GC

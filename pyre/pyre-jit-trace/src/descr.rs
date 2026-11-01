@@ -5545,9 +5545,10 @@ fn dict_strategy_ref_field_descr(field_key: &str) -> DescrRef {
 /// `quasiimmut.py get_mutate_field_name`). The cache_key is the
 /// crate-stripped STRUCT spelling `canonical_struct_name` yields for
 /// `pyre_object::mapdict::<Struct>` (`mapdict::Terminator` and siblings).
-/// SizeDescr is headerless (no vtable). `MapNode` / `CachedAttributeHolder`
-/// are GC objects (`mapdict.py AbstractAttribute`); walker pins intern
-/// the object start. `CellFamily` remains a headerless leak.
+/// SizeDescr is headerless (no vtable). `Terminator` / `PlainAttribute` /
+/// `UnboxedPlainAttribute` / `CachedAttributeHolder` are GC objects
+/// (`mapdict.py`); walker pins intern the object start. `CellFamily` remains
+/// a headerless leak.
 fn make_mapdict_quasi_descr_group(
     struct_name: &str,
     cache_path: &str,
@@ -5630,20 +5631,18 @@ fn make_mapdict_quasi_descr_group(
 }
 
 /// `mapdict.py Terminator._immutable_fields_ = ['w_cls', 'allow_unboxing?']`.
-/// `MapNode` is the GC object (`AbstractAttribute`); the Terminator
-/// payload is inlined (`lltype.Struct._note_inlined_into`). Walker
-/// `QUASIIMMUT_FIELD` arg0 is the node start (`MapRef`); offsets include
-/// `MAP_NODE_TERMINATOR_OFFSET`.
+/// Walker `QUASIIMMUT_FIELD` arg0 is the Terminator object start; offsets
+/// are `offset_of!` from that start (`GcStruct._first_struct`).
 static TERMINATOR_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
-    use pyre_object::mapdict::{MAP_NODE_TERMINATOR_OFFSET, MapNode, Terminator};
+    use pyre_object::mapdict::Terminator;
     make_mapdict_quasi_descr_group(
         "Terminator",
         "mapdict::Terminator",
-        core::mem::size_of::<MapNode>(),
+        core::mem::size_of::<Terminator>(),
         "allow_unboxing",
-        MAP_NODE_TERMINATOR_OFFSET + core::mem::offset_of!(Terminator, allow_unboxing),
+        core::mem::offset_of!(Terminator, allow_unboxing),
         core::mem::size_of::<std::cell::Cell<bool>>(),
-        MAP_NODE_TERMINATOR_OFFSET + core::mem::offset_of!(Terminator, mutate_allow_unboxing),
+        core::mem::offset_of!(Terminator, mutate_allow_unboxing),
     )
 });
 
@@ -5660,19 +5659,19 @@ pub fn terminator_mutate_allow_unboxing_descr() -> DescrRef {
 }
 
 /// `mapdict.py PlainAttribute._immutable_fields_` `ever_mutated?`.
-/// Walker arg0 is the `MapNode` start; offsets include
-/// `MAP_NODE_PLAIN_OFFSET`.
+/// Walker arg0 is the PlainAttribute object start; offsets are
+/// `offset_of!` from that start (`GcStruct._first_struct`).
 static PLAIN_ATTRIBUTE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
     LazyLock::new(|| {
-        use pyre_object::mapdict::{MAP_NODE_PLAIN_OFFSET, MapNode, PlainAttribute};
+        use pyre_object::mapdict::PlainAttribute;
         make_mapdict_quasi_descr_group(
             "PlainAttribute",
             "mapdict::PlainAttribute",
-            core::mem::size_of::<MapNode>(),
+            core::mem::size_of::<PlainAttribute>(),
             "ever_mutated",
-            MAP_NODE_PLAIN_OFFSET + core::mem::offset_of!(PlainAttribute, ever_mutated),
+            core::mem::offset_of!(PlainAttribute, ever_mutated),
             core::mem::size_of::<std::cell::Cell<bool>>(),
-            MAP_NODE_PLAIN_OFFSET + core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
+            core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
         )
     });
 
@@ -5686,6 +5685,37 @@ pub fn plain_attribute_ever_mutated_descr() -> DescrRef {
 
 pub fn plain_attribute_mutate_ever_mutated_descr() -> DescrRef {
     plain_attribute_field_descr("mutate_ever_mutated")
+}
+
+/// `mapdict.py UnboxedPlainAttribute` inherits `PlainAttribute.ever_mutated?`.
+/// Walker arg0 is the UnboxedPlainAttribute object start; the mutate words
+/// sit on the inlined `PlainAttribute` prefix (`GcStruct._first_struct`).
+static UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
+    LazyLock::new(|| {
+        use pyre_object::mapdict::{PlainAttribute, UnboxedPlainAttribute};
+        make_mapdict_quasi_descr_group(
+            "UnboxedPlainAttribute",
+            "mapdict::UnboxedPlainAttribute",
+            core::mem::size_of::<UnboxedPlainAttribute>(),
+            "ever_mutated",
+            core::mem::offset_of!(UnboxedPlainAttribute, base)
+                + core::mem::offset_of!(PlainAttribute, ever_mutated),
+            core::mem::size_of::<std::cell::Cell<bool>>(),
+            core::mem::offset_of!(UnboxedPlainAttribute, base)
+                + core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
+        )
+    });
+
+fn unboxed_plain_attribute_field_descr(field_key: &str) -> DescrRef {
+    field_descr_from_group_named(&*UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP, field_key)
+}
+
+pub fn unboxed_plain_attribute_ever_mutated_descr() -> DescrRef {
+    unboxed_plain_attribute_field_descr("ever_mutated")
+}
+
+pub fn unboxed_plain_attribute_mutate_ever_mutated_descr() -> DescrRef {
+    unboxed_plain_attribute_field_descr("mutate_ever_mutated")
 }
 
 /// `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
@@ -12154,7 +12184,9 @@ mod tests {
 
     #[test]
     fn mapdict_mutate_descr_for_field_is_the_group_mutate_row() {
-        use pyre_object::mapdict::{CachedAttributeHolder, PlainAttribute, Terminator, UnboxType};
+        use pyre_object::mapdict::{
+            CachedAttributeHolder, PlainAttribute, Terminator, UnboxType, UnboxedPlainAttribute,
+        };
         let cases: &[(
             DescrRef,
             DescrRef,
@@ -12168,8 +12200,7 @@ mod tests {
                 terminator_allow_unboxing_descr(),
                 terminator_mutate_allow_unboxing_descr(),
                 "allow_unboxing",
-                pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
-                    + core::mem::offset_of!(Terminator, allow_unboxing),
+                core::mem::offset_of!(Terminator, allow_unboxing),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
                 Type::Int,
                 &*TERMINATOR_DESCR_GROUP,
@@ -12178,11 +12209,20 @@ mod tests {
                 plain_attribute_ever_mutated_descr(),
                 plain_attribute_mutate_ever_mutated_descr(),
                 "ever_mutated",
-                pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET
-                    + core::mem::offset_of!(PlainAttribute, ever_mutated),
+                core::mem::offset_of!(PlainAttribute, ever_mutated),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
                 Type::Int,
                 &*PLAIN_ATTRIBUTE_DESCR_GROUP,
+            ),
+            (
+                unboxed_plain_attribute_ever_mutated_descr(),
+                unboxed_plain_attribute_mutate_ever_mutated_descr(),
+                "ever_mutated",
+                core::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + core::mem::offset_of!(PlainAttribute, ever_mutated),
+                core::mem::size_of::<std::cell::Cell<bool>>(),
+                Type::Int,
+                &*UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP,
             ),
             (
                 holder_attr_descr(),
@@ -12241,37 +12281,45 @@ mod tests {
         assert!(mapdict_group_for_owner("ullbc::Terminator").is_none());
         assert!(mapdict_group_for_owner("mapdict::Terminator").is_some());
         assert!(mapdict_group_for_owner("pyre_object::mapdict::Terminator").is_some());
+        assert!(mapdict_group_for_owner("mapdict::UnboxedPlainAttribute").is_some());
+        assert!(mapdict_group_for_owner("pyre_object::mapdict::UnboxedPlainAttribute").is_some());
     }
 
     #[test]
     fn mapdict_mutate_descr_offset_lands_on_quasiimmut_field() {
         use pyre_object::mapdict::{
-            CachedAttributeHolder, PlainAttribute, Terminator, TerminatorKind, UnboxType,
+            AbstractAttribute, CachedAttributeHolder, MapClass, PlainAttribute, Terminator,
+            TerminatorKind, UnboxType, UnboxedPlainAttribute,
         };
         use rustpython_wtf8::Wtf8Buf;
         use std::cell::Cell;
         use std::sync::atomic::AtomicPtr;
 
         let term = Terminator {
-            terminator: std::ptr::null(),
+            base: AbstractAttribute {
+                class: MapClass::Terminator,
+                terminator: std::ptr::null(),
+                cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
+            },
             w_cls: pyre_object::PY_NULL,
             allow_unboxing: Cell::new(true),
             mutate_allow_unboxing: pyre_object::quasiimmut::null_mutate_word(),
             mutate_allow_unboxing_lock: pyre_object::quasiimmut::null_mutate_lock(),
             kind: TerminatorKind::NoDict,
             devolved_dict_terminator: Cell::new(std::ptr::null()),
-            cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         };
-        let node = pyre_object::mapdict::MapNode::Terminator(term);
         let mutate = terminator_mutate_allow_unboxing_descr();
         let off = mutate.as_field_descr().expect("mutate descr").offset();
-        let via = (&node as *const pyre_object::mapdict::MapNode as *const u8).wrapping_add(off);
-        let term = unsafe { (*(&node as *const pyre_object::mapdict::MapNode)).as_terminator() };
+        let via = (&term as *const Terminator as *const u8).wrapping_add(off);
         let direct = std::ptr::addr_of!(term.mutate_allow_unboxing) as *const u8;
         assert_eq!(via, direct);
 
         let plain = PlainAttribute {
-            terminator: std::ptr::null(),
+            base: AbstractAttribute {
+                class: MapClass::PlainAttribute,
+                terminator: std::ptr::null(),
+                cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
+            },
             name: Wtf8Buf::from("x"),
             attrkind: 0,
             storageindex: 0,
@@ -12281,15 +12329,38 @@ mod tests {
             mutate_ever_mutated: pyre_object::quasiimmut::null_mutate_word(),
             mutate_ever_mutated_lock: pyre_object::quasiimmut::null_mutate_lock(),
             order: 0,
-            cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
-            unboxed: None,
         };
-        let node = pyre_object::mapdict::MapNode::Plain(plain);
         let mutate = plain_attribute_mutate_ever_mutated_descr();
         let off = mutate.as_field_descr().expect("mutate descr").offset();
-        let via = (&node as *const pyre_object::mapdict::MapNode as *const u8).wrapping_add(off);
-        let plain = unsafe { (*(&node as *const pyre_object::mapdict::MapNode)).as_plain() };
+        let via = (&plain as *const PlainAttribute as *const u8).wrapping_add(off);
         let direct = std::ptr::addr_of!(plain.mutate_ever_mutated) as *const u8;
+        assert_eq!(via, direct);
+
+        let unboxed = UnboxedPlainAttribute {
+            base: PlainAttribute {
+                base: AbstractAttribute {
+                    class: MapClass::UnboxedPlainAttribute,
+                    terminator: std::ptr::null(),
+                    cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
+                },
+                name: Wtf8Buf::from("x"),
+                attrkind: 0,
+                storageindex: 0,
+                num_attributes: 1,
+                back: std::ptr::null(),
+                ever_mutated: Cell::new(false),
+                mutate_ever_mutated: pyre_object::quasiimmut::null_mutate_word(),
+                mutate_ever_mutated_lock: pyre_object::quasiimmut::null_mutate_lock(),
+                order: 0,
+            },
+            typ: UnboxType::Int,
+            listindex: 0,
+            firstunwrapped: true,
+        };
+        let mutate = unboxed_plain_attribute_mutate_ever_mutated_descr();
+        let off = mutate.as_field_descr().expect("mutate descr").offset();
+        let via = (&unboxed as *const UnboxedPlainAttribute as *const u8).wrapping_add(off);
+        let direct = std::ptr::addr_of!(unboxed.base.mutate_ever_mutated) as *const u8;
         assert_eq!(via, direct);
 
         let holder = CachedAttributeHolder {
@@ -15206,7 +15277,9 @@ mod tests {
     fn make_descr_from_bh_bridges_mapdict_quasi_fields() {
         use majit_ir::descr::ArrayFlag;
         use majit_jitcode::jitcode::BhDescr;
-        use pyre_object::mapdict::{CachedAttributeHolder, PlainAttribute, Terminator, UnboxType};
+        use pyre_object::mapdict::{
+            CachedAttributeHolder, PlainAttribute, Terminator, UnboxType, UnboxedPlainAttribute,
+        };
 
         let cases: &[(&[&str], &str, usize, usize, Type, bool, DescrRef)] = &[
             (
@@ -15216,8 +15289,7 @@ mod tests {
                     "objspace::std::mapdict::Terminator",
                 ],
                 "allow_unboxing",
-                pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
-                    + core::mem::offset_of!(Terminator, allow_unboxing),
+                core::mem::offset_of!(Terminator, allow_unboxing),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
                 Type::Int,
                 true,
@@ -15230,8 +15302,7 @@ mod tests {
                     "objspace::std::mapdict::Terminator",
                 ],
                 "mutate_allow_unboxing",
-                pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
-                    + core::mem::offset_of!(Terminator, mutate_allow_unboxing),
+                core::mem::offset_of!(Terminator, mutate_allow_unboxing),
                 WORD,
                 Type::Ref,
                 false,
@@ -15243,8 +15314,7 @@ mod tests {
                     "pyre_object::mapdict::PlainAttribute",
                 ],
                 "ever_mutated",
-                pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET
-                    + core::mem::offset_of!(PlainAttribute, ever_mutated),
+                core::mem::offset_of!(PlainAttribute, ever_mutated),
                 core::mem::size_of::<std::cell::Cell<bool>>(),
                 Type::Int,
                 true,
@@ -15256,12 +15326,37 @@ mod tests {
                     "pyre_object::mapdict::PlainAttribute",
                 ],
                 "mutate_ever_mutated",
-                pyre_object::mapdict::MAP_NODE_PLAIN_OFFSET
-                    + core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
+                core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
                 WORD,
                 Type::Ref,
                 false,
                 plain_attribute_mutate_ever_mutated_descr(),
+            ),
+            (
+                &[
+                    "mapdict::UnboxedPlainAttribute",
+                    "pyre_object::mapdict::UnboxedPlainAttribute",
+                ],
+                "ever_mutated",
+                core::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + core::mem::offset_of!(PlainAttribute, ever_mutated),
+                core::mem::size_of::<std::cell::Cell<bool>>(),
+                Type::Int,
+                true,
+                unboxed_plain_attribute_ever_mutated_descr(),
+            ),
+            (
+                &[
+                    "mapdict::UnboxedPlainAttribute",
+                    "pyre_object::mapdict::UnboxedPlainAttribute",
+                ],
+                "mutate_ever_mutated",
+                core::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
+                WORD,
+                Type::Ref,
+                false,
+                unboxed_plain_attribute_mutate_ever_mutated_descr(),
             ),
             (
                 &[
@@ -15342,8 +15437,7 @@ mod tests {
         }
 
         let nested = make_descr_from_bh(&BhDescr::Field {
-            offset: pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET
-                + core::mem::offset_of!(Terminator, mutate_allow_unboxing),
+            offset: core::mem::offset_of!(Terminator, mutate_allow_unboxing),
             field_size: 2 * WORD,
             field_type: Type::Ref,
             field_flag: ArrayFlag::Struct,
@@ -15617,6 +15711,16 @@ mod tests {
                 "objspace::std::mapdict::PlainAttribute",
                 "mutate_ever_mutated",
                 plain_attribute_mutate_ever_mutated_descr(),
+            ),
+            (
+                "mapdict::UnboxedPlainAttribute",
+                "ever_mutated",
+                unboxed_plain_attribute_ever_mutated_descr(),
+            ),
+            (
+                "objspace::std::mapdict::UnboxedPlainAttribute",
+                "mutate_ever_mutated",
+                unboxed_plain_attribute_mutate_ever_mutated_descr(),
             ),
             (
                 "mapdict::CachedAttributeHolder",
@@ -16600,6 +16704,15 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("objspace::std::mapdict::PlainAttribute", || {
         LazyLock::force(&PLAIN_ATTRIBUTE_DESCR_GROUP);
+    }),
+    ("mapdict::UnboxedPlainAttribute", || {
+        LazyLock::force(&UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP);
+    }),
+    ("pyre_object::mapdict::UnboxedPlainAttribute", || {
+        LazyLock::force(&UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP);
+    }),
+    ("objspace::std::mapdict::UnboxedPlainAttribute", || {
+        LazyLock::force(&UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP);
     }),
     ("mapdict::CachedAttributeHolder", || {
         LazyLock::force(&HOLDER_DESCR_GROUP);
@@ -18110,6 +18223,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             }
             // `mapdict.py` `Terminator.allow_unboxing?` /
             // `PlainAttribute.ever_mutated?` /
+            // `UnboxedPlainAttribute.ever_mutated?` (inherited) /
             // `CachedAttributeHolder.attr?` / `typ?`. Owner match is
             // `mapdict::<Struct>` (the analyzer's `canonical_struct_name`
             // of the crate-stripped def-path), never the bare leaf
@@ -19578,6 +19692,17 @@ fn is_mapdict_plain_attribute_struct(struct_id: u64) -> bool {
     .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
 }
 
+fn is_mapdict_unboxed_plain_attribute_struct(struct_id: u64) -> bool {
+    [
+        "mapdict::UnboxedPlainAttribute",
+        "pyre_object::mapdict::UnboxedPlainAttribute",
+        "objspace::std::mapdict::UnboxedPlainAttribute",
+        "pyre_interpreter::objspace::std::mapdict::UnboxedPlainAttribute",
+    ]
+    .into_iter()
+    .any(|owner| struct_id == majit_ir::descr::path_hash(owner))
+}
+
 fn is_mapdict_holder_struct(struct_id: u64) -> bool {
     [
         "mapdict::CachedAttributeHolder",
@@ -19592,6 +19717,10 @@ fn is_mapdict_holder_struct(struct_id: u64) -> bool {
 fn mapdict_group_for_owner(owner: &str) -> Option<&'static majit_ir::descr::SimpleDescrGroup> {
     if owner == "mapdict::Terminator" || owner.ends_with("::mapdict::Terminator") {
         Some(&*TERMINATOR_DESCR_GROUP)
+    } else if owner == "mapdict::UnboxedPlainAttribute"
+        || owner.ends_with("::mapdict::UnboxedPlainAttribute")
+    {
+        Some(&*UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP)
     } else if owner == "mapdict::PlainAttribute" || owner.ends_with("::mapdict::PlainAttribute") {
         Some(&*PLAIN_ATTRIBUTE_DESCR_GROUP)
     } else if owner == "mapdict::CachedAttributeHolder"
@@ -19608,6 +19737,8 @@ fn mapdict_group_for_struct_id(
 ) -> Option<&'static majit_ir::descr::SimpleDescrGroup> {
     if is_mapdict_terminator_struct(struct_id) {
         Some(&*TERMINATOR_DESCR_GROUP)
+    } else if is_mapdict_unboxed_plain_attribute_struct(struct_id) {
+        Some(&*UNBOXED_PLAIN_ATTRIBUTE_DESCR_GROUP)
     } else if is_mapdict_plain_attribute_struct(struct_id) {
         Some(&*PLAIN_ATTRIBUTE_DESCR_GROUP)
     } else if is_mapdict_holder_struct(struct_id) {

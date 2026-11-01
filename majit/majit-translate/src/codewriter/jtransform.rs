@@ -10028,8 +10028,8 @@ impl<'a> Transformer<'a> {
         // off the *base register* (`is_gc = kc == 'r'`), not the owner's
         // recorded gckind. When that base is already Int, stamp the loaded
         // word into the int bank so assemble emits `getfield_raw_i`.
-        // Immutable fields already returned `_pure` above
-        // (`MapNodeTerminatorView.w_cls`).
+        // Immutable fields already returned `_pure` above (a raw
+        // overlay GCREF).
         //
         // A GC owner with a Signed base is not that raw-struct arm:
         // `promote_gc_field_bases` rehomes the base (`cast_int_to_ptr` /
@@ -20232,6 +20232,159 @@ mod tests {
         assert_eq!(
             w_class_base, &frame,
             "w_class is read off the outer object; ops={ops:?}"
+        );
+    }
+
+    /// GC struct whose first field is another GC struct
+    /// (`GcStruct._first_struct`). Downcast (`cast_pointer`) is Identity;
+    /// a subsequent field read is `getfield_gc_*` on the same object.
+    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC interior.
+    #[test]
+    fn gc_first_struct_downcast_field_read_is_same_object() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let child = "gc_first_struct::Terminator";
+        let parent = "gc_first_struct::AbstractAttribute";
+        let child_id = majit_ir::descr::StructId::from_canonical(child);
+        let parent_id = majit_ir::descr::StructId::from_canonical(parent);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (child.to_string(), Some(child_id)),
+                (parent.to_string(), Some(parent_id)),
+            ]));
+        let word = crate::layout::target_word_size();
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            child_id,
+            StructLayout {
+                size: 4 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "base".into(),
+                        offset: 0,
+                        size: 3 * word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "w_cls".into(),
+                        offset: 3 * word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            parent_id,
+            StructLayout {
+                size: 3 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "class".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "terminator".into(),
+                        offset: word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Pointer,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "cache_attrs".into(),
+                        offset: 2 * word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let mut graph = FunctionGraph::new("downcast_then_w_cls");
+        let map = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "map".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, map.clone());
+        let downcast = graph
+            .push_op_var(
+                graph.startblock,
+                crate::model::cast_pointer_call(child, map.clone()),
+                true,
+            )
+            .unwrap();
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: downcast,
+                    field: FieldDescriptor::new("w_cls", Some(child.into())),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "add"
+            )),
+            "downcast + field read must not emit an interior int_add; ops={ops:?}"
+        );
+        let w_cls = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "w_cls"
+            )
+        });
+        let w_cls_base = match &w_cls.expect("w_cls getfield").kind {
+            OpKind::FieldRead { base, .. } => base,
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            w_cls_base, &map,
+            "w_cls is read off the same object as the downcast; ops={ops:?}"
         );
     }
 
@@ -34785,8 +34938,8 @@ mod tests {
             LowLevelType, Ptr, PtrTarget, Struct,
         };
 
-        let owner = "jtransform_raw_ctor::MapNode::Terminator";
-        let result_base = "jtransform_raw_ctor::MapNode";
+        let owner = "jtransform_raw_ctor::Kind::Circle";
+        let result_base = "jtransform_raw_ctor::Kind";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
         let _registry =
             crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
@@ -34795,7 +34948,7 @@ mod tests {
 
         let mut cc = crate::call::CallControl::new();
         let mut by_discr = std::collections::HashMap::new();
-        by_discr.insert(0, "Terminator".to_string());
+        by_discr.insert(0, "Circle".to_string());
         let mut map = std::collections::HashMap::new();
         map.insert(result_base.to_string(), by_discr);
         cc.set_enum_variant_by_discriminant(map);
@@ -34817,8 +34970,8 @@ mod tests {
             TO: PtrTarget::Struct(Struct::new(owner, vec![])),
         }))));
         let target = CallTarget::synthetic_transparent_enum_variant_ctor(
-            vec!["jtransform_raw_ctor".to_string(), "MapNode".to_string()],
-            "Terminator",
+            vec!["jtransform_raw_ctor".to_string(), "Kind".to_string()],
+            "Circle",
             0,
         );
         let result_ty = ValueType::Ref(Some(owner.to_string()));

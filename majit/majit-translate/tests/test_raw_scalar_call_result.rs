@@ -68,6 +68,8 @@ use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, lower_named}
 use majit_charon_reader::{FunDecl, Llbc};
 use majit_translate::{
     ErrorCarrierSpec, HostStaticAddrs,
+    call::CallControl,
+    codewriter::jtransform::{GraphTransformConfig, Transformer},
     flowspace::model::ConstValue,
     front::llbc_hints::harvest_immutable_fields_from_llbcs,
     front::mir::{LowerError, lower_fun_decl, lower_function, lower_function_with_static_addrs},
@@ -384,34 +386,44 @@ fn call_returned_byte_pointer_stays_ref() {
     );
 }
 
-/// `rclass.py` `getinstancerepr` of a Rust-repr MapNode owner: FieldRead
-/// of `terminator` / `w_cls` is already the instance field. Dest overlay
-/// `cast_int_to_ptr(Ptr(Struct Raw))` is `rffi.py` `CStruct` only.
+/// Front-end: `map_terminator` loads `AbstractAttribute.terminator`
+/// and `map_terminator_w_cls` / `instance_getclass` load
+/// `Terminator.w_cls` as GCREF field reads (`getfield_gc_r`). The
+/// parent is first-field-inlined (`GcStruct._first_struct`); a
+/// downcast (`cast_pointer`) keeps the object start.
+/// `jtransform.py rewrite_op_getfield` marks `w_cls` pure from
+/// `_immutable_fields_`.
 #[test]
-fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
+fn map_terminator_w_cls_is_gc_field_read_from_object_start() {
     let llbc = load_llbc(OBJECT_LLBC);
     common::with_shared_lowering(llbc, |context| {
         let ranks = harvest_immutable_fields_from_llbcs(std::slice::from_ref(llbc));
         assert!(
-            ranks.get("MapNodeTerminatorView").is_some_and(|fields| {
-                fields.iter().any(|(name, _)| name == "terminator")
-                    && fields.iter().any(|(name, _)| name == "w_cls")
+            ranks.get("Terminator").is_some_and(|fields| {
+                fields.iter().any(|(name, _)| name == "w_cls")
+                    && fields.iter().any(|(name, _)| name == "allow_unboxing")
             }),
-            "harvested _immutable_fields_ for MapNodeTerminatorView: {:?}",
-            ranks.get("MapNodeTerminatorView")
+            "harvested _immutable_fields_ for Terminator: {:?}",
+            ranks.get("Terminator")
         );
         assert!(
             ranks
-                .get("MapNodeAbstractAttribute")
+                .get("AbstractAttribute")
                 .is_some_and(|fields| fields.iter().any(|(name, _)| name == "terminator")),
-            "harvested _immutable_fields_ for MapNodeAbstractAttribute: {:?}",
-            ranks.get("MapNodeAbstractAttribute")
+            "harvested _immutable_fields_ for AbstractAttribute: {:?}",
+            ranks.get("AbstractAttribute")
         );
         let mut saw_terminator = false;
         let mut saw_w_cls = false;
-        let mut saw_w_cls_object = false;
+        let mut saw_terminator_gcref = false;
+        let mut saw_w_cls_gcref = false;
+        let mut saw_pure_w_cls = false;
         let mut saw_raw_overlay = false;
-        for leaf in ["map_terminator_w_cls", "instance_getclass"] {
+        for leaf in [
+            "map_terminator",
+            "map_terminator_w_cls",
+            "instance_getclass",
+        ] {
             let fns = mapdict_fns(llbc, leaf);
             assert!(!fns.is_empty(), "{leaf} is in pyre-object LLBC");
             for fd in fns {
@@ -436,33 +448,54 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
                     if let OpKind::FieldRead { field, ty, .. } = &op.kind {
                         if field.name == "terminator" {
                             saw_terminator = true;
+                            if matches!(ty, ValueType::Ref(_)) {
+                                saw_terminator_gcref = true;
+                            }
                         }
                         if field.name == "w_cls" {
                             saw_w_cls = true;
-                            if matches!(ty, ValueType::Ref(Some(root)) if root.contains("PyObject"))
-                            {
-                                saw_w_cls_object = true;
+                            if matches!(ty, ValueType::Ref(_)) {
+                                saw_w_cls_gcref = true;
                             }
                         }
+                    }
+                }
+                let mut cc = CallControl::new();
+                cc.immutable_fields_by_struct = ranks.clone();
+                let out = Transformer::new(&GraphTransformConfig::default())
+                    .with_callcontrol(&mut cc)
+                    .transform(&graph);
+                for op in ops(&out.graph) {
+                    if let OpKind::FieldRead { field, pure, .. } = &op.kind
+                        && field.name == "w_cls"
+                        && *pure
+                    {
+                        saw_pure_w_cls = true;
                     }
                 }
             }
         }
         assert!(
             !saw_raw_overlay,
-            "Rust-repr MapNode is getinstancerepr, not CStruct dest overlay"
+            "map_terminator_w_cls is a GC field read, not a raw overlay"
         );
+        assert!(saw_terminator, "FieldRead of terminator");
+        assert!(saw_terminator_gcref, "terminator FieldRead is GCREF");
+        assert!(saw_w_cls, "FieldRead of w_cls");
+        assert!(saw_w_cls_gcref, "w_cls FieldRead is GCREF");
         assert!(
-            saw_terminator,
-            "class FieldRead terminator via getinstancerepr"
+            saw_pure_w_cls,
+            "jtransform rewrite_op_getfield marks w_cls as pure getfield_gc_r"
         );
-        assert!(saw_w_cls, "class FieldRead w_cls via getinstancerepr");
-        assert!(saw_w_cls_object, "w_cls FieldRead is Ref(PyObject)");
     });
 }
 
-fn is_mapnode_leaf(root: &str) -> bool {
-    root.rsplit("::").next() == Some("MapNode")
+fn is_mapdict_node_leaf(root: &str) -> bool {
+    root.contains("mapdict")
+        && matches!(
+            root.rsplit("::").next(),
+            Some("AbstractAttribute" | "Terminator" | "PlainAttribute" | "UnboxedPlainAttribute")
+        )
 }
 
 fn operand_is_word(graph: &FunctionGraph, arg: &LinkArg) -> bool {
@@ -498,9 +531,9 @@ fn var_is_word(
     }
 }
 
-fn graph_has_word_to_mapnode_cast(graph: &FunctionGraph) -> bool {
+fn graph_has_word_to_map_class_cast(graph: &FunctionGraph) -> bool {
     ops(graph).any(|op| {
-        majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapnode_leaf)
+        majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapdict_node_leaf)
             && operand_is_word(
                 graph,
                 match &op.kind {
@@ -512,7 +545,7 @@ fn graph_has_word_to_mapnode_cast(graph: &FunctionGraph) -> bool {
 }
 
 /// `instance_getclass` loads the mixin `map` as a typed GCREF
-/// (`getfield_gc_r`). A word → `MapNode` `__cast_instance_intrinsic`
+/// (`getfield_gc_r`). A word → `AbstractAttribute` `__cast_instance_intrinsic`
 /// is `gc_load_indexed` of a GCREF, which `rewrite_op_gc_load_indexed`
 /// refuses.
 #[test]
@@ -536,8 +569,8 @@ fn instance_getclass_loads_typed_mapref_field() {
                 graph.name
             );
             assert!(
-                !graph_has_word_to_mapnode_cast(&graph),
-                "{} must not cast a word to MapNode",
+                !graph_has_word_to_map_class_cast(&graph),
+                "{} must not cast a word to AbstractAttribute",
                 graph.name
             );
         }
@@ -551,8 +584,8 @@ fn instance_getclass_loads_typed_mapref_field() {
             let graph = lower_fun_decl(interp_ctx, fd)
                 .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path_str()));
             assert!(
-                !graph_has_word_to_mapnode_cast(&graph),
-                "{} must not keep a word-operand MapNode cast",
+                !graph_has_word_to_map_class_cast(&graph),
+                "{} must not keep a word-operand AbstractAttribute cast",
                 graph.name
             );
         }

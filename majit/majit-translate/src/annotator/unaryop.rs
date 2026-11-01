@@ -5605,21 +5605,20 @@ mod tests {
     #[test]
     fn consider_getattr_dest_typed_overlay_terminator_and_w_cls() {
         // `ann_cast_int_to_ptr(PtrT, s_int)` returns `SomePtr(PTRTYPE)`.
-        // Overlay dest (`*const MapNodeAbstractAttribute` /
-        // `*const MapNodeTerminatorView`) carries the prefix fields;
-        // getattr terminator is the raw pointer word, getattr w_cls is
-        // GCREF.
+        // Overlay dest (`*const raw_overlay::PrefixView`) carries the
+        // prefix fields; getattr `head` is the raw pointer word, getattr
+        // `payload` is GCREF.
         use crate::translator::rtyper::lltypesystem::lltype::{
             GCREF, GcKind, LowLevelType, Ptr, SomePtr, Struct,
         };
 
         let ann = mk_ann();
         let overlay = Struct::registry_fields(
-            "mapdict::MapNodeTerminatorView",
+            "raw_overlay::PrefixView",
             vec![
                 ("_discriminant".into(), LowLevelType::Signed),
-                ("terminator".into(), LowLevelType::Signed),
-                ("w_cls".into(), (*GCREF).clone()),
+                ("head".into(), LowLevelType::Signed),
+                ("payload".into(), (*GCREF).clone()),
             ],
             GcKind::Raw,
         );
@@ -5631,31 +5630,31 @@ mod tests {
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v.clone()),
-                Hlvalue::Constant(Constant::new(ConstValue::byte_str("terminator"))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("head"))),
             ],
         );
         let term = term_hl
             .consider(&ann)
-            .expect("overlay getattr terminator")
+            .expect("overlay getattr head")
             .unwrap();
         match term {
-            SomeValue::Integer(i) => assert!(!i.unsigned, "terminator is Signed"),
-            other => panic!("overlay terminator is Signed, got {other:?}"),
+            SomeValue::Integer(i) => assert!(!i.unsigned, "head is Signed"),
+            other => panic!("overlay head is Signed, got {other:?}"),
         }
         let cls_hl = HLOperation::new(
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v),
-                Hlvalue::Constant(Constant::new(ConstValue::byte_str("w_cls"))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("payload"))),
             ],
         );
         let cls = cls_hl
             .consider(&ann)
-            .expect("overlay getattr w_cls")
+            .expect("overlay getattr payload")
             .unwrap();
         assert!(
             matches!(cls, SomeValue::Ptr(_)),
-            "overlay w_cls is GCREF SomePtr, got {cls:?}"
+            "overlay payload is GCREF SomePtr, got {cls:?}"
         );
     }
 

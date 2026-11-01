@@ -594,15 +594,14 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         }
         f(std::ptr::from_mut(&mut t.dict).cast());
         // `W_TypeObject.terminator` (`typeobject.py`) is a GC [`MapRef`].
-        // The node's own custom trace visits `Terminator.w_cls`.
-        t.terminator = pyre_object::mapdict::map_ref_node_start(t.terminator);
+        // `Terminator.w_cls` is a fixed GC-pointer offset on that type.
         f(std::ptr::from_mut(&mut t.terminator).cast());
     }
 }
 
-unsafe fn map_node_gc_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+unsafe fn cache_attrs_gc_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe {
-        pyre_object::mapdict::map_node_custom_trace(obj_addr, &mut |slot| {
+        pyre_object::mapdict::cache_attrs_custom_trace(obj_addr, &mut |slot| {
             f(slot as *mut majit_ir::GcRef);
         });
     }
@@ -5571,14 +5570,53 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_jit_trace::descr::restamp_execution_context_size_descr_if_unresolved(
         execution_context_tid,
     );
-    // `mapdict.py AbstractAttribute` / `CachedAttributeHolder` — GC map
-    // nodes. Auto-id at the tail so established tids do not shift.
-    register_traced_storage_box::<pyre_object::mapdict::MapNode>(
-        &mut gc,
-        map_node_gc_trace,
-        pyre_object::mapdict::map_node_destructor,
-        |tid| pyre_object::mapdict::MAP_NODE_GC_TYPE_ID.set(tid),
-    );
+    // `mapdict.py Terminator` / `PlainAttribute` / `UnboxedPlainAttribute` /
+    // `CachedAttributeHolder`. Auto-id at the tail so established tids do not
+    // shift.
+    {
+        use pyre_object::mapdict::{
+            AbstractAttribute, PlainAttribute, Terminator, UnboxedPlainAttribute,
+        };
+        let mut term_info = TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<Terminator>(),
+            vec![
+                std::mem::offset_of!(Terminator, base)
+                    + std::mem::offset_of!(AbstractAttribute, terminator),
+                std::mem::offset_of!(Terminator, w_cls),
+                std::mem::offset_of!(Terminator, devolved_dict_terminator),
+            ],
+        )
+        .with_destructor_fn(pyre_object::mapdict::terminator_destructor);
+        term_info.custom_trace = Some(cache_attrs_gc_trace);
+        let tid = gc.register_type(term_info);
+        pyre_object::mapdict::TERMINATOR_GC_TYPE_ID.set(tid);
+        let mut plain_info = TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<PlainAttribute>(),
+            vec![
+                std::mem::offset_of!(PlainAttribute, base)
+                    + std::mem::offset_of!(AbstractAttribute, terminator),
+                std::mem::offset_of!(PlainAttribute, back),
+            ],
+        )
+        .with_destructor_fn(pyre_object::mapdict::plain_attribute_destructor);
+        plain_info.custom_trace = Some(cache_attrs_gc_trace);
+        let tid = gc.register_type(plain_info);
+        pyre_object::mapdict::PLAIN_ATTRIBUTE_GC_TYPE_ID.set(tid);
+        let mut unboxed_info = TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<UnboxedPlainAttribute>(),
+            vec![
+                std::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + std::mem::offset_of!(PlainAttribute, base)
+                    + std::mem::offset_of!(AbstractAttribute, terminator),
+                std::mem::offset_of!(UnboxedPlainAttribute, base)
+                    + std::mem::offset_of!(PlainAttribute, back),
+            ],
+        )
+        .with_destructor_fn(pyre_object::mapdict::unboxed_plain_attribute_destructor);
+        unboxed_info.custom_trace = Some(cache_attrs_gc_trace);
+        let tid = gc.register_type(unboxed_info);
+        pyre_object::mapdict::UNBOXED_PLAIN_ATTRIBUTE_GC_TYPE_ID.set(tid);
+    }
     register_traced_storage_box::<pyre_object::mapdict::CachedAttributeHolder>(
         &mut gc,
         cached_attribute_holder_gc_trace,

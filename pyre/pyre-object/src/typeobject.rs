@@ -1588,7 +1588,7 @@ pub unsafe fn w_type_set_uses_object_setattr(obj: PyObjectRef, v: bool) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_get_terminator(obj: PyObjectRef) -> MapRef {
-    crate::mapdict::map_ref_node_start((*(obj as *const W_TypeObject)).terminator)
+    (*(obj as *const W_TypeObject)).terminator
 }
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -1600,8 +1600,7 @@ pub unsafe fn w_type_set_terminator(obj: PyObjectRef, terminator: MapRef) {
         crate::gc_roots::shadow_stack_get(base) as crate::gc_hook::GCREF
     );
     let obj = crate::gc_roots::shadow_stack_get(base);
-    let terminator =
-        crate::mapdict::map_ref_node_start(crate::gc_roots::shadow_stack_get(base + 1) as MapRef);
+    let terminator = crate::gc_roots::shadow_stack_get(base + 1) as MapRef;
     (*(obj as *mut W_TypeObject)).terminator = terminator;
 }
 

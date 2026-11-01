@@ -13824,9 +13824,7 @@ fn emit_walker_instance<Sym: WalkSym>(
     let _instance_roots = pyre_object::gc_roots::push_roots();
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(concrete_instance);
-    let terminator_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::mapdict::map_ref_node_start(terminator) as i64);
+    let terminator_const = ctx.trace_ctx.const_ref(terminator as i64);
     // The vtable `alloc_instance_object` stamps for this `w_type`. Exact
     // `object()` is `INSTANCE_TYPE`; every other carrier is
     // `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`).

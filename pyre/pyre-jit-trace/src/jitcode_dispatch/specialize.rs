@@ -2700,8 +2700,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(None);
     };
     walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, w_type, map)?;
-    let terminator = unsafe { (*map).terminator() };
-    let term = unsafe { (*terminator).as_terminator() as *const _ };
+    let term = unsafe { pyre_object::mapdict::map_terminator(map) };
     walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
 
     // mapdict.py `UnboxedPlainAttribute._pure_direct_read`:
@@ -2829,9 +2828,7 @@ unsafe fn walker_classify_shadow_guard(
 ) -> Option<ShadowGuard> {
     unsafe {
         if pyre_object::is_instance(concrete_obj) {
-            let map = pyre_object::mapdict::map_ref_node_start(
-                (*(concrete_obj as *const pyre_object::W_ObjectObject)).map,
-            );
+            let map = (*(concrete_obj as *const pyre_object::W_ObjectObject)).map;
             if map.is_null() {
                 return None;
             }
@@ -2900,9 +2897,7 @@ where
     // `MapdictStorageMixin.map` is a GCREF. Record `getfield_gc_r` and
     // `GuardValue` against a `ConstPtr` (`jit.promote(self.map)`).
     let slot_op = walker_record_getfield_gc_r_uncached(ctx, obj, descr.clone());
-    let slot_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::mapdict::map_ref_node_start(map) as i64);
+    let slot_const = ctx.trace_ctx.const_ref(map as i64);
     emit_guard(ctx, OpCode::GuardValue, &[slot_op, slot_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
@@ -5126,26 +5121,23 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         }
         && let Some(value_pin) = store_attr_add_value_pin(&add, concrete_value)
     {
-        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, add.w_type, add.map)?;
-        walker_pin_holder_typ(ctx, op_pc, add.holder)?;
+        walker_guard_mapdict_instance_shape(ctx, op_pc, obj, concrete_obj, add.w_type, add.map())?;
+        walker_pin_holder_typ(ctx, op_pc, add.holder())?;
         // This marker is not redundant with the instance-map GuardValue. The
-        // fold bakes `add.new_map`, the transition target, as a green
-        // `const_ref`, while the guard pins `add.map`, the instance map before
-        // the transition. `holder_pick_attr` can replace `holder.attr` with a
-        // fresh `PlainAttribute` without changing any instance's current map;
-        // this marker protects the baked target.
-        walker_pin_holder_attr(ctx, op_pc, add.holder)?;
+        // fold bakes `add.new_map()`, the transition target, as a green
+        // `const_ref`, while the guard pins `add.map()`, the instance map
+        // before the transition. `holder_pick_attr` can replace `holder.attr`
+        // with a fresh `PlainAttribute` without changing any instance's
+        // current map; this marker protects the baked target.
+        walker_pin_holder_attr(ctx, op_pc, add.holder())?;
         // General rule: plant the `allow_unboxing` marker only where the fold
         // read the flag as true. Marking a false read re-arms a permanently
         // dead field and lets later writes invalidate without bound.
         if add.picked_unbox.is_some() {
-            let terminator = unsafe { (*add.map).terminator() };
-            let term = unsafe { (*terminator).as_terminator() as *const _ };
+            let term = unsafe { pyre_object::mapdict::map_terminator(add.map()) };
             walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
         }
-        let new_map_const = ctx
-            .trace_ctx
-            .const_ref(pyre_object::mapdict::map_ref_node_start(add.new_map) as i64);
+        let new_map_const = ctx.trace_ctx.const_ref(add.new_map() as i64);
         let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
         let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete_obj) };
         let unboxed_raw = match value_pin {
@@ -5174,12 +5166,13 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         // transition now; the emitted operations reproduce it in compiled code.
         // Commit before emit: a failed grow must not leave a successful
         // STORE_ATTR in the trace (`MapdictStorageMixin._set_mapdict_increase_storage1`).
-        // The shape guard and the holder pins can minor-collect. Both pointers
-        // are copies of `obj` / `value` (`RefFrontendOp` / `getref_base`).
-        // Old storage is read before the transition, as in
-        // `_set_mapdict_increase_storage1`; the existing `live_box_ref`
-        // lines after it already cover a collection the GETFIELD recording
-        // may trigger.
+        // Contended `instance_lock` in `store_attr_add_commit` can
+        // minor-collect. `obj` / `value` are copies of their boxes
+        // (`RefFrontendOp` / `getref_base`); `add`'s map/holder/new_map
+        // reload from their shadow-stack slots. Old storage is read before
+        // the transition, as in `_set_mapdict_increase_storage1`; the
+        // existing `live_box_ref` lines after it already cover a collection
+        // the GETFIELD recording may trigger.
         let old_block = (add.storageindex > 0)
             .then(|| crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, storage_descr.clone()));
         let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
@@ -8630,9 +8623,7 @@ fn walker_emit_user_mapdict_empty<Sym: WalkSym>(
     terminator: pyre_object::mapdict::MapRef,
     concrete: pyre_object::PyObjectRef,
 ) {
-    let terminator_const = ctx
-        .trace_ctx
-        .const_ref(pyre_object::mapdict::map_ref_node_start(terminator) as i64);
+    let terminator_const = ctx.trace_ctx.const_ref(terminator as i64);
     let map_idx = map_descr.index();
     // `record` → `_record_op` can minor-collect. The caller handed a
     // nursery instance; re-read it from the pin after the two SETFIELD_GC
@@ -8661,9 +8652,7 @@ fn walker_emit_user_mapdict_empty<Sym: WalkSym>(
         ctx.trace_ctx.field_store(
             concrete as i64,
             &map_descr,
-            majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::mapdict::map_ref_node_start(
-                terminator,
-            ) as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(terminator as usize)),
         );
         ctx.trace_ctx.field_store(
             concrete as i64,
