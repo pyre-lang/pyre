@@ -1454,8 +1454,8 @@ pub unsafe fn walk_map_attr_cache(f: &mut dyn FnMut(*mut PyObjectRef)) {
 //
 // PyPy holds `map` and `attr` through weakrefs (`mapdict.py` `CacheEntry` /
 // `_fill_cache` / `_is_valid_for_map`). A dead weakref is a cache miss.
-// `walk_mapdict_method_cache_gc` strong-traces the WEAKREF structs and
-// `w_method`.
+// `walk_enrolled_code_roots` and `walk_mapdict_method_cache_gc`
+// strong-trace the WEAKREF structs and `w_method`.
 
 /// mapdict.py `CacheEntry`. PyPy's shared `INVALID_CACHE_ENTRY`
 /// sentinel (a `CacheEntry` carrying a fake map, mapdict.py) is
@@ -1945,6 +1945,13 @@ unsafe fn load_attr_slowpath(
                 w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                 w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                 if let Some((current_map, attr)) = direct {
+                    // `map` / `attr` are GCREFs (`mapdict.py AbstractAttribute`).
+                    // `fill_cache` mallocs WEAKREF (`gct_weakref_create` /
+                    // `collect_and_reserve`); reload both after that safepoint.
+                    let node_base = pyre_object::gc_roots::pin_roots(&[
+                        current_map as PyObjectRef,
+                        attr as PyObjectRef,
+                    ]);
                     // mapdict.py `_fill_cache(...,
                     // valid_for_store=w_type.setattr_if_not_from_object() is None)`.
                     let valid_for_store =
@@ -1954,9 +1961,9 @@ unsafe fn load_attr_slowpath(
                         fill_cache(
                             pycode,
                             nameindex,
-                            current_map,
+                            pyre_object::gc_roots::shadow_stack_get(node_base) as MapRef,
                             version_tag,
-                            attr,
+                            pyre_object::gc_roots::shadow_stack_get(node_base + 1) as MapRef,
                             std::ptr::null_mut(),
                             valid_for_store,
                         );
@@ -1965,6 +1972,7 @@ unsafe fn load_attr_slowpath(
                     // `before_external_block`.  mapdict.py
                     // `LOAD_ATTR_slowpath` fills first, then
                     // `return attr._direct_read(w_obj)`.
+                    let attr = pyre_object::gc_roots::shadow_stack_get(node_base + 1) as MapRef;
                     let w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                     let mut inst = unsafe { mapdict_carrier(w_obj) };
                     return Ok(unsafe { direct_read(attr, &mut inst) });
@@ -3805,8 +3813,16 @@ unsafe fn store_attr_slowpath(
                 match unsafe { find_map_attr(map, Wtf8::new(attrname), attrkind) } {
                     Some(attr) => {
                         let _roots = pyre_object::gc_roots::push_roots();
-                        let base =
-                            pyre_object::gc_roots::pin_roots(&[pycode, w_obj, w_type, w_value]);
+                        // `map` / `attr` are GCREFs (`mapdict.py AbstractAttribute`).
+                        // `fill_cache` mallocs WEAKREF (`gct_weakref_create`).
+                        let base = pyre_object::gc_roots::pin_roots(&[
+                            pycode,
+                            w_obj,
+                            w_type,
+                            w_value,
+                            map as PyObjectRef,
+                            attr as PyObjectRef,
+                        ]);
                         let written = {
                             let (_instance_guard, _live) =
                                 instance_lock(pyre_object::gc_roots::shadow_stack_get(base + 1));
@@ -3815,6 +3831,7 @@ unsafe fn store_attr_slowpath(
                                     base + 1,
                                 ))
                             };
+                            let map = pyre_object::gc_roots::shadow_stack_get(base + 4) as MapRef;
                             if !std::ptr::eq(current_map, map)
                                 || unsafe {
                                     find_map_attr(current_map, Wtf8::new(attrname), attrkind)
@@ -3823,6 +3840,8 @@ unsafe fn store_attr_slowpath(
                             {
                                 false
                             } else {
+                                let attr =
+                                    pyre_object::gc_roots::shadow_stack_get(base + 5) as MapRef;
                                 let p = unsafe { (*attr).as_plain() };
                                 // mapdict.py:1632-1633
                                 // `if not attr.ever_mutated: ...`.
@@ -3847,6 +3866,8 @@ unsafe fn store_attr_slowpath(
                         w_obj = pyre_object::gc_roots::shadow_stack_get(base + 1);
                         w_type = pyre_object::gc_roots::shadow_stack_get(base + 2);
                         w_value = pyre_object::gc_roots::shadow_stack_get(base + 3);
+                        let map = pyre_object::gc_roots::shadow_stack_get(base + 4) as MapRef;
+                        let attr = pyre_object::gc_roots::shadow_stack_get(base + 5) as MapRef;
                         if !written {
                             return crate::baseobjspace::setattr_str(w_obj, name, w_value)
                                 .map(|_| ());
@@ -3933,13 +3954,17 @@ unsafe fn store_attr_slowpath(
                                 }
                                 .is_none()
                             {
+                                let mapnew_slot =
+                                    pyre_object::gc_roots::pin_roots(&[mapnew as PyObjectRef]);
                                 unsafe {
                                     fill_cache(
                                         pycode,
                                         nameindex,
-                                        mapnew,
+                                        pyre_object::gc_roots::shadow_stack_get(mapnew_slot)
+                                            as MapRef,
                                         version_tag,
-                                        mapnew,
+                                        pyre_object::gc_roots::shadow_stack_get(mapnew_slot)
+                                            as MapRef,
                                         std::ptr::null_mut(),
                                         true,
                                     );
@@ -4029,7 +4054,9 @@ impl MapdictObject for pyre_object::W_ObjectObject {
         ]);
         instance_write_barrier(pyre_object::gc_roots::shadow_stack_get(base));
         let owner = pyre_object::gc_roots::shadow_stack_get(base);
-        let map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
+        let map = pyre_object::mapdict::map_ref_node_start(
+            pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef,
+        );
         unsafe { (*(owner as *mut Self)).map = map };
     }
     fn _mapdict_read_storage(&self, storageindex: usize) -> PyObjectRef {
@@ -4261,9 +4288,104 @@ impl MapdictObject for pyre_object::W_ObjectObject {
     }
 }
 
+/// Interpreter-named `_getusercls` carriers, then the object-crate match
+/// / typeptr slot (`import_from_mixin` per-class `self.map`).
+macro_rules! mapdict_interp_carrier {
+    ($obj:expr, $p:ident => $body:expr, else => $fallback:expr) => {{
+        let obj = $obj;
+        unsafe {
+        if pyre_object::py_type_check(obj, &crate::module::_collections::DEQUE_USER_TYPE) {
+            let $p = obj as *mut crate::module::_collections::W_DequeUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::BYTESIO_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_BytesIOUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::STRINGIO_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_StringIOUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDREADER_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_BufferedReaderUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDWRITER_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_BufferedWriterUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDRWPAIR_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_BufferedRWPairUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::BUFFEREDRANDOM_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_BufferedRandomUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::TEXTIOWRAPPER_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_TextIOWrapperUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::_io::FILEIO_USER_TYPE) {
+            let $p = obj as *mut crate::module::_io::W_FileIOUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::thread::LOCAL_USER_TYPE) {
+            let $p = obj as *mut crate::module::thread::W_LocalUser;
+            $body
+        } else if pyre_object::py_type_check(obj, &crate::module::r#struct::STRUCT_USER_TYPE) {
+            let $p = obj as *mut crate::module::r#struct::W_StructUser;
+            $body
+        } else if pyre_object::py_type_check(
+            obj,
+            &crate::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
+        ) {
+            let $p = obj
+                as *mut crate::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser;
+            $body
+        } else {
+            $fallback
+        }
+        }
+    }};
+}
+
+#[inline]
+unsafe fn mapdict_interp_load_map(obj: PyObjectRef) -> MapRef {
+    mapdict_interp_carrier!(
+        obj,
+        p => (*p).map,
+        else => pyre_object::mapdict::mapdict_typed_load_map(obj)
+    )
+}
+
+#[inline]
+unsafe fn mapdict_interp_store_map(obj: PyObjectRef, map: MapRef) {
+    let map = pyre_object::mapdict::map_ref_node_start(map);
+    mapdict_interp_carrier!(
+        obj,
+        p => (*p).map = map,
+        else => pyre_object::mapdict::mapdict_typed_store_map(obj, map)
+    )
+}
+
+#[inline]
+unsafe fn mapdict_interp_load_storage(
+    obj: PyObjectRef,
+) -> *mut pyre_object::object_array::ItemsBlock {
+    mapdict_interp_carrier!(
+        obj,
+        p => (*p).storage,
+        else => pyre_object::mapdict::mapdict_typed_load_storage(obj)
+    )
+}
+
+#[inline]
+unsafe fn mapdict_interp_store_storage(
+    obj: PyObjectRef,
+    storage: *mut pyre_object::object_array::ItemsBlock,
+) {
+    mapdict_interp_carrier!(
+        obj,
+        p => (*p).storage = storage,
+        else => pyre_object::mapdict::mapdict_typed_store_storage(obj, storage)
+    )
+}
+
 /// A live view of an object's `MapdictStorageMixin` slots. `map` is the
-/// word at `(*ob_type).mapdict_offset` and `storage` is the next word
-/// (`mapdict.py` `import_from_mixin`, `typedef.py` `_getusercls`).
+/// carrier's own typed field (`mapdict.py` `import_from_mixin`,
+/// `typedef.py` `_getusercls`).
 #[derive(Clone, Copy)]
 struct MapdictCarrier {
     obj: PyObjectRef,
@@ -4275,27 +4397,19 @@ unsafe fn mapdict_carrier(obj: PyObjectRef) -> MapdictCarrier {
 }
 
 impl MapdictCarrier {
-    unsafe fn slots(&self) -> (*mut MapRef, *mut *mut pyre_object::object_array::ItemsBlock) {
-        let obj = self.obj;
-        let mapdict_offset = unsafe { (*(*obj).ob_type).mapdict_offset };
-        let map = unsafe { (obj as *mut u8).add(mapdict_offset) as *mut MapRef };
-        let storage = unsafe { map.add(1) as *mut *mut pyre_object::object_array::ItemsBlock };
-        (map, storage)
-    }
-
     unsafe fn storage(&self) -> *mut pyre_object::object_array::ItemsBlock {
-        unsafe { *self.slots().1 }
+        unsafe { mapdict_interp_load_storage(self.obj) }
     }
 
     unsafe fn set_storage(&mut self, storage: *mut pyre_object::object_array::ItemsBlock) {
-        unsafe { *self.slots().1 = storage };
+        unsafe { mapdict_interp_store_storage(self.obj, storage) };
     }
 }
 
 impl MapdictObject for MapdictCarrier {
     fn _get_mapdict_map(&self) -> MapRef {
         // mapdict.py `_get_mapdict_map`: `return jit.promote(self.map)`.
-        majit_ir::jit::promote(unsafe { *self.slots().0 })
+        majit_ir::jit::promote(unsafe { mapdict_interp_load_map(self.obj) })
     }
 
     fn _set_mapdict_map(&mut self, map: MapRef) {
@@ -4305,7 +4419,7 @@ impl MapdictObject for MapdictCarrier {
         let owner = pyre_object::gc_roots::shadow_stack_get(base);
         let map = pyre_object::gc_roots::shadow_stack_get(base + 1) as MapRef;
         unsafe {
-            *mapdict_carrier(owner).slots().0 = map;
+            mapdict_interp_store_map(owner, map);
         }
         self.obj = owner;
     }
@@ -6900,9 +7014,18 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
 /// `obj` must be a live object for which [`has_mapdict_layout`] holds.
 pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
     unsafe {
-        let inst = mapdict_carrier(obj);
-        f(inst.slots().0 as *mut PyObjectRef);
-        let storage_slot = inst.slots().1;
+        // GC custom-trace: `mapdict_offset` arithmetic is allowed here
+        // (`jtransform.py rewrite_op_getsubstruct` never looks inside).
+        let mapdict_offset = (*(*obj).ob_type).mapdict_offset;
+        let mixin =
+            (obj as *mut u8).add(mapdict_offset) as *mut pyre_object::mapdict::MapdictStorageMixin;
+        let map_slot = std::ptr::addr_of_mut!((*mixin).map);
+        let start = pyre_object::mapdict::map_ref_node_start(*map_slot);
+        if start != *map_slot {
+            *map_slot = start;
+        }
+        f(map_slot as *mut PyObjectRef);
+        let storage_slot = std::ptr::addr_of_mut!((*mixin).storage);
         if (*storage_slot).is_null() {
             return;
         }

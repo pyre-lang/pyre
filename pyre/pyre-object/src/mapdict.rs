@@ -623,18 +623,371 @@ pub unsafe fn holder_force_typ_qmut(holder: *const CachedAttributeHolder) {
     unsafe { (*holder).force_typ_qmut() };
 }
 
-/// `repr(C)` [`MapNode`] prefix: enum tag then `AbstractAttribute.terminator`.
-/// Both variants put `terminator` first in the payload, so this overlay is
+/// `mapdict.py` `MapdictStorageMixin`: the `map` + `storage` tail mixed
+/// into an instance layout (`import_from_mixin`). Not itself a `GcType`;
+/// the owner object is. `map` is a GCREF (`MapdictStorageMixin.map`).
+#[repr(C)]
+pub struct MapdictStorageMixin {
+    pub map: MapRef,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(std::mem::offset_of!(MapdictStorageMixin, storage) == std::mem::size_of::<MapRef>());
+};
+
+/// Per-class copies of `MapdictStorageMixin._get_mapdict_map` /
+/// `_set_mapdict_map` / `_mapdict_read_storage` field accessors
+/// (`typedef.py` `_getusercls` `import_from_mixin`). Stored on the typeptr
+/// so a crate that cannot name the carrier still dispatches to that
+/// class's typed `self.map` / `self.storage` (`W_Root.getclass` overridden
+/// on the generated class).
+#[derive(Clone, Copy)]
+pub struct MapdictMixinAccess {
+    pub get_map: unsafe fn(crate::PyObjectRef) -> MapRef,
+    pub set_map: unsafe fn(crate::PyObjectRef, MapRef),
+    pub get_storage: unsafe fn(crate::PyObjectRef) -> *mut crate::object_array::ItemsBlock,
+    pub set_storage: unsafe fn(crate::PyObjectRef, *mut crate::object_array::ItemsBlock),
+}
+
+/// Typed `self.map` / `self.storage` accessors for one carrier layout.
+#[macro_export]
+macro_rules! mapdict_mixin_access {
+    ($ty:ty) => {
+        $crate::mapdict::MapdictMixinAccess {
+            get_map: {
+                unsafe fn get_map(obj: $crate::PyObjectRef) -> $crate::mapdict::MapRef {
+                    unsafe { (*(obj as *const $ty)).map }
+                }
+                get_map
+            },
+            set_map: {
+                unsafe fn set_map(obj: $crate::PyObjectRef, map: $crate::mapdict::MapRef) {
+                    unsafe {
+                        (*(obj as *mut $ty)).map = $crate::mapdict::map_ref_node_start(map);
+                    }
+                }
+                set_map
+            },
+            get_storage: {
+                unsafe fn get_storage(
+                    obj: $crate::PyObjectRef,
+                ) -> *mut $crate::object_array::ItemsBlock {
+                    unsafe { (*(obj as *const $ty)).storage }
+                }
+                get_storage
+            },
+            set_storage: {
+                unsafe fn set_storage(
+                    obj: $crate::PyObjectRef,
+                    storage: *mut $crate::object_array::ItemsBlock,
+                ) {
+                    unsafe {
+                        (*(obj as *mut $ty)).storage = storage;
+                    }
+                }
+                set_storage
+            },
+        }
+    };
+}
+
+/// Select the carrier's own `map` / `storage` fields.
+///
+/// `typedef.py` `_getusercls` `import_from_mixin(MapdictStorageMixin)` copies
+/// those fields onto each generated class; this match is how pyre names
+/// the same per-class layout from a `PyObjectRef` (`mapdict_map_descr`).
+macro_rules! mapdict_typed_carrier {
+    ($obj:expr, $p:ident => $body:expr, else => $fallback:expr) => {{
+        let obj = $obj;
+        unsafe {
+            if crate::py_type_check(obj, &crate::INSTANCE_USER_TYPE)
+                || crate::py_type_check(obj, &crate::INSTANCE_TYPE)
+            {
+                let $p = obj as *mut crate::objectobject::W_ObjectObject;
+                $body
+            } else if crate::py_type_check(obj, &crate::INT_USER_TYPE) {
+                let $p = obj as *mut crate::W_IntObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::FLOAT_USER_TYPE) {
+                let $p = obj as *mut crate::W_FloatObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::BYTES_USER_TYPE) {
+                let $p = obj as *mut crate::W_BytesObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::BYTEARRAY_USER_TYPE) {
+                let $p = obj as *mut crate::W_BytearrayObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::LIST_USER_TYPE) {
+                let $p = obj as *mut crate::W_ListObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::SET_USER_TYPE)
+                || crate::py_type_check(obj, &crate::FROZENSET_USER_TYPE)
+            {
+                let $p = obj as *mut crate::W_SetObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::interp_array::ARRAY_USER_TYPE) {
+                let $p = obj as *mut crate::interp_array::W_ArrayUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE) {
+                let $p = obj as *mut crate::weakref::W_WeakrefUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::COMPLEX_USER_TYPE) {
+                let $p = obj as *mut crate::W_ComplexObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::STR_USER_TYPE) {
+                let $p = obj as *mut crate::W_UnicodeObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::TUPLE_USER_TYPE) {
+                let $p = obj as *mut crate::W_TupleObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::ENUMERATE_USER_TYPE) {
+                let $p = obj as *mut crate::W_EnumerateUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::MAP_USER_TYPE) {
+                let $p = obj as *mut crate::W_MapUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::FILTER_USER_TYPE) {
+                let $p = obj as *mut crate::W_FilterUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::ZIP_USER_TYPE) {
+                let $p = obj as *mut crate::W_ZipUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::REVERSED_USER_TYPE) {
+                let $p = obj as *mut crate::W_ReversedIteratorUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::SUPER_USER_TYPE) {
+                let $p = obj as *mut crate::W_SuperUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::PROPERTY_USER_TYPE) {
+                let $p = obj as *mut crate::W_PropertyUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::COUNT_USER_TYPE) {
+                let $p = obj as *mut crate::W_CountUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::REPEAT_USER_TYPE) {
+                let $p = obj as *mut crate::W_RepeatUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::TAKEWHILE_USER_TYPE) {
+                let $p = obj as *mut crate::W_TakeWhileUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::DROPWHILE_USER_TYPE) {
+                let $p = obj as *mut crate::W_DropWhileUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::FILTERFALSE_USER_TYPE) {
+                let $p = obj as *mut crate::W_FilterFalseUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::ISLICE_USER_TYPE) {
+                let $p = obj as *mut crate::W_ISliceUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::BATCHED_USER_TYPE) {
+                let $p = obj as *mut crate::W_BatchedUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::PRODUCT_USER_TYPE) {
+                let $p = obj as *mut crate::W_ProductUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::COMBINATIONS_USER_TYPE) {
+                let $p = obj as *mut crate::W_CombinationsUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE) {
+                let $p = obj as *mut crate::W_CombinationsWithReplacementUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::PERMUTATIONS_USER_TYPE) {
+                let $p = obj as *mut crate::W_PermutationsUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::GROUPBY_USER_TYPE) {
+                let $p = obj as *mut crate::W_GroupByUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::COMPRESS_USER_TYPE) {
+                let $p = obj as *mut crate::W_CompressUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::STARMAP_USER_TYPE) {
+                let $p = obj as *mut crate::W_StarMapUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::ACCUMULATE_USER_TYPE) {
+                let $p = obj as *mut crate::W_AccumulateUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::ZIP_LONGEST_USER_TYPE) {
+                let $p = obj as *mut crate::W_ZipLongestUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::PAIRWISE_USER_TYPE) {
+                let $p = obj as *mut crate::W_PairwiseUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::CYCLE_USER_TYPE) {
+                let $p = obj as *mut crate::W_CycleUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::CHAIN_USER_TYPE) {
+                let $p = obj as *mut crate::W_ChainUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::GENERIC_ALIAS_USER_TYPE) {
+                let $p = obj as *mut crate::GenericAliasUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::LONG_USER_TYPE) {
+                let $p = obj as *mut crate::W_LongObjectUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::STATICMETHOD_USER_TYPE) {
+                let $p = obj as *mut crate::StaticMethodUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::CLASSMETHOD_USER_TYPE) {
+                let $p = obj as *mut crate::ClassMethodUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::MODULE_USER_TYPE) {
+                let $p = obj as *mut crate::ModuleUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::BASE_EXCEPTION_USER_TYPE) {
+                let $p = obj as *mut crate::W_BaseExceptionUser;
+                $body
+            } else if crate::py_type_check(obj, &crate::EXCEPTION_EXTENDED_USER_TYPE) {
+                let $p = obj as *mut crate::W_ExceptionExtendedUser;
+                $body
+            } else {
+                $fallback
+            }
+        }
+    }};
+}
+
+#[inline]
+unsafe fn mapdict_access_load_map(obj: crate::PyObjectRef) -> MapRef {
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return std::ptr::null();
+    }
+    match unsafe { (*tp).mapdict_access } {
+        Some(access) => unsafe { (access.get_map)(obj) },
+        None => std::ptr::null(),
+    }
+}
+
+#[inline]
+unsafe fn mapdict_access_store_map(obj: crate::PyObjectRef, map: MapRef) {
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    if let Some(access) = unsafe { (*tp).mapdict_access } {
+        unsafe { (access.set_map)(obj, map) };
+    }
+}
+
+#[inline]
+unsafe fn mapdict_access_load_storage(
+    obj: crate::PyObjectRef,
+) -> *mut crate::object_array::ItemsBlock {
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return std::ptr::null_mut();
+    }
+    match unsafe { (*tp).mapdict_access } {
+        Some(access) => unsafe { (access.get_storage)(obj) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+#[inline]
+unsafe fn mapdict_access_store_storage(
+    obj: crate::PyObjectRef,
+    storage: *mut crate::object_array::ItemsBlock,
+) {
+    let tp = unsafe { (*obj).ob_type };
+    if tp.is_null() {
+        return;
+    }
+    if let Some(access) = unsafe { (*tp).mapdict_access } {
+        unsafe { (access.set_storage)(obj, storage) };
+    }
+}
+
+/// Load `self.map` from the carrier's own typed field
+/// (`MapdictStorageMixin._get_mapdict_map`).
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier, or null.
+#[inline]
+pub unsafe fn mapdict_typed_load_map(obj: crate::PyObjectRef) -> MapRef {
+    if obj.is_null() {
+        return std::ptr::null();
+    }
+    mapdict_typed_carrier!(
+        obj,
+        p => (*p).map,
+        else => mapdict_access_load_map(obj)
+    )
+}
+
+/// Store `self.map` on the carrier's own typed field
+/// (`MapdictStorageMixin._set_mapdict_map`).
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier. The caller has already issued
+/// the write barrier.
+#[inline]
+pub unsafe fn mapdict_typed_store_map(obj: crate::PyObjectRef, map: MapRef) {
+    if obj.is_null() {
+        return;
+    }
+    let map = map_ref_node_start(map);
+    mapdict_typed_carrier!(
+        obj,
+        p => (*p).map = map,
+        else => mapdict_access_store_map(obj, map)
+    )
+}
+
+/// Load `self.storage` from the carrier's own typed field
+/// (`MapdictStorageMixin._mapdict_read_storage`).
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier, or null.
+#[inline]
+pub unsafe fn mapdict_typed_load_storage(
+    obj: crate::PyObjectRef,
+) -> *mut crate::object_array::ItemsBlock {
+    if obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    mapdict_typed_carrier!(
+        obj,
+        p => (*p).storage,
+        else => mapdict_access_load_storage(obj)
+    )
+}
+
+/// Store `self.storage` on the carrier's own typed field
+/// (`MapdictStorageMixin._mapdict_write_storage`).
+///
+/// # Safety
+/// `obj` must be a live mapdict carrier. The caller has already issued
+/// the write barrier.
+#[inline]
+pub unsafe fn mapdict_typed_store_storage(
+    obj: crate::PyObjectRef,
+    storage: *mut crate::object_array::ItemsBlock,
+) {
+    if obj.is_null() {
+        return;
+    }
+    mapdict_typed_carrier!(
+        obj,
+        p => (*p).storage = storage,
+        else => mapdict_access_store_storage(obj, storage)
+    )
+}
+
+/// `repr(C)` [`MapNode`] prefix: C-int discriminant then
+/// `AbstractAttribute.terminator`. Field-carrying `repr(C)` enums store
+/// the tag as a C `int` (`i32`); the payload is aligned after it. Both
+/// variants put `terminator` first in the payload, so this overlay is
 /// the typed field read `self.terminator` (`mapdict.py`).
 /// `AbstractAttribute._immutable_fields_` includes `terminator`.
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("terminator")]
 struct MapNodeAbstractAttribute {
-    _discriminant: isize,
+    _discriminant: i32,
     terminator: MapRef,
 }
 
-/// Terminator node overlay: tag, `terminator`, then `Terminator.w_cls`.
+/// Terminator node overlay: C-int tag, `terminator`, then `Terminator.w_cls`.
 /// getclass loads `.terminator.w_cls` through a pointer that is always a
 /// Terminator (`AbstractAttribute.__init__` `assert isinstance(terminator,
 /// Terminator)`).
@@ -643,7 +996,7 @@ struct MapNodeAbstractAttribute {
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("terminator", "w_cls")]
 struct MapNodeTerminatorView {
-    _discriminant: isize,
+    _discriminant: i32,
     terminator: MapRef,
     w_cls: PyObjectRef,
 }
@@ -656,10 +1009,10 @@ pub const MAP_NODE_TAG_OFFSET: usize = 0;
 pub const MAP_NODE_TERMINATOR_OFFSET: usize =
     std::mem::offset_of!(MapNodeAbstractAttribute, terminator);
 pub const MAP_NODE_PLAIN_OFFSET: usize = std::mem::offset_of!(MapNodeAbstractAttribute, terminator);
-/// `#[repr(C)]` first variant discriminant.
-pub const MAP_NODE_TERMINATOR_TAG: isize = 0;
+/// `#[repr(C)]` field-carrying enum discriminant is a C `int`.
+pub const MAP_NODE_TERMINATOR_TAG: i32 = 0;
 /// `#[repr(C)]` second variant discriminant.
-pub const MAP_NODE_PLAIN_TAG: isize = 1;
+pub const MAP_NODE_PLAIN_TAG: i32 = 1;
 
 const _: () = {
     assert!(std::mem::offset_of!(Terminator, terminator) == 0);
@@ -667,6 +1020,7 @@ const _: () = {
     assert!(std::mem::offset_of!(PlainAttribute, terminator) == 0);
     assert!(MAP_NODE_TERMINATOR_OFFSET == std::mem::size_of::<isize>());
     assert!(MAP_NODE_PLAIN_OFFSET == std::mem::size_of::<isize>());
+    assert!(std::mem::size_of::<i32>() <= MAP_NODE_TERMINATOR_OFFSET);
     assert!(
         std::mem::offset_of!(MapNodeAbstractAttribute, terminator) == std::mem::size_of::<isize>()
     );
@@ -691,6 +1045,33 @@ const _: () = {
             < std::mem::offset_of!(CachedAttributeHolder, mutate_typ)
     );
 };
+
+/// GC object start of a [`MapRef`].
+///
+/// `as_terminator()` / `as_plain()` yield the inlined payload
+/// (`MAP_NODE_TERMINATOR_OFFSET` past the enum tag). MiniMark traces and
+/// intern's object starts (`incminimark.py` `id_or_identityhash`); an
+/// interior word is a payload i32 tag read as a header.
+#[inline]
+pub fn map_ref_node_start(map: MapRef) -> MapRef {
+    if map.is_null() {
+        return map;
+    }
+    let tag = unsafe { *(map as *const i32) };
+    if tag == MAP_NODE_TERMINATOR_TAG || tag == MAP_NODE_PLAIN_TAG {
+        return map;
+    }
+    let start = (map as usize).wrapping_sub(MAP_NODE_TERMINATOR_OFFSET);
+    if start == 0 {
+        return map;
+    }
+    let start_tag = unsafe { *(start as *const i32) };
+    if start_tag == MAP_NODE_TERMINATOR_TAG || start_tag == MAP_NODE_PLAIN_TAG {
+        start as MapRef
+    } else {
+        map
+    }
+}
 
 /// `mapdict.py` `AbstractAttribute.terminator` then `Terminator.w_cls`.
 ///
@@ -739,21 +1120,19 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
     if tp.is_null() || unsafe { (*tp).user_base.is_null() } {
         return unsafe { (*obj).w_class };
     }
-    // `_get_mapdict_map` is `self.map` (`mapdict.py`). The
-    // `W_ObjectObjectUserDictWeakrefable` payload is `W_ObjectObject` at
-    // offset 0, so the typed field is that word. Generated `_getusercls`
-    // payloads put `map` after the builtin prefix; `mapdict_offset` is
-    // that mixin word. The layout stores a GC [`MapRef`];
-    // `_mapdict_init_empty` is a null pointer.
-    let map_word = if std::ptr::eq(tp, &crate::pyobject::INSTANCE_USER_TYPE) {
-        unsafe { (*(obj as *const crate::objectobject::W_ObjectObject)).map }
-    } else {
-        let off = unsafe { (*tp).mapdict_offset };
-        if off == 0 {
-            return unsafe { (*obj).w_class };
-        }
-        unsafe { majit_ir::llop::gc_load_indexed::<MapRef, _>(obj, off, 1, 0) }
-    };
+    // `_get_mapdict_map` is `self.map` (`mapdict.py`). Generated
+    // `_getusercls` payloads put the mixin after the builtin prefix
+    // as ordinary fields of that class (`import_from_mixin`). Load
+    // `map` off the carrier (`getfield_gc_r`).
+    let off = unsafe { (*tp).mapdict_offset };
+    if off == 0 {
+        return unsafe { (*obj).w_class };
+    }
+    let map_word = mapdict_typed_carrier!(
+        obj,
+        p => (*p).map,
+        else => mapdict_access_load_map(obj)
+    );
     if map_word.is_null() {
         return unsafe { (*obj).w_class };
     }
@@ -773,6 +1152,12 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
 pub type CacheAttrsTable = Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>;
 
 fn visit_map_ref_slot(slot: *mut MapRef, f: &mut dyn FnMut(*mut PyObjectRef)) {
+    unsafe {
+        let start = map_ref_node_start(*slot);
+        if start != *slot {
+            *slot = start;
+        }
+    }
     f(slot as *mut PyObjectRef);
 }
 
@@ -799,7 +1184,10 @@ unsafe fn walk_cache_attrs_table(
 /// # Safety
 /// `obj_addr` must point at a live [`MapNode`].
 pub unsafe fn map_node_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut PyObjectRef)) {
-    let tag = unsafe { *(obj_addr as *const isize) };
+    // Field-carrying `repr(C)` discriminant is a C `int`. An `isize` load
+    // includes the alignment padding; nursery bytes there are not defined
+    // (`ptr::write` of the enum writes the tag and payload).
+    let tag = unsafe { *(obj_addr as *const i32) };
     if tag == MAP_NODE_TERMINATOR_TAG {
         let t = unsafe {
             &mut *((obj_addr as *mut u8).add(MAP_NODE_TERMINATOR_OFFSET) as *mut Terminator)
@@ -896,15 +1284,40 @@ mod prefix_overlay_tests {
             unboxed: None,
         });
         assert_eq!(
-            unsafe { *(&term as *const MapNode as *const isize) },
+            unsafe { *(&term as *const MapNode as *const i32) },
             MAP_NODE_TERMINATOR_TAG
         );
         assert_eq!(
-            unsafe { *(&plain as *const MapNode as *const isize) },
+            unsafe { *(&plain as *const MapNode as *const i32) },
             MAP_NODE_PLAIN_TAG
         );
         let _ = &mut term;
         let _ = &mut plain;
+    }
+
+    #[test]
+    fn map_node_custom_trace_reads_c_int_tag_not_padding() {
+        let w_cls = 0x2000 as PyObjectRef;
+        let mut buf = vec![0xAAu8; std::mem::size_of::<MapNode>()];
+        let node = buf.as_mut_ptr() as *mut MapNode;
+        unsafe {
+            std::ptr::write(node, MapNode::Terminator(dummy_terminator(w_cls)));
+            (*node).as_terminator_mut().terminator = node;
+            // Nursery padding between the C-int tag and the payload is not
+            // defined. An `isize` tag load would see this as not Terminator.
+            // wasm32 has no padding: the payload sits at `size_of::<i32>()`.
+            if MAP_NODE_TERMINATOR_OFFSET > std::mem::size_of::<i32>() {
+                *buf.as_mut_ptr().add(std::mem::size_of::<i32>()) = 1;
+            }
+        }
+        let mut seen = Vec::new();
+        unsafe {
+            map_node_custom_trace(node as usize, &mut |slot| seen.push(*slot));
+        }
+        assert!(
+            seen.iter().any(|&p| std::ptr::eq(p, w_cls)),
+            "Terminator path visits w_cls; dirty tag padding must not take Plain"
+        );
     }
 
     #[test]

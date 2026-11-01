@@ -5968,6 +5968,13 @@ impl CallControl {
             .take_while(|(inner, _, _)| inner == &owner_canon)
             .filter(|(_, outer, fname)| {
                 crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
+                    || self
+                        .layout_field_offset(
+                            majit_ir::descr::struct_id_for_name(outer),
+                            outer,
+                            fname,
+                        )
+                        .is_some_and(|offset| offset != 0)
             })
             .map(|(_, outer, fname)| (outer.clone(), format!("{fname}.{path}")))
             .collect()
@@ -12991,6 +12998,13 @@ impl CallControl {
                 rows.iter()
                     .filter(|row| {
                         crate::front::mir::is_flattened_storage_leaf(owner, &field.name, &row.name)
+                            || self
+                                .layout_field_offset(
+                                    majit_ir::descr::struct_id_for_name(owner),
+                                    owner,
+                                    &field.name,
+                                )
+                                .is_some_and(|offset| offset != 0)
                     })
                     .map(|row| (owner.to_string(), format!("{}.{}", field.name, row.name))),
             );
@@ -26527,6 +26541,68 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A GC pointer leaf of a non-first inlined struct is
+    /// `getfield_gc_r` / `setfield_gc_r` on the outer object at the
+    /// summed offset (`heaptracker.py all_fielddescrs`;
+    /// `lltype.Struct._note_inlined_into`).
+    #[test]
+    fn fielddescrof_flattens_nonfirst_inlined_gc_pointer_leaf() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "InlineInner".to_string(),
+            vec![("ptr".to_string(), "GCREF".to_string())],
+        );
+        fields.fields.insert(
+            "InlineOuter".to_string(),
+            vec![
+                ("first".to_string(), "i64".to_string()),
+                ("nested".to_string(), "InlineInner".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["InlineInner".to_string()].into_iter().collect());
+        let (descr, member) = cc
+            .fielddescrof_keyed(0, "InlineOuter", None, "nested.ptr")
+            .expect("dotted GC-pointer leaf of a non-first inlined struct resolves");
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.offset(), 8, "first (8) + nested.ptr (0)");
+        assert_eq!(fd.field_size(), 8);
+        assert_eq!(fd.field_type(), majit_ir::value::Type::Ref);
+        match member {
+            majit_ir::effectinfo::DescrSetMember::Field { field_name, .. } => {
+                assert_eq!(field_name, "nested.ptr");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A pointer field to a struct is `rewrite_op_getfield`, not an
+    /// inlined substructure (`lltype.Struct._note_inlined_into`).
+    #[test]
+    fn fielddescrof_pointer_field_leaf_is_not_flattened_on_outer() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "InlineInner".to_string(),
+            vec![("ptr".to_string(), "GCREF".to_string())],
+        );
+        fields.fields.insert(
+            "PointerOuter".to_string(),
+            vec![
+                ("first".to_string(), "i64".to_string()),
+                ("nested".to_string(), "&InlineInner".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(["InlineInner".to_string()].into_iter().collect());
+        assert!(
+            cc.fielddescrof_keyed(0, "PointerOuter", None, "nested.ptr")
+                .is_none(),
+            "pointer field leaf must not flatten onto the outer object"
+        );
     }
 
     /// The embedded object header contributes no slot, the way recursing

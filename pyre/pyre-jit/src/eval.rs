@@ -583,6 +583,7 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         f(std::ptr::from_mut(&mut t.dict).cast());
         // `W_TypeObject.terminator` (`typeobject.py`) is a GC [`MapRef`].
         // The node's own custom trace visits `Terminator.w_cls`.
+        t.terminator = pyre_object::mapdict::map_ref_node_start(t.terminator);
         f(std::ptr::from_mut(&mut t.terminator).cast());
     }
 }

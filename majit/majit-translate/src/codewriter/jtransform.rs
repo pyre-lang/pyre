@@ -4084,8 +4084,8 @@ impl<'a> Transformer<'a> {
     /// `TYPE.TO._gckind`). `history.getkind` of a raw `Ptr` is `'int'`.
     /// Harvested `_alloc_flavor_ = raw` is the classdesc fact for the
     /// owner; it is the fallback when no `concretetype` cell is present
-    /// and also when the owner itself is raw (`MapNode::Terminator`
-    /// inherits `MapNode`).
+    /// and also when the owner itself is raw (an enum variant owner
+    /// `X::Variant` inherits `X`, `ClassDesc.get_param`).
     fn malloc_result_is_raw_flavored(
         &self,
         result: Option<&crate::flowspace::model::Variable>,
@@ -9203,8 +9203,10 @@ impl<'a> Transformer<'a> {
         // off the *base register* (`is_gc = kc == 'r'`), not the owner's
         // recorded gckind. When that base is already Int, stamp the loaded
         // word into the int bank so assemble emits `getfield_raw_i`.
-        // Immutable fields already returned `_pure` above
-        // (`MapNodeTerminatorView.w_cls`).
+        // A declared-GC owner keeps the result `'r'` so
+        // `promote_gc_field_bases` can lift the Int base (`history.getkind`
+        // of `Ptr(TO)` follows `TO._gckind`). Immutable fields already
+        // returned `_pure` above (`MapNodeTerminatorView.w_cls`).
         if let OpKind::FieldRead { base, pure, .. } = &op.kind
             && !*pure
             && self.get_value_kind_var(base) == 'i'
@@ -9212,6 +9214,7 @@ impl<'a> Transformer<'a> {
                 .result
                 .as_ref()
                 .is_some_and(|r| self.get_value_kind_var(r) == 'r')
+            && !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
         {
             self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
             return RewriteResult::Replace(vec![SpaceOperation {
