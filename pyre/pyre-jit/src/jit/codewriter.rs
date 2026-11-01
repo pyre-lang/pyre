@@ -12495,14 +12495,58 @@ impl CodeWriter {
                                 );
                             restore_canraise_exit_order(&current_block.block());
 
-                            let stop_match_state = stop_match
-                                .framestate()
-                                .expect("FOR_ITER catch must have a FrameState");
-                            let (_, stop_exc_value) = exception_edge_extravars(&stop_match_state);
                             let stop_iteration = pyre_interpreter::builtins::lookup_exc_class(
                                 "StopIteration",
                             )
                             .expect("StopIteration class must be initialized before JIT codegen");
+                            // `baseobjspace.py exception_match` opens with
+                            // `if self.is_w(w_exc_type, w_check_class): return True`
+                            // on `e.w_type`.  The landing tests the raised
+                            // object's class against StopIteration first and
+                            // takes the matched edge on identity, so a virtual
+                            // exception folds the test away; any other class
+                            // falls through to the residual MRO match below.
+                            let stop_is_state = stop_match
+                                .framestate()
+                                .expect("FOR_ITER catch must have a FrameState");
+                            let (_, stop_is_exc_value) = exception_edge_extravars(&stop_is_state);
+                            let stop_is_class = emit_graph_op_with_result(
+                                &mut graph,
+                                &stop_match.block(),
+                                "getfield_gc_r",
+                                vec![
+                                    stop_is_exc_value.into(),
+                                    pyre_jit_trace::descr::w_class_descr().into(),
+                                ],
+                                Kind::Ref,
+                                py_pc as i64,
+                            );
+                            let stop_is_same = emit_graph_op_with_result(
+                                &mut graph,
+                                &stop_match.block(),
+                                "ptr_eq",
+                                vec![
+                                    stop_is_class.into(),
+                                    pyobject_const_ref_value(stop_iteration).into(),
+                                ],
+                                Kind::Int,
+                                py_pc as i64,
+                            );
+                            stop_match.block().borrow_mut().exitswitch =
+                                Some(super::flow::ExitSwitch::Value(stop_is_same.into()));
+                            let stop_is_block = stop_match;
+                            let stop_match_state = {
+                                let mut fresh = |kind| fresh_variable_for_state(&mut graph, kind);
+                                stop_is_state.copy(&mut fresh)
+                            };
+                            let stop_match = SpamBlockRef::new(
+                                graph.new_block(Vec::new()),
+                                Some(stop_match_state.clone()),
+                            );
+                            stop_match.block().borrow_mut().inputargs =
+                                stop_match_state.getvariables();
+                            all_walker_blocks.push(stop_match.clone());
+                            let (_, stop_exc_value) = exception_edge_extravars(&stop_match_state);
                             let matched = record_residual_call_graph_op(
                                 &mut graph,
                                 &stop_match.block(),
@@ -12628,6 +12672,35 @@ impl CodeWriter {
                             .with_llexitcase(super::flow::Constant::bool(true).into())
                             .into_ref();
                             append_exit(&stop_match.block(), matched_link);
+                            // The identity test's exits: false enters the
+                            // residual match, true is the same matched edge.
+                            append_exit(
+                                &stop_is_block.block(),
+                                super::flow::Link::new(
+                                    stop_is_state.getoutputargs(&stop_match_state),
+                                    Some(stop_match.block()),
+                                    None,
+                                )
+                                .into_ref(),
+                            );
+                            set_last_bool_exitcase(&stop_is_block.block(), false);
+                            let mut stop_is_matched_source = stop_is_state.clone();
+                            stop_is_matched_source
+                                .last_exception
+                                .clone_from(&current_state.last_exception);
+                            let mut stop_is_matched_args =
+                                stop_is_matched_source.getoutputargs(&next_state);
+                            stop_is_matched_args.push(null_stack_sentinel());
+                            append_exit(
+                                &stop_is_block.block(),
+                                super::flow::Link::new(
+                                    stop_is_matched_args,
+                                    Some(next_block.block()),
+                                    None,
+                                )
+                                .into_ref(),
+                            );
+                            set_last_bool_exitcase(&stop_is_block.block(), true);
                             current_block = next_block;
                             current_state = next_state;
                             // Emit the exhaustion branch: ptr_nonzero(next)
