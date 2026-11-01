@@ -3486,6 +3486,17 @@ impl<'a> Lowering<'a> {
                     let base = self.resolve_place(mir_bb, place)?;
                     return Ok((None, base));
                 }
+                // Void `Option<uninhabited>` has only `None`. Discriminant
+                // is that inhabitant's declared tag (`const_discriminant_locals`
+                // / fieldless identity), not a `__discriminant` getfield of
+                // a missing aggregate (`rewrite_op_getfield` of Void).
+                if tyref_is_void_zst(&place.ty, self.llbc)
+                    && (crate::front::result_exc::tyref_is_option(&place.ty, self.llbc)
+                        || crate::front::result_exc::tyref_is_option_ref(&place.ty, self.llbc))
+                {
+                    let tag = option_none_discriminant(&place.ty, self.llbc).unwrap_or(0);
+                    return Ok((Some(OpKind::ConstInt(tag)), res));
+                }
                 // `*p` on a raw address is the enum's bytes, not the
                 // explicit sum shell. Load the host tag and decode it to
                 // the variant index `host_variant_index` returns;
@@ -6227,6 +6238,12 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                         ))
+                        || (tyref_is_void_zst(&inner.ty, self.llbc)
+                            && !tyref_keeps_empty_class_instance(
+                                &inner.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            ))
                         || self.tyref_is_fieldless_enum(&inner.ty)
                         || self.tyref_is_borrowed_fieldless_enum(&inner.ty)
                     {

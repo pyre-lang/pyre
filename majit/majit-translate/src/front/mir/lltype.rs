@@ -2755,6 +2755,13 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if let Some(paint) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
         return paint;
     }
+    // `Option<Never>` / `Option<Infallible>` / `Option<!>` is
+    // `lltype.Void` (`VoidRepr`): one inhabitant (`None`) and no bytes.
+    // Classify before `tyref_payload_enum_class_root_with` paints the
+    // residual `Ref(Some("option::Option<Never>"))`.
+    if tyref_is_option_of_uninhabited(ty, llbc) {
+        return ValueType::Void;
+    }
     // A payload-carrying enum (any variant has a non-ZST field) is a
     // `SomeInstance` of its interned enum-base classdef.  Fieldless
     // (C-like) enums are already `Int` above; a mixed enum would
@@ -3245,6 +3252,12 @@ pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool 
     if tyref_keeps_callable_identity(ty, llbc) {
         return false;
     }
+    // `Never` / `Option<Never>` before the fieldless-enum exclusion: the
+    // generic Option TypeDecl still has a `Some` field, so it is not a
+    // C-like enum, and its `layout.size` is not this instantiation.
+    if tyref_is_never(ty, llbc) || tyref_is_option_of_uninhabited(ty, llbc) {
+        return true;
+    }
     if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return false;
     }
@@ -3258,10 +3271,75 @@ pub(in crate::front::mir) fn tyref_is_void_zst(ty: &TyRef, llbc: &Llbc) -> bool 
     if tyref_keeps_callable_identity(&peeled, llbc) {
         return false;
     }
+    if tyref_is_never(&peeled, llbc) || tyref_is_option_of_uninhabited(&peeled, llbc) {
+        return true;
+    }
     if tyref_is_fieldless_enum_free(&peeled, llbc) {
         return false;
     }
     is_unit_type(&peeled, llbc) || tyref_is_zero_sized(&peeled, llbc)
+}
+
+/// `Option<U>` whose `U` is an uninhabited atom (`Never` / `Infallible` /
+/// `!`). `Try::Residual` of a tagged Option; `_names_without_voids`
+/// (`lltype.py`) drops that field. A `Ref` / `RawPtr` payload, and a
+/// generic container (`Vec<_>`, `PhantomData<_>`), stay non-Void.
+pub(in crate::front::mir) fn tyref_is_option_of_uninhabited(ty: &TyRef, llbc: &Llbc) -> bool {
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
+        return tyref_uninhabited_atom(&payload, llbc);
+    }
+    // Instantiation spelling when the generic Option TypeDecl hid the
+    // argument (`layout.size` of that decl is not this residual).
+    let spelling = tyref_to_ast_string(ty, llbc);
+    crate::front::result_exc::option_spelling_payload(&spelling)
+        .is_some_and(crate::front::result_exc::type_spelling_is_uninhabited)
+}
+
+/// Uninhabited atom: `Never` / `!`, or a named ADT such as `Infallible`.
+/// A `Ref` / `RawPtr` of one is still a pointer word. A generic
+/// container whose argument is uninhabited is not an atom.
+fn tyref_uninhabited_atom(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_never(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let node = strip_ty_indirections(node, llbc).unwrap_or(node);
+    if node
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("Ref") || obj.contains_key("RawPtr"))
+    {
+        return false;
+    }
+    if node
+        .get("Adt")
+        .and_then(|a| a.as_object())
+        .is_some_and(|adt| type_decl_ref_generics(adt, llbc).is_some_and(generic_args_are_nonempty))
+    {
+        return false;
+    }
+    crate::front::result_exc::type_spelling_is_uninhabited(&charon_type_value_to_ast_string(
+        node, llbc, 0,
+    ))
+}
+
+/// Discriminant of `Option`'s `None` variant, from the enum's declared
+/// layout (`VariantDecl::discriminant_i64`).
+pub(in crate::front::mir) fn option_none_discriminant(ty: &TyRef, llbc: &Llbc) -> Option<i64> {
+    let def_id = tyref_adt_def_id_of(ty, llbc).or_else(|| {
+        tyref_node(ty, llbc)
+            .and_then(|node| strip_ty_wrappers(node, llbc))
+            .and_then(adt_node_def_id)
+    })?;
+    let td = llbc.type_by_id(def_id)?;
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    variants
+        .iter()
+        .find(|v| v.name == "None")
+        .and_then(|v| v.discriminant_i64())
 }
 
 /// A closure ADT or a function item (`FnDef`). Layout size 0 does not erase
@@ -4572,6 +4650,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     }
     if tyref_option_fieldless_niche(ty, llbc).is_some() {
         return ValueType::Int;
+    }
+    if tyref_is_option_of_uninhabited(ty, llbc) {
+        return ValueType::Void;
     }
     // Matching [`tyref_to_value_type`]: a payload-carrying enum field
     // seeds `Ref(Some(root))` so the FORCE-attr / call-result narrow
@@ -6258,6 +6339,7 @@ pub(in crate::front::mir) fn tyref_keeps_empty_class_instance(
     tombstoned: &std::collections::HashSet<String>,
 ) -> bool {
     tyref_is_void_zst(ty, llbc)
+        && !tyref_is_option_of_uninhabited(ty, llbc)
         && !tyref_is_bytecode_arg_marker(ty, llbc)
         && tyref_input_class_root(ty, llbc, tombstoned).is_some()
 }

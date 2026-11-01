@@ -14439,7 +14439,20 @@ pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
         return true;
     }
     let leaf = outer_type_leaf(type_str);
-    leaf == "PhantomData" || leaf == "BuildHasherDefault"
+    if leaf == "PhantomData" || leaf == "BuildHasherDefault" {
+        return true;
+    }
+    // `Option<Never>` / `Option<Infallible>` / `Option<!>` is
+    // `lltype.Void` (`_names_without_voids`): one inhabitant (`None`)
+    // and no bytes. The payload must be an uninhabited atom; a pointer
+    // or generic container (`Vec<_>`, `PhantomData<_>`) is not.
+    // `Option<`, `core::option::Option<`, and `std::option::Option<`
+    // peel the same way. Bare `Never` / `Infallible` / `!` are the
+    // same Void atom (`VoidRepr`).
+    if let Some(payload) = crate::front::result_exc::option_spelling_payload(type_str) {
+        return crate::front::result_exc::type_spelling_is_uninhabited(payload);
+    }
+    crate::front::result_exc::type_spelling_is_uninhabited(type_str) || leaf == "??scalar"
 }
 
 /// descr.py get_type_flag: a Ptr whose immediate target `TO._gckind == 'raw'`
@@ -14557,6 +14570,11 @@ pub(crate) fn get_type_flag(
                 2 * crate::layout::target_word_size(),
             )
         }
+        // Zero-sized types occupy no storage (`_names_without_voids`).
+        // Before the `Option<` pointer arm so `Option<!>` /
+        // `Option<Never>` / `Option<Infallible>` is Void;
+        // `Option<*const T>` keeps FLAG_POINTER (`get_type_flag`).
+        s if type_str_leaf_is_void_zst(s) => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
             || s.starts_with("Box<")
@@ -14626,9 +14644,6 @@ pub(crate) fn get_type_flag(
             let (flag, item_type, elem_size) = get_type_flag(elem, raw_alloc_flavor_structs);
             (flag, item_type, elem_size.saturating_mul(len))
         }
-        // Zero-sized types occupy no storage and contribute no field slot
-        // (heaptracker.py:60-62; lltype.py `_names_without_voids()`).
-        s if type_str_leaf_is_void_zst(s) => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
         s if let Some(leaf) = atomic_wrapper_leaf(s, raw_alloc_flavor_structs) => leaf,
         // Unknown type — treat as GC pointer (conservative)
         _ => (
@@ -24918,6 +24933,53 @@ mod tests {
         assert!(type_str_leaf_is_void_zst(
             "core::marker::PhantomData<pyre_object::PyObject>"
         ));
+        assert!(type_str_leaf_is_void_zst("option::Option<Never>"));
+        assert!(type_str_leaf_is_void_zst(
+            "core::option::Option<Infallible>"
+        ));
+        assert!(type_str_leaf_is_void_zst("Option<!>"));
+        assert!(!type_str_leaf_is_void_zst("option::Option<u8>"));
+    }
+
+    /// `Option<uninhabited-atom>` is Void (`_names_without_voids`).
+    /// `Option` of a pointer or generic container keeps its non-Void flag
+    /// (`get_type_flag`). `PhantomData<Infallible>` is Void via PhantomData.
+    #[test]
+    fn option_of_uninhabited_atom_is_void_before_option_pointer_arm() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let empty = HashSet::new();
+        let void = (ArrayFlag::Void, Type::Void, 0);
+        for spelling in [
+            "Option<!>",
+            "Option<Never>",
+            "Option<core::convert::Infallible>",
+            "core::option::Option<Infallible>",
+        ] {
+            assert!(type_str_leaf_is_void_zst(spelling), "{spelling}");
+            assert_eq!(get_type_flag(spelling, &empty), void, "{spelling}");
+        }
+        for spelling in [
+            "core::option::Option<*const core::convert::Infallible>",
+            "Option<*const Infallible>",
+            "Option<Vec<Infallible>>",
+            "Option<PhantomData<Infallible>>",
+        ] {
+            assert!(!type_str_leaf_is_void_zst(spelling), "{spelling}");
+            let (flag, ty, _) = get_type_flag(spelling, &empty);
+            assert_ne!(flag, ArrayFlag::Void, "{spelling}");
+            assert_ne!(ty, Type::Void, "{spelling}");
+        }
+        assert!(type_str_leaf_is_void_zst("PhantomData<Infallible>"));
+        assert_eq!(
+            get_type_flag("PhantomData<Infallible>", &empty),
+            void,
+            "PhantomData leaf rule"
+        );
+        let (ptr_flag, ptr_ty, _) = get_type_flag("Option<*const Infallible>", &empty);
+        assert_eq!(ptr_flag, ArrayFlag::Pointer);
+        assert_eq!(ptr_ty, Type::Ref);
     }
 
     /// A one-word-item Vec field is `Ptr(Struct(raw) "RustVec")`

@@ -4435,8 +4435,19 @@ fn derive_program_metadata(
                         // payload store replaces the tag store it is keyed against.
                         // A payload-less variant is skipped: a lone `__discriminant` row is
                         // the sentinel `StructFieldRegistry::is_enum_base` reads to tell a
-                        // base from a subclass.
-                        if explicit_sum_shell && !v.fields.is_empty() {
+                        // base from a subclass. `_names_without_voids` drops a Void /
+                        // uninhabited payload (`Option<Never>`), so that variant has no
+                        // stored field. A named empty class is still an instance
+                        // (`InstanceRepr`) and counts as stored.
+                        let has_stored_payload = v.fields.iter().any(|f| {
+                            !tyref_is_void_zst(&f.ty, llbc)
+                                || tyref_keeps_empty_class_instance(
+                                    &f.ty,
+                                    llbc,
+                                    no_tombstoned_leaves(),
+                                )
+                        });
+                        if explicit_sum_shell && has_stored_payload {
                             vrows.push(crate::front::semantic::FieldRow::named(
                                 "__discriminant",
                                 discr_ty.unwrap_or("i64"),
@@ -4446,6 +4457,23 @@ fn derive_program_metadata(
                         // The shell's next free payload word.
                         let mut shell_word = 0u64;
                         for (i, f) in v.fields.iter().enumerate() {
+                            // `_names_without_voids` drops a Void / uninhabited
+                            // payload. A named empty class stays an instance
+                            // (`InstanceRepr`). Shell-word accounting still
+                            // advances so later fields keep the offsets they
+                            // would have had.
+                            if tyref_is_void_zst(&f.ty, llbc)
+                                && !tyref_keeps_empty_class_instance(
+                                    &f.ty,
+                                    llbc,
+                                    no_tombstoned_leaves(),
+                                )
+                            {
+                                if explicit_sum_shell {
+                                    shell_word += 1;
+                                }
+                                continue;
+                            }
                             let fname = field_decl_name(i, f);
                             // A pair-slice payload is its pointer and length
                             // words, the length under `pair_len_field_name`.

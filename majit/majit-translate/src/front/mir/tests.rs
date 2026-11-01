@@ -14632,6 +14632,76 @@ fn field_row_ty<'a>(
         .map(|row| row.ty.as_str())
 }
 
+/// `_names_without_voids` drops a Void payload. A named empty class is still
+/// an instance (`InstanceRepr`), so an enum variant that carries one keeps
+/// that payload row. `Option<Never>` stays Void and is dropped.
+#[test]
+fn enum_metadata_keeps_named_empty_class_payload_and_drops_option_never() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let field =
+        |ty: serde_json::Value| serde_json::json!({"name": null, "ty": ty, "attr_info": null});
+    let variant = |name: &str, ty: serde_json::Value, disc: u64| {
+        serde_json::json!({
+            "name": name,
+            "fields": [field(ty)],
+            "discriminant": {"Scalar": {"Unsigned": ["U8", disc.to_string()]}}
+        })
+    };
+    let marker = interior_struct(1, &["fixture", "Marker"], &[], 0, &[], false);
+    let carrier = serde_json::json!({
+        "def_id": 2,
+        "item_meta": {
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Carrier", 0]}],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Enum": [
+            variant("EmptyClass", adt_node(1), 0),
+            variant("Residual", option_adt_node(0, serde_json::json!("Never")), 1),
+            variant("Int", interior_i64(), 2)
+        ]},
+        "layout": []
+    });
+    let llbc = llbc_with_types("fixture", vec![option_enum(0), marker, carrier], vec![]);
+    let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
+        &llbc,
+        &harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+    );
+    let keys: Vec<_> = fields.fields.keys().collect();
+    assert!(
+        fields.fields.get("Marker").is_some() || fields.fields.get("fixture::Marker").is_some(),
+        "named empty struct is a registered class; keys={keys:?}"
+    );
+    let row_names = |owner: &str| -> Vec<&str> {
+        fields
+            .fields
+            .get(owner)
+            .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
+            .unwrap_or_default()
+    };
+    let empty_class = row_names("fixture::Carrier::EmptyClass");
+    assert!(
+        empty_class.iter().any(|name| *name == "__pos_0"),
+        "named empty class payload is an instance (`InstanceRepr`); rows={empty_class:?}; keys={keys:?}"
+    );
+    let residual = row_names("fixture::Carrier::Residual");
+    assert!(
+        !residual.iter().any(|name| *name == "__pos_0"),
+        "Option<Never> residual is Void (`_names_without_voids`); rows={residual:?}"
+    );
+    let int_rows = row_names("fixture::Carrier::Int");
+    assert!(
+        int_rows.iter().any(|name| *name == "__pos_0"),
+        "ordinary payload stays; rows={int_rows:?}"
+    );
+}
+
 /// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
 /// RegularCall's substituted callee signature. The caller has no Option local.
 #[test]
@@ -23553,12 +23623,9 @@ fn str_idx_params_unrooted_pos0_owners_are_option_i64() {
         continues.iter().all(|o| o.contains("i64")),
         "Continue payload stays i64, got {continues:?}"
     );
-    assert_eq!(breaks.len(), 2, "two Break residuals, got {breaks:?}");
     assert!(
-        breaks
-            .iter()
-            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
-        "Break residual is Option<Never>, got {breaks:?}"
+        breaks.is_empty(),
+        "Break's Option<Never> residual is lltype.Void so there is no Break.__pos_0 FieldRead, got {breaks:?}"
     );
 }
 
@@ -23617,12 +23684,9 @@ fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
         continues.iter().all(|o| o.contains("usize")),
         "Continue payload stays usize, got {continues:?}"
     );
-    assert_eq!(breaks.len(), 7, "seven Break residuals, got {breaks:?}");
     assert!(
-        breaks
-            .iter()
-            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
-        "Break residual is Option<Never>, got {breaks:?}"
+        breaks.is_empty(),
+        "Break's Option<Never> residual is lltype.Void so there is no Break.__pos_0 FieldRead, got {breaks:?}"
     );
 }
 
@@ -23645,12 +23709,9 @@ fn std_gc_array_size_does_not_getattr_template_option_some() {
         continues.iter().all(|o| o.contains("usize")),
         "Continue payload stays usize, got {continues:?}"
     );
-    assert_eq!(breaks.len(), 2, "two Break residuals, got {breaks:?}");
     assert!(
-        breaks
-            .iter()
-            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
-        "Break residual is Option<Never>, got {breaks:?}"
+        breaks.is_empty(),
+        "Break's Option<Never> residual is lltype.Void so there is no Break.__pos_0 FieldRead, got {breaks:?}"
     );
     let some_owners: Vec<String> = graph
         .blocks
