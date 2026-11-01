@@ -6042,32 +6042,26 @@ pub(crate) fn concrete_frame_local_is_writable(value: &Value) -> bool {
     !matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE)
 }
 
-/// Write every static field then every *replaced* array item onto `frame`.
+/// Write every static field then every array item onto `frame`.
 ///
 /// `virtualizable.py VirtualizableInfo.write_boxes` walks `unroll_static_fields`
-/// then each array's items `for j in range(len(lst))`. `pyjitpl.py
-/// MetaInterp.synchronize_virtualizable` is the caller of that write. pyre's
-/// `synchronize_virtualizable` targets `virtualizable_heap_ptr` (the
-/// `snapshot_for_tracing` copy; `TraceCtx::standard_virtualizable_ptr` is the
-/// live identity), so the interpreter frame lags until this write.
+/// then each array's items `for j in range(len(lst))`, unwrapping the current
+/// box. `_opimpl_setarrayitem_vable` (`pyjitpl.py`) replaces
+/// `virtualizable_boxes[index]` with the stored valuebox, so an aliased
+/// `AbstractInputArg` (STORE_FAST `a = b` of a loop input) is written into
+/// slot `a`. `pyjitpl.py MetaInterp.synchronize_virtualizable` is the caller
+/// of that write. pyre's `synchronize_virtualizable` targets
+/// `virtualizable_heap_ptr` (the `snapshot_for_tracing` copy;
+/// `TraceCtx::standard_virtualizable_ptr` is the live identity), so the
+/// interpreter frame lags until this write.
 /// Walk-owned frames already mirror array items through
 /// `own_frame_vable_store_target` → `store_live_frame_array_slot`; the
 /// portal live frame is written here.
 ///
-/// `write_boxes` unwraps the *current* box: `_opimpl_setarrayitem_vable`
-/// (`pyjitpl.py`) replaces `virtualizable_boxes[index]` with the stored
-/// valuebox. An unreplaced `AbstractInputArg` (`history.py`) is still the
-/// trace-start box, whose `box_runtime_concrete` is the portal-entry
-/// stamp. `force_now` on `TOKEN_TRACING_RESCALL` (`virtualizable.py`) leaves
-/// the live virtualizable alone because those values are already correct;
-/// `vable_and_vrefs_before_residual_call` (`pyjitpl.py`) never calls
-/// `write_boxes`. Writing that start concrete over a slot the interpreter
-/// or `setarrayitem_vable` already stored clobbers it. Const padding
-/// above `valuestackdepth` (`pyframe.py popvalue` stores None) and
-/// replaced valueboxes still write. `Void` / `NO_CONCRETE` / a missing
-/// entry never reached this helper (556 residual flushes across 80 synth
-/// fixtures). A `debug_assert!` names that invariant; release still skips
-/// so boxing cannot store `PY_NULL`.
+/// Const padding above `valuestackdepth` (`pyframe.py popvalue` stores None)
+/// still writes. `Void` / `NO_CONCRETE` / a missing entry never reached this
+/// helper (556 residual flushes across 80 synth fixtures). A `debug_assert!`
+/// names that invariant; release still skips so boxing cannot store `PY_NULL`.
 pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usize) {
     if frame == 0 {
         return;
@@ -6110,19 +6104,13 @@ pub(crate) fn flush_known_virtualizable_to_frame(ctx: &TraceCtx, mut frame: usiz
     };
     let base = static_count;
     for j in 0..len {
-        let Some((opref, value)) = ctx.virtualizable_entry_at(base + j) else {
+        let Some((_opref, value)) = ctx.virtualizable_entry_at(base + j) else {
             debug_assert!(
                 false,
                 "write_boxes: array item {j} must have a virtualizable box"
             );
             continue;
         };
-        // Unreplaced InputArg: live slot is already the interpreter /
-        // `setarrayitem_vable` image. See the helper doc for
-        // `_opimpl_setarrayitem_vable` / `force_now` TOKEN_TRACING_RESCALL.
-        if opref.is_input_arg() {
-            continue;
-        }
         debug_assert!(
             known_vable_bits(&value).is_some(),
             "write_boxes: array item {j} must carry a runtime concrete (not Void/NO_CONCRETE)"

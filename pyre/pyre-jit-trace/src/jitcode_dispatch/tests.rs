@@ -24460,11 +24460,14 @@ fn walk_start_undo_restores_value_stack_slot_above_nlocals() {
     );
 }
 
-/// An unreplaced `AbstractInputArg` is the trace-start box. `force_now` on
-/// TOKEN_TRACING_RESCALL leaves the live virtualizable alone; writing the
-/// start concrete would clobber an interpreter / `setarrayitem_vable` store.
+/// `virtualizable.py VirtualizableInfo.write_boxes` unwraps the current box
+/// for every array item. `_opimpl_setarrayitem_vable` replaces
+/// `virtualizable_boxes[index]` with the stored valuebox, so after
+/// STORE_FAST `a = b` of a loop input, slot `a` holds `InputArg(b)` and
+/// flush writes `b`'s concrete into `a`. An operand-stack slot holding an
+/// InputArg of a local is written the same way.
 #[test]
-fn flush_known_virtualizable_skips_unreplaced_inputarg_array_items() {
+fn flush_known_virtualizable_writes_aliased_inputarg_array_items() {
     use majit_ir::{GcRef, OpRef, Value};
     use pyre_interpreter::bytecode::ConstantData;
     use pyre_interpreter::locals_w_mut;
@@ -24487,9 +24490,12 @@ fn flush_known_virtualizable_skips_unreplaced_inputarg_array_items() {
         .expect("frame must have locals_cells_stack_w");
     let nlocals = crate::state::concrete_nlocals(frame_ptr).unwrap_or(0);
     assert!(
-        nlocals > 0 && array_len > nlocals,
-        "the fixture needs locals and stack slots above nlocals"
+        nlocals >= 2 && array_len > nlocals,
+        "the fixture needs two locals (a, b) and a stack slot above nlocals"
     );
+    let slot_a = 0usize;
+    let slot_b = 1usize;
+    let stack_slot = nlocals;
 
     {
         let slots = locals_w_mut!(frame).as_mut_slice();
@@ -24528,15 +24534,21 @@ fn flush_known_virtualizable_skips_unreplaced_inputarg_array_items() {
     values.push(Value::Ref(GcRef(debugdata)));
     assert_eq!(boxes.len(), static_count, "PyFrame static field order");
     for j in 0..array_len {
+        let live = 0xBEEF0000 + j;
         if j < nlocals {
             boxes.push(OpRef::input_arg_ref(j as u32));
-            values.push(Value::Ref(GcRef(0xDEAD0000 + j)));
+            values.push(Value::Ref(GcRef(live)));
         } else {
-            let ptr = 0x1000 + j * 0x10;
-            boxes.push(tc.const_ref(ptr as i64));
-            values.push(Value::Ref(GcRef(ptr)));
+            boxes.push(tc.const_ref(live as i64));
+            values.push(Value::Ref(GcRef(live)));
         }
     }
+    // `a = b`: slot a's current box is slot b's InputArg, carrying b's word.
+    boxes[static_count + slot_a] = OpRef::input_arg_ref(slot_b as u32);
+    values[static_count + slot_a] = Value::Ref(GcRef(0xBEEF0000 + slot_b));
+    // Operand stack above the locals holds an InputArg of local b.
+    boxes[static_count + stack_slot] = OpRef::input_arg_ref(slot_b as u32);
+    values[static_count + stack_slot] = Value::Ref(GcRef(0xBEEF0000 + slot_b));
     tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
@@ -24556,18 +24568,24 @@ fn flush_known_virtualizable_skips_unreplaced_inputarg_array_items() {
     assert_eq!(last_instr, 37, "write_boxes writes last_instr");
 
     let slots = pyre_interpreter::locals_w!(frame).as_slice();
-    for j in 0..nlocals {
+    assert_eq!(
+        slots[slot_a],
+        (0xBEEF0000 + slot_b) as pyre_object::PyObjectRef,
+        "write_boxes writes aliased InputArg of b into slot a"
+    );
+    assert_eq!(
+        slots[stack_slot],
+        (0xBEEF0000 + slot_b) as pyre_object::PyObjectRef,
+        "write_boxes writes an operand-stack InputArg of local b"
+    );
+    for j in 0..array_len {
+        if j == slot_a || j == stack_slot {
+            continue;
+        }
         assert_eq!(
             slots[j],
             (0xBEEF0000 + j) as pyre_object::PyObjectRef,
-            "unreplaced InputArg array item {j} must keep the live store"
-        );
-    }
-    for j in nlocals..array_len {
-        assert_eq!(
-            slots[j],
-            (0x1000 + j * 0x10) as pyre_object::PyObjectRef,
-            "replaced / Const array item {j} still writes"
+            "unaliased array item {j} is unchanged"
         );
     }
 }
