@@ -2632,7 +2632,9 @@ fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
 /// `ec.bytecode_only_trace(self)` is `jtransform.py handle_regular_call` of
 /// the translator jitcode `bytecode_only_trace__AccessDirect_None`. After
 /// the call, `next_instr = r_uint(self.last_instr)` is a vable `last_instr`
-/// reload (`dispatch_bytecode`).
+/// reload (`dispatch_bytecode`). The call is the raising op, so it ends
+/// its block (`flowspace/model.py Block.raising_op`, `flatten.py
+/// insert_exits`); the reload lives on the normal successor.
 fn emit_dispatch_bytecode_jitted_trace_arm(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -2716,13 +2718,28 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         Kind::Ref,
         py_pc as i64,
     );
-    let _next_instr = emit_vable_getfield_int(
-        graph,
-        &tr_armed.block(),
-        frame_var,
-        VABLE_LAST_INSTR_FIELD_IDX,
-        py_pc as i64,
-    );
+    // `record_graph_op` already appended the call's trailing `-live-`.
+    // `flatten.py insert_exits` treats a canraise block whose last op is
+    // not `-live-` as unable to raise and follows only `exits[0]`, dropping
+    // `catch_exception` / `make_exception_link`. The `last_instr` reload is
+    // not a raising op, so it must not sit in this block.
+    let armed_state = tr_armed
+        .framestate()
+        .expect("ptr_iszero armed arm carries a FrameState");
+    // Identity split after the raising call: same `next_offset` / blocklist
+    // as `make_next_block`, without enqueueing the successor on
+    // `pendingblocks` — the `last_instr` reload is emitted here, then
+    // `link_to_join`.
+    let mut next_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        armed_state.copy(&mut fresh)
+    };
+    next_state.next_offset = py_pc;
+    next_state.blocklist = frame_blocks_for_offset(code, py_pc);
+    let next_block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(next_state.clone()));
+    all_walker_blocks.push(next_block.clone());
+    arm_blocks.push(next_block.block());
+    next_block.block().borrow_mut().inputargs = next_state.getvariables();
     if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
         && let Some(site) = catch_sites
             .iter()
@@ -2733,16 +2750,25 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
             graph,
             &tr_armed.block(),
             &site.landing,
-            &tr_armed
-                .framestate()
-                .expect("ptr_iszero armed arm carries a FrameState"),
+            &armed_state,
             site,
             unwind_memo,
             depth_at_pc,
         );
     }
-    link_to_join(&tr_armed, &join);
+    append_exit(
+        &tr_armed.block(),
+        output_link(&armed_state, &next_state, next_block.block()),
+    );
     restore_canraise_exit_order(&tr_armed.block());
+    let _next_instr = emit_vable_getfield_int(
+        graph,
+        &next_block.block(),
+        frame_var,
+        VABLE_LAST_INSTR_FIELD_IDX,
+        py_pc as i64,
+    );
+    link_to_join(&next_block, &join);
 
     join
 }
@@ -20853,6 +20879,68 @@ def f(i):
         assert!(
             !opnames.contains(&"abort_permanent"),
             "named-handler DELETE_FAST cleanup must remain executable in blackhole"
+        );
+    }
+
+    #[test]
+    fn armed_dispatch_try_finally_keeps_handler_catch_and_merge_green() {
+        // `dispatch_bytecode` jitted arm: `inline_call_r_r` of
+        // `bytecode_only_trace` can raise (`jtransform.py handle_regular_call`).
+        // `Block.raising_op` is the last op of a canraise block
+        // (`flowspace/model.py`); `flatten.py insert_exits` drops exception
+        // exits unless the tail is `[raising_op, -live-]`. The `last_instr`
+        // reload (`pyopcode.py dispatch_bytecode`) belongs on the normal
+        // successor so the Python finally handler CFG stays attached.
+        let _ = pyre_interpreter::builtins::new_builtin_module_dict();
+        let source = "\
+def f(g):
+    try:
+        g()
+    finally:
+        return 1
+";
+        let code = first_nested_function_code(source);
+        let entries: Vec<_> =
+            pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
+        assert!(
+            !entries.is_empty(),
+            "try/finally must produce an exception table"
+        );
+        let handler_pcs: Vec<usize> = entries
+            .iter()
+            .map(|entry| entry.target as usize / 2)
+            .collect();
+
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code_ptr = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject
+        };
+        let writer = CodeWriter::new();
+        writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
+            portal_graph: code_ptr,
+            mainjitcode: None,
+        });
+        writer.make_jitcodes();
+        let pyjit = writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .expect("try/finally around a call must produce a jitcode");
+        let opnames: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            opnames.contains(&"inline_call_r_r"),
+            "armed arm must keep the inline_call of bytecode_only_trace, got {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|&name| name == "catch_exception"),
+            "handler catch_exception must survive the armed canraise arm, got {opnames:?}"
+        );
+        assert!(
+            handler_pcs
+                .iter()
+                .any(|&pc| pyjit.merge_entry_for(pc).is_some()),
+            "finally handler greens {handler_pcs:?} must keep a merge sandwich"
         );
     }
 
