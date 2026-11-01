@@ -9570,10 +9570,6 @@ impl<S: JitState> JitDriver<S> {
         let savedata = result.savedata;
         let deadframe = result.deadframe.take();
 
-        // `warmstate.py execute_assembler`: `memory_manager.keep_loop_alive`
-        // on the token it ran.
-        self.meta.keep_compiled_token_alive(procedure_token);
-
         if is_finish {
             let typed_values = std::mem::take(&mut result.typed_values);
             drop(result);

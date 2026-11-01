@@ -1166,7 +1166,7 @@ pub trait JitCodeRuntime {
     /// for standalone test runtimes), in which case the caller aborts.
     fn execute_recursive_assembler_int(
         &self,
-        _token: &majit_backend::JitCellToken,
+        _token: &Arc<majit_backend::JitCellToken>,
         _reds: &[Value],
     ) -> Option<i64> {
         None
@@ -1182,7 +1182,7 @@ pub trait JitCodeRuntime {
     /// aborts.
     fn execute_recursive_assembler_ref(
         &self,
-        _token: &majit_backend::JitCellToken,
+        _token: &Arc<majit_backend::JitCellToken>,
         _reds: &[Value],
     ) -> Option<i64> {
         None
@@ -1198,7 +1198,7 @@ pub trait JitCodeRuntime {
     /// which case the caller aborts.
     fn execute_recursive_assembler_float(
         &self,
-        _token: &majit_backend::JitCellToken,
+        _token: &Arc<majit_backend::JitCellToken>,
         _reds: &[Value],
     ) -> Option<i64> {
         None
@@ -1212,7 +1212,7 @@ pub trait JitCodeRuntime {
     /// default), in which case the caller aborts.
     fn execute_recursive_assembler_void(
         &self,
-        _token: &majit_backend::JitCellToken,
+        _token: &Arc<majit_backend::JitCellToken>,
         _reds: &[Value],
     ) -> Option<()> {
         None
@@ -1506,10 +1506,10 @@ where
     FLabel: Fn(usize) -> usize,
     FTarget: Fn(usize, &[i64]) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)>,
     FDecision: Fn(usize, &[i64], usize, usize) -> crate::pyjitpl::InlineDecision,
-    FExec: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
-    FExecR: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
-    FExecF: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
-    FExecV: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<()>,
+    FExec: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<i64>,
+    FExecR: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<i64>,
+    FExecF: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<i64>,
+    FExecV: Fn(&Arc<majit_backend::JitCellToken>, &[Value]) -> Option<()>,
 {
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
@@ -1535,7 +1535,7 @@ where
 
     fn execute_recursive_assembler_int(
         &self,
-        token: &majit_backend::JitCellToken,
+        token: &Arc<majit_backend::JitCellToken>,
         reds: &[Value],
     ) -> Option<i64> {
         (self.recursive_exec)(token, reds)
@@ -1543,7 +1543,7 @@ where
 
     fn execute_recursive_assembler_ref(
         &self,
-        token: &majit_backend::JitCellToken,
+        token: &Arc<majit_backend::JitCellToken>,
         reds: &[Value],
     ) -> Option<i64> {
         (self.recursive_exec_ref)(token, reds)
@@ -1551,7 +1551,7 @@ where
 
     fn execute_recursive_assembler_float(
         &self,
-        token: &majit_backend::JitCellToken,
+        token: &Arc<majit_backend::JitCellToken>,
         reds: &[Value],
     ) -> Option<i64> {
         (self.recursive_exec_float)(token, reds)
@@ -1559,7 +1559,7 @@ where
 
     fn execute_recursive_assembler_void(
         &self,
-        token: &majit_backend::JitCellToken,
+        token: &Arc<majit_backend::JitCellToken>,
         reds: &[Value],
     ) -> Option<()> {
         (self.recursive_exec_void)(token, reds)
@@ -7258,7 +7258,7 @@ mod tests {
 
         fn execute_recursive_assembler_int(
             &self,
-            _token: &majit_backend::JitCellToken,
+            _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
             let arg = match reds.first() {
@@ -7271,7 +7271,7 @@ mod tests {
 
         fn execute_recursive_assembler_ref(
             &self,
-            _token: &majit_backend::JitCellToken,
+            _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
             let arg = match reds.first() {
@@ -7286,7 +7286,7 @@ mod tests {
 
         fn execute_recursive_assembler_float(
             &self,
-            _token: &majit_backend::JitCellToken,
+            _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
             let arg = match reds.first() {
@@ -7301,7 +7301,7 @@ mod tests {
 
         fn execute_recursive_assembler_void(
             &self,
-            _token: &majit_backend::JitCellToken,
+            _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<()> {
             let arg = match reds.first() {
@@ -7492,7 +7492,7 @@ mod tests {
 
         fn execute_recursive_assembler_int(
             &self,
-            _token: &majit_backend::JitCellToken,
+            _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
             let arg = match reds.first() {
@@ -8002,7 +8002,7 @@ mod tests {
 
         fn execute_recursive_assembler_int(
             &self,
-            _token: &majit_backend::JitCellToken,
+            _token: &Arc<majit_backend::JitCellToken>,
             reds: &[Value],
         ) -> Option<i64> {
             // Concrete leg: the fresh reds start with the zeroed scalar, so
