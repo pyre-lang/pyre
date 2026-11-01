@@ -433,16 +433,21 @@ impl W_BytesIO {
 
     fn seek(
         &mut self,
-        pos: PyIndexInt,
+        pos: PyObjectRef,
         #[default(0)] whence: PyIndexCInt,
     ) -> Result<i64, crate::PyError> {
-        // interp_bytesio.py:162-180 validation followed by RStringIO.seek.
-        // `@unwrap_spec(pos=r_longlong, whence=int)` (:162): the position is a
-        // long long but the whence is a C int, so one that does not fit is an
-        // OverflowError from the converter rather than a value the arms below
-        // ever see. Both come through `__index__` alone — 3.14 rejects a whence
-        // carrying only `__int__`, and reads one carrying both from `__index__`.
+        // W_BytesIO.seek_w `@unwrap_spec(pos=r_longlong, whence=int)`.
+        // Overflow of pos is OverflowError from `index_int_w` before the
+        // negative-seek ValueError arm. `__index__` can collect, so the
+        // receiver is recovered from its pin afterwards.
         self.check_closed()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = self.pin_self();
+        let arg_base = pyre_object::gc_roots::pin_roots(&[pos]);
+        let pos =
+            crate::baseobjspace::index_int_w(pyre_object::gc_roots::shadow_stack_get(arg_base))?;
+        let this = Self::from_slot(slot);
+        this.check_closed()?;
         match whence {
             0 if pos < 0 => {
                 return Err(crate::PyError::value_error(format!(
@@ -451,12 +456,12 @@ impl W_BytesIO {
             }
             0 => {}
             1 => {
-                if pos > i64::MAX - self.tell_pos() {
+                if pos > i64::MAX - this.tell_pos() {
                     return Err(crate::PyError::overflow_error("new position too large"));
                 }
             }
             2 => {
-                if pos > i64::MAX - self.getsize() {
+                if pos > i64::MAX - this.getsize() {
                     return Err(crate::PyError::overflow_error("new position too large"));
                 }
             }
@@ -466,8 +471,8 @@ impl W_BytesIO {
                 )));
             }
         }
-        self.seek_pos(pos, whence as i64);
-        Ok(self.tell_pos())
+        this.seek_pos(pos, whence as i64);
+        Ok(this.tell_pos())
     }
 
     fn tell(&self) -> Result<i64, crate::PyError> {
