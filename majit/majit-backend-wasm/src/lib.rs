@@ -4164,14 +4164,18 @@ impl WasmBackend {
         addrs
     }
 
+    /// The owner's exit at merged-stream ordinal `fail_index`. The owner's exits occupy positions
+    /// `[0, num_guard_cells)` of `fail_descrs` in merged-stream order (position at emit,
+    /// `assembler.py` `self.faildescr.index = i`); descrs past that prefix belong to standalone bridges.
     fn owner_guard_descr(
         source_loop: &CompiledWasmLoop,
         fail_index: u32,
     ) -> Option<Arc<WasmFailDescr>> {
-        source_loop.fail_descrs.borrow().iter().find_map(|descr| {
-            (descr.trace_id == source_loop.trace_id && descr.fail_index == fail_index)
-                .then(|| Arc::clone(descr))
-        })
+        let index = fail_index as usize;
+        if index >= source_loop.num_guard_cells.get() {
+            return None;
+        }
+        source_loop.fail_descrs.borrow().get(index).cloned()
     }
 
     /// Re-point a guard's dispatch cell at the bridge slot stored on its descr.
