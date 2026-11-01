@@ -280,6 +280,11 @@ pub struct CallGraph {
     /// of the graph is only actionable if you know whether it is `dyn Error`
     /// or something that can reach Python.
     pub opaque: OpaqueCensus,
+    /// `(callee FunDecl id, resolved TraitImpl binding key) → node id`.
+    /// Identity entries (`value == callee`) record that this instantiation
+    /// was considered and kept the generic node. Specialized nodes are
+    /// fresh ids; [`Self::callee_node`] looks them up.
+    pub spec_memo: HashMap<(u64, String), u64>,
 }
 
 /// The unresolved calls, bucketed by what could not be resolved.
@@ -295,6 +300,68 @@ pub struct OpaqueCensus {
     pub by_variant: HashMap<&'static str, usize>,
     /// Anything else the reader could not classify.
     pub unknown: usize,
+}
+
+impl CallGraph {
+    /// Shared helper: the node a Regular call site names, given the caller's
+    /// resolved clause bindings and the call site's `FunId::Regular` plus
+    /// `generics.trait_refs`. Lookup-only on a finished graph: a miss is the
+    /// generic FunDecl id, never a narrower answer than [`build`] recorded.
+    pub fn callee_node(
+        &self,
+        llbc: &majit_charon_reader::Llbc,
+        caller_bindings: &[serde_json::Value],
+        callee: u64,
+        generics: &serde_json::Value,
+    ) -> u64 {
+        super::instantiate::callee_node_for_call(self, llbc, caller_bindings, callee, generics)
+    }
+
+    /// Fold specialized nodes in `collecting` back to their generic FunDecl.
+    ///
+    /// `graphanalyze.py` `analyze_direct_call` analyzes the specialized graph,
+    /// so a spec copy whose closure Regular-reaches a collecting seed is a
+    /// resolved collecting callee. Its call sites are real collecting calls
+    /// with no root bracket today (`unbracketed_calls`, `short_brackets`,
+    /// `frames_across_collecting`); until those sites get `push_roots` /
+    /// `with_roots!` / `FrameAnchor`, the spec node is folded back to the
+    /// generic `indirect` FunDecl and the call stays in the unresolved
+    /// buckets. Removing this fold and the matching remap in
+    /// `liveness.rs` goes together with bracketing those sites.
+    /// A spec that cannot collect is left in place and may drop `indirect`.
+    pub fn demote_specializations_in(&mut self, collecting: &HashSet<u64>) {
+        let mut rewrite: HashMap<u64, u64> = HashMap::new();
+        for (&(callee, _), &node) in &self.spec_memo {
+            if node != callee && collecting.contains(&node) {
+                rewrite.insert(node, callee);
+            }
+        }
+        if rewrite.is_empty() {
+            return;
+        }
+        for node in self.spec_memo.values_mut() {
+            if let Some(&generic) = rewrite.get(node) {
+                *node = generic;
+            }
+        }
+        for cs in self.callees.values_mut() {
+            let extra: Vec<u64> = cs.iter().filter_map(|c| rewrite.get(c).copied()).collect();
+            cs.retain(|c| !rewrite.contains_key(c));
+            cs.extend(extra);
+        }
+        for spec_id in rewrite.keys() {
+            self.names.remove(spec_id);
+            self.keys.remove(spec_id);
+            self.callees.remove(spec_id);
+            self.indirect.remove(spec_id);
+        }
+        self.callers.clear();
+        for (&caller, cs) in &self.callees {
+            for &c in cs {
+                self.callers.entry(c).or_default().insert(caller);
+            }
+        }
+    }
 }
 
 /// Whether a `CallKind::Trait` payload's trait reference is a `dyn` one.
@@ -327,6 +394,7 @@ pub fn trait_ref_kind(llbc: &majit_charon_reader::Llbc, tref: &serde_json::Value
 /// Both spellings of a virtual call carry the trait the same way — the
 /// `CallKind::Trait` payload and the fat pointer's `DynTrait` type — just at
 /// different depths, so one search answers for both.
+#[allow(dead_code)]
 fn first_trait_id(v: &serde_json::Value) -> Option<u64> {
     if let Some(map) = v.as_object() {
         if let Some(r) = map.get("trait_decl_ref")
@@ -705,6 +773,7 @@ impl Joined {
                 callers,
                 indirect,
                 opaque: OpaqueCensus::default(),
+                spec_memo: HashMap::new(),
             },
             canonical,
             joined_names,
@@ -876,7 +945,10 @@ fn rvalue_label(r: &majit_charon_reader::ullbc::Rvalue) -> &'static str {
 /// cleanup is outside `strip_cleanup_blocks`; every other block is in
 /// the flow graph. `forward_reachable_mask` stops at `Unknown`, so a
 /// later non-cleanup Call is still walked here.
-fn call_graph_walks_block(bb: &majit_charon_reader::ullbc::BasicBlock, forward: bool) -> bool {
+pub(crate) fn call_graph_walks_block(
+    bb: &majit_charon_reader::ullbc::BasicBlock,
+    forward: bool,
+) -> bool {
     forward || !bb.is_cleanup
 }
 
@@ -884,7 +956,7 @@ fn call_graph_walks_block(bb: &majit_charon_reader::ullbc::BasicBlock, forward: 
 /// is unavailable (`DelayedPointer`, missing `graph`, `indirect_call`
 /// with `graphs is None`). An unparsed or `Unknown` terminator is that
 /// case for this walk.
-fn call_graph_flow_is_incomplete(
+pub(crate) fn call_graph_flow_is_incomplete(
     llbc: &majit_charon_reader::Llbc,
     bb: &majit_charon_reader::ullbc::BasicBlock,
 ) -> bool {
@@ -897,159 +969,15 @@ fn call_graph_flow_is_incomplete(
 /// Build the call graph of one charon artefact.
 ///
 /// Only `Call` terminators contribute edges, and only when charon already
-/// resolved the callee to a `FunDeclId`.  Everything else — `dyn` dispatch, a
-/// function-pointer call, a trait call charon left unresolved — marks the
-/// caller in [`CallGraph::indirect`] instead of inventing an edge.
+/// resolved the callee to a `FunDeclId` — or, for a generic callee, to the
+/// specialized node its call-site `trait_refs` select (`analyze_direct_call`
+/// walking `FunctionDesc.cachedgraph`).  Everything else — `dyn` dispatch, a
+/// function-pointer call, a trait call whose clause the caller cannot
+/// resolve — marks the caller in [`CallGraph::indirect`] instead of inventing
+/// an edge. A `CallKind::Trait` on a generic body is recovered by
+/// propagating the caller's instantiation; see [`super::instantiate`].
 pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
-    use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
-
-    let mut names = HashMap::new();
-    let mut keys: HashMap<u64, String> = HashMap::new();
-    let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
-    let mut indirect = HashSet::new();
-    let mut opaque = OpaqueCensus::default();
-    let mut note_opaque = |raw: Option<&serde_json::Value>, variant: &'static str| {
-        *opaque.by_variant.entry(variant).or_insert(0) += 1;
-        match raw.and_then(first_trait_id) {
-            Some(tid) => {
-                let name = llbc
-                    .trait_by_id(tid)
-                    .map(|t| t.item_meta.name_path())
-                    .unwrap_or_else(|| format!("trait#{tid}"));
-                *opaque.dyn_trait.entry(name).or_insert(0) += 1;
-            }
-            None => opaque.fn_value += 1,
-        }
-    };
-
-    for fd in llbc.iter_local_fns() {
-        let id = fd.def_id;
-        let name = fd.item_meta.name_path();
-        // `name_path` renders an `impl` block as the opaque segment `<Impl>`,
-        // so the spelling alone does not identify the function.  The item's
-        // own source line restores what the rendering dropped: charon stamps
-        // it from the definition, so every artefact carrying the item — the
-        // one holding the body and the ones holding only a declaration —
-        // stamps the same line, while two items collapsing onto one spelling
-        // are written at two different lines.
-        let key = if name.contains('<') {
-            format!(
-                "{name}@{}",
-                llbc.span_data(&fd.item_meta.span)
-                    .expect("item span missing from the artefact")
-                    .beg
-                    .line
-            )
-        } else {
-            name.clone()
-        };
-        keys.insert(id, key);
-        names.insert(id, name);
-        let entry = callees.entry(id).or_default();
-        let Some(body) = fd.unstructured() else {
-            continue;
-        };
-        // A Call that lives only on an `on_unwind` cleanup chain is not a
-        // call-graph edge: the flow graph never carries that edge, so
-        // `strip_cleanup_blocks` dropped the block. `forward_reachable_mask`
-        // stops at `Unknown`; a later non-cleanup Call is still an edge,
-        // and that Unknown is `GraphAnalyzer.analyze` `top_result`.
-        let forward = crate::front::mir::forward_reachable_mask(llbc, &body);
-        let mut incomplete = false;
-        for (bb_idx, bb) in body.body.iter().enumerate() {
-            if !call_graph_walks_block(bb, forward[bb_idx]) {
-                continue;
-            }
-            if forward[bb_idx] && call_graph_flow_is_incomplete(llbc, bb) {
-                incomplete = true;
-            }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
-                continue;
-            };
-            match &call.func {
-                CallFunc::Regular(reg) => match &reg.kind {
-                    CallKind::Fun(FunId::Regular { id: callee }) => {
-                        entry.insert(*callee);
-                    }
-                    CallKind::Fun(FunId::Other(v)) => {
-                        indirect.insert(id);
-                        note_opaque(Some(v), "Fun(Other)");
-                    }
-                    CallKind::Trait(v) => {
-                        // `[trait_ref, method_index, fun_decl_id]`.  The third
-                        // element is the **trait's method declaration**, not
-                        // the impl that will run: measured over this artefact,
-                        // 382 of 541 have no body at all, and every trait ref
-                        // is a generic `Clause` / `ParentClause` rather than a
-                        // `TraitImpl`, so the impl is not recoverable here
-                        // without propagating the caller's instantiation.
-                        // Turning this into an edge therefore buys false
-                        // confidence — it retires the caller's undecidability
-                        // by pointing it at a bodyless leaf.
-                        //
-                        // A default body is still real code the call may run,
-                        // so it is added as an edge, which can only widen
-                        // "reaches a collection".  The caller stays opaque
-                        // either way, because an overriding impl is invisible
-                        // from here.
-                        if let Some(c) = v.get(2).and_then(|x| x.as_u64())
-                            && llbc.fn_by_id(c).and_then(|f| f.unstructured()).is_some()
-                        {
-                            entry.insert(c);
-                        }
-                        indirect.insert(id);
-                        note_opaque(Some(v), "Trait");
-                    }
-                    CallKind::Ptr(v) => {
-                        indirect.insert(id);
-                        note_opaque(Some(v), "Ptr");
-                    }
-                    CallKind::Unknown => {
-                        indirect.insert(id);
-                        opaque.unknown += 1;
-                    }
-                },
-                CallFunc::Dynamic(op, _) => {
-                    indirect.insert(id);
-                    // A fat pointer's type is as often a dedup id as an inline
-                    // body; resolving it is what keeps `dyn Trait` out of the
-                    // function-pointer bucket.
-                    let ty = match op {
-                        majit_charon_reader::ullbc::Operand::Copy(p)
-                        | majit_charon_reader::ullbc::Operand::Move(p) => match &p.ty {
-                            majit_charon_reader::ullbc::TyRef::Inline { value: (_, v) } => Some(v),
-                            majit_charon_reader::ullbc::TyRef::Dedup { id } => llbc.dedup_body(*id),
-                            majit_charon_reader::ullbc::TyRef::Other(v) => Some(v),
-                        },
-                        majit_charon_reader::ullbc::Operand::Const(v) => Some(v),
-                    };
-                    note_opaque(ty, "Dynamic");
-                }
-                CallFunc::Unknown => {
-                    indirect.insert(id);
-                    opaque.unknown += 1;
-                }
-            }
-        }
-        if incomplete {
-            indirect.insert(id);
-        }
-    }
-    for (&caller, cs) in &callees {
-        for &c in cs {
-            callers.entry(c).or_default().insert(caller);
-        }
-    }
-    drop(note_opaque);
-    CallGraph {
-        names,
-        keys,
-        callees,
-        callers,
-        indirect,
-        opaque,
-    }
+    super::instantiate::build_call_graph(llbc)
 }
 
 #[cfg(test)]
@@ -1279,6 +1207,7 @@ mod tests {
             callers,
             indirect: HashSet::new(),
             opaque: OpaqueCensus::default(),
+            spec_memo: HashMap::new(),
         }
     }
 
@@ -1476,11 +1405,12 @@ mod tests {
     }
 
     /// Regular and trait-default callees of every Call terminator in `body`.
-    /// The oracle iterates every block, matching `build` before cleanup
-    /// blocks were kept.
+    /// Regular Fun ids go through the same helper `build` uses, so a
+    /// specialized instantiation is the node the oracle names.
     fn all_block_callees(
         llbc: &majit_charon_reader::Llbc,
         body: &majit_charon_reader::ullbc::Unstructured,
+        cg: &CallGraph,
     ) -> HashSet<u64> {
         use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
         let mut entry = HashSet::new();
@@ -1491,7 +1421,7 @@ mod tests {
             match &call.func {
                 CallFunc::Regular(reg) => match &reg.kind {
                     CallKind::Fun(FunId::Regular { id }) => {
-                        entry.insert(*id);
+                        entry.insert(cg.callee_node(llbc, &[], *id, &reg.generics));
                     }
                     CallKind::Trait(v) => {
                         if let Some(c) = v.get(2).and_then(|x| x.as_u64())
@@ -1527,7 +1457,7 @@ mod tests {
         let stripped = strip_cleanup_blocks(fd.unstructured().expect("Unstructured body"));
         assert_eq!(
             holder,
-            &all_block_callees(&llbc, &stripped),
+            &all_block_callees(&llbc, &stripped, &cg),
             "retained-body edges must equal strip_cleanup_blocks"
         );
     }
@@ -1547,7 +1477,7 @@ mod tests {
             };
             let stripped = strip_cleanup_blocks(body);
             let got = cg.callees.get(&fd.def_id).cloned().unwrap_or_default();
-            let want = all_block_callees(&llbc, &stripped);
+            let want = all_block_callees(&llbc, &stripped, &cg);
             assert_eq!(
                 got,
                 want,
@@ -1643,6 +1573,257 @@ mod tests {
         assert!(
             cg.indirect.contains(&0),
             "Unknown terminator is GraphAnalyzer.analyze top_result"
+        );
+    }
+
+    /// Generic `mk` with a `Clause`-bound Trait call, plus a concrete
+    /// `TraitImpl` caller and an unresolved-clause caller.
+    fn llbc_clause_trait_instantiation() -> majit_charon_reader::Llbc {
+        let span = serde_json::json!({
+            "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+        });
+        let scalar = serde_json::json!({"Value": [1, {"Scalar": "Bool"}]});
+        let empty_g = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let place = |id: u64| serde_json::json!({"kind": {"Local": id}, "ty": scalar});
+        let local = |id: u64| {
+            serde_json::json!({
+                "index": id, "name": null, "span": span.clone(), "ty": scalar.clone()
+            })
+        };
+        let unstructured = |blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Unstructured": {
+                    "span": span.clone(),
+                    "locals": {"arg_count": 0, "locals": [local(0)]},
+                    "body": blocks
+                }
+            })
+        };
+        let call_term = |func: serde_json::Value, target: u64, on_unwind: u64| {
+            serde_json::json!({
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span.clone(), "kind": {"Call": {
+                    "call": {"func": func, "args": [], "dest": place(0)},
+                    "target": target,
+                    "on_unwind": on_unwind
+                }}}
+            })
+        };
+        let ret = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "Return"}
+        });
+        let unwind = serde_json::json!({
+            "statements": [], "kind": "Regular",
+            "terminator": {"span": span.clone(), "kind": "UnwindResume"}
+        });
+        let impl_ref = serde_json::json!({
+            "kind": {"TraitImpl": {
+                "id": 0,
+                "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }
+            }}
+        });
+        let clause_ref = serde_json::json!({
+            "kind": {"Clause": {"Bound": [0, 0]}}
+        });
+        let fun =
+            |id: u64, name: &str, body: serde_json::Value, generics: Option<serde_json::Value>| {
+                let mut row = serde_json::json!({
+                    "def_id": id,
+                    "item_meta": item_meta(&["fixture", name]),
+                    "signature": {"is_unsafe": false, "inputs": [], "output": scalar.clone()},
+                    "body": body
+                });
+                if let Some(g) = generics {
+                    row.as_object_mut().unwrap().insert("generics".into(), g);
+                }
+                row
+            };
+        let mk = fun(
+            3,
+            "mk",
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Trait": [clause_ref.clone(), 0]},
+                        "generics": empty_g.clone()
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind.clone(),
+                ret.clone(),
+            ]),
+            Some(serde_json::json!({
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_clauses": [{"clause_id": 0}],
+                "regions_outlive": [],
+                "types_outlive": [],
+                "trait_type_constraints": []
+            })),
+        );
+        let closure = fun(1, "closure_body", unstructured(vec![ret.clone()]), None);
+        let use_concrete = fun(
+            0,
+            "use_concrete",
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Fun": 3},
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [impl_ref]
+                        }
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind.clone(),
+                ret.clone(),
+            ]),
+            None,
+        );
+        let use_open = fun(
+            2,
+            "use_open",
+            unstructured(vec![
+                call_term(
+                    serde_json::json!({"Regular": {
+                        "kind": {"Fun": 3},
+                        "generics": {
+                            "regions": [],
+                            "types": [],
+                            "const_generics": [],
+                            "trait_refs": [clause_ref]
+                        }
+                    }}),
+                    2,
+                    1,
+                ),
+                unwind,
+                ret,
+            ]),
+            None,
+        );
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [use_concrete, closure, use_open, mk],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["fixture", "Apply"])
+                }],
+                "trait_impls": [{
+                    "def_id": 0,
+                    "methods": [{
+                        "kind": {"TraitMethod": [0, 0]},
+                        "skip_binder": {"id": 1}
+                    }],
+                    "impl_trait": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    },
+                    "implied_trait_refs": []
+                }]
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("clause-trait fixture parses")
+    }
+
+    /// A generic fn with a `Clause`-bound Trait call, called with a concrete
+    /// closure impl, yields a non-indirect specialized node with an edge to
+    /// the closure body.
+    #[test]
+    fn concrete_trait_impl_specializes_clause_trait_call() {
+        let llbc = llbc_clause_trait_instantiation();
+        let cg = build(&llbc);
+        assert!(
+            cg.indirect.contains(&3),
+            "the generic template stays indirect: {:?}",
+            cg.indirect
+        );
+        let concrete = llbc.fn_by_id(0).expect("use_concrete");
+        let body = concrete.unstructured().expect("body");
+        let (callee, generics) = {
+            use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
+            let TermKind::Call { call, .. } = body.body[0].term(&llbc).expect("call") else {
+                panic!("expected Call");
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                panic!("expected Regular");
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                panic!("expected Fun Regular");
+            };
+            (*id, reg.generics.clone())
+        };
+        let spec = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_ne!(spec, 3, "concrete call must name a specialized node");
+        assert!(
+            !cg.indirect.contains(&spec),
+            "specialized node must not be indirect"
+        );
+        let spec_callees = cg.callees.get(&spec).expect("spec node callees");
+        assert!(
+            spec_callees.contains(&1),
+            "spec node must edge to the closure body, callees={spec_callees:?}"
+        );
+        let caller_callees = cg.callees.get(&0).expect("use_concrete callees");
+        assert!(
+            caller_callees.contains(&spec),
+            "concrete caller must edge to the spec node, callees={caller_callees:?}"
+        );
+        assert!(
+            !caller_callees.contains(&3),
+            "concrete caller must not keep the generic edge, callees={caller_callees:?}"
+        );
+    }
+
+    /// The same generic, called through an unresolved clause, keeps the
+    /// generic node and that node stays indirect.
+    #[test]
+    fn unresolved_clause_keeps_generic_indirect() {
+        let llbc = llbc_clause_trait_instantiation();
+        let cg = build(&llbc);
+        assert!(cg.indirect.contains(&3), "generic mk stays indirect");
+        let open = llbc.fn_by_id(2).expect("use_open");
+        let body = open.unstructured().expect("body");
+        let (callee, generics) = {
+            use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
+            let TermKind::Call { call, .. } = body.body[0].term(&llbc).expect("call") else {
+                panic!("expected Call");
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                panic!("expected Regular");
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                panic!("expected Fun Regular");
+            };
+            (*id, reg.generics.clone())
+        };
+        let node = cg.callee_node(&llbc, &[], callee, &generics);
+        assert_eq!(node, 3, "unresolved clause must keep the generic node");
+        let open_callees = cg.callees.get(&2).expect("use_open callees");
+        assert!(
+            open_callees.contains(&3),
+            "unresolved caller must edge to the generic node, callees={open_callees:?}"
         );
     }
 }

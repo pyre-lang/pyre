@@ -23,6 +23,7 @@
 //! cover their respective execution paths without a source-level colouring
 //! approximation.
 pub mod framework;
+pub(crate) mod instantiate;
 pub mod liveness;
 pub mod shadowcolor;
 pub mod shadowstack;
