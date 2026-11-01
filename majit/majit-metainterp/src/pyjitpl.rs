@@ -3690,6 +3690,15 @@ impl<M: Clone> MetaInterp<M> {
             for gb in &mut mp.green_boxes {
                 gb.opref.trace_const_ptr(&mut visitor);
             }
+            // `RefFrontendOp._resref` of
+            // `original_boxes[index_of_virtualizable]`, kept alive and
+            // forwarded while this merge point is reachable. `compile.py`
+            // `send_loop_to_backend` reads it with `getref_base()`.
+            if mp.vable_ptr != 0 {
+                let mut gcref = GcRef(mp.vable_ptr);
+                visitor(&mut gcref);
+                mp.vable_ptr = gcref.0;
+            }
         }
         if let Some(reds) = trace_ctx.live_portal_reds.as_ref() {
             for (op, ty) in reds {
@@ -29698,6 +29707,40 @@ mod tests {
         assert_eq!(
             ops[0].arg(0).to_opref().as_const_ptr(),
             Some(GcRef(0x92_0000_B000))
+        );
+    }
+
+    #[test]
+    fn walk_active_trace_refs_forwards_merge_point_vable_ptr() {
+        // `MergePoint.vable_ptr` is the concrete
+        // `original_boxes[index_of_virtualizable]` word. A minor while the
+        // merge point is reachable writes the forwarded address back.
+        const A: usize = 0xA000;
+        const B: usize = 0xB000;
+        let mut meta = MetaInterp::<()>::new(0);
+        let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
+        let position = trace_ctx.get_trace_position();
+        trace_ctx
+            .current_merge_points
+            .push(crate::trace_ctx::MergePoint {
+                green_key: gk(0).get_uhash(),
+                green_key_typed: gk(0),
+                position,
+                green_boxes: Vec::new(),
+                header_pc: 0,
+                vable_ptr: A,
+            });
+        meta.tracing = Some(trace_ctx);
+
+        meta.walk_active_trace_refs(|slot| {
+            if slot.0 == A {
+                slot.0 = B;
+            }
+        });
+
+        assert_eq!(
+            meta.tracing.as_ref().unwrap().current_merge_points[0].vable_ptr,
+            B
         );
     }
 

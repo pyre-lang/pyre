@@ -4,6 +4,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{Const, EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
+use crate::optimizeopt::optimizer::Optimizer;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 pub use crate::optimizeopt::info::{
@@ -41,6 +42,20 @@ pub struct StrOrUnicode {
 /// from `first_optimization` via `send_extra_operation` (vstring.py), so
 /// OptIntBounds — a pass BEFORE OptString — computes the result bound.
 pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand {
+    _int_add_with(&mut None, box1, box2, ctx)
+}
+
+/// `vstring.py` `_int_add`: `optstring.optimizer.send_extra_operation(op)`
+/// from `first_optimization`, so OptIntBounds (before OptString) bounds the
+/// add before NEWSTR. Not keyed off `force_direct`: a child string forced
+/// through `Optimizer.force_box` still reenters from pass 0. During
+/// `in_final_emission`, `send_extra_operation_rc` appends directly.
+pub(crate) fn _int_add_with(
+    optimizer: &mut Option<&mut Optimizer>,
+    box1: &Operand,
+    box2: &Operand,
+    ctx: &mut OptContext,
+) -> Operand {
     if let Some(v1) = ctx
         .resolve_operand_operand_opt(box1)
         .and_then(|cb| cb.const_int())
@@ -65,7 +80,17 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
     let arg2 = ctx.resolve_operand_operand(box2);
     let op = majit_ir::OpRc::new(Op::new(OpCode::IntAdd, &[arg1, arg2]));
     // vstring.py:380 optstring.optimizer.send_extra_operation(op).
-    ctx.send_extra_operation_rc(op.clone());
+    if ctx.in_final_emission || optimizer.is_none() {
+        ctx.send_extra_operation_rc(op.clone());
+    } else if let Some(opt) = optimizer.as_deref_mut() {
+        ctx.assign_extra_pos(&op);
+        let saved = ctx.current_pass_idx;
+        let result = opt.send_extra_operation(&op, ctx);
+        ctx.current_pass_idx = saved;
+        if let Err(crate::optimize::InvalidLoop(reason)) = result {
+            ctx.signal_invalid_loop(reason);
+        }
+    }
     Operand::from_bound_op(&op)
 }
 
@@ -79,6 +104,38 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
     reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
 )]
 pub fn copy_str_content(
+    ctx: &mut OptContext,
+    srcbox: &Operand,
+    targetbox: &Operand,
+    srcoffsetbox: &Operand,
+    offsetbox: &Operand,
+    lengthbox: &Operand,
+    mode: u8,
+    need_next_offset: bool,
+) -> Option<Operand> {
+    copy_str_content_with(
+        &mut None,
+        ctx,
+        srcbox,
+        targetbox,
+        srcoffsetbox,
+        offsetbox,
+        lengthbox,
+        mode,
+        need_next_offset,
+    )
+}
+
+/// `vstring.py` `copy_str_content`: STRGETITEM / STRSETITEM / COPYSTRCONTENT
+/// go through `optstring.emit_extra`. On the force path `opt` is the owning
+/// optimizer and `emit_for_force_with` walks immediately; otherwise the ops
+/// stay queued.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
+)]
+pub(crate) fn copy_str_content_with(
+    opt: &mut Option<&mut Optimizer>,
     ctx: &mut OptContext,
     srcbox: &Operand,
     targetbox: &Operand,
@@ -139,8 +196,8 @@ pub fn copy_str_content(
                 // instance routes the read through the shared strgetitem
                 // (make_nonnull_str, slice rebase, concat recursion, virtual /
                 // ConstPtr fold, residual) instead of reimplementing it here.
-                let charbox = OptString.strgetitem_emit_box(&srcbox, &src_offset, mode, ctx);
-                src_offset = _int_add(&src_offset, &one, ctx);
+                let charbox = OptString.strgetitem_emit_box(opt, &srcbox, &src_offset, mode, ctx);
+                src_offset = _int_add_with(opt, &src_offset, &one, ctx);
                 let arg_target = ctx.resolve_operand_operand(targetbox);
                 let arg_dst_off = ctx.resolve_operand_operand(&dst_offset);
                 let arg_char = ctx.resolve_operand_operand(&charbox);
@@ -148,8 +205,8 @@ pub fn copy_str_content(
                     set_opcode,
                     &[arg_target.clone(), arg_dst_off.clone(), arg_char.clone()],
                 );
-                ctx.emit_for_force(setitem_op);
-                dst_offset = _int_add(&dst_offset, &one, ctx);
+                ctx.emit_for_force_with(opt, setitem_op);
+                dst_offset = _int_add_with(opt, &dst_offset, &one, ctx);
             }
             // vstring.py:369: the inline path returns the incremented
             // offsetbox unconditionally (need_next_offset only gates the
@@ -162,7 +219,7 @@ pub fn copy_str_content(
     // vstring.py: nextoffsetbox = _int_add(...) if need_next_offset
     // else None — the caller that passes need_next_offset=False discards it.
     let next_offset = if need_next_offset {
-        Some(_int_add(offsetbox, lengthbox, ctx))
+        Some(_int_add_with(opt, offsetbox, lengthbox, ctx))
     } else {
         None
     };
@@ -181,7 +238,7 @@ pub fn copy_str_content(
             arg_len.clone(),
         ],
     );
-    ctx.emit_for_force(copy_op);
+    ctx.emit_for_force_with(opt, copy_op);
     next_offset
 }
 
@@ -193,6 +250,20 @@ pub fn copy_str_content(
 /// This is the Rust equivalent of RPython's per-subclass
 /// `string_copy_parts` / `initialize_forced_string` polymorphic dispatch.
 pub fn string_copy_parts(
+    opref: &Operand,
+    targetbox: &Operand,
+    offsetbox: &Operand,
+    mode: u8,
+    ctx: &mut OptContext,
+) -> Operand {
+    string_copy_parts_with(&mut None, opref, targetbox, offsetbox, mode, ctx)
+}
+
+/// `vstring.py` `string_copy_parts` / `initialize_forced_string`. `opt` is the
+/// owning optimizer on the `force_box` path so STRSETITEM, STRLEN and the
+/// nested `force_box` use `emit_extra` immediately.
+pub(crate) fn string_copy_parts_with(
+    opt: &mut Option<&mut Optimizer>,
     opref: &Operand,
     targetbox: &Operand,
     offsetbox: &Operand,
@@ -257,31 +328,33 @@ pub fn string_copy_parts(
                         set_opcode,
                         &[arg_target.clone(), arg_offset.clone(), arg_char.clone()],
                     );
-                    ctx.emit_for_force(setitem_op);
+                    ctx.emit_for_force_with(opt, setitem_op);
                 }
-                offset = _int_add(&offset, &one, ctx);
+                offset = _int_add_with(opt, &offset, &one, ctx);
             }
             offset
         }
         Action::Slice { s, start, lgtop } => {
             // vstring.py VStringSliceInfo.string_copy_parts
-            copy_str_content(ctx, &s, targetbox, &start, offsetbox, &lgtop, mode, true)
-                .expect("need_next_offset=true always returns the offset")
+            copy_str_content_with(
+                opt, ctx, &s, targetbox, &start, offsetbox, &lgtop, mode, true,
+            )
+            .expect("need_next_offset=true always returns the offset")
         }
         Action::Concat { vleft, vright } => {
             // vstring.py VStringConcatInfo.string_copy_parts
-            let offset = string_copy_parts(&vleft, targetbox, offsetbox, mode, ctx);
-            string_copy_parts(&vright, targetbox, &offset, mode, ctx)
+            let offset = string_copy_parts_with(opt, &vleft, targetbox, offsetbox, mode, ctx);
+            string_copy_parts_with(opt, &vright, targetbox, &offset, mode, ctx)
         }
         Action::NonVirtual => {
             // vstring.py StrPtrInfo.string_copy_parts (base class)
             // lengthbox = self.getstrlen(op, optstring, mode)
-            // srcbox = self.force_box(op, optstring)  -- no-op for non-virtual
-            let lengthbox = ctx.getstrlen_opref(opref.to_opref(), mode);
-            let srcbox = force_child_for_string(opref, ctx);
+            // srcbox = self.force_box(op, optstring)
+            let lengthbox = ctx.getstrlen_opref_with(opt, opref.to_opref(), mode);
+            let srcbox = force_child_for_string_with(opt, opref, ctx);
             let zero = Operand::const_(Const::Int(0));
-            copy_str_content(
-                ctx, &srcbox, targetbox, &zero, offsetbox, &lengthbox, mode, true,
+            copy_str_content_with(
+                opt, ctx, &srcbox, targetbox, &zero, offsetbox, &lengthbox, mode, true,
             )
             .expect("need_next_offset=true always returns the offset")
         }
@@ -289,8 +362,14 @@ pub fn string_copy_parts(
 }
 
 /// Force a string-typed OpRef if it's virtual. Used by string_copy_parts
-/// base class path (vstring.py: srcbox = self.force_box(op, optstring)).
-fn force_child_for_string(opref: &Operand, ctx: &mut OptContext) -> Operand {
+/// base class path (`vstring.py` `srcbox = self.force_box(op, optstring)`).
+/// `optforce` is the string pass's emitter, so this calls `force_box_impl`
+/// (FromPass `emit_extra`) and does not set `force_direct`.
+fn force_child_for_string_with(
+    optimizer: &mut Option<&mut Optimizer>,
+    opref: &Operand,
+    ctx: &mut OptContext,
+) -> Operand {
     // One chain walk; the position view falls back to the source.
     let resolved_box = ctx.resolve_operand_operand_opt(opref);
     let resolved = resolved_box
@@ -299,7 +378,11 @@ fn force_child_for_string(opref: &Operand, ctx: &mut OptContext) -> Operand {
     if resolved_box.as_ref().is_some_and(|b| ctx.is_virtual(b)) {
         let resolved_box = resolved_box.expect("recorder-populated");
         let mut info = ctx.take_ptr_info(&resolved_box).unwrap();
-        let forced = info.force_box(&resolved_box, ctx);
+        let forced = if let Some(opt) = optimizer.as_deref_mut() {
+            crate::optimizeopt::info::force_box_impl(&mut info, &resolved_box, ctx, opt)
+        } else {
+            info.force_box(&resolved_box, ctx)
+        };
         return ctx.resolve_operand_operand(&forced);
     }
     resolved
@@ -385,12 +468,24 @@ impl OptString {
         }
     }
 
-    /// vstring.py StrPtrInfo.force_box — delegate to PtrInfo::force_box.
-    fn force_box(&mut self, op: &Operand, ctx: &mut OptContext) -> Operand {
+    /// vstring.py `StrPtrInfo.force_box` — `force_box_impl` when the owning
+    /// optimizer is present (`optforce.optimizer`), so `emit_extra` runs
+    /// immediately. Does not call `Optimizer::force_box`: that would pop
+    /// `potential_extra_ops` a second time. No optimizer keeps the queue.
+    fn force_box(
+        &mut self,
+        opt: &mut Option<&mut Optimizer>,
+        op: &Operand,
+        ctx: &mut OptContext,
+    ) -> Operand {
         match ctx.resolve_operand_operand_opt(op) {
             Some(resolved) if ctx.is_virtual(&resolved) => {
                 let mut info = ctx.take_ptr_info(&resolved).unwrap();
-                let forced = info.force_box(&resolved, ctx);
+                let forced = if let Some(optimizer) = opt.as_deref_mut() {
+                    crate::optimizeopt::info::force_box_impl(&mut info, &resolved, ctx, optimizer)
+                } else {
+                    info.force_box(&resolved, ctx)
+                };
                 ctx.resolve_operand_operand(&forced)
             }
             Some(resolved) => resolved,
@@ -494,7 +589,14 @@ impl OptString {
     /// string-compare and inline-copy callers. Resolves a virtual/constant char
     /// via `strgetitem`, otherwise emits a residual STRGETITEM. Always returns a
     /// box, matching `strgetitem(None, ...)`.
-    fn strgetitem_emit(&self, s: &Operand, index: i64, mode: u8, ctx: &mut OptContext) -> Operand {
+    fn strgetitem_emit(
+        &self,
+        opt: &mut Option<&mut Optimizer>,
+        s: &Operand,
+        index: i64,
+        mode: u8,
+        ctx: &mut OptContext,
+    ) -> Operand {
         if let Some(r) = self.strgetitem(s, index, mode, ctx) {
             return r;
         }
@@ -506,7 +608,7 @@ impl OptString {
         let resolved_s = ctx.resolve_operand_operand(s);
         let index_const_box = Operand::const_(Const::Int(index));
         let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
-            let index_box = _int_add(&slice.start, &index_const_box, ctx);
+            let index_box = _int_add_with(opt, &slice.start, &index_const_box, ctx);
             (ctx.resolve_operand_operand(&slice.s), index_box)
         } else {
             (resolved_s, index_const_box)
@@ -527,16 +629,16 @@ impl OptString {
             // including a variable whose IntBound merely happens to be
             // constant — is not `isinstance(len1box, ConstInt)`, so it falls
             // through to the residual STRGETITEM on the whole concat.
-            let len1box = ctx.getstrlen_opref(concat.vleft.to_opref(), mode);
+            let len1box = ctx.getstrlen_opref_with(opt, concat.vleft.to_opref(), mode);
             if let Some(len1) = len1box.const_int() {
                 return if idx < len1 {
-                    self.strgetitem_emit(&concat.vleft, idx, mode, ctx)
+                    self.strgetitem_emit(opt, &concat.vleft, idx, mode, ctx)
                 } else {
-                    self.strgetitem_emit(&concat.vright, idx - len1, mode, ctx)
+                    self.strgetitem_emit(opt, &concat.vright, idx - len1, mode, ctx)
                 };
             }
         }
-        self._strgetitem(&strbox, &index_box, mode, ctx)
+        self._strgetitem(opt, &strbox, &index_box, mode, ctx)
     }
 
     /// vstring.py _strgetitem residual emission — `strgetitem` already
@@ -545,6 +647,7 @@ impl OptString {
     /// it through `emit_extra` to the downstream passes.
     fn _strgetitem(
         &self,
+        opt: &mut Option<&mut Optimizer>,
         strbox: &Operand,
         index_box: &Operand,
         mode: u8,
@@ -563,7 +666,8 @@ impl OptString {
         // the previous emit_extra(current_pass_idx) for the pass-time
         // string-compare / dispatcher callers.
         let getop = OpRc::new(Op::new(get_opcode, &[arg_str.clone(), arg_index.clone()]));
-        ctx.emit_for_force_rc(getop.clone());
+        // vstring.py `_strgetitem`: `optstring.emit_extra(resbox)`.
+        ctx.emit_for_force_rc_with(opt, getop.clone());
         Operand::from_bound_op(&getop)
     }
 
@@ -576,6 +680,7 @@ impl OptString {
     /// skipped).
     fn strgetitem_emit_box(
         &self,
+        opt: &mut Option<&mut Optimizer>,
         s: &Operand,
         index: &Operand,
         mode: u8,
@@ -585,18 +690,18 @@ impl OptString {
             .resolve_operand_operand_opt(index)
             .and_then(|b| ctx.get_constant_int_box(&b))
         {
-            return self.strgetitem_emit(s, idx, mode, ctx);
+            return self.strgetitem_emit(opt, s, idx, mode, ctx);
         }
         // vstring.py:487: make_nonnull_str(s, mode)
         let resolved_s = ctx.resolve_operand_operand(s);
         ctx.make_nonnull_str(&resolved_s, mode);
         let (strbox, index_box) = if let Some(slice) = self.get_slice_info(&resolved_s, ctx) {
-            let new_index = _int_add(&slice.start, index, ctx);
+            let new_index = _int_add_with(opt, &slice.start, index, ctx);
             (ctx.resolve_operand_operand(&slice.s), new_index)
         } else {
             (resolved_s, index.clone())
         };
-        self._strgetitem(&strbox, &index_box, mode, ctx)
+        self._strgetitem(opt, &strbox, &index_box, mode, ctx)
     }
 
     /// Get the known length of a virtual string as a constant, if available.
@@ -664,7 +769,12 @@ impl OptString {
     }
 
     /// Handle STRSETITEM: if target is virtual Plain and index is constant, track.
-    fn optimize_strsetitem(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_strsetitem(
+        &mut self,
+        op: &Op,
+        opt: &mut Option<&mut Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let str_ref = ctx.resolve_operand_operand(&op.arg(0));
 
         if let Some(idx) = ctx
@@ -689,7 +799,7 @@ impl OptString {
             }
         }
         // Not virtual or index not constant -> force and emit.
-        self.force_if_virtual(&str_ref, ctx);
+        self.force_if_virtual(opt, &str_ref, ctx);
         OptimizationResult::PassOn
     }
 
@@ -699,6 +809,7 @@ impl OptString {
         op: &Op,
         op_rc: &majit_ir::OpRc,
         mode: u8,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let str_ref = ctx.resolve_operand_operand(&op.arg(0));
@@ -743,7 +854,7 @@ impl OptString {
             return OptimizationResult::Replace(getitem);
         }
         // Plain / non-virtual: keep the op and force the string.
-        self.force_if_virtual(&str_ref, ctx);
+        self.force_if_virtual(opt, &str_ref, ctx);
         OptimizationResult::PassOn
     }
 
@@ -885,7 +996,8 @@ impl OptString {
             for index in 0..length {
                 // vstring.py: vresult = self.strgetitem(None, ...) —
                 // const-folds a virtual/constant char or emits a STRGETITEM.
-                let ch_ref = self.strgetitem_emit(&src_ref_box, src_start + index, mode, ctx);
+                let ch_ref =
+                    self.strgetitem_emit(&mut None, &src_ref_box, src_start + index, mode, ctx);
                 let char_box = ctx.resolve_operand_operand(&ch_ref);
                 if dst_virtual {
                     dst_chars.push(Some(char_box));
@@ -930,9 +1042,14 @@ impl OptString {
     }
 
     /// Force a string if it is virtual.
-    fn force_if_virtual(&mut self, op: &Operand, ctx: &mut OptContext) {
+    fn force_if_virtual(
+        &mut self,
+        opt: &mut Option<&mut Optimizer>,
+        op: &Operand,
+        ctx: &mut OptContext,
+    ) {
         if self.is_virtual(op, ctx) {
-            self.force_box(op, ctx);
+            self.force_box(opt, op, ctx);
         }
     }
 
@@ -990,7 +1107,12 @@ impl OptString {
         }
     }
 
-    fn force_args_if_virtual(&mut self, op: &Op, ctx: &mut OptContext) {
+    fn force_args_if_virtual(
+        &mut self,
+        opt: &mut Option<&mut Optimizer>,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) {
         // earlyforce.py exempt set: SETFIELD_GC, SETARRAYITEM_GC, SAME_AS_*,
         // QUASIIMMUT_FIELD, raw_free do NOT force their args (the value of a
         // store can stay virtual). OptString is not RPython's forcing pass —
@@ -1014,7 +1136,7 @@ impl OptString {
             .collect();
         for arg_op in args {
             if self.is_virtual(&arg_op, ctx) {
-                self.force_box(&arg_op, ctx);
+                self.force_box(opt, &arg_op, ctx);
             }
         }
     }
@@ -1028,28 +1150,37 @@ impl OptString {
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ei: &EffectInfo,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match ei.oopspecindex {
             OopSpecIndex::StrConcat => {
-                self.opt_call_stroruni_str_concat(op, op_rc, mode_string, ctx)
+                self.opt_call_stroruni_str_concat(op, op_rc, mode_string, opt, ctx)
             }
-            OopSpecIndex::StrSlice => self.opt_call_stroruni_str_slice(op, op_rc, mode_string, ctx),
-            OopSpecIndex::StrEqual => self.opt_call_stroruni_str_equal(op, op_rc, mode_string, ctx),
-            OopSpecIndex::StrCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_string, ctx),
+            OopSpecIndex::StrSlice => {
+                self.opt_call_stroruni_str_slice(op, op_rc, mode_string, opt, ctx)
+            }
+            OopSpecIndex::StrEqual => {
+                self.opt_call_stroruni_str_equal(op, op_rc, mode_string, opt, ctx)
+            }
+            OopSpecIndex::StrCmp => {
+                self.opt_call_stroruni_str_cmp(op, op_rc, mode_string, opt, ctx)
+            }
             OopSpecIndex::UniConcat => {
-                self.opt_call_stroruni_str_concat(op, op_rc, mode_unicode, ctx)
+                self.opt_call_stroruni_str_concat(op, op_rc, mode_unicode, opt, ctx)
             }
             OopSpecIndex::UniSlice => {
-                self.opt_call_stroruni_str_slice(op, op_rc, mode_unicode, ctx)
+                self.opt_call_stroruni_str_slice(op, op_rc, mode_unicode, opt, ctx)
             }
             OopSpecIndex::UniEqual => {
-                self.opt_call_stroruni_str_equal(op, op_rc, mode_unicode, ctx)
+                self.opt_call_stroruni_str_equal(op, op_rc, mode_unicode, opt, ctx)
             }
-            OopSpecIndex::UniCmp => self.opt_call_stroruni_str_cmp(op, op_rc, mode_unicode, ctx),
-            OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, op_rc, ctx),
+            OopSpecIndex::UniCmp => {
+                self.opt_call_stroruni_str_cmp(op, op_rc, mode_unicode, opt, ctx)
+            }
+            OopSpecIndex::ShrinkArray => self.opt_call_shrink_array(op, op_rc, opt, ctx),
             _ => {
-                self.force_args_if_virtual(op, ctx);
+                self.force_args_if_virtual(opt, op, ctx);
                 OptimizationResult::PassOn
             }
         }
@@ -1061,6 +1192,7 @@ impl OptString {
         op: &Op,
         op_rc: &majit_ir::OpRc,
         mode: u8,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
@@ -1089,7 +1221,7 @@ impl OptString {
             );
             return OptimizationResult::Remove;
         }
-        self.force_args_if_virtual(op, ctx);
+        self.force_args_if_virtual(opt, op, ctx);
         OptimizationResult::PassOn
     }
 
@@ -1099,6 +1231,7 @@ impl OptString {
         op: &Op,
         op_rc: &majit_ir::OpRc,
         mode: u8,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 4 {
@@ -1136,7 +1269,7 @@ impl OptString {
             );
             return OptimizationResult::Remove;
         }
-        self.force_args_if_virtual(op, ctx);
+        self.force_args_if_virtual(opt, op, ctx);
         OptimizationResult::PassOn
     }
 
@@ -1146,10 +1279,11 @@ impl OptString {
         op: &Op,
         op_rc: &majit_ir::OpRc,
         mode: u8,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() < 3 {
-            self.force_args_if_virtual(op, ctx);
+            self.force_args_if_virtual(opt, op, ctx);
             return OptimizationResult::PassOn;
         }
         // vstring.py:693-696
@@ -1218,7 +1352,7 @@ impl OptString {
                 return result;
             }
         }
-        self.force_args_if_virtual(op, ctx);
+        self.force_args_if_virtual(opt, op, ctx);
         OptimizationResult::PassOn
     }
 
@@ -1271,8 +1405,8 @@ impl OptString {
                     // vstring.py:761-768: both length 1 → compare chars. Each
                     // strgetitem either folds a virtual/const char or emits a
                     // STRGETITEM, so both operands are always available.
-                    let arg_ch1 = self.strgetitem_emit(arg1, 0, mode, ctx);
-                    let arg_ch2 = self.strgetitem_emit(arg2, 0, mode, ctx);
+                    let arg_ch1 = self.strgetitem_emit(&mut None, arg1, 0, mode, ctx);
+                    let arg_ch2 = self.strgetitem_emit(&mut None, arg2, 0, mode, ctx);
                     let mut eq_op = Op::new(OpCode::IntEq, &[arg_ch1.clone(), arg_ch2.clone()]);
                     eq_op.pos().set(op.pos().get());
                     // vstring.py:765-767: replace_op_with(INT_EQ, [c1, c2]) then
@@ -1285,7 +1419,7 @@ impl OptString {
                     let source = info.s.clone();
                     let start = info.start.clone();
                     let length = info.lgtop.clone();
-                    let vchar = self.strgetitem_emit(arg2, 0, mode, ctx);
+                    let vchar = self.strgetitem_emit(&mut None, arg2, 0, mode, ctx);
                     return self.generate_modified_call(
                         OopSpecIndex::StreqSliceChar,
                         &[source, start, length, vchar],
@@ -1339,7 +1473,7 @@ impl OptString {
             };
             if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py: vchar = self.strgetitem(None, arg2, CONST_0, mode)
-                let vchar = self.strgetitem_emit(arg2, 0, mode, ctx);
+                let vchar = self.strgetitem_emit(&mut None, arg2, 0, mode, ctx);
                 // vstring.py:800-804
                 let oopspec = if self.is_known_nonnull(arg1, ctx) {
                     OopSpecIndex::StreqNonnullChar
@@ -1427,10 +1561,11 @@ impl OptString {
         op: &Op,
         _op_rc: &majit_ir::OpRc,
         mode: u8,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() < 3 {
-            self.force_args_if_virtual(op, ctx);
+            self.force_args_if_virtual(opt, op, ctx);
             return OptimizationResult::PassOn;
         }
         // vstring.py:819-822: bail out if either info is missing
@@ -1441,7 +1576,7 @@ impl OptString {
             .getptrinfo(&op.arg(2).get_box_replacement(false))
             .is_some();
         if !i1 || !i2 {
-            self.force_args_if_virtual(op, ctx);
+            self.force_args_if_virtual(opt, op, ctx);
             return OptimizationResult::PassOn;
         }
         // vstring.py: l1box = i1.getstrlen(arg1, self, mode)
@@ -1459,13 +1594,13 @@ impl OptString {
             // a final Emit, which would skip every subsequent pass. Mirror that
             // with a new op whose pos is the original result position
             // (replace_op_with) and a Restart result (send_extra_operation).
-            let arg_char1 = self.strgetitem_emit(&op.arg(1), 0, mode, ctx);
-            let arg_char2 = self.strgetitem_emit(&op.arg(2), 0, mode, ctx);
+            let arg_char1 = self.strgetitem_emit(&mut None, &op.arg(1), 0, mode, ctx);
+            let arg_char2 = self.strgetitem_emit(&mut None, &op.arg(2), 0, mode, ctx);
             let mut sub_op = Op::new(OpCode::IntSub, &[arg_char1.clone(), arg_char2.clone()]);
             sub_op.pos().set(op.pos().get());
             return OptimizationResult::Restart(sub_op);
         }
-        self.force_args_if_virtual(op, ctx);
+        self.force_args_if_virtual(opt, op, ctx);
         OptimizationResult::PassOn
     }
 
@@ -1506,6 +1641,7 @@ impl OptString {
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if op.num_args() >= 3 {
@@ -1540,7 +1676,7 @@ impl OptString {
                 }
             }
         }
-        self.force_args_if_virtual(op, ctx);
+        self.force_args_if_virtual(opt, op, ctx);
         OptimizationResult::PassOn
     }
 }
@@ -1551,9 +1687,23 @@ impl Default for OptString {
     }
 }
 
-impl Optimization for OptString {
-    fn propagate_forward(
+/// `vstring.py` `OptString.propagate_forward` with `self.optimizer`.
+/// `OptString` is a ZST: the boxed pass stays unborrowed and reentry from
+/// `_int_add`'s `send_extra_operation` is another stack copy.
+pub(crate) fn propagate_with_optimizer(
+    optimizer: &mut Optimizer,
+    op: &Op,
+    op_rc: &majit_ir::OpRc,
+    ctx: &mut OptContext,
+) -> OptimizationResult {
+    let mut pass = OptString;
+    pass.propagate_inner(&mut Some(optimizer), op, op_rc, ctx)
+}
+
+impl OptString {
+    fn propagate_inner(
         &mut self,
+        opt: &mut Option<&mut Optimizer>,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1563,22 +1713,22 @@ impl Optimization for OptString {
             // both dispatch to _optimize_NEWSTR(op, mode).
             OpCode::Newstr => self._optimize_newstr(op, op_rc, mode_string, ctx),
             OpCode::Newunicode => self._optimize_newstr(op, op_rc, mode_unicode, ctx),
-            OpCode::Strsetitem => self.optimize_strsetitem(op, ctx),
-            OpCode::Strgetitem => self.optimize_strgetitem(op, op_rc, mode_string, ctx),
+            OpCode::Strsetitem => self.optimize_strsetitem(op, opt, ctx),
+            OpCode::Strgetitem => self.optimize_strgetitem(op, op_rc, mode_string, opt, ctx),
             OpCode::Strlen => self.optimize_strlen(op, op_rc, ctx),
             OpCode::Copystrcontent => self.optimize_copystrcontent(op, mode_string, ctx),
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
-            OpCode::Unicodesetitem => self.optimize_strsetitem(op, ctx),
-            OpCode::Unicodegetitem => self.optimize_strgetitem(op, op_rc, mode_unicode, ctx),
+            OpCode::Unicodesetitem => self.optimize_strsetitem(op, opt, ctx),
+            OpCode::Unicodegetitem => self.optimize_strgetitem(op, op_rc, mode_unicode, opt, ctx),
             OpCode::Unicodelen => self.optimize_strlen(op, op_rc, ctx),
             OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, mode_unicode, ctx),
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {
                 let src = ctx.resolve_operand_operand(&op.arg(0));
-                self.force_if_virtual(&src, ctx);
+                self.force_if_virtual(opt, &src, ctx);
                 OptimizationResult::PassOn
             }
 
@@ -1610,19 +1760,30 @@ impl Optimization for OptString {
                 {
                     let ei = cd.get_extra_info();
                     if ei.has_oopspec() {
-                        return self.optimize_oopspec_call(op, op_rc, ei, ctx);
+                        return self.optimize_oopspec_call(op, op_rc, ei, opt, ctx);
                     }
                 }
-                self.force_args_if_virtual(op, ctx);
+                self.force_args_if_virtual(opt, op, ctx);
                 OptimizationResult::PassOn
             }
 
             _ => {
                 // For any other op, force virtual strings that appear as arguments.
-                self.force_args_if_virtual(op, ctx);
+                self.force_args_if_virtual(opt, op, ctx);
                 OptimizationResult::PassOn
             }
         }
+    }
+}
+
+impl Optimization for OptString {
+    fn propagate_forward(
+        &mut self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.propagate_inner(&mut None, op, op_rc, ctx)
     }
 
     fn name(&self) -> &'static str {
@@ -2117,7 +2278,7 @@ mod tests {
         set_vstring_slice(&mut ctx, slice_ref, src_ref, start_ref, OpRef::int_op(301));
 
         let slice_op = ctx.materialize_operand_at(slice_ref);
-        let res = pass.strgetitem_emit(&slice_op, 0, mode_string, &mut ctx);
+        let res = pass.strgetitem_emit(&mut None, &slice_op, 0, mode_string, &mut ctx);
 
         let (_pass_idx, op) = ctx
             .extra_operations_after
@@ -2156,7 +2317,7 @@ mod tests {
 
         // index 3 lands in vright at offset 3 - len(vleft) = 1.
         let concat_op = ctx.materialize_operand_at(concat_ref);
-        let res = pass.strgetitem_emit(&concat_op, 3, mode_string, &mut ctx);
+        let res = pass.strgetitem_emit(&mut None, &concat_op, 3, mode_string, &mut ctx);
 
         let (res_pos, opcode, arg0, arg1) = {
             let (_pass_idx, op) = ctx
@@ -2212,7 +2373,7 @@ mod tests {
         let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
-        let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut ctx);
+        let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut None, &mut ctx);
 
         match result {
             OptimizationResult::Replace(emitted) => {
@@ -2272,7 +2433,7 @@ mod tests {
         let op_rc = OpRc::new(getitem.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
 
-        let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut ctx);
+        let result = pass.optimize_strgetitem(&getitem, &op_rc, mode_string, &mut None, &mut ctx);
 
         match result {
             OptimizationResult::Replace(emitted) => {
