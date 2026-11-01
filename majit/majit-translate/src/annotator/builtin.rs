@@ -1721,7 +1721,11 @@ fn ptr_null_constant(
 /// requires the same `ll_ptrtype` as the function-pointer field read.
 /// An optional constant spelling is the FUNC type `lltype.nullptr` takes
 /// (`getfunctionptr`); without it the coarse empty `FuncType` is used.
-fn fn_null_constant(
+///
+/// `ann_nullptr` returns `immutablevalue(nullptr(T.const))`, so the
+/// annotation is a constant; `rbuiltin.py` `rtype_const_result` then
+/// emits that nullptr as a Constant.
+pub(crate) fn fn_null_constant(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,
@@ -1729,8 +1733,8 @@ fn fn_null_constant(
     if !kwds.is_empty() {
         return Err(AnnotatorError::new("ptr::null_fn() takes no keywords"));
     }
-    match args_s {
-        [] => Ok(super::bookkeeper::raw_fn_ptr_somevalue()),
+    let mut s = match args_s {
+        [] => super::bookkeeper::raw_fn_ptr_somevalue(),
         [Some(s_ty)] => {
             let Some(spelling) = s_ty.const_().and_then(|c| c.as_pystr()) else {
                 return Err(AnnotatorError::new(
@@ -1743,12 +1747,36 @@ fn fn_null_constant(
                         "ptr::null_fn() type argument is not a function pointer: {spelling}"
                     ))
                 },
-            )
+            )?
         }
-        _ => Err(AnnotatorError::new(
-            "ptr::null_fn() takes an optional function-pointer type argument",
-        )),
-    }
+        _ => {
+            return Err(AnnotatorError::new(
+                "ptr::null_fn() takes an optional function-pointer type argument",
+            ));
+        }
+    };
+    stamp_fn_null_const(&mut s);
+    Ok(s)
+}
+
+/// `ann_nullptr`: `immutablevalue(nullptr(T))` on the `SomePtr`.
+fn stamp_fn_null_const(s: &mut SomeValue) {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget, nullptr};
+
+    let SomeValue::Ptr(p) = s else {
+        return;
+    };
+    let PtrTarget::Func(func) = &p.ll_ptrtype.TO else {
+        return;
+    };
+    let ll = LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()));
+    let Ok(null) = nullptr(LowLevelType::Func(Box::new(func.clone()))) else {
+        return;
+    };
+    s.set_const_box(crate::flowspace::model::Constant::with_concretetype(
+        crate::flowspace::model::ConstValue::LLPtr(Box::new(null)),
+        ll,
+    ));
 }
 
 /// `classdesc.get_param('_alloc_flavor_')` (`rclass.py` `getgcflavor`).
@@ -3550,10 +3578,14 @@ mod tests {
     #[test]
     fn option_fn_null_unions_with_fn_pointer() {
         use crate::annotator::bookkeeper::raw_fn_ptr_somevalue;
-        use crate::annotator::model::unionof;
+        use crate::annotator::model::{SomeObjectTrait, unionof};
         let s_fn = raw_fn_ptr_somevalue();
         let s_null =
             fn_null_constant(&bk(), &[], &std::collections::HashMap::new()).expect("null_fn");
+        assert!(
+            s_null.is_constant(),
+            "ann_nullptr is immutablevalue, got {s_null:?}"
+        );
         let merged = unionof([&s_fn, &s_null]).expect("Option<fn> arms union");
         assert!(
             matches!(merged, SomeValue::Ptr(_)),
@@ -3576,7 +3608,7 @@ mod tests {
     #[test]
     fn typed_null_fn_unions_with_matching_fn_pointer() {
         use crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling;
-        use crate::annotator::model::{SomeValue, unionof};
+        use crate::annotator::model::{SomeObjectTrait, SomeValue, unionof};
         use crate::flowspace::model::{ConstValue, Constant};
 
         let spelling = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
@@ -3585,6 +3617,10 @@ mod tests {
         s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
         let s_null = fn_null_constant(&bk(), &[Some(s_ty)], &std::collections::HashMap::new())
             .expect("typed null_fn");
+        assert!(
+            s_null.is_constant(),
+            "typed nullptr is immutablevalue, got {s_null:?}"
+        );
         let merged =
             unionof([&s_fn, &s_null]).expect("typed None unions with Some of the same fn type");
         assert!(

@@ -4609,30 +4609,60 @@ fn rtype_ptr_null(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeR
 /// `convert_const(None)` on an `InstanceRepr`. A constant spelling
 /// argument is consumed at annotation (`fn_null_constant`); `r_result`
 /// already carries that `FuncType`.
-fn rtype_null_fn(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+///
+/// `ann_nullptr` is `immutablevalue`, so a constant annotation folds
+/// through `rbuiltin.py` `rtype_const_result`. `history.getkind` of
+/// `Ptr(FuncType)` is `'int'`; a Skip-path IntegerRepr is that bank
+/// and the Constant is Signed 0.
+fn rtype_null_fn(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
     use crate::flowspace::model::{ConstValue, Hlvalue};
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget, nullptr};
 
     hop.exception_cannot_occur()?;
+    // `ann_nullptr` is `immutablevalue`; `rtype_const_result` folds that
+    // constant when `r_result` is `Ptr(FuncType)`. A Skip-path IntegerRepr
+    // (`history.getkind` of the same pointer is `'int'`) does not
+    // `_contains_value` an `LLPtr`, so reconstruct Signed 0 below.
+    let s_result_is_constant = hop
+        .s_result
+        .borrow()
+        .as_ref()
+        .is_some_and(|s| s.is_constant());
+    if s_result_is_constant && let Ok(folded) = rtype_const_result(hop, kwds_i) {
+        return Ok(folded);
+    }
     let r_result_borrow = hop.r_result.borrow();
     let r_result = r_result_borrow
         .as_ref()
         .ok_or_else(|| TyperError::message("rtype_null_fn: r_result missing".to_string()))?;
     let ll = r_result.lowleveltype().clone();
-    let LowLevelType::Ptr(ptr) = &ll else {
-        return Err(TyperError::message(format!(
+    match &ll {
+        LowLevelType::Ptr(ptr) => {
+            let PtrTarget::Func(func) = &ptr.TO else {
+                return Err(TyperError::message(format!(
+                    "rtype_null_fn: result is not a function pointer, got {ll:?}"
+                )));
+            };
+            let null =
+                nullptr(LowLevelType::Func(Box::new(func.clone()))).map_err(TyperError::message)?;
+            Ok(Some(Hlvalue::Constant(
+                crate::flowspace::model::Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    ll,
+                ),
+            )))
+        }
+        LowLevelType::Signed | LowLevelType::Bool => Ok(Some(Hlvalue::Constant(
+            crate::flowspace::model::Constant::with_concretetype(ConstValue::Int(0), ll),
+        ))),
+        LowLevelType::Unsigned => Ok(Some(Hlvalue::Constant(
+            crate::flowspace::model::Constant::with_concretetype(ConstValue::UInt(0), ll),
+        ))),
+        _ => Err(TyperError::message(format!(
             "rtype_null_fn: result is not a pointer, got {ll:?}"
-        )));
-    };
-    let PtrTarget::Func(func) = &ptr.TO else {
-        return Err(TyperError::message(format!(
-            "rtype_null_fn: result is not a function pointer, got {ll:?}"
-        )));
-    };
-    let null = nullptr(LowLevelType::Func(Box::new(func.clone()))).map_err(TyperError::message)?;
-    Ok(Some(Hlvalue::Constant(
-        crate::flowspace::model::Constant::with_concretetype(ConstValue::LLPtr(Box::new(null)), ll),
-    )))
+        ))),
+    }
 }
 
 /// `core.ptr.null_raw` — `lltype.nullptr(T)` of a raw `Ptr` (`rptr.py`
@@ -5335,6 +5365,76 @@ mod tests {
         );
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops)
+    }
+
+    /// `ann_nullptr` `immutablevalue` folds through `rtype_const_result`
+    /// when `r_result` is `Ptr(FuncType)`.
+    #[test]
+    fn rtype_null_fn_const_result_is_null_func_ptr() {
+        use std::rc::Rc;
+
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::builtin::fn_null_constant;
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let s_result = fn_null_constant(&Rc::new(Bookkeeper::new()), &[], &HashMap::new())
+            .expect("fn_null_constant");
+        assert!(s_result.is_constant());
+        let repr = hop.rtyper.getrepr(&s_result).expect("getrepr SomePtr");
+        *hop.s_result.borrow_mut() = Some(s_result);
+        *hop.r_result.borrow_mut() = Some(repr);
+        let out = rtype_null_fn(&hop, &HashMap::new()).expect("rtype_null_fn");
+        let Some(Hlvalue::Constant(c)) = out else {
+            panic!("expected Constant, got {out:?}");
+        };
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr, got {:?}", c.value);
+        };
+        assert!(!ptr.nonzero(), "nullptr must be null");
+        let Some(LowLevelType::Ptr(ll_ptr)) = &c.concretetype else {
+            panic!("concretetype must be Ptr, got {:?}", c.concretetype);
+        };
+        assert!(
+            matches!(&ll_ptr.TO, PtrTarget::Func(_)),
+            "nullptr(FUNC), got {:?}",
+            ll_ptr.TO
+        );
+    }
+
+    /// Skip-path IntegerRepr (`history.getkind` of `Ptr(FuncType)` is
+    /// `'int'`): the Constant is Signed 0.
+    #[test]
+    fn rtype_null_fn_integer_repr_is_signed_zero() {
+        use std::rc::Rc;
+
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::builtin::fn_null_constant;
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let s_result = fn_null_constant(&Rc::new(Bookkeeper::new()), &[], &HashMap::new())
+            .expect("fn_null_constant");
+        *hop.s_result.borrow_mut() = Some(s_result);
+        let r_int: Arc<dyn Repr> = signed_repr();
+        *hop.r_result.borrow_mut() = Some(r_int);
+        let out = rtype_null_fn(&hop, &HashMap::new()).expect("rtype_null_fn");
+        let Some(Hlvalue::Constant(c)) = out else {
+            panic!("expected Constant, got {out:?}");
+        };
+        assert!(
+            matches!(c.value, ConstValue::Int(0)),
+            "IntegerRepr nullptr is Signed 0, got {:?}",
+            c.value
+        );
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Signed));
     }
 
     /// `rtype_null_raw` of a flavor-raw `InstanceRepr` is

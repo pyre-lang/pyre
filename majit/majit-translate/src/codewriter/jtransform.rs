@@ -989,6 +989,39 @@ fn is_null_ptr_result(result_ty: &ValueType) -> bool {
     matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
 }
 
+/// The null-function-pointer builtin `HostEnv::bootstrap` registers
+/// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
+/// `history.getkind` of `Ptr(FuncType)` is `'int'`.
+const NULL_FN_BUILTIN_QUALNAMES: &[&str] = &["core.ptr.null_fn"];
+
+/// Whether a `FunctionPath` call names `core.ptr.null_fn`.
+///
+/// Resolve through `HOST_ENV` the same way as [`resolves_to_null_ptr_builtin`]:
+/// the surviving model graph still carries whichever path the source spelled.
+fn resolves_to_null_fn_builtin(segments: &[String]) -> bool {
+    let Some((leaf, module_path)) = segments.split_last() else {
+        return false;
+    };
+    if module_path.is_empty() {
+        return false;
+    }
+    crate::flowspace::model::HOST_ENV
+        .import_module(&module_path.join("."))
+        .and_then(|module| module.module_get(leaf))
+        .is_some_and(|attr| NULL_FN_BUILTIN_QUALNAMES.contains(&attr.qualname()))
+}
+
+/// Result banks on which `ptr::null_fn()` is `lltype.nullptr(FUNC)`.
+///
+/// Function pointers live in the int bank (`history.getkind` of
+/// `Ptr(FuncType)`). A Skip-path IntegerRepr is Signed / Unsigned / Bool.
+fn is_null_fn_result(result_ty: &ValueType) -> bool {
+    matches!(
+        result_ty,
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool
+    )
+}
+
 /// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` /
 /// `try_gc_write_barrier_prebuilt` — the interpreter's spelling of
 /// `llop.gc_writebarrier`, which [`drop_guarded_gc_write_barriers`]
@@ -1643,6 +1676,19 @@ fn const_kind_of_op(kind: &OpKind) -> Option<ConstKind> {
             && resolves_to_null_ptr_builtin(segments) =>
         {
             ConstValue::None
+        }
+        // Spelling `ByteStr` is a Constant (`call_arg_vars` skips it), so the
+        // unrewritten `null_fn` Call is still a 0-Variable nullptr. Falsy
+        // Signed 0 lets `_rewrite_equality` fold `is_` / `eq` against it.
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty,
+        } if crate::model::call_arg_vars(args).is_empty()
+            && is_null_fn_result(result_ty)
+            && resolves_to_null_fn_builtin(segments) =>
+        {
+            ConstValue::Int(0)
         }
         OpKind::Call { target, .. } => match target {
             CallTarget::FunctionPath { segments, .. }
@@ -5644,7 +5690,7 @@ impl<'a> Transformer<'a> {
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "eq" | "ne")
+            } if matches!(binop_name.as_str(), "eq" | "ne" | "is_")
                 && self.get_value_kind_var(lhs) == 'i'
                 && self.get_value_kind_var(rhs) == 'i'
                 && (is_renamed_falsy_constant(
@@ -5669,10 +5715,13 @@ impl<'a> Transformer<'a> {
                 } else {
                     lhs
                 };
-                let unop = if binop_name == "eq" {
-                    "int_is_zero"
-                } else {
+                // `is_` of two ints is `_rewrite_nongc_ptrs` `int_eq`;
+                // `_rewrite_equality` then folds a zero operand the same
+                // way as `eq`. `ne` is the complementary unary.
+                let unop = if binop_name == "ne" {
                     "int_is_true"
+                } else {
+                    "int_is_zero"
                 };
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -10673,6 +10722,28 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::ConstRefNull,
+            }]);
+        }
+        // `rbuiltin.py rtype_const_result` (`lltype.nullptr(FUNC)`):
+        // `history.getkind` of `Ptr(FuncType)` is `'int'`. Pyre's rtyper
+        // types an ephemeral oracle rather than rewriting the surviving
+        // model graph, so the `direct_call` of `core.ptr.null_fn` is still
+        // here. Fold it to Signed 0 — the int-bank twin of ConstRefNull
+        // above. A spelling `ByteStr` is a Constant (`call_arg_vars`
+        // already dropped it from `args`).
+        if let CallTarget::FunctionPath { segments, .. } = target
+            && args.is_empty()
+            && is_null_fn_result(result_ty)
+            && resolves_to_null_fn_builtin(segments)
+        {
+            if let Some(result) = &op.result {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+                ));
+            }
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstInt(0),
             }]);
         }
         // `__cast_pointer` / `ptr::from_ref` fold through
@@ -32146,6 +32217,145 @@ mod tests {
                     folded.kind
                 );
             }
+        }
+    }
+
+    fn is_null_fn_call_kind(kind: &OpKind) -> bool {
+        matches!(
+            kind,
+            OpKind::Call { target, .. }
+                if matches!(
+                    target.path_segments().as_deref(),
+                    Some(["core", "ptr", "null_fn"])
+                )
+        )
+    }
+
+    fn op_is_int_zero_test(kind: &OpKind) -> bool {
+        match kind {
+            OpKind::ConstInt(0) => true,
+            OpKind::UnaryOp { op, .. } if matches!(op.as_str(), "int_is_zero" | "int_is_true") => {
+                true
+            }
+            OpKind::BinOp { op, .. }
+                if matches!(op.as_str(), "eq" | "ne" | "int_eq" | "int_ne") =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `lltype.nullptr(FUNC)` is a Constant (`rtype_const_result`).
+    /// The surviving graph still carries `direct_call(core.ptr.null_fn)`;
+    /// fold it to Signed 0 (`history.getkind` of `Ptr(FuncType)` is `'int'`).
+    #[test]
+    fn ptr_null_fn_builtin_rewrites_to_int_constant_zero() {
+        use crate::flowspace::model::ConstValue;
+
+        for args in [
+            crate::model::call_args(vec![]),
+            vec![LinkArg::from(ConstValue::byte_str("fn() -> i64"))],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut graph = FunctionGraph::new("ptr_null_fn_constant");
+            let entry = graph.startblock;
+            let result_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["core", "ptr", "null_fn"]),
+                        args,
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+            graph.set_return(entry, Some(result_var.clone()));
+
+            let result = transform_graph(&graph, &config);
+            let folded = result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|op| op.result.as_ref() == Some(&result_var))
+                .expect("null_fn result must survive as a constant definition");
+            assert!(
+                matches!(folded.kind, OpKind::ConstInt(0)),
+                "null_fn stayed {:?}",
+                folded.kind
+            );
+            assert!(
+                !result
+                    .graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| is_null_fn_call_kind(&op.kind)),
+                "null_fn Call must not survive"
+            );
+        }
+    }
+
+    /// Generated `Option<fn>::is_some` (`push_niche_is_some` /
+    /// `NicheIntNull::FnPtr`): no residual `null_fn`, and the compare
+    /// against 0 is `int_is_zero` / `int_is_true` / `eq` / `ne`.
+    #[test]
+    fn option_fn_is_some_spec_shape_has_no_null_fn_residual() {
+        use crate::model::NicheIntNull;
+
+        for spelling in [None, Some("fn() -> i64".to_string())] {
+            let config = GraphTransformConfig::default();
+            let mut graph = FunctionGraph::new("is_some__spec_fn");
+            let entry = graph.startblock;
+            let opt = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Input {
+                        name: "opt".into(),
+                        ty: ValueType::Int,
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let result_var = graph.alloc_value_var();
+            graph.push_niche_is_some(
+                entry,
+                opt.clone(),
+                Some(&NicheIntNull::FnPtr(spelling.clone())),
+                None,
+                result_var.clone(),
+            );
+            graph.set_return(entry, Some(result_var.clone()));
+            FunctionGraph::set_concretetype_of_inline(&opt, ConcreteType::Signed);
+            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    if let Some(r) = &op.result {
+                        FunctionGraph::set_concretetype_of_inline(r, ConcreteType::Signed);
+                    }
+                }
+            }
+
+            let result = transform_graph(&graph, &config);
+            let kinds: Vec<&OpKind> = result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .map(|op| &op.kind)
+                .collect();
+            assert!(
+                !kinds.iter().any(|kind| is_null_fn_call_kind(kind)),
+                "spelling {spelling:?}: null_fn Call survived {kinds:?}"
+            );
+            assert!(
+                kinds.iter().any(|kind| op_is_int_zero_test(kind)),
+                "spelling {spelling:?}: expected int_eq/int_ne/int_is_zero/int_is_true against 0, got {kinds:?}"
+            );
         }
     }
 

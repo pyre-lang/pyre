@@ -22220,6 +22220,31 @@ mod tests {
         );
     }
 
+    /// Look-inside `bytecode_only_trace` / `call_trace` / `run_trace_func`
+    /// stay `Regular` once a word-ABI `fnaddr` is bound. The Residual flip
+    /// in `guess_call_kind` is only `is_dont_look_inside_residual_helper`
+    /// (`ll_append_res0` / `ll_append_res_slice`).
+    #[test]
+    fn look_inside_tracefunc_graphs_stay_regular_with_a_bound_fnaddr() {
+        let mut cc = CallControl::new();
+        let leaves = ["bytecode_only_trace", "call_trace", "run_trace_func"];
+        for leaf in leaves {
+            let path = CallPath::from_segments(["executioncontext", "ExecutionContext", leaf]);
+            cc.register_function_graph(path.clone(), FunctionGraph::new(leaf));
+            cc.register_function_fnaddr(path.clone(), 0x1000);
+            assert!(!is_dont_look_inside_residual_helper(&path));
+        }
+        cc.find_all_graphs_for_tests();
+        for leaf in leaves {
+            let target = CallTarget::function_path(["executioncontext", "ExecutionContext", leaf]);
+            assert_eq!(
+                cc.guess_call_kind(&direct_call_op(target)),
+                CallKind::Regular,
+                "{leaf}"
+            );
+        }
+    }
+
     /// Effect metadata lives on the funcobj (`graph.func`), and every alias
     /// spelling of one source funcobj shares that single graph object via
     /// [`GraphStore`]'s identity indirection — so a mark applied through one

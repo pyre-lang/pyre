@@ -129,6 +129,7 @@ fn annotate_inner(
                             Incoming::Annotation(rc)
                         }
                         _ => typed_null_raw_incoming(bookkeeper, &op.kind)
+                            .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
                             .unwrap_or(Incoming::Flat(inferred)),
                     };
                     let op_changed = if let Incoming::Annotation(sv) = &incoming
@@ -390,6 +391,44 @@ fn incoming_from_link_arg(src: &LinkArg) -> Incoming {
             Incoming::Annotation(Rc::new(SomeValue::None_(SomeNone::new())))
         }
         LinkArg::Const(c) => Incoming::Flat(const_value_type(&c.value)),
+    }
+}
+
+/// Typed `null_fn` (`model.rs push_null_fn_ptr_with_spelling`) is
+/// `lltype.nullptr(FuncType)` as constant `SomePtr`
+/// (`builtin.rs fn_null_constant` / `ann_nullptr` `immutablevalue`).
+fn typed_null_fn_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    let OpKind::Call { target, args, .. } = kind else {
+        return None;
+    };
+    if !matches!(
+        target.path_segments().as_deref(),
+        Some(["core", "ptr", "null_fn"])
+    ) {
+        return None;
+    }
+    let args_s: Vec<Option<SomeValue>> = match args.as_slice() {
+        [] => Vec::new(),
+        [LinkArg::Const(c)] => {
+            let ConstValue::ByteStr(spelling) = &c.value else {
+                return None;
+            };
+            let mut s_ty = crate::annotator::model::s_str0();
+            s_ty.set_const_box(crate::flowspace::model::Constant::new(
+                crate::flowspace::model::ConstValue::byte_str(spelling),
+            ));
+            vec![Some(s_ty)]
+        }
+        _ => return None,
+    };
+    match crate::annotator::builtin::fn_null_constant(
+        bk,
+        &args_s,
+        &std::collections::HashMap::new(),
+    ) {
+        Ok(sv @ SomeValue::Ptr(_)) => Some(Incoming::Annotation(Rc::new(sv))),
+        _ => None,
     }
 }
 
@@ -706,6 +745,35 @@ fn merge_binding(var: &Variable, incoming: Incoming, bookkeeper: Option<&Rc<Book
                     }
                 }
                 _ => merge_flat(var, ValueType::Ref(None), bookkeeper),
+            },
+            // `consider_op` / `setbinding` recomputes the op result.
+            // `pairtype(SomePtr, SomePtr).union` rebuilds a non-constant
+            // `SomePtr`; keep the existing cell when `ll_ptrtype` matches
+            // so `ann_nullptr`'s `immutablevalue` const survives the
+            // fixpoint.
+            SomeValue::Ptr(incoming_ptr) => match read_binding_some(var) {
+                None => {
+                    *var.annotation.borrow_mut() = Some(sv.clone());
+                    true
+                }
+                Some(existing) => match existing.as_ref() {
+                    SomeValue::Ptr(existing_ptr)
+                        if existing_ptr.ll_ptrtype == incoming_ptr.ll_ptrtype =>
+                    {
+                        false
+                    }
+                    SomeValue::Ptr(_) => {
+                        match crate::annotator::model::union(existing.as_ref(), sv.as_ref()) {
+                            Ok(u) if u != *existing => {
+                                *var.annotation.borrow_mut() = Some(Rc::new(u));
+                                true
+                            }
+                            Ok(_) => false,
+                            Err(_) => merge_flat(var, somevalue_to_valuetype(&sv), bookkeeper),
+                        }
+                    }
+                    _ => merge_flat(var, somevalue_to_valuetype(&sv), bookkeeper),
+                },
             },
             _ => merge_flat(var, somevalue_to_valuetype(&sv), bookkeeper),
         },
@@ -1966,6 +2034,30 @@ mod tests {
                 assert!(inst.can_be_none);
             }
             other => panic!("expected nullable instance of X, got {other:?}"),
+        }
+    }
+
+    /// Typed `null_fn` (`push_null_fn_ptr_with_spelling`) annotates as
+    /// constant `SomePtr` (`ann_nullptr` `immutablevalue`).
+    #[test]
+    fn typed_null_fn_annotates_as_constant_someptr() {
+        let bk = Rc::new(Bookkeeper::new());
+        for spelling in [None, Some("fn() -> i64")] {
+            let mut graph = FunctionGraph::new("typed_null_fn");
+            let entry = graph.startblock;
+            let null_var = graph.push_null_fn_ptr_with_spelling(entry, spelling);
+            graph.set_return(entry, Some(null_var.clone()));
+            annotate_with_bookkeeper(&graph, Some(&bk));
+            match read_binding_some(&null_var).as_deref() {
+                Some(sv @ SomeValue::Ptr(_)) => {
+                    use crate::annotator::model::SomeObjectTrait;
+                    assert!(
+                        sv.is_constant(),
+                        "spelling {spelling:?} must be immutablevalue, got {sv:?}"
+                    );
+                }
+                other => panic!("spelling {spelling:?}: expected constant SomePtr, got {other:?}"),
+            }
         }
     }
 }

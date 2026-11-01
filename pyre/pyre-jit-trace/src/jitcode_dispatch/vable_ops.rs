@@ -1311,7 +1311,12 @@ pub(crate) fn walker_implement_guard_value<Sym: WalkSym>(
     if box_.is_constant() {
         return Ok(box_);
     }
-    let expected = ctx.trace_ctx.const_int(runtime_value);
+    // `executor.py constant_from_op(box)` / `MIFrame.implement_guard_value`:
+    // mint `ConstPtr` for a Ref, `ConstInt` otherwise.
+    let expected = match box_.ty() {
+        Some(Type::Ref) => ctx.trace_ctx.const_ref(runtime_value),
+        _ => ctx.trace_ctx.const_int(runtime_value),
+    };
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[box_, expected], 0);
     // Full-body walks install `snapshot_sym` so `generate_guard` can

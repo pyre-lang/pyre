@@ -15471,6 +15471,9 @@ pub(crate) fn publish_pyre_class_vtables() {
 }
 
 /// Second pass after the collector has stamped `TypeIdCell`s.
+///
+/// One walk per collector (`LAST_GC` epoch), matching
+/// `heaptracker.py` `setup_cache_gcstruct2vtable`.
 pub(crate) fn refresh_pyre_class_vtable_tids() {
     publish_pyre_class_vtables_inner();
 }

@@ -1492,6 +1492,7 @@ impl ExecutionContext {
         Ok(pyre_object::gc_roots::shadow_stack_get(retval_slot))
     }
 
+    #[majit_macros::always_inline]
     #[inline(always)]
     pub fn bytecode_trace(
         &mut self,
@@ -1558,6 +1559,7 @@ impl ExecutionContext {
     /// per-frame trace is unset (so a later `frame.f_trace = cb`
     /// observes the unmodified instr_prev_plus_one and can fire its
     /// first `line` event correctly).
+    #[majit_macros::always_inline]
     #[inline(always)]
     /// Answers the frame, because the tracer arm below runs Python and a frame
     /// a compiled trace built moves there.  Returning it puts the reload on the
@@ -1576,7 +1578,7 @@ impl ExecutionContext {
             return Ok(frame);
         }
         let f_trace_is_none = unsafe { (*frame).get_w_f_trace().is_null() };
-        if f_trace_is_none || self.is_tracing != 0 || self.w_tracefunc.is_null() {
+        if f_trace_is_none || self.is_tracing != 0 || self.gettrace().is_null() {
             return Ok(frame);
         }
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
@@ -1633,6 +1635,8 @@ impl ExecutionContext {
         if frame.is_null() {
             return Ok(());
         }
+        // `code = frame.getcode() # promote the frame!` (`run_trace_func`).
+        let _code = unsafe { (*frame).getcode() };
         // Reached only with a tracer installed, so the anchor is already on the
         // slow path.  `getorcreatedebug` allocates a nursery `FrameDebugData`
         // and the events below run Python, so take it before either.
@@ -3109,6 +3113,61 @@ pub extern "C" fn space_decrement_ticker_jit_abi(ec: *mut ExecutionContext, by: 
     // graph read it from; it outlives the call.
     let ec = unsafe { &mut *(ec) };
     space_decrement_ticker(ec, by as isize) as i64
+}
+
+/// One-word C-ABI entry for [`ExecutionContext::bytecode_only_trace`].
+///
+/// `call.py CallControl.get_jitcode` stores `getfunctionptr(graph)` as
+/// `JitCode.fnaddr`. The source graph is a Rust `Result` method; blackhole
+/// `bhimpl_inline_call_*` calls the one-word Ref ABI
+/// (`get_jitcode_calldescr`: two Ref args, Ref result — the live frame).
+/// `Err` publishes through [`crate::runtime_ops::jit_publish_residual_error_ref`].
+#[inline(never)]
+pub extern "C" fn bytecode_only_trace_jit_abi(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> i64 {
+    majit_ir::icf_identity!("executioncontext::bytecode_only_trace_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::bytecode_only_trace(ec, frame) {
+        Ok(frame) => frame as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as i64,
+    }
+}
+
+/// One-word C-ABI entry for [`ExecutionContext::call_trace`].
+///
+/// Same `getfunctionptr` / `bhimpl_inline_call_*` pairing as
+/// [`bytecode_only_trace_jit_abi`]. `Result<(), PyError>` lowers to void
+/// (`get_jitcode_calldescr` FUNC.RESULT); the ignored word is 0, and `Err`
+/// publishes through [`crate::runtime_ops::jit_publish_residual_error`].
+#[inline(never)]
+pub extern "C" fn call_trace_jit_abi(ec: *mut ExecutionContext, frame: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("executioncontext::call_trace_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::call_trace(ec, frame) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+/// One-word C-ABI entry for [`ExecutionContext::run_trace_func`].
+///
+/// Same void-result pairing as [`call_trace_jit_abi`].
+#[inline(never)]
+pub extern "C" fn run_trace_func_jit_abi(ec: *mut ExecutionContext, frame: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("executioncontext::run_trace_func_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::run_trace_func(ec, frame) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
 }
 
 pub struct AsyncAction {
