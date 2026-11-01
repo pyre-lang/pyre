@@ -14,14 +14,12 @@
 
 use std::cell::UnsafeCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use smallvec::smallvec;
 
-use majit_backend::{
-    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, JitCellToken,
-};
+use majit_backend::{Backend, BackendError, CompiledLoopToken, DeadFrame, JitCellToken};
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
@@ -1958,7 +1956,6 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
     })
@@ -2037,7 +2034,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
         bridge: std::sync::OnceLock::new(),
     })
@@ -2278,12 +2274,6 @@ impl FailDescr for ResumeAtPositionDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -2327,7 +2317,6 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -2681,12 +2670,6 @@ impl FailDescr for ResumeGuardForcedDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -2730,7 +2713,6 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>, jitdriver_sd: usiz
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -2927,12 +2909,6 @@ impl FailDescr for ResumeGuardExcDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -2976,7 +2952,6 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -3057,13 +3032,6 @@ pub struct ResumeGuardCopiedDescr {
     /// copy guards the same back edge as its donor, so the optimizer stamps
     /// each copy as it emits it.
     back_edge_poll: std::sync::atomic::AtomicBool,
-    /// Pyre-only per-emission `CompiledTraceInfo` cell.  Same shape
-    /// and atomic-swap discipline as
-    /// `ResumeGuardDescr::trace_info`.  Per-emission because
-    /// `record_loop_or_bridge` (compile.py) stamps the
-    /// loop-token-equivalent metadata onto each emitted descr
-    /// individually; the cell is reclaimed in `Drop`.
-    trace_info: std::sync::atomic::AtomicPtr<CompiledTraceInfo>,
     /// Per-emission cranelift bridge cells; see
     /// `ResumeGuardDescr::bridge`.  Per-emission because each copied descr
     /// can have its own bridge attached (`compile.py handle_fail` applies
@@ -3081,22 +3049,6 @@ pub struct ResumeGuardCopiedDescr {
 
 unsafe impl Send for ResumeGuardCopiedDescr {}
 unsafe impl Sync for ResumeGuardCopiedDescr {}
-
-impl Drop for ResumeGuardCopiedDescr {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        // Reclaim any published `Arc<CompiledTraceInfo>`; mirrors
-        // `ResumeGuardDescr::drop`.  Swap-to-null first so a concurrent
-        // reader either bumps the strong count on the live pointer or
-        // observes null.
-        let ptr = self.trace_info.swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !ptr.is_null() {
-            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
-            // `set_trace_info_any`.
-            unsafe { drop(Arc::from_raw(ptr as *const CompiledTraceInfo)) };
-        }
-    }
-}
 
 impl ResumeGuardCopiedDescr {
     /// Read the current `prev` Arc.
@@ -3160,7 +3112,6 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
         }))
@@ -3391,33 +3342,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.back_edge_poll
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    /// Per-emission `trace_info` (see field comment).  Same
-    /// atomic-swap discipline as `ResumeGuardDescr::set_trace_info` —
-    /// owning Arc reclaimed by `Drop`.
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        let ptr = self.trace_info.load(Ordering::Acquire);
-        if ptr.is_null() {
-            None
-        } else {
-            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
-            // `set_trace_info_any`.
-            unsafe {
-                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
-                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
-                Some(arc as Arc<dyn std::any::Any + Send + Sync>)
-            }
-        }
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        let typed: Arc<CompiledTraceInfo> = info
-            .downcast::<CompiledTraceInfo>()
-            .expect("set_trace_info_any expected Arc<CompiledTraceInfo>");
-        let new_ptr = Arc::into_raw(typed) as *mut CompiledTraceInfo;
-        let old_ptr = self.trace_info.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
-        }
-    }
     /// Per-emission cranelift bridge cells; same contract as
     /// `ResumeGuardDescr`.
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
@@ -3511,7 +3435,6 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 bridge: std::sync::OnceLock::new(),
                 external_jump_target: std::sync::OnceLock::new(),
             },
@@ -3649,12 +3572,6 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_back_edge_poll(&self) {
         self.inner.set_back_edge_poll();
     }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        self.inner.trace_info_any()
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        self.inner.set_trace_info_any(info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         self.inner.bridge_cache_addrs()
     }
@@ -3719,7 +3636,6 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-        trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         bridge: std::sync::OnceLock::new(),
         external_jump_target: std::sync::OnceLock::new(),
     })
@@ -3754,7 +3670,6 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             bridge: std::sync::OnceLock::new(),
             external_jump_target: std::sync::OnceLock::new(),
         },
@@ -3896,7 +3811,7 @@ pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
 /// Modeled as a newtype wrapping `ResumeGuardDescr` so the subclass
 /// inherits the full `_attrs_` slot set (adr_jump_offset, rd_locs,
 /// status, rd_loop_token, plus the pyre-side per-emission cells:
-/// trace_info, external_jump_target, bridge_*) the cranelift codegen
+/// external_jump_target, bridge_*) the cranelift codegen
 /// path reads off every guard descr at `collect_guards` / dispatch emission.
 /// Same shape as `ResumeAtPositionDescr` (compile.py).
 #[derive(Debug)]
@@ -3949,7 +3864,6 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: AtomicBool::new(false),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
             },
@@ -4110,12 +4024,6 @@ impl FailDescr for CompileLoopVersionDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.inner.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn trace_info_any(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
-        FailDescr::trace_info_any(&self.inner)
-    }
-    fn set_trace_info_any(&self, info: Arc<dyn std::any::Any + Send + Sync>) {
-        FailDescr::set_trace_info_any(&self.inner, info);
-    }
     fn bridge_cache_addrs(&self) -> Option<(usize, usize)> {
         FailDescr::bridge_cache_addrs(&self.inner)
     }
@@ -4157,7 +4065,6 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-            trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
             bridge: std::sync::OnceLock::new(),
         },
@@ -4737,7 +4644,6 @@ mod fail_descr_tests {
                 fail_index_per_trace: AtomicU32::new(0),
                 bridge_declined_terminally: AtomicBool::new(false),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
-                trace_info: AtomicPtr::new(std::ptr::null_mut()),
                 external_jump_target: OnceLock::new(),
                 bridge: std::sync::OnceLock::new(),
             },
