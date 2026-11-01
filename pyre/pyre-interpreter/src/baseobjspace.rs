@@ -18042,6 +18042,14 @@ pub fn getindex_w(obj: PyObjectRef) -> Result<i64, PyError> {
     }
 }
 
+/// `space.index` then `int_w`. Overflow of either sign is OverflowError.
+/// `W_BytesIO.seek_w` `@unwrap_spec(pos=r_longlong)` and
+/// `W_StringIO.seek_w` `@unwrap_spec(pos=int)` convert before the seek body.
+pub fn index_int_w(obj: PyObjectRef) -> Result<i64, PyError> {
+    let mut w_index = space_index(obj)?;
+    pyre_object::with_roots!(w_index => int_w(w_index))
+}
+
 /// Index-protocol conversion for an argument whose callee performs its own
 /// negative-value check.  A positive bigint outside the machine range raises
 /// OverflowError; a negative overflow is represented by i64::MIN so the

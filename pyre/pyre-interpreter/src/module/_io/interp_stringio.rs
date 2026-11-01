@@ -425,21 +425,20 @@ impl W_StringIO {
         w_pos: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] w_whence: PyObjectRef,
     ) -> Result<i64, crate::PyError> {
-        // interp_stringio.py:403-422. Conversion stays inside the pinned
-        // region because either argument may execute Python through __index__.
+        // W_StringIO.seek_w `@unwrap_spec(pos=int, mode=int)`. Conversion
+        // stays inside the pinned region because either argument may execute
+        // Python through `__index__`. Overflow of pos is OverflowError from
+        // `index_int_w` before the negative-seek ValueError arm. The whence
+        // is a C int, so one that does not fit is OverflowError from the
+        // converter rather than a value the range check below ever sees.
+        // The position conversion runs `__index__`, so whence is reloaded
+        // from this pin afterwards.
         self.check_closed()?;
         let _roots = pyre_object::gc_roots::push_roots();
         let slot = self.pin_self();
-        // `@unwrap_spec(pos=int, mode=int)` (:403). The whence is a C int, so
-        // one that does not fit is an OverflowError from the converter rather
-        // than a value the range check below ever sees. The position is not:
-        // 3.14 takes it as a `Py_ssize_t`, and `seek(2**32)` is a position it
-        // accepts. Both stay on the index protocol. The position conversion
-        // runs `__index__`, so whence is reloaded from this pin afterwards.
         let arg_base = pyre_object::gc_roots::pin_roots(&[w_pos, w_whence]);
-        let pos = crate::baseobjspace::index_int_w_preserve_negative(
-            pyre_object::gc_roots::shadow_stack_get(arg_base),
-        )?;
+        let pos =
+            crate::baseobjspace::index_int_w(pyre_object::gc_roots::shadow_stack_get(arg_base))?;
         let whence = crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
             arg_base + 1,
         ))?;
