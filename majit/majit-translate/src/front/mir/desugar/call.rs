@@ -1341,20 +1341,50 @@ impl<'a> Lowering<'a> {
                 // the rtyper cannot route on the classdef-less receiver.
                 //
                 // A `Vec` of one-word items is the address of its raw
-                // `{ptr, len, cap}` header, not a list, so its slice is not
-                // the receiver.  Only `<[T]>::reverse` consumes the alias,
-                // which the call arm retargets to `ll_vec_reverse`; any other
-                // slice use would read the header words as items, so that
-                // deref keeps the residual `deref` call, which the annotator
-                // rejects on the `SomeRustVec` receiver.
+                // `{ptr, len, cap}` header, not a list. Aliasing that header
+                // would make a later item read consume the header words.
+                // `<[T]>::reverse` is the one consumer of the alias: the call
+                // arm retargets it to `ll_vec_reverse`. Every other use is
+                // [`Self::pair_of_vec`] (`ll_vec_items` / `ll_vec_length`,
+                // `rlist.py` `ll_getitem_fast` on the same list).
                 if args.len() == 1
                     && self.is_container_identity_deref(&reg)
-                    && (first_arg_ty
+                    && first_arg_ty
                         .as_ref()
                         .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())
-                        || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local))
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // One-word `Vec::deref` / `deref_mut` that did not enter
+                // `is_pair_call`. `&[i64]` has a length slot and takes the
+                // pair arm; `&[f64]` does not (`PAIR_SLICE_ITEM_KINDS` has
+                // no Float — a `FloatArray` length stays `ll_length` of the
+                // struct). The items and the length are still `pair_of_vec`.
+                // With no slot the pointer word is the slice and the length
+                // stays on this local for a later `.len()`. A reborrow aliases
+                // that pointer (`Rvalue::Ref` ignores the slice metadata).
+                if args.len() == 1
+                    && let Some(path) = regular_call_name_path(&reg, self.llbc)
+                    && rust_vec_slice_view(&path).is_some_and(RustVecSliceView::is_deref)
+                    && let Some(kind) = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc))
+                {
+                    if rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local) {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    } else {
+                        let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
+                        if self.len_shadow[dest_local].is_some() {
+                            self.bind_pair_local(mir_bb, dest_local, ptr, len, None);
+                        } else {
+                            self.local_var[dest_local] = Some(LocalValue::One(ptr));
+                            self.record_numeric_array_view_len(dest_local, len);
+                        }
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);

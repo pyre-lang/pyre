@@ -156,6 +156,75 @@ fn rust_vec_std_leaf_accepts_both_callee_spellings() {
     ] {
         assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
     }
+    assert_eq!(
+        super::rust_vec_std_leaf(&path(&[
+            "vec",
+            "Vec",
+            "<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>",
+            "deref",
+        ])),
+        Some("deref")
+    );
+}
+
+#[test]
+fn rust_vec_slice_view_accepts_inherent_and_trait_impl_spellings() {
+    let cases = [
+        ("alloc::vec::<Impl>::deref", super::RustVecSliceView::Deref),
+        (
+            "alloc::vec::<Impl>::deref_mut",
+            super::RustVecSliceView::DerefMut,
+        ),
+        (
+            "alloc::vec::<Impl>::as_slice",
+            super::RustVecSliceView::AsSlice,
+        ),
+        (
+            "alloc::vec::<Impl>::as_mut_slice",
+            super::RustVecSliceView::AsMutSlice,
+        ),
+        ("vec::Vec::deref", super::RustVecSliceView::Deref),
+        ("vec::Vec::as_slice", super::RustVecSliceView::AsSlice),
+        (
+            "vec::Vec::<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>::deref",
+            super::RustVecSliceView::Deref,
+        ),
+        (
+            "vec::Vec::<impl core::ops::deref::DerefMut<alloc::vec::Vec<v0,v1>>>::deref_mut",
+            super::RustVecSliceView::DerefMut,
+        ),
+        (
+            "vec::Vec::<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>::as_slice",
+            super::RustVecSliceView::AsSlice,
+        ),
+        (
+            "alloc::vec::Vec::<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>::as_mut_slice",
+            super::RustVecSliceView::AsMutSlice,
+        ),
+    ];
+    for (path, view) in cases {
+        assert_eq!(super::rust_vec_slice_view(path), Some(view), "{path}");
+    }
+    assert_eq!(
+        super::rust_vec_slice_view("core::slice::<Impl>::as_slice"),
+        None
+    );
+    assert_eq!(
+        super::rust_vec_slice_view(
+            "vec::Vec::<impl core::ops::index::Index<core::ops::range::RangeFull>>::index"
+        ),
+        None
+    );
+    let index = [
+        "vec",
+        "Vec",
+        "<impl core::ops::index::Index<core::ops::range::RangeFull>>",
+        "index",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    assert_eq!(super::rust_vec_std_leaf(&index), Some("index"));
 }
 
 #[test]

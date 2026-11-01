@@ -2471,13 +2471,14 @@ impl<'a> Lowering<'a> {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
                 }
-                (
-                    "alloc::vec::<Impl>::deref"
-                    | "alloc::vec::<Impl>::deref_mut"
-                    | "alloc::vec::<Impl>::as_slice"
-                    | "alloc::vec::<Impl>::as_mut_slice",
-                    Some(kind),
-                ) if args.len() == 1 => self.pair_of_vec(mir_bb, kind, args[0].clone()),
+                // Inherent `alloc::vec::<Impl>::deref` and the trait-impl
+                // residual `vec::Vec::<impl Deref<Vec<…>>>::deref` (and
+                // `deref_mut` / `as_slice` / `as_mut_slice`) are one view of
+                // the same list. `pair_of_vec` is `(ll_vec_items, ll_vec_length)`
+                // (`rlist.py` `ll_getitem_fast` reads that list; nothing is copied).
+                (_, Some(kind)) if args.len() == 1 && rust_vec_slice_view(&name).is_some() => {
+                    self.pair_of_vec(mir_bb, kind, args[0].clone())
+                }
                 ("alloc::vec::<Impl>::index" | "alloc::vec::<Impl>::index_mut", Some(kind))
                     if args.len() == 2 =>
                 {
@@ -6009,17 +6010,108 @@ pub(in crate::front::mir) fn raw_array_slice_is_push_roots_only(
     seen_push
 }
 
-/// The method name of an `alloc::vec::Vec` inherent-method callee path:
-/// `alloc::vec::<Impl>::<leaf>`, or the short `vec::Vec::<leaf>` spelling
-/// `call_target_segments` gives an impl method it resolved by its owner type.
+/// The method name of an `alloc::vec::Vec` callee path:
+/// `alloc::vec::<Impl>::<leaf>`, `alloc::vec::Vec::<leaf>`, or the short
+/// `vec::Vec::<leaf>` spelling `call_target_segments` gives an impl method
+/// it resolved by its owner type.
+///
+/// A trait-impl identity segment (`<impl core::ops::deref::Deref<…>>`, the
+/// segment [`trait_impl_identity_path`] writes) is not part of the owner.
+/// Dropping it makes `vec::Vec::<impl Deref<Vec<…>>>::deref` the same leaf
+/// as `alloc::vec::<Impl>::deref`. [`rust_vec_std_call`] still lowers only
+/// `new` / `with_capacity` / `push` / `as_ptr` / `as_mut_ptr`; the slice-view
+/// leaves go through [`rust_vec_slice_view`].
 pub(in crate::front::mir) fn rust_vec_std_leaf(segments: &[String]) -> Option<&str> {
-    match segments {
-        [a, b, c, leaf] if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") => {
-            Some(leaf)
+    let mut idx = [0usize; 4];
+    let mut n = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        if is_trait_impl_identity_segment(seg) {
+            continue;
         }
-        [a, b, leaf] if a == "vec" && b == "Vec" => Some(leaf),
+        if n == idx.len() {
+            return None;
+        }
+        idx[n] = i;
+        n += 1;
+    }
+    let seg = |at: usize| segments[idx[at]].as_str();
+    let matches = match n {
+        4 => seg(0) == "alloc" && seg(1) == "vec" && (seg(2) == "<Impl>" || seg(2) == "Vec"),
+        3 => seg(0) == "vec" && seg(1) == "Vec",
+        _ => false,
+    };
+    matches.then(|| segments[idx[n - 1]].as_str())
+}
+
+/// Which whole-buffer view of a `Vec` a callee is.
+///
+/// `deref` / `as_slice` borrow the items; `deref_mut` / `as_mut_slice`
+/// borrow them mutably. Both are the same list (`rlist.py`
+/// `ll_getitem_fast`); [`Lowering::pair_of_vec`] is
+/// `(ll_vec_items, ll_vec_length)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::front::mir) enum RustVecSliceView {
+    Deref,
+    DerefMut,
+    AsSlice,
+    AsMutSlice,
+}
+
+impl RustVecSliceView {
+    pub(in crate::front::mir) fn is_mut(self) -> bool {
+        matches!(self, Self::DerefMut | Self::AsMutSlice)
+    }
+
+    pub(in crate::front::mir) fn is_deref(self) -> bool {
+        matches!(self, Self::Deref | Self::DerefMut)
+    }
+
+    pub(in crate::front::mir) fn is_as_slice(self) -> bool {
+        matches!(self, Self::AsSlice | Self::AsMutSlice)
+    }
+}
+
+/// [`rust_vec_std_leaf`] restricted to `deref` / `deref_mut` / `as_slice` /
+/// `as_mut_slice`.
+///
+/// `path` is a FunDecl `name_path` (`alloc::vec::<Impl>::deref`) or the
+/// joined trait-impl residual
+/// (`vec::Vec::<impl core::ops::deref::Deref<alloc::vec::Vec<v0,v1>>>::deref`).
+/// The identity segment contains `::`, so the split keeps text inside `<>`.
+pub(in crate::front::mir) fn rust_vec_slice_view(path: &str) -> Option<RustVecSliceView> {
+    let segments = path_segments_respecting_angles(path);
+    match rust_vec_std_leaf(&segments)? {
+        "deref" => Some(RustVecSliceView::Deref),
+        "deref_mut" => Some(RustVecSliceView::DerefMut),
+        "as_slice" => Some(RustVecSliceView::AsSlice),
+        "as_mut_slice" => Some(RustVecSliceView::AsMutSlice),
         _ => None,
     }
+}
+
+/// Split `path` on `::` outside `<...>`.
+fn path_segments_respecting_angles(path: &str) -> Vec<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' if depth > 0 => depth -= 1,
+            b':' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                out.push(path[start..i].to_string());
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(path[start..].to_string());
+    out
 }
 
 /// `alloc::vec::from_elem`, the call `vec![item; count]` lowers to.

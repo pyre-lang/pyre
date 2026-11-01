@@ -6341,15 +6341,14 @@ impl<'a> Lowering<'a> {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
             matches!(
-                fd.item_meta.name_path().as_str(),
+                path.as_str(),
                 "core::slice::<Impl>::as_slice"
                     | "core::slice::<Impl>::as_mut_slice"
-                    | "alloc::vec::<Impl>::as_slice"
-                    | "alloc::vec::<Impl>::as_mut_slice"
                     | "pyre_object::object_array::<Impl>::as_slice"
                     | "pyre_object::object_array::<Impl>::as_mut_slice"
-            )
+            ) || rust_vec_slice_view(&path).is_some_and(RustVecSliceView::is_as_slice)
         })
     }
 
