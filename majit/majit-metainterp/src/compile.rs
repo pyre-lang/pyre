@@ -153,8 +153,8 @@ pub fn guard_resume_pc(descr: &dyn majit_ir::FailDescr) -> Option<u64> {
 pub struct CompileResult {
     /// The exit slots this run left through.
     ///
-    /// Populated on a FINISH and on a back-edge JUMP (`fail_index ==
-    /// u32::MAX`). A guard-failure leaves this empty: `compile.py
+    /// Populated on a FINISH and the propagate rewrite (which sets
+    /// `is_finish`). A guard-failure leaves this empty: `compile.py
     /// ResumeGuardDescr.handle_fail` does not copy the deadframe out, and
     /// `resume.py ResumeDataDirectReader.decode_int` reads named slots via
     /// `self.cpu.get_int_value(self.deadframe, num)`.
@@ -185,16 +185,16 @@ pub struct CompileResult {
     /// `descr.rd_loop_token_clt() -> clt.upgrade_loop_token()`.
     ///
     /// `None` when the walk finds no live owner (memmgr eviction) and on a
-    /// finish or back-edge JUMP exit, neither of which has a guard identity to
-    /// recover: `descr_owning_green_key` and `must_compile` are the only
-    /// readers, and neither exit reaches either. Readers fall back to the
-    /// key of the entry they came in through.
+    /// finish exit, which has no guard identity to recover:
+    /// `descr_owning_green_key` and `must_compile` are the only readers, and
+    /// a finish exit reaches neither. Readers fall back to the key of the
+    /// entry they came in through.
     pub rd_loop_token: Option<u64>,
     pub savedata: Option<GcRef>,
     /// `llmodel.py` deadframe from `cpu.force` / `execute_token`.
     /// Kept until `AllVirtuals.show` so `jf_savedata` stays rooted the
     /// way upstream traces it on the live jitframe. `None` on FINISH
-    /// and JUMP exits that never hide a cache.
+    /// exits that never hide a cache.
     pub deadframe: Option<DeadFrame>,
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
@@ -204,33 +204,6 @@ pub struct CompileResult {
     /// deadframe's live range ends inside the run, so the read happens where
     /// `status` is read and the word travels out on this result, keeping it
     /// per-failure the way upstream's deadframe read is.
-    pub guard_value_operand: Option<i64>,
-}
-
-/// Raw (lightweight) result from running compiled code.
-pub struct RawCompileResult {
-    pub values: ExitRawValues,
-    pub typed_values: ExitValues,
-    pub fail_index: u32,
-    pub trace_id: u64,
-    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
-    /// `compile.py:701`) — runtime descr Arc owning this exit.  Always
-    /// set: routed through `Backend::get_latest_descr_arc` via
-    /// `RawExecResult::descr_arc`, so FINISH / `DoneWithThisFrame*` /
-    /// `ExitFrameWithExceptionDescrRef` singletons return their global
-    /// Arc identity instead of `None`.  Bridge consumers
-    /// (`start_bridge_tracing`, `_trace_and_compile_from_bridge`) read
-    /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
-    pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
-    pub is_finish: bool,
-    /// compile.py ExitFrameWithExceptionDescrRef parity —
-    /// mirrors `CompileResult::is_exit_frame_with_exception`.
-    pub is_exit_frame_with_exception: bool,
-    pub savedata: Option<GcRef>,
-    pub exception: ExceptionState,
-    /// compile.py: ResumeGuardDescr.status read at guard failure.
-    pub status: u64,
-    /// Failing GUARD_VALUE operand read while the raw frame is live.
     pub guard_value_operand: Option<i64>,
 }
 

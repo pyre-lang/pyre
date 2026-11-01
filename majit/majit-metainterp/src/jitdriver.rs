@@ -7397,7 +7397,7 @@ impl<S: JitState> JitDriver<S> {
         // The exit is consumed here, outside the function that read the
         // repeats for the earlier stages, so it reads them again.
         #[cfg(feature = "__back-edge-stage-probe")]
-        if result.is_finish || result.fail_index == u32::MAX {
+        if result.is_finish {
             let stage_repeats = back_edge_stage_repeats();
             count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
             for _ in 0..stage_repeats.marshal_out {
@@ -7489,20 +7489,6 @@ impl<S: JitState> JitDriver<S> {
             // path, whose header `guard_value` already passed.
             self.meta.single_pass_finish = true;
             return Some(PortalResume::DoneWithThisFrame(None));
-        }
-
-        // Normal loop back-edge JUMP, not a guard failure.
-        if result.fail_index == u32::MAX {
-            // Same handle as the FINISH arm above, for the same reason.
-            let run_meta = &compiled_meta;
-            if !result.typed_values.is_empty() {
-                state.restore_values(run_meta, &result.typed_values);
-            }
-            // Carried from the entry decision above, not re-resolved; see
-            // the FINISH arm for why one resolution serves both ends of a
-            // compiled entry.
-            self.sync_after(state, run_meta, vable, None);
-            return Some(continue_at_pc(target_pc));
         }
 
         // compile.py handle_fail
@@ -9493,11 +9479,9 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        // JUMP already decoded on its own arm. A guard-failure through this
-        // runner still `restore_values`; re-derive the list from the deadframe.
-        let typed_values = if result.fail_index == u32::MAX {
-            std::mem::take(&mut result.typed_values)
-        } else if let (Some(frame), Some(fd)) = (
+        // A guard-failure through this runner still `restore_values`;
+        // re-derive the list from the deadframe.
+        let typed_values = if let (Some(frame), Some(fd)) = (
             result.deadframe.as_ref(),
             result.descr_arc.as_ref().and_then(|a| a.as_fail_descr()),
         ) {
@@ -9716,17 +9700,6 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let descr_arc = descr_arc.expect("a guard exit carries its descr");
-        // Normal loop back-edge JUMP, not a guard failure.
-        if fail_index == u32::MAX {
-            state.restore_values(&meta, &result.typed_values);
-            self.sync_after(state, &meta, vable, saved_vable_ptr);
-            drop(result);
-            return DetailedDriverRunOutcome::Jump {
-                via_blackhole: false,
-                continue_running_normally_values: None,
-                continue_running_normally_pc: None,
-            };
-        }
 
         // compile.py handle_fail / must_compile: single tick+check.
         // Guard-failure: decode from the deadframe after the split, for
