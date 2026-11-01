@@ -172,6 +172,7 @@ pub mod warmstate;
 #[cfg(test)]
 pub(crate) mod test_greens;
 
+pub use blackhole::BlackholeAbortBanks;
 pub use call_descr::{
     CANNOT_RAISE_NO_HEAP_EFFECT_INFO, ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
     ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO, ELIDABLE_EFFECT_INFO,

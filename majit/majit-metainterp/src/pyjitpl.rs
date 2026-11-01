@@ -7120,6 +7120,7 @@ impl<M: Clone> MetaInterp<M> {
             per_frame,
             on_enter_level,
             on_leave_level,
+            None,
         );
         self.framestack.frames.clear();
         result.outcome

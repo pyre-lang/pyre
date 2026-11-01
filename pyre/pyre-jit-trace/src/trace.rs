@@ -3574,10 +3574,7 @@ fn try_adopt_single_frame_blackhole(
         cf_addr
     };
     let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
-    let vable_frame = latched
-        .miframe
-        .ref_value_for_blackhole(frame_reg as usize)
-        .unwrap_or(0) as usize;
+    let vable_frame = latched.banks.ref_word(frame_reg as usize).unwrap_or(0) as usize;
     if vable_frame == 0 || vable_frame != root_addr {
         assert!(
             !preflighted,
@@ -3664,24 +3661,17 @@ fn try_adopt_single_frame_blackhole(
     // walker. `write_back_outer_locals` may box Int/Float locals and collect
     // before the blackhole driver installs its own packed roots. Bridge that
     // interval explicitly, including the detached snapshot's active operand
-    // stack, and copy forwarding updates into the MIFrame.
+    // stack, and copy forwarding updates into the abort banks.
     let image_ref_locations: Vec<usize> = latched
-        .miframe
-        .ref_regs
+        .banks
+        .registers_r
         .iter()
         .enumerate()
-        .filter_map(|(index, slot)| {
-            matches!(slot, Some(majit_ir::OpRef::ConstPtr(_))).then_some(index)
-        })
+        .filter_map(|(index, slot)| slot.map(|_| index))
         .collect();
     let mut image_ref_roots: Vec<i64> = image_ref_locations
         .iter()
-        .map(|&index| {
-            latched
-                .miframe
-                .ref_value_for_blackhole(index)
-                .expect("location came from ConstPtr")
-        })
+        .map(|&index| latched.banks.registers_r[index].expect("location came from abort ref bank"))
         .collect();
     let image_exception_root = (latched.last_exc_value != 0).then(|| {
         let index = image_ref_roots.len();
@@ -3709,14 +3699,14 @@ fn try_adopt_single_frame_blackhole(
         return false;
     }
     for (&index, &forwarded) in image_ref_locations.iter().zip(&image_ref_roots) {
-        latched.miframe.set_forwarded_ref_value(index, forwarded);
+        latched.banks.registers_r[index] = Some(forwarded);
     }
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
     }
     let committed_root_addr = latched
-        .miframe
-        .ref_value_for_blackhole(frame_reg as usize)
+        .banks
+        .ref_word(frame_reg as usize)
         .expect("preflighted frame register disappeared after forwarding")
         as usize;
     if let Some(stack) = captured_stack.as_ref() {
@@ -3753,6 +3743,7 @@ fn try_adopt_single_frame_blackhole(
         ctx.metainterp_sd().as_ref(),
         latched.last_exc_value,
         latched.raising_exception,
+        Some(&mut latched.banks),
     );
     // The blackhole roots and forwards both its Ref bank and the virtualizable
     // in place. A collection during the drive can therefore move the live frame
@@ -4044,7 +4035,11 @@ fn try_adopt_multi_frame_blackhole(
             per_frame.push((0, 0));
             continue;
         }
-        let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
+        let Some(frame_ptr) = latched
+            .banks
+            .get(index)
+            .and_then(|frame_banks| frame_banks.ref_word(frame_reg as usize))
+        else {
             mfdbg!("frame {index}: reg {frame_reg} unstamped");
             return false;
         };
@@ -4301,32 +4296,27 @@ fn try_adopt_multi_frame_blackhole(
         return false;
     };
     // Taking the latch removes it from the TLS extra-root walker.  Root every
-    // MIFrame Ref bank and the pending exception across root-locals boxing,
+    // abort-bank Ref word and the pending exception across root-locals boxing,
     // then copy forwarding updates back before the blackhole copies the banks.
     // This is the multi-frame counterpart of the packed image roots in
     // `try_adopt_single_frame_blackhole`.
     let image_ref_locations: Vec<(usize, usize)> = latched
-        .framestack
-        .frames
+        .banks
         .iter()
         .enumerate()
-        .flat_map(|(frame_index, frame)| {
-            frame
-                .ref_regs
+        .flat_map(|(frame_index, frame_banks)| {
+            frame_banks
+                .registers_r
                 .iter()
                 .enumerate()
-                .filter_map(move |(reg_index, slot)| {
-                    matches!(slot, Some(majit_ir::OpRef::ConstPtr(_)))
-                        .then_some((frame_index, reg_index))
-                })
+                .filter_map(move |(reg_index, slot)| slot.map(|_| (frame_index, reg_index)))
         })
         .collect();
     let mut image_ref_roots: Vec<i64> = image_ref_locations
         .iter()
         .map(|&(frame_index, reg_index)| {
-            latched.framestack.frames[frame_index]
-                .ref_value_for_blackhole(reg_index)
-                .expect("location came from ConstPtr")
+            latched.banks[frame_index].registers_r[reg_index]
+                .expect("location came from abort ref bank")
         })
         .collect();
     let image_exception_root = (latched.last_exc_value != 0).then(|| {
@@ -4359,7 +4349,7 @@ fn try_adopt_multi_frame_blackhole(
     // both, while the roots are still registered.
     for (&(frame_index, reg_index), &forwarded) in image_ref_locations.iter().zip(&image_ref_roots)
     {
-        latched.framestack.frames[frame_index].set_forwarded_ref_value(reg_index, forwarded);
+        latched.banks[frame_index].registers_r[reg_index] = Some(forwarded);
     }
     if let Some(index) = image_exception_root {
         latched.last_exc_value = image_ref_roots[index];
@@ -4495,6 +4485,7 @@ fn try_adopt_multi_frame_blackhole(
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
         Some(&finish_level as &dyn Fn(i64)),
+        Some(latched.banks.as_mut_slice()),
     );
     // `leave`: restore `ec.topframeref` to the portal after the inline chain,
     // reading the root back so an in-place forward during the drive is kept.

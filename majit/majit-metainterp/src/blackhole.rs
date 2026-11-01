@@ -635,6 +635,50 @@ impl Default for BlackholeInterpreter {
     }
 }
 
+/// `BlackholeInterpreter.registers_{i,r,f}` for one abort-handoff frame.
+///
+/// `_copy_data_from_miframe` (`blackhole.py`) does `box.getint()` /
+/// `box.getref_base()` / `box.getfloatstorage()` then `setarg_*`. FBW abort
+/// captures those raw words here instead of minting `OpRef::const_*` onto
+/// the tracing MIFrame. A `None` slot is `box is None`.
+#[derive(Clone, Debug, Default)]
+pub struct BlackholeAbortBanks {
+    pub registers_i: Vec<Option<i64>>,
+    pub registers_r: Vec<Option<i64>>,
+    pub registers_f: Vec<Option<i64>>,
+}
+
+impl BlackholeAbortBanks {
+    /// Sized to the tracing MIFrame's `num_regs_and_consts_*` banks.
+    pub fn sized_for(miframe: &MIFrame) -> Self {
+        Self {
+            registers_i: vec![None; miframe.int_regs.len()],
+            registers_r: vec![None; miframe.ref_regs.len()],
+            registers_f: vec![None; miframe.float_regs.len()],
+        }
+    }
+
+    /// Harvest `getint` / `getref_base` / `getfloatstorage` off already-minted
+    /// Const boxes. Used by the vable-escape latch, which still mints.
+    pub fn from_miframe_const_boxes(miframe: &MIFrame) -> Self {
+        Self {
+            registers_i: (0..miframe.int_regs.len())
+                .map(|i| miframe.int_value_for_blackhole(i))
+                .collect(),
+            registers_r: (0..miframe.ref_regs.len())
+                .map(|i| miframe.ref_value_for_blackhole(i))
+                .collect(),
+            registers_f: (0..miframe.float_regs.len())
+                .map(|i| miframe.float_value_for_blackhole(i))
+                .collect(),
+        }
+    }
+
+    pub fn ref_word(&self, index: usize) -> Option<i64> {
+        self.registers_r.get(index).copied().flatten()
+    }
+}
+
 /// `history.py` `getint` / `getref_base` / `getfloatstorage` exist only on
 /// the box class of that bank. `BlackholeInterpreter._copy_data_from_miframe`
 /// calls the matching getter; an int box in `registers_r` is a tracer bug.
@@ -1044,6 +1088,32 @@ impl BlackholeInterpreter {
         for i in 0..self.jitcode.num_regs_f() {
             expect_box_bank(miframe, i, majit_ir::Type::Float, &miframe.float_regs);
             if let Some(val) = miframe.float_value_for_blackhole(i) {
+                self.setarg_f(i, val);
+            }
+        }
+    }
+
+    /// `_copy_data_from_miframe` from raw words already taken off the
+    /// live boxes (`box.getint()` / `getref_base()` / `getfloatstorage()`).
+    ///
+    /// FBW abort captures those words on [`BlackholeAbortBanks`] instead of
+    /// minting `OpRef::const_*` onto the tracing MIFrame. `setposition`
+    /// still comes from the MIFrame; typed `setarg_*` come from the banks.
+    /// A `None` slot is `box is None` and is skipped.
+    pub fn copy_data_from_abort_banks(&mut self, miframe: &MIFrame, banks: &BlackholeAbortBanks) {
+        self.setposition(miframe.jitcode.clone(), miframe.pc);
+        for i in 0..self.jitcode.num_regs_i() {
+            if let Some(val) = banks.registers_i.get(i).copied().flatten() {
+                self.setarg_i(i, val);
+            }
+        }
+        for i in 0..self.jitcode.num_regs_r() {
+            if let Some(val) = banks.registers_r.get(i).copied().flatten() {
+                self.setarg_r(i, val);
+            }
+        }
+        for i in 0..self.jitcode.num_regs_f() {
+            if let Some(val) = banks.registers_f.get(i).copied().flatten() {
                 self.setarg_f(i, val);
             }
         }
@@ -3796,6 +3866,10 @@ pub struct PyjitplBlackholeFrameConfig<'a> {
     /// portal's virtualizable, and a nested level would hand back the frame
     /// ABOVE it — marking a caller that is still running as finished.
     pub on_leave_level: Option<&'a dyn Fn(i64)>,
+    /// FBW abort handoff: per-frame raw banks aligned with `framestack`.
+    /// When present, `_copy_data_from_miframe` `setarg_*` reads these instead
+    /// of MIFrame Const boxes. MetaInterp freeze-then-abort leaves this `None`.
+    pub abort_banks: Option<&'a [BlackholeAbortBanks]>,
 }
 
 pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
@@ -3821,7 +3895,11 @@ pub fn convert_and_run_from_pyjitpl<P: BlackholeInterpPool>(
         let mut next_bh: Option<Box<BlackholeInterpreter>> = None;
         for (frame_index, frame) in framestack.frames.iter().enumerate() {
             let mut cur_bh = builder.acquire_interp();
-            cur_bh.copy_data_from_miframe(frame);
+            if let Some(banks) = config.as_ref().and_then(|c| c.abort_banks) {
+                cur_bh.copy_data_from_abort_banks(frame, &banks[frame_index]);
+            } else {
+                cur_bh.copy_data_from_miframe(frame);
+            }
             if let Some(config) = config.as_ref() {
                 cur_bh.state_field_layout = config.state_field_layout.clone();
                 cur_bh.virtualizable_info = config.virtualizable_info;
@@ -4836,6 +4914,29 @@ mod tests {
             bh.copy_data_from_miframe(&frame);
 
             assert_eq!(bh.registers_r[0], 0xBEEF);
+        }
+
+        /// FBW abort copies `getint` / `getref_base` / `getfloatstorage`
+        /// words already taken off the live boxes. The MIFrame register
+        /// slots stay unset.
+        #[test]
+        fn copy_data_from_abort_banks_reads_raw_words() {
+            use crate::blackhole::BlackholeAbortBanks;
+            use crate::pyjitpl::MIFrame;
+
+            let mut b = JitCodeBuilder::default();
+            b.ref_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let frame = MIFrame::new(jitcode, 0);
+            let mut banks = BlackholeAbortBanks::sized_for(&frame);
+            banks.registers_r[0] = Some(0xBEEF);
+
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.copy_data_from_abort_banks(&frame, &banks);
+
+            assert_eq!(bh.registers_r[0], 0xBEEF);
+            assert!(frame.ref_regs.iter().all(Option::is_none));
         }
 
         #[test]
