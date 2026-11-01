@@ -14555,44 +14555,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// Check whether a bridge was actually compiled and attached for a guard.
-    /// Used by jit_bridge_compile_for_guard to distinguish successful bridge
-    /// compilation from trace abort (`pyjitpl.py` handle_guard_failure).
-    ///
-    /// The failing descr is in hand (`bridge_info().source_descr`); callers
-    /// already try `bridge_attached` on it. The live procedure token is the
-    /// remaining backend query (`get_procedure_token`).
-    pub fn bridge_was_compiled(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
-        // The guard being asked about is the trace session's own origin, and
-        // its descr is in hand (`pyjitpl.py handle_guard_failure`'s
-        // `resumedescr`); the backend answers off that descr without a walk
-        // over the token's code blocks.
-        if let Some(info) = self.bridge_info()
-            && info.trace_id == trace_id
-            && info.fail_index == fail_index
-            && let Some(fd) = info.source_descr.as_fail_descr()
-            && let Some(attached) = self.backend.bridge_attached(fd)
-        {
-            return attached;
-        }
-        if let Some(token) = self.get_procedure_token(green_key)
-            && self
-                .backend
-                .bridge_was_compiled(&token, trace_id, fail_index)
-        {
-            return true;
-        }
-        false
-    }
-
-    /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
-    #[allow(dead_code)]
-    fn cut_tentative_op(&mut self, cut_at: crate::recorder::TracePosition) {
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.cut_trace(cut_at);
-        }
-    }
-
     /// pyjitpl.py: the `compile_trace` outcome classification shared by
     /// every close that goes through `compile_trace_inner` — the guard-origin
     /// bridge (`close_bridge`) and the interp-origin entry bridge
@@ -31568,7 +31530,7 @@ mod tests {
         assert_eq!(meta.stats.bridges_compiled, 1);
         assert!(
             meta.backend
-                .bridge_was_compiled(&origin_token, trace_id, fail_index),
+                .bridge_attached(descr_arc.as_fail_descr().unwrap()),
             "the kept origin token must own the attached FINISH bridge"
         );
     }

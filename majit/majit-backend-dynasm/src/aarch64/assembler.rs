@@ -4934,7 +4934,7 @@ impl<'a> AssemblerARM64<'a> {
         // ResumeGuardDescr (`op.descr`).  See x86 counterpart for rationale:
         // routing the writes through the trait at codegen time lets readers
         // consume the canonical metainterp identity before
-        // `build_guard_metadata` (`compile.rs`) re-stamps.
+        // `stamp_guard_descr_trace_positions` (`compile.rs`) re-stamps.
         if let Some(d) = op.getdescr()
             && (d.is_resume_guard() || d.is_resume_guard_copied())
             && let Some(fd) = d.as_fail_descr()

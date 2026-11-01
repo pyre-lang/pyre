@@ -11117,16 +11117,8 @@ impl<S: JitState> JitDriver<S> {
         // path once a bridge is attached. A later `must_compile` FIRED
         // here is a pyre re-entry; walking again can abort setup and
         // terminally decline the working source.
-        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
-        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
-        // `bridge_attached` returns `Some(false)` while the guard still
-        // owns its recovery stub; `None` falls back to the token map.
-        let already_compiled = match self.meta.backend.bridge_attached(descr_fd) {
-            Some(attached) => attached,
-            None => self
-                .meta
-                .bridge_was_compiled(green_key, trace_id, fail_index),
-        };
+        // The descr's mark answers (`assembler.py patch_jump_for_descr`).
+        let already_compiled = self.meta.backend.bridge_attached(descr_fd);
         if already_compiled {
             return false;
         }

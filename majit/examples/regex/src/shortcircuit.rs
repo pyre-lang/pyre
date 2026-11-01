@@ -1159,8 +1159,8 @@ mod tests {
     }
 
     /// Same Matcher, same input, several passes: the bridge counter after each
-    /// one. `bridge_was_compiled` already refuses a (trace_id, fail_index)
-    /// that has a bridge; later passes compile *new* fail sites at the
+    /// one. The guard descr's mark (`assembler.py patch_jump_for_descr`)
+    /// already refuses a site that has a bridge; later passes compile *new* fail sites at the
     /// `trace_eagerness` rate (a bridge's own guards), not the same site
     /// again. The count therefore keeps growing at about `n / 200` per pass.
     #[test]

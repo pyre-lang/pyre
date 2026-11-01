@@ -5638,7 +5638,7 @@ impl<'a> Assembler386<'a> {
         // ResumeGuardDescr (`op.descr`).  `compile.py` reserves these
         // slots for the `ResumeDescr` family; gate the writes accordingly
         // so non-resume meta descrs (Done* / Exit* / Propagate) take the
-        // default panic path.  The metainterp's `build_guard_metadata`
+        // default panic path.  The metainterp's `stamp_guard_descr_trace_positions`
         // (`compile.rs`) used to do this after backend codegen with
         // the same sequential counter; doing it here lets readers consume
         // the canonical metainterp identity before metadata builds.

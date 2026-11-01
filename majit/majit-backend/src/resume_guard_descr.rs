@@ -178,7 +178,7 @@ pub struct ResumeGuardDescr {
     pub status: AtomicU64,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
     pub trace_id: AtomicU64,
-    /// Pyre-only: per-trace `fail_index` assigned by `build_guard_metadata`.
+    /// Pyre-only: per-trace `fail_index` assigned by `stamp_guard_descr_trace_positions`.
     pub fail_index_per_trace: AtomicU32,
     /// Set when `compile_bridge` declined this guard for a deterministic
     /// structural reason (`Backend::bridge_decline_is_terminal`).

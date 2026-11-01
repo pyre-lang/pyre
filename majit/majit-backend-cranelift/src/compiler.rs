@@ -22756,33 +22756,10 @@ impl majit_backend::Backend for CraneliftBackend {
         CraneliftBackend::set_callinfocollection(self, cic);
     }
 
-    fn bridge_was_compiled(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> bool {
-        let Some(original_compiled) = original_token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)
-        else {
-            return false;
-        };
-        find_fail_descr_in_fail_descrs(
-            &original_compiled.fail_descrs,
-            source_trace_id,
-            source_fail_index,
-        )
-        .and_then(|descr| fail_descr_bridge_ref(as_fd(&descr)))
-        .is_some()
-    }
-
     /// The guard's dispatch cell holds the `BridgeData` once a bridge is
     /// attached; `patch_jump_for_descr` installs it.
-    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
-        Some(fail_descr_bridge_ref(descr).is_some())
+    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> bool {
+        fail_descr_bridge_ref(descr).is_some()
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
@@ -23196,31 +23173,6 @@ impl majit_backend::Backend for CraneliftBackend {
         Some(build_per_trace_layouts(
             &compiled.fail_descrs,
             compiled.trace_id,
-        ))
-    }
-
-    fn compiled_bridge_fail_descr_layouts(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let original_compiled = original_token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        // Use recursive search to find fail_descrs nested inside bridges.
-        let source_descr = find_fail_descr_in_fail_descrs(
-            &original_compiled.fail_descrs,
-            source_trace_id,
-            source_fail_index,
-        )?;
-        let bridge = fail_descr_bridge_ref(as_fd(&source_descr));
-        let bridge = bridge.as_ref()?;
-        Some(build_per_trace_layouts(
-            &bridge.fail_descrs,
-            bridge.trace_id,
         ))
     }
 

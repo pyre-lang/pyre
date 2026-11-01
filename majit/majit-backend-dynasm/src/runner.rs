@@ -2209,31 +2209,6 @@ impl DynasmBackend {
         }
     }
 
-    /// Bridge entry-pointer lookup by source guard `(trace_id, fail_index_per_trace)`.
-    /// Reads `CompiledLoopToken.compiled_bridge_addrs`, written when the
-    /// matching `CompiledCode` is pushed onto `asmmemmgr_blocks`. Returns
-    /// `0` if none — `assembler.py` treats `adr_jump_offset == 0`
-    /// uniformly as "patched / no entry".
-    ///
-    /// The map is append-only and insert-overwrites, so retracing the same
-    /// guard resolves to the most recently compiled bridge — that is the
-    /// one `bridge_was_compiled` / `compiled_bridge_fail_descr_layouts`
-    /// ask about and the one subsequent guard failures should dispatch into.
-    pub fn lookup_bridge_addr(
-        &self,
-        token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> usize {
-        token
-            .compiled_loop_token_expect()
-            .compiled_bridge_addrs
-            .lock()
-            .get(&(source_trace_id, source_fail_index))
-            .copied()
-            .unwrap_or(0)
-    }
-
     /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
     /// `ExitFrameWithExceptionDescrRef` descrs, mirroring the state
     /// `MetaInterpStaticData.attach_descrs_to_cpu(cpu)` leaves the
@@ -2923,23 +2898,6 @@ impl DynasmBackend {
                 }
             }
             eprintln!();
-        }
-
-        // Debug: verify bridge patches are visible
-        if diag && crate::majit_log_enabled() {
-            for descr in compiled.unwrap().fail_descrs.iter() {
-                if let Some(fd) = descr.as_fail_descr() {
-                    let bridge_addr =
-                        self.lookup_bridge_addr(token, fd.trace_id(), fd.fail_index_per_trace());
-                    if bridge_addr != 0 && fd.adr_jump_offset() == 0 {
-                        eprintln!(
-                            "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
-                            fd.fail_index_per_trace(),
-                            bridge_addr
-                        );
-                    }
-                }
-            }
         }
 
         // llmodel.py `make_execute_token` fixes the entry signature as
@@ -3842,12 +3800,8 @@ impl Backend for DynasmBackend {
             }
         }
 
-        let source_guard = compiled.source_guard;
         let clt = original_token.compiled_loop_token_expect();
         clt.asmmemmgr_blocks.lock().push(Box::new(compiled));
-        if let Some(key) = source_guard {
-            clt.compiled_bridge_addrs.lock().insert(key, bridge_addr);
-        }
 
         Ok(AsmInfo {
             code_addr: bridge_addr,
@@ -4261,25 +4215,6 @@ impl Backend for DynasmBackend {
         let new_addr = new_compiled.entry_ptr();
         Asm::redirect_call_assembler(old, new, old_addr, new_addr);
         Ok(())
-    }
-
-    fn bridge_was_compiled(
-        &self,
-        token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> bool {
-        self.lookup_bridge_addr(token, source_trace_id, source_fail_index) != 0
-    }
-
-    /// `patch_pending_failure_recoveries` stamps every assembled guard's
-    /// recovery stub address into `adr_jump_offset`, and `patch_jump_for_descr`
-    /// zeroes it once the guard's jump has been redirected into a bridge. A
-    /// non-zero offset therefore still names the guard's own stub: no bridge.
-    /// Zero is left to the token map, since a guard that never received a
-    /// stub reads the same way as a patched one.
-    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
-        (descr.adr_jump_offset() != 0).then_some(false)
     }
 
     fn bh_new(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
@@ -4833,49 +4768,6 @@ impl Backend for DynasmBackend {
                         })
                         .collect(),
                 );
-            }
-        }
-        None
-    }
-
-    fn compiled_bridge_fail_descr_layouts(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        // RPython faildescr lookup is by object identity, never misses.
-        // majit query-style callers (`bridge_was_compiled` etc.) probe
-        // by (trace_id, fail_index) and must treat the miss as `None`
-        // — match cranelift's `?` semantics in
-        // `compiler.rs`'s `compiled_bridge_fail_descr_layouts`.
-        let bridge_addr =
-            self.lookup_bridge_addr(original_token, source_trace_id, source_fail_index);
-        if bridge_addr == 0 {
-            return None;
-        }
-        let blocks_clt = original_token.compiled_loop_token_expect();
-        let blocks = blocks_clt.asmmemmgr_blocks.lock();
-        for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                let addr = bridge.entry_ptr() as usize;
-                if addr == bridge_addr {
-                    let bridge_trace_id = bridge.trace_id;
-                    return Some(
-                        bridge
-                            .fail_descrs
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, d)| {
-                                crate::guard::layout_for_fail_descr(
-                                    &d.descr,
-                                    idx as u32,
-                                    bridge_trace_id,
-                                )
-                            })
-                            .collect(),
-                    );
-                }
             }
         }
         None
