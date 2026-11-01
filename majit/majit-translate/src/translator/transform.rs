@@ -882,10 +882,11 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                         break;
                     }
                     // upstream `items[s.const] = None` relies on Python
-                    // dict key semantics where `1 == 1.0 == True` all
-                    // hash to the same bucket and the FIRST insertion
-                    // wins. `ConstValue`'s derived `Eq`/`Hash` treats
-                    // `Int(1)`, `Float(1.0)`, and `Bool(true)` as
+                    // dict key semantics where `1 == 1.0 == True ==
+                    // r_uchar(1)` all hash to the same bucket and the
+                    // FIRST insertion wins. `ConstValue`'s derived
+                    // `Eq`/`Hash` treats `Int(1)`, `Float(1.0)`,
+                    // `Bool(true)`, `UInt(1)`, and `RInt(_, 1, _)` as
                     // distinct, so dedup via `canonical_dict_key` but
                     // store the ORIGINAL key so the DictDef annotation
                     // keeps the caller's inferred type (e.g. `SomeBool`
@@ -915,14 +916,36 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
     }
 }
 
+/// Fold an integer numeric value onto the single [`ConstValue`] carrier
+/// Python's dict would bucket it under.
+///
+/// Upstream `transform_list_contains` does `items[s.const] = None`; a
+/// Python dict collapses keys that compare equal (`r_uchar(1) == 1 ==
+/// True == r_uint(1)`). Prefer `Int` when the value fits `i64`, else
+/// `UInt` when it fits `u64` (the crate's word-sized unsigned carrier),
+/// else `Int128` when it fits `i128`, else `UInt128`.
+fn canonical_integer_key(v: crate::rlib::rarithmetic::RIntValue) -> ConstValue {
+    if let Some(n) = v.as_i128() {
+        if let Ok(i) = i64::try_from(n) {
+            ConstValue::Int(i)
+        } else if let Ok(u) = u64::try_from(n) {
+            ConstValue::UInt(u)
+        } else {
+            ConstValue::Int128(n)
+        }
+    } else {
+        ConstValue::UInt128(v.as_u128())
+    }
+}
+
 /// Map a [`ConstValue`] to the key Python's built-in `dict` would
 /// bucket it under.
 ///
 /// Python's numeric tower makes `True`, `1`, and `1.0` interchangeable
 /// as dict keys: `hash(True) == hash(1) == hash(1.0)` and equality
 /// spans the three. `ConstValue` derives `Eq`/`Hash` from its enum
-/// shape, so `Bool(true)` / `Int(1)` / `Float(bits_of_1.0)` are three
-/// separate keys.
+/// shape, so `Bool(true)` / `Int(1)` / `Float(bits_of_1.0)` /
+/// `RInt(r_uchar, 1, _)` / `UInt(1)` are distinct keys.
 ///
 /// Canonical rules used here:
 ///
@@ -931,12 +954,20 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
 ///   and fits an `i64` → `Int(value as i64)`. Non-integral / non-finite
 ///   floats keep their `Float` form (Python hashes `1.5` and `Int(1)`
 ///   into different buckets).
+/// * Integer carriers (`Int`, `UInt`, `Int128`, `UInt128`, `RInt`) —
+///   `rint_value` for `RInt`, then [`canonical_integer_key`].
 /// * `Tuple(items)` — recurse so `(True,)` and `(1,)` collapse the
 ///   same way upstream's Python dict would.
 /// * Everything else returns as-is.
 fn canonical_dict_key(cv: ConstValue) -> ConstValue {
+    use crate::rlib::rarithmetic::{RIntValue, rint_value};
     match cv {
-        ConstValue::Bool(b) => ConstValue::Int(if b { 1 } else { 0 }),
+        ConstValue::Bool(b) => canonical_integer_key(RIntValue::Signed(i128::from(b))),
+        ConstValue::Int(n) => canonical_integer_key(RIntValue::Signed(i128::from(n))),
+        ConstValue::UInt(n) => canonical_integer_key(RIntValue::Unsigned(u128::from(n))),
+        ConstValue::Int128(n) => canonical_integer_key(RIntValue::Signed(n)),
+        ConstValue::UInt128(n) => canonical_integer_key(RIntValue::Unsigned(n)),
+        ConstValue::RInt(class, v, _) => canonical_integer_key(rint_value(class, v)),
         ConstValue::Float(bits) => {
             let f = f64::from_bits(bits);
             if f.is_finite() && f == f.trunc() && f >= i64::MIN as f64 && f < i64::MAX as f64 + 1.0
@@ -979,6 +1010,7 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         ConstValue::Bool(_)
         | ConstValue::Int(_)
         | ConstValue::UInt(_)
+        | ConstValue::RInt(_, _, _)
         | ConstValue::Int128(_)
         | ConstValue::UInt128(_)
         | ConstValue::Float(_)
@@ -1957,5 +1989,109 @@ mod tests {
             items.contains_key(&CV::Bool(true)),
             "first-inserted Bool(true) must win over Int(1); got {items:?}"
         );
+    }
+
+    /// Run `transform_list_contains` on a constant `newlist` and return
+    /// the rewritten dict. The needle is a nonneg `SomeInteger` so an
+    /// unsigned first key (`r_uchar`) can `generalize_key` against it.
+    fn contains_dict_from_constant_list(
+        keys: Vec<ConstValue>,
+    ) -> std::sync::Arc<IndexMap<ConstValue, ConstValue>> {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{Constant as C, SpaceOperation};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+        let list_v = Variable::new();
+        let needle = Variable::new();
+        needle
+            .annotation
+            .replace(Some(std::rc::Rc::new(SomeValue::Integer(
+                SomeInteger::new(true, false),
+            ))));
+        let result = Variable::new();
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "newlist",
+            keys.into_iter()
+                .map(|key| Hlvalue::Constant(C::new(key)))
+                .collect(),
+            Hlvalue::Variable(list_v.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "contains",
+            vec![Hlvalue::Variable(list_v), Hlvalue::Variable(needle)],
+            Hlvalue::Variable(result),
+        ));
+        transform_list_contains(&ann, std::slice::from_ref(&block));
+        let ops = &block.borrow().operations;
+        let Hlvalue::Constant(dict_c) = &ops[1].args[0] else {
+            panic!("contains lhs should be rewritten to Constant(dict)");
+        };
+        let ConstValue::Dict(items) = &dict_c.value else {
+            panic!("contains lhs constant should carry Dict");
+        };
+        items.clone()
+    }
+
+    #[test]
+    fn transform_list_contains_canonicalises_rint_and_integer_carriers() {
+        use crate::flowspace::model::ConstValue as CV;
+        use crate::rlib::rarithmetic::built_rint;
+
+        let uchar = built_rint("r_uchar", false, 8);
+        let ushort = built_rint("r_ushort", false, 16);
+        let r_uchar_1 = CV::rint(uchar, 1);
+        let r_ushort_1 = CV::rint(ushort, 1);
+
+        assert_eq!(canonical_dict_key(r_uchar_1.clone()), CV::Int(1));
+        assert_eq!(canonical_dict_key(r_ushort_1.clone()), CV::Int(1));
+        assert_eq!(canonical_dict_key(CV::UInt(1)), CV::Int(1));
+        assert_eq!(canonical_dict_key(CV::Int128(1)), CV::Int(1));
+        assert_eq!(canonical_dict_key(CV::UInt128(1)), CV::Int(1));
+        assert_eq!(canonical_dict_key(CV::UInt(u64::MAX)), CV::UInt(u64::MAX));
+        assert_eq!(
+            canonical_dict_key(CV::Int128(u64::MAX as i128)),
+            CV::UInt(u64::MAX)
+        );
+        assert_eq!(
+            canonical_dict_key(CV::UInt128(u64::MAX as u128)),
+            CV::UInt(u64::MAX)
+        );
+        assert_eq!(
+            canonical_dict_key(CV::Int128(i128::MIN)),
+            CV::Int128(i128::MIN)
+        );
+        assert_eq!(
+            canonical_dict_key(CV::UInt128(u128::MAX)),
+            CV::UInt128(u128::MAX)
+        );
+        assert_eq!(
+            canonical_dict_key(CV::UInt128(i128::MAX as u128)),
+            CV::Int128(i128::MAX)
+        );
+        assert_eq!(
+            canonical_dict_key(CV::Tuple(vec![r_uchar_1.clone()])),
+            canonical_dict_key(CV::Tuple(vec![CV::Int(1)]))
+        );
+
+        let items =
+            contains_dict_from_constant_list(vec![r_uchar_1.clone(), CV::Int(1), CV::Bool(true)]);
+        assert_eq!(items.len(), 1, "[r_uchar(1), 1, True] must be one entry");
+        assert!(
+            items.contains_key(&r_uchar_1),
+            "first-inserted r_uchar(1) must win; got {items:?}"
+        );
+
+        let items = contains_dict_from_constant_list(vec![r_uchar_1.clone(), r_ushort_1]);
+        assert_eq!(
+            items.len(),
+            1,
+            "[r_uchar(1), r_ushort(1)] must be one entry"
+        );
+
+        let items = contains_dict_from_constant_list(vec![r_uchar_1.clone(), CV::Int(2)]);
+        assert_eq!(items.len(), 2, "[r_uchar(1), 2] must be two entries");
+        assert!(items.contains_key(&r_uchar_1));
+        assert!(items.contains_key(&CV::Int(2)));
     }
 }

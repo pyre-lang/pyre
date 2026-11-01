@@ -35321,6 +35321,49 @@ mod tests {
             .collect()
     }
 
+    /// One `test_flatten.py test_force_cast_ints` row: `""` is identity,
+    /// `"int_is_true"` one `int_is_true`, `"int_and %i0, $N"` / `"int_signext %i0, $N"`
+    /// one matching binop with constant `N`.
+    fn force_cast_ints_row(
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        expected: &str,
+    ) {
+        if expected.is_empty() {
+            force_cast_identity(from, to);
+            return;
+        }
+        let (ops, _) = force_cast_replace(from.clone(), to.clone());
+        if expected == "int_is_true" {
+            assert_eq!(
+                ops_unaries(&ops),
+                ["int_is_true"],
+                "force_cast {from:?} -> {to:?}"
+            );
+            return;
+        }
+        let (opname, n_str) = if let Some(rest) = expected.strip_prefix("int_and %i0, $") {
+            ("int_and", rest)
+        } else if let Some(rest) = expected.strip_prefix("int_signext %i0, $") {
+            ("int_signext", rest)
+        } else {
+            panic!("force_cast {from:?} -> {to:?}: bad expected {expected:?}");
+        };
+        let n: i64 = n_str.parse().unwrap_or_else(|_| {
+            panic!("force_cast {from:?} -> {to:?}: bad constant in {expected:?}")
+        });
+        assert_eq!(
+            ops_binops(&ops),
+            [opname],
+            "force_cast {from:?} -> {to:?}: ops={ops:?}"
+        );
+        assert_eq!(
+            ops_const_ints(&ops),
+            [n],
+            "force_cast {from:?} -> {to:?}: ops={ops:?}"
+        );
+    }
+
     /// `test_flatten.py test_force_cast_char_to_bool` / Char→Bool.
     #[test]
     fn force_cast_char_to_bool_is_int_is_true() {
@@ -35353,9 +35396,100 @@ mod tests {
         assert_eq!(ops_const_ints(&ops), [255]);
     }
 
-    /// `LowLevelType` has no signed 1-byte/2-byte primitive, so
-    /// `int_signext` has no dest type to unit-test. Unsigned→Char is
-    /// `int_and 255`; Char→Signed is identity (`test_flatten.py`).
+    /// `test_flatten.py test_force_cast_ints`: SIGNEDCHAR / UCHAR / SHORT /
+    /// USHORT / LONG / ULONG sources × their targets (Bool included).
+    /// `_WIN32` `ulong_cast` / `ulong_sign` via `cfg!(windows)`.
+    #[test]
+    fn force_cast_ints_table() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::{
+            LONG, SHORT, SIGNEDCHAR, UCHAR, ULONG, USHORT,
+        };
+
+        let ulong_cast = if cfg!(windows) {
+            "int_and %i0, $4294967295"
+        } else {
+            ""
+        };
+        let ulong_sign = if cfg!(windows) {
+            "int_signext %i0, $4"
+        } else {
+            ""
+        };
+        let rows = [
+            ((*SIGNEDCHAR).clone(), (*SIGNEDCHAR).clone(), ""),
+            ((*SIGNEDCHAR).clone(), (*UCHAR).clone(), "int_and %i0, $255"),
+            ((*SIGNEDCHAR).clone(), (*SHORT).clone(), ""),
+            (
+                (*SIGNEDCHAR).clone(),
+                (*USHORT).clone(),
+                "int_and %i0, $65535",
+            ),
+            ((*SIGNEDCHAR).clone(), (*LONG).clone(), ""),
+            ((*SIGNEDCHAR).clone(), (*ULONG).clone(), ulong_cast),
+            ((*SIGNEDCHAR).clone(), LowLevelType::Bool, "int_is_true"),
+            (
+                (*UCHAR).clone(),
+                (*SIGNEDCHAR).clone(),
+                "int_signext %i0, $1",
+            ),
+            ((*UCHAR).clone(), (*UCHAR).clone(), ""),
+            ((*UCHAR).clone(), (*SHORT).clone(), ""),
+            ((*UCHAR).clone(), (*USHORT).clone(), ""),
+            ((*UCHAR).clone(), (*LONG).clone(), ""),
+            ((*UCHAR).clone(), (*ULONG).clone(), ""),
+            ((*UCHAR).clone(), LowLevelType::Bool, "int_is_true"),
+            (
+                (*SHORT).clone(),
+                (*SIGNEDCHAR).clone(),
+                "int_signext %i0, $1",
+            ),
+            ((*SHORT).clone(), (*UCHAR).clone(), "int_and %i0, $255"),
+            ((*SHORT).clone(), (*SHORT).clone(), ""),
+            ((*SHORT).clone(), (*USHORT).clone(), "int_and %i0, $65535"),
+            ((*SHORT).clone(), (*LONG).clone(), ""),
+            ((*SHORT).clone(), (*ULONG).clone(), ulong_cast),
+            ((*SHORT).clone(), LowLevelType::Bool, "int_is_true"),
+            (
+                (*USHORT).clone(),
+                (*SIGNEDCHAR).clone(),
+                "int_signext %i0, $1",
+            ),
+            ((*USHORT).clone(), (*UCHAR).clone(), "int_and %i0, $255"),
+            ((*USHORT).clone(), (*SHORT).clone(), "int_signext %i0, $2"),
+            ((*USHORT).clone(), (*USHORT).clone(), ""),
+            ((*USHORT).clone(), (*LONG).clone(), ""),
+            ((*USHORT).clone(), (*ULONG).clone(), ""),
+            ((*USHORT).clone(), LowLevelType::Bool, "int_is_true"),
+            (
+                (*LONG).clone(),
+                (*SIGNEDCHAR).clone(),
+                "int_signext %i0, $1",
+            ),
+            ((*LONG).clone(), (*UCHAR).clone(), "int_and %i0, $255"),
+            ((*LONG).clone(), (*SHORT).clone(), "int_signext %i0, $2"),
+            ((*LONG).clone(), (*USHORT).clone(), "int_and %i0, $65535"),
+            ((*LONG).clone(), LowLevelType::Bool, "int_is_true"),
+            ((*LONG).clone(), (*LONG).clone(), ""),
+            ((*LONG).clone(), (*ULONG).clone(), ulong_cast),
+            (
+                (*ULONG).clone(),
+                (*SIGNEDCHAR).clone(),
+                "int_signext %i0, $1",
+            ),
+            ((*ULONG).clone(), (*UCHAR).clone(), "int_and %i0, $255"),
+            ((*ULONG).clone(), (*SHORT).clone(), "int_signext %i0, $2"),
+            ((*ULONG).clone(), (*USHORT).clone(), "int_and %i0, $65535"),
+            ((*ULONG).clone(), LowLevelType::Bool, "int_is_true"),
+            ((*ULONG).clone(), (*LONG).clone(), ulong_sign),
+            ((*ULONG).clone(), (*ULONG).clone(), ""),
+        ];
+        for (from, to, expected) in rows {
+            force_cast_ints_row(from, to, expected);
+        }
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Unsigned→Char: `int_and 255`.
     #[test]
     fn force_cast_unsigned_to_char_is_int_and_255() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;

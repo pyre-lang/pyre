@@ -15500,6 +15500,10 @@ fn try_array_item_spelling(
         LowLevelType::SignedLongLong => "i64".to_string(),
         LowLevelType::UnsignedLongLong => "u64".to_string(),
         LowLevelType::Address => "usize".to_string(),
+        LowLevelType::Number(n) => match n._type.bits {
+            8 | 16 | 32 | 64 => format!("{}{}", if n._type.sign { "i" } else { "u" }, n._type.bits),
+            _ => return None,
+        },
         _ => return None,
     })
 }
@@ -15589,33 +15593,45 @@ fn effect_materialize(
     match hlv {
         Hlvalue::Variable(v) => v.clone(),
         Hlvalue::Constant(c) => {
-            let (kind, lltype) = match &c.value {
-                ConstValue::Int(n) => (OpKind::ConstInt(*n), LowLevelType::Signed),
-                ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
-                ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
-                ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
-                ConstValue::ByteStr(bytes) => {
-                    let n = i64::from(bytes.first().copied().unwrap_or(0));
-                    (OpKind::ConstInt(n), LowLevelType::Signed)
-                }
-                ConstValue::None => (OpKind::ConstRefNull, LowLevelType::Void),
-                ConstValue::LLPtr(ptr) => {
-                    let lltype = c
-                        .concretetype
-                        .clone()
-                        .unwrap_or_else(|| LowLevelType::Ptr(Box::new(ptr._TYPE.clone())));
-                    let kind = match ptr._obj0_value() {
-                        Ok(None) => OpKind::ConstRefNull,
-                        _ => panic!(
-                            "effect_graph_from_rtyped_helper: non-null LLPtr constant \
-                             must stay a ConstValue (effect_linkarg / emit_const); \
-                             cannot pool _hashable_identity"
-                        ),
-                    };
-                    (kind, lltype)
-                }
-                other => {
-                    panic!("effect_graph_from_rtyped_helper: cannot materialise constant {other:?}")
+            // `Assembler.emit_const` kind `'int'`: Number / RInt is
+            // `cast_primitive(Signed, value)` → `ConstInt`.
+            let (kind, lltype) = if let Some((n, lltype)) =
+                crate::codewriter::assembler::signed_int_from_number_const(
+                    &c.value,
+                    c.concretetype.as_ref(),
+                ) {
+                (OpKind::ConstInt(n), lltype)
+            } else {
+                match &c.value {
+                    ConstValue::Int(n) => (OpKind::ConstInt(*n), LowLevelType::Signed),
+                    ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
+                    ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
+                    ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
+                    ConstValue::ByteStr(bytes) => {
+                        let n = i64::from(bytes.first().copied().unwrap_or(0));
+                        (OpKind::ConstInt(n), LowLevelType::Signed)
+                    }
+                    ConstValue::None => (OpKind::ConstRefNull, LowLevelType::Void),
+                    ConstValue::LLPtr(ptr) => {
+                        let lltype = c
+                            .concretetype
+                            .clone()
+                            .unwrap_or_else(|| LowLevelType::Ptr(Box::new(ptr._TYPE.clone())));
+                        let kind = match ptr._obj0_value() {
+                            Ok(None) => OpKind::ConstRefNull,
+                            _ => panic!(
+                                "effect_graph_from_rtyped_helper: non-null LLPtr constant \
+                                 must stay a ConstValue (effect_linkarg / emit_const); \
+                                 cannot pool _hashable_identity"
+                            ),
+                        };
+                        (kind, lltype)
+                    }
+                    other => {
+                        panic!(
+                            "effect_graph_from_rtyped_helper: cannot materialise constant {other:?}"
+                        )
+                    }
                 }
             };
             let result = out
@@ -15977,7 +15993,7 @@ fn effect_transduce_op(
             );
         }
         name @ ("same_as" | "cast_ptr_to_adr" | "cast_adr_to_ptr" | "cast_primitive"
-        | "cast_bool_to_int" | "cast_char_to_int" | "cast_int_to_char"
+        | "force_cast" | "cast_bool_to_int" | "cast_char_to_int" | "cast_int_to_char"
         | "cast_opaque_ptr" | "cast_pointer" | "cast_int_to_uint" | "cast_uint_to_int") => {
             // `FreshMallocs.__init__` (`writeanalyze.py`) aliases only
             // `cast_pointer` / `same_as`. Other casts keep their llop name
@@ -16253,6 +16269,22 @@ fn effect_transduce_op(
                     kind: OpKind::Live { forced },
                 });
         }
+        "likely" | "unlikely" => {
+            // `Transformer.rewrite_op_likely` / `rewrite_op_unlikely` return
+            // None: the Bool result is args[0]. Emit `same_as` so FreshMallocs
+            // aliases the result onto the operand.
+            let operand = effect_materialize(out, block, &op.args[0]);
+            let result = effect_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand,
+                    result_ty: effect_value_type_of(&result),
+                },
+                result,
+            );
+        }
         other => panic!("effect_graph_from_rtyped_helper: unsupported opname {other:?}"),
     }
 }
@@ -16511,6 +16543,35 @@ mod tests {
             get_type_flag("usize", &HashSet::new()).0,
             majit_ir::descr::ArrayFlag::Unsigned
         );
+    }
+
+    /// `rffi.UCHAR` / `USHORT` spell as `u8` / `u16`. `rffi.UINT` spells
+    /// as `u32` when it is a distinct `Number`; when
+    /// `lltype.build_number` intern (`lltype.py` `_numbertypes`) makes
+    /// `UINT` `lltype.Unsigned` (word-width unsigned int), the ARRAY key
+    /// is `GcArray<usize>`. `get_type_flag` reads FLAG_UNSIGNED at the
+    /// item size.
+    #[test]
+    fn array_type_id_gc_rffi_numbers_are_narrow_unsigned() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let uint_spelling = if *rffi::UINT == LowLevelType::Unsigned {
+            "usize"
+        } else {
+            "u32"
+        };
+        let cases = [
+            ((*rffi::UCHAR).clone(), "u8", 1usize),
+            ((*rffi::USHORT).clone(), "u16", 2),
+            ((*rffi::UINT).clone(), uint_spelling, 4),
+        ];
+        for (of, spelling, size) in cases {
+            let id = array_type_id_of_lltype(&Array::gc(of));
+            assert_eq!(id, format!("GcArray<{spelling}>"));
+            let (flag, _, item_size) = get_type_flag(spelling, &HashSet::new());
+            assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
+            assert_eq!(item_size, size, "{id}");
+        }
     }
 
     /// When Signed is 8 bytes `lltype.SignedLongLong is lltype.Signed`, so
@@ -29466,6 +29527,57 @@ mod tests {
                 ),
                 ReadWriteEffects::Top => {}
             }
+        }
+    }
+
+    /// `Assembler.emit_const` kind `'int'`: `cast_primitive(Signed, r_uchar(200))`
+    /// materialises as `ConstInt(200)` so `force_cast` / `cast_primitive` of a
+    /// Number constant lower without panic.
+    #[test]
+    fn effect_graph_cast_primitive_rint_uchar_operand_carries_200() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let uchar = (*rffi::UCHAR).clone();
+        let class = match &uchar {
+            LowLevelType::Number(n) => n._type,
+            other => panic!("UCHAR is a Number, got {other:?}"),
+        };
+        let operand =
+            constant_with_lltype(crate::flowspace::model::ConstValue::rint(class, 200), uchar);
+        for opname in ["force_cast", "cast_primitive"] {
+            let result = variable_with_lltype("out", LowLevelType::Signed);
+            let graph = rtyped_one_op(
+                &format!("effect_{opname}_rint"),
+                opname,
+                vec![operand.clone()],
+                result,
+            );
+            let converted = effect_graph_from_rtyped_helper(&graph);
+            let ops: Vec<_> = converted.iter_block_ops().map(|(_, op)| op).collect();
+            let const_var = ops
+                .iter()
+                .find(|op| matches!(op.kind, OpKind::ConstInt(200)))
+                .and_then(|op| op.result.clone())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{opname}: r_uchar(200) did not materialise as ConstInt(200): {:?}",
+                        ops.iter()
+                            .map(|op| format!("{:?}", op.kind))
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == opname && operand == &const_var
+                )),
+                "{opname} operand is the ConstInt(200) var: {:?}",
+                ops.iter()
+                    .map(|op| format!("{:?}", op.kind))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 

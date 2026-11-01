@@ -503,6 +503,7 @@ fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
     match v {
         LowLevelValue::Signed(n) => Some(ConstValue::Int(*n)),
         LowLevelValue::Unsigned(u) => Some(ConstValue::UInt(*u)),
+        LowLevelValue::Number(n, v) => Some(ConstValue::rint(n._type, *v)),
         LowLevelValue::SignedLongLongLong(n) => Some(ConstValue::Int128(*n)),
         LowLevelValue::UnsignedLongLongLong(u) => Some(ConstValue::UInt128(*u)),
         LowLevelValue::Bool(b) => Some(ConstValue::Bool(*b)),

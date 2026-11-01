@@ -9,7 +9,8 @@
 //! the convergent analogue of that exception path. The `lllong_*` /
 //! `ulllong_*` family returns [`Result<ConstValue, OpimplError>`] so
 //! `LLFrame.getoperationhandler` (`llinterp.py`) can surface the same
-//! exception text; [`get_op_impl`] maps `Err` to `None`.
+//! exception text. [`get_op_impl`] maps `Err` to `None` for constfold;
+//! [`eval_op_impl`] is the llinterp entry and lets the exception escape.
 //!
 //! Coverage: every op with a primitive carrier in [`ConstValue`] is
 //! ported (Int / UInt / Int128 / UInt128 / Bool / Float / ByteStr /
@@ -415,13 +416,40 @@ pub fn op_float_mul(args: &[ConstValue]) -> Option<ConstValue> {
     Some(ConstValue::float(a * b))
 }
 
-pub fn op_float_truediv(args: &[ConstValue]) -> Option<ConstValue> {
-    let (a, b) = float_pair(args)?;
-    if b == 0.0 {
-        // Python `x / 0.0` raises ZeroDivisionError → no fold.
-        return None;
+/// `get_primitive_op_src` `op_function` for `float_truediv`:
+/// `operator.truediv` on two floats. Zero divides raise
+/// `ZeroDivisionError`; constfold (`get_op_impl`) maps that to `None`.
+fn op_float_truediv_result(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    match args {
+        [ConstValue::Float(a), ConstValue::Float(b)] => {
+            let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+            if b == 0.0 {
+                return Err(OpimplError {
+                    message: "ZeroDivisionError: float division by zero".to_string(),
+                });
+            }
+            Ok(ConstValue::float(a / b))
+        }
+        [x, _] if !matches!(x, ConstValue::Float(_)) => Err(primitive_arg_type_error(
+            "float_truediv",
+            Some(1),
+            "float",
+            x,
+        )),
+        [_, y] => Err(primitive_arg_type_error(
+            "float_truediv",
+            Some(2),
+            "float",
+            y,
+        )),
+        _ => Err(OpimplError {
+            message: "TypeError: 'float_truediv' expected two arguments".to_string(),
+        }),
     }
-    Some(ConstValue::float(a / b))
+}
+
+pub fn op_float_truediv(args: &[ConstValue]) -> Option<ConstValue> {
+    op_float_truediv_result(args).ok()
 }
 
 pub fn op_float_lt(args: &[ConstValue]) -> Option<ConstValue> {
@@ -2435,6 +2463,29 @@ pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
     registry.get(opname).copied()
 }
 
+/// `LLOp.fold` as `LLFrame.getoperationhandler` invokes it: the opimpl
+/// body runs and its exception escapes. `Ok(None)` means there is no
+/// `op_*` entry (not yet ported). `Err` is the exception the body
+/// raised (`ZeroDivisionError`, `TypeError`, …). [`get_op_impl`] stays
+/// the constfold path (`None` = do not fold).
+pub fn eval_op_impl(opname: &str, args: &[ConstValue]) -> Result<Option<ConstValue>, OpimplError> {
+    if let Some(f) = lllong_op_impl(opname) {
+        return f(args).map(Some);
+    }
+    if opname == "float_truediv" {
+        return op_float_truediv_result(args).map(Some);
+    }
+    match get_op_impl(opname) {
+        None => Ok(None),
+        Some(f) => match f(args) {
+            Some(v) => Ok(Some(v)),
+            None => Err(OpimplError {
+                message: format!("TypeError: op_{opname} refused its arguments"),
+            }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2702,6 +2753,13 @@ mod tests {
         // Zero division refuses to fold (Python ZeroDivisionError).
         assert_eq!(op_float_truediv(&[f(1.0), f(0.0)]), None);
         assert_eq!(op_float_truediv(&[f(1.0), f(-0.0)]), None);
+        let err = eval_op_impl("float_truediv", &[f(1.0), f(0.0)]).expect_err("zero div");
+        assert!(err.message.contains("ZeroDivisionError"), "{}", err.message);
+        assert_eq!(eval_op_impl("definitely_not_an_op", &[]), Ok(None));
+        assert_eq!(
+            eval_op_impl("float_truediv", &[f(3.0), f(2.0)]).unwrap(),
+            Some(f(1.5))
+        );
         assert_eq!(op_float_neg(&[f(2.0)]), Some(f(-2.0)));
         assert_eq!(op_float_abs(&[f(-2.0)]), Some(f(2.0)));
         assert_eq!(op_float_is_true(&[f(0.0)]), Some(b(false)));

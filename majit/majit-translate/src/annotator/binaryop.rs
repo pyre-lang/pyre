@@ -237,8 +237,13 @@ pub fn is__default(annotator: &RPythonAnnotator, hlop: &HLOperation) -> SomeValu
             // Upstream: `r.const = s_obj1.const is s_obj2.const` — Python
             // object identity. For primitives (int/float/str/bool/None)
             // structural equality on `ConstValue` reproduces the Python
-            // intern semantics.
-            let eq = s_obj1.const_() == s_obj2.const_();
+            // intern semantics. HostObject `PartialEq` is `Arc` identity.
+            // RInt instances compare by value in `PartialEq` (`Hashable.key`)
+            // and by the minted token here (`object_is`).
+            let eq = match (s_obj1.const_(), s_obj2.const_()) {
+                (Some(a), Some(b)) => a.object_is(b),
+                _ => false,
+            };
             r.base.const_box = Some(Constant::new(ConstValue::Bool(eq)));
         }
         if matches!(s_obj2.const_(), Some(ConstValue::None)) && !s_obj1.can_be_none() {
@@ -3151,6 +3156,35 @@ mod tests {
         assert!(matches!(r, SomeValue::Bool(_)), "got {:?}", r);
     }
 
+    #[test]
+    fn cmp_integer_rint_constants_fold_true() {
+        // `_compare_helper`: two immutable `base_int` constants compare
+        // numerically (`r_uchar(1) == r_ushort(1)`).
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let ushort = crate::rlib::rarithmetic::built_rint("r_ushort", false, 16);
+        let ann = mk_ann();
+        let mut v0 = Variable::named("a");
+        let mut v1 = Variable::named("b");
+        let mut s0 = SomeInteger::new_with_knowntype(true, KnownType::RInt(uchar));
+        s0.base.const_box = Some(Constant::new(ConstValue::rint(uchar, 1)));
+        let mut s1 = SomeInteger::new_with_knowntype(true, KnownType::RInt(ushort));
+        s1.base.const_box = Some(Constant::new(ConstValue::rint(ushort, 1)));
+        ann.setbinding(&mut v0, SomeValue::Integer(s0));
+        ann.setbinding(&mut v1, SomeValue::Integer(s1));
+        let hl = HLOperation::new(
+            OpKind::Eq,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        match r {
+            SomeValue::Bool(b) => {
+                let c = b.base.const_box.expect("cmp_integer must fold constants");
+                assert_eq!(c.value, ConstValue::Bool(true));
+            }
+            other => panic!("expected SomeBool constant True, got {other:?}"),
+        }
+    }
+
     fn hl_bool_bool(op: OpKind) -> (HLOperation, Rc<RPythonAnnotator>) {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let v0 = Variable::named("a");
@@ -3798,5 +3832,41 @@ mod tests {
         );
         let r = hl.consider(&ann).unwrap().unwrap();
         assert!(matches!(r, SomeValue::String(_)), "got {:?}", r);
+    }
+
+    fn is_default_of_consts(c1: ConstValue, c2: ConstValue) -> SomeValue {
+        let ann = mk_ann();
+        let s1 = ann
+            .bookkeeper
+            .immutablevalue(&c1)
+            .expect("left constant annotates");
+        let s2 = ann
+            .bookkeeper
+            .immutablevalue(&c2)
+            .expect("right constant annotates");
+        let mut v0 = Variable::named("a");
+        let mut v1 = Variable::named("b");
+        ann.setbinding(&mut v0, s1);
+        ann.setbinding(&mut v1, s2);
+        let hl = HLOperation::new(
+            OpKind::Is,
+            vec![Hlvalue::Variable(v0), Hlvalue::Variable(v1)],
+        );
+        is__default(&ann, &hl)
+    }
+
+    #[test]
+    fn is_default_two_rint_new_same_value_is_constant_false() {
+        // `signed_int.__new__` / `unsigned_int.__new__` mint a fresh
+        // instance; `is__default` uses Python `is`, so two `r_uchar(1)`
+        // objects are equal but not identical.
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let a = crate::rlib::rarithmetic::rint_new(uchar, 1).expect("r_uchar(1)");
+        let b = crate::rlib::rarithmetic::rint_new(uchar, 1).expect("r_uchar(1)");
+        assert_eq!(a, b);
+        let r = is_default_of_consts(a.clone(), b);
+        assert_eq!(r.const_(), Some(&ConstValue::Bool(false)));
+        let r_same = is_default_of_consts(a.clone(), a);
+        assert_eq!(r_same.const_(), Some(&ConstValue::Bool(true)));
     }
 }

@@ -5,11 +5,13 @@
 //!
 //! | majit                 | rpython/translator/tool/      |
 //! |-----------------------|-------------------------------|
+//! | `cbuild`              | `cbuild.py`                   |
 //! | `taskengine`          | `taskengine.py`               |
 //!
-//! Deferred (no current consumer): `cbuild.py`, `graphpage.py`,
+//! Deferred (no current consumer): `graphpage.py`,
 //! `lltracker.py`, `make_dot.py`, `pdbplus.py`, `reftracker.py`,
 //! `staticsizereport.py`, `stdoutcapture.py`. They land alongside
 //! the consumers that require them.
 
+pub mod cbuild;
 pub mod taskengine;

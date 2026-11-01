@@ -120,7 +120,7 @@ pub fn annotation_to_lltype(
         return Ok(lltype::LowLevelType::from(s_ptr.ll_ptrtype.clone()));
     }
     if let SomeValue::Integer(s_int) = s_val {
-        return Ok(lltype::build_number(None, s_int.knowntype()));
+        return lltype::build_number(None, s_int.knowntype()).map_err(AnnotatorError::new);
     }
 
     for (witness, ty) in annotation_to_ll_map() {
@@ -172,6 +172,10 @@ where
         lltype::LowLevelType::UnsignedLongLongLong => SomeValue::Integer(
             SomeInteger::new_with_knowntype(false, KnownType::ULongLongLong),
         ),
+        lltype::LowLevelType::Number(n) => SomeValue::Integer(SomeInteger::new_with_knowntype(
+            false,
+            KnownType::RInt(n._type),
+        )),
         lltype::LowLevelType::InteriorPtr(t) => SomeValue::InteriorPtr(SomeInteriorPtr::new(*t)),
         lltype::LowLevelType::Ptr(t) => SomeValue::Ptr(SomePtr::new(*t)),
         other => {
@@ -405,6 +409,7 @@ fn integer_number_lltype(ty: &lltype::LowLevelType) -> bool {
             | lltype::LowLevelType::SignedLongLongLong
             | lltype::LowLevelType::UnsignedLongLong
             | lltype::LowLevelType::UnsignedLongLongLong
+            | lltype::LowLevelType::Number(_)
     )
 }
 

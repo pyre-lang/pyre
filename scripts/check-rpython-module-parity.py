@@ -937,7 +937,6 @@ INTENTIONAL_SYMBOL_EXTRA: dict[tuple[str, str], dict[str, dict[str, str]]] = {
             "execute": "Rust free-function helper for the upstream Platform.execute method slice used without a platform object",
         },
         "types": {
-            "CompilationInfo": "Rust minimal carrier for upstream ExternalCompilationInfo.library_dirs consumed by Platform.execute",
             "EnvMapping": "Rust alias for upstream env dict copied by Platform.execute",
         },
     },
@@ -1194,10 +1193,7 @@ INTENTIONAL_SYMBOL_MISSING: dict[tuple[str, str], dict[str, dict[str, str]]] = {
     },
     ("rpython/rtyper/tool", "rfficache"): {
         "functions": {
-            "ask_gcc": "permanently unused C probing boundary; pyre keeps source construction/parsing helpers but does not invoke a C compiler here",
             "signof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_signof_c_type once external answers are supplied",
-            "sizeof_c_type": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_type once external answers are supplied",
-            "sizeof_c_types": "permanently unused C probing wrapper around ask_gcc; pyre uses parse_sizeof_c_types once external answers are supplied",
         },
     },
     ("rpython/translator", "platform"): {

@@ -1649,6 +1649,7 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
     match cv {
         ConstValue::Int(_)
         | ConstValue::UInt(_)
+        | ConstValue::RInt(_, _, _)
         | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)

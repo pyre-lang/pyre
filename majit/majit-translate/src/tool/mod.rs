@@ -11,6 +11,7 @@
 //! | `ansi_print`          | `ansi_print.py`               |
 //! | `error`               | `error.py`                    |
 //! | `flattenrec`          | `flattenrec.py`               |
+//! | `gcc_cache`           | `gcc_cache.py`                |
 //! | `pairtype`            | `pairtype.py`                 |
 //! | `sourcetools`         | `sourcetools.py`              |
 //! | `udir`                | `udir.py`                     |
@@ -19,6 +20,7 @@ pub mod algo;
 pub mod ansi_print;
 pub mod error;
 pub mod flattenrec;
+pub mod gcc_cache;
 pub mod pairtype;
 pub mod sourcetools;
 pub mod udir;

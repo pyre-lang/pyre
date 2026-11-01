@@ -1201,6 +1201,7 @@ impl FunctionDesc {
         match value {
             ConstValue::Int(i) => i.to_string(),
             ConstValue::UInt(i) => i.to_string(),
+            ConstValue::RInt(c, i, _) => crate::rlib::rarithmetic::rint_value(*c, *i).to_string(),
             ConstValue::Bool(b) => {
                 if *b {
                     "True".to_string()

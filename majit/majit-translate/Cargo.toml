@@ -31,6 +31,7 @@ majit-ir = { workspace = true }
 majit-jitcode = { workspace = true }
 majit-config = { workspace = true }
 libc = { workspace = true }
+cc = "1.2"
 # PRE-EXISTING-ADAPTATION, parity rule #1.
 #
 # RPython's `rpython/flowspace/bytecode.py` does `from opcode import

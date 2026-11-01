@@ -5676,6 +5676,9 @@ pub fn build_ll_arrayclear_helper_graph(
         LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
             constant_with_lltype(ConstValue::UInt(0), item_lltype.clone())
         }
+        LowLevelType::Number(n) => {
+            constant_with_lltype(ConstValue::rint(n._type, 0), item_lltype.clone())
+        }
         LowLevelType::UnsignedLongLongLong => {
             constant_with_lltype(ConstValue::UInt128(0), item_lltype.clone())
         }

@@ -5360,6 +5360,22 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(ConstValue::UInt128(*i)));
                 Ok(SomeValue::Integer(s))
             }
+            ConstValue::RInt(_, _, _) => {
+                // `immutablevalue` consults `extregistry.is_registered(x)`
+                // (`bookkeeper.py`); `ForValuesEntry.compute_annotation`
+                // (`build_int`) returns `SomeInteger(knowntype=int_type)`.
+                assert!(
+                    crate::translator::rtyper::extregistry::is_registered(x),
+                    "Bookkeeper.immutablevalue(RInt): ForValuesEntry must be registered"
+                );
+                let entry = crate::translator::rtyper::extregistry::lookup(x).expect(
+                    "Bookkeeper.immutablevalue(RInt): extregistry.lookup must succeed after \
+                     is_registered",
+                );
+                let mut result = entry.compute_annotation_bk(self)?;
+                result.set_const_box(Constant::new(x.clone()));
+                Ok(result)
+            }
             ConstValue::Float(_) => {
                 let mut s = SomeFloat::new();
                 s.base.const_box = Some(Constant::new(x.clone()));
@@ -10878,6 +10894,101 @@ mod tests {
             inner.borrow().attrs.contains_key("argcount"),
             "inner struct projected on the late pass"
         );
+    }
+
+    #[test]
+    fn immutablevalue_rint_uchar_keeps_knowntype() {
+        use crate::annotator::model::{KnownType, SomeObjectTrait};
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let s = bk()
+            .immutablevalue(&ConstValue::rint(uchar, 5))
+            .expect("r_uchar constant annotates");
+        match s {
+            SomeValue::Integer(si) => {
+                assert_eq!(si.knowntype(), KnownType::RInt(uchar));
+                assert!(si.unsigned);
+                assert!(si.nonneg);
+                assert_eq!(
+                    si.base.const_box.as_ref().map(|constant| &constant.value),
+                    Some(&ConstValue::rint(uchar, 5))
+                );
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn immutablevalue_rint_signed_constant_nonneg_is_false() {
+        let signed = crate::rlib::rarithmetic::built_rint("r_short", true, 16);
+        let s = bk()
+            .immutablevalue(&ConstValue::rint(signed, 5))
+            .expect("signed rint constant annotates");
+        match s {
+            SomeValue::Integer(si) => {
+                assert!(!si.unsigned);
+                assert!(!si.nonneg);
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r_uchar_call_annotates_someinteger_of_that_class() {
+        use crate::annotator::model::{KnownType, SomeObjectTrait};
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let host = crate::rlib::rarithmetic::rint_class_object(uchar);
+        let bk = bk();
+        let _guard = bk.at_position(None);
+        let s_cls = bk
+            .immutablevalue(&ConstValue::HostObject(host))
+            .expect("r_uchar class annotates");
+        let s_arg = bk
+            .immutablevalue(&ConstValue::Int(5))
+            .expect("int 5 annotates");
+        let args = ArgumentsForTranslation::new(vec![Some(s_arg)], None, None);
+        let result = s_cls
+            .call(&args)
+            .expect("r_uchar(5) annotates")
+            .expect("non-void");
+        match result {
+            SomeValue::Integer(si) => {
+                assert_eq!(si.knowntype(), KnownType::RInt(uchar));
+                assert!(si.unsigned);
+                assert!(si.nonneg);
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r_uint_call_still_annotates_ruint() {
+        use crate::annotator::model::{KnownType, SomeObjectTrait};
+        let r_uint = crate::flowspace::model::HOST_ENV
+            .import_module("rpython.rlib.rarithmetic")
+            .expect("rarithmetic")
+            .module_get("r_uint")
+            .expect("r_uint");
+        let bk = bk();
+        let _guard = bk.at_position(None);
+        let s_cls = bk
+            .immutablevalue(&ConstValue::HostObject(r_uint))
+            .expect("r_uint class annotates");
+        let s_arg = bk
+            .immutablevalue(&ConstValue::Int(5))
+            .expect("int 5 annotates");
+        let args = ArgumentsForTranslation::new(vec![Some(s_arg)], None, None);
+        let result = s_cls
+            .call(&args)
+            .expect("r_uint(5) annotates")
+            .expect("non-void");
+        match result {
+            SomeValue::Integer(si) => {
+                assert_eq!(si.knowntype(), KnownType::Ruint);
+                assert!(si.unsigned);
+                assert!(si.nonneg);
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
     }
 
     #[test]

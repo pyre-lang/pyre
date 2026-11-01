@@ -1076,6 +1076,23 @@ fn transduce_op(
                 result,
             );
         }
+        // `Transformer.rewrite_op_likely` / `rewrite_op_unlikely` return
+        // None ("no real effect"): the result is renamed to args[0].
+        // Emit `same_as` so the shared identity rewrite does that rename.
+        "likely" | "unlikely" => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "same_as".to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
+        }
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
     }
 }
@@ -1556,70 +1573,83 @@ pub(crate) fn materialize_constant(
             c.value, c.concretetype
         )
     };
-    let kind = match c.concretetype.as_ref() {
-        Some(LowLevelType::Signed) => match &c.value {
-            ConstValue::Int(n) => OpKind::ConstInt(*n),
-            _ => fail(),
-        },
-        Some(LowLevelType::SignedLongLong) => match &c.value {
-            ConstValue::Int(n) => OpKind::ConstInt(*n),
-            _ => fail(),
-        },
-        Some(LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => match &c.value {
-            ConstValue::UInt(n) => OpKind::ConstUInt(*n),
-            ConstValue::Int(n) if *n >= 0 => OpKind::ConstUInt(*n as u64),
-            _ => fail(),
-        },
-        Some(LowLevelType::Bool) => match &c.value {
-            ConstValue::Bool(b) => OpKind::ConstBool(*b),
-            _ => fail(),
-        },
-        Some(LowLevelType::Char) => match &c.value {
-            ConstValue::ByteStr(bytes) if bytes.len() == 1 => OpKind::ConstInt(i64::from(bytes[0])),
-            _ => fail(),
-        },
-        Some(LowLevelType::UniChar) => match &c.value {
-            ConstValue::UniStr(s) if s.chars().count() == 1 => {
-                OpKind::ConstInt(s.chars().next().expect("one UniChar") as i64)
-            }
-            _ => fail(),
-        },
-        Some(LowLevelType::Float) => match &c.value {
-            ConstValue::Float(bits) => OpKind::ConstFloat(*bits),
-            _ => fail(),
-        },
-        Some(LowLevelType::SingleFloat) => match &c.value {
-            ConstValue::Float(bits) => {
-                OpKind::ConstSingleFloat((f64::from_bits(*bits) as f32).to_bits())
-            }
-            _ => fail(),
-        },
-        Some(LowLevelType::Ptr(p)) => match &c.value {
-            ConstValue::LLPtr(ptr) if matches!(ptr._obj0_value(), Ok(None)) => {
-                if p._needsgc() {
-                    OpKind::ConstRefNull
-                } else {
-                    OpKind::ConstInt(0)
+    // `Assembler.emit_const` kind `'int'`: Number / RInt is
+    // `cast_primitive(Signed, value)` → `ConstInt`.
+    let (kind, lltype) = if let Some((n, lltype)) =
+        crate::codewriter::assembler::signed_int_from_number_const(
+            &c.value,
+            c.concretetype.as_ref(),
+        ) {
+        (OpKind::ConstInt(n), lltype)
+    } else {
+        let kind = match c.concretetype.as_ref() {
+            Some(LowLevelType::Signed) => match &c.value {
+                ConstValue::Int(n) => OpKind::ConstInt(*n),
+                _ => fail(),
+            },
+            Some(LowLevelType::SignedLongLong) => match &c.value {
+                ConstValue::Int(n) => OpKind::ConstInt(*n),
+                _ => fail(),
+            },
+            Some(LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => match &c.value {
+                ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+                ConstValue::Int(n) if *n >= 0 => OpKind::ConstUInt(*n as u64),
+                _ => fail(),
+            },
+            Some(LowLevelType::Bool) => match &c.value {
+                ConstValue::Bool(b) => OpKind::ConstBool(*b),
+                _ => fail(),
+            },
+            Some(LowLevelType::Char) => match &c.value {
+                ConstValue::ByteStr(bytes) if bytes.len() == 1 => {
+                    OpKind::ConstInt(i64::from(bytes[0]))
                 }
-            }
-            _ => fail(),
-        },
-        None => match &c.value {
-            ConstValue::Int(n) => OpKind::ConstInt(*n),
-            ConstValue::UInt(n) => OpKind::ConstUInt(*n),
-            ConstValue::Bool(b) => OpKind::ConstBool(*b),
-            _ => fail(),
-        },
-        Some(_) => fail(),
-    };
-    let lltype = match c.concretetype.clone() {
-        Some(ty) => ty,
-        None => match &c.value {
-            ConstValue::Int(_) => LowLevelType::Signed,
-            ConstValue::UInt(_) => LowLevelType::Unsigned,
-            ConstValue::Bool(_) => LowLevelType::Bool,
-            _ => fail(),
-        },
+                _ => fail(),
+            },
+            Some(LowLevelType::UniChar) => match &c.value {
+                ConstValue::UniStr(s) if s.chars().count() == 1 => {
+                    OpKind::ConstInt(s.chars().next().expect("one UniChar") as i64)
+                }
+                _ => fail(),
+            },
+            Some(LowLevelType::Float) => match &c.value {
+                ConstValue::Float(bits) => OpKind::ConstFloat(*bits),
+                _ => fail(),
+            },
+            Some(LowLevelType::SingleFloat) => match &c.value {
+                ConstValue::Float(bits) => {
+                    OpKind::ConstSingleFloat((f64::from_bits(*bits) as f32).to_bits())
+                }
+                _ => fail(),
+            },
+            Some(LowLevelType::Ptr(p)) => match &c.value {
+                ConstValue::LLPtr(ptr) if matches!(ptr._obj0_value(), Ok(None)) => {
+                    if p._needsgc() {
+                        OpKind::ConstRefNull
+                    } else {
+                        OpKind::ConstInt(0)
+                    }
+                }
+                _ => fail(),
+            },
+            None => match &c.value {
+                ConstValue::Int(n) => OpKind::ConstInt(*n),
+                ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+                ConstValue::Bool(b) => OpKind::ConstBool(*b),
+                _ => fail(),
+            },
+            Some(_) => fail(),
+        };
+        let lltype = match c.concretetype.clone() {
+            Some(ty) => ty,
+            None => match &c.value {
+                ConstValue::Int(_) => LowLevelType::Signed,
+                ConstValue::UInt(_) => LowLevelType::Unsigned,
+                ConstValue::Bool(_) => LowLevelType::Bool,
+                _ => fail(),
+            },
+        };
+        (kind, lltype)
     };
     let result = out
         .push_op_var(block, kind, true)
@@ -4504,6 +4534,168 @@ mod tests {
             ops[0].kind
         );
         assert_eq!(result.concretetype(), Some(LowLevelType::Float));
+    }
+
+    fn r_uchar_const(n: i128) -> (Constant, LowLevelType) {
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let uchar = (*rffi::UCHAR).clone();
+        let class = match &uchar {
+            LowLevelType::Number(num) => num._type,
+            other => panic!("UCHAR is a Number, got {other:?}"),
+        };
+        (
+            Constant::with_concretetype(ConstValue::rint(class, n), uchar.clone()),
+            uchar,
+        )
+    }
+
+    /// `Assembler.emit_const` kind `'int'`: `cast_primitive(Signed, r_uchar(200))`
+    /// is `ConstInt(200)` and keeps the Number concretetype.
+    #[test]
+    fn materialize_constant_rint_uchar_is_const_int() {
+        let (c, uchar) = r_uchar_const(200);
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_rint_uchar");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstInt(200)),
+            "r_uchar(200) becomes ConstInt(200): {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(uchar));
+    }
+
+    /// Without a concretetype, the Number lltype is `build_number` of the
+    /// RInt class (`UCHAR` is already interned by rffi setup).
+    #[test]
+    fn materialize_constant_rint_without_concretetype_uses_build_number() {
+        use crate::translator::rtyper::lltypesystem::lltype::build_number;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let uchar = (*rffi::UCHAR).clone();
+        let class = match &uchar {
+            LowLevelType::Number(num) => num._type,
+            other => panic!("UCHAR is a Number, got {other:?}"),
+        };
+        let c = Constant::new(ConstValue::rint(class, 200));
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_rint_no_lltype");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstInt(200)),
+            "r_uchar(200) becomes ConstInt(200): {:?}",
+            ops[0].kind
+        );
+        let expected = build_number(None, crate::annotator::model::KnownType::RInt(class))
+            .expect("UCHAR is interned");
+        assert_eq!(result.concretetype(), Some(expected));
+    }
+
+    /// `rewrite_op_cast_primitive` / `rewrite_op_force_cast`: a Number
+    /// constant operand materialises as `ConstInt` carrying 200.
+    #[test]
+    fn lower_graph_cast_primitive_rint_uchar_operand_carries_200() {
+        for opname in ["force_cast", "cast_primitive"] {
+            let (c, _) = r_uchar_const(200);
+            let startblock = Block::shared(vec![]);
+            let out = variable_with_lltype("out", LowLevelType::Signed);
+            let graph = FlowGraph::with_return_var(
+                &format!("ll_test_{opname}_rint_uchar"),
+                startblock.clone(),
+                Hlvalue::Variable(out.clone()),
+            );
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                opname,
+                vec![Hlvalue::Constant(c)],
+                Hlvalue::Variable(out.clone()),
+            ));
+            startblock.closeblock(vec![
+                Link::new(
+                    vec![Hlvalue::Variable(out)],
+                    Some(graph.returnblock.clone()),
+                    None,
+                )
+                .into_ref(),
+            ]);
+            let model = lower_graph(&graph);
+            let ops = &model.block(model.startblock).operations;
+            let const_var = ops
+                .iter()
+                .find(|op| matches!(op.kind, OpKind::ConstInt(200)))
+                .and_then(|op| op.result.clone())
+                .unwrap_or_else(|| {
+                    panic!("{opname}: r_uchar(200) did not materialise as ConstInt(200): {ops:?}")
+                });
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == opname && operand == &const_var
+                )),
+                "{opname} operand is the ConstInt(200) var: {ops:?}"
+            );
+        }
+    }
+
+    /// `rewrite_op_direct_call` materialises a Number constant arg as
+    /// `ConstInt(200)` (`OpKind::Call` takes Variables).
+    #[test]
+    fn lower_graph_direct_call_rint_constant_arg_carries_200() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+
+        let (c, uchar) = r_uchar_const(200);
+        let startblock = Block::shared(vec![]);
+        let return_var = variable_with_lltype("out", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_direct_call_rint_arg",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let func_type = FuncType {
+            args: vec![uchar],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = Ptr {
+            TO: PtrTarget::Func(func_type),
+        }
+        ._example();
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![callee, Hlvalue::Constant(c)],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let const_var = ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::ConstInt(200)))
+            .and_then(|op| op.result.clone())
+            .unwrap_or_else(|| panic!("RInt arg did not materialise as ConstInt(200): {ops:?}"));
+        let call_args = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { args, .. } => Some(args),
+                _ => None,
+            })
+            .expect("direct_call lowers to Call");
+        assert_eq!(
+            call_args.first(),
+            Some(&LinkArg::Value(const_var)),
+            "Call arg is the ConstInt(200) var: {call_args:?}"
+        );
     }
 
     /// `jit_conditional_call_value` value operand may be a null GC-pointer

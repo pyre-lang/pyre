@@ -33,7 +33,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use indexmap::IndexMap;
 
 use super::bytecode::HostCode;
-use crate::annotator::model::SomeValue;
+use crate::annotator::model::{RIntClass, SomeValue};
 use crate::translator::rtyper::lltypesystem::lltype::_ptr;
 
 // Exists to localise prepass nondeterminism (gh#1139).
@@ -1718,7 +1718,9 @@ impl HostEnv {
     fn bootstrap_builtin_types(&mut self) {
         // Builtin class objects referred to upstream via `const(type)` and
         // similar. Inheritance is not in scope yet, so bases stay empty and
-        // only identity is preserved.
+        // only identity is preserved. `int` is the interned host class
+        // `rarithmetic.base_int` subclasses (`base_int(long)`; this port's
+        // `long` is `int`).
         for name in [
             "type",
             "object",
@@ -1753,7 +1755,12 @@ impl HostEnv {
             "classmethod",
             "staticmethod",
         ] {
-            self.insert_builtin(name, HostObject::new_class(name, vec![]));
+            let cls = if name == "int" {
+                builtin_int_class()
+            } else {
+                HostObject::new_class(name, vec![])
+            };
+            self.insert_builtin(name, cls);
         }
     }
 
@@ -1898,6 +1905,21 @@ impl HostEnv {
         // `translator::simplify::transform_ovfcheck` looks the sentinel up
         // directly.
         let rarithmetic = HostObject::new_module("rpython.rlib.rarithmetic");
+        // `base_int` / `signed_int` / `unsigned_int` live in
+        // `rarithmetic.rs` so `_inttypes` can subclass them without
+        // entering HOST_ENV. Publish the same objects here.
+        if rarithmetic.module_get("base_int").is_none() {
+            rarithmetic.module_set("base_int", crate::rlib::rarithmetic::base_int_class());
+        }
+        if rarithmetic.module_get("signed_int").is_none() {
+            rarithmetic.module_set("signed_int", crate::rlib::rarithmetic::signed_int_class());
+        }
+        if rarithmetic.module_get("unsigned_int").is_none() {
+            rarithmetic.module_set(
+                "unsigned_int",
+                crate::rlib::rarithmetic::unsigned_int_class(),
+            );
+        }
         rarithmetic.module_set("ovfcheck", HostObject::new_builtin_callable("ovfcheck"));
         // `rbuiltin.py @typer_for(rarithmetic.intmask)` /
         // `rbuiltin.py @typer_for(rarithmetic.longlongmask)`.
@@ -2839,6 +2861,19 @@ impl HostEnv {
     }
 }
 
+/// Host builtin `int` class (`__builtin__.int`).
+///
+/// Upstream `rarithmetic.base_int(long)` subclasses `long`; this port's
+/// `long` is `int`. Interned independently of [`HOST_ENV`] so `base_int`
+/// can take it as a base during HOST_ENV bootstrap without re-entering
+/// the `HOST_ENV` LazyLock.
+static BUILTIN_INT: LazyLock<HostObject> = LazyLock::new(|| HostObject::new_class("int", vec![]));
+
+/// Host builtin `int` class. Same object [`HOST_ENV`] publishes as `"int"`.
+pub fn builtin_int_class() -> HostObject {
+    BUILTIN_INT.clone()
+}
+
 /// Process-global host namespace singleton. Bootstrap fills it with
 /// placeholders for upstream `__builtin__` plus known stdlib modules.
 pub static HOST_ENV: LazyLock<HostEnv> = LazyLock::new(HostEnv::bootstrap);
@@ -2912,6 +2947,39 @@ pub(crate) fn is_jit_conditional_call_path(segs: &[String]) -> bool {
     is_host_env_conditional_call_leaf(leaf)
 }
 
+/// Identity of one `build_int` instance (`signed_int.__new__` /
+/// `unsigned_int.__new__`).
+///
+/// `Hashable.key` is `(type(value), value)`, so `PartialEq`/`Hash` of
+/// the token are constantly equal / empty and `ConstValue` keeps value
+/// semantics. `is__default` compares the token (`object_is`).
+#[derive(Clone, Copy, Debug)]
+pub struct RIntId(u64);
+
+impl PartialEq for RIntId {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RIntId {}
+
+impl Hash for RIntId {
+    fn hash<H: Hasher>(&self, _state: &mut H) {}
+}
+
+impl RIntId {
+    fn mint() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Python `is` on two `build_int` instances.
+    pub fn is_same(self, other: Self) -> bool {
+        self.0 == other.0
+    }
+}
+
 /// Flow-space carrier for Python objects referenced directly by the
 /// strict `flowcontext.py` port.
 ///
@@ -2950,6 +3018,11 @@ pub enum ConstValue {
     Int128(i128),
     /// RPython `r_ulonglonglong` constant.
     UInt128(u128),
+    /// Instance of a `build_int` class (`r_uchar(5)`). The `i128` is
+    /// already normalized by `rarithmetic.rint_new`. `RIntId` is the
+    /// Python instance identity (`signed_int.__new__`); it is excluded
+    /// from `PartialEq`/`Hash` so `Hashable.key` stays `(type, value)`.
+    RInt(RIntClass, i128, RIntId),
     /// Python float constant. RPython stores the `f64` directly on
     /// `Constant.value`; Rust carries it as `f64::to_bits()` so the
     /// enum keeps its `Eq + Hash` derivation (IEEE 754 NaN violates
@@ -3184,6 +3257,7 @@ impl PartialEq for ConstValue {
             (ConstValue::UInt(a), ConstValue::UInt(b)) => a == b,
             (ConstValue::Int128(a), ConstValue::Int128(b)) => a == b,
             (ConstValue::UInt128(a), ConstValue::UInt128(b)) => a == b,
+            (ConstValue::RInt(c1, a, _), ConstValue::RInt(c2, b, _)) => c1 == c2 && a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
             (ConstValue::SingleFloat(a), ConstValue::SingleFloat(b)) => a == b,
             (ConstValue::LongFloat(a), ConstValue::LongFloat(b)) => {
@@ -3252,6 +3326,13 @@ impl std::fmt::Display for ConstValue {
             ConstValue::UInt(value) => write!(f, "{value}"),
             ConstValue::Int128(value) => write!(f, "{value}"),
             ConstValue::UInt128(value) => write!(f, "{value}"),
+            ConstValue::RInt(class, value, _) => {
+                write!(
+                    f,
+                    "{}",
+                    crate::rlib::rarithmetic::rint_value(*class, *value)
+                )
+            }
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
             ConstValue::SingleFloat(bits) => {
                 write!(f, "r_singlefloat({})", f32::from_bits(*bits))
@@ -3300,6 +3381,10 @@ impl Hash for ConstValue {
             ConstValue::UInt(value) => value.hash(state),
             ConstValue::Int128(value) => value.hash(state),
             ConstValue::UInt128(value) => value.hash(state),
+            ConstValue::RInt(class, value, _) => {
+                class.hash(state);
+                crate::rlib::rarithmetic::rint_value(*class, *value).hash(state);
+            }
             ConstValue::Float(bits) => bits.hash(state),
             ConstValue::SingleFloat(bits) => bits.hash(state),
             ConstValue::LongFloat(bits) => {
@@ -3958,6 +4043,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::UInt(_) => "UInt",
         ConstValue::Int128(_) => "Int128",
         ConstValue::UInt128(_) => "UInt128",
+        ConstValue::RInt(_, _, _) => "RInt",
         ConstValue::Float(_) => "Float",
         ConstValue::SingleFloat(_) => "SingleFloat",
         ConstValue::LongFloat(_) => "LongFloat",
@@ -4046,6 +4132,24 @@ impl ConstValue {
     /// Wrap an `f64` into the bit-preserving `Float` variant.
     pub fn float(value: f64) -> Self {
         ConstValue::Float(value.to_bits())
+    }
+
+    /// Fresh `build_int` instance (`signed_int.__new__` /
+    /// `unsigned_int.__new__`). Each call mints a new [`RIntId`].
+    pub fn rint(class: RIntClass, value: i128) -> Self {
+        ConstValue::RInt(class, value, RIntId::mint())
+    }
+
+    /// Python `is` on the wrapped object (`is__default`).
+    ///
+    /// HostObject / Opaque / SpecTag already compare by identity in
+    /// `PartialEq`. RInt compares by value there (`Hashable.key`);
+    /// identity is the token minted at construction.
+    pub fn object_is(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ConstValue::RInt(_, _, a), ConstValue::RInt(_, _, b)) => a.is_same(*b),
+            _ => self == other,
+        }
     }
 
     /// Construct a Python 2 byte string (`str`) constant.
@@ -4167,6 +4271,9 @@ impl ConstValue {
             ConstValue::UInt(n) => Some(*n != 0),
             ConstValue::Int128(n) => Some(*n != 0),
             ConstValue::UInt128(n) => Some(*n != 0),
+            ConstValue::RInt(c, n, _) => {
+                Some(!crate::rlib::rarithmetic::rint_value(*c, *n).is_zero())
+            }
             // Python `bool(float)` is `float != 0.0` (including -0.0
             // which equals 0.0 under IEEE 754).
             ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
@@ -4271,6 +4378,7 @@ impl ConstValue {
             | ConstValue::UInt(_)
             | ConstValue::Int128(_)
             | ConstValue::UInt128(_) => HOST_ENV.lookup_builtin("int"),
+            ConstValue::RInt(c, _, _) => Some(crate::rlib::rarithmetic::rint_class_object(*c)),
             ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
             ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => None,
             ConstValue::Bool(_) => HOST_ENV.lookup_builtin("bool"),
@@ -5170,6 +5278,11 @@ pub struct GraphFunc {
     /// to `true` by RPython's `@not_rpython` decorator to mark a
     /// function as flow-space-ineligible.
     pub not_rpython: bool,
+    /// Upstream `func.no_direct_compare` (`rint.py` `ll_eq_shortint`).
+    /// `rordereddict.py` `get_ll_dict` copies it onto `ENTRIES` via
+    /// `getattr(ll_eq_function, 'no_direct_compare', False)`. `false`
+    /// mirrors the attribute-absent default.
+    pub no_direct_compare: bool,
 }
 
 impl GraphFunc {
@@ -5208,6 +5321,7 @@ impl GraphFunc {
             filename: None,
             module: None,
             not_rpython: false,
+            no_direct_compare: false,
         }
     }
 
@@ -5838,6 +5952,7 @@ pub(crate) fn exitcase_numeric_i128(exitcase: &Option<Hlvalue>) -> Option<i128> 
         Some(Hlvalue::Constant(c)) => match &c.value {
             ConstValue::Int(n) => Some(*n as i128),
             ConstValue::UInt(n) => Some(*n as i128),
+            ConstValue::RInt(c, n, _) => crate::rlib::rarithmetic::rint_value(*c, *n).as_i128(),
             ConstValue::Bool(flag) => Some(i128::from(*flag)),
             _ => None,
         },
@@ -5858,6 +5973,7 @@ fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
         Hlvalue::Constant(Constant {
             value: ConstValue::Int(_)
                 | ConstValue::UInt(_)
+                | ConstValue::RInt(_, _, _)
                 | ConstValue::Bool(_)
                 | ConstValue::None,
             ..
@@ -6837,6 +6953,48 @@ mod tests {
             crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
         )));
         assert!(c.foldable());
+    }
+
+    #[test]
+    fn rint_constant_class_is_rarithmetic_and_not_foldable() {
+        let class = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let value = ConstValue::rint(class, 3);
+        let cls = value.class_of().expect("RInt has a class");
+        let builtin_int = HOST_ENV.lookup_builtin("int").expect("int");
+        assert_ne!(cls, builtin_int);
+        assert_eq!(cls.module_name(), Some("rpython.rlib.rarithmetic"));
+        assert!(!Constant::new(value).foldable());
+    }
+
+    #[test]
+    fn rint_instances_eq_by_value_object_is_by_identity() {
+        let class = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let a = crate::rlib::rarithmetic::rint_new(class, 1).expect("r_uchar(1)");
+        let b = crate::rlib::rarithmetic::rint_new(class, 1).expect("r_uchar(1)");
+        assert_eq!(a, b);
+        let hash_of = |v: &ConstValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&a), hash_of(&b));
+        assert!(!a.object_is(&b));
+        assert!(a.object_is(&a));
+        assert!(a.object_is(&a.clone()));
+    }
+
+    #[test]
+    fn rarithmetic_module_publishes_base_int_hierarchy() {
+        let m = HOST_ENV
+            .import_module("rpython.rlib.rarithmetic")
+            .expect("rarithmetic");
+        let base = m.module_get("base_int").expect("base_int");
+        let signed = m.module_get("signed_int").expect("signed_int");
+        let unsigned = m.module_get("unsigned_int").expect("unsigned_int");
+        assert!(signed.is_subclass_of(&base));
+        assert!(unsigned.is_subclass_of(&base));
+        assert_eq!(signed.class_get("SIGNED"), Some(ConstValue::Bool(true)));
+        assert_eq!(unsigned.class_get("SIGNED"), Some(ConstValue::Bool(false)));
     }
 
     #[test]
