@@ -3109,6 +3109,13 @@ pub(crate) fn erased_integer_positional_field(s: &SomeValue, attr: &str) -> bool
     attr == "__pos_0" && matches!(s, SomeValue::Integer(_))
 }
 
+/// RPython `SomeString()` (`model.py` `SomeString.__init__` default
+/// `no_nul=False`). `no_nul` becomes True only through
+/// `rlib/rstring.py` `assert_str0`; `s_Str0` is the proven form.
+pub(crate) fn s_str() -> SomeValue {
+    SomeValue::String(SomeString::new(false, false))
+}
+
 /// RPython `s_Str0 = SomeString(no_nul=True)` (model.py).
 pub(crate) fn s_str0() -> SomeValue {
     SomeValue::String(SomeString::new(false, true))

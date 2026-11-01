@@ -1150,7 +1150,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
 ///   except a str-family result (`is_str_family_class_root`: rust-heap
 ///   `String`, `Wtf8Buf`, …) keeps `Ref(Some(root))` so the residual
 ///   annotates `SomeString` (`annotator/model.py` `SomeString`,
-///   `s_str0()`). Dropping that root minted the classdef-less Instance
+///   `no_nul=False`). Dropping that root minted the classdef-less Instance
 ///   `pairtype(SomeObject, SomeObject).union` cannot join with
 ///   `String::new()` (`binaryop.py`);
 /// - output is a payload-carrying enum (`GcAllocOutcome`) →
@@ -1391,8 +1391,8 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //   `SomeInstance`, the shell `bigint_from` produces, except a
         //   str-family result (`is_str_family_class_root`: rust-heap
         //   `String`, …) keeps the class root so
-        //   `foreign_opaque_method_return_shell` seeds `s_str0()`
-        //   (`annotator/model.py` `SomeString`). Dropping it to
+        //   `foreign_opaque_method_return_shell` seeds `SomeString`
+        //   (`no_nul=False`). Dropping it to
         //   `Ref(None)` minted the classdef-less Instance
         //   `pairtype(SomeObject, SomeObject).union` cannot join with
         //   `String::new()` (`binaryop.py`);
@@ -4533,8 +4533,8 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // behind `*mut Wtf8Buf` (`W_UnicodeObject.value`).
     // A rust-heap `String` is not rstr `STR`; the `ValueType` stays
     // `Ref` so `ll_strconcat` does not consume a `{cap, ptr, len}`
-    // header. `valuetype_to_someshell` shells that Ref as `s_str0()`
-    // (`annotator/model.py` `SomeString`).
+    // header. `valuetype_to_someshell` shells that Ref as `SomeString`
+    // with `no_nul=False` (`annotator/model.py` `SomeString`).
     if tyref_is_rust_heap_string(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }

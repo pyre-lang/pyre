@@ -216,8 +216,9 @@ pub(crate) fn setbinding(var: &Variable, ty: ValueType) {
 
 /// `SomeValue` shell `setbinding` would write for `ty`. A classed
 /// `Ref(Some(root))` is `SomeInstance(classdef, can_be_None=False)`;
-/// a str-family root is `s_str0()` (`annotator/model.py` `SomeString`);
-/// `Ref(None)` is the classdef-less `ref_fallback_instance`.
+/// a str-family root is `SomeString` with `no_nul=False`
+/// (`annotator/model.py` `SomeString.__init__` default); `Ref(None)` is
+/// the classdef-less `ref_fallback_instance`.
 fn shell_for(ty: &ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> Option<SomeValue> {
     match ty {
         ValueType::Ref(Some(root))
@@ -226,11 +227,13 @@ fn shell_for(ty: &ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> Option<Some
             Some(crate::annotator::bookkeeper::gcref_ptr_annotation())
         }
         ValueType::Ref(Some(root)) if crate::front::mir::is_str_family_class_root(root) => {
-            // `valuetype_to_someshell` shells this as `s_str0()`; interning
-            // a ClassDef here would mint `SomeInstance(String)` that
+            // `valuetype_to_someshell` shells this as `SomeString` with
+            // `no_nul=False` (`SomeString.__init__` default); `no_nul`
+            // needs `rlib/rstring.py` `assert_str0`. Interning a ClassDef
+            // here would mint `SomeInstance(String)` that
             // `binaryop.py` `pairtype(SomeObject, SomeObject).union` cannot
             // join with `String::new()`.
-            Some(crate::annotator::model::s_str0())
+            Some(crate::annotator::model::s_str())
         }
         ValueType::Ref(Some(root)) => bookkeeper
             .and_then(|bk| bk.classdef_for_known_struct_root(root))
@@ -1199,12 +1202,21 @@ mod tests {
             Some(&bk),
         )
         .expect("str-family Ref must project");
+        let SomeValue::String(s) = &shell else {
+            panic!(
+                "str-family Ref must stay SomeString when String has struct rows, got {shell:?}"
+            );
+        };
         assert!(
-            matches!(shell, SomeValue::String(_)),
-            "str-family Ref must stay SomeString when String has struct rows, got {shell:?}"
+            !s.inner.no_nul,
+            "str-family Ref is SomeString(no_nul=False) (SomeString.__init__ default)"
         );
         let s_new = SomeValue::String(SomeString::new(false, false));
-        union(&shell, &s_new).expect("str-family Ref must union with String::new()");
+        let joined = union(&shell, &s_new).expect("str-family Ref must union with String::new()");
+        assert!(
+            matches!(joined, SomeValue::String(_)),
+            "str-family Ref ∪ String::new() must stay SomeString, got {joined:?}"
+        );
     }
 
     #[test]
