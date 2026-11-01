@@ -238,22 +238,19 @@ fn scalar_pointer_params_match_int_callers() {
         })
         .expect("caller invokes the callback");
     let hash_out = args[5].as_variable().expect("hash_out value").clone();
+    let hash_word = args[2].as_variable().expect("hash value").clone();
+    assert_ne!(
+        hash_out, hash_word,
+        "hash_out is the address of keyhash, not the hash word"
+    );
     let produced = root_op(&caller, &hash_out);
-    let passed_int = match produced {
-        Some(OpKind::Input { ty, .. }) => int_family(ty),
-        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => true,
-        Some(
-            OpKind::Call { result_ty, .. }
-            | OpKind::UnaryOp { result_ty, .. }
-            | OpKind::BinOp { result_ty, .. },
-        ) => int_family(result_ty),
-        Some(OpKind::RawLoad { item_ty, .. }) => int_family(item_ty),
-        // `&mut keyhash` is spilled to a raw address. `_rewrite_raw_malloc`
-        // types that word Int, the same bank as `hash_out`.
-        Some(OpKind::RawMalloc { .. }) => true,
-        other => panic!("caller must pass hash_out as int, producer {other:?}"),
-    };
-    assert!(passed_int, "caller passes hash_out as int");
+    // rustc lowers `&mut keyhash` into `*mut i64` as
+    // `_r = &mut keyhash; _p = &raw mut (*_r)`. `_p` aliases the word, so
+    // the call must spill it (`RawMalloc`) rather than pass `hash`.
+    match produced {
+        Some(OpKind::RawMalloc { .. }) => {}
+        other => panic!("hash_out must be the spill address of &mut keyhash, producer {other:?}"),
+    }
 
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
         std::slice::from_ref(&llbc),

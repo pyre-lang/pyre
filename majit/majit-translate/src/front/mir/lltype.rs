@@ -959,9 +959,13 @@ pub(in crate::front::mir) fn pointer_elem_pointee_is_gc(
 
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
 ///
-/// References return `None`. Their flow value stays the address;
-/// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
-/// or a `Rvalue::Ref`, not for a call result.
+/// References return `None`. Inside a looked-inside graph `Rvalue::Ref`
+/// of a primitive aliases the scalar word; [`tyref_scalar_pointee_value_type`]
+/// names the pointee for a parameter or a `Rvalue::Ref`, not for a call
+/// result. A residual (`dont_look_inside`) callee whose declared parameter
+/// is `&prim` / `&mut prim` (including a generic `&Q` instantiated to a
+/// copy scalar) still dereferences an address; [`raw_scalar_borrow_spills`]
+/// spills that word (`scoped_alloc` / `_rewrite_raw_malloc`).
 pub(in crate::front::mir) fn raw_scalar_address_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -5030,7 +5034,8 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// [`tyref_one_word_handle_payload_field`], the Field-projection
 /// identity); `all_fielddescrs` does not recurse, so
 /// `PyreDecodeContext.pos_delta` is one
-/// `getfield(PyreDecodeContext, "pos_delta")`.
+/// `getfield(PyreDecodeContext, "pos_delta")`. A `repr(transparent)` scalar wrapper
+/// is that word ([`tyref_transparent_inner_value_type`]); copying its fields would getattr them on Integer and `getfield_raw_r` a marker.
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
@@ -5072,6 +5077,16 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         return None;
     }
     if tyref_one_word_handle_payload_field(ty, llbc, tombstoned).is_some() {
+        return None;
+    }
+    if let Some(inner) = tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) && value_type_is_transparent_scalar_word(&inner)
+    {
         return None;
     }
     Some(td)
@@ -5351,11 +5366,27 @@ pub(in crate::front::mir) fn is_deref_call(reg: &RegularCall, llbc: &Llbc) -> bo
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after
 /// stripping `Ref` / hash-cons wrappers.  `None` for non-ADT types.
+///
+/// [`apply_published_structs`] remaps a harvested field onto a dest
+/// numeric id when that crate has a matching TypeDecl; otherwise the
+/// id stays `{"Path": ...}`. [`type_decl_ref_adt_id`] reads only a
+/// number, so a Path-form marker would miss
+/// `type_str_leaf_is_void_zst` without this arm.
 pub(in crate::front::mir) fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = tyref_node(ty, llbc)?;
     let node = strip_ty_wrappers(node, llbc)?;
-    let id = adt_node_def_id(node)?;
-    Some(llbc.type_by_id(id)?.item_meta.name_path())
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    match adt.get("builtin").and_then(serde_json::Value::as_str) {
+        None | Some("Box") => {}
+        Some(_) => return None,
+    }
+    if let Some(id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        return Some(llbc.type_by_id(id)?.item_meta.name_path());
+    }
+    adt.get("id")?
+        .get("Path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Whether `td` declares a field named `name` — a struct field, or any
@@ -5634,7 +5665,10 @@ pub(in crate::front::mir) fn unique_nonzst_field(
     decl: &TypeDecl,
     llbc: &Llbc,
 ) -> Option<(usize, String)> {
-    if decl.published_struct_copy {
+    // A published copy keeps the defining crate's `repr(transparent)`
+    // layout and field list (`apply_published_structs`), so its
+    // unique sized field is still that field; any other published copy is refused.
+    if decl.published_struct_copy && !decl.is_repr_transparent() {
         return None;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -6136,22 +6170,25 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
-    // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
-    // crate is outside the extraction set, so the layout does not record the
-    // wrapper. The linked kind is that missing field.
-    // `apply_published_structs` turns that import into a `Struct` and does
-    // not copy `repr`, so the same false flag remains. Reading the copied
-    // field would retype the word; the kind stays the scalar table.
-    if (matches!(&decl.kind, TypeDeclKind::Opaque) || decl.published_struct_copy)
-        && let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path())
-    {
+    // The linked kind is the defining crate's unique non-ZST scalar field.
+    // Consult it for every decl of that path: a foreign `Opaque` has no
+    // field list, and a published copy is the same identity.
+    if let Some(kind) = linked_transparent_scalar_kind(decl, llbc) {
         return Some(transparent_scalar_value_type(kind));
+    }
+    // An unpublished Opaque has no field list; the bank above is its
+    // only peel. A published copy is a Struct that still carries
+    // `repr.transparent` from the foreign layout, so the unique
+    // scalar-word field is the ABI the same way a defining-crate
+    // Struct is.
+    if matches!(&decl.kind, TypeDeclKind::Opaque) {
+        return None;
     }
     if !decl.is_repr_transparent() {
         return None;
     }
     match &decl.kind {
-        TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
+        TypeDeclKind::Struct(fields) => {
             let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
                 fields.get(index)?
             } else if let [only] = fields.as_slice() {
@@ -6184,6 +6221,35 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
         }
         _ => None,
     }
+}
+
+pub(in crate::front::mir) fn linked_transparent_scalar_kind(
+    decl: &TypeDecl,
+    llbc: &Llbc,
+) -> Option<majit_charon_reader::TransparentScalarKind> {
+    let path = decl.item_meta.name_path();
+    if let Some(kind) = llbc.transparent_scalar_kind(&path) {
+        return Some(kind);
+    }
+    let stripped = strip_crate_prefix(&path);
+    if stripped != path {
+        llbc.transparent_scalar_kind(&stripped)
+    } else {
+        None
+    }
+}
+
+pub(in crate::front::mir) fn value_type_is_transparent_scalar_word(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+            | ValueType::Int128
+            | ValueType::UInt128
+    )
 }
 
 pub(in crate::front::mir) fn transparent_scalar_value_type(

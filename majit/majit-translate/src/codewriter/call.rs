@@ -11717,9 +11717,18 @@ impl CallControl {
                 // `analyze_random_effects` keeps returning False for it, as
                 // `RandomEffectsAnalyzer.analyze_simple_operation` does
                 // (effectinfo.py).
-                return self
-                    .external_funcobj(path)
-                    .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
+                //
+                // `GraphAnalyzer.analyze` (`graphanalyze.py`): a non-external
+                // funcobj with no `graph` is AttributeError → `top_result()`.
+                // CollectAnalyzer.top_result is True. A registered FunDecl
+                // whose build produced no graph is that funcobj
+                // (`names_funcobj`); a `mark_*` record with no store slot is
+                // the external arm above.
+                let (random_effects, canmallocgc) = match self.external_funcobj(path) {
+                    Some(f) => (f.random_effects_on_gcobjs, f.canmallocgc),
+                    None => (false, false),
+                };
+                return random_effects || canmallocgc || self.function_graphs.names_funcobj(path);
             }
         };
         if !seen.enter(path.clone(), analyzed) {
@@ -23009,6 +23018,56 @@ mod tests {
             !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
+        );
+    }
+
+    /// A registered funcobj whose build produced no graph is
+    /// `GraphAnalyzer.analyze`'s AttributeError arm (`graphanalyze.py`):
+    /// CollectAnalyzer.top_result is True. The hop that dropped
+    /// `jit_bigint_add` was that funcobj answering False through the
+    /// external-call arm, so a caller whose only Call is that funcobj
+    /// never reached the `canmallocgc` mark on the real allocator.
+    #[test]
+    fn a_graphless_registered_funcobj_can_collect_its_caller() {
+        let impl_path = CallPath::from_segments(["alloc_impl"]);
+        let wrapper = CallPath::from_segments(["alloc_wrapper"]);
+        let caller = CallPath::from_segments(["top_caller"]);
+
+        let mut cc = CallControl::new();
+        cc.function_graphs.insert_deferred(
+            impl_path.clone(),
+            (None, "alloc_impl".to_string(), GraphSpecialization::Regular),
+            || None,
+        );
+
+        let mut wrapper_graph = FunctionGraph::new("alloc_wrapper");
+        let start = wrapper_graph.startblock;
+        wrapper_graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(["alloc_impl"])));
+        wrapper_graph.set_return(start, None);
+        cc.register_function_graph(wrapper.clone(), wrapper_graph);
+
+        let mut caller_graph = FunctionGraph::new("top_caller");
+        let start = caller_graph.startblock;
+        caller_graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(["alloc_wrapper"])));
+        caller_graph.set_return(start, None);
+        cc.register_function_graph(caller.clone(), caller_graph);
+
+        assert!(
+            cc.function_graphs.get(&impl_path).is_none(),
+            "the impl's build produced no graph"
+        );
+        assert!(
+            cc.function_graphs.names_funcobj(&impl_path),
+            "the impl stays a registered funcobj after the failed build"
+        );
+        assert!(
+            cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "GraphAnalyzer.analyze (graphanalyze.py) — the caller of a non-external \
+             funcobj with no graph collects"
         );
     }
 

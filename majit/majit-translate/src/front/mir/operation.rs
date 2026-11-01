@@ -1346,6 +1346,38 @@ impl<'a> Lowering<'a> {
             .is_some_and(|decl| tyref_is_primitive_scalar(&decl.ty, self.llbc))
     }
 
+    /// rustc `&mut x` → `*mut T` is `_r = &mut x; _p = &raw mut (*_r)`.
+    /// `_p` is a raw pointer whose value is still the aliased word.
+    pub(in crate::front::mir) fn raw_scalar_arg_aliases_primitive_word(
+        &self,
+        arg_local: Option<usize>,
+    ) -> bool {
+        self.resolved_borrow_place(arg_local)
+            .is_some_and(|place| self.place_holds_aliased_primitive_word(&place))
+    }
+
+    /// A place that *holds* the scalar word: a primitive local, or a
+    /// field of a by-value aggregate. A remaining `Deref` is an address
+    /// that already names the word (`&raw mut (*p)` of a real pointer).
+    pub(in crate::front::mir) fn place_holds_aliased_primitive_word(&self, place: &Place) -> bool {
+        if !tyref_is_primitive_scalar(&place.ty, self.llbc) {
+            return false;
+        }
+        let mut current = place;
+        for _ in 0..8 {
+            match &current.kind {
+                PlaceKind::Local(_) => return true,
+                PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                    if v.get("Field").is_some() =>
+                {
+                    current = inner;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// Preserve the declared RPython reference repr of a typed field value.
     ///
     /// RPython represents an instance attribute as `SomeInstance(classdef)`;
@@ -1498,6 +1530,23 @@ impl<'a> Lowering<'a> {
         // (`rclass.py` `pairtype(InstanceRepr, InstanceRepr).convert_from_to`).
         // Same decision as [`Self::instance_narrow_for_type`].
         if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
+            return None;
+        }
+        // A `repr(transparent)` scalar wrapper's borrow is the word
+        // (`tyref_transparent_inner_value_type` peels `&W` the same way
+        // [`tyref_to_value_type_with`] does). Narrowing to the wrapper
+        // class would mint `Ptr(W)` next to the Integer the by-value
+        // site already stores, and `setattr("__pos_0")` cannot union them.
+        // A pointer newtype whose inner is already a Ref stays a class
+        // instance: skip only the integer/float/bool word.
+        if let Some(inner) = tyref_transparent_inner_value_type(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) && value_type_is_transparent_scalar_word(&inner)
+        {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
@@ -4130,6 +4179,20 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
             return None;
         }
+        // Same peel as [`tyref_to_value_type_with`]: a transparent scalar
+        // wrapper (by value or through `&` / `&mut`) is the word, so a
+        // call dest or pointer-cast must not mint `Ptr(W)`. A pointer
+        // newtype whose inner is a Ref is still a class dest.
+        if let Some(inner) = tyref_transparent_inner_value_type(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) && value_type_is_transparent_scalar_word(&inner)
+        {
+            return None;
+        }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
             // ByteStr is the intern leaf (`Function`, `PyObject`):
             // `bookkeeper.py` `getuniqueclassdef`, `stamp_named_ref_call_dests`.
@@ -5927,6 +5990,52 @@ impl<'a> Lowering<'a> {
                     // struct still has no bytes. Emitting a FieldRead would
                     // try to dereference that word as an aggregate base.
                     //
+                    // `tyref_transparent_nonzst_field` is the defining-crate
+                    // form (named field, `is_repr_transparent`). An Opaque
+                    // or published copy has no `repr` and a named field
+                    // (`__pos_0` is only the missing-row fallback), so the
+                    // linked scalar bank [`tyref_transparent_inner_value_type`]
+                    // is the same question: the non-ZST field is the word.
+                    if let Some(inner_vt) = tyref_transparent_inner_value_type(
+                        &inner.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ) {
+                        if field_is_zst(&field_ty, self.llbc) {
+                            return Ok(self.emit_unit(self.emit_bb(mir_bb)));
+                        }
+                        if let Some((_, name)) =
+                            tyref_transparent_nonzst_field(&inner.ty, self.llbc)
+                            && field_name != name
+                        {
+                            return Ok(self.emit_unit(self.emit_bb(mir_bb)));
+                        }
+                        // A linked-bank wrapper has no field list here
+                        // (`tyref_transparent_nonzst_field` is None). A
+                        // field that is not the scalar word is a zero-sized
+                        // marker; loading it would `getfield_raw_r` the
+                        // word as an aggregate.
+                        let field_vt = tyref_to_value_type_with(
+                            &field_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        );
+                        if value_type_is_transparent_scalar_word(&inner_vt)
+                            && !value_type_is_transparent_scalar_word(&field_vt)
+                        {
+                            return Ok(self.emit_unit(self.emit_bb(mir_bb)));
+                        }
+                        let wrapper_ty = clone_tyref(&inner.ty);
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        // The carrier word stays one pointer. Projecting
+                        // its inner `PyObjectRef` has to name that class,
+                        // or the handle and the object merge.
+                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                    }
                     // A one-word std handle that is not `repr(transparent)`
                     // (a pointer plus ZST markers) is the same declared
                     // layout: the unique sized field *is* the word
@@ -5952,23 +6061,6 @@ impl<'a> Lowering<'a> {
                             return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                         }
                         return Ok(self.emit_unit(self.emit_bb(mir_bb)));
-                    }
-                    // An opaque dependency view has no field list, but the
-                    // linked scalar bank still types the wrapper as its inner
-                    // word. The only projection that view emits is `__pos_0`.
-                    if field_name == "__pos_0"
-                        && tyref_transparent_inner_value_type(
-                            &inner.ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                        .is_some()
-                    {
-                        let wrapper_ty = clone_tyref(&inner.ty);
-                        let base = self.resolve_place(mir_bb, *inner)?;
-                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
                     }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the
@@ -6936,6 +7028,32 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && tyref_transparent_inner_value_type(
+                        &inner.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .is_some()
+                {
+                    // Same identity as `tyref_transparent_nonzst_field` on
+                    // a defining crate: an Opaque wrapper has no field list,
+                    // so [`Self::resolve_adt_field`] never reaches that arm.
+                    // The non-ZST field is the word; a ZST marker has no
+                    // layout word (`opaque_scalar_field` is `None`).
+                    if self
+                        .opaque_scalar_field(&inner.ty, &place_ty, field_payload)
+                        .is_some()
+                    {
+                        let wrapper_ty = clone_tyref(&inner.ty);
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                    }
+                    return Ok(self.emit_unit(self.emit_bb(mir_bb)));
                 }
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))

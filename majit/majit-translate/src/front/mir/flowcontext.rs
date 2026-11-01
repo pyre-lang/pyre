@@ -179,8 +179,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// local from every assignment consult it and skip the rest.
     pub(in crate::front::mir) forward_reached: Vec<bool>,
     /// Locals some forward-reached `Call` terminator writes whole, for
-    /// [`Self::local_is_call_dest`]; built on first query.
-    pub(in crate::front::mir) call_dest_locals: std::cell::OnceCell<bit_set::BitSet>,
+    /// [`Self::local_is_call_dest`]; built on first query. A unique
+    /// Regular call also records its argument operands so a pointer
+    /// identity cast can name the place its operand names.
+    pub(in crate::front::mir) call_dest_locals: std::cell::OnceCell<CallDestLocals>,
     /// Root locals of some forward-reached projected `Assign` destination,
     /// for [`Self::local_has_projected_store`]; built on first query.
     pub(in crate::front::mir) projected_store_roots: std::cell::OnceCell<bit_set::BitSet>,
@@ -1252,12 +1254,12 @@ impl<'a> Lowering<'a> {
             }
         }
         let glue_call_drops = glue_call_drop_blocks(body, llbc);
-        // A root-bracket guard's `Drop` lowers to a call that takes the guard
-        // by reference, so the dropping block reads it.  Every other drop is
-        // pure control flow as far as liveness is concerned; without this the
-        // guard reaches no drop block's inputargs and the close has no place
-        // to name.  `glue_call_drops` is the same fact for the `drop_in_place`
-        // spelling #1689 already keeps live.
+        // A root-bracket guard's `Drop` lowers to a call that takes the
+        // guard's one word, so the dropping block reads it.  Every
+        // other drop is pure control flow as far as liveness is concerned;
+        // without this the guard reaches no drop block's inputargs and the
+        // close has no place to name.  `glue_call_drops` is the same fact for
+        // the `drop_in_place` spelling #1689 already keeps live.
         let root_scope_moved_locals = MovedOutLocals::new(body, llbc);
         let root_bracket = analyze_root_brackets(body, llbc, &root_scope_moved_locals, root_stack);
         if extra_live.len() < body.body.len() {
@@ -3061,9 +3063,10 @@ impl<'a> Lowering<'a> {
             // RootScope drop closes the shadow-stack bracket opened by
             // `push_roots`.  #1689 spells that as the Charon `drop_in_place`
             // glue call; this branch spells the same rewind as the named
-            // `root_scope_close` residual so a crate that only imports the
-            // opaque guard can still name it.  Emit the named residual, not
-            // both — a second close would truncate an already-rewound stack.
+            // `root_scope_close_word` residual so a crate that only imports
+            // the opaque guard can still name it, and so the residual takes
+            // the guard's Int word.  Emit the named residual, not both — a
+            // second close would truncate an already-rewound stack.
             // FrameAnchor drop is the matching rewind for `frame_anchor_new`;
             // matching it here keeps that glue residual live.  Other drops
             // keep the legacy goto until their glue bodies and residual

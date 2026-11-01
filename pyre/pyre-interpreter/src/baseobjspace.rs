@@ -131,9 +131,17 @@ pub fn clear_method_cache() {
 /// Only an exact `TypeError` raised while hashing is replaced; equality
 /// callback errors, non-TypeError exceptions, and TypeError subclasses pass
 /// through unchanged.
-#[majit_macros::dont_look_inside]
 pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
-    take_pending_hash_error_for(key, wrap_dict_key_hash_error)
+    PyError::from_raw(take_pending_dict_key_error_raw(key) as PyObjectRef)
+}
+
+/// Word-ABI residual twin: the parked dict-key TypeError as a handle
+/// (`getfunctionptr`). `descroperation.py` `hash_w` raised it.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_pending_dict_key_error_raw(
+    key: PyObjectRef,
+) -> *mut crate::error::PyErrorObject {
+    take_pending_hash_error_for(key, wrap_dict_key_hash_error).as_raw()
 }
 
 /// The set-element counterpart, for a caller that reached the shared hash
@@ -206,10 +214,20 @@ fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyErro
 /// Recover a pending key-hash error naming `container` as `dict` or
 /// `frozendict` (`dict_unhashable_type`).
 pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
+    PyError::from_raw(take_pending_mapping_key_error_raw(container, key) as PyObjectRef)
+}
+
+/// Word-ABI residual twin: the parked mapping-key TypeError as a handle
+/// (`getfunctionptr`). `descroperation.py` `hash_w` raised it.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_pending_mapping_key_error_raw(
+    container: PyObjectRef,
+    key: PyObjectRef,
+) -> *mut crate::error::PyErrorObject {
     if container_is_frozendict(container) {
-        take_pending_hash_error_for(key, wrap_frozendict_key_hash_error)
+        take_pending_hash_error_for(key, wrap_frozendict_key_hash_error).as_raw()
     } else {
-        take_pending_dict_key_error(key)
+        take_pending_dict_key_error_raw(key)
     }
 }
 

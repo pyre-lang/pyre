@@ -1003,6 +1003,10 @@ pub(crate) fn discover_transparent_scalar_kinds(
         if !decl.is_repr_transparent() || decl.published_struct_copy {
             continue;
         }
+        // Only the defining crate's field list defines the linked kind.
+        if !decl.item_meta.is_local {
+            continue;
+        }
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             continue;
         };
@@ -1019,7 +1023,12 @@ pub(crate) fn discover_transparent_scalar_kinds(
             ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
             _ => continue,
         };
-        discovered.push((decl.item_meta.name_path(), kind));
+        let path = decl.item_meta.name_path();
+        discovered.push((path.clone(), kind));
+        let stripped = strip_crate_prefix(&path);
+        if stripped != path {
+            discovered.push((stripped, kind));
+        }
     }
     // The defining crate is outside the extraction set, so the `u32` field
     // is known from `bitflags!` — the same knowledge [`code_flags_const`]'s

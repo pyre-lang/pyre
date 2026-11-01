@@ -73,10 +73,12 @@ fn optional_module() -> &'static Llbc {
     load_llbc(MODULE_LLBC)
 }
 
+/// A lowered `RootScope` drop closes the scope by value
+/// (`root_scope_close_word`, `shadowstack.py` `pop_roots`).
 fn is_root_scope_close(op: &OpKind) -> bool {
     matches!(op,
         OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-            if segments.last().map(String::as_str) == Some("root_scope_close")
+            if segments.last().map(String::as_str) == Some("root_scope_close_word")
                 || (segments.last().map(String::as_str) == Some("drop_in_place")
                     && segments.iter().any(|s| s == "RootScope")))
 }
