@@ -501,6 +501,145 @@ fn every_continuation_parent_carries_the_pending_result_placeholder() {
     }
 }
 
+/// Decode one `descr_call_tail` resume section the way
+/// `rebuild_from_resumedata` fills that level's registers. Const slots
+/// never consult the CPU.
+fn reconstruct_ctor_tail_recipe(
+    ctx: &mut TraceCtx,
+    frame: &majit_ir::resumedata::RebuiltFrame,
+) -> Option<majit_metainterp::ReconstructRecipe> {
+    struct UnusedCpu;
+    impl majit_backend::Backend for UnusedCpu {
+        fn compile_loop(
+            &mut self,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("UnusedCpu::compile_loop")
+        }
+        fn compile_bridge(
+            &mut self,
+            _fail_descr: &dyn majit_ir::FailDescr,
+            _inputargs: &[majit_ir::InputArgRc],
+            _ops: &[majit_ir::OpRc],
+            _original_token: &majit_backend::JitCellToken,
+        ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
+            unimplemented!("UnusedCpu::compile_bridge")
+        }
+        fn execute_token(
+            &self,
+            _token: &majit_backend::JitCellToken,
+            _args: &[majit_ir::Value],
+        ) -> majit_backend::DeadFrame {
+            unimplemented!("UnusedCpu::execute_token")
+        }
+        fn get_latest_descr<'a>(
+            &self,
+            _frame: &'a majit_backend::DeadFrame,
+        ) -> &'a dyn majit_ir::FailDescr {
+            unimplemented!("UnusedCpu::get_latest_descr")
+        }
+        fn get_latest_descr_arc(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+        ) -> std::sync::Arc<dyn majit_ir::descr::Descr> {
+            unimplemented!("UnusedCpu::get_latest_descr_arc")
+        }
+        fn get_int_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> i64 {
+            unimplemented!("UnusedCpu::get_int_value")
+        }
+        fn get_value_direct(&self, frame: &majit_backend::DeadFrame, slot: usize) -> i64 {
+            self.get_int_value(frame, slot)
+        }
+        fn get_float_value(&self, _frame: &majit_backend::DeadFrame, _index: usize) -> f64 {
+            unimplemented!("UnusedCpu::get_float_value")
+        }
+        fn get_ref_value(
+            &self,
+            _frame: &majit_backend::DeadFrame,
+            _index: usize,
+        ) -> majit_ir::GcRef {
+            unimplemented!("UnusedCpu::get_ref_value")
+        }
+        fn invalidate_loop(&self, _token: &majit_backend::JitCellToken) {
+            unimplemented!("UnusedCpu::invalidate_loop")
+        }
+    }
+    let resume_data = majit_metainterp::ResumeDataResult {
+        frames: Vec::new(),
+        virtualizable_boxes: Vec::new(),
+        virtualref_values: Vec::new(),
+        storage: None,
+        num_failargs: 0,
+        fail_arg_types: Vec::new(),
+    };
+    let mut cache = majit_metainterp::BridgeVirtualCache::new(0, crate::descr::make_array_descr);
+    crate::state::reconstruct_inline_recipe(
+        ctx,
+        frame,
+        None,
+        &resume_data,
+        &[],
+        &[],
+        &UnusedCpu,
+        &mut cache,
+        false,
+        &[],
+    )
+}
+
+/// `resume.py rebuild_from_resumedata` fills `descr_call_tail` from its
+/// section: one value at the in-call `-live-`, two after CALL_ASSEMBLER.
+#[test]
+fn reconstruct_inline_recipe_fills_ctor_tail_registers_from_the_section() {
+    use majit_ir::resumedata::{RebuiltFrame, RebuiltValue};
+
+    let Some(index) = crate::ctor_continuation::jitcode_index() else {
+        panic!("descr_call_tail must install");
+    };
+    let resume_pc = crate::ctor_continuation::resume_pc().expect("in-call pc");
+    let assembler_pc = crate::ctor_continuation::assembler_resume_pc().expect("assembler pc");
+
+    const INSTANCE: usize = 0x51_0000_1000;
+    const INIT_RESULT: usize = 0x51_0000_2000;
+    let _restore = [
+        RestoreConstPtr::intern(INSTANCE),
+        RestoreConstPtr::intern(INIT_RESULT),
+    ];
+    let mut ctx = TraceCtx::for_test_types(&[]);
+    let instance = ctx.const_ref(INSTANCE as i64);
+    let init_result = ctx.const_ref(INIT_RESULT as i64);
+    let const_box =
+        |addr: usize| RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef(addr)));
+
+    let in_call = reconstruct_ctor_tail_recipe(
+        &mut ctx,
+        &RebuiltFrame {
+            jitcode_index: index,
+            pc: resume_pc as i32,
+            values: vec![const_box(INSTANCE)],
+        },
+    )
+    .expect("in-call ctor tail reconstructs");
+    assert!(in_call.ctor_tail);
+    assert_eq!(in_call.jitcode_pc, resume_pc as i32);
+    assert_eq!(in_call.registers_r, vec![instance]);
+
+    let assembler = reconstruct_ctor_tail_recipe(
+        &mut ctx,
+        &RebuiltFrame {
+            jitcode_index: index,
+            pc: assembler_pc as i32,
+            values: vec![const_box(INSTANCE), const_box(INIT_RESULT)],
+        },
+    )
+    .expect("assembler ctor tail reconstructs");
+    assert!(assembler.ctor_tail);
+    assert_eq!(assembler.jitcode_pc, assembler_pc as i32);
+    assert_eq!(assembler.registers_r, vec![instance, init_result]);
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,

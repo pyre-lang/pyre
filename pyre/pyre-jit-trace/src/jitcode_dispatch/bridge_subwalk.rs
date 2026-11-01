@@ -1823,17 +1823,19 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let mut pending_tails: Vec<InlineParentFrame> = Vec::new();
     for parent_recipe in paused_parent_recipes {
         if parent_recipe.len_tail
+            || parent_recipe.ctor_tail
             || crate::state::jitcode_is_transparent_helper(parent_recipe.jitcode_index)
         {
             // The recipe's jitcode is the operator tail that was paused
-            // (`bh_len_tail` or `bh_truth_bool_tail`), or a descended helper
-            // paused past its CALL. Rebuilding `Len` unconditionally would
-            // run the length check on a `__bool__` result.
+            // (`bh_len_tail` or `bh_truth_bool_tail`), `descr_call`'s tail,
+            // or a descended helper paused past its CALL. Rebuilding `Len`
+            // unconditionally would run the length check on a `__bool__`
+            // result.
             if parent_recipe.jitcode_pc < 0 {
                 return None;
             }
             let resume_pc = parent_recipe.jitcode_pc as usize;
-            let boxes = if parent_recipe.len_tail {
+            let boxes = if parent_recipe.len_tail || parent_recipe.ctor_tail {
                 parent_recipe.registers_r.clone()
             } else {
                 crate::state::recipe_live_boxes(parent_recipe)
@@ -1862,14 +1864,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     nboxes,
                 ),
             });
-            continue;
-        }
-        if let Some(instance) = parent_recipe.return_substitute {
-            let Some(tail) = crate::jitcode_dispatch::ctor_continuation_parent_frame(instance)
-            else {
-                return None;
-            };
-            pending_tails.push(tail);
             continue;
         }
         // Preserve the wrapper identity for frame-local metadata, but not a

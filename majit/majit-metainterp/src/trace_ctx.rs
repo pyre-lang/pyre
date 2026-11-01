@@ -965,18 +965,14 @@ pub struct ReconstructRecipe {
     /// frame that runs.  `NONE` for a level that has no frame red.
     pub frame: OpRef,
     pub nargs: usize,
-    /// Set only for a level that reconstructs NO frame: on the way out it
-    /// discards its callee's result and yields this box to its own caller
-    /// instead.  `typeobject.py descr_call` is the one such level — the
-    /// discard of `__init__`'s result plus `return w_newobject` is its whole
-    /// JIT-visible body, so there is no bytecode to walk and no
-    /// `locals_cells_stack_w` to rebuild.  Every other field above is unread
-    /// when this is `Some`.
-    pub return_substitute: Option<OpRef>,
     /// `operation.py len` after `_len`. Not a Python frame: the drain runs
     /// `bh_len_tail` on the callee's return. `capture_resumedata`
     /// (`pyjitpl.py`) keeps that graph on the framestack.
     pub len_tail: bool,
+    /// `typeobject.py descr_call` after `__init__`. Not a Python frame: the
+    /// drain walks `descr_call_tail` from the resume pc
+    /// (`resume.py rebuild_from_resumedata`).
+    pub ctor_tail: bool,
     /// `NewWithVtable` of this frame on an exception-guard bridge, recorded
     /// while the framestack is rebuilt and before
     /// `prepare_resume_from_failure` records that guard. `None` for a level
@@ -1015,7 +1011,6 @@ impl ReconstructRecipe {
             .iter()
             .chain(self.registers_r_color.iter())
             .chain(std::iter::once(&self.frame))
-            .chain(self.return_substitute.iter())
             .chain(self.rebuilt_frame.iter())
             .chain(self.rebuilt_ec.iter())
             .for_each(|op| f(*op));

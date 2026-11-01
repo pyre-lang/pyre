@@ -8818,8 +8818,8 @@ fn reconstruct_transparent_helper_recipe(
         registers_r_color: Vec::new(),
         frame: OpRef::NONE,
         nargs: 0,
-        return_substitute: None,
         len_tail: false,
+        ctor_tail: false,
         rebuilt_frame: None,
         rebuilt_ec: None,
     })
@@ -8849,7 +8849,7 @@ fn reconstruct_transparent_helper_recipe(
 /// interpreter and resumes correctly — only the inline-frame reconstruction
 /// optimization is forfeited, never correctness. The forward inline capture
 /// declines on the same conditions.
-fn reconstruct_inline_recipe(
+pub(crate) fn reconstruct_inline_recipe(
     ctx: &mut majit_metainterp::TraceCtx,
     frame: &majit_ir::resumedata::RebuiltFrame,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -8873,34 +8873,35 @@ fn reconstruct_inline_recipe(
     if frame.pc < 0 {
         decline!("NoSnapshotPc");
     }
-    // `descr_call`'s tail reconstructs no frame.  Its jitcode has no code
-    // object, so every check below would decline it, and the whole chain with
-    // it; but its JIT-visible body is only the discard of `__init__`'s result
-    // and `ref_return` of the instance, which the drain can carry out by
-    // substituting the box on the way out.  Decode that one box here.
+    // `descr_call`'s tail reconstructs no Python frame. Its jitcode has no
+    // code object, so every check below would decline it, and the whole chain
+    // with it. `resume.py rebuild_from_resumedata` still fills this level's
+    // registers from its section; the drain walks `descr_call_tail` from the
+    // resume pc (`bh_check_init_returned_none`, then `ref_return`).
     if crate::ctor_continuation::is_installed_level(frame.jitcode_index) {
-        // In-call resume carries the instance alone (`r1` pending). After
-        // CALL_ASSEMBLER both registers are live; the tail still has to run
-        // `bh_check_init_returned_none`, so decline and let the blackhole
-        // execute it (`W_TypeObject.descr_call` after `get_and_call_args`).
-        let instance_value = match frame.values.as_slice() {
-            [instance_value] => instance_value,
-            [_, _] => decline!("CtorTailAssembler"),
-            _ => decline!("CtorTailArity"),
-        };
-        let (instance, _) = bridge_decode_box(
-            ctx,
-            instance_value,
-            Type::Ref,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        if instance.is_none() {
-            decline!("CtorTailBox");
+        // In-call `-live-` names r0 (the instance) alone; after
+        // CALL_ASSEMBLER both r0 and r1 are live (`descr_call` after
+        // `get_and_call_args`).
+        if frame.values.len() != 1 && frame.values.len() != 2 {
+            decline!("CtorTailArity");
+        }
+        let mut registers_r = Vec::with_capacity(frame.values.len());
+        for value in &frame.values {
+            let (boxed, _) = bridge_decode_box(
+                ctx,
+                value,
+                Type::Ref,
+                rd_virtuals,
+                resume_data,
+                fail_values,
+                fail_types,
+                backend,
+                cache,
+            );
+            if boxed.is_none() {
+                decline!("CtorTailBox");
+            }
+            registers_r.push(boxed);
         }
         return Some(ReconstructRecipe {
             code_ptr: std::ptr::null(),
@@ -8909,27 +8910,22 @@ fn reconstruct_inline_recipe(
             nlocals: 0,
             valuestackdepth: 0,
             registers_i: Vec::new(),
-            registers_r: Vec::new(),
+            registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
             registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
-            return_substitute: Some(instance),
             len_tail: false,
+            ctor_tail: true,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
     }
     // An operator's tail (`crate::operator_continuation`) reconstructs no
-    // frame either, and unlike `descr_call`'s it cannot be carried out by
-    // substituting a box: its JIT-visible body is a CALL that has to run, over
-    // a value the callee has not returned yet.  The conservative blackhole
-    // resume runs it correctly, so decline the whole chain here -- named,
-    // rather than as the `NoCodeForJitcodeIndex` every check below would give
-    // it anyway.
-    // `capture_resumedata` keeps `operation.py len` on the framestack. This
-    // level is that tail: no code object, applied after `__len__` returns.
+    // Python frame either. `capture_resumedata` keeps `operation.py len` on
+    // the framestack. This level is that tail: no code object, applied after
+    // `__len__` returns.
     if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
         // `resume.py rebuild_from_resumedata` fills this level's registers
         // from its section like any other frame's. The resume `-live-` names
@@ -8966,8 +8962,8 @@ fn reconstruct_inline_recipe(
             registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
-            return_substitute: None,
             len_tail: true,
+            ctor_tail: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
@@ -9413,8 +9409,8 @@ fn reconstruct_inline_recipe(
                 registers_r_color: by_color_r,
                 frame: frame_box,
                 nargs: frame_nlocals,
-                return_substitute: None,
                 len_tail: false,
+                ctor_tail: false,
                 rebuilt_frame: None,
                 rebuilt_ec: None,
             });
@@ -9574,8 +9570,8 @@ fn reconstruct_inline_recipe(
             registers_r_color: by_color_r,
             frame: frame_red,
             nargs: frame_nlocals,
-            return_substitute: None,
             len_tail: false,
+            ctor_tail: false,
             rebuilt_frame: None,
             rebuilt_ec: None,
         });
@@ -16709,7 +16705,7 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// rather than rebuilding under the code's first namespace. A Python callee
 /// with no frame red is declined at reconstruct time (`NoFrameForGlobals`).
 /// Recipes that carry no frame red (transparent helpers, `len_tail`,
-/// `descr_call`'s return substitute) keep the first-namespace fallback;
+/// `ctor_tail`) keep the first-namespace fallback;
 /// the portal/root is `resume_data.frames[0]` and is not recovered here.
 pub(crate) fn recover_inline_callee_globals_from_recipe(
     ctx: &mut TraceCtx,
@@ -16944,9 +16940,7 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// catching middle that cannot be reconstructed declines before any
 /// `carrier_ec_leave` shortens `topframeref`.
 fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
-    !recipe.len_tail
-        && recipe.return_substitute.is_none()
-        && reconstructed_callee_recipe_is_portable(recipe)
+    !recipe.len_tail && !recipe.ctor_tail && reconstructed_callee_recipe_is_portable(recipe)
 }
 
 /// Stamp a resume-decoded GCREF onto its box (`RefFrontendOp._resref` /
@@ -17109,7 +17103,7 @@ fn emit_reconstructed_callee_pyframe(
 
 /// Record one `PyFrame` per rebuilt callee of an exception-guard bridge,
 /// before `prepare_resume_from_failure` records that guard. `len` tails
-/// and `descr_call`'s return substitute build no frame.
+/// and `descr_call`'s tail build no frame.
 fn record_rebuilt_callee_frames(
     ctx: &mut TraceCtx,
     ec_box: OpRef,
