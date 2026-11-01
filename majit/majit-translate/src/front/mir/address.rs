@@ -83,7 +83,9 @@ pub(in crate::front::mir) fn emit_raw_cell_malloc(
         result: Some(length.clone()),
         kind: OpKind::ConstUInt(itemsize as u64),
     });
-    let ptr = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    // `lltype.malloc(flavor='raw')` is an address integer.
+    // `Unknown` maps `getkind` to `'r'` (`assembler.py` `raw_store` base).
+    let ptr = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     graph.block_mut(bb).operations.push(SpaceOperation {
         result: Some(ptr.clone()),
         kind: OpKind::raw_malloc_with_flags(
@@ -153,6 +155,19 @@ pub(in crate::front::mir) fn emit_raw_cell_load(
     loaded
 }
 
+fn push_cast_int_to_ptr(graph: &mut FunctionGraph, bb: BlockId, arg: Variable) -> Variable {
+    // Restored GC handle. `Unknown` makes `get_value_kind_var` report
+    // `'r'` too, but align then treats the cell as a soft leftover and
+    // can pull a sibling int operand into the ref bank.
+    // `rbuiltin.py` `rtype_cast_int_to_ptr`.
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(result.clone()),
+        kind: cast_int_to_ptr_call(arg),
+    });
+    result
+}
+
 pub(in crate::front::mir) fn emit_raw_cell_free(
     graph: &mut FunctionGraph,
     bb: BlockId,
@@ -164,9 +179,10 @@ pub(in crate::front::mir) fn emit_raw_cell_free(
     });
 }
 
-/// Function-local primitive scalars whose address is passed as a raw
-/// scalar pointer. One Char-varsize cell each, for the local's storage
-/// scope (`scoped_alloc`).
+/// Function-local primitive scalars, or residual one-word handles
+/// (`repr(transparent)` thin-pointer ADT), whose address is passed as
+/// a raw scalar pointer. One Char-varsize cell each, for the local's
+/// storage scope (`scoped_alloc`).
 pub(in crate::front::mir) struct CellScalarPlan {
     pub(in crate::front::mir) locals: bit_set::BitSet,
     pub(in crate::front::mir) descr: Vec<Option<(ValueType, usize, bool)>>,
@@ -275,6 +291,51 @@ fn declared_residual_scalar_ref(declared: &TyRef, llbc: &Llbc) -> bool {
 /// word. A Charon `&` / `*const` is an address and is not this.
 fn tyref_is_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
     residual_scalar_word_descr(ty, llbc).is_some()
+}
+
+/// Residual copy word that is not a Charon primitive: a
+/// `repr(transparent)` one-word handle. The local stays `ValueType::Ref`
+/// (`tyref_transparent_inner_value_type`) while the residual ABI stores
+/// an Int word. Keyed on that type property, not on a type name.
+///
+/// The inner payload is a pointer word (`PyError` = `*mut PyObject`),
+/// not an integer. An Int-banked transparent wrapper (`RootScope` =
+/// `save_point: usize`) is already the word the JIT carries
+/// (`gc_roots.rs` `RootScope`; `jtransform.py` `getkind` `'int'`). A
+/// StorageLive cell replaces that word with the cell address, so a
+/// residual `shadow_stack_get` indexes with the pointer
+/// (`assembler.py` residual call args).
+fn tyref_is_residual_handle_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_residual_scalar_word(ty, llbc)
+        && !tyref_is_primitive_scalar(ty, llbc)
+        && residual_handle_inner_is_pointer_word(ty, llbc)
+}
+
+fn residual_handle_inner_is_pointer_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some((index, _)) = tyref_transparent_nonzst_field(ty, llbc) else {
+        return false;
+    };
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(decl) = adt_node_def_id(node).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return false;
+    };
+    let Some(field) = fields.get(index) else {
+        return false;
+    };
+    if tyref_is_primitive_scalar(&field.ty, llbc) {
+        return false;
+    }
+    let Some(field_node) = tyref_node(&field.ty, llbc) else {
+        return false;
+    };
+    json_ty_is_thin_pointer_element(field_node, llbc)
+        || tyref_is_raw_pointer(&field.ty, llbc)
+        || tyref_is_residual_handle_word(&field.ty, llbc)
 }
 
 fn tyref_is_ref_of_residual_scalar_word(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -432,12 +493,22 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             let Some(decl) = body.locals.locals.get(id) else {
                 continue;
             };
-            if !tyref_is_primitive_scalar(&decl.ty, llbc) {
+            // A Charon primitive, or a residual one-word handle. The
+            // handle then mallocs at `StorageLive` (after
+            // `jit_merge_point`) instead of a function-entry cell that
+            // would trip `unsimplify.py` `split_block` `_forcelink`.
+            if !tyref_is_primitive_scalar(&decl.ty, llbc)
+                && !tyref_is_residual_handle_word(&decl.ty, llbc)
+            {
                 continue;
             }
-            let Some(cell_descr) =
+            let cell_descr = if tyref_is_primitive_scalar(&decl.ty, llbc) {
                 tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
-            else {
+            } else {
+                residual_arg_store_descr(&decl.ty, llbc)
+                    .filter(|(_, size, _)| *size > 0 && *size <= RAW_SCALAR_SPILL_BYTES)
+            };
+            let Some(cell_descr) = cell_descr else {
                 continue;
             };
             locals.insert(id);
@@ -562,9 +633,29 @@ pub(in crate::front::mir) fn collect_function_scope_spill_cells(
             else {
                 continue;
             };
+            // Function-local residual handle word. Main's function-entry
+            // Char cell is residual `&T` of a parameter or field
+            // (`flowcontext` malloc at startblock, live-in everywhere
+            // except bb0). That cell across `jit_merge_point` trips
+            // `unsimplify.py` `split_block` `_forcelink`. The local
+            // already has a StorageLive cell from
+            // `collect_cell_scalar_locals`. A field of a function-local
+            // struct is still a function-scope cell.
+            if let PlaceKind::Local(id) = place.kind {
+                let id = id as usize;
+                if id > arg_count
+                    && body
+                        .locals
+                        .locals
+                        .get(id)
+                        .is_some_and(|decl| tyref_is_residual_handle_word(&decl.ty, llbc))
+                {
+                    continue;
+                }
+            }
             if place_is_planned_cell(&place, cell_locals) {
                 continue;
-            }
+            };
             if out
                 .iter()
                 .any(|cell: &FunctionScopeCellPlan| places_alias(&cell.place, &place))
@@ -908,6 +999,47 @@ impl<'a> Lowering<'a> {
         self.cell_locals.contains(local)
     }
 
+    fn tyref_is_ref_banked(&self, ty: &TyRef) -> bool {
+        matches!(
+            tyref_to_value_type_with(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+            ValueType::Ref(_)
+        )
+    }
+
+    fn local_is_ref_banked(&self, local: usize) -> bool {
+        self.body
+            .locals
+            .locals
+            .get(local)
+            .is_some_and(|decl| self.tyref_is_ref_banked(&decl.ty))
+    }
+
+    fn place_is_ref_banked(&self, place: &Place) -> bool {
+        self.tyref_is_ref_banked(&place.ty)
+    }
+
+    fn local_decl_is_residual_scalar_word(&self, local: usize) -> bool {
+        self.body
+            .locals
+            .locals
+            .get(local)
+            .is_some_and(|decl| tyref_is_residual_scalar_word(&decl.ty, self.llbc))
+    }
+
+    fn cast_gc_ref_word_to_int(&mut self, bb: BlockId, value: Variable) -> Variable {
+        if FunctionGraph::concretetype_of(&value) == crate::model::ConcreteType::GcRef {
+            push_cast_ptr_to_int(&mut self.graph, bb, value)
+        } else {
+            value
+        }
+    }
+
     pub(in crate::front::mir) fn cell_descr(
         &self,
         local: usize,
@@ -1031,6 +1163,11 @@ impl<'a> Lowering<'a> {
         };
         let ptr = self.defined_local(mir_bb, local)?;
         let bb = self.emit_bb(mir_bb);
+        let value = if self.local_is_ref_banked(local) {
+            self.cast_gc_ref_word_to_int(bb, value)
+        } else {
+            value
+        };
         emit_raw_cell_store(
             &mut self.graph,
             bb,
@@ -1055,14 +1192,13 @@ impl<'a> Lowering<'a> {
         };
         let ptr = self.defined_local(mir_bb, local)?;
         let bb = self.emit_bb(mir_bb);
-        Ok(emit_raw_cell_load(
-            &mut self.graph,
-            bb,
-            ptr,
-            item_ty,
-            itemsize,
-            is_item_signed,
-        ))
+        let loaded =
+            emit_raw_cell_load(&mut self.graph, bb, ptr, item_ty, itemsize, is_item_signed);
+        if self.local_is_ref_banked(local) {
+            Ok(push_cast_int_to_ptr(&mut self.graph, bb, loaded))
+        } else {
+            Ok(loaded)
+        }
     }
 
     pub(in crate::front::mir) fn emit_cell_free(
@@ -1911,7 +2047,15 @@ impl<'a> Lowering<'a> {
         let mut replacements = Vec::new();
         for group in groups {
             if self.group_place_is_cell(&group) {
-                let ptr = group.word.clone();
+                let ptr = if let Some(local) = group
+                    .place
+                    .as_ref()
+                    .and_then(|place| self.cell_local_of_address_place(place))
+                {
+                    self.defined_local(mir_bb, local)?
+                } else {
+                    group.word.clone()
+                };
                 for index in group.indices {
                     replacements.push((index, ptr.clone()));
                 }
@@ -1928,11 +2072,20 @@ impl<'a> Lowering<'a> {
                         "bb{mir_bb}: function-scope raw cell is unbound"
                     )));
                 };
+                let word = if group
+                    .place
+                    .as_ref()
+                    .is_some_and(|place| self.place_is_ref_banked(place))
+                {
+                    self.cast_gc_ref_word_to_int(bb_id, group.word)
+                } else {
+                    group.word
+                };
                 emit_raw_cell_store(
                     &mut self.graph,
                     bb_id,
                     ptr.clone(),
-                    group.word,
+                    word,
                     group.item_ty.clone(),
                     group.itemsize,
                     group.is_item_signed,
@@ -1951,9 +2104,13 @@ impl<'a> Lowering<'a> {
                 });
                 continue;
             }
+            // Call-scoped `Tuple<i64>` (`RAW_SCALAR_SPILL_OWNER`): same
+            // owner main uses. The pointer is still a raw address
+            // (`lltype.malloc(flavor='raw')`); `Unknown` would bank as
+            // `'r'` and `assembler.py` `raw_store` would reject the base.
             let ptr = self
                 .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(ptr.clone()),
                 kind: OpKind::raw_malloc(RAW_SCALAR_SPILL_OWNER, false, None),
@@ -1965,12 +2122,21 @@ impl<'a> Lowering<'a> {
                 result: Some(offset.clone()),
                 kind: OpKind::ConstInt(0),
             });
+            let word = if group
+                .place
+                .as_ref()
+                .is_some_and(|place| self.place_is_ref_banked(place))
+            {
+                self.cast_gc_ref_word_to_int(bb_id, group.word)
+            } else {
+                group.word
+            };
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
                 kind: OpKind::RawStore {
                     base: ptr.clone(),
                     offset,
-                    value: group.word,
+                    value: word,
                     item_ty: group.item_ty.clone(),
                     itemsize: group.itemsize,
                     is_item_signed: group.is_item_signed,
@@ -2126,17 +2292,24 @@ impl<'a> Lowering<'a> {
     /// whose [`pointer_place_of_local`] names that place is the same
     /// pointer (`type_holds_full_address`): `q = &mut x as *mut i64 as
     /// usize` is passed the spill pointer, and that integer does not
-    /// copy the pointee back. A field projection is that integer when
-    /// its stored operand names a place (`constant_field_path`,
-    /// `spill_address_source`). An integer literal
-    /// (`const_expr_literal`) stays the caller's value. An
-    /// address-sized integer this walk cannot place leaves the call
-    /// unlowered: a parameter, a call result, arithmetic, or `pair.0`
-    /// whose operand is not a single place. A pointer this walk cannot
-    /// place, or a pointer or integer that covers the spilled place,
-    /// leaves the call unlowered. Only a thin scalar pointer shares
-    /// the copy-out. A pointer or that integer packed into a tuple,
-    /// struct, enum, or array is still the caller's place
+    /// copy the pointee back. A `&T` / `&mut T` (a Charon `Ref`, not a
+    /// raw pointer) is judged like a raw pointer by its pointee, never
+    /// as an address-sized integer: a reference to a non-scalar cannot
+    /// name the `&prim` spill through its declared type. A field
+    /// projection is that integer when its stored operand names a
+    /// place (`constant_field_path`, `spill_address_source`). An
+    /// integer literal (`const_expr_literal`) stays the caller's
+    /// value. The pointee word itself (`hash` beside `&mut keyhash`)
+    /// and a plain integer that was never a pointer (`hash_known`)
+    /// stay the caller's value: they hold the scalar, not its address.
+    /// A raw pointer whose declared type is not a thin scalar address
+    /// (`*mut PyObject`) cannot be `q` for this word. A `*mut i64`
+    /// with no referent still leaves the call unlowered, and so does a
+    /// call result, arithmetic, or `pair.0` whose operand is not a
+    /// single place. A pointer or integer that covers the spilled
+    /// place leaves the call unlowered. Only a thin scalar pointer
+    /// shares the copy-out. A pointer or that integer packed into a
+    /// tuple, struct, enum, or array is still the caller's place
     /// (`local_hides_spill_alias`): the aggregate is not rewritten, so
     /// the call stays unlowered. A field that names another place
     /// stays, and so does a tuple of integer literals. A tuple of
@@ -2173,9 +2346,12 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let raw = tyref_is_raw_pointer(declared, self.llbc);
+            // A Charon `Ref` (`&T` / `&mut T`) is judged by its pointee
+            // like a raw pointer, not as an address-sized integer.
+            let is_ref = !raw && tyref_peel_one_ref_node(declared, self.llbc).is_some();
             // `usize` / `u64` can be the spilled address with the pointer
             // bits still intact. A narrower integer cannot name it.
-            let address_int = !raw && type_holds_full_address(declared, self.llbc);
+            let address_int = !raw && !is_ref && type_holds_full_address(declared, self.llbc);
             let arg_local = arg_locals.get(index).copied().flatten();
             let op = arg_operands.get(index);
             // `rffi.scoped_alloc`: a by-value copy of the fresh cell is
@@ -2211,7 +2387,7 @@ impl<'a> Lowering<'a> {
             // that operand cannot name the cell. `spill_address_source`
             // follows a field when its stored operand names one place.
             let place = match self.spill_address_source(op, 0) {
-                SpillAddressSource::Constant if !raw => continue,
+                SpillAddressSource::Constant if !raw && !is_ref => continue,
                 SpillAddressSource::Place(place) => place,
                 SpillAddressSource::Constant | SpillAddressSource::Unknown => {
                     if fresh_cell {
@@ -2284,7 +2460,8 @@ impl<'a> Lowering<'a> {
             return false;
         };
         let id = id as usize;
-        id > self.arg_count && self.local_decl_is_primitive(id)
+        id > self.arg_count
+            && (self.local_decl_is_primitive(id) || self.local_decl_is_residual_scalar_word(id))
     }
 
     /// `pair = (q,)` with `q` naming the spilled place. The aggregate
@@ -2348,23 +2525,48 @@ impl<'a> Lowering<'a> {
             .map(|decl| clone_tyref(&decl.ty))
     }
 
-    pub(in crate::front::mir) fn local_is_call_dest(&self, local: usize) -> bool {
-        self.call_dest_locals
-            .get_or_init(|| {
-                let mut out = bit_set::BitSet::new();
-                for (bb_idx, block) in self.body.body.iter().enumerate() {
-                    if !self.forward_reached[bb_idx] {
-                        continue;
-                    }
-                    if let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc)
-                        && let PlaceKind::Local(id) = call.dest.kind
-                    {
-                        out.insert(id as usize);
-                    }
+    fn call_dests(&self) -> &CallDestLocals {
+        self.call_dest_locals.get_or_init(|| {
+            let mut dests = bit_set::BitSet::new();
+            let mut unique: Vec<Option<(RegularCall, Vec<Operand>)>> = Vec::new();
+            for (bb_idx, block) in self.body.body.iter().enumerate() {
+                if !self.forward_reached[bb_idx] {
+                    continue;
                 }
-                out
-            })
-            .contains(local)
+                if let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc)
+                    && let PlaceKind::Local(id) = call.dest.kind
+                {
+                    let local = id as usize;
+                    if dests.contains(local) {
+                        if local < unique.len() {
+                            unique[local] = None;
+                        }
+                    } else if let CallFunc::Regular(reg) = &call.func {
+                        if unique.len() <= local {
+                            unique.resize_with(local + 1, || None);
+                        }
+                        unique[local] = Some((reg.clone(), call.args.clone()));
+                    }
+                    dests.insert(local);
+                }
+            }
+            CallDestLocals { dests, unique }
+        })
+    }
+
+    fn local_is_call_dest(&self, local: usize) -> bool {
+        self.call_dests().dests.contains(local)
+    }
+
+    /// Single argument of a unique `is_ptr_identity_cast` that writes
+    /// `local`. Every other call destination stays unnamed.
+    fn ptr_identity_cast_operand(&self, local: usize) -> Option<Operand> {
+        let (reg, args) = self.call_dests().unique.get(local)?.as_ref()?;
+        if args.len() == 1 && self.is_ptr_identity_cast(reg) {
+            Some(args[0].clone())
+        } else {
+            None
+        }
     }
 
     /// `pair.0 = q` after `pair` was built. The field write is the value
@@ -2461,10 +2663,13 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Place named by an address-sized integer or raw pointer operand.
-    /// A literal is [`SpillAddressSource::Constant`]. A field is the
-    /// place stored in that field (`constant_field_path`). Depth above
-    /// 8 is the same bound as [`pointer_place_of_local`].
+    /// Place named by an address-sized integer, a raw pointer, or a
+    /// `&T` / `&mut T` operand. A reference is judged by its pointee
+    /// like a raw pointer: a `&T` to a non-scalar cannot name the
+    /// `&prim` spill through its declared type. A literal is
+    /// [`SpillAddressSource::Constant`]. A field is the place stored in
+    /// that field (`constant_field_path`). Depth above 8 is the same
+    /// bound as [`pointer_place_of_local`].
     pub(in crate::front::mir) fn spill_address_source(
         &self,
         op: &Operand,
@@ -2475,7 +2680,7 @@ impl<'a> Lowering<'a> {
         }
         match op {
             Operand::Const(value) => {
-                if self.const_is_integer_literal(value) {
+                if self.const_is_integer_literal(value) || self.const_is_trait_const(value) {
                     SpillAddressSource::Constant
                 } else {
                     SpillAddressSource::Unknown
@@ -2494,6 +2699,17 @@ impl<'a> Lowering<'a> {
             .is_some_and(|literal| literal.get("Scalar").is_some())
     }
 
+    /// A `TraitConst` is a type-level value (`T::SIZE`), not the address
+    /// of a spilled local. The selected impl's literal is folded later
+    /// (`resolved_trait_const_op`); an unresolved `Clause` is the same
+    /// bits for this walk.
+    fn const_is_trait_const(&self, value: &serde_json::Value) -> bool {
+        self.llbc
+            .const_expr_kind(value)
+            .and_then(|kind| kind.as_object().map(|obj| obj.contains_key("TraitConst")))
+            .unwrap_or(false)
+    }
+
     pub(in crate::front::mir) fn place_address_source(
         &self,
         place: &Place,
@@ -2505,7 +2721,15 @@ impl<'a> Lowering<'a> {
         match &place.kind {
             PlaceKind::Local(id) => {
                 let local = *id as usize;
-                if self.local_is_call_dest(local) || self.local_has_projected_store(local) {
+                if self.local_has_projected_store(local) {
+                    return SpillAddressSource::Unknown;
+                }
+                if self.local_is_call_dest(local) {
+                    // A pointer cast is the same address (`lltype.cast_pointer`,
+                    // `rffi.cast`). The dest names the place its operand names.
+                    if let Some(arg) = self.ptr_identity_cast_operand(local) {
+                        return self.spill_address_source(&arg, depth + 1);
+                    }
                     return SpillAddressSource::Unknown;
                 }
                 if let Some(named) = self.pointer_place_of_local(local, 0) {
@@ -2777,7 +3001,19 @@ impl<'a> Lowering<'a> {
         depth: u8,
     ) -> bool {
         match &place.kind {
-            PlaceKind::Local(id) => self.local_hides_spill_alias(*id as usize, groups, depth),
+            PlaceKind::Local(id) => {
+                let local = *id as usize;
+                // A whole local that is one pointer or scalar word is the
+                // named slot (`&mut rooted_class`). It does not pack the
+                // spilled field the way `pair` does in `q = &pair`.
+                if let Some(ty) = self.mir_local_ty(local)
+                    && (tyref_is_raw_pointer(&ty, self.llbc)
+                        || tyref_is_primitive_scalar(&ty, self.llbc))
+                {
+                    return self.projected_store_hides_spill_alias(local, groups, depth + 1);
+                }
+                self.local_hides_spill_alias(local, groups, depth)
+            }
             _ => self.raw_scalar_spill_result_escapes(&place.ty),
         }
     }
@@ -2939,13 +3175,30 @@ impl<'a> Lowering<'a> {
                 match place.kind {
                     PlaceKind::Local(index) => {
                         let index = index as usize;
-                        if !(self.local_decl_is_primitive(index) && index < self.local_var.len()) {
+                        // A Charon primitive, or a residual one-word handle.
+                        // Both are the residual copy-word the spill cell holds.
+                        let writable = index < self.local_var.len()
+                            && (self.local_decl_is_primitive(index)
+                                || self.local_decl_is_residual_scalar_word(index));
+                        if !writable {
                             return Err(LowerError::Unsupported(format!(
                                 "bb{mir_bb}: raw scalar out-parameter write-back is not a primitive local"
                             )));
                         }
                         let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
-                        self.local_var[index] = Some(LocalValue::One(loaded));
+                        // A cell local's register is the cell address
+                        // (`scoped_alloc`). Writing the payload back into
+                        // that register would mix the GC handle with the
+                        // raw pointer.
+                        if self.is_cell_local(index) {
+                            self.emit_cell_store(mir_bb, index, loaded)?;
+                        } else if self.local_is_ref_banked(index) {
+                            let bb_id = self.emit_bb(mir_bb);
+                            let loaded = push_cast_int_to_ptr(&mut self.graph, bb_id, loaded);
+                            self.local_var[index] = Some(LocalValue::One(loaded));
+                        } else {
+                            self.local_var[index] = Some(LocalValue::One(loaded));
+                        }
                     }
                     PlaceKind::Projection(inner, elem) => {
                         let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
@@ -5079,7 +5332,11 @@ pub(in crate::front::mir) fn call_address_escape(
         return clean_address_escape();
     }
     let CallFunc::Regular(reg) = &call.func else {
-        return unclassified_address_escape();
+        // Target is not the spill address (`indirect_target_address`).
+        // A Dynamic callee borrows the pointer for the call and writes
+        // through it then (`copy_out`), the `lltype.scoped_alloc` buffer
+        // contract of a raw pointer passed to a call.
+        return clean_address_escape();
     };
     match &reg.kind {
         CallKind::Fun(FunId::Regular { id }) => function_address_escape(llbc, *id, &entry, walk),

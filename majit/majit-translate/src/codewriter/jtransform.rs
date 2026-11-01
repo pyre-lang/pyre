@@ -5733,7 +5733,7 @@ impl<'a> Transformer<'a> {
                     .result
                     .as_ref()
                     .is_some_and(|result| self.get_value_kind_var(result) == 'r');
-                if ops.is_empty() && !result_is_ref {
+                if ops.is_empty() && !result_is_ref && addr == *base {
                     RewriteResult::Keep
                 } else if result_is_ref
                     && self.cast_int_to_ptr_is_int_identity(item_ty, op.result.as_ref())
@@ -5840,7 +5840,11 @@ impl<'a> Transformer<'a> {
                 // address: that int is not in the call gcmap.
                 let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
                 let (stored, store_ops) = self.recast_stored_pointer(graph, value);
-                if ops.is_empty() && store_ops.is_empty() {
+                // `coerce_operand_to_int` / `recast_stored_pointer` may
+                // resolve a Ref cell to an int alias without emitting
+                // ops. Keep would leave the original Ref as the raw
+                // address (`assembler.py` `raw_store` base is int).
+                if ops.is_empty() && store_ops.is_empty() && addr == *base && stored == *value {
                     RewriteResult::Keep
                 } else {
                     ops.extend(store_ops);

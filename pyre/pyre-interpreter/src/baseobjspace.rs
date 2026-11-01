@@ -235,12 +235,20 @@ pub fn clear_method_cache() {
 /// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
 /// is fetched first: `w_dict_store_checked` reports that as the same
 /// `DictKeyError` sentinel as a hash failure.
-#[majit_macros::dont_look_inside]
 pub fn take_pending_dict_key_error(key: PyObjectRef) -> PyError {
+    PyError::from_raw(take_pending_dict_key_error_raw(key) as PyObjectRef)
+}
+
+/// Word-ABI residual twin: the parked dict-key TypeError as a handle
+/// (`getfunctionptr`). `descroperation.py` `hash_w` raised it.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_pending_dict_key_error_raw(
+    key: PyObjectRef,
+) -> *mut crate::error::PyErrorObject {
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return crate::runtime_ops::fetch_memory_error();
+        return crate::runtime_ops::fetch_memory_error().as_raw();
     }
-    take_pending_hash_error_for(key, wrap_dict_key_hash_error)
+    take_pending_hash_error_for(key, wrap_dict_key_hash_error).as_raw()
 }
 
 /// The set-element counterpart, for a caller that reached the shared hash
@@ -316,13 +324,23 @@ fn wrap_mapping_key_hash_error(kind: &'static str, key: PyObjectRef, err: PyErro
 /// A pending collector failure from `AbstractTypedStrategy.switch_to_object_strategy`
 /// is fetched first, matching [`take_pending_dict_key_error`].
 pub fn take_pending_mapping_key_error(container: PyObjectRef, key: PyObjectRef) -> PyError {
+    PyError::from_raw(take_pending_mapping_key_error_raw(container, key) as PyObjectRef)
+}
+
+/// Word-ABI residual twin: the parked mapping-key TypeError as a handle
+/// (`getfunctionptr`). `descroperation.py` `hash_w` raised it.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_pending_mapping_key_error_raw(
+    container: PyObjectRef,
+    key: PyObjectRef,
+) -> *mut crate::error::PyErrorObject {
     if pyre_object::gc_hook::gc_alloc_failed_pending() {
-        return crate::runtime_ops::fetch_memory_error();
+        return crate::runtime_ops::fetch_memory_error().as_raw();
     }
     if container_is_frozendict(container) {
-        take_pending_hash_error_for(key, wrap_frozendict_key_hash_error)
+        take_pending_hash_error_for(key, wrap_frozendict_key_hash_error).as_raw()
     } else {
-        take_pending_dict_key_error(key)
+        take_pending_dict_key_error_raw(key)
     }
 }
 

@@ -21,8 +21,9 @@
 //! `history.py` `getkind` banks that parameter as `int`, and `Rvalue::Ref`
 //! of a non-cell aliases the pointee word.
 //! Two borrows of one place share that address. A raw pointer of that
-//! place uses the same address. A raw pointer with no referent is not
-//! lowered. A raw pointer taken while its local is still clean reloads
+//! place uses the same address. A raw pointer of another primitive
+//! place (`&raw mut other`) is a second address. A raw pointer with no
+//! referent is not lowered. A raw pointer taken while its local is still clean reloads
 //! a later store of the address, including through a callee that
 //! returns that load and through a field that holds the pointer. A
 //! borrow of a field or a constant index names that path
@@ -39,9 +40,10 @@
 //! (`attach_aliasing_raw_arguments`). A pointer packed into a tuple,
 //! struct, or array stays on the caller's place
 //! (`local_hides_spill_alias`), so that call stays unlowered. An
-//! address-sized integer whose place this walk cannot name stays
-//! unlowered (`spill_address_source`): `pair.0`, a parameter, and a
-//! call result. An integer literal still lowers. `[q; N]` keeps `q`'s
+//! address-sized integer that is a call result, arithmetic, or
+//! `pair.0` stays unlowered (`spill_address_source`). A parameter that
+//! is a plain integer stays the caller's value (`hash_known`). An
+//! integer literal still lowers. `[q; N]` keeps `q`'s
 //! referent on each element (`repeat_slots`). A union folds that
 //! referent onto the local (`rvalue_referent`); its fields overlap, so
 //! they are not split (`aggregate_slots`). A store through an index
@@ -135,6 +137,15 @@ fn call_leaf(target: &CallTarget) -> Option<&str> {
         CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
         CallTarget::Method { name, .. } => Some(name.as_str()),
         _ => None,
+    }
+}
+
+/// Residual generic calls name `leaf__inst_<types>`
+/// (`residual_generic_fun_segments` / `template_callable_leaf`).
+fn callable_leaf_stem(leaf: &str) -> &str {
+    match leaf.split_once("__inst_") {
+        Some((stem, rest)) if !stem.is_empty() && !rest.is_empty() => stem,
+        _ => leaf,
     }
 }
 
@@ -701,6 +712,85 @@ enum Pass {
 }
 
 fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass) -> FunctionGraph {
+    lower_probe_with(word_name, word_ty, sink_param, pass, false)
+}
+
+fn lower_probe_with(
+    word_name: &str,
+    word_ty: &Value,
+    sink_param: &Value,
+    pass: Pass,
+    dont_look_inside: bool,
+) -> FunctionGraph {
+    lower_probe_cfg(
+        word_name,
+        word_ty,
+        sink_param,
+        pass,
+        dont_look_inside,
+        None,
+        &[],
+    )
+}
+
+fn type_var_q() -> Value {
+    json!({"TypeVar": {"Bound": [0, 0]}})
+}
+
+fn pair_struct_ty() -> Value {
+    json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }})
+}
+
+fn pair_struct_decl() -> Value {
+    named_decl(
+        0,
+        &["probe", "Pair"],
+        json!({"Struct": [
+            field_decl("a", &i64_ty()),
+            field_decl("b", &i64_ty()),
+        ]}),
+    )
+}
+
+fn lower_generic_q_probe(
+    word_name: &str,
+    word_ty: &Value,
+    pass: Pass,
+    dont_look_inside: bool,
+    q_arg: &Value,
+    type_decls: &[Value],
+) -> FunctionGraph {
+    let kind = match &pass {
+        Pass::Borrow { kind, .. } => *kind,
+        Pass::CopyThenMutBorrow
+        | Pass::RawReborrow { .. }
+        | Pass::RawPtrOfLocal { .. }
+        | Pass::CastMutToRaw { .. } => "Mut",
+        Pass::Direct { .. } => "Shared",
+    };
+    lower_probe_cfg(
+        word_name,
+        word_ty,
+        &borrow_ty(&type_var_q(), kind),
+        pass,
+        dont_look_inside,
+        Some(q_arg),
+        type_decls,
+    )
+}
+
+fn lower_probe_cfg(
+    word_name: &str,
+    word_ty: &Value,
+    sink_param: &Value,
+    pass: Pass,
+    dont_look_inside: bool,
+    generic_q: Option<&Value>,
+    type_decls: &[Value],
+) -> FunctionGraph {
     let span = json!({"data": {"file_id": 0,
         "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
     let meta = |path: &[&str]| {
@@ -710,7 +800,12 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
             "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
         })
     };
-    let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let generics = match generic_q {
+        Some(q) => {
+            json!({"regions": [], "types": [q], "const_generics": [], "trait_refs": []})
+        }
+        None => json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []}),
+    };
     let ret = i64_ty();
     // Narrower than a pointer. An address-sized integer parameter beside
     // the spill stays unlowered (`spill_address_source`).
@@ -860,15 +955,38 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
         ]}}),
     );
     let params = vec![flag.clone(), sink_param.clone()];
-    let sink = fun(
+    let mut sink = fun(
         1,
         &["probe", "sink_pair"],
         params.clone(),
         idle_body(&ret, &params),
     );
+    if generic_q.is_some() {
+        sink["generics"] = json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "Q"}],
+            "const_generics": [],
+            "trait_clauses": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "trait_type_constraints": []
+        });
+    }
+    let mut global_decls = Vec::new();
+    if dont_look_inside {
+        // `_jit_look_inside_<leaf>` bool false is `dont_look_inside`
+        // (`harvest_hints_from_llbcs` / `fun_decl_is_dont_look_inside`).
+        global_decls.push(json!({
+            "def_id": 0,
+            "item_meta": meta(&["probe", "_jit_look_inside_sink_pair"]),
+            "global_kind": "NamedConst",
+            "ty": {"Scalar": "Bool"},
+            "value": [{"Bool": false}, {"Scalar": "Bool"}]
+        }));
+    }
     let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
-        "crate_name": "probe", "type_decls": [], "fun_decls": [caller, sink],
-        "global_decls": [], "trait_decls": [], "trait_impls": []
+        "crate_name": "probe", "type_decls": type_decls, "fun_decls": [caller, sink],
+        "global_decls": global_decls, "trait_decls": [], "trait_impls": []
     }});
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
     lower_function(&llbc, "write_hash").unwrap_or_else(|err| panic!("lower write_hash: {err}"))
@@ -905,7 +1023,7 @@ fn sink_call(graph: &FunctionGraph) -> &OpKind {
         let OpKind::Call { target, .. } = &op.kind else {
             continue;
         };
-        if call_leaf(target) == Some("sink_pair") {
+        if call_leaf(target).is_some_and(|leaf| callable_leaf_stem(leaf) == "sink_pair") {
             assert!(found.is_none(), "two sink_pair calls\n{}", op_lines(graph));
             found = Some(&op.kind);
         }
@@ -1097,6 +1215,21 @@ fn mut_borrow_of_i64_passed_to_raw_pointer_reloads_the_word() {
             kind: "Mut",
             ret_local: 2,
         },
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+/// rustc `&mut keyhash` into `hash_out: *mut i64` is `_r = &mut keyhash;
+/// _p = &raw mut (*_r)`. The call operand is already a raw pointer whose
+/// value is the aliased word; that pointer still has to be spilled.
+#[test]
+fn rustc_mut_borrow_coerced_to_raw_pointer_spills_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::RawReborrow { ret_local: 2 },
     );
     assert_address_spill(&graph, true, true);
 }
@@ -1507,6 +1640,72 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             op_lines(&graph)
         );
     }
+}
+
+#[test]
+fn looked_inside_shared_borrow_of_i64_stays_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &borrow_ty(&word, "Shared"),
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 2,
+        },
+    );
+    assert_no_raw_address(&graph, "looked-inside &i64");
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), input_var(&graph, "flag"));
+    assert_eq!(
+        call_arg(call, 1),
+        input_var(&graph, "keyhash"),
+        "looked-inside &i64 stays the word\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn residual_generic_q_of_struct_does_not_spill() {
+    let pair = pair_struct_ty();
+    let decl = pair_struct_decl();
+    let graph = lower_generic_q_probe(
+        "pair",
+        &pair,
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 1,
+        },
+        true,
+        &pair,
+        std::slice::from_ref(&decl),
+    );
+    assert_no_raw_address(&graph, "generic dont_look_inside &Q with Q a struct");
+}
+
+#[test]
+fn looked_inside_generic_q_of_i64_stays_the_word() {
+    let word = i64_ty();
+    let graph = lower_generic_q_probe(
+        "keyhash",
+        &word,
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 2,
+        },
+        false,
+        &word,
+        &[],
+    );
+    assert_no_raw_address(&graph, "looked-inside generic &Q with Q = i64");
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), input_var(&graph, "flag"));
+    assert_eq!(
+        call_arg(call, 1),
+        input_var(&graph, "keyhash"),
+        "looked-inside generic &Q stays the word\n{}",
+        op_lines(&graph)
+    );
 }
 
 enum BorrowAlias {
@@ -3069,8 +3268,6 @@ enum TracedInt {
     FieldOther,
     /// `pair.0` is the literal `0usize`.
     FieldConst,
-    /// The second parameter is an incoming `usize`.
-    Param,
     /// `q = usize_source(); f(&mut word, q)`.
     CallResult,
     /// The second argument is the literal `0usize`.
@@ -3190,23 +3387,6 @@ fn lower_traced_int(
             vec![
                 json!({"Move": place(2, &borrowed)}),
                 json!({"Move": field_place(3, &usize_tuple, 0, &bits)}),
-            ],
-            bits.clone(),
-        ),
-        TracedInt::Param => (
-            2,
-            vec![word.clone(), bits.clone()],
-            vec![
-                local(0, None, &ret),
-                local(1, Some("word"), &word),
-                local(2, Some("q"), &bits),
-                local(3, None, &borrowed),
-                local(4, None, &ret),
-            ],
-            vec![ref_assign_mut(3, &borrowed, place(1, &word))],
-            vec![
-                json!({"Move": place(3, &borrowed)}),
-                json!({"Read": place(2, &bits)}),
             ],
             bits.clone(),
         ),
