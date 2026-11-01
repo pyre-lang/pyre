@@ -2053,4 +2053,227 @@ mod tests {
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "cast_int_to_unichar");
     }
+
+    /// `self.0 & other.0 == other.0` where both words are the integer a
+    /// single-field newtype erased to (`tyref_transparent_inner_value_type`).
+    /// A `u16` shell is `r_uint` (`uint_and` + `uint_eq`, `rint.py`
+    /// `integer_opprefix_for`). A signed shell is `int_and` + `int_eq`.
+    #[test]
+    fn erased_integer_pos0_and_eq_annotates_bool_and_rtypes_without_getattr() {
+        use crate::annotator::model::s_uint;
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
+        };
+
+        fn assert_shell(got: &Option<SomeValue>, shell: &SomeValue) {
+            let SomeValue::Integer(expect) = shell else {
+                panic!("shell is not an integer: {shell:?}");
+            };
+            let Some(SomeValue::Integer(got)) = got else {
+                panic!("positional field was not the integer shell: {got:?}");
+            };
+            assert_eq!(got.unsigned, expect.unsigned);
+            assert_eq!(got.nonneg, expect.nonneg);
+            assert_eq!(got.base.knowntype, expect.base.knowntype);
+            assert!(got.base.const_box.is_none());
+        }
+
+        fn contains_body(shell: SomeValue, and_op: &str, eq_op: &str) {
+            let ann = RPythonAnnotator::new(None, None, None, false);
+            let rtyper = Rc::new(RPythonTyper::new(&ann));
+            rtyper
+                .initialize_exceptiondata()
+                .expect("initialize_exceptiondata");
+
+            let self_v = Variable::named("self_bits");
+            let other_v = Variable::named("other_bits");
+            let startblock = Block::shared(vec![
+                Hlvalue::Variable(self_v.clone()),
+                Hlvalue::Variable(other_v.clone()),
+            ]);
+            let graph = FunctionGraph::new("erased_contains", startblock.clone());
+            let self_0 = Variable::named("self_0");
+            let other_0 = Variable::named("other_0");
+            let masked = Variable::named("masked");
+            let result = Variable::named("r");
+            let attr = Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_0")));
+            startblock.borrow_mut().operations.extend([
+                SpaceOperation::new(
+                    "getattr",
+                    vec![Hlvalue::Variable(self_v), attr.clone()],
+                    Hlvalue::Variable(self_0.clone()),
+                ),
+                SpaceOperation::new(
+                    "getattr",
+                    vec![Hlvalue::Variable(other_v), attr],
+                    Hlvalue::Variable(other_0.clone()),
+                ),
+                SpaceOperation::new(
+                    "and_",
+                    vec![
+                        Hlvalue::Variable(self_0.clone()),
+                        Hlvalue::Variable(other_0.clone()),
+                    ],
+                    Hlvalue::Variable(masked.clone()),
+                ),
+                SpaceOperation::new(
+                    "eq",
+                    vec![
+                        Hlvalue::Variable(masked),
+                        Hlvalue::Variable(other_0.clone()),
+                    ],
+                    Hlvalue::Variable(result.clone()),
+                ),
+            ]);
+            startblock.closeblock(vec![
+                Link::new(
+                    vec![Hlvalue::Variable(result)],
+                    Some(graph.returnblock.clone()),
+                    None,
+                )
+                .into_ref(),
+            ]);
+            let graph = graph.into_ref();
+
+            let annotated = ann
+                .build_graph_types(&graph, &[Some(shell.clone()), Some(shell.clone())], true)
+                .expect("erased contains must annotate");
+            assert!(
+                matches!(annotated, Some(SomeValue::Bool(_))),
+                "self.0 & other.0 == other.0 is SomeBool, got {annotated:?}"
+            );
+            let s_self_0 = ann.annotation(&Hlvalue::Variable(self_0));
+            let s_other_0 = ann.annotation(&Hlvalue::Variable(other_0));
+            assert_shell(&s_self_0, &shell);
+            assert_shell(&s_other_0, &shell);
+
+            rtyper
+                .specialize_more_blocks()
+                .expect("erased contains must rtype");
+            let names: Vec<String> = startblock
+                .borrow()
+                .operations
+                .iter()
+                .map(|op| op.opname.clone())
+                .collect();
+            assert!(
+                names.iter().any(|op| op == and_op) && names.iter().any(|op| op == eq_op),
+                "expected {and_op} + {eq_op}, ops={names:?}"
+            );
+            assert!(
+                names.iter().all(|op| op != "getattr" && op != "getfield"),
+                "positional field must not survive as a field read, ops={names:?}"
+            );
+            assert!(
+                names.iter().any(|op| op == "same_as"),
+                "rtyper renames the field read with same_as, ops={names:?}"
+            );
+        }
+
+        // u16 / unsigned newtype. `ValueType::Unsigned` is `s_uint`.
+        contains_body(s_uint(), "uint_and", "uint_eq");
+        // Signed integer shell. `integer_opprefix_for(Signed)` is `int_`.
+        contains_body(
+            SomeValue::Integer(SomeInteger::default()),
+            "int_and",
+            "int_eq",
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let flags = Variable::named("flags");
+        let startblock = Block::shared(vec![Hlvalue::Variable(flags.clone())]);
+        let graph = FunctionGraph::new("erased_pos0", startblock.clone());
+        let word = Variable::named("word");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getattr",
+            vec![
+                Hlvalue::Variable(flags),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_0"))),
+            ],
+            Hlvalue::Variable(word.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(word)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph.into_ref();
+        let mut constant = SomeInteger::new(false, true);
+        constant.base.const_box = Some(Constant::new(ConstValue::UInt(4)));
+        let annotated = ann
+            .build_graph_types(&graph, &[Some(SomeValue::Integer(constant))], true)
+            .expect("constant positional field must annotate");
+        match annotated {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.unsigned && i.nonneg);
+                assert_eq!(i.base.knowntype, KnownType::Ruint);
+                assert!(matches!(
+                    i.base.const_box.as_ref().map(|c| &c.value),
+                    Some(ConstValue::UInt(4))
+                ));
+            }
+            other => panic!("constant __pos_0 must stay the unsigned integer, got {other:?}"),
+        }
+        rtyper
+            .specialize_more_blocks()
+            .expect("constant positional field must rtype");
+        let names: Vec<String> = startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().all(|op| op != "getattr") && names.iter().any(|op| op == "same_as"),
+            "constant field read lowers to same_as, ops={names:?}"
+        );
+    }
+
+    /// `SomeBool` walks Integer before Object. The identity is the integer
+    /// shell only; a bool has no `__pos_0`.
+    #[test]
+    fn bool_pos0_getattr_is_not_erased_integer_identity() {
+        use crate::annotator::model::SomeBool;
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
+        };
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bit = Variable::named("bit");
+        let startblock = Block::shared(vec![Hlvalue::Variable(bit.clone())]);
+        let graph = FunctionGraph::new("bool_pos0", startblock.clone());
+        let out = Variable::named("out");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getattr",
+            vec![
+                Hlvalue::Variable(bit),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_0"))),
+            ],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph.into_ref();
+        let err = ann
+            .build_graph_types(&graph, &[Some(SomeValue::Bool(SomeBool::new()))], true)
+            .expect_err("bool __pos_0 must not annotate");
+        let text = err.to_string();
+        assert!(
+            text.contains("__pos_0") && text.contains("Bool"),
+            "bool field read must stay missing, got {text}"
+        );
+    }
 }

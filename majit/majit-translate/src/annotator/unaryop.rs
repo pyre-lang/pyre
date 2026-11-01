@@ -856,6 +856,11 @@ fn init_someobject_defaults(
                 {
                     return item.clone();
                 }
+                // `tyref_transparent_inner_value_type` already stored this
+                // value as its integer. `__pos_0` is that word.
+                if super::model::erased_integer_positional_field(&s_self, &attr) {
+                    return s_self.clone();
+                }
                 panic!(
                     "AnnotatorError: Cannot find attribute {:?} on {:?}",
                     attr, s_self
