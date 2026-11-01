@@ -8838,6 +8838,9 @@ mod tests {
         static RAISING_EQ_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
 
+    /// Serializes the tests that reset and count `RAISING_EQ_CALLS` (the eq hooks themselves are thread-local).
+    static RAISING_EQ_CALLS_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     /// An `eq_w` hook that always raises: it records the call, signals the
     /// error flag, and returns `false` (the Rust `Eq` callback cannot raise).
     unsafe fn raising_eq(a: PyObjectRef, _b: PyObjectRef) -> bool {
@@ -8859,6 +8862,7 @@ mod tests {
     /// builtin ladder and never reach a user `__eq__`.
     #[test]
     fn test_dict_store_raising_eq_leaves_dict_unchanged() {
+        let _guard = RAISING_EQ_CALLS_LOCK.lock();
         use crate::longobject::w_long_new;
         use majit_rlib::rbigint::RBigInt as BigInt;
         install_test_hash_hook();
@@ -8919,6 +8923,7 @@ mod tests {
     /// second take is empty; the dict is unchanged; `__eq__` runs once.
     #[test]
     fn test_scan_dict_key_reentrant_eq_error_leaves_flag() {
+        let _guard = RAISING_EQ_CALLS_LOCK.lock();
         use crate::longobject::w_long_new;
         use majit_rlib::rbigint::RBigInt as BigInt;
         install_test_hash_hook();
