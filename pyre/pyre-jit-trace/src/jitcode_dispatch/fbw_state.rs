@@ -4570,7 +4570,7 @@ pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
     pc: usize,
     receiver: Option<OpRef>,
 ) -> Result<(), DispatchError> {
-    let mut session = ctx.session.borrow_mut();
+    let session = ctx.session.borrow();
     if session.binop_rewind_depth == 0 {
         return Ok(());
     }
@@ -4595,8 +4595,7 @@ pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
     {
         return Ok(());
     }
-    session.binop_rewind_refused = true;
-    Err(DispatchError::callee_inline_unsupported(pc))
+    Err(DispatchError::BinopRewindCommitRefused { pc })
 }
 
 /// Raises a [`fbw_binop_rewind_refuse_commit`] region for one descent.
@@ -4615,11 +4614,7 @@ impl<'s> BinopRewindInlineGuard<'s> {
     pub(crate) fn enter(session: &'s std::cell::RefCell<WalkSession>, from: u32) -> Self {
         let mut s = session.borrow_mut();
         let outermost = s.binop_rewind_depth == 0;
-        // The outermost entry starts from a clean slate, so a flag left behind
-        // by a descent that unwound for some other reason cannot be read as
-        // this one's refusal.
         if outermost {
-            s.binop_rewind_refused = false;
             s.binop_rewind_fresh_from = Some(from);
         }
         s.binop_rewind_depth += 1;
@@ -4631,22 +4626,6 @@ impl<'s> BinopRewindInlineGuard<'s> {
     /// one must unwind to it so the commit is not applied twice.
     pub(crate) fn is_outermost(&self) -> bool {
         self.outermost
-    }
-
-    /// Whether a commit was refused while this guard was in force.
-    ///
-    /// A guard nested inside another region does NOT clear the flag: the
-    /// enclosing entry's rewind is exposed by the same commit, and consuming
-    /// the flag here would leave it looking at a descent that declined for no
-    /// stated reason and continuing past it.  Only the entry that raised the
-    /// region takes it.
-    pub(crate) fn refused(&self) -> bool {
-        let mut s = self.session.borrow_mut();
-        let refused = s.binop_rewind_refused;
-        if refused && self.outermost {
-            s.binop_rewind_refused = false;
-        }
-        refused
     }
 }
 

@@ -4066,7 +4066,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             }
             Ok(rec)
         };
-        try_execute_residual_call_via_executor_inner(
+        match try_execute_residual_call_via_executor_inner(
             ctx,
             OpCode::CallMayForceR,
             &allboxes,
@@ -4078,7 +4078,15 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             None,
             false,
             Some(&mut record_call),
-        )?
+        ) {
+            Ok(exec) => exec,
+            Err(error) => {
+                if ran {
+                    ctx.live_after_jit_pc = op.next_pc;
+                }
+                return Err(error);
+            }
+        }
     };
     if !ran {
         ca_result = ctx.trace_ctx.call_assembler_red_only_ref_arc(
@@ -4130,6 +4138,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // as the residual dispatcher (pyjitpl.py / 2074-2077:
     // make_result_of_lastop before handle_possible_exception for
     // get_list_of_active_boxes).
+    if ran || matches!(exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = op.next_pc;
+    }
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, ca_result)?;
 
     // The CALL_ASSEMBLER fold records both post-call guards before the walk
@@ -4846,6 +4857,9 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let exec = match exec {
         Ok(exec) => exec,
         Err(e) => {
+            if ran && let Some(next_pc) = resume_pc {
+                ctx.live_after_jit_pc = next_pc;
+            }
             if leave_callee_ec {
                 leave_loop_callee_ec(ctx, callee_frame, callee_ec, false);
             } else {
@@ -4885,6 +4899,11 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             false
         }
     };
+    if ran || matches!(exec, ResidualExecOutcome::Executed(_)) {
+        if let Some(next_pc) = resume_pc {
+            ctx.live_after_jit_pc = next_pc;
+        }
+    }
     // `typeobject.py W_TypeObject.descr_call` after `get_and_call_args`:
     // a non-None `__init__` result raises TypeError there, and the
     // constructor is not re-entered. Keep the assembler record and play
@@ -17571,7 +17590,7 @@ fn descend_generatorentry<Sym: WalkSym>(
             }
             Ok(rec)
         };
-        try_execute_residual_call_via_executor_inner(
+        match try_execute_residual_call_via_executor_inner(
             ctx,
             OpCode::CallMayForceR,
             &allboxes,
@@ -17583,7 +17602,15 @@ fn descend_generatorentry<Sym: WalkSym>(
             None,
             false,
             Some(&mut record_call),
-        )?
+        ) {
+            Ok(exec) => exec,
+            Err(error) => {
+                if ca_result != OpRef::NONE {
+                    ctx.live_after_jit_pc = op.next_pc;
+                }
+                return Err(error);
+            }
+        }
     };
     // `execute_residual_call` consumes `BH_LAST_EXC_VALUE` and returns the
     // exception word. Carry that word; do not read the TLS slot afterwards.
@@ -17608,6 +17635,7 @@ fn descend_generatorentry<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
         );
     }
+    ctx.live_after_jit_pc = op.next_pc;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
@@ -18610,9 +18638,8 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
     let rewind_outermost = rewind_guard
         .as_ref()
         .is_some_and(BinopRewindInlineGuard::is_outermost);
-    let refused_a_commit = rewind_guard.as_ref().is_some_and(|guard| guard.refused());
     drop(rewind_guard);
-    if refused_a_commit {
+    if matches!(descent, Err(DispatchError::BinopRewindCommitRefused { .. })) {
         fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
@@ -18623,16 +18650,8 @@ fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
         // outermost cut would then residualize the operator and apply it
         // again. Propagate so the outermost entry residualizes once.
         if !rewind_outermost {
-            return match descent {
-                Err(err) => Err(err),
-                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
-            };
+            return descent;
         }
-        // A declined inlined callee may have latched a blackhole image and
-        // claimed the abort coordinate. This recovery continues the walk, so
-        // neither the image nor the claim may answer for a later abort
-        // (`abort_blackhole_latched`, `claim_abort_coordinate`).
-        discard_staged_abort(ctx.session);
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -18890,21 +18909,16 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         other => other,
     };
     let rewind_outermost = rewind_guard.is_outermost();
-    let refused_a_commit = rewind_guard.refused();
     drop(rewind_guard);
-    if refused_a_commit {
+    if matches!(descent, Err(DispatchError::BinopRewindCommitRefused { .. })) {
         fbw_effect_journal_rollback_since(journal_mark);
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx
             .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
         if !rewind_outermost {
-            return match descent {
-                Err(err) => Err(err),
-                Ok(_) => Err(DispatchError::callee_inline_unsupported(op.pc)),
-            };
+            return descent;
         }
-        discard_staged_abort(ctx.session);
         return Ok(None);
     }
     let Some(inlined) = descent? else {
@@ -20111,6 +20125,9 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
                             .count_ops(call_opcode, majit_metainterp::counters::RECORDED_OPS);
                     }
                 }
+                if ran && let Some((_, _, next_pc)) = call_opcode_result_dst(code, pc) {
+                    ctx.live_after_jit_pc = next_pc;
+                }
                 return Err(error);
             }
         }
@@ -20149,6 +20166,10 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     // again from `SubReturn` (`finishframe`); the second write is the same
     // OpRef.
     if let Some((op_dst_bank, dst, next_pc)) = call_opcode_result_dst(code, pc) {
+        // `_get_opimpl_method` has already set `self.pc` past this residual.
+        // Record it before dest-write so a later `?` still resumes past the
+        // executed call (`helper_capability_gap_resume_pc`).
+        ctx.live_after_jit_pc = next_pc;
         super::residual_call::write_residual_call_result_to_dst(
             ctx,
             pc,
@@ -20156,9 +20177,6 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
             op_dst_bank,
             recorded,
         )?;
-        if emit_guard_not_forced {
-            ctx.live_after_jit_pc = next_pc;
-        }
     }
     if emit_guard_not_forced {
         ctx.trace_ctx
@@ -20326,6 +20344,10 @@ struct SubWalkFrame<'a, Sym: WalkSym> {
     /// before the step replays, so the replayed step's decline arms see the
     /// trace their recursive form saw.
     suspend_trace_position: Option<majit_metainterp::recorder::TracePosition>,
+    /// `fbw_executed_effect_count` at the CALL that pushed a child. Child
+    /// steps overwrite `SubWalkExchange.step_effect_count`, so the parent
+    /// keeps this CALL-entry odometer to refuse a replay after an effect.
+    effects_at_call: Option<usize>,
 }
 
 struct PendingSubReturn {
@@ -20643,6 +20665,16 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     }
                     return Err(error);
                 }
+                // Clean decline of a speculative dunder (`do_residual_call`).
+                // Replaying the CALL would residualize the helper, not the
+                // operator; unwind to the outermost `BinopRewindInlineGuard`.
+                Err(error @ DispatchError::BinopRewindCommitRefused { .. }) => {
+                    self.exchange.completed.clear();
+                    while !self.frames.is_empty() {
+                        let _ = self.pop_frame();
+                    }
+                    return Err(error);
+                }
                 Err(DispatchError::SubWalkSuspended { pc }) => {
                     assert_eq!(
                         fbw_executed_effect_count(),
@@ -20674,6 +20706,10 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                             .expect("sub-walk driver lost its root frame");
                         frame.pc = pc;
                         frame.suspend_trace_position = self.exchange.step_trace_position;
+                        // Child steps overwrite `exchange.step_effect_count`.
+                        // Keep the CALL-entry odometer so a later Err can
+                        // refuse replay after an effect this step applied.
+                        frame.effects_at_call = Some(self.exchange.step_effect_count);
                         // Keep the results this pass consumed; the callee that
                         // just suspended appends its own when it finishes.
                         let mut replay_log = std::mem::take(&mut self.exchange.completed);
@@ -20735,6 +20771,26 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     {
                         trace_ctx.cut_trace_with_snapshots(position);
                         trace_ctx.heap_cache_mut().reset();
+                    }
+                    // `_get_opimpl_method` has already advanced the nested
+                    // frame past an executed residual. Replaying this CALL
+                    // (`parent.pc = caller_pc`) would apply that effect again.
+                    if result.is_err()
+                        && parent
+                            .effects_at_call
+                            .is_some_and(|at_call| fbw_executed_effect_count() != at_call)
+                    {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[subwalk-driver] decline CALL replay: this step applied \
+                                 an effect with no latched image caller_pc={caller_pc}"
+                            );
+                        }
+                        self.exchange.completed.clear();
+                        while !self.frames.is_empty() {
+                            let _ = self.pop_frame();
+                        }
+                        return result.map(|outcome| (outcome, class_state));
                     }
                     SUBWALK_CALL_REPLAY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     parent.pc = caller_pc;
@@ -21617,6 +21673,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         pending_subreturn: None,
         replay_log: Vec::new(),
         suspend_trace_position: None,
+        effects_at_call: None,
     };
 
     if !driver_pointer.is_null() {

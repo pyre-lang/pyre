@@ -4688,11 +4688,21 @@ pub fn w_list_size_descr() -> DescrRef {
 ///
 /// `version_tag` is `typeobject.py _immutable_fields_` `_version_tag?`
 /// (pyre field `version_tag`). `w_name` is `name?` (pyre field `w_name`).
-/// `quasiimmut.py get_mutate_field_name` prepends `mutate_` to the pyre
-/// name, so the hidden rows are `mutate_version_tag` / `mutate_w_name`
-/// (upstream would spell `mutate__version_tag` / `mutate_name` from
-/// `_version_tag` / `name`). `mutate_*_lock` is the second word
+/// `mro_w` is `mro_w?[*]`. `quasiimmut.py get_mutate_field_name` prepends
+/// `mutate_` to the pyre name, so the hidden rows are `mutate_version_tag`
+/// / `mutate_w_name` / `mutate_mro_w` (upstream would spell
+/// `mutate__version_tag` / `mutate_name` / `mutate_mro_w` from
+/// `_version_tag` / `name` / `mro_w`). `mutate_*_lock` is the second word
 /// `FUNCTION_DESCR_GROUP` declares for each `mutate_<name>`.
+///
+/// `bases`, `dict`, `lifeline`, `w_qualname`, `w_doc`, `name`, `qualname`,
+/// and `w_class` are the other GC pointer slots
+/// `type_object_custom_trace` visits. A named `Type::Ref` row puts the
+/// slot in `gc_fielddescrs`, so `rewrite.py clear_gc_fields` zeros it on
+/// JIT NEW and `handle_write_barrier_setfield` emits `COND_CALL_GC_WB`
+/// for a `SETFIELD_GC`. `weak_subclasses` and `terminator` are walked
+/// too, but they are not MiniMark pointers (`Box` / `malloc_raw`
+/// intern_node); `extra_clear` birth-zeros them without a write barrier.
 ///
 /// `w_type_get_version_tag`'s Acquire load lowers to this row's getfield, and
 /// the stored bit makes the executable read Acquire. The Relaxed sibling
@@ -4708,6 +4718,17 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
             core::mem::offset_of!(W_TypeObject, mutate_version_tag_lock);
         let mutate_w_name_offset = core::mem::offset_of!(W_TypeObject, mutate_w_name);
         let mutate_w_name_lock_offset = core::mem::offset_of!(W_TypeObject, mutate_w_name_lock);
+        let mro_w_offset = core::mem::offset_of!(W_TypeObject, mro_w);
+        let bases_offset = core::mem::offset_of!(W_TypeObject, bases);
+        let dict_offset = core::mem::offset_of!(W_TypeObject, dict);
+        let lifeline_offset = core::mem::offset_of!(W_TypeObject, lifeline);
+        let w_qualname_offset = core::mem::offset_of!(W_TypeObject, w_qualname);
+        let w_doc_offset = core::mem::offset_of!(W_TypeObject, w_doc);
+        let name_offset = core::mem::offset_of!(W_TypeObject, name);
+        let qualname_offset = core::mem::offset_of!(W_TypeObject, qualname);
+        let w_class_offset = core::mem::offset_of!(W_TypeObject, ob_header.w_class);
+        let mutate_mro_w_offset = core::mem::offset_of!(W_TypeObject, mutate_mro_w);
+        let mutate_mro_w_lock_offset = core::mem::offset_of!(W_TypeObject, mutate_mro_w_lock);
         let field = |index,
                      field_key: &str,
                      offset,
@@ -4807,11 +4828,143 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 5,
                 false,
             ),
+            field(
+                u32::MAX,
+                "mro_w",
+                mro_w_offset,
+                WORD,
+                Type::Ref,
+                false,
+                true,
+                ArrayFlag::Pointer,
+                6,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "bases",
+                bases_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                7,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "dict",
+                dict_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                8,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "lifeline",
+                lifeline_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                9,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "w_qualname",
+                w_qualname_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                10,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "w_doc",
+                w_doc_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                11,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "name",
+                name_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                12,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "qualname",
+                qualname_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                13,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "w_class",
+                w_class_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                14,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "mutate_mro_w",
+                mutate_mro_w_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                15,
+                false,
+            ),
+            field(
+                u32::MAX,
+                "mutate_mro_w_lock",
+                mutate_mro_w_lock_offset,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                ArrayFlag::Pointer,
+                16,
+                false,
+            ),
         ];
         let cache_key = majit_ir::descr::path_hash("typeobject::W_TypeObject");
         let type_id = pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
         let headerless = type_id == 0;
-        majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             core::mem::size_of::<W_TypeObject>(),
             type_id,
@@ -4821,7 +4974,12 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
             headerless,
             &specs,
             &[],
-        )
+        );
+        group.size_descr.set_extra_clear_field_offsets(vec![
+            core::mem::offset_of!(W_TypeObject, weak_subclasses),
+            core::mem::offset_of!(W_TypeObject, terminator),
+        ]);
+        group
     });
 
 fn type_object_field_descr(field_key: &str) -> DescrRef {
@@ -4867,6 +5025,12 @@ pub fn type_mutate_version_tag_descr() -> DescrRef {
 /// `w_name`).
 pub fn type_mutate_w_name_descr() -> DescrRef {
     type_object_field_descr("mutate_w_name")
+}
+
+/// Hidden `mutate_mro_w` (`quasiimmut.py get_mutate_field_name` of pyre
+/// `mro_w`).
+pub fn type_mutate_mro_w_descr() -> DescrRef {
+    type_object_field_descr("mutate_mro_w")
 }
 
 /// `quasiimmut.py get_mutate_field_name(fieldname)` = `'mutate_' + fieldname`
@@ -11311,10 +11475,13 @@ mod tests {
     fn type_mutate_descr_for_field_is_the_group_mutate_row() {
         let version = type_version_tag_descr();
         let name = type_name_obj_descr();
+        let mro = field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mro_w");
         let mutate_version = type_mutate_descr_for_field(&version)
             .expect("W_TypeObject.version_tag has mutate_version_tag");
         let mutate_name =
             type_mutate_descr_for_field(&name).expect("W_TypeObject.w_name has mutate_w_name");
+        let mutate_mro =
+            type_mutate_descr_for_field(&mro).expect("W_TypeObject.mro_w has mutate_mro_w");
         assert!(std::sync::Arc::ptr_eq(
             &mutate_version,
             &type_mutate_version_tag_descr()
@@ -11324,12 +11491,20 @@ mod tests {
             &type_mutate_w_name_descr()
         ));
         assert!(std::sync::Arc::ptr_eq(
+            &mutate_mro,
+            &type_mutate_mro_w_descr()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
             &mutate_version,
             &field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mutate_version_tag")
         ));
         assert!(std::sync::Arc::ptr_eq(
             &mutate_name,
             &field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mutate_w_name")
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &mutate_mro,
+            &field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mutate_mro_w")
         ));
         assert!(type_mutate_descr_for_field(&function_code_descr()).is_none());
         assert!(type_mutate_descr_for_field(&module_dict_version_descr()).is_none());
@@ -11348,6 +11523,7 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&version_parent, &mutate_parent));
         assert!(version.is_quasi_immutable());
         assert!(name.is_quasi_immutable());
+        assert!(mro.is_quasi_immutable());
         assert!(!mutate_version.is_quasi_immutable());
         assert_eq!(
             version_field.offset(),
@@ -11369,6 +11545,10 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(
             &mutate_descr_for_quasi_field(&name).expect("parent lookup of mutate_w_name"),
             &mutate_name
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &mutate_descr_for_quasi_field(&mro).expect("parent lookup of mutate_mro_w"),
+            &mutate_mro
         ));
         assert!(std::sync::Arc::ptr_eq(
             &mutate_descr_for_quasi_field(&function_code_descr())
@@ -11398,6 +11578,68 @@ mod tests {
                 .as_field_descr()
                 .expect("mutate_version_tag is a field")
                 .load_is_acquire()
+        );
+    }
+
+    #[test]
+    fn type_object_custom_trace_gc_edges_are_pointer_fielddescrs() {
+        LazyLock::force(&W_TYPE_OBJECT_DESCR_GROUP);
+        let size = W_TYPE_OBJECT_DESCR_GROUP
+            .size_descr
+            .as_size_descr()
+            .expect("W_TypeObject SizeDescr");
+        let gc_keys: Vec<&str> = size
+            .gc_fielddescrs()
+            .iter()
+            .map(|fd| fd.field_key())
+            .collect();
+        for name in [
+            "mro_w",
+            "bases",
+            "dict",
+            "lifeline",
+            "w_qualname",
+            "w_doc",
+            "name",
+            "qualname",
+            "w_class",
+            "w_name",
+            "mutate_mro_w",
+        ] {
+            assert!(
+                gc_keys.iter().any(|key| *key == name),
+                "{name} must be a gc_fielddescrs Type::Ref row so SETFIELD_GC \
+                 emits COND_CALL_GC_WB and clear_gc_fields zeros the slot"
+            );
+        }
+        let mro = field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mro_w");
+        let mro_field = mro.as_field_descr().expect("mro_w is a field");
+        assert_eq!(
+            mro_field.offset(),
+            core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, mro_w),
+        );
+        assert_eq!(mro_field.field_size(), WORD);
+        assert_eq!(mro_field.field_type(), Type::Ref);
+        assert!(mro.is_quasi_immutable());
+        let mutate_mro =
+            type_mutate_descr_for_field(&mro).expect("W_TypeObject.mro_w has mutate_mro_w");
+        assert!(std::sync::Arc::ptr_eq(
+            &mutate_mro,
+            &field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mutate_mro_w")
+        ));
+        assert!(
+            size.extra_clear_field_offsets()
+                .contains(&core::mem::offset_of!(
+                    pyre_object::typeobject::W_TypeObject,
+                    weak_subclasses
+                ))
+        );
+        assert!(
+            size.extra_clear_field_offsets()
+                .contains(&core::mem::offset_of!(
+                    pyre_object::typeobject::W_TypeObject,
+                    terminator
+                ))
         );
     }
 
@@ -13790,6 +14032,7 @@ mod tests {
         let canonical_name = type_name_obj_descr();
         let canonical_mutate_version = type_mutate_version_tag_descr();
         let canonical_mutate_name = type_mutate_w_name_descr();
+        let canonical_mutate_mro = type_mutate_mro_w_descr();
         let version_offset =
             core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag);
         let name_offset = core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, w_name);
@@ -13797,6 +14040,8 @@ mod tests {
             core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, mutate_version_tag);
         let mutate_name_offset =
             core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, mutate_w_name);
+        let mutate_mro_offset =
+            core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, mutate_mro_w);
         for owner in [
             "W_TypeObject",
             "typeobject::W_TypeObject",
@@ -13845,6 +14090,7 @@ mod tests {
                     &canonical_mutate_version,
                 ),
                 ("mutate_w_name", mutate_name_offset, &canonical_mutate_name),
+                ("mutate_mro_w", mutate_mro_offset, &canonical_mutate_mro),
             ] {
                 let descr = make_descr_from_bh(&BhDescr::Field {
                     offset,
@@ -13894,6 +14140,7 @@ mod tests {
             ("w_name", type_name_obj_descr()),
             ("mutate_version_tag", type_mutate_version_tag_descr()),
             ("mutate_w_name", type_mutate_w_name_descr()),
+            ("mutate_mro_w", type_mutate_mro_w_descr()),
         ] {
             let lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
                 struct_id: majit_ir::descr::path_hash("typeobject::W_TypeObject"),
@@ -16459,9 +16706,11 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 }
             }
             // `typeobject.py W_TypeObject._immutable_fields_` `version_tag?` /
-            // `w_name?` assemble `record_quasiimmut_field` with this group's
-            // `mutate_<name>` (`quasiimmut.py get_mutate_field_name`). Bridge
-            // by `(STRUCT, fieldname)` so the hydrated Arc is the group row.
+            // `w_name?` / `mro_w?[*]` assemble `record_quasiimmut_field` with
+            // this group's `mutate_<name>` (`quasiimmut.py
+            // get_mutate_field_name`). Bridge by `(STRUCT, fieldname)` so the
+            // hydrated Arc is the group row, including the GC pointer slots
+            // `type_object_custom_trace` walks.
             if owner.as_str() == "W_TypeObject" || owner.as_str().ends_with("::W_TypeObject") {
                 let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
                 if let Some(canonical) = W_TYPE_OBJECT_DESCR_GROUP
@@ -17444,10 +17693,6 @@ fn mint_field(
     }
     if let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
         && is_w_type_object_struct(*struct_id)
-        && matches!(
-            field_name,
-            "version_tag" | "w_name" | "mutate_version_tag" | "mutate_w_name"
-        )
     {
         if let Some(canonical) = W_TYPE_OBJECT_DESCR_GROUP
             .field_descrs
@@ -17998,12 +18243,12 @@ pub(crate) fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) ->
                 return SetMemberLookup::Resolved(module_dict_mutate_version_descr());
             }
             if is_w_type_object_struct(*struct_id)
-                && matches!(
-                    field_name.as_str(),
-                    "version_tag" | "w_name" | "mutate_version_tag" | "mutate_w_name"
-                )
+                && let Some(canonical) = W_TYPE_OBJECT_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == field_name.as_str())
             {
-                return SetMemberLookup::Resolved(type_object_field_descr(field_name));
+                return SetMemberLookup::Resolved(canonical.clone() as DescrRef);
             }
             if let Some(group) = mapdict_group_for_struct_id(*struct_id)
                 && let Some(canonical) = group

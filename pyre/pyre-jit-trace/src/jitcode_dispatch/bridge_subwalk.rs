@@ -1532,6 +1532,86 @@ fn seed_bridge_shadow_concrete(
     shadow.set_concrete(frame_reg, slot, value);
 }
 
+/// Abort-image decision for a reconstructed carrier, then publish its
+/// [`CalleeLocalsShadow`] onto the concrete `PyFrame` when a blackhole
+/// image will resume.
+///
+/// `virtualizable.py write_boxes` publishes every box before
+/// `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
+/// A carrier region that cannot be supplied — a written slot with no
+/// reconstructable concrete half — discards the latched image
+/// (`discard_staged_abort`), as `materialize_published_callee_locals`
+/// returning `Some(false)` does on the residual force path.
+///
+/// `blackhole_if_trace_too_long` stops in the innermost MIFrame. Preserve
+/// the image that frame already captured while the error unwinds, as `walk`
+/// does for TraceTooLong. Its pc is not a pc in this carrier: rebuilding
+/// here drops the intervening frames and resumes this frame with a
+/// different opcode's operand stack. `pyjitpl.py handle_guard_failure`
+/// converts the whole live stack through `run_blackhole_interp_to_cancel_tracing`
+/// without replay.
+pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
+    sub_wc: &WalkContext<'_, '_, Sym>,
+    error: &DispatchError,
+    concrete_callee_frame: *mut pyre_interpreter::PyFrame,
+    portal_frame_reg: u16,
+) -> bool {
+    let accepted =
+        if matches!(error, DispatchError::TraceTooLong { .. }) && abort_blackhole_latched() {
+            false
+        } else if abort_blackhole_latched() && error.leaves_complete_image() {
+            // A deeper helper already staged its MIFrame. Replacing that
+            // image with a carrier-rooted latch would resume the CALL
+            // whose body already ran (`SwitchToBlackhole` just unwinds).
+            false
+        } else if error.is_clean_decline() {
+            // The refuse is a clean decline of a speculative inline
+            // (`pyjitpl.py do_residual_call`), not
+            // `run_blackhole_interp_to_cancel_tracing`, so no carrier
+            // image is latched; the outermost `BinopRewindInlineGuard`
+            // entry residualizes the operator.
+            false
+        } else {
+            latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
+        };
+    // The carrier frame keeps locals in its shadow
+    // (`InlineConcreteFrameGuard` is not installed on this walk).
+    // `virtualizable.py write_boxes` publishes every box before
+    // `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
+    // The blackhole resumes from whichever image is latched, deeper helper's
+    // or this carrier's; the carrier's locals live in `CalleeLocalsShadow`,
+    // so the region is flushed whenever any image will resume. A region that
+    // cannot be supplied discards that image (`discard_staged_abort`), as
+    // `materialize_published_callee_locals` returning `Some(false)` does.
+    // When no image is latched the walk's writes are discarded with it, so
+    // the flush stays off.
+    if accepted || abort_blackhole_latched() {
+        match publish_callee_locals_region(
+            &sub_wc.frame_state,
+            concrete_callee_frame,
+            portal_frame_reg,
+        ) {
+            CalleeLocalsPublish::Written => {}
+            CalleeLocalsPublish::Unreconstructable => {
+                discard_staged_abort(sub_wc.session);
+                return false;
+            }
+            CalleeLocalsPublish::BrokenInvariant => {
+                debug_assert!(
+                    false,
+                    "carrier locals flush hit a broken invariant \
+                     (null frame, no w_code, short/null locals array, \
+                     no shadow, frame_reg mismatch, stale Void, or \
+                     store_pinned_frame_locals failure)"
+                );
+                discard_staged_abort(sub_wc.session);
+                return false;
+            }
+        }
+    }
+    accepted
+}
+
 /// Issue #215 item 2: drive the reconstructed deepest
 /// callee frame of a multi-frame bridge as an INLINE SUB-WALK
 /// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
@@ -2393,36 +2473,12 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // always true.  `already_latched` is the one that matters — it means
             // this call replaced an inner frame's image with one rooted here.
             let already_latched = audit.then(abort_blackhole_latched);
-            // `blackhole_if_trace_too_long` stops in the innermost MIFrame.
-            // Preserve the image that frame already captured while the error
-            // unwinds, as `walk` does for TraceTooLong. Its pc is not a pc in
-            // this carrier: rebuilding here drops the intervening frames and
-            // resumes this frame with a different opcode's operand stack.
-            // `pyjitpl.py handle_guard_failure` converts the whole live stack
-            // through `run_blackhole_interp_to_cancel_tracing` without replay.
-            let accepted = if matches!(error, DispatchError::TraceTooLong { .. })
-                && abort_blackhole_latched()
-            {
-                false
-            } else if abort_blackhole_latched() && error.leaves_complete_image() {
-                // A deeper helper already staged its MIFrame. Replacing that
-                // image with a carrier-rooted latch would resume the CALL
-                // whose body already ran (`SwitchToBlackhole` just unwinds).
-                false
-            } else {
-                latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361")
-            };
-            // The carrier frame keeps locals in its shadow
-            // (`InlineConcreteFrameGuard` is not installed on this walk).
-            // `virtualizable.py write_boxes` publishes that region before the
-            // blackhole reads the live frame. The image stays latched either way.
-            if accepted {
-                let _ = flush_callee_locals_region(
-                    &sub_wc.frame_state,
-                    concrete_callee_frame as *mut pyre_interpreter::PyFrame,
-                    callee_pjc.metadata.portal_frame_reg,
-                );
-            }
+            let accepted = latch_bridge_abort_and_publish_carrier_locals(
+                &sub_wc,
+                error,
+                concrete_callee_frame as *mut pyre_interpreter::PyFrame,
+                callee_pjc.metadata.portal_frame_reg,
+            );
             if let Some(already_latched) = already_latched {
                 eprintln!(
                     "[bridge-latch] outcome=err already_latched={already_latched} complete_image={} accepted={accepted} stop_pc={} error={error:?}",

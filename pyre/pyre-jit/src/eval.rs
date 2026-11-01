@@ -626,7 +626,10 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // holds the instance.  `flag_cpython_immutabletype?` is the Freeze /
     // construction twin: a type compiled against and never frozen still holds
     // the instance.  `flag_patma_collection?` is the `_abc` twin: a type
-    // compiled against and never registered still holds the instance.
+    // compiled against and never registered still holds the instance.  `mro_w?`
+    // is written by `w_type_set_mro`/`w_type_store_mro_block`/`w_type_clear_mro`,
+    // and a type compiled against whose mro never changes afterwards still holds
+    // the instance.
     unsafe { (*t).mutate_version_tag().reclaim() };
     unsafe { (*t).mutate_w_name().reclaim() };
     unsafe { (*t).mutate_flag_cpython_immutabletype().reclaim() };
@@ -634,6 +637,7 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // `flag_abstract?` and `compares_by_identity_status?` are the same shape.
     unsafe { (*t).mutate_flag_abstract().reclaim() };
     unsafe { (*t).mutate_compares_by_identity_status().reclaim() };
+    unsafe { (*t).mutate_mro_w().reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` / `w_fdel?` instances on sweep.

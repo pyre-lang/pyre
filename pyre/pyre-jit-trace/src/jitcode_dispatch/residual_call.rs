@@ -893,6 +893,26 @@ pub(crate) fn latched_multi_frame_names() -> Vec<String> {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn stage_test_helper_abort_image_at(
+    jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+    pc: usize,
+    origin: &'static str,
+) {
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    framestack.push(majit_metainterp::MIFrame::new(jitcode, pc));
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+            framestack,
+            banks: Vec::new(),
+            last_exc_value: 0,
+            raising_exception: false,
+            mirror_stack: None,
+            origin,
+        });
+    });
+}
+
 /// Name each decline under `PYRE_FBW_DEBUG_ABORT`, the way `build_multi_frame_
 /// miframe`'s `s2dbg!` and `try_adopt_multi_frame_blackhole`'s `mfdbg!` name
 /// theirs: an unlatched abort and a latch that was never reached both end in the
@@ -10436,6 +10456,12 @@ fn finish_dispatch_residual_call<Sym: WalkSym>(
         count_recorded_residual(ctx, call_opcode, profiled_call, rec);
         (rec, wb, false)
     };
+    // `_get_opimpl_method` has already set `self.pc` past this residual.
+    // Record it before dest-write / snapshot so a later `?` still resumes
+    // past the executed call (`helper_capability_gap_resume_pc`).
+    if hook_state.ran || matches!(resid_exec, ResidualExecOutcome::Executed(_)) {
+        ctx.live_after_jit_pc = next_pc;
+    }
     let can_raise = can_raise && recorded.inline_const_to_value().is_none();
     let raised = match resid_exec {
         ResidualExecOutcome::Executed(result) => result.is_err(),
@@ -13525,6 +13551,22 @@ fn concrete_ref_is_null(value: ConcreteValue) -> bool {
     }
 }
 
+/// After a typed `conditional_call` helper returns: publish this opcode's
+/// `next_pc`, then bump the executed-effect odometer the way
+/// `try_execute_residual_call_via_executor_inner` does for an executed
+/// residual. That path skips the bump when `reentrant_residual` holds
+/// (`EffectInfo::check_is_elidable` or `EF_LOOPINVARIANT`).
+fn publish_executed_conditional_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    next_pc: usize,
+    ei: &majit_ir::descr::EffectInfo,
+) {
+    ctx.live_after_jit_pc = next_pc;
+    if !ei.check_is_elidable() && ei.extraeffect != majit_ir::ExtraEffect::LoopInvariant {
+        fbw_bump_executed_effect("conditional_call");
+    }
+}
+
 /// `pyjitpl.py opimpl_conditional_call_ir_v` / `do_conditional_call`.
 ///
 /// Operand layout `iiIRd`: condition, funcptr, I-list, R-list, descr.
@@ -13599,6 +13641,7 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
                 &concrete_args,
                 &arg_types,
             );
+            publish_executed_conditional_call(ctx, op.next_pc, &ei);
         } else {
             // `do_conditional_call` runs `executor.execute_varargs` whenever
             // the condition holds; the body after this op reads what the
@@ -13703,7 +13746,7 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
             && !majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_addr)
             && let Some(concrete_args) = cond_record_concrete_args(ctx, &allboxes)
         {
-            match dst_bank {
+            let (result, concrete) = match dst_bank {
                 'i' => {
                     let n = majit_metainterp::call_int_function_typed(
                         func_addr as *const (),
@@ -13724,7 +13767,9 @@ fn dispatch_conditional_call_value_ir<Sym: WalkSym>(
                     )
                 }
                 _ => (recorded, ConcreteValue::Null),
-            }
+            };
+            publish_executed_conditional_call(ctx, op.next_pc, &ei);
+            (result, concrete)
         } else {
             (recorded, ConcreteValue::Null)
         }

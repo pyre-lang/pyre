@@ -3685,7 +3685,10 @@ fn extraeffect_from_bh(bh: &BhDescr) -> Option<ExtraEffect> {
 /// walker-side `descr_ref_table` / `as_call_descr` / `get_extra_info`
 /// accessor). Inline: target `JitCode.calldescr` (`call.py
 /// get_jitcode_calldescr` / `JitCode.calldescr`). Missing descr or
-/// EffectInfo → `None` (may-raise).
+/// EffectInfo → `None` (may-raise). Lookup order matches
+/// `JitCode::descr_at` and the blackhole's `read_descr` (`blackhole.py`
+/// `_get_method` d-argument `self.descrs[index]`), so the scan reads
+/// the descr the executing call reads.
 pub(crate) fn call_op_extraeffect(
     code: &[u8],
     op: &DecodedOp,
@@ -3695,16 +3698,6 @@ pub(crate) fn call_op_extraeffect(
         return None;
     }
     let idx = decoded_op_descr_index(code, op)? as usize;
-    if let Some(descr) = descr_ref_table().at(idx) {
-        if let Some(call) = descr.as_call_descr() {
-            return Some(call.get_extra_info().extraeffect);
-        }
-        if let Some(jc) = descr.as_jitcode_descr() {
-            if let Some(callee) = get_runtime_jitcode_by_index(jc.jitcode_index()) {
-                return Some(callee.calldescr().extra_info.extraeffect);
-            }
-        }
-    }
     if let Some(frame_jc) = jitcode {
         if let Some(descr) = frame_jc.descr_at(idx) {
             if let Some(call) = descr.as_call() {
@@ -3725,6 +3718,16 @@ pub(crate) fn call_op_extraeffect(
             }
         }
     }
+    if let Some(descr) = descr_ref_table().at(idx) {
+        if let Some(call) = descr.as_call_descr() {
+            return Some(call.get_extra_info().extraeffect);
+        }
+        if let Some(jc) = descr.as_jitcode_descr() {
+            if let Some(callee) = get_runtime_jitcode_by_index(jc.jitcode_index()) {
+                return Some(callee.calldescr().extra_info.extraeffect);
+            }
+        }
+    }
     get_descr_by_index(idx).and_then(extraeffect_from_bh)
 }
 
@@ -3734,17 +3737,17 @@ fn call_op_callee_name(
     jitcode: Option<&majit_metainterp::jitcode::JitCode>,
 ) -> Option<String> {
     let idx = decoded_op_descr_index(code, op)? as usize;
-    if let Some(descr) = descr_ref_table().at(idx) {
-        if let Some(jc) = descr.as_jitcode_descr() {
-            if let Some(callee) = get_jitcode_by_index(jc.jitcode_index()) {
-                return Some(callee.name.clone());
-            }
-        }
-    }
     if let Some(frame_jc) = jitcode {
         if let Some(descr) = frame_jc.descr_at(idx) {
             if let Some(callee) = descr.as_jitcode_exec() {
                 return Some(callee.name().to_string());
+            }
+        }
+    }
+    if let Some(descr) = descr_ref_table().at(idx) {
+        if let Some(jc) = descr.as_jitcode_descr() {
+            if let Some(callee) = get_jitcode_by_index(jc.jitcode_index()) {
+                return Some(callee.name.clone());
             }
         }
     }
@@ -5416,6 +5419,83 @@ mod tests {
             blackhole_resume_reachable_starts(&parent, 11, callee_may_raise),
             Some(vec![11, 14, 18]),
         );
+    }
+
+    #[test]
+    fn call_op_extraeffect_reads_frame_jitcode_descr_before_global_table() {
+        // Global `descr_ref_table` and a runtime `exec.descrs` slot share a
+        // numeric index but name different descrs (`JitCode::descr_at`).
+        let idx = (0..descr_count())
+            .find(|&i| {
+                match get_descr_by_index(i) {
+                    Some(BhDescr::Call { calldescr })
+                        if calldescr.translated_effect_info_id.is_some() => {}
+                    _ => return false,
+                }
+                let Some(descr) = descr_ref_table().at(i) else {
+                    return false;
+                };
+                descr.as_call_descr().is_some_and(|call| {
+                    call.get_extra_info().extraeffect == ExtraEffect::CannotRaise
+                })
+            })
+            .expect(
+                "descr_ref_table must hold a CannotRaise CallDescr so the old \
+                 global-first lookup would hide the frame CanRaise",
+            );
+        assert!(
+            idx <= u16::MAX as usize,
+            "call-op d operand is two bytes; CannotRaise slot {idx} does not fit"
+        );
+        let global = descr_ref_table()
+            .at(idx)
+            .expect("precondition: global slot exists");
+        let global_call = global
+            .as_call_descr()
+            .expect("precondition: global slot is a CallDescr");
+        assert_eq!(
+            global_call.get_extra_info().extraeffect,
+            ExtraEffect::CannotRaise
+        );
+
+        let byte = |key: &str| {
+            *insns_opname_to_byte()
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be in insns table"))
+        };
+        let idx_bytes = (idx as u16).to_le_bytes();
+        let code = vec![
+            byte("residual_call_r_v/iRd"),
+            0,
+            0,
+            idx_bytes[0],
+            idx_bytes[1],
+            byte("void_return/"),
+        ];
+
+        let raise_descr = majit_metainterp::jitcode::RuntimeBhDescr::Call(Box::new(
+            majit_metainterp::jitcode::JitCallTarget::new(std::ptr::null(), std::ptr::null()),
+        ));
+        let mut descrs = vec![raise_descr.clone(); idx];
+        descrs.push(raise_descr);
+        let mut jitcode = majit_metainterp::jitcode::JitCode::new("frame_can_raise_call");
+        jitcode.set_body(majit_jitcode::jitcode::JitCodeBody {
+            code: code.clone(),
+            ..Default::default()
+        });
+        jitcode.exec.descrs = descrs;
+
+        let op = decode_op_at(&code, 0).expect("residual_call_r_v must decode");
+        assert_eq!(op.opname, "residual_call_r_v");
+        assert_eq!(
+            call_op_extraeffect(&code, &op, Some(&jitcode)),
+            Some(ExtraEffect::CanRaise),
+        );
+        assert!(!blackhole_decoded_op_cannot_raise(
+            &code,
+            &op,
+            Some(&jitcode)
+        ));
     }
 
     #[test]

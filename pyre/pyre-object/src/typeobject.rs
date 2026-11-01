@@ -195,11 +195,13 @@ impl Layout {
 /// PyPy: pypy/objspace/std/typeobject.py W_TypeObject
 ///
 /// `typeobject.py W_TypeObject._immutable_fields_` `?` entries ported
-/// here: `_version_tag?` → pyre `version_tag?`, `name?` → pyre `w_name?`.
+/// here: `_version_tag?` → pyre `version_tag?`, `name?` → pyre `w_name?`,
+/// `mro_w?[*]` → pyre `mro_w?[*]`.
 /// `quasiimmut.py get_mutate_field_name` prepends `mutate_` to the pyre
 /// field name, so the hidden fields are `mutate_version_tag` /
-/// `mutate_w_name` (upstream would spell `mutate__version_tag` /
-/// `mutate_name` from `_version_tag` / `name`).
+/// `mutate_w_name` / `mutate_mro_w` (upstream would spell
+/// `mutate__version_tag` / `mutate_name` / `mutate_mro_w` from
+/// `_version_tag` / `name` / `mro_w`).
 #[repr(C)]
 #[majit_macros::jit_immutable_fields(
     "flag_heaptype",
@@ -207,6 +209,7 @@ impl Layout {
     "flag_cpython_immutabletype?",
     "version_tag?",
     "w_name?",
+    "mro_w?[*]",
     "flag_patma_collection?",
     "flag_map_or_seq",
     "flag_abstract?",
@@ -432,6 +435,13 @@ pub struct W_TypeObject {
     /// no GC pointers, reclaimed by `type_object_destructor`.
     pub mutate_w_name: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
     pub mutate_w_name_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+    /// Hidden `mutate_mro_w` field (`quasiimmut.py get_mutate_field_name` of
+    /// `typeobject.py W_TypeObject._immutable_fields_` `mro_w?[*]`).
+    ///
+    /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
+    /// no GC pointers, reclaimed by `type_object_destructor`.
+    pub mutate_mro_w: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_mro_w_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// Hidden `mutate_flag_cpython_immutabletype` field `rclass.py
     /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
     /// `"flag_cpython_immutabletype?"`.
@@ -501,6 +511,7 @@ pub struct W_TypeObject {
 
 crate::quasi_immut_words!(W_TypeObject, mutate_version_tag, mutate_version_tag_lock);
 crate::quasi_immut_words!(W_TypeObject, mutate_w_name, mutate_w_name_lock);
+crate::quasi_immut_words!(W_TypeObject, mutate_mro_w, mutate_mro_w_lock);
 crate::quasi_immut_words!(
     W_TypeObject,
     mutate_flag_cpython_immutabletype,
@@ -534,6 +545,11 @@ impl W_TypeObject {
     #[inline]
     pub fn mutate_w_name(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
         crate::quasiimmut::QuasiImmutField::new(&self.mutate_w_name, &self.mutate_w_name_lock)
+    }
+
+    #[inline]
+    pub fn mutate_mro_w(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_mro_w, &self.mutate_mro_w_lock)
     }
 
     #[inline]
@@ -775,6 +791,8 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         mutate_version_tag_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_w_name: crate::quasiimmut::null_mutate_word(),
         mutate_w_name_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_mro_w: crate::quasiimmut::null_mutate_word(),
+        mutate_mro_w_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_flag_cpython_immutabletype: crate::quasiimmut::null_mutate_word(),
         mutate_flag_cpython_immutabletype_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_flag_patma_collection: crate::quasiimmut::null_mutate_word(),
@@ -930,6 +948,8 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         mutate_version_tag_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_w_name: crate::quasiimmut::null_mutate_word(),
         mutate_w_name_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_mro_w: crate::quasiimmut::null_mutate_word(),
+        mutate_mro_w_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_flag_cpython_immutabletype: crate::quasiimmut::null_mutate_word(),
         mutate_flag_cpython_immutabletype_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_flag_patma_collection: crate::quasiimmut::null_mutate_word(),
@@ -1967,8 +1987,17 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
         crate::object_array::alloc_mro_block_gc(&mro)
     };
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let t = obj as *mut W_TypeObject;
+    // `rclass.py hook_setfield` emits `jit_force_quasi_immutable` ahead of
+    // every store to `mro_w?[*]`. The residual writers share that lock
+    // with the store so a recorder cannot publish a watcher for the old
+    // block in between.
+    // `framework.py transform_generic_set` emits the write barrier before
+    // the `setfield`.
     type_write_barrier(obj);
-    (*(obj as *mut W_TypeObject)).mro_w = mro_w;
+    (*t).mutate_mro_w().invalidate_then_store(|| {
+        (*t).mro_w = mro_w;
+    });
     if !purely_of_types {
         w_type_set_version_tag(obj, 0);
     }
@@ -1985,8 +2014,11 @@ pub unsafe fn w_type_store_mro_block(
     obj: PyObjectRef,
     mro_w: *mut crate::object_array::FixedObjectArray,
 ) {
+    let t = obj as *mut W_TypeObject;
     type_write_barrier(obj);
-    (*(obj as *mut W_TypeObject)).mro_w = mro_w;
+    (*t).mutate_mro_w().invalidate_then_store(|| {
+        (*t).mro_w = mro_w;
+    });
 }
 
 /// Restore the pre-`compute_mro` incomplete state (`mro_w is None`).
@@ -1998,7 +2030,10 @@ pub unsafe fn w_type_store_mro_block(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_clear_mro(obj: PyObjectRef) {
-    (*(obj as *mut W_TypeObject)).mro_w = std::ptr::null_mut();
+    let t = obj as *mut W_TypeObject;
+    (*t).mutate_mro_w().invalidate_then_store(|| {
+        (*t).mro_w = std::ptr::null_mut();
+    });
     w_type_set_version_tag(obj, 0);
     crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
