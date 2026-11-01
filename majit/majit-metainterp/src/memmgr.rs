@@ -16,10 +16,10 @@
 //! `CompiledLoopToken::free_loop_and_bridges` (`llmodel.py`) and the
 //! CLT `Drop` bumps `total_freed_*` (`model.py` `CompiledLoopToken.__del__`).
 //!
-//! Both long-lived handles on a compiled token are now weak —
-//! `BaseJitCell::loop_token` (`warmstate.py`) and
-//! `CompiledEntry::token` — so `alive_loops` is the sole long-lived strong
-//! owner and removing an entry here is what actually frees the token.
+//! The long-lived cell handle on a compiled token is weak —
+//! `BaseJitCell::loop_token` (`warmstate.py`) — so `alive_loops` is the
+//! sole long-lived strong owner and removing an entry here is what
+//! actually frees the token.
 //!
 //! The corollary every producer owes: a token must be registered HERE before
 //! any cell or table is given a handle to it, or it dies with the producer's
@@ -56,13 +56,6 @@ struct MemoryManagerInner {
     /// `-1` is "uninitialized"; `set_max_age` derives a real value
     /// (`int(sqrt(max_age))` by default per `memmgr.py`).
     check_frequency: i64,
-    /// How many times this manager has let go of loops: each
-    /// `_kill_old_loops_now` that evicted something, and each
-    /// `release_all_loops`. A strong handle dropped here can be a cell's last,
-    /// after which its weak reference no longer upgrades and the cell stops
-    /// answering runnable — so this is one input of
-    /// `MetaInterp::runnable_generation`.
-    evictions: u64,
 
     /// `memmgr.py` `self.alive_loops = {}` — a dict keyed on the
     /// looptoken object itself.  In Rust the dict key uses the Arc's
@@ -120,7 +113,6 @@ impl MemoryManagerInner {
             check_frequency: -1,
             max_age: 0,
             alive_loops: indexmap::IndexMap::new(),
-            evictions: 0,
             // rlib/jit.py PARAMETERS defaults.
             retrace_limit: 0,
             max_retrace_guards: 15,
@@ -215,19 +207,8 @@ impl MemoryManagerInner {
     /// `LoopToken.__del__` (`memmgr.py`) lets the CLT run
     /// `cpu.free_loop_and_bridges` once `alive_loops` drops the token.
     /// Pyre does the same in `JitCellToken::drop` /
-    /// `CompiledLoopToken::drop`. The list lets
-    /// `pyjitpl::try_to_free_some_loops` retire the matching
-    /// `compiled_loops` entries, whose metadata cannot live on the
-    /// token (crate split).
-    ///
-    /// The return value is a `Vec<Arc<JitCellToken>>` rather than
-    /// `Vec<u64>` (green_keys) so the caller can match by **token-object
-    /// identity** (`Arc::ptr_eq`) — mirroring `memmgr.py`'s
-    /// `del self.alive_loops[looptoken]`, which keys on the looptoken
-    /// itself.  Returning green_keys would let an evicted stale
-    /// looptoken kick out the *current* compiled token at the same
-    /// green_key (the recompile case where `compiled_loops[gk].token`
-    /// has already been replaced).
+    /// `CompiledLoopToken::drop`. Callers discard the Vec; eviction is
+    /// the drop of these Arcs.
     pub fn next_generation(&mut self) -> Vec<Arc<JitCellToken>> {
         self.current_generation += 1;
         if self.current_generation == self.next_check {
@@ -274,7 +255,7 @@ impl MemoryManagerInner {
         // looptoken.invalidated): del self.alive_loops[looptoken]`.
         // Pyre returns the looptoken Arcs themselves so the caller can
         // match by Arc identity (cf. RPython's `del` keying on the
-        // looptoken object) when dropping `compiled_loops` entries.
+        // looptoken object). `try_to_free_some_loops` discards them.
         let mut evicted_tokens = Vec::new();
         self.alive_loops.retain(|_key, token| {
             let token_gen = token.generation.get();
@@ -290,9 +271,6 @@ impl MemoryManagerInner {
         // `_keepalive_jitcell_tokens` stays alive. Break only garbage
         // `record_jump_to` cycles so `JitCellToken::drop` can run.
         self.trial_delete_keepalive_tokens(&evicted_tokens);
-        if !evicted_tokens.is_empty() {
-            self.evictions = self.evictions.wrapping_add(1);
-        }
         if log {
             let newtotal = self.alive_loops.len();
             crate::debug::debug_print(&format!("Loop tokens freed: {}", oldtotal - newtotal));
@@ -320,7 +298,6 @@ impl MemoryManagerInner {
             .map(|(_, token)| token)
             .collect();
         self.trial_delete_keepalive_tokens(&evicted_tokens);
-        self.evictions = self.evictions.wrapping_add(1);
     }
 
     /// Clear `keepalive_tokens` only on tokens that are garbage after
@@ -419,11 +396,6 @@ impl MemoryManagerInner {
         }
     }
 
-    /// The counter [`Self::evictions`] documents.
-    pub fn eviction_generation(&self) -> u64 {
-        self.evictions
-    }
-
     /// Number of loops currently tracked.  Test/debug accessor; no
     /// upstream counterpart since RPython's `alive_loops` is a Python
     /// dict whose `len()` is read directly.
@@ -490,11 +462,6 @@ impl MemoryManager {
         self.inner.borrow_mut().release_all_loops()
     }
 
-    /// The counter `MemoryManagerInner::evictions` documents.
-    pub fn eviction_generation(&self) -> u64 {
-        self.inner.borrow().eviction_generation()
-    }
-
     /// `len(self.alive_loops)`.
     pub fn alive_count(&self) -> usize {
         self.inner.borrow().alive_count()
@@ -513,6 +480,17 @@ impl MemoryManager {
     /// `looptoken in self.alive_loops`.
     pub fn contains(&self, looptoken: &Arc<JitCellToken>) -> bool {
         self.inner.borrow().contains(looptoken)
+    }
+
+    /// MiniMark traces `MemoryManager.alive_loops` dict values. Clone
+    /// the Arcs out of the `RefCell` borrow so the caller can re-enter
+    /// the manager.
+    pub fn for_each_alive(&self, mut f: impl FnMut(&Arc<JitCellToken>)) {
+        let tokens: Vec<Arc<JitCellToken>> =
+            self.inner.borrow().alive_loops.values().cloned().collect();
+        for token in &tokens {
+            f(token);
+        }
     }
 
     /// `warmstate.py` `set_param_retrace_limit` target.

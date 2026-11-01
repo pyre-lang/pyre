@@ -5,7 +5,7 @@
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::IndexMapExt;
 use std::borrow::Cow;
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -26,7 +26,7 @@ use cranelift_codegen::ir::Value as CValue;
 use majit_backend::{
     AsmInfo, BackendError, CompiledLoopToken, CompiledTraceInfo, CpuDescrAttachments,
     CpuDescrHandle, DeadFrame, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout,
-    ExitVirtualLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
+    FailDescrLayout, JitCellToken,
 };
 use majit_gc::header::{GcHeader, TYPE_ID_BITS, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
@@ -651,7 +651,6 @@ struct RegisteredLoopTarget {
         reason = "registered loop targets retain green-key identity for bridge metadata"
     )]
     green_key: u64,
-    caller_prefix_layout: Option<ExitRecoveryLayout>,
     /// Host-ABI wrapper (`execute_token` / `run_compiled_code`).
     code_ptr: *const u8,
     /// `CallConv::Tail` body. RPython `_ll_function_addr`
@@ -792,7 +791,6 @@ fn deadframe_recovery_layout_for_call_assembler(
                 None, // no per-guard resume_pc available here
                 trace_info.source_guard,
                 &layout.fail_arg_types,
-                None,
             )
         })
     })
@@ -804,7 +802,6 @@ fn caller_prefix_recovery_layout(
     source_guard: Option<(u64, u32)>,
     slot_types: &[Type],
     inputs: &[i64],
-    caller_prefix_layout: Option<&ExitRecoveryLayout>,
 ) -> ExitRecoveryLayout {
     ExitRecoveryLayout {
         vable_array: Vec::new(),
@@ -814,12 +811,10 @@ fn caller_prefix_recovery_layout(
             header_pc: Some(header_pc),
             source_guard,
             pc: header_pc,
-            // Placeholder: this caller-prefix identity layout is replaced by
-            // the resume_layout-derived layout via
-            // `compile::patch_guard_recovery_layouts_for_trace`
-            // (compile.rs) before any guard can fire.  The
-            // resume_layout carries the authoritative jitcode_index
-            // threaded from `Snapshot::single_frame`.
+            // Live CALL_ASSEMBLER caller identity: jitcode_index is not
+            // consulted on this path. `wrap_call_assembler_deadframe_with_caller_prefix`
+            // stashes this layout on the deadframe; production deopt still
+            // decodes the callee descr's `rd_numb` (`ResumeGuardDescr.get_resumestorage`).
             jitcode_index: 0,
             slots: slot_types
                 .iter()
@@ -837,7 +832,6 @@ fn caller_prefix_recovery_layout(
         virtual_layouts: Vec::new(),
         pending_field_layouts: Vec::new(),
     }
-    .prefixed_by(caller_prefix_layout)
 }
 
 fn wrap_call_assembler_deadframe_with_caller_prefix(
@@ -873,7 +867,6 @@ fn wrap_call_assembler_deadframe_with_caller_prefix(
         ctx.source_guard,
         &ctx.input_types,
         &ctx.inputs,
-        ctx.caller_prefix_layout.as_ref(),
     );
     jf.call_assembler_caller_layout = Some(caller_layout);
     frame
@@ -902,7 +895,6 @@ struct CallAssemblerCallerContext {
     source_guard: Option<(u64, u32)>,
     input_types: Vec<Type>,
     inputs: Vec<i64>,
-    caller_prefix_layout: Option<ExitRecoveryLayout>,
 }
 
 impl CallAssemblerCallerContext {
@@ -913,7 +905,6 @@ impl CallAssemblerCallerContext {
             source_guard: None,
             input_types: compiled.input_types.clone(),
             inputs: inputs.to_vec(),
-            caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         }
     }
 
@@ -924,7 +915,6 @@ impl CallAssemblerCallerContext {
             source_guard: Some(bridge.source_guard),
             input_types: bridge.input_types.clone(),
             inputs: inputs.to_vec(),
-            caller_prefix_layout: bridge.caller_prefix_layout.clone(),
         }
     }
 
@@ -935,7 +925,6 @@ impl CallAssemblerCallerContext {
             source_guard: None,
             input_types: target.inputarg_types.clone(),
             inputs: inputs.to_vec(),
-            caller_prefix_layout: target.caller_prefix_layout.clone(),
         }
     }
 }
@@ -2698,7 +2687,6 @@ fn register_call_assembler_target(
         trace_id: compiled.trace_id,
         header_pc: compiled.header_pc,
         green_key: token.green_key(),
-        caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: entry_code,
         body_ptr: entry_body,
         fail_descrs: compiled.fail_descrs.clone(),
@@ -10214,7 +10202,6 @@ struct CompiledLoop {
     header_pc: u64,
     /// Green key hash from JitCellToken. Used by bridge threshold callback.
     green_key: u64,
-    caller_prefix_layout: Option<ExitRecoveryLayout>,
     _func_id: FuncId,
     code_ptr: *const u8,
     /// `CallConv::Tail` body entry (the wrapper-bypassing in-code target).
@@ -10237,7 +10224,6 @@ struct CompiledLoop {
     /// Position-aligned `FailDescrCell` wrappers (see
     /// `RegisteredLoopTarget::fail_descr_cells`).
     fail_descr_cells: Arc<[Box<majit_ir::FailDescrCell>]>,
-    terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -10331,16 +10317,6 @@ impl CompiledLoop {
         let blocks = std::mem::take(&mut self.asm_memory_blocks);
         crate::stub::patch_pending_failure_recoveries(&self.pending_guard_tokens);
         blocks
-    }
-
-    #[inline]
-    fn terminal_exit_layouts_ref(&self) -> &Vec<TerminalExitLayout> {
-        unsafe { &*self.terminal_exit_layouts.get() }
-    }
-
-    #[inline]
-    fn terminal_exit_layouts_mut(&self) -> &mut Vec<TerminalExitLayout> {
-        unsafe { &mut *self.terminal_exit_layouts.get() }
     }
 }
 
@@ -10536,26 +10512,6 @@ fn find_trace_fail_descr_layouts_in_fail_descrs(
     None
 }
 
-fn find_trace_terminal_exit_layouts_in_fail_descrs(
-    fail_descrs: &[DescrRef],
-    trace_id: u64,
-) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-    for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref() {
-            if bridge.trace_id == trace_id {
-                return Some(bridge.terminal_exit_layouts_ref().clone());
-            }
-            if let Some(layouts) =
-                find_trace_terminal_exit_layouts_in_fail_descrs(&bridge.fail_descrs, trace_id)
-            {
-                return Some(layouts);
-            }
-        }
-    }
-    None
-}
-
 fn find_trace_info_in_fail_descrs(
     fail_descrs: &[DescrRef],
     trace_id: u64,
@@ -10613,6 +10569,32 @@ fn find_fail_descr_in_fail_descrs(
         if let Some(bridge) = bridge_guard.as_ref()
             && let Some(found) =
                 find_fail_descr_in_fail_descrs(&bridge.fail_descrs, trace_id, fail_index)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Locate `fail_descr` in `fail_descrs` or a nested attached bridge's
+/// `fail_descrs` by `dyn FailDescr` data-pointer equality
+/// (`history.py` `AbstractFailDescr` object identity /
+/// `cpu.get_latest_descr`). Recurses the same tree as
+/// `find_fail_descr_in_fail_descrs`.
+fn find_fail_descr_by_identity(
+    fail_descrs: &[DescrRef],
+    fail_descr: &dyn FailDescr,
+) -> Option<DescrRef> {
+    let wanted = fail_descr as *const dyn FailDescr as *const ();
+    for descr in fail_descrs {
+        if as_fd(descr) as *const dyn FailDescr as *const () == wanted {
+            return Some(descr.clone());
+        }
+    }
+    for descr in fail_descrs {
+        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
+        if let Some(bridge) = bridge_guard.as_ref()
+            && let Some(found) = find_fail_descr_by_identity(&bridge.fail_descrs, fail_descr)
         {
             return Some(found);
         }
@@ -11286,91 +11268,29 @@ fn identity_recovery_layout(
     guard_resume_pc: Option<u64>,
     source_guard: Option<(u64, u32)>,
     slot_types: &[Type],
-    caller_layout: Option<&ExitRecoveryLayout>,
 ) -> ExitRecoveryLayout {
-    let mut frames = caller_layout
-        .map(|layout| layout.frames.clone())
-        .unwrap_or_default();
-    frames.push(ExitFrameLayout {
-        trace_id: Some(trace_id),
-        header_pc: Some(header_pc),
-        source_guard,
-        pc: guard_resume_pc.unwrap_or(header_pc),
-        // Placeholder: this backend-side identity layout is produced at
-        // compile time, then replaced by the resume_layout-derived layout
-        // via `compile::patch_guard_recovery_layouts_for_trace`
-        // (compile.rs). The guard-exit rd_numb path in `do_compile`
-        // additionally overwrites `frame.jitcode_index` with the
-        // topmost rd_numb frame, covering guards whose resume_layout is
-        // absent. `Snapshot::single_frame(jitcode_index, pc, ...)` is the
-        // upstream source of truth.
-        jitcode_index: 0,
-        slots: (0..slot_types.len())
-            .map(ExitValueSourceLayout::ExitValue)
-            .collect(),
-        slot_types: Some(slot_types.to_vec()),
-    });
     ExitRecoveryLayout {
         vable_array: Vec::new(),
         vref_array: Vec::new(),
-        frames,
-        virtual_layouts: caller_layout
-            .map(|layout| layout.virtual_layouts.clone())
-            .unwrap_or_default(),
-        pending_field_layouts: caller_layout
-            .map(|layout| layout.pending_field_layouts.clone())
-            .unwrap_or_default(),
+        frames: vec![ExitFrameLayout {
+            trace_id: Some(trace_id),
+            header_pc: Some(header_pc),
+            source_guard,
+            pc: guard_resume_pc.unwrap_or(header_pc),
+            // CALL_ASSEMBLER caller-prefix identity frame
+            // (`deadframe_recovery_layout_for_call_assembler`). Production
+            // deopt from a guard decodes the descr's `rd_numb`
+            // (`ResumeGuardDescr.get_resumestorage`); this layout is not
+            // that path.
+            jitcode_index: 0,
+            slots: (0..slot_types.len())
+                .map(ExitValueSourceLayout::ExitValue)
+                .collect(),
+            slot_types: Some(slot_types.to_vec()),
+        }],
+        virtual_layouts: Vec::new(),
+        pending_field_layouts: Vec::new(),
     }
-}
-
-fn patch_terminal_exit_recovery_layout_in_vec(
-    terminal_exit_layouts: &UnsafeCell<Vec<TerminalExitLayout>>,
-    trace_id: u64,
-    op_index: usize,
-    recovery_layout: &ExitRecoveryLayout,
-) -> bool {
-    let terminal_exit_layouts = unsafe { &mut *terminal_exit_layouts.get() };
-    if let Some(layout) = terminal_exit_layouts
-        .iter_mut()
-        .find(|layout| layout.trace_id == trace_id && layout.op_index == op_index)
-    {
-        layout.recovery_layout = Some(recovery_layout.clone());
-        return true;
-    }
-    false
-}
-
-fn patch_terminal_exit_recovery_layout(
-    root_terminal_exit_layouts: &UnsafeCell<Vec<TerminalExitLayout>>,
-    fail_descrs: &[DescrRef],
-    trace_id: u64,
-    op_index: usize,
-    recovery_layout: &ExitRecoveryLayout,
-) -> bool {
-    if patch_terminal_exit_recovery_layout_in_vec(
-        root_terminal_exit_layouts,
-        trace_id,
-        op_index,
-        recovery_layout,
-    ) {
-        return true;
-    }
-
-    for descr in fail_descrs {
-        let bridge_guard = fail_descr_bridge_ref(as_fd(descr));
-        if let Some(bridge) = bridge_guard.as_ref()
-            && patch_terminal_exit_recovery_layout(
-                &bridge.terminal_exit_layouts,
-                &bridge.fail_descrs,
-                trace_id,
-                op_index,
-                recovery_layout,
-            )
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn infer_fail_arg_types(
@@ -12370,7 +12290,6 @@ impl CraneliftBackend {
         ops: &[OpRc],
         invalidation_flag_ptr: Option<usize>,
         source_guard: Option<(u64, u32)>,
-        caller_layout: Option<&ExitRecoveryLayout>,
         merge: Option<&MergePlan>,
         bridge_source_slots: Option<Vec<usize>>,
     ) -> Result<CompiledLoop, BackendError> {
@@ -12442,7 +12361,7 @@ impl CraneliftBackend {
         // process-global callback rather than inherit the previous driver's
         // build-time store, which decodes the same `-live-` marker to a
         // different — and silently plausible — count.
-        let frame_value_count_fn = self.next_frame_value_count_fn.take();
+        let _ = self.next_frame_value_count_fn.take();
         let frontend_config = self.module.target_config();
         let ptr_type = frontend_config.pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
@@ -12717,12 +12636,8 @@ impl CraneliftBackend {
             &mut guard_infos,
             &mut max_output_slots,
             trace_id,
-            header_pc,
-            source_guard,
-            caller_layout,
             &constants_i64,
             attached_descrs,
-            frame_value_count_fn,
             merge.is_some(),
             &fail_arg_homes,
             finish_arity,
@@ -12843,14 +12758,6 @@ impl CraneliftBackend {
                 _ => {}
             }
         }
-        let terminal_exit_layouts = collect_terminal_exit_layouts(
-            ops,
-            inputargs,
-            trace_id,
-            header_pc,
-            source_guard,
-            caller_layout,
-        )?;
 
         let known_values = build_known_values_set(inputargs, ops);
         let used_vars = build_used_vars_set(ops);
@@ -20786,7 +20693,6 @@ impl CraneliftBackend {
             input_types: trace_info.input_types.clone(),
             header_pc,
             green_key: 0, // Set by compile_loop from token.green_key
-            caller_prefix_layout: caller_layout.cloned(),
             _func_id: func_id,
             code_ptr,
             body_ptr,
@@ -20796,7 +20702,6 @@ impl CraneliftBackend {
             pending_guard_tokens,
             fail_descrs,
             fail_descr_cells,
-            terminal_exit_layouts: UnsafeCell::new(terminal_exit_layouts),
             num_inputs: inputargs.len(),
             num_ref_roots: reserved_tail,
             max_output_slots,
@@ -21532,15 +21437,8 @@ fn collect_guards(
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
     trace_id: u64,
-    header_pc: u64,
-    source_guard: Option<(u64, u32)>,
-    caller_layout: Option<&ExitRecoveryLayout>,
     _constants: &indexmap::IndexMap<u32, i64>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
-    // `Backend::set_next_frame_value_count_fn` — the compiling driver's
-    // `-live-` decoder for the `rd_numb` reads below.  `None` falls back to the
-    // process-global callback.
-    frame_value_count_fn: Option<fn(i32, i32) -> usize>,
     preserve_descrs: bool,
     homes: &FailArgHomes<'_>,
     finish_arity: usize,
@@ -21688,360 +21586,6 @@ fn collect_guards(
             *max_output_slots = n;
         }
 
-        // RPython resume.py:396: on guard failure the resume PC is taken
-        // from the rebuilt top frame (`RebuiltFrame.pc`). rd_numb/rd_consts
-        // are populated by `store_final_boxes_in_guard` during optimizer
-        // emit, so every non-finish, non-external-jump guard that reaches
-        // the backend has them. We pre-compute the PC at compile time so
-        // the ExitFrameLayout doesn't need to decode rd_numb at resume.
-        let guard_resume_pc: Option<u64> = if !is_finish && !is_external_jump {
-            if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
-                (op.resolved_rd_numb(), op.resolved_rd_consts())
-            {
-                use majit_ir::resumedata::{get_frame_value_count_fn, rebuild_from_numbering};
-                let fvc = frame_value_count_fn.or_else(get_frame_value_count_fn);
-                let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-                    fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                let num_virtuals = op.resolved_rd_virtuals().map_or(0, |v| v.len());
-                let (_nfa, _vable, _vref, frames) = rebuild_from_numbering(
-                    &rd_numb_bytes,
-                    &rd_consts_data,
-                    &fail_arg_types,
-                    fvc_ref,
-                    num_virtuals,
-                );
-                // This pre-computed pc is exit-layout metadata, not the resume
-                // target (the orthodox path re-decodes rd_numb), so carry the
-                // published resume word unchanged.
-                frames.last().map(|f| f.pc as u64)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if majit_log_enabled() && guard_resume_pc.is_some() {
-            eprintln!(
-                "[guard-resume] fail_index={} last_ref={:?} resume_pc={:?}",
-                fail_index,
-                fail_arg_refs.last(),
-                guard_resume_pc
-            );
-        }
-        let mut recovery_layout = identity_recovery_layout(
-            trace_id,
-            header_pc,
-            guard_resume_pc,
-            source_guard,
-            &fail_arg_types,
-            caller_layout,
-        );
-        // RPython parity: when rd_numb is present, rebuild frame slots from
-        // rd_numb. rd_numb encodes ALL snapshot positions (including virtuals
-        // as TAGVIRTUAL), while the identity recovery_layout only has
-        // fail_args-count slots. The rd_numb-based layout is authoritative.
-        if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
-            (op.resolved_rd_numb(), op.resolved_rd_consts())
-        {
-            let rd_vi = op.resolved_rd_virtuals();
-            use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
-            let rd_consts_ref: &[majit_ir::Const] = &rd_consts_data;
-            let fvc = frame_value_count_fn.or_else(majit_ir::resumedata::get_frame_value_count_fn);
-            let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
-                fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-            let num_virtuals = rd_vi.as_ref().map_or(0, |v| v.len());
-            let (_num_failargs, _vable_values, _vref_values, frames) = rebuild_from_numbering(
-                &rd_numb_bytes,
-                &rd_consts_data,
-                &fail_arg_types,
-                fvc_ref,
-                num_virtuals,
-            );
-
-            // Rebuild frame slots from rd_numb values.
-            // Track Virtual(vidx) → slot_idx for target_slot in virtual_layouts.
-            let mut vidx_to_slot: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
-            let mut new_slots: Vec<ExitValueSourceLayout> = Vec::new();
-            for frame in &frames {
-                for val in &frame.values {
-                    new_slots.push(match val {
-                        RebuiltValue::Box(idx, _) => ExitValueSourceLayout::ExitValue(*idx),
-                        RebuiltValue::Virtual(vidx) => {
-                            vidx_to_slot.insert(*vidx, new_slots.len());
-                            ExitValueSourceLayout::Virtual(*vidx)
-                        }
-                        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
-                            let c = val.const_at_use(rd_consts_ref);
-                            ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
-                        }
-                        RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
-                    });
-                }
-            }
-            if let Some(frame) = recovery_layout.frames.last_mut() {
-                // Rebuild slot_types to match new slots length.
-                // ExitValue → use original type (from fail_arg_types).
-                // Virtual/Constant/Uninitialized → Ref (default for objects).
-                let new_slot_types: Vec<Type> = new_slots
-                    .iter()
-                    .map(|slot| match slot {
-                        ExitValueSourceLayout::ExitValue(idx) => {
-                            fail_arg_types.get(*idx).copied().unwrap_or(Type::Ref)
-                        }
-                        ExitValueSourceLayout::Constant(_, ty) => *ty,
-                        _ => Type::Ref,
-                    })
-                    .collect();
-                frame.slots = new_slots;
-                frame.slot_types = Some(new_slot_types);
-                // resume.py:250 jitcode_index parity: overwrite the
-                // identity layout's default 0 with the innermost frame's
-                // jitcode_index from rd_numb. After `opencoder.py:217`
-                // `framestack.reverse()` parity rd_numb encodes frames
-                // outermost-first (caller before callee), so the
-                // innermost frame — the one the identity layout
-                // represents — is `frames.last()`.
-                if let Some(innermost) = frames.last() {
-                    frame.jitcode_index = innermost.jitcode_index;
-                }
-            }
-
-            // Build virtual_layouts from rd_virtuals.
-            let total_fail_args = fail_arg_refs.len();
-            let resolve_fieldnum = |fnum: i16| -> ExitValueSourceLayout {
-                let (val, tagbits) = resumedata::untag(fnum);
-                match tagbits {
-                    // resume.py parity: TAGBOX indices can be negative
-                    // (assigned by assign_number_to_box for virtual field values).
-                    // RPython uses Python negative indexing (liveboxes[-1]);
-                    // Rust needs explicit conversion to positive index.
-                    resumedata::TAGBOX => {
-                        let idx = if val >= 0 {
-                            val as usize
-                        } else {
-                            (total_fail_args as i32 + val) as usize
-                        };
-                        ExitValueSourceLayout::ExitValue(idx)
-                    }
-                    resumedata::TAGVIRTUAL => {
-                        // resume.py assign_number_to_virtual nested virtuals are numbered
-                        // negatively; resolve via negative indexing into
-                        // rd_virtuals (resume.py:951-954).
-                        let idx = if val >= 0 {
-                            val as usize
-                        } else {
-                            (num_virtuals as i32 + val) as usize
-                        };
-                        ExitValueSourceLayout::Virtual(idx)
-                    }
-                    resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64, Type::Int),
-                    resumedata::TAGCONST => {
-                        let idx = (val - resumedata::TAG_CONST_OFFSET) as usize;
-                        let c = rd_consts_ref
-                            .get(idx)
-                            .copied()
-                            .unwrap_or(majit_ir::Const::Int(0));
-                        ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
-                    }
-                    _ => ExitValueSourceLayout::Constant(0, Type::Int),
-                }
-            };
-            let resolve_fieldnums = |fieldnums: &[i16],
-                                     fielddescr_indices: &[u32]|
-             -> Vec<(u32, ExitValueSourceLayout)> {
-                fieldnums
-                    .iter()
-                    .enumerate()
-                    .map(|(fi, &fnum)| {
-                        let fdi = fielddescr_indices.get(fi).copied().unwrap_or(fi as u32);
-                        (fdi, resolve_fieldnum(fnum))
-                    })
-                    .collect()
-            };
-
-            // Build virtual_layouts from rd_virtuals or rd_virtuals.
-            recovery_layout.virtual_layouts.clear();
-            if let Some(rd_vi_slice) = rd_vi {
-                for (vidx, entry_rc) in rd_vi_slice.iter().enumerate() {
-                    let entry: &majit_ir::RdVirtualInfo = entry_rc.as_ref();
-                    let target_slot = vidx_to_slot.get(&vidx).copied();
-                    let layout = match entry {
-                        majit_ir::RdVirtualInfo::VirtualInfo {
-                            descr,
-                            type_id,
-                            known_class,
-                            fielddescrs,
-                            fieldnums,
-                            descr_size,
-                        } => {
-                            let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
-                            ExitVirtualLayout::Object {
-                                descr: descr.clone(),
-                                type_id: *type_id,
-                                known_class: *known_class,
-                                fields: resolve_fieldnums(fieldnums, &indices),
-                                target_slot,
-                                fielddescrs: fielddescrs.clone(),
-                                descr_size: *descr_size,
-                            }
-                        }
-                        majit_ir::RdVirtualInfo::VStructInfo {
-                            typedescr,
-                            type_id,
-                            fielddescrs,
-                            fieldnums,
-                            descr_size,
-                        } => {
-                            let indices: Vec<u32> = fielddescrs.iter().map(|fd| fd.index).collect();
-                            ExitVirtualLayout::Struct {
-                                typedescr: typedescr.clone(),
-                                type_id: *type_id,
-                                fields: resolve_fieldnums(fieldnums, &indices),
-                                target_slot,
-                                fielddescrs: fielddescrs.clone(),
-                                descr_size: *descr_size,
-                            }
-                        }
-                        majit_ir::RdVirtualInfo::VArrayInfoClear {
-                            arraydescr,
-                            kind,
-                            fieldnums,
-                        } => ExitVirtualLayout::Array {
-                            arraydescr: arraydescr.clone(),
-                            clear: true,
-                            kind: *kind,
-                            items: fieldnums
-                                .iter()
-                                .map(|&fnum| resolve_fieldnum(fnum))
-                                .collect(),
-                        },
-                        majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                            arraydescr,
-                            kind,
-                            fieldnums,
-                        } => ExitVirtualLayout::Array {
-                            arraydescr: arraydescr.clone(),
-                            clear: false,
-                            kind: *kind,
-                            items: fieldnums
-                                .iter()
-                                .map(|&fnum| resolve_fieldnum(fnum))
-                                .collect(),
-                        },
-                        majit_ir::RdVirtualInfo::VArrayStructInfo {
-                            arraydescr,
-                            fielddescrs,
-                            size,
-                            fielddescr_indices,
-                            fieldnums,
-                            ..
-                        } => {
-                            let fpe = fieldnums.len().checked_div(*size).unwrap_or(0);
-                            ExitVirtualLayout::ArrayStruct {
-                                arraydescr: arraydescr.clone(),
-                                fielddescrs: fielddescrs.clone(),
-                                element_fields: (0..*size)
-                                    .map(|ei| {
-                                        let s = ei * fpe;
-                                        let e = (s + fpe).min(fieldnums.len());
-                                        resolve_fieldnums(&fieldnums[s..e], fielddescr_indices)
-                                    })
-                                    .collect(),
-                            }
-                        }
-                        majit_ir::RdVirtualInfo::VRawBufferInfo {
-                            func,
-                            size,
-                            offsets,
-                            descrs,
-                            fieldnums,
-                        } => ExitVirtualLayout::RawBuffer {
-                            func: *func,
-                            size: *size,
-                            offsets: offsets.clone(),
-                            descrs: descrs.clone(),
-                            values: fieldnums
-                                .iter()
-                                .map(|&fnum| resolve_fieldnum(fnum))
-                                .collect(),
-                        },
-                        majit_ir::RdVirtualInfo::VRawSliceInfo { offset, fieldnums } => {
-                            ExitVirtualLayout::RawSlice {
-                                offset: *offset,
-                                base: fieldnums
-                                    .first()
-                                    .map(|&fnum| resolve_fieldnum(fnum))
-                                    .unwrap_or(ExitValueSourceLayout::Constant(0, Type::Int)),
-                            }
-                        }
-                        // resume.py VStrPlainInfo / resume.py
-                        // VUniPlainInfo — length = len(fieldnums).
-                        majit_ir::RdVirtualInfo::VStrPlainInfo { fieldnums } => {
-                            let chars = fieldnums
-                                .iter()
-                                .map(|&fnum| resolve_fieldnum(fnum))
-                                .collect();
-                            ExitVirtualLayout::StrPlain {
-                                is_unicode: false,
-                                chars,
-                            }
-                        }
-                        majit_ir::RdVirtualInfo::VUniPlainInfo { fieldnums } => {
-                            let chars = fieldnums
-                                .iter()
-                                .map(|&fnum| resolve_fieldnum(fnum))
-                                .collect();
-                            ExitVirtualLayout::StrPlain {
-                                is_unicode: true,
-                                chars,
-                            }
-                        }
-                        // resume.py VStrConcatInfo / resume.py
-                        // VUniConcatInfo — decoder.concat_strings(left, right);
-                        // funcptr/calldescr resolved at materialization via
-                        // `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT
-                        // / OS_UNI_CONCAT)` (resume.py / 1494-1495).
-                        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
-                        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
-                            let is_unicode =
-                                matches!(entry, majit_ir::RdVirtualInfo::VUniConcatInfo { .. });
-                            let left = resolve_fieldnum(fieldnums[0]);
-                            let right = resolve_fieldnum(fieldnums[1]);
-                            ExitVirtualLayout::StrConcat {
-                                is_unicode,
-                                left,
-                                right,
-                            }
-                        }
-                        // resume.py VStrSliceInfo / resume.py
-                        // VUniSliceInfo — decoder.slice_string(str, start, length);
-                        // funcptr/calldescr resolved via callinfocollection at
-                        // materialization (resume.py / 1504-1505).
-                        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
-                        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
-                            let is_unicode =
-                                matches!(entry, majit_ir::RdVirtualInfo::VUniSliceInfo { .. });
-                            let str_src = resolve_fieldnum(fieldnums[0]);
-                            let start = resolve_fieldnum(fieldnums[1]);
-                            let length = resolve_fieldnum(fieldnums[2]);
-                            ExitVirtualLayout::StrSlice {
-                                is_unicode,
-                                str_src,
-                                start,
-                                length,
-                            }
-                        }
-                        // `ResumeDataVirtualAdder._number_virtuals` can leave
-                        // a None hole when loop-memo numbering is reused by a
-                        // later guard. Keep it in the vector: skipping it
-                        // would shift every subsequent TAGVIRTUAL index.
-                        majit_ir::RdVirtualInfo::Empty => ExitVirtualLayout::Hole,
-                    };
-                    recovery_layout.virtual_layouts.push(layout);
-                }
-            }
-        }
-        let recovery_layout = Some(recovery_layout);
         // Guard gcmap fail-arg portion: each live Ref fail arg is marked at
         // the physical slot `fail_locs` names (packed dense or a ref-root /
         // demoted home). Holes and pending home tags stay out. `get_gcmap`
@@ -22195,10 +21739,8 @@ fn collect_guards(
                 // scaffolding bypassing the tracer/optimizer that
                 // normally stamps op.descr to a ResumeGuardDescr via
                 // store_final_boxes_in_guard) synthesize a
-                // ResumeGuardDescr so the recovery_layout slot has
-                // somewhere to land — only the
-                // meta-side slot stores recovery_layout, no backend
-                // cell fallback.
+                // ResumeGuardDescr so the descr identity exists for
+                // fail-index / source-op-index stamping.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.to_vec())
             };
             // Stamp the per-trace fail_index and trace_id onto the
@@ -22227,7 +21769,6 @@ fn collect_guards(
             if !preserve_descrs && (descr.is_resume_guard() || descr.is_resume_guard_copied()) {
                 as_fd(&descr).set_source_op_index(op_idx);
             }
-            let _ = recovery_layout;
             if !preserve_descrs && let Some(target) = external_jump_target {
                 fail_descr_set_external_jump_target(&descr, target);
             }
@@ -22387,74 +21928,6 @@ fn collect_guards(
     }
 
     Ok(())
-}
-
-fn collect_terminal_exit_layouts(
-    ops: &[Op],
-    inputargs: &[InputArgRc],
-    trace_id: u64,
-    header_pc: u64,
-    source_guard: Option<(u64, u32)>,
-    caller_layout: Option<&ExitRecoveryLayout>,
-) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let type_index = OpTypeIndex::new(inputargs, ops);
-    let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
-    let mut layouts = Vec::new();
-    let mut fail_index = 0u32;
-
-    for (op_index, op) in ops.iter().enumerate() {
-        let is_guard = op.opcode.is_guard();
-        let is_finish = op.opcode == OpCode::Finish;
-        let is_jump = op.opcode == OpCode::Jump;
-
-        if is_finish || is_jump {
-            let arg_oprefs: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
-            let exit_types =
-                infer_fail_arg_types(&arg_oprefs, &type_index, &type_overrides, op_index)?;
-            let recovery_layout = (is_jump || is_finish).then(|| {
-                identity_recovery_layout(
-                    trace_id,
-                    header_pc,
-                    None, // terminal exits don't need per-guard resume_pc
-                    source_guard,
-                    &exit_types,
-                    caller_layout,
-                )
-            });
-            layouts.push(TerminalExitLayout {
-                op_index,
-                trace_id,
-                trace_info: Some(CompiledTraceInfo {
-                    trace_id,
-                    input_types: inputargs.iter().map(|arg| arg.tp.get()).collect(),
-                    header_pc,
-                    source_guard: None,
-                }),
-                fail_index: if is_finish { fail_index } else { u32::MAX },
-                exit_types,
-                is_finish,
-                is_exception_exit: op
-                    .getdescr()
-                    .as_ref()
-                    .and_then(|d| d.as_fail_descr())
-                    .is_some_and(|fd| fd.is_exit_frame_with_exception()),
-                recovery_layout,
-                // Terminal exits (FINISH/JUMP) don't carry per-guard resume
-                // data — RPython's jitdriver dispatches them via a separate
-                // path (DoneWithThisFrame / ContinueRunningNormally).
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals: None,
-                rd_pendingfields: None,
-            });
-        }
-
-        if is_guard || is_finish {
-            fail_index += 1;
-        }
-    }
-
-    Ok(layouts)
 }
 
 /// `clt.frame_info.jfi_frame_depth` of `token`, or 0 when it has no
@@ -22679,15 +22152,9 @@ impl CraneliftBackend {
         };
         let op_rcs: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        let Ok(mut merged) = self.do_compile(
-            &inputargs,
-            &op_rcs,
-            Some(flag_ptr),
-            None,
-            None,
-            Some(&plan),
-            None,
-        ) else {
+        let Ok(mut merged) =
+            self.do_compile(&inputargs, &op_rcs, Some(flag_ptr), None, Some(&plan), None)
+        else {
             return;
         };
         // `x86/assembler.py gcreftracers.append(tracer)` +
@@ -22964,8 +22431,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // the retained ops again, would never define.
         let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
             .then(|| retained_merge_source(inputargs, ops));
-        let mut compiled =
-            self.do_compile(inputargs, ops, Some(flag_ptr), None, None, None, None)?;
+        let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), None, None, None)?;
         compiled.merge_source = merge_source.and_then(|source| {
             finish_merge_source(source, compiled.trace_id, compiled.gc_table.as_deref())
         });
@@ -23093,7 +22559,6 @@ impl majit_backend::Backend for CraneliftBackend {
         inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
-        caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         // Same close as `compile_loop`: bridge lowering reads `type_info_group`.
         majit_gc::ensure_type_registry_closed();
@@ -23114,46 +22579,31 @@ impl majit_backend::Backend for CraneliftBackend {
             .ok_or_else(|| {
                 BackendError::CompilationFailed("original token has no compiled loop".to_string())
             })?;
-        // compile.py:569 / compile.py:593 line-by-line: the caller hands
-        // `send_bridge_to_backend` the actual `faildescr` object;
-        // `fail_descr.trace_id()` is the bridge origin's allocated id
-        // (`alloc_trace_id` starts at 1, no sentinel) and identifies the
-        // owning trace.  `descr_owning_jct(fail_descr)`
-        // (`majit-backend/src/lib.rs`) resolves the descr's owning JCT
-        // directly via
-        // `rd_loop_token_clt`.  The metainterp caller now passes that
-        // owning JCT as `original_token`, so the matching backend descr
-        // is always reachable inside `original_compiled.fail_descrs` —
-        // the prior `previous_tokens` scan was a TODO compensating
-        // for the absence of `descr_owning_jct` and has been retired.
+        // `compile.py send_bridge_to_backend` / `do_compile_bridge` and
+        // `x86/assembler.py assemble_bridge(faildescr)` attach to the
+        // caller `faildescr` object. Presence: that object must live in
+        // `original_token.compiled.fail_descrs` or a nested attached
+        // bridge's `fail_descrs` (same tree the stamp walk covers).
+        // `fail_descr.trace_id()` is still the origin's allocated id
+        // (`alloc_trace_id` starts at 1) for `CompiledTraceInfo.source_guard`.
         let source_trace_id = fail_descr.trace_id();
-        let source_descr = find_fail_descr_in_fail_descrs(
-            &original_compiled.fail_descrs,
-            source_trace_id,
-            fail_descr.fail_index_per_trace(),
-        );
-        if source_descr.is_none() {
-            // RPython compile.py: send_bridge_to_backend always has a
-            // valid faildescr. If source_descr is not found, the bridge
-            // cannot be attached — return error for all fail_indices.
-            return Err(BackendError::CompilationFailed(format!(
-                "source fail descr not found for trace {} fail {}",
-                source_trace_id,
-                fail_descr.fail_index_per_trace()
-            )));
+        if find_fail_descr_by_identity(&original_compiled.fail_descrs, fail_descr).is_none() {
+            // `send_bridge_to_backend` always has a valid faildescr.
+            return Err(BackendError::CompilationFailed(
+                "source fail descr not found by identity".to_string(),
+            ));
         }
-        // caller_recovery_layout is now passed in by the
-        // metainterp (StoredExitLayout.recovery_layout for the source
-        // guard).  The previous `source_descr.recovery_layout_ref()`
-        // read forced the metainterp to push the layout into the
-        // descr-side cache; threading the layout through the
-        // compile_bridge parameter eliminates that cache dependency.
-        let _ = source_descr; // kept for the trace_id / fail_index_per_trace lookup above
-        let caller_layout = caller_recovery_layout.map(|layout| {
-            let mut popped = layout.clone();
-            popped.frames.pop();
-            popped
-        });
+        debug_assert!(
+            find_fail_descr_in_fail_descrs(
+                &original_compiled.fail_descrs,
+                source_trace_id,
+                fail_descr.fail_index_per_trace(),
+            )
+            .is_none_or(|stamp| {
+                as_fd(&stamp) as *const dyn FailDescr as *const ()
+                    == fail_descr as *const dyn FailDescr as *const ()
+            })
+        );
         // Snapshot before `do_compile`, like the loop path above.
         let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
             .then(|| retained_merge_source(inputargs, ops));
@@ -23163,7 +22613,6 @@ impl majit_backend::Backend for CraneliftBackend {
             ops,
             Some(flag_ptr),
             Some((source_trace_id, fail_descr.fail_index_per_trace())),
-            caller_layout.as_ref(),
             None,
             Some(bridge_source_slots),
         );
@@ -23243,57 +22692,43 @@ impl majit_backend::Backend for CraneliftBackend {
                 );
             }
         }
-        {
-            let terminal_exit_layouts = compiled.terminal_exit_layouts_mut();
-            for layout in terminal_exit_layouts.iter_mut() {
-                layout.trace_info = Some(bridge_trace_info.clone());
-            }
+        if let Some(bridge) = fail_descr_bridge_ref(fail_descr) {
+            unregister_bridge_call_assembler_expectations(&bridge);
         }
-        {
-            if let Some(ref sd) = source_descr
-                && let Some(bridge) = fail_descr_bridge_ref(as_fd(sd))
-            {
-                unregister_bridge_call_assembler_expectations(&bridge);
-            }
-        }
-        if let Some(ref sd) = source_descr {
-            let bridge_num_inputs = inputargs.len().max(compiled.input_types.len());
-            // history.py TargetToken parity: a bridge that ends with
-            // an external JUMP re-enters its target via
-            // `target_descr._ll_loop_code` (stored on the fail_descr at
-            // collect_guards time). BridgeData.loop_reentry caches this for
-            // the `execute_bridge` entry marshaling path; derive it from
-            // the compiled fail_descrs' is_external_jump flag rather than
-            // re-scanning ops + mutating descrs after the fact.
-            let loop_reentry = compiled
-                .fail_descrs
-                .iter()
-                .any(|d| as_fd(d).is_external_jump());
-            fail_descr_attach_bridge(
-                as_fd(sd),
-                BridgeData {
-                    trace_id: compiled.trace_id,
-                    input_types: compiled.input_types.clone(),
-                    header_pc: compiled.header_pc,
-                    source_guard: (source_trace_id, fail_descr.fail_index_per_trace()),
-                    caller_prefix_layout: compiled.caller_prefix_layout.clone(),
-                    code_ptr: compiled.code_ptr,
-                    body_ptr: compiled.body_ptr,
-                    fail_descrs: compiled.fail_descrs,
-                    fail_descr_cells: compiled.fail_descr_cells,
-                    terminal_exit_layouts: compiled.terminal_exit_layouts,
-                    loop_reentry,
-                    num_inputs: bridge_num_inputs,
-                    num_ref_roots: compiled.num_ref_roots,
-                    max_output_slots: compiled.max_output_slots,
-                    frame_depth: compiled.frame_depth,
+        let bridge_num_inputs = inputargs.len().max(compiled.input_types.len());
+        // history.py TargetToken parity: a bridge that ends with
+        // an external JUMP re-enters its target via
+        // `target_descr._ll_loop_code` (stored on the fail_descr at
+        // collect_guards time). BridgeData.loop_reentry caches this for
+        // the `execute_bridge` entry marshaling path; derive it from
+        // the compiled fail_descrs' is_external_jump flag rather than
+        // re-scanning ops + mutating descrs after the fact.
+        let loop_reentry = compiled
+            .fail_descrs
+            .iter()
+            .any(|d| as_fd(d).is_external_jump());
+        fail_descr_attach_bridge(
+            fail_descr,
+            BridgeData {
+                trace_id: compiled.trace_id,
+                input_types: compiled.input_types.clone(),
+                header_pc: compiled.header_pc,
+                source_guard: (source_trace_id, fail_descr.fail_index_per_trace()),
+                code_ptr: compiled.code_ptr,
+                body_ptr: compiled.body_ptr,
+                fail_descrs: compiled.fail_descrs,
+                fail_descr_cells: compiled.fail_descr_cells,
+                loop_reentry,
+                num_inputs: bridge_num_inputs,
+                num_ref_roots: compiled.num_ref_roots,
+                max_output_slots: compiled.max_output_slots,
+                frame_depth: compiled.frame_depth,
 
-                    invalidated_arc: Some(invalidated_arc),
-                    gc_table: compiled.gc_table.clone(),
-                    merge_source,
-                },
-            );
-        }
+                invalidated_arc: Some(invalidated_arc),
+                gc_table: compiled.gc_table.clone(),
+                merge_source,
+            },
+        );
 
         // `assemble_bridge` ends at `patch_jump_for_descr(faildescr,
         // rawstart + startpos)`. That is the whole attach: a new code
@@ -23551,7 +22986,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 let descr: &dyn FailDescr = descr_arc
                     .as_fail_descr()
                     .expect("get_latest_descr_arc returned a non-FailDescr Descr");
-                let exit_layout = self.describe_deadframe(&frame);
                 let savedata = self.get_savedata_ref(&frame);
                 let exception_value = self.grab_exc_value(&frame);
                 let exit_arity = descr.fail_arg_types().len();
@@ -23585,7 +23019,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
-                    exit_layout,
                     savedata,
                     exception_value,
                     fail_index: descr.fail_index(),
@@ -23674,12 +23107,10 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
-                let fail_descr_ref: DescrRef = fail_descr.to_arc();
                 let trace_id = fail_descr_fd.trace_id();
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
-                    exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
                     savedata,
                     exception_value: exception,
                     fail_index,
@@ -23736,12 +23167,10 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
-            let fail_descr_ref: DescrRef = fail_descr.to_arc();
             let trace_id = fail_descr_fd.trace_id();
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,
-                exit_layout: Some(fail_descr_layout(&fail_descr_ref, fail_index, trace_id)),
                 savedata,
                 exception_value: exception,
                 fail_index,
@@ -23814,54 +23243,6 @@ impl majit_backend::Backend for CraneliftBackend {
         find_trace_fail_descr_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
     }
 
-    fn compiled_terminal_exit_layouts(
-        &self,
-        token: &JitCellToken,
-    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        Some(compiled.terminal_exit_layouts_ref().clone())
-    }
-
-    fn compiled_bridge_terminal_exit_layouts(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-        let original_compiled = original_token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        let source_descr = original_compiled.fail_descrs.iter().find(|descr| {
-            let fd = as_fd(descr);
-            fd.fail_index() == source_fail_index && fd.trace_id() == source_trace_id
-        })?;
-        let bridge = fail_descr_bridge_ref(as_fd(source_descr));
-        let bridge = bridge.as_ref()?;
-        Some(bridge.terminal_exit_layouts_ref().clone())
-    }
-
-    fn compiled_trace_terminal_exit_layouts(
-        &self,
-        token: &JitCellToken,
-        trace_id: u64,
-    ) -> Option<Vec<majit_backend::TerminalExitLayout>> {
-        let compiled = token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)?;
-        if compiled.trace_id == trace_id {
-            return Some(compiled.terminal_exit_layouts_ref().clone());
-        }
-        find_trace_terminal_exit_layouts_in_fail_descrs(&compiled.fail_descrs, trace_id)
-    }
-
     fn compiled_trace_info(
         &self,
         token: &JitCellToken,
@@ -23885,30 +23266,6 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_backend::FailDescrLayout> {
         deadframe_layout(frame)
-    }
-
-    fn update_terminal_exit_recovery_layout(
-        &mut self,
-        token: &JitCellToken,
-        trace_id: u64,
-        op_index: usize,
-        recovery_layout: ExitRecoveryLayout,
-    ) -> bool {
-        let Some(compiled) = token
-            .compiled
-            .get()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())
-            .map(CompiledLoop::current)
-        else {
-            return false;
-        };
-        patch_terminal_exit_recovery_layout(
-            &compiled.terminal_exit_layouts,
-            &compiled.fail_descrs,
-            trace_id,
-            op_index,
-            &recovery_layout,
-        )
     }
 
     fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
@@ -24837,6 +24194,33 @@ mod tests {
             .expect("ResumeGuardDescr always implements FailDescr")
             .set_trace_id(trace_id);
         descr
+    }
+
+    /// First non-finish descr in `CompiledLoop.fail_descrs` — the loop
+    /// guard `assemble_bridge(faildescr)` attaches to.
+    fn test_loop_guard_descr(token: &JitCellToken) -> DescrRef {
+        token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .map(CompiledLoop::current)
+            .expect("test token has a compiled loop")
+            .fail_descrs
+            .iter()
+            .find(|d| !as_fd(d).is_finish())
+            .cloned()
+            .expect("compiled loop has a non-finish fail descr")
+    }
+
+    /// First non-finish descr in the bridge already attached to `source`.
+    fn test_attached_bridge_guard_descr(source: &dyn FailDescr) -> DescrRef {
+        fail_descr_bridge_ref(source)
+            .expect("source fail descr has an attached bridge")
+            .fail_descrs
+            .iter()
+            .find(|d| !as_fd(d).is_finish())
+            .cloned()
+            .expect("attached bridge has a non-finish fail descr")
     }
 
     /// `x86/assembler.py assemble_loop`: `adr_jump_offset` is stamped only
@@ -26190,7 +25574,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(1)]);
@@ -26261,7 +25645,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
         (backend, token, root)
     }
@@ -26379,7 +25763,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
         (backend, token, root)
     }
@@ -26480,7 +25864,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token_a, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token_a)
             .unwrap();
 
         let label_b = make_label_descr(1_500_442);
@@ -26601,7 +25985,7 @@ mod tests {
         bridge_constants.insert(111, 500);
         backend.set_constants(bridge_constants);
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -26631,7 +26015,6 @@ mod tests {
                 &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
                 &finish,
                 &token,
-                None,
             )
             .unwrap();
         backend.set_constants(indexmap::IndexMap::new());
@@ -26692,7 +26075,7 @@ mod tests {
             .expect("side guard should produce a descr");
         let finish = vec![mk_op(OpCode::Finish, &[s], OpRef::NONE.raw())];
         backend
-            .compile_bridge(side_descr, &inputargs, &finish, &token, None)
+            .compile_bridge(side_descr, &inputargs, &finish, &token)
             .unwrap();
         let owner = token
             .compiled
@@ -26720,7 +26103,7 @@ mod tests {
         closing_constants.insert(110, 4);
         backend.set_constants(closing_constants);
         backend
-            .compile_bridge(exit_descr, &inputargs, &closing, &token, None)
+            .compile_bridge(exit_descr, &inputargs, &closing, &token)
             .unwrap();
         let owner = token
             .compiled
@@ -26809,7 +26192,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -26875,7 +26258,7 @@ mod tests {
             mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge, &token)
             .unwrap();
         assert_eq!(
             owner.gc_table.as_ref().unwrap().slot(0),
@@ -26966,7 +26349,7 @@ mod tests {
             mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
         ];
         backend
-            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token, None)
+            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token)
             .unwrap();
         assert_ne!(
             owner.entry_code_ptr.load(Ordering::Acquire),
@@ -27071,7 +26454,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token_a, None)
+            .compile_bridge(as_fd(&enter_descr), &inputargs, &bridge, &token_a)
             .unwrap();
         assert_ne!(owner.entry_code_ptr.load(Ordering::Acquire), entry_before);
 
@@ -27178,7 +26561,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &bridge_inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -27566,7 +26949,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let bridge = fail_descr_bridge_ref(as_fd(&real_fail_descr)).expect("bridge attached");
@@ -27866,7 +27248,7 @@ mod tests {
             label_c.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, None)
+            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a)
             .unwrap();
         let bridge_to_a = vec![mk_op_with_descr(
             OpCode::Jump,
@@ -27875,7 +27257,7 @@ mod tests {
             label_a.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, None)
+            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c)
             .unwrap();
 
         let (family_body, family_code) = {
@@ -27999,7 +27381,7 @@ mod tests {
             label_c.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a, None)
+            .compile_bridge(as_fd(&odd_a), &inputargs, &bridge_to_c, &token_a)
             .unwrap();
         let bridge_to_a = vec![mk_op_with_descr(
             OpCode::Jump,
@@ -28008,7 +27390,7 @@ mod tests {
             label_a.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c, None)
+            .compile_bridge(as_fd(&odd_c), &inputargs, &bridge_to_a, &token_c)
             .unwrap();
 
         let family_body = token_c
@@ -28110,7 +27492,7 @@ mod tests {
             label_c.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&to_c), &inputargs, &bridge, &token_a, None)
+            .compile_bridge(as_fd(&to_c), &inputargs, &bridge, &token_a)
             .unwrap();
         {
             let compiled_a = token_a
@@ -28194,7 +27576,7 @@ mod tests {
             label_t.clone(),
         )];
         backend
-            .compile_bridge(as_fd(&to_t), &inputargs, &bridge, &token_l, None)
+            .compile_bridge(as_fd(&to_t), &inputargs, &bridge, &token_l)
             .unwrap();
         {
             let compiled_l = token_l
@@ -28457,13 +27839,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(
-                as_fd(&odd_descr),
-                &bridge_inputargs,
-                &bridge_ops,
-                &token,
-                None,
-            )
+            .compile_bridge(as_fd(&odd_descr), &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
         let entry_after = token
             .compiled
@@ -28549,13 +27925,7 @@ mod tests {
             mk_op_with_descr(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw(), label),
         ];
         backend
-            .compile_bridge(
-                as_fd(&odd_descr),
-                &bridge_inputargs,
-                &bridge_ops,
-                &token,
-                None,
-            )
+            .compile_bridge(as_fd(&odd_descr), &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
         {
             let entry = token
@@ -28654,13 +28024,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         backend
-            .compile_bridge(
-                as_fd(&odd_descr),
-                &bridge_inputargs,
-                &bridge_ops,
-                &token,
-                None,
-            )
+            .compile_bridge(as_fd(&odd_descr), &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         assert!(Arc::ptr_eq(
@@ -28696,7 +28060,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &nested_ops,
                 &token,
-                None,
             )
             .unwrap();
         assert_ne!(entry_before, entry_code_ptr());
@@ -28789,7 +28152,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &odd_bridge,
                 &token,
-                None,
             )
             .unwrap();
         assert_eq!(as_fd(&exit_descr).adr_jump_offset(), exit_stub);
@@ -28800,7 +28162,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &finish_plus(100),
                 &token,
-                None,
             )
             .unwrap();
         assert_eq!(as_fd(&bridge_guard_descr).adr_jump_offset(), 0);
@@ -28811,7 +28172,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &finish_plus(1000),
                 &token,
-                None,
             )
             .unwrap();
         assert_eq!(as_fd(&bridge_guard_descr).adr_jump_offset(), 0);
@@ -28926,7 +28286,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &odd_bridge,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29047,7 +28406,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29164,7 +28522,6 @@ mod tests {
                 &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29258,7 +28615,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29353,7 +28709,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &exc_bridge,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after_exc = token
@@ -29381,7 +28736,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &hot_bridge,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after_hot = token
@@ -29457,7 +28811,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29539,7 +28892,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29635,7 +28987,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -29727,7 +29078,6 @@ mod tests {
                 &[InputArg::new_int_rc(0)],
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         let entry_after = token
@@ -30258,169 +29608,23 @@ mod tests {
             .expect("compiled layouts should exist");
         let layout = &layouts[0];
         assert_eq!(layout.source_op_index, Some(1));
-        // Backend no longer caches per-fail-descr recovery
-        // layouts.  Terminal exit layouts (sibling test below) still
-        // carry the recovery_layout because they live on
-        // `CompiledLoop.terminal_exit_layouts`, not on the descr.
+        // Backend no longer caches per-fail-descr recovery layouts.
         assert!(
             layout.recovery_layout.is_none(),
             "per-fail-descr recovery_layout is metainterp-owned"
         );
         assert_eq!(layout.fail_arg_types, vec![Type::Ref, Type::Int]);
-    }
-
-    #[test]
-    fn test_compiled_terminal_exit_layouts_include_backend_jump_recovery_layout() {
-        let mut backend = CraneliftBackend::new();
-
-        // The JUMP passes its two args in the opposite order to the LABEL, so
-        // the recovery layout under test is built from a Ref and an Int that
-        // sit at swapped positions rather than from a straight-through
-        // backedge.
-        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_ref(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Jump,
-                &[OpRef::input_arg_ref(1), OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        backend.set_next_trace_id(77);
-        backend.set_next_header_pc(1234);
-        let token = JitCellToken::new(8009);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let layouts = backend
-            .compiled_terminal_exit_layouts(&token)
-            .expect("compiled terminal layouts should exist");
-        assert_eq!(layouts.len(), 1);
-        let layout = &layouts[0];
-        assert_eq!(layout.op_index, 1);
-        assert_eq!(layout.trace_id, 77);
-        assert_eq!(layout.fail_index, u32::MAX);
-        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Int]);
-        assert!(!layout.is_finish);
-        let recovery = layout
-            .recovery_layout
+        let descr = layout
+            .descr
             .as_ref()
-            .expect("jump layout should include backend recovery layout");
-        assert_eq!(recovery.frames.len(), 1);
-        assert_eq!(recovery.frames[0].trace_id, Some(77));
-        assert_eq!(recovery.frames[0].header_pc, Some(1234));
-        assert_eq!(recovery.frames[0].pc, 1234);
+            .expect("compiled fail-descr layout carries the descr Arc");
         assert_eq!(
-            recovery.frames[0].slots,
-            vec![
-                majit_backend::ExitValueSourceLayout::ExitValue(0),
-                majit_backend::ExitValueSourceLayout::ExitValue(1),
-            ]
+            descr
+                .as_fail_descr()
+                .expect("layout descr is a FailDescr")
+                .fail_arg_types(),
+            layout.fail_arg_types.as_slice()
         );
-        assert_eq!(
-            recovery.frames[0].slot_types,
-            Some(vec![Type::Ref, Type::Int])
-        );
-    }
-
-    #[test]
-    fn test_compiled_terminal_exit_layouts_include_backend_finish_recovery_layout() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_ref_rc(1)];
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_float(0), OpRef::input_arg_ref(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_ref(1), OpRef::input_arg_float(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        backend.set_next_trace_id(79);
-        backend.set_next_header_pc(5678);
-        let token = JitCellToken::new(8011);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let layouts = backend
-            .compiled_terminal_exit_layouts(&token)
-            .expect("compiled terminal layouts should exist");
-        assert_eq!(layouts.len(), 1);
-        let layout = &layouts[0];
-        assert_eq!(layout.op_index, 1);
-        assert_eq!(layout.trace_id, 79);
-        assert_eq!(layout.fail_index, 0);
-        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
-        assert!(layout.is_finish);
-        let recovery = layout
-            .recovery_layout
-            .as_ref()
-            .expect("finish layout should include backend recovery layout");
-        assert_eq!(recovery.frames.len(), 1);
-        assert_eq!(recovery.frames[0].trace_id, Some(79));
-        assert_eq!(recovery.frames[0].header_pc, Some(5678));
-        assert_eq!(recovery.frames[0].pc, 5678);
-        assert_eq!(
-            recovery.frames[0].slots,
-            vec![
-                majit_backend::ExitValueSourceLayout::ExitValue(0),
-                majit_backend::ExitValueSourceLayout::ExitValue(1),
-            ]
-        );
-        assert_eq!(
-            recovery.frames[0].slot_types,
-            Some(vec![Type::Ref, Type::Float])
-        );
-    }
-
-    #[test]
-    fn test_update_terminal_exit_recovery_layout_patches_compiled_terminal_layout() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int_rc(0)];
-        let ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::Jump, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-        ];
-
-        backend.set_next_trace_id(78);
-        backend.set_next_header_pc(1000);
-        let token = JitCellToken::new(8010);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let patched = majit_backend::ExitRecoveryLayout {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: vec![majit_backend::ExitFrameLayout {
-                trace_id: None,
-                header_pc: None,
-                source_guard: None,
-                pc: 4242,
-                jitcode_index: 0,
-                slots: vec![majit_backend::ExitValueSourceLayout::Constant(
-                    99,
-                    majit_ir::Type::Int,
-                )],
-                slot_types: Some(vec![Type::Int]),
-            }],
-            virtual_layouts: Vec::new(),
-            pending_field_layouts: Vec::new(),
-        };
-        assert!(backend.update_terminal_exit_recovery_layout(&token, 78, 1, patched.clone()));
-
-        let layouts = backend
-            .compiled_terminal_exit_layouts(&token)
-            .expect("compiled terminal layouts should exist");
-        assert_eq!(layouts.len(), 1);
-        assert_eq!(layouts[0].recovery_layout, Some(patched));
     }
 
     #[test]
@@ -30458,13 +29662,13 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let fail_descr_arc = mk_test_resume_guard_descr(90, vec![Type::Int]);
-        let fail_descr = fail_descr_arc.as_fail_descr().unwrap();
+        let fail_descr_arc = test_loop_guard_descr(&token);
+        let fail_descr = as_fd(&fail_descr_arc);
 
         backend.set_next_trace_id(91);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(fail_descr, &bridge_inputargs, &bridge_ops, &token, None)
+            .compile_bridge(fail_descr, &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
 
         let root_layouts = backend
@@ -30492,25 +29696,10 @@ mod tests {
         assert_eq!(bridge_info.input_types, vec![Type::Int]);
         assert_eq!(bridge_info.header_pc, 2000);
         assert_eq!(bridge_info.source_guard, Some((90, 0)));
-
-        let bridge_terminal_layouts = backend
-            .compiled_trace_terminal_exit_layouts(&token, 91)
-            .expect("bridge terminal layouts should exist");
-        assert_eq!(bridge_terminal_layouts.len(), 1);
-        assert_eq!(bridge_terminal_layouts[0].trace_id, 91);
-        assert_eq!(
-            bridge_terminal_layouts[0]
-                .recovery_layout
-                .as_ref()
-                .expect("bridge terminal layout should have recovery")
-                .frames[0]
-                .pc,
-            2000
-        );
     }
 
     #[test]
-    fn test_compiled_bridge_recovery_layouts_inherit_source_guard_caller_frames() {
+    fn test_compiled_bridge_terminal_recovery_is_single_current_trace_frame() {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int_rc(0)];
@@ -30535,52 +29724,8 @@ mod tests {
         let token = JitCellToken::new(8013);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
-        let source_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: vec![
-                majit_backend::ExitFrameLayout {
-                    trace_id: Some(10),
-                    header_pc: Some(900),
-                    source_guard: Some((9, 0)),
-                    pc: 900,
-                    jitcode_index: 0,
-                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                    slot_types: Some(vec![Type::Int]),
-                },
-                majit_backend::ExitFrameLayout {
-                    trace_id: Some(190),
-                    header_pc: Some(1000),
-                    source_guard: None,
-                    pc: 1000,
-                    jitcode_index: 0,
-                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                    slot_types: Some(vec![Type::Int]),
-                },
-            ],
-            virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
-                arraydescr: None,
-                clear: false,
-                kind: 1,
-                items: vec![
-                    majit_backend::ExitValueSourceLayout::ExitValue(0),
-                    majit_backend::ExitValueSourceLayout::Constant(44, majit_ir::Type::Int),
-                ],
-            }],
-            pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
-                descr: None,
-                item_index: Some(1),
-                is_array_item: true,
-                target: majit_backend::ExitValueSourceLayout::Virtual(0),
-                value: majit_backend::ExitValueSourceLayout::ExitValue(0),
-            }],
-        };
-        // Backend no longer caches recovery_layout; the source
-        // layout flows through `compile_bridge`'s explicit
-        // `caller_recovery_layout` parameter (QQ-7 contract).
-
-        let bridge_fail_descr_arc = mk_test_resume_guard_descr(190, vec![Type::Int]);
-        let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
+        let bridge_fail_descr_arc = test_loop_guard_descr(&token);
+        let bridge_fail_descr = as_fd(&bridge_fail_descr_arc);
         let bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -30600,13 +29745,7 @@ mod tests {
         backend.set_next_trace_id(191);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(
-                bridge_fail_descr,
-                &inputargs,
-                &bridge_ops,
-                &token,
-                Some(&source_layout),
-            )
+            .compile_bridge(bridge_fail_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         let bridge_layouts = backend
@@ -30616,32 +29755,9 @@ mod tests {
             .iter()
             .find(|layout| !layout.is_finish)
             .expect("bridge guard layout should exist");
-        // Per-fail-descr recovery_layout is metainterp-owned;
-        // the bridge's terminal exit (sibling assertion below) still
-        // composes the caller frames because that path lives on
-        // `CompiledLoop.terminal_exit_layouts`.
         assert!(
             guard_layout.recovery_layout.is_none(),
-            "bridge guard fail_descr recovery_layout is metainterp-owned"
-        );
-
-        let bridge_terminal_layouts = backend
-            .compiled_trace_terminal_exit_layouts(&token, 191)
-            .expect("bridge terminal layouts should exist");
-        let finish_recovery = bridge_terminal_layouts[0]
-            .recovery_layout
-            .as_ref()
-            .expect("bridge finish should carry backend recovery");
-        assert_eq!(finish_recovery.frames.len(), 2);
-        assert_eq!(finish_recovery.frames[0].pc, 900);
-        assert_eq!(finish_recovery.frames[1].pc, 2000);
-        assert_eq!(
-            finish_recovery.virtual_layouts,
-            source_layout.virtual_layouts
-        );
-        assert_eq!(
-            finish_recovery.pending_field_layouts,
-            source_layout.pending_field_layouts
+            "bridge guard fail_descr recovery_layout is None at the backend boundary"
         );
     }
 
@@ -30671,49 +29787,8 @@ mod tests {
         let token = JitCellToken::new(8014);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
-        let root_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: vec![
-                majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: None,
-                    source_guard: None,
-                    pc: 900,
-                    jitcode_index: 0,
-                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                    slot_types: Some(vec![Type::Int]),
-                },
-                majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: None,
-                    source_guard: None,
-                    pc: 1000,
-                    jitcode_index: 0,
-                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                    slot_types: Some(vec![Type::Int]),
-                },
-            ],
-            virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
-                arraydescr: None,
-                clear: false,
-                kind: 1,
-                items: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-            }],
-            pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
-                descr: None,
-                item_index: Some(0),
-                is_array_item: true,
-                target: majit_backend::ExitValueSourceLayout::Virtual(0),
-                value: majit_backend::ExitValueSourceLayout::ExitValue(0),
-            }],
-        };
-        // Backend no longer caches recovery_layout; layout flows
-        // through `compile_bridge`'s explicit `caller_recovery_layout`
-        // parameter below.
-
-        let bridge_fail_descr_arc = mk_test_resume_guard_descr(290, vec![Type::Int]);
-        let bridge_fail_descr = bridge_fail_descr_arc.as_fail_descr().unwrap();
+        let bridge_fail_descr_arc = test_loop_guard_descr(&token);
+        let bridge_fail_descr = as_fd(&bridge_fail_descr_arc);
         let bridge_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -30733,13 +29808,7 @@ mod tests {
         backend.set_next_trace_id(291);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(
-                bridge_fail_descr,
-                &inputargs,
-                &bridge_ops,
-                &token,
-                Some(&root_layout),
-            )
+            .compile_bridge(bridge_fail_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
         assert!(
             backend
@@ -30754,62 +29823,13 @@ mod tests {
             Some((290, 0))
         );
 
-        let bridge_source_layout = majit_backend::ExitRecoveryLayout {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            frames: vec![
-                majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: None,
-                    source_guard: None,
-                    pc: 444,
-                    jitcode_index: 0,
-                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                    slot_types: Some(vec![Type::Int]),
-                },
-                majit_backend::ExitFrameLayout {
-                    trace_id: None,
-                    header_pc: None,
-                    source_guard: Some((290, 0)),
-                    pc: 2000,
-                    jitcode_index: 0,
-                    slots: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
-                    slot_types: Some(vec![Type::Int]),
-                },
-            ],
-            virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
-                arraydescr: None,
-                clear: false,
-                kind: 1,
-                items: vec![
-                    majit_backend::ExitValueSourceLayout::ExitValue(0),
-                    majit_backend::ExitValueSourceLayout::Constant(55, majit_ir::Type::Int),
-                ],
-            }],
-            pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
-                descr: None,
-                item_index: Some(1),
-                is_array_item: true,
-                target: majit_backend::ExitValueSourceLayout::Virtual(0),
-                value: majit_backend::ExitValueSourceLayout::ExitValue(0),
-            }],
-        };
-        // Backend no longer caches recovery_layout; the bridge
-        // source layout flows through the nested `compile_bridge`'s
-        // explicit `caller_recovery_layout` parameter below.
-
-        let nested_bridge_fail_descr_arc = mk_test_resume_guard_descr(291, vec![Type::Int]);
-        let nested_bridge_fail_descr = nested_bridge_fail_descr_arc.as_fail_descr().unwrap();
+        let nested_bridge_fail_descr_arc =
+            test_attached_bridge_guard_descr(as_fd(&bridge_fail_descr_arc));
+        let nested_bridge_fail_descr = as_fd(&nested_bridge_fail_descr_arc);
         backend.set_next_trace_id(292);
         backend.set_next_header_pc(3000);
         backend
-            .compile_bridge(
-                nested_bridge_fail_descr,
-                &inputargs,
-                &bridge_ops,
-                &token,
-                Some(&bridge_source_layout),
-            )
+            .compile_bridge(nested_bridge_fail_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         assert!(
@@ -30829,34 +29849,9 @@ mod tests {
             .iter()
             .find(|layout| !layout.is_finish)
             .expect("nested bridge guard layout should exist");
-        // Per-fail-descr recovery_layout is metainterp-owned.
         assert!(
             nested_guard_layout.recovery_layout.is_none(),
-            "nested bridge guard fail_descr recovery_layout is metainterp-owned"
-        );
-
-        let nested_terminal_layouts = backend
-            .compiled_trace_terminal_exit_layouts(&token, 292)
-            .expect("nested bridge terminal layouts should exist");
-        let nested_finish_recovery = nested_terminal_layouts[0]
-            .recovery_layout
-            .as_ref()
-            .expect("nested bridge finish should carry backend recovery");
-        assert_eq!(
-            nested_finish_recovery
-                .frames
-                .iter()
-                .map(|frame| frame.pc)
-                .collect::<Vec<_>>(),
-            vec![444, 3000]
-        );
-        assert_eq!(
-            nested_finish_recovery.virtual_layouts,
-            bridge_source_layout.virtual_layouts
-        );
-        assert_eq!(
-            nested_finish_recovery.pending_field_layouts,
-            bridge_source_layout.pending_field_layouts
+            "nested bridge guard fail_descr recovery_layout is None at the backend boundary"
         );
     }
 
@@ -31407,13 +30402,12 @@ mod tests {
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
         assert!(!raw.exception_value.is_null());
         assert_eq!(unsafe { *(raw.exception_value.0 as *const i64) }, 0x1111);
-        let layout = raw
-            .exit_layout
-            .expect("raw exit should expose backend layout");
-        assert_eq!(layout.fail_index, 0);
-        assert_eq!(layout.source_op_index, Some(2));
-        // Per-fail-descr recovery_layout is metainterp-owned.
-        assert!(layout.recovery_layout.is_none());
+        let fd = raw
+            .descr_arc
+            .as_fail_descr()
+            .expect("raw exit carries a FailDescr");
+        assert_eq!(fd.fail_index(), 0);
+        assert_eq!(fd.source_op_index(), Some(2));
         assert!(!jit_exc_is_pending());
     }
 
@@ -33487,7 +32481,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
         assert!(bridge_info.code_addr != 0);
@@ -33586,7 +32579,6 @@ mod tests {
                 &bridge_inputargs,
                 &bridge_ops,
                 &token,
-                None,
             )
             .unwrap();
 
@@ -34093,13 +33085,12 @@ mod tests {
         assert_eq!(raw.typed_outputs, vec![Value::Int(1), Value::Int(10)]);
         assert_eq!(raw.savedata, Some(GcRef(0xDADA)));
         assert_eq!(raw.exception_value, GcRef::NULL);
-        let layout = raw
-            .exit_layout
-            .expect("raw exit should expose backend layout");
-        assert_eq!(layout.fail_index, 0);
-        assert_eq!(layout.source_op_index, Some(3));
-        // Per-fail-descr recovery_layout is metainterp-owned.
-        assert!(layout.recovery_layout.is_none());
+        let fd = raw
+            .descr_arc
+            .as_fail_descr()
+            .expect("raw exit carries a FailDescr");
+        assert_eq!(fd.fail_index(), 0);
+        assert_eq!(fd.source_op_index(), Some(3));
         assert_eq!(*may_force_void_values().lock(), vec![0, 1, 10]);
     }
 
@@ -34635,7 +33626,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -34710,7 +33701,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
         let clif = backend.last_body_clif.clone();
         assert!(
@@ -34774,7 +33765,7 @@ mod tests {
             head,
         )];
         backend
-            .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -34909,7 +33900,7 @@ mod tests {
             tail,
         )];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -34983,7 +33974,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -35083,7 +34074,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -35168,7 +34159,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -35265,7 +34256,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -35376,7 +34367,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -35478,7 +34469,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         backend.set_constants(indexmap::IndexMap::new());
@@ -37657,7 +36648,7 @@ mod tests {
         let finish = mk_op(OpCode::Finish, &[i0, i1, r], OpRef::NONE.raw());
         finish.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Ref]);
         backend
-            .compile_bridge(guard_descr, &bridge_inputargs, &[finish], &token, None)
+            .compile_bridge(guard_descr, &bridge_inputargs, &[finish], &token)
             .unwrap();
 
         let in_code = backend.execute_token(
@@ -37739,7 +36730,7 @@ mod tests {
             finish,
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
         let compiled = token
             .compiled
@@ -37811,7 +36802,7 @@ mod tests {
         );
         backend.set_constants(constants);
         backend
-            .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token)
             .unwrap();
 
         let returned = backend.execute_token(&token, &[Value::Int(77)]);
@@ -37889,13 +36880,7 @@ mod tests {
         );
         backend.set_constants(constants);
         backend
-            .compile_bridge(
-                guard_descr,
-                &[InputArg::new_ref_rc(0)],
-                &bridge_ops,
-                &token,
-                None,
-            )
+            .compile_bridge(guard_descr, &[InputArg::new_ref_rc(0)], &bridge_ops, &token)
             .unwrap();
 
         let returned = backend.execute_token(&token, &[]);
@@ -37950,7 +36935,7 @@ mod tests {
         let finish = mk_op(OpCode::Finish, &[i0], OpRef::NONE.raw());
         finish.set_fail_arg_types(vec![Type::Int]);
         backend
-            .compile_bridge(guard_descr, &inputargs, &[finish], &token, None)
+            .compile_bridge(guard_descr, &inputargs, &[finish], &token)
             .unwrap();
         let hit = backend.execute_token(&token, &[Value::Int(77)]);
         assert_eq!(backend.get_int_value(&hit, 0), 77);
@@ -38038,7 +37023,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::ref_op(6)], OpRef::NONE.raw()),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         let compiled = token
@@ -38105,7 +37090,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         let compiled = token
@@ -38180,7 +37165,7 @@ mod tests {
         );
         backend.set_constants(constants);
         backend
-            .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token)
             .unwrap();
 
         let compiled = token
@@ -38267,7 +37252,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         let hit = backend.execute_token(&token, &[Value::Int(0), Value::Ref(root)]);
@@ -38334,7 +37319,7 @@ mod tests {
             mk_op(OpCode::Finish, &[i1], OpRef::NONE.raw()),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
         let compiled = token
@@ -38516,7 +37501,7 @@ mod tests {
             tail,
         )];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
         let descr = backend.get_latest_descr(&frame);
@@ -38571,12 +37556,9 @@ mod tests {
             .compiled_fail_descr_layouts(&token)
             .expect("compiled layouts should exist");
 
-        // Backend no longer caches a per-descr recovery
-        // layout — `FailDescrLayout.recovery_layout` is None for every
-        // fail descr (matching dynasm parity).  The metainterp's
-        // `StoredExitLayout.recovery_layout` is the canonical store;
-        // consumers read it via `trace_layout_ref.recovery_layout`
-        // (`pyjitpl.rs`).
+        // `FailDescrLayout.recovery_layout` is None for every fail descr
+        // (dynasm / wasm same contract). Production deopt from a guard
+        // decodes the descr's `rd_numb` (`ResumeGuardDescr.get_resumestorage`).
         let mut guard_layouts_seen = 0;
         for (idx, layout) in layouts.iter().enumerate() {
             assert!(

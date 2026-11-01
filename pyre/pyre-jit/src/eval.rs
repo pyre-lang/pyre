@@ -29,7 +29,7 @@ use majit_ir::{Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
 use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
-use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
+use majit_metainterp::{DetailedDriverRunOutcome, JitState};
 use pyre_interpreter::importing::ModuleGcLayout;
 
 /// Host tracer registered with majit-gc so `walk_jf_roots` can reach
@@ -6488,14 +6488,14 @@ pub fn existing_driver_pair() -> Option<&'static mut JitDriverPair> {
 }
 
 /// framework.py `root_walker.walk_roots` hook for
-/// `storage.rd_consts` (resume.py:451) across every live compiled
+/// `storage.rd_consts` (`resume.py`) across every live compiled
 /// trace.
 ///
 /// Registered once during `JIT_DRIVER` init (see
 /// `register_thread_root_areas`). Routes into the thread-local
-/// `JitDriver`'s `walk_rd_consts_refs`, which in turn iterates
-/// `MetaInterp::compiled_loops` and visits the Ref-typed entries in
-/// every `StoredExitLayout::rd_consts`.
+/// `JitDriver`'s `walk_rd_consts_refs`, which visits Ref-typed
+/// entries in each fail descr's `rd_consts` pool
+/// (`ResumeGuardDescr.get_resumestorage`).
 unsafe fn rd_consts_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -6625,9 +6625,8 @@ unsafe fn compile_snapshot_root_walker_area(
 ///   1. this walker stops forming a `&mut` (or `&`) to the pair;
 ///   2. `driver_pair()` stops returning `&'static mut` — the exclusivity is
 ///      minted there, and that is what invalidates every other access;
-///   3. the GC-visible root fields (`compiled_loops` / `partial_trace` /
-///      `exported_state` / `framestack` / `tracing`) move behind interior
-///      mutability.
+///   3. the GC-visible root fields (`partial_trace` / `exported_state` /
+///      `framestack` / `tracing`) move behind interior mutability.
 ///
 /// Wrapping the fields alone does NOT help: `UnsafeCell` only opts out of the
 /// immutability of `&T`, while a `&mut T` retag is `Unique` over the whole
@@ -8457,7 +8456,6 @@ fn drive_generatorentry_trace(
     };
     let drove = meta.with_trace_ctx_and_token_resolver(
         |ctx,
-         resolve_token,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -8466,7 +8464,6 @@ fn drive_generatorentry_trace(
          recursive_exec_void| {
             let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
                 |_pc: usize| 0usize,
-                resolve_token,
                 recursive_target,
                 recursive_decision,
                 recursive_exec,
@@ -8531,9 +8528,7 @@ fn drive_generatorentry_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let trace_meta = pyre_jit_trace::genentry_state::GenEntryJitState { pycode }
-            .build_meta(header_pc, &pyre_jit_trace::state::PyreEnv);
-        let outcome = meta.compile_loop(&jump_args, trace_meta);
+        let outcome = meta.compile_loop(&jump_args);
         if dbg {
             eprintln!("[jd2] compile_loop outcome={outcome:?}");
         }
@@ -8698,9 +8693,11 @@ fn run_compiled_generatorentry(
                     r.is_finish,
                     r.is_exit_frame_with_exception,
                     r.fail_index,
-                    r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
+                    r.descr_arc
+                        .as_ref()
+                        .and_then(majit_metainterp::resume::get_resumestorage)
+                        .is_some(),
                     majit_metainterp::raw_exit_values(&r.typed_values),
-                    r.exit_layout.clone(),
                     r.exception.exc_value,
                     r.descr_arc.clone(),
                     r.guard_value_operand,
@@ -8713,7 +8710,6 @@ fn run_compiled_generatorentry(
             fail_index,
             has_storage,
             mut values,
-            exit_layout,
             guard_exc,
             descr_arc,
             guard_value_operand,
@@ -8787,15 +8783,11 @@ fn run_compiled_generatorentry(
                         ref_slots.get(index).copied().unwrap_or(false)
                     })
                 };
-                let layout = exit_layout
-                    .as_deref()
-                    .expect("a guard exit carrying resume storage carries its layout");
                 let _guard = GuardCompilingScope::new(descr_arc);
                 let resolution = crate::call_jit::trace_and_compile_from_bridge(
                     descr_arc,
                     None,
                     &values,
-                    layout,
                     guard_exc_root.get(),
                     true,
                 );
@@ -8828,11 +8820,11 @@ fn run_compiled_generatorentry(
         // A non-StopIteration guard exit still has to run the portal
         // jitcode's `catch_exception` / `finally` (`blackhole.py`
         // `resume_in_blackhole`) so `running` and the EC link are cleared.
-        let bh = resume_in_blackhole_from_exit_layout(
+        let bh = resume_in_blackhole(
             &mut values,
-            exit_layout
-                .as_deref()
-                .expect("a guard exit carrying resume storage carries its layout"),
+            descr_arc
+                .as_ref()
+                .expect("a guard exit carrying resume storage carries its descr"),
             guard_exc_root.get(),
             true,
             None,
@@ -9037,7 +9029,7 @@ fn drive_unpack_iterable_trace(
     // dropped; `ContinueRunningNormally` re-enters the compiled loop, and the
     // drain ends at the StopIteration guard exit. The interp `ln` loop then
     // exits on its own next `next()` (StopIteration). Uses the values-based
-    // runner + the frameless `resume_in_blackhole_from_exit_layout` because jd1
+    // runner + the frameless `resume_in_blackhole` because jd1
     // is novable with raw `(w_iterator, items)` reds, not a PyFrame the
     // frame-projecting `execute_assembler`/`handle_fail` path expects.
     if matches!(action, BackEdgeAction::RunCompiled) && jd1_enter_enabled() {
@@ -9069,21 +9061,23 @@ fn drive_unpack_iterable_trace(
                 fail_index,
                 has_storage,
                 mut values,
-                exit_layout,
+                descr_arc,
                 guard_exc,
             )) = meta
                 .run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
-                        // Off the result, not off the layout: a finish exit
-                        // carries no layout, and the flag one would have held
-                        // is a copy of this word.
+                        // Off the result: a finish exit carries no guard descr,
+                        // and the flag is this word.
                         r.is_exit_frame_with_exception,
                         r.fail_index,
-                        r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
+                        r.descr_arc
+                            .as_ref()
+                            .and_then(majit_metainterp::resume::get_resumestorage)
+                            .is_some(),
                         majit_metainterp::raw_exit_values(&r.typed_values),
-                        r.exit_layout.clone(),
+                        r.descr_arc.clone(),
                         r.exception.exc_value,
                     )
                 })
@@ -9118,11 +9112,11 @@ fn drive_unpack_iterable_trace(
             }
             // compile.py:710-716 resume_in_blackhole: complete the in-flight
             // `next()`/`append` and run forward to the next merge point.
-            let bh = resume_in_blackhole_from_exit_layout(
+            let bh = resume_in_blackhole(
                 &mut values,
-                exit_layout
-                    .as_deref()
-                    .expect("a guard exit carrying resume storage carries its layout"),
+                descr_arc
+                    .as_ref()
+                    .expect("a guard exit carrying resume storage carries its descr"),
                 guard_exc,
                 // jd1 is novable: it has no virtualizable to force.
                 true,
@@ -9234,7 +9228,6 @@ fn drive_unpack_iterable_trace(
     // compiled-loop / warmstate state.
     let drove = meta.with_trace_ctx_and_token_resolver(
         |ctx,
-         resolve_token,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -9243,7 +9236,6 @@ fn drive_unpack_iterable_trace(
          recursive_exec_void| {
             let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
                 |_pc: usize| 0usize,
-                resolve_token,
                 recursive_target,
                 recursive_decision,
                 recursive_exec,
@@ -9284,11 +9276,7 @@ fn drive_unpack_iterable_trace(
         _ => None,
     };
     if let Some(jump_args) = jump_args {
-        let trace_meta = pyre_jit_trace::unpack_state::UnpackJitState {
-            greenkey: greenkey_raw,
-        }
-        .build_meta(header_pc, &pyre_jit_trace::state::PyreEnv);
-        let outcome = meta.compile_loop(&jump_args, trace_meta);
+        let outcome = meta.compile_loop(&jump_args);
         if dbg {
             eprintln!("[jd1] compile_loop outcome={outcome:?}");
         }
@@ -9340,9 +9328,8 @@ fn drive_unpack_iterable_trace(
         // envelope (only `JitDriver::force_start_tracing` calls
         // `begin_trace_session`).
         //
-        // Opening the session here (the meta is fully static for the novable
-        // driver, so it is the value the back-edge arm above builds) is what
-        // would compile the trace; the defect that used to block it — the
+        // Opening the session here is what would compile the trace; the
+        // defect that used to block it — the
         // parked error resurfacing at an unrelated later unpack, which
         // `synth/unpack_drain_star_raise` case 4 catches — was the backend
         // `_store_exception` leak drained just above, not the park itself.
@@ -11789,23 +11776,20 @@ fn maybe_compile_and_run(
     // warmstate.py: procedure_token exists → EnterJitAssembler.
     // RPython enters assembler unconditionally when a compiled loop is
     // available for this green_key. Pyre gates on `has_runnable_compiled_loop`
-    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token — which
-    // has a compiled body but no `compiled_loops` meta — falls through to the
-    // counter tick below instead of entering `execute_assembler` with no meta
-    // to interpret its exit (which aborts). The tmp cell then re-ticks until
-    // the real loop compiles.
+    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token
+    // (`JC_TEMPORARY`) falls through to the counter tick below instead of
+    // entering `execute_assembler`. The tmp cell then re-ticks until the
+    // real loop compiles. The enter predicate is the cell's procedure token.
     // Why a compiled loop for this green key is or is not enterable, per
-    // back-edge.  `has_runnable_compiled_loop` is the conjunction of an entry
-    // procedure token and a frontend `compiled_loops` entry, and the two fail
-    // for different reasons: a pruned cell reads `cell_present=false
-    // state=NotHot` while its meta survives, an invalidated token reads
+    // back-edge.  `has_runnable_compiled_loop` is the cell's non-temporary
+    // procedure token compiled for this driver. A pruned cell reads
+    // `cell_present=false state=NotHot`, an invalidated token reads
     // `seen_token=true has_token=false`.  Separating them is what distinguishes
     // a cell the warmstate dropped from a token something revoked.
     static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *GEN_ENTRY_DIAG.get_or_init(|| std::env::var_os("PYRE_GEN_ENTRY_DIAG").is_some()) {
         let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
         let runnable = driver.has_runnable_compiled_loop(green_key);
-        let meta = driver.get_compiled_meta(green_key).is_some();
         let last = driver.last_compiled_key();
         let ws = driver
             .meta_interp_mut()
@@ -11820,12 +11804,11 @@ fn maybe_compile_and_run(
             None => (false, false, false),
         };
         eprintln!(
-            "[gen-entry] code={} pc={} key={} runnable={} meta={} last_compiled={:?} cell_present={} state={:?} seen_token={} has_token={}",
+            "[gen-entry] code={} pc={} key={} runnable={} last_compiled={:?} cell_present={} state={:?} seen_token={} has_token={}",
             code.obj_name.as_str(),
             loop_header_pc,
             green_key,
             runnable,
-            meta,
             last,
             present,
             state,
@@ -12041,7 +12024,6 @@ fn handle_fail(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     _owning_key: u64,
-    exit_layout: &CompiledExitLayout,
     raw_values: &mut [i64],
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -12064,11 +12046,23 @@ fn handle_fail(
     // The exit values are a host copy of the JITFRAME slots; the JITFRAME's
     // own gcmap rooting ended when `execute_token` returned. Bridge tracing
     // below allocates, so root the traced Ref slots for this whole call
-    // (`DeadFrameRefRoots`), the set `compute_gcmap` marks — force tokens
-    // included, since one is a jitframe pointer and the jitframe moves.
+    // (`DeadFrameRefRoots`).
+    // `llsupport/assembler.py compute_gcmap` skips the hole a virtual leaves
+    // (`if arg is None: continue`), marks every remaining `REF`-typed failarg,
+    // and narrows nothing else. A force token is marked like any other, because
+    // `resoperation.py FORCE_TOKEN/0/r` is REF — it returns the jitframe, itself
+    // a GC object that moves — and both emitted gcmaps
+    // (`guard_gcmap_from_faillocs`, `collect_guards`) mark it.
+    // The skip has nothing to do here: every fail arg is bound, so the type
+    // test is the whole rule. Do not narrow it by force-token position: that
+    // would stop rooting a live jitframe pointer.
+    let fail_arg_types = descr_arc
+        .as_fail_descr()
+        .map(|fd| fd.fail_arg_types())
+        .unwrap_or(&[]);
     let _deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
-            exit_layout.is_traced_ref_slot(index)
+            fail_arg_types.get(index) == Some(&majit_ir::Type::Ref)
         })
     };
 
@@ -12082,7 +12076,10 @@ fn handle_fail(
     // machine trace on every iteration.
     //
     // Only when the guard's owning token IS the one currently installed.  A
-    // retired token's descrs stay reachable through the loop's side tables
+    // retired token's descrs stay reachable through the compiled loop
+    // token's GC ref tracer (`model.py`
+    // `CompiledLoopToken.asmmemmgr_gcreftracers`), the `JitCellToken`
+    // keepalive in `memmgr.py` `alive_loops`, and the deadframe's descr Arc,
     // long after the key has been recompiled, and `invalidate_loop` resolves
     // the key through `get_procedure_token`, which skips invalidated tokens —
     // so an unscoped revoke kills the *replacement* loop instead, on every
@@ -12134,7 +12131,6 @@ fn handle_fail(
                 descr_arc,
                 Some(frame),
                 raw_values,
-                exit_layout,
                 _guard_exc_root.get(),
                 true,
             )
@@ -12241,7 +12237,6 @@ fn dispatch_handle_fail(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     owning_key: u64,
-    exit_layout: &CompiledExitLayout,
     raw_values: &mut [i64],
     guard_exc: i64,
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
@@ -12268,7 +12263,6 @@ fn dispatch_handle_fail(
         descr_arc,
         should_bridge,
         owning_key,
-        exit_layout,
         raw_values,
         guard_exc_root.get(),
         info,
@@ -12281,13 +12275,8 @@ fn dispatch_handle_fail(
         }
         (HandleFailOutcome::ResumeInBlackhole, savedata) => {
             // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
-            let bh_result = resume_in_blackhole_from_exit_layout(
-                raw_values,
-                exit_layout,
-                guard_exc_root.get(),
-                false,
-                savedata,
-            );
+            let bh_result =
+                resume_in_blackhole(raw_values, descr_arc, guard_exc_root.get(), false, savedata);
             match &bh_result {
                 crate::call_jit::BlackholeResult::ContinueRunningNormally { green_int, .. } => {
                     apply_blackhole_crn_handoff(frame_root.frame(), green_int);
@@ -12367,16 +12356,17 @@ pub(crate) fn savedata_from_jitframe(
     (ptr != 0).then_some(majit_ir::GcRef(ptr))
 }
 
-/// compile.py:710-716 resume_in_blackhole parity.
+/// `blackhole.py resume_in_blackhole` /
+/// `compile.py AbstractResumeGuardDescr.handle_fail`.
 ///
 /// RPython: resume_in_blackhole → blackhole_from_resumedata →
 /// consume_one_section → _run_forever → raises.
 ///
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
-pub(crate) fn resume_in_blackhole_from_exit_layout(
+pub(crate) fn resume_in_blackhole(
     raw_values: &mut [i64],
-    exit_layout: &CompiledExitLayout,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     guard_exc: i64,
     // True when the failing guard belongs to a novable jitdriver (jd1
     // `unpackiterable_driver`): its resume data has no vable section, so the
@@ -12407,33 +12397,34 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // still registered pins whatever object the guard left in it for the whole
     // run.  `blackhole.py resume_in_blackhole` ends `deadframe`'s
     // live range at `_prepare_resume_from_failure`, before `_run_forever`.
+    let fd = descr_arc
+        .as_fail_descr()
+        .expect("a guard blackhole resume carries a FailDescr");
+    let fail_arg_types = fd.fail_arg_types();
+    // Same `compute_gcmap` rule as `handle_fail`.
     let deadframe_roots = unsafe {
         majit_metainterp::resume::DeadFrameRefRoots::enter(raw_values, |index| {
-            exit_layout.is_traced_ref_slot(index)
+            fail_arg_types.get(index) == Some(&majit_ir::Type::Ref)
         })
     };
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
+            "[dynasm-debug] resume_in_blackhole: raw_values.len={} fail_arg_types.len={} rd_numb={:?}",
             raw_values.len(),
-            exit_layout.exit_types.len(),
-            exit_layout
-                .storage
-                .as_deref()
-                .map(|s| s.rd_numb().map_or(0, <[_]>::len))
+            fail_arg_types.len(),
+            fd.rd_numb().map_or(0, <[_]>::len)
         );
     }
 
     // resume.py blackhole_from_resumedata is the single blackhole
-    // resume mechanism: every exit_layout that carries resume storage
-    // decodes through the orthodox rd_numb reader
-    // `blackhole_resume_via_rd_numb`. It walks jitcode liveness once per
-    // resume frame, so it reconstructs the full inline framestack.
-    // exit_layout already carries (rd_loop_token, trace_id, fail_index,
-    // storage), mirroring the CALL_ASSEMBLER caller
+    // resume mechanism: every descr that carries resume storage
+    // (`ResumeGuardDescr.get_resumestorage` returns self) decodes through
+    // the orthodox rd_numb reader `blackhole_resume_via_rd_numb`. It walks
+    // jitcode liveness once per resume frame, so it reconstructs the full
+    // inline framestack. Mirrors the CALL_ASSEMBLER caller
     // `jit_blackhole_resume_from_guard` (call_jit.rs).
-    if let Some(storage) = exit_layout.storage.as_deref() {
-        // The failing guard's own `exit_types`, not a re-lookup of them:
+    if let Some(storage) = majit_metainterp::resume::get_resumestorage(descr_arc) {
+        // The failing guard's own `fail_arg_types`, not a re-lookup of them:
         // `compile.py handle_fail` and `resume.py blackhole_from_resumedata`
         // read every slot's kind out of the self-describing deadframe+descr
         // they were handed, so no metadata a pending resume is about to
@@ -12465,8 +12456,8 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[bh-rd-numb] trace={} fail_idx={} result={}",
-                exit_layout.trace_id,
-                exit_layout.fail_index,
+                fd.trace_id(),
+                fd.fail_index_per_trace(),
                 blackhole_result_tag(&result),
             );
         }
@@ -12474,16 +12465,15 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     }
     // resume.py `ResumeDataDirectReader._prepare` dereferences
     // `storage.rd_numb_list` with no fallback: a guard reaching the
-    // blackhole resume MUST carry rd_numb. `storage` is None only for
-    // terminal FINISH/JUMP exit layouts (compile.rs
-    // `infer_terminal_exit_layout`) and synthesized fallback layouts,
-    // none of which reach the guard blackhole path. If one ever did,
-    // there would be no resume data to decode — fail loudly rather than
-    // silently mis-resume.
+    // blackhole resume MUST carry rd_numb. `get_resumestorage` is None
+    // only for terminal FINISH/JUMP descrs, which carry no resume
+    // payload, none of which reach the guard blackhole path. If one
+    // ever did, there would be no resume data to decode — fail loudly
+    // rather than silently mis-resume.
     panic!(
-        "resume_in_blackhole_from_exit_layout: exit_layout.storage missing \
-         (trace={} fail_idx={})",
-        exit_layout.trace_id, exit_layout.fail_index,
+        "resume_in_blackhole: get_resumestorage missing \
+         (index={})",
+        descr_arc.index(),
     );
 }
 
@@ -12776,7 +12766,6 @@ fn execute_assembler(
             should_bridge,
             owning_key,
             ref mut raw_values,
-            ref exit_layout,
             guard_exc,
             savedata,
             deadframe: _,
@@ -12789,7 +12778,6 @@ fn execute_assembler(
                 descr_arc,
                 should_bridge,
                 owning_key,
-                exit_layout,
                 raw_values,
                 guard_exc,
                 info,
@@ -13059,12 +13047,9 @@ fn compile_and_run_once(
     }
     let compiled_key = driver.last_compiled_key().unwrap_or(green_key);
     let tracing_finished = !driver.is_tracing();
-    if tracing_finished
-        && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some()
-        && let Some(trace_id) = driver.meta_interp().compiled_root_trace_id(compiled_key)
-    {
+    if tracing_finished && std::env::var_os("MAJIT_DYNASM_EXEC_DIAG").is_some() {
         eprintln!(
-            "[dynasm-compile] trace={trace_id} key={compiled_key} function={} file={}",
+            "[dynasm-compile] key={compiled_key} function={} file={}",
             code.qualname, code.source_path
         );
     }
@@ -13258,7 +13243,6 @@ fn bound_reached(
             should_bridge,
             owning_key,
             ref mut raw_values,
-            ref exit_layout,
             guard_exc,
             savedata,
             deadframe: _,
@@ -13272,7 +13256,6 @@ fn bound_reached(
                 descr_arc,
                 should_bridge,
                 owning_key,
-                exit_layout,
                 raw_values,
                 guard_exc,
                 info,
@@ -13446,10 +13429,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // JC_TRACING: skipping here dropped residual portal ticks for inlined
     // callees during the parent trace.
 
-    // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
+    // warmstate.py maybe_compile_and_run: read the cell's procedure
     // token, and only when it is absent ask the counter. A bare
-    // `compile_tmp_callback` token (a token, but no `compiled_loops` meta) is
-    // not runnable, so it keeps ticking toward compiling the real loop.
+    // `compile_tmp_callback` token (`JC_TEMPORARY`) is not runnable, so
+    // it keeps ticking toward compiling the real loop.
     //
     // One call, one walk of the cell chain. The three questions this replaces --
     // `has_runnable_compiled_loop`, the counter gate, then
@@ -13599,7 +13582,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             should_bridge,
             owning_key,
             ref mut raw_values,
-            ref exit_layout,
             guard_exc,
             savedata,
             deadframe: _,
@@ -13613,7 +13595,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 descr_arc,
                 should_bridge,
                 owning_key,
-                exit_layout,
                 raw_values,
                 guard_exc,
                 info,
@@ -14964,9 +14945,8 @@ fn materialize_virtual_from_rd(
     virtuals_cache.live_ref_value(vidx)
 }
 
-fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
-    layout
-        .exit_types
+fn decode_fail_arg_values(raw_values: &[i64], fail_arg_types: &[Type]) -> Vec<Value> {
+    fail_arg_types
         .iter()
         .enumerate()
         .map(|(index, tp)| {
@@ -15008,21 +14988,16 @@ impl DecodedGuardFailure {
 #[majit_macros::dont_look_inside]
 pub(crate) fn decode_and_restore_guard_failure(
     jit_state: &mut PyreJitState,
-    meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
-    exit_layout: &CompiledExitLayout,
+    descr: &dyn majit_ir::FailDescr,
 ) -> Option<DecodedGuardFailure> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit] exit-layout trace_id={} fail_idx={} source_op={:?} rd_numb={}",
-            exit_layout.trace_id,
-            exit_layout.fail_index,
-            exit_layout.source_op_index,
-            exit_layout
-                .storage
-                .as_deref()
-                .and_then(|s| s.rd_numb())
-                .map_or(0, <[_]>::len),
+            "[jit] guard-fail trace_id={} fail_idx={} source_op={:?} rd_numb={}",
+            descr.trace_id(),
+            descr.fail_index_per_trace(),
+            descr.source_op_index(),
+            descr.rd_numb().map_or(0, <[_]>::len),
         );
     }
     if majit_metainterp::majit_log_enabled() {
@@ -15032,13 +15007,13 @@ pub(crate) fn decode_and_restore_guard_failure(
             .collect();
         eprintln!(
             "[jit] guard-fail: fail_idx={} types={:?} raw_len={} raw=[{}]",
-            exit_layout.fail_index,
-            exit_layout.exit_types,
+            descr.fail_index_per_trace(),
+            descr.fail_arg_types(),
             nraw,
             slots.join(", ")
         );
     }
-    let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    let dead_frame_typed = decode_fail_arg_values(raw_values, descr.fail_arg_types());
     // resume.py rebuild_from_resumedata: decode rd_numb into typed values.
     // compile.py `ResumeGuardDescr` storage — borrow rd_numb / rd_consts
     // from the guard-owned shared Arc instead of a per-guard Vec copy.
@@ -15047,11 +15022,8 @@ pub(crate) fn decode_and_restore_guard_failure(
     // (`build_resumed_frames`, `restore_guard_failure_values`): decoded
     // `Value::Ref` copies are otherwise from-space after a minor collection.
     let (typed, mut pending_virtuals_cache, _dead_frame_keep, _typed_roots) = {
-        let storage = exit_layout.storage.as_deref();
-        let rd_numb = storage
-            .map(|s| s.rd_numb().expect("rd_numb"))
-            .unwrap_or(&[]);
-        let rd_consts: &[majit_ir::Const] = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
+        let rd_numb = descr.rd_numb().unwrap_or(&[]);
+        let rd_consts: &[majit_ir::Const] = descr.rd_consts().unwrap_or(&[]);
         if rd_numb.is_empty() {
             let mut t = dead_frame_typed.clone();
             let cache = DirectVirtualsCache::new(0);
@@ -15061,7 +15033,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             }
             (t, cache, Vec::new(), roots)
         } else {
-            rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, exit_layout)
+            rebuild_typed_from_rd_numb(raw_values, rd_numb, rd_consts, descr)
         }
     };
     if majit_metainterp::majit_log_enabled() {
@@ -15094,16 +15066,15 @@ pub(crate) fn decode_and_restore_guard_failure(
     // pyre-only single-frame synthesis.
     let resumed_frames = {
         // compile.py `ResumeGuardDescr` storage — borrow rd_numb /
-        // rd_consts from the guard-owned shared Arc instead of a
-        // per-guard Vec copy.
-        let storage = exit_layout
-            .storage
-            .as_deref()
-            .expect("rebuild_guard_fail_state: exit_layout.storage missing");
+        // rd_consts from the guard-owned descr instead of a per-guard
+        // Vec copy.
+        let rd_numb = descr
+            .rd_numb()
+            .expect("rebuild_guard_fail_state: descr rd_numb missing");
         assert!(
-            !storage.rd_numb().expect("rd_numb").is_empty(),
+            !rd_numb.is_empty(),
             "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
-            exit_layout.fail_index
+            descr.fail_index_per_trace()
         );
         // GuardFailureSync mode writes the captured vable boxes back onto
         // the physical frame — `build_resumed_frames` picks that mode for a
@@ -15113,15 +15084,19 @@ pub(crate) fn decode_and_restore_guard_failure(
         // in the vable `last_instr` field.
         build_resumed_frames(
             raw_values,
-            storage.rd_numb().expect("rd_numb"),
-            storage.rd_consts().unwrap_or(&[]),
-            exit_layout,
+            rd_numb,
+            descr.rd_consts().unwrap_or(&[]),
+            descr,
             ResumeVableMode::GuardFailureSync,
             &mut pending_virtuals_cache,
         )
     };
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
-    let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
+    // `has_virtualizable` / extra reds are driver-static; build them from the
+    // live frame (`JitState::build_meta`).
+    let meta = jit_state.build_meta(0, &PyreEnv);
+    let restored =
+        jit_state.restore_guard_failure_values(&meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",
@@ -15212,7 +15187,7 @@ fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
-    exit_layout: &CompiledExitLayout,
+    descr: &dyn majit_ir::FailDescr,
 ) -> (
     Vec<Value>,
     DirectVirtualsCache,
@@ -15230,14 +15205,11 @@ fn rebuild_typed_from_rd_numb(
     // header word stream symmetrically so that boundary is correct for
     // multi-frame (inlined-callee) guards.
     let cb = pyre_jit_trace::state::frame_value_count_at;
-    let num_virtuals = exit_layout
-        .storage
-        .as_deref()
-        .map_or(0, |s| s.rd_virtuals().map_or(0, <[_]>::len));
+    let num_virtuals = descr.rd_virtuals().map_or(0, <[_]>::len);
     let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
         rd_numb,
         rd_consts,
-        &exit_layout.exit_types,
+        descr.fail_arg_types(),
         Some(&cb),
         num_virtuals,
     );
@@ -15253,7 +15225,7 @@ fn rebuild_typed_from_rd_numb(
         );
     }
 
-    let mut dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    let mut dead_frame_typed = decode_fail_arg_values(raw_values, descr.fail_arg_types());
     let mut virtuals_cache = DirectVirtualsCache::new(num_virtuals);
     // Root TAGBOX copies (`cpu.get_ref_value`) and the decoded `typed`
     // vector (`registers_r`) for the whole window until the caller drops
@@ -15271,15 +15243,11 @@ fn rebuild_typed_from_rd_numb(
     fn decode_rv(
         rv: &majit_ir::resumedata::RebuiltValue,
         dead_frame_typed: &[Value],
-        exit_layout: &CompiledExitLayout,
+        descr: &dyn majit_ir::FailDescr,
         virtuals_cache: &mut DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
-        let rd_consts = exit_layout
-            .storage
-            .as_deref()
-            .and_then(|s| s.rd_consts())
-            .unwrap_or(&[]);
+        let rd_consts = descr.rd_consts().unwrap_or(&[]);
         match rv {
             RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
@@ -15294,18 +15262,14 @@ fn rebuild_typed_from_rd_numb(
                 let c = rv.const_at_use(rd_consts);
                 c.to_value()
             }
-            RebuiltValue::Virtual(vidx) => {
-                let storage = exit_layout.storage.as_deref();
-                let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
-                materialize_virtual_from_rd(
-                    *vidx,
-                    dead_frame_typed,
-                    exit_layout.exit_types.len() as i32,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                )
-            }
+            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                descr.fail_arg_types().len() as i32,
+                rd_consts,
+                descr.rd_virtuals(),
+                virtuals_cache,
+            ),
             RebuiltValue::Unassigned => {
                 panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
             }
@@ -15347,7 +15311,7 @@ fn rebuild_typed_from_rd_numb(
             decode_rv(
                 &vable_values[0],
                 &dead_frame_typed,
-                exit_layout,
+                descr,
                 &mut virtuals_cache,
             ),
         );
@@ -15360,7 +15324,7 @@ fn rebuild_typed_from_rd_numb(
                 decode_rv(
                     &vable_values[i],
                     &dead_frame_typed,
-                    exit_layout,
+                    descr,
                     &mut virtuals_cache,
                 ),
             );
@@ -15381,7 +15345,7 @@ fn rebuild_typed_from_rd_numb(
         _prepare_next_section(
             outermost,
             &dead_frame_typed,
-            exit_layout,
+            descr,
             &mut typed,
             &mut virtuals_cache,
             true,
@@ -15598,7 +15562,7 @@ fn build_resumed_frames(
     raw_values: &[i64],
     rd_numb: &[u8],
     rd_consts: &[majit_ir::Const],
-    exit_layout: &CompiledExitLayout,
+    descr: &dyn majit_ir::FailDescr,
     vable_mode: ResumeVableMode,
     // resume.py `virtuals_cache`: shared with the typed rebuild that ran
     // before this walk, so a virtual both consume is one object.
@@ -15611,19 +15575,16 @@ fn build_resumed_frames(
     // boxes each frame contributes. There is no out-of-band frame size — the
     // decoder reads jitcode liveness at the frame's resume pc.
     let cb = pyre_jit_trace::state::frame_value_count_at;
-    let num_virtuals = exit_layout
-        .storage
-        .as_deref()
-        .map_or(0, |s| s.rd_virtuals().map_or(0, <[_]>::len));
+    let num_virtuals = descr.rd_virtuals().map_or(0, <[_]>::len);
     let (_num_failargs, vable_values, _vref_values, frames) = rebuild_from_numbering(
         rd_numb,
         rd_consts,
-        &exit_layout.exit_types,
+        descr.fail_arg_types(),
         Some(&cb),
         num_virtuals,
     );
 
-    let mut dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
+    let mut dead_frame_typed = decode_fail_arg_values(raw_values, descr.fail_arg_types());
     // TAGBOX copies live in this vec; root them before materialize
     // allocates. Drop `_section_roots` explicitly before returning so
     // registered interiors are unregistered while the vecs are still alive.
@@ -15633,8 +15594,8 @@ fn build_resumed_frames(
     }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][resume] exit_types={:?} dead_frame={:?} vable={} frames={}",
-            exit_layout.exit_types,
+            "[jit][resume] fail_arg_types={:?} dead_frame={:?} vable={} frames={}",
+            descr.fail_arg_types(),
             dead_frame_typed,
             vable_values.len(),
             frames.len()
@@ -15645,15 +15606,11 @@ fn build_resumed_frames(
     fn resolve_rebuilt_value(
         rv: &majit_ir::resumedata::RebuiltValue,
         dead_frame_typed: &[Value],
-        exit_layout: &CompiledExitLayout,
+        descr: &dyn majit_ir::FailDescr,
         virtuals_cache: &mut DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
-        let rd_consts = exit_layout
-            .storage
-            .as_deref()
-            .and_then(|s| s.rd_consts())
-            .unwrap_or(&[]);
+        let rd_consts = descr.rd_consts().unwrap_or(&[]);
         match rv {
             RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
@@ -15668,18 +15625,14 @@ fn build_resumed_frames(
                 let c = rv.const_at_use(rd_consts);
                 c.to_value()
             }
-            RebuiltValue::Virtual(vidx) => {
-                let storage = exit_layout.storage.as_deref();
-                let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
-                materialize_virtual_from_rd(
-                    *vidx,
-                    dead_frame_typed,
-                    exit_layout.exit_types.len() as i32,
-                    rd_consts,
-                    rd_virtuals,
-                    virtuals_cache,
-                )
-            }
+            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
+                *vidx,
+                dead_frame_typed,
+                descr.fail_arg_types().len() as i32,
+                rd_consts,
+                descr.rd_virtuals(),
+                virtuals_cache,
+            ),
             RebuiltValue::Unassigned => {
                 panic!("resume.py decode_box: UNINITIALIZED is not a live-register box")
             }
@@ -15710,7 +15663,7 @@ fn build_resumed_frames(
         _prepare_next_section(
             frame,
             &dead_frame_typed,
-            exit_layout,
+            descr,
             &mut values,
             virtuals_cache,
             true,
@@ -15730,7 +15683,7 @@ fn build_resumed_frames(
             all_values.len()
         );
     }
-    replay_pending_fields(&dead_frame_typed, exit_layout, virtuals_cache);
+    replay_pending_fields(&dead_frame_typed, descr, virtuals_cache);
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[dynasm-debug] after replay_pending_fields");
     }
@@ -15753,12 +15706,7 @@ fn build_resumed_frames(
     for i in 0..vable_values.len() {
         push_decoded_value(
             &mut resolved_vable,
-            resolve_rebuilt_value(
-                &vable_values[i],
-                &dead_frame_typed,
-                exit_layout,
-                virtuals_cache,
-            ),
+            resolve_rebuilt_value(&vable_values[i], &dead_frame_typed, descr, virtuals_cache),
         );
     }
     if majit_metainterp::majit_log_enabled() {
@@ -15977,16 +15925,15 @@ fn build_resumed_frames(
 fn _prepare_next_section(
     frame: &majit_ir::resumedata::RebuiltFrame,
     dead_frame_typed: &[Value],
-    exit_layout: &CompiledExitLayout,
+    descr: &dyn majit_ir::FailDescr,
     typed: &mut Vec<Value>,
     virtuals_cache: &mut DirectVirtualsCache,
     root_refs: bool,
 ) {
     use majit_ir::resumedata::RebuiltValue;
-    let storage = exit_layout.storage.as_deref();
-    let rd_consts = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
-    let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
-    let num_failargs = exit_layout.exit_types.len() as i32;
+    let rd_consts = descr.rd_consts().unwrap_or(&[]);
+    let rd_virtuals = descr.rd_virtuals();
+    let num_failargs = descr.fail_arg_types().len() as i32;
     for val in &frame.values {
         let decoded = match val {
             RebuiltValue::Box(idx, _tp) => {
@@ -16100,28 +16047,22 @@ fn live_pending_source(
 /// take effect when the guard fires.
 fn replay_pending_fields(
     dead_frame_typed: &[Value],
-    exit_layout: &CompiledExitLayout,
+    descr: &dyn majit_ir::FailDescr,
     virtuals_cache: &mut DirectVirtualsCache,
 ) {
-    let num_failargs = exit_layout.exit_types.len() as i32;
+    let num_failargs = descr.fail_arg_types().len() as i32;
     // `resume.py _prepare_pendingfields` reads the list off the guard's
     // `rd_pendingfields` (`ResumeGuardDescr.get_resumestorage`).
-    let pending = match exit_layout.storage.as_deref() {
-        Some(storage) => {
-            majit_metainterp::resume::exit_pending_field_layouts(storage, num_failargs)
-        }
-        None => return,
-    };
+    if descr.rd_pendingfields().is_none() {
+        return;
+    }
+    let pending = majit_metainterp::resume::exit_pending_field_layouts(descr, num_failargs);
     if pending.is_empty() {
         return;
     }
 
-    let rd_consts: &[majit_ir::Const] = exit_layout
-        .storage
-        .as_deref()
-        .and_then(|s| s.rd_consts())
-        .unwrap_or(&[]);
-    let rd_virtuals = exit_layout.storage.as_deref().and_then(|s| s.rd_virtuals());
+    let rd_consts: &[majit_ir::Const] = descr.rd_consts().unwrap_or(&[]);
+    let rd_virtuals = descr.rd_virtuals();
 
     // TAGBOX fail-arg refs are a host copy of the deadframe; root them so a
     // collection while materializing a virtual value forwards the slot in
@@ -16841,23 +16782,13 @@ mod tests {
                 value_tagged: tagged(3),
             },
         ];
-        let layout = CompiledExitLayout {
-            rd_loop_token: 1,
-            trace_id: 2,
-            fail_index: 3,
-            source_op_index: None,
-            exit_types: [Type::Ref, Type::Int, Type::Ref, Type::Int]
-                .into_iter()
-                .collect(),
-            is_finish: false,
-            is_exception_exit: false,
-            storage: Some(majit_metainterp::resume::new_resume_storage(
-                majit_ir::NumberingRef::from_bytes(&[]),
-                Vec::new(),
-                Vec::new(),
-                pending,
-            )),
-        };
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            Vec::new(),
+            Vec::new(),
+            pending,
+        );
+        storage.set_fail_arg_types(vec![Type::Ref, Type::Int, Type::Ref, Type::Int]);
         let values = [
             Value::Ref(majit_ir::GcRef(
                 (&mut field_target as *mut FieldTarget) as usize,
@@ -16867,7 +16798,7 @@ mod tests {
             Value::Int(42),
         ];
 
-        replay_pending_fields(&values, &layout, &mut DirectVirtualsCache::new(0));
+        replay_pending_fields(&values, storage.as_ref(), &mut DirectVirtualsCache::new(0));
 
         assert_eq!(field_target.value, 41);
         assert_eq!(array_target, [2, 42]);
@@ -16908,21 +16839,13 @@ mod tests {
             target_tagged: tagged_virtual(0),
             value_tagged: tagged_box(0),
         }];
-        let layout = CompiledExitLayout {
-            rd_loop_token: 1,
-            trace_id: 2,
-            fail_index: 3,
-            source_op_index: None,
-            exit_types: [Type::Int].into_iter().collect(),
-            is_finish: false,
-            is_exception_exit: false,
-            storage: Some(majit_metainterp::resume::new_resume_storage(
-                majit_ir::NumberingRef::from_bytes(&[]),
-                Vec::new(),
-                Vec::new(),
-                pending,
-            )),
-        };
+        let storage = majit_metainterp::resume::new_resume_storage(
+            majit_ir::NumberingRef::from_bytes(&[]),
+            Vec::new(),
+            Vec::new(),
+            pending,
+        );
+        storage.set_fail_arg_types(vec![Type::Int]);
         let values = [Value::Int(41)];
         let mut cache = DirectVirtualsCache::new(1);
         cache.insert(
@@ -16932,7 +16855,7 @@ mod tests {
             )),
         );
 
-        replay_pending_fields(&values, &layout, &mut cache);
+        replay_pending_fields(&values, storage.as_ref(), &mut cache);
 
         assert_eq!(field_target.value, 41);
         assert_eq!(

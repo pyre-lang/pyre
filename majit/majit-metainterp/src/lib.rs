@@ -184,7 +184,7 @@ pub use call_descr::{
     nursery_alloc_effect_info, str_concat_effect_info,
 };
 pub use compile::{
-    AllVirtuals, exit_layout_for_descr, guard_resume_pc, make_fail_descr, make_fail_descr_typed,
+    AllVirtuals, guard_resume_pc, make_fail_descr, make_fail_descr_typed,
     make_finish_fail_descr_typed, raw_exit_values, resume_guard_descr, set_all_virtuals_gc_type_id,
 };
 pub use io_buffer::{
@@ -250,8 +250,7 @@ pub use pyjitpl::dispatch::{
 };
 pub use pyjitpl::{
     BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
-    ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
-    CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
+    ClosureRuntimeWithResolver, CompileOutcome, DetailedDriverRunOutcome, InlineDecision,
     JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
     MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey,
     PrepareResumeFromFailure, RawCompileResult, SharedBlackholeInterpPool, SharedLiveness,
@@ -1640,7 +1639,7 @@ pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 /// compile_bridge retrace_requested return, 11 = retired (compile.py
 /// compile_trace has no JUMP/LABEL arity giveup), 12 = start_bridge_tracing entered,
 /// 13 = sbt early: descr not FailDescr, 14 = sbt early: no owning jct, 15 = retired
-/// (compiled_loops meta is not the loop_token_wref gate), 16 = sbt early: !can_trace, 17 = sbt early:
+/// (retired: meta is not the loop_token_wref gate), 16 = sbt early: !can_trace, 17 = sbt early:
 /// fail_values too short, 18 = compile_and_run_once entered from a back edge,
 /// 19 = compile_and_run_once entered from a function entry, 20 =
 /// compile_and_run_once early-out: portal jitcode unavailable, 21 =

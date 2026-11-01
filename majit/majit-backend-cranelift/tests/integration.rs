@@ -4,9 +4,7 @@
 
 use std::sync::Arc;
 
-use majit_backend::{
-    Backend, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout, JitCellToken,
-};
+use majit_backend::{Backend, JitCellToken};
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::test_support::{RecordedTrace, Trace};
 use majit_ir::{
@@ -51,11 +49,7 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
 // Test helpers
 
 /// Test helper — produces a real `ResumeGuardDescr` (PyPy
-/// `compile.py ResumeGuardDescr` family) so that
-/// `recovery_layout` storage routes through the meta-side slot.
-/// The meta slot is the sole storage; earlier
-/// test scaffolds returned a custom `TestFailDescr` that the
-/// downcast couldn't reach.  `_index` parameter is preserved for
+/// `compile.py ResumeGuardDescr` family). `_index` is preserved for
 /// call-site clarity but discarded — every guard descr gets a
 /// fresh global fail_index inside `make_resume_guard_descr_typed`.
 fn make_descr(_index: u32) -> DescrRef {
@@ -257,18 +251,6 @@ fn test_bridge_end_to_end() {
     // Compile main loop
     let mut backend = CraneliftBackend::new();
 
-    // Pin the loop trace id to match the test's TestFailDescr defaults
-    // (`trace_id() == 0`).  In production, metainterp's
-    // `record_loop_or_bridge` (compile.py line-by-line counterpart)
-    // stamps the metainterp ResumeGuardDescr's trace_id to match the
-    // backend allocation; this integration test bypasses metainterp, so
-    // we instead pin the backend's `next_trace_id` to align both sides
-    // explicitly.  Without this, `find_fail_descr_in_fail_descrs`
-    // compares the backend descr's `trace_id` field (allocated by
-    // `compile_loop`, default 1) against the bridge fail descr's
-    // `trace_id()` trait method (which forwards through the test's
-    // TestFailDescr meta_descr, default 0).
-    backend.set_next_trace_id(0);
     let token = JitCellToken::new(10);
     backend
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
@@ -284,11 +266,8 @@ fn test_bridge_end_to_end() {
     //   iter5: i=1,sum=14 -> sum2=15, i2=0, fail
     // Guard saves input args (i=1, sum=14)
     let frame = backend.execute_token(&token, &[Value::Int(5), Value::Int(0)]);
-    let (source_trace_id, source_fail_index_per_trace) = {
-        let descr = backend.get_latest_descr(&frame);
-        assert_eq!(descr.fail_index(), 0);
-        (descr.trace_id(), descr.fail_index_per_trace())
-    };
+    let descr = backend.get_latest_descr(&frame);
+    assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), 1); // i
     assert_eq!(backend.get_int_value(&frame, 1), 14); // sum
 
@@ -304,26 +283,14 @@ fn test_bridge_end_to_end() {
     bridge_rec.finish(&[result], make_descr(1));
     let bridge_trace = bridge_rec.get_trace();
 
-    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity.
-    // Bridge compilation looks up the parent guard by
-    // `FailDescr::{trace_id, fail_index_per_trace}` from the descr passed
-    // by the metainterp (`pyjitpl.rs`).
-    let bridge_fail_descr =
-        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-    {
-        let fd = bridge_fail_descr.as_fail_descr().unwrap();
-        fd.set_trace_id(source_trace_id);
-        fd.set_fail_index_per_trace(source_fail_index_per_trace);
-    }
-    let bridge_fail_descr_ref = bridge_fail_descr.as_fail_descr().unwrap();
-
+    // `assemble_bridge(faildescr)` / `do_compile_bridge`: attach to the
+    // live guard descr `get_latest_descr` returned.
     let bridge_info = backend
         .compile_bridge(
-            bridge_fail_descr_ref,
+            descr,
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
-            None,
         )
         .expect("bridge compilation should succeed");
     assert!(bridge_info.code_addr != 0);
@@ -2115,20 +2082,17 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     // Guard saves input args: x=200
     assert_eq!(backend.get_int_value(&frame, 0), 200);
 
-    // Backend's `describe_deadframe` no longer caches the recovery
-    // layout — `frame_stack`/`recovery_layout` come from the
-    // metainterp's `StoredExitLayout.recovery_layout` (consumed via
-    // `trace_layout_ref.recovery_layout` at `pyjitpl.rs`).
-    // Without a pyre-jit boot here, the backend reports None; this
-    // matches the dynasm contract (see `runner.rs` describe_deadframe
-    // default impl returning recovery_layout=None).
+    // Backend `describe_deadframe` reports `frame_stack` /
+    // `recovery_layout` as None (same contract as dynasm
+    // `layout_for_fail_descr`). Production deopt decodes the descr's
+    // `rd_numb` (`ResumeGuardDescr.get_resumestorage`).
     let layout = backend
         .describe_deadframe(&frame)
         .expect("describe_deadframe should return a layout");
     assert_eq!(layout.fail_index, 0);
     assert!(
         layout.frame_stack.is_none(),
-        "backend returns None; metainterp owns recovery layout"
+        "backend describe_deadframe reports no frame_stack"
     );
 }
 
@@ -2162,43 +2126,6 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
         .compile_loop(&inputargs_view(&trace), &trace.ops, &token)
         .expect("main loop compilation should succeed");
 
-    // Set up recovery layout on the guard with 2 frames so the bridge
-    // inherits a caller prefix. compile_bridge pops the last frame from the
-    // source guard's recovery layout to form the caller prefix, then the
-    // bridge's own frame is appended, giving 2 frames total.
-    let source_layout = ExitRecoveryLayout {
-        vable_array: vec![],
-        vref_array: vec![],
-        frames: vec![
-            ExitFrameLayout {
-                trace_id: Some(909),
-                header_pc: Some(500),
-                source_guard: None,
-                pc: 500,
-                jitcode_index: 0,
-                slots: vec![ExitValueSourceLayout::Constant(0, Type::Int)],
-                slot_types: Some(vec![Type::Int]),
-            },
-            ExitFrameLayout {
-                trace_id: Some(910),
-                header_pc: Some(1000),
-                source_guard: Some((909, 0)),
-                pc: 1000,
-                jitcode_index: 0,
-                slots: vec![
-                    ExitValueSourceLayout::ExitValue(0),
-                    ExitValueSourceLayout::ExitValue(1),
-                ],
-                slot_types: Some(vec![Type::Int, Type::Int]),
-            },
-        ],
-        virtual_layouts: vec![],
-        pending_field_layouts: vec![],
-    };
-    // Backend no longer caches recovery_layout; the source
-    // layout flows through `compile_bridge`'s explicit
-    // `caller_recovery_layout` parameter (QQ-7 contract).
-
     // Bridge: takes (i, sum), checks sum > 0, returns sum * 2
     let mut bridge_rec = Trace::new();
     let _bi = bridge_rec.record_input_arg(Type::Int);
@@ -2214,28 +2141,19 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let bridge_trace = bridge_rec.get_trace();
     set_guard_failargs(&bridge_trace, bridge_guard, &[_bi, bsum]);
 
-    // Mint a `ResumeGuardDescr` that mirrors the source guard's identity
-    // (per-trace fail_index = 0, trace_id = 910). Bridge compilation
-    // looks up the parent guard by `FailDescr::{trace_id,
-    // fail_index_per_trace}` from the descr passed by the metainterp.
-    let bridge_fail_descr =
-        majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-    {
-        let fd = bridge_fail_descr.as_fail_descr().unwrap();
-        fd.set_trace_id(910);
-        fd.set_fail_index_per_trace(0);
-    }
-    let bridge_fail_descr_ref = bridge_fail_descr.as_fail_descr().unwrap();
+    // `assemble_bridge(faildescr)` / `do_compile_bridge`: attach to the
+    // live guard descr `get_latest_descr` returned.
+    let loop_frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
+    let descr = backend.get_latest_descr(&loop_frame);
 
     backend.set_next_trace_id(911);
     backend.set_next_header_pc(2000);
     let _bridge_info = backend
         .compile_bridge(
-            bridge_fail_descr_ref,
+            descr,
             &inputargs_view(&bridge_trace),
             &bridge_trace.ops,
             &token,
-            Some(&source_layout),
         )
         .expect("bridge compilation should succeed");
 
@@ -2260,7 +2178,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
         .expect("bridge guard failure should produce a layout");
     assert!(
         layout.frame_stack.is_none(),
-        "backend returns None; metainterp owns recovery layout"
+        "backend describe_deadframe reports no frame_stack"
     );
 }
 
@@ -2314,7 +2232,7 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
         .expect("callee guard failure should have a layout");
     assert!(
         layout.frame_stack.is_none(),
-        "backend returns None; metainterp owns recovery layout"
+        "backend describe_deadframe reports no frame_stack"
     );
 }
 
@@ -2374,7 +2292,7 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
     );
     assert!(
         layout.frame_stack.is_none(),
-        "backend returns None; metainterp owns recovery layout"
+        "backend describe_deadframe reports no frame_stack"
     );
 }
 

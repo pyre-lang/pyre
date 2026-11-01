@@ -1087,21 +1087,6 @@ pub trait JitCodeSym {
 pub trait JitCodeRuntime {
     fn label_at(&self, pc: usize) -> usize;
 
-    /// Resolve a `JitCellToken.number` to the production
-    /// `Arc<JitCellToken>` that the warm cell / `CompiledEntry::token` /
-    /// `alive_loops` already hold.  When the dispatcher sees a
-    /// `BC_CALL_ASSEMBLER_*` opcode it asks the runtime for the real Arc
-    /// so the recorded descr carries production token identity
-    /// (compile.py:187 parity) and skips the synth-Arc +
-    /// `jitcell_token_by_number` keepalive fallback.  Returns `None` for
-    /// standalone test runtimes that have no warmstate / metainterp.
-    fn jitcell_token_arc_for_number(
-        &self,
-        _token_number: u64,
-    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        None
-    }
-
     /// Recursive portal-call inline decision (pyjitpl.py _opimpl_recursive_call
     /// `opimpl_recursive_call` → `should_unroll_one_iteration` /
     /// `max_unroll_recursion`).  When the dispatcher meets a
@@ -1149,8 +1134,9 @@ pub trait JitCodeRuntime {
     /// by the green values (the portal green key, pyjitpl.py
     /// `get_assembler_token(greenargs)`).  The runtime hashes the greens
     /// to that key and resolves the production `Arc<JitCellToken>` — used
-    /// both for the recorded descr's token identity (compile.py:187 via
-    /// `call_assembler_int_arc_typed_with_value`) and to drive the concrete loop
+    /// both for the recorded descr's token identity
+    /// (`compile.py record_loop_or_bridge` (`isinstance(descr, JitCellToken)`)
+    /// via `call_assembler_int_arc_typed_with_value`) and to drive the concrete loop
     /// through [`Self::execute_recursive_assembler_int`].  The `u64` is the
     /// resolved green key (compile.py:186 `rd_loop_token`), returned so the
     /// concrete leg keys the same loop the descr names.  Returns `None` for
@@ -1473,27 +1459,14 @@ where
     }
 }
 
-/// `JitCodeRuntime` carrying the `label_at` /
-/// `jitcell_token_arc_for_number` closures plus the recursive-call recursive-call
+/// `JitCodeRuntime` carrying the `label_at` closure plus the recursive-call
 /// seams (inline decision, green-key target resolver, concrete loop
-/// executor).  Used by `MetaInterp::interpret` so the
-/// dispatcher resolves CALL_ASSEMBLER targets to their production Arcs via
-/// `MetaInterp::jitcell_token_by_number` and routes recursive portal calls
-/// through the production warmstate / backend.  All closures are built by
-/// `MetaInterp::with_trace_ctx_and_token_resolver`, which split-borrows the
-/// MetaInterp fields they read.
-pub struct ClosureRuntimeWithResolver<
-    FLabel,
-    FResolve,
-    FTarget,
-    FDecision,
-    FExec,
-    FExecR,
-    FExecF,
-    FExecV,
-> {
+/// executor).  Used by `MetaInterp::interpret` so the dispatcher routes
+/// recursive portal calls through the production warmstate / backend.
+/// All closures are built by `MetaInterp::with_trace_ctx_and_token_resolver`,
+/// which split-borrows the MetaInterp fields they read.
+pub struct ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV> {
     label_at: FLabel,
-    resolve_token: FResolve,
     recursive_target: FTarget,
     recursive_decision: FDecision,
     recursive_exec: FExec,
@@ -1502,13 +1475,12 @@ pub struct ClosureRuntimeWithResolver<
     recursive_exec_void: FExecV,
 }
 
-impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
-    ClosureRuntimeWithResolver<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
+impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
+    ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         label_at: FLabel,
-        resolve_token: FResolve,
         recursive_target: FTarget,
         recursive_decision: FDecision,
         recursive_exec: FExec,
@@ -1518,7 +1490,6 @@ impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
     ) -> Self {
         Self {
             label_at,
-            resolve_token,
             recursive_target,
             recursive_decision,
             recursive_exec,
@@ -1529,20 +1500,10 @@ impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
     }
 }
 
-impl<FLabel, FResolve, FTarget, FDecision, FExec, FExecR, FExecF, FExecV> JitCodeRuntime
-    for ClosureRuntimeWithResolver<
-        FLabel,
-        FResolve,
-        FTarget,
-        FDecision,
-        FExec,
-        FExecR,
-        FExecF,
-        FExecV,
-    >
+impl<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV> JitCodeRuntime
+    for ClosureRuntimeWithResolver<FLabel, FTarget, FDecision, FExec, FExecR, FExecF, FExecV>
 where
     FLabel: Fn(usize) -> usize,
-    FResolve: Fn(u64) -> Option<std::sync::Arc<majit_backend::JitCellToken>>,
     FTarget: Fn(usize, &[i64]) -> Option<(std::sync::Arc<majit_backend::JitCellToken>, u64)>,
     FDecision: Fn(usize, &[i64], usize, usize) -> crate::pyjitpl::InlineDecision,
     FExec: Fn(&majit_backend::JitCellToken, &[Value]) -> Option<i64>,
@@ -1552,13 +1513,6 @@ where
 {
     fn label_at(&self, pc: usize) -> usize {
         (self.label_at)(pc)
-    }
-
-    fn jitcell_token_arc_for_number(
-        &self,
-        token_number: u64,
-    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
-        (self.resolve_token)(token_number)
     }
 
     fn recursive_inline_decision(
@@ -5289,10 +5243,9 @@ where
 
 /// Production wire-up: variant that takes a pre-built
 /// `JitCodeRuntime` instance, so the caller can provide a
-/// `ClosureRuntimeWithResolver` carrying both `label_at` and the
-/// `jitcell_token_arc_for_number` callback — the second is what lets
-/// `BC_CALL_ASSEMBLER_*` dispatch hit the production `Arc<JitCellToken>`
-/// instead of the `_by_number_typed` synth-Arc fallback.
+/// `ClosureRuntimeWithResolver` carrying `label_at` and the
+/// recursive-call seams (inline decision, green-key target resolver,
+/// concrete loop executor).
 pub fn trace_jitcode_with_args_and_runtime<S, R>(
     ctx: &mut TraceCtx,
     sym: &mut S,
@@ -8918,7 +8871,6 @@ mod tests {
             _inputargs: &[majit_ir::InputArgRc],
             _ops: &[majit_ir::OpRc],
             _original_token: &majit_backend::JitCellToken,
-            _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
         ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
             unimplemented!("RecordingGetfieldCpu::compile_bridge")
         }

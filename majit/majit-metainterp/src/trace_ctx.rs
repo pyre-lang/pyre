@@ -297,7 +297,7 @@ pub struct TraceCtx {
     /// pyjitpl.py:1396-1401's element-wise `same_constant` parity when
     /// comparing against inline-frame green keys; the u64 `green_key`
     /// above is the hash derived from this pair and stays the identity
-    /// key for HashMap lookups (warmstate / compiled_loops / pending
+    /// key for HashMap lookups (warmstate / pending
     /// token) while comparisons route through the raw pair.
     pub(crate) green_key_raw: (usize, usize),
     pub(crate) root_green_key_raw: (usize, usize),
@@ -8476,7 +8476,6 @@ mod tests {
             _inputargs: &[majit_ir::InputArgRc],
             _ops: &[majit_ir::OpRc],
             _original_token: &majit_backend::JitCellToken,
-            _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
         ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
             unimplemented!("SanityTestCpu::compile_bridge")
         }

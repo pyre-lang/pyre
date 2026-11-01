@@ -15,7 +15,7 @@
 //! Dormant means gated, not unbuilt: the descriptor builder, its second
 //! `register_jitdriver_sd` registration in `build_jit_driver_pair`, the
 //! merge-point invocation (`eval.rs drive_unpack_iterable_trace`) and the
-//! blackhole entry (`resume_in_blackhole_from_exit_layout`) all exist.  What
+//! blackhole entry (`pyre_jit::eval::resume_in_blackhole`) all exist.  What
 //! keeps them off the hot path is `PYRE_JD1`, which is opt-in because pyre
 //! drives jd1 through the same `MetaInterp.tracing` slot as the bytecode
 //! portal — see `eval.rs jd1_experiment_enabled` for why that is not yet

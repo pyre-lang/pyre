@@ -865,8 +865,9 @@ impl OptRewrite {
                         // before replacing the op — identical to the
                         // GUARD_CLASS strengthening below. Passing None here
                         // would leave the strengthened guard with no descr →
-                        // no rd_numb → exit_layout.storage None → resume panic
-                        // when the promoted value actually changes at runtime.
+                        // no rd_numb → `get_resumestorage` is None → resume
+                        // panic when the promoted value actually changes at
+                        // runtime.
                         let new_descr = crate::compile::make_resume_guard_descr_typed(
                             old_guard
                                 .get_fail_arg_types()

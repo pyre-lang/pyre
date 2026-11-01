@@ -1388,7 +1388,6 @@ pub struct PreviewShortState {
         crate::optimizeopt::virtualstate::VirtualState,
         Vec<OpRef>,
         Vec<OpRef>,
-        Vec<usize>,
         Vec<majit_ir::operand::Operand>,
     )>,
 }
@@ -1399,6 +1398,8 @@ pub struct PreviewShortState {
 pub struct OptContext {
     /// Backend cost capability for RPython's constant-division rewrite.
     pub supports_efficient_uint_mul_high: bool,
+    /// optimizer.py Optimizer.jitdriver_sd
+    pub jitdriver_sd: usize,
     /// The output operation list being built.
     pub new_operations: Vec<majit_ir::OpRc>,
     /// Once the output buffer is drained, PtrInfo guard positions stamped
@@ -2593,6 +2594,7 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             supports_efficient_uint_mul_high: true,
+            jitdriver_sd: 0,
             new_operations: Vec::with_capacity(estimated_ops),
             new_operations_drained: false,
             new_operations_index: FxHashMap::with_capacity_and_hasher(
@@ -3275,6 +3277,7 @@ impl OptContext {
     ) -> Self {
         OptContext {
             supports_efficient_uint_mul_high: true,
+            jitdriver_sd: 0,
             new_operations: Vec::with_capacity(estimated_ops),
             new_operations_drained: false,
             new_operations_index: FxHashMap::with_capacity_and_hasher(
@@ -7824,7 +7827,10 @@ impl OptContext {
                 use majit_ir::OpCode;
                 op.setdescr(match op.opcode {
                     OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-                        crate::compile::make_resume_guard_forced_descr_typed(new_types)
+                        crate::compile::make_resume_guard_forced_descr_typed(
+                            new_types,
+                            self.jitdriver_sd,
+                        )
                     }
                     OpCode::GuardException | OpCode::GuardNoException => {
                         crate::compile::make_resume_guard_exc_descr_typed(new_types)
@@ -10086,7 +10092,7 @@ impl OptContext {
                 for r in &state.2 {
                     r.trace_const_ptr(visitor);
                 }
-                for operand in &state.4 {
+                for operand in &state.3 {
                     operand.walk_const_ptr_refs(visitor);
                 }
             }

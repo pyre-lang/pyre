@@ -49,7 +49,7 @@ struct MetaCallDescr {
 /// inherit-from the trait, but it preserves the *identity* contract by
 /// owning an `Arc<JitCellToken>` here. Callers (`direct_assembler_call`,
 /// `compile_tmp_callback`) clone the same Arc that the warm cell /
-/// `CompiledEntry::token` /` MemoryManager.alive_loops` already hold, so the
+/// `MemoryManager.alive_loops` already hold, so the
 /// keepalive walker's downcast recovers the production token's strong
 /// reference rather than a number-recovered side-table lookup.
 #[derive(Debug)]
@@ -1044,7 +1044,7 @@ pub fn jit_cell_token_as_descr(token: Arc<JitCellToken>) -> DescrRef {
 /// `compile.py isinstance(descr, JitCellToken)` parity factory.
 ///
 /// Create a `CALL_ASSEMBLER_*` descr that owns the same `Arc<JitCellToken>`
-/// as the production warm cell / `CompiledEntry::token` / `alive_loops`.
+/// as the production warm cell / `alive_loops`.
 /// `direct_assembler_call` (`pyjitpl.py`) is the canonical caller —
 /// it threads the cell's compiled token through, so `record_loop_or_bridge`'s
 /// keepalive walker downcasts the descr and pushes that same Arc into

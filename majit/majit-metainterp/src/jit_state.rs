@@ -406,13 +406,13 @@ pub trait JitState: Sized {
         out.extend(self.extract_live_values(meta));
     }
 
-    /// Fill compiled-entry reds without `compiled_loops`.
+    /// Fill compiled-entry reds from the live state.
     ///
-    /// `execute_assembler` receives reds the caller already unboxed. It does
-    /// not look up a side table of compiled metadata. Returns `true` only
-    /// when `is_compatible` does not read meta and the reds do not either,
-    /// so the entry can skip `IndexMap::get` of `CompiledEntry`. The default
-    /// is the meta path.
+    /// `warmstate.py execute_assembler` unspecializes the caller's live reds.
+    /// Returns `true` when this filled `out` and the entry skips
+    /// `is_compatible`. Generated portals always return `true`. The default
+    /// is `false`; entry then builds meta from live state (`build_meta`)
+    /// and still runs `is_compatible`.
     fn fill_entry_reds_without_meta(&mut self, out: &mut Vec<Value>) -> bool {
         let _ = out;
         false
@@ -420,8 +420,7 @@ pub trait JitState: Sized {
 
     /// `warmstate.py maybe_compile_and_run`: the reds as `unspecialize_value`
     /// words, in inputarg order. `false` when the state cannot produce them
-    /// without the compiled meta (same condition as
-    /// `fill_entry_reds_without_meta`).
+    /// here (same condition as `fill_entry_reds_without_meta`).
     fn fill_entry_raw_reds(&mut self, out: &mut Vec<i64>) -> bool {
         let _ = out;
         false
@@ -1813,8 +1812,7 @@ pub trait JitState: Sized {
             // present in RPython; a `None` here would mean the
             // optimizer/recorder failed to attach the descr and replaying
             // the write would corrupt memory.  Fail loud rather than
-            // silently skipping (parity with the `expect` at
-            // `compile.rs`'s `build_guard_metadata`).
+            // silently skipping.
             let descr = pending.descr.as_ref().expect(
                 "resume.py `_prepare_pendingfields`: PENDINGFIELDSTRUCT.lldescr must be set",
             );
