@@ -797,22 +797,47 @@ use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
 use majit_ir::{FailDescr, GcRef, InputArgRc, Op, OpRc, Value};
 
+/// A pending guard that has no dispatch cell (host build, or no cell array)
+/// still carries a non-zero `adr_jump_offset`, because 0 means "patched"
+/// (`patch_jump_for_descr`).
+pub(crate) const PENDING_NO_CELL: usize = 1;
+
 /// `x86/assembler.py` `patch_pending_failure_recoveries`: once the module is
-/// accepted, each guard's `faildescr.adr_jump_offset` names the cell its exit
-/// dispatches through. Called only after the last decline, because a declined
-/// build frees the cell array the address points into.
-fn patch_pending_failure_recoveries(guard_exits: &[codegen::GuardExit]) {
+/// accepted, each non-FINISH guard's `faildescr.adr_jump_offset` is the cell
+/// its exit dispatches through, or [`PENDING_NO_CELL`] when there is none.
+/// `0` means the guard is already patched (`patch_jump_for_descr`). Called
+/// only after the last decline, because a declined build frees the cell array
+/// a real address would point into. `assembled` lists the descrs an earlier
+/// assembly already stamped; such a descr at 0 is patched and stays 0; every
+/// other guard is being assembled now and gets its cell or [`PENDING_NO_CELL`].
+fn patch_pending_failure_recoveries(
+    guard_exits: &[codegen::GuardExit],
+    assembled: &[std::sync::Arc<WasmFailDescr>],
+) {
     for g in guard_exits {
-        if g.bridge_cell == 0 {
-            continue;
-        }
         let Some(fd) = g.meta_descr.as_ref().and_then(|meta| meta.as_fail_descr()) else {
             continue;
         };
         if fd.is_finish() {
             continue;
         }
-        let stamp = std::panic::AssertUnwindSafe(|| fd.set_adr_jump_offset(g.bridge_cell as usize));
+        if fd.adr_jump_offset() == 0
+            && assembled.iter().any(|descr| {
+                descr
+                    .meta_descr
+                    .as_ref()
+                    .zip(g.meta_descr.as_ref())
+                    .is_some_and(|(existing, meta)| std::sync::Arc::ptr_eq(existing, meta))
+            })
+        {
+            continue;
+        }
+        let offset = if g.bridge_cell != 0 {
+            g.bridge_cell as usize
+        } else {
+            PENDING_NO_CELL
+        };
+        let stamp = std::panic::AssertUnwindSafe(|| fd.set_adr_jump_offset(offset));
         let _ = std::panic::catch_unwind(stamp);
     }
 }
@@ -4133,29 +4158,6 @@ impl WasmBackend {
         })
     }
 
-    /// Put each guard's stable cell address back on `adr_jump_offset` so a
-    /// rebuild bakes that address. `compile_bridge` clears the slot after
-    /// patching; `WasmFailDescr.bridge_cell` keeps it.
-    fn restore_guard_cell_offsets(source_loop: &CompiledWasmLoop, ops: &[Op]) {
-        let descrs = source_loop.fail_descrs.borrow();
-        for op in ops.iter().filter(|op| op.opcode.is_guard()) {
-            let Some(meta) = op.getdescr() else {
-                continue;
-            };
-            let Some(fd) = meta.as_fail_descr() else {
-                continue;
-            };
-            if fd.is_finish() || fd.adr_jump_offset() != 0 {
-                continue;
-            }
-            let Some(addr) = Self::cell_for_meta(&descrs, &meta).filter(|&addr| addr != 0) else {
-                continue;
-            };
-            let stamp = std::panic::AssertUnwindSafe(|| fd.set_adr_jump_offset(addr as usize));
-            let _ = std::panic::catch_unwind(stamp);
-        }
-    }
-
     /// Re-point a guard's dispatch cell at the bridge slot stored on its descr.
     fn restore_dispatch_cell(owner: &JitCellToken, source_fail_index: u32) {
         let Some(source_loop) = owner
@@ -4413,10 +4415,14 @@ impl WasmBackend {
         }
         inputs.fail_index_base = 0;
         // Every guard the rebuilt module can fail through names the cell its
-        // descr already owns. A guard that was inlined before it had a module
-        // of its own has no cell yet; allocate that cell now, before emit, so
-        // the descr and the module share it.
-        Self::restore_guard_cell_offsets(compiled, &inputs.ops);
+        // descr already owns. `reemit_guard_cells` takes that cell from
+        // `WasmFailDescr.bridge_cell` via `cell_for_meta`. A guard that was
+        // inlined before it had a module of its own has no cell yet; allocate
+        // that cell now, before emit, so the descr and the module share it.
+        // After accept, `patch_pending_failure_recoveries` is given the
+        // pre-replacement `fail_descrs` as `assembled`, so an already-attached
+        // descr stays at `adr_jump_offset == 0` while a first-time guard is
+        // stamped with its cell.
         let mut fresh_cells = Vec::new();
         let mut guard_cell_addrs = Self::reemit_guard_cells(
             compiled,
@@ -4426,7 +4432,6 @@ impl WasmBackend {
             &mut fresh_cells,
         );
         for region in &inputs.inlined_bridges {
-            Self::restore_guard_cell_offsets(compiled, &region.ops);
             guard_cell_addrs.extend(Self::reemit_guard_cells(
                 compiled,
                 &region.ops,
@@ -4636,7 +4641,7 @@ impl WasmBackend {
         }
         #[cfg(not(target_arch = "wasm32"))]
         let install_handle = old_handle;
-        patch_pending_failure_recoveries(&guard_exits);
+        patch_pending_failure_recoveries(&guard_exits, &compiled.fail_descrs.borrow());
 
         // The host has accepted the replacement, so its newly encoded global
         // indices can now be made visible in the registry and local metadata.
@@ -4654,20 +4659,13 @@ impl WasmBackend {
             &inputs.ca.attached,
         );
         // Keep still-standalone bridge descriptors after the rebuilt merged
-        // prefix. Adding regions grows that prefix, so every old positional
-        // range moves by exactly the difference in guard-cell counts.
+        // prefix. Adding regions grows that prefix.
         let old_guard_count = compiled.num_guard_cells.get();
         let chained_descrs = compiled.fail_descrs.borrow()[old_guard_count..].to_vec();
         let mut replacement_descrs = descrs.clone();
         replacement_descrs.extend(chained_descrs);
         *compiled.fail_descrs.borrow_mut() = replacement_descrs;
         Self::register_meta_descrs(token, &descrs);
-        let guard_growth = guard_exits.len().saturating_sub(old_guard_count);
-        if guard_growth != 0 {
-            for (_, _, start, _) in compiled.bridge_descr_ranges.borrow_mut().iter_mut() {
-                *start += guard_growth;
-            }
-        }
         let old_homes = compiled.num_ref_homes.get();
         let old_labels = compiled.used_label_homes.get();
         let widened = merged_ref_homes.max(old_homes);
@@ -5804,7 +5802,7 @@ impl majit_backend::Backend for WasmBackend {
             ));
         }
 
-        patch_pending_failure_recoveries(&guard_exits);
+        patch_pending_failure_recoveries(&guard_exits, &[]);
 
         // `asmmemmgr.py` counts the block a `materialize` handed out, which
         // here is the module the host has taken. Below the decline above, as
@@ -5889,7 +5887,6 @@ impl majit_backend::Backend for WasmBackend {
                 })
                 .collect(),
             bridge_param_dispatch,
-            bridge_descr_ranges: std::cell::RefCell::new(Vec::new()),
             // Retaining the snapshot costs long-lived heap for the token's
             // whole lifetime, which moves when the collector next runs and so
             // moves which iteration a back edge's eval-breaker guard bails on.
@@ -6152,13 +6149,13 @@ impl majit_backend::Backend for WasmBackend {
         };
         // The bridge cell hangs off `fail_descr.adr_jump_offset`, including
         // when the guard was emitted inside a nested trace. A missing side
-        // table row is not a decline.
+        // table row is not a decline. `<= PENDING_NO_CELL` is not a cell.
         let (source_fail_arg_advanced, source_fail_arg_count, source_bridge_param_dispatch) =
             source_guard.unwrap_or((Vec::new(), None, false));
         let source_cells_base = {
-            let stamped = fail_descr.adr_jump_offset() as u32;
-            if stamped != 0 {
-                stamped
+            let stamped = fail_descr.adr_jump_offset();
+            if stamped > PENDING_NO_CELL {
+                stamped as u32
             } else {
                 let fail_ptr = fail_descr as *const dyn FailDescr as *const ();
                 original_token
@@ -6432,10 +6429,9 @@ impl majit_backend::Backend for WasmBackend {
             let bridge_trace_id = self.trace_counter;
             // `source_fail_index` is the SOURCE TRACE's own exit ordinal, and
             // stays that everywhere else in this function: the dispatch cell
-            // and `bridge_descr_ranges` are keyed by it, and the metainterp
-            // re-derives that key off the FailDescr. The
-            // region handed to the owner is the one thing that indexes the
-            // merged stream instead.
+            // is keyed by it, and the metainterp re-derives that key off the
+            // FailDescr. The region handed to the owner is the one thing that
+            // indexes the merged stream instead.
             let merged_source_fail_index = if is_direct {
                 // The owner's own guards come first in the merged stream, so a
                 // direct guard's two numberings coincide.
@@ -6860,7 +6856,7 @@ impl majit_backend::Backend for WasmBackend {
                     .to_string(),
             ));
         }
-        patch_pending_failure_recoveries(&guard_exits);
+        patch_pending_failure_recoveries(&guard_exits, &[]);
         // `assemble_bridge`: `update_frame_depth` on the source token, so a
         // later entry allocates the depth this bridge and its JUMP target need.
         if let Some(clt) = original_token.compiled_loop_token() {
@@ -6927,23 +6923,8 @@ impl majit_backend::Backend for WasmBackend {
                 .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
                 .expect("source loop disappeared between borrows");
             // Append the bridge's exit descrs to the source loop's flat
-            // `fail_descrs` and record the slice they occupy, keyed by the
-            // source guard's `fail_index`. `bridge_attached`
-            // maps a source guard back to that range. `start` is captured inside the same `borrow_mut`
-            // critical section as the `extend`, so the range stays in lockstep
-            // with the vec.
-            let count = bridge_descrs.len();
-            {
-                let mut descrs = source_loop.fail_descrs.borrow_mut();
-                let start = descrs.len();
-                descrs.extend(bridge_descrs);
-                source_loop.bridge_descr_ranges.borrow_mut().push((
-                    source_trace_id,
-                    source_fail_index,
-                    start,
-                    count,
-                ));
-            }
+            // `fail_descrs`.
+            source_loop.fail_descrs.borrow_mut().extend(bridge_descrs);
             // The bridge module lives as long as this source loop, so hand its
             // own cell array (if any) to the loop, freed when the loop drops.
             source_loop.bridge_owned_label_targets.borrow_mut().extend(
@@ -6995,12 +6976,13 @@ impl majit_backend::Backend for WasmBackend {
                 }
             }
         }
-        // `assembler.py` `patch_jump_for_descr`: write the bridge slot through
-        // `faildescr.adr_jump_offset`, then clear the slot ("patched").
+        // `patch_jump_for_descr`: write the bridge slot through the cell, then
+        // `faildescr.adr_jump_offset = 0` means patched. The cell write itself
+        // stays wasm32-only.
         let patch_cell = {
-            let stamped = fail_descr.adr_jump_offset() as u32;
-            if stamped != 0 {
-                stamped
+            let stamped = fail_descr.adr_jump_offset();
+            if stamped > PENDING_NO_CELL {
+                stamped as u32
             } else {
                 source_cells_base
             }
@@ -7011,7 +6993,6 @@ impl majit_backend::Backend for WasmBackend {
                 diag_bump(29);
             }
             crate::failguard::write_guard_cell(patch_cell, bridge_slot);
-            fail_descr.set_adr_jump_offset(0);
             if let Some(source_loop) = original_token
                 .compiled
                 .get()
@@ -7030,6 +7011,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
             }
         }
+        fail_descr.set_adr_jump_offset(0);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = (patch_cell, bridge_slot, source_cells_base);
 
@@ -7045,26 +7027,10 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    /// `compile_bridge` records each attach in the source loop's
-    /// `bridge_descr_ranges`; the host build does not clear
-    /// `adr_jump_offset` ("patched"), so read the record for this descr.
+    /// `patch_jump_for_descr` sets `faildescr.adr_jump_offset = 0` to mean
+    /// the guard's jump has been rewritten to the bridge.
     fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> bool {
-        let Some(token) = majit_backend::descr_owning_jct(descr) else {
-            return false;
-        };
-        let Some(compiled) = token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-        else {
-            return false;
-        };
-        let (trace_id, fail_index) = (descr.trace_id(), descr.fail_index_per_trace());
-        compiled
-            .bridge_descr_ranges
-            .borrow()
-            .iter()
-            .any(|r| r.0 == trace_id && r.1 == fail_index)
+        descr.adr_jump_offset() == 0 && majit_backend::descr_owning_jct(descr).is_some()
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {
@@ -7985,6 +7951,88 @@ mod tests {
         assert!(failguard::label_target(&label).is_some());
     }
 
+    #[test]
+    fn bridge_attached_reads_the_patched_descr() {
+        let _compile_guard = failguard::lock_cpu();
+        let mut backend = WasmBackend::new();
+        let token = std::sync::Arc::new(JitCellToken::new(9_910_401));
+        let clt = token.compiled_loop_token_expect();
+        clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+        let label = majit_ir::make_loop_target_descr(90, false);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let label_op = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Label,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        label_op.setdescr(label.clone());
+        let advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        advance.pos().set(majit_ir::OpRef::int_op(2));
+        let guard = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[rb(majit_ir::OpRef::int_op(2))],
+        ));
+        guard.setfailargs(
+            vec![
+                rb(majit_ir::OpRef::int_op(2)),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ]
+            .into(),
+        );
+        guard.set_fail_arg_types(vec![majit_ir::Type::Int, majit_ir::Type::Int]);
+        let fd = majit_backend::make_resume_guard_descr_typed(vec![
+            majit_ir::Type::Int,
+            majit_ir::Type::Int,
+        ]);
+        guard.setdescr(fd.clone());
+        fd.as_fail_descr()
+            .expect("resume guard")
+            .set_rd_loop_token_clt(
+                std::sync::Arc::clone(&clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>
+            );
+        let jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        jump.setdescr(label.clone());
+        backend
+            .compile_loop(&inputargs, &[label_op, advance, guard, jump], &token)
+            .expect("loop compiles");
+        let fail = fd.as_fail_descr().expect("resume guard");
+        assert!(!backend.bridge_attached(fail));
+        let bridge_advance = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntAdd,
+            &[
+                rb(majit_ir::OpRef::input_arg_int(0)),
+                rb(majit_ir::OpRef::const_int(1)),
+            ],
+        ));
+        bridge_advance.pos().set(majit_ir::OpRef::int_op(3));
+        let bridge_jump = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::Jump,
+            &[
+                majit_ir::operand::Operand::from_bound_op(&bridge_advance),
+                rb(majit_ir::OpRef::input_arg_int(1)),
+            ],
+        ));
+        bridge_jump.setdescr(label);
+        backend
+            .compile_bridge(fail, &inputargs, &[bridge_advance, bridge_jump], &token)
+            .expect("bridge compiles");
+        assert!(backend.bridge_attached(fail));
+    }
+
     #[derive(Debug)]
     struct FreeFailDescr {
         fail_index: u32,
@@ -8000,6 +8048,7 @@ mod tests {
         fn fail_arg_types(&self) -> &[majit_ir::Type] {
             &self.arg_types
         }
+        fn set_adr_jump_offset(&self, _offset: usize) {}
     }
 
     #[test]

@@ -1448,7 +1448,7 @@ pub struct CompiledWasmLoop {
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
     /// every chained bridge `compile_bridge` appended (positional bookkeeping
-    /// for `bridge_descr_ranges` — layouts and jitcounter hashes). An exit
+    /// for layouts and jitcounter hashes). An exit
     /// resolves through `jf_descr` (the cell), not by indexing this vec.
     /// `RefCell` because the
     /// append happens through the shared `&JitCellToken` the bridge attaches
@@ -1524,16 +1524,6 @@ pub struct CompiledWasmLoop {
     /// Whether this module transfers a compiled bridge's fail arguments as
     /// wasm call parameters instead of reloading their positional frame slots.
     pub bridge_param_dispatch: bool,
-    /// `(source_trace_id, source_fail_index, start, count)` ranges into
-    /// `fail_descrs` for each chained bridge `compile_bridge` appended (lib.rs
-    /// extend site). Lets `bridge_attached` map a source
-    /// guard back to its bridge's
-    /// appended descr slice. Keyed by BOTH the source guard's
-    /// owning trace and its per-trace fail index: with nested chaining, the
-    /// loop's guard `k` and a chained bridge's guard `k` are distinct sources.
-    /// Recorded in lockstep with the `extend`, inside the same `borrow_mut`
-    /// critical section.
-    pub bridge_descr_ranges: RefCell<Vec<(u64, u32, usize, usize)>>,
     /// Post-intern module inputs retained for a loop re-emission. Entry
     /// bridges store `None` because they tail-call another loop.
     pub reemit: RefCell<Option<crate::codegen::ModuleBuildInputs>>,
