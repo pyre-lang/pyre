@@ -16819,7 +16819,7 @@ fn jit_force_virtual_wrong_arity_fails_loud() {
     {
         assert!(
             matches!(
-                call.0(),
+                call(),
                 Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 })
             ),
             "arity != 2 must fail loud in release"
@@ -16897,7 +16897,7 @@ fn jit_force_virtual_missing_standard_box_fails_loud() {
     #[cfg(not(debug_assertions))]
     {
         assert!(matches!(
-            call.0(),
+            call(),
             Err(DispatchError::JitForceVirtualRequiresConcreteResolver { pc: 0 })
         ));
     }
