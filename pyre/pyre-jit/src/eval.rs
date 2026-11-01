@@ -8273,7 +8273,13 @@ fn genentry_merge_point_jit(
     if w_gen.is_null() || pycode.is_null() {
         return None;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[pycode, w_gen, w_arg]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let _nested = NestedTracePark::enter();
+    let pycode = roots.get(base);
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
     ) else {
@@ -8382,7 +8388,13 @@ fn drive_generatorentry_trace(
         pyre_jit_trace::state::install_build_time_jitcode_at(index, payload);
     }
 
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[pycode, w_gen, w_arg]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let _nested = NestedTracePark::enter();
+    let pycode = roots.get(base);
+    let w_gen = roots.get(base + 1);
+    let w_arg = roots.get(base + 2);
 
     let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
     let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
@@ -8975,7 +8987,13 @@ fn drive_unpack_iterable_trace(
 
     // `warmstate.py bound_reached` is a fresh MetaInterp. Park the reused
     // object so jd1 can open its own profiler TRACING.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[greenkey_raw, w_iterator, items]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let _nested = NestedTracePark::enter();
+    let greenkey_raw = roots.get(base);
+    let w_iterator = roots.get(base + 1);
+    let items = roots.get(base + 2);
     let (driver, _) = driver_pair();
     let meta = driver.meta_interp_mut();
 
@@ -10577,15 +10595,22 @@ fn generatorentry_ll_portal_runner(
     // `warmstate.py bound_reached` is a fresh MetaInterp; park the reused
     // object so other greenkeys still tick and a fire can nest while an outer
     // attempt is in flight.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[pycode, w_gen, w_arg]);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let _nested = NestedTracePark::enter();
+    pycode = roots.get(base);
+    w_gen = roots.get(base + 1);
+    w_arg = roots.get(base + 2);
 
     // The portal's reds and green stay live across `maybe_compile_and_run`,
     // which can trace, compile or run the loop.
-    if let Some(result) = pyre_object::with_roots!(pycode, w_gen, w_arg =>
-            genentry_merge_point_jit(w_gen, w_arg, pycode))
-    {
+    if let Some(result) = genentry_merge_point_jit(w_gen, w_arg, pycode) {
         return result;
     }
+    pycode = roots.get(base);
+    w_gen = roots.get(base + 1);
+    w_arg = roots.get(base + 2);
     pyre_interpreter::generatorentry_portal(pycode, w_gen, w_arg)
 }
 
@@ -13068,8 +13093,9 @@ fn compile_and_run_once(
     // warmstate.py bound_reached: a nested MetaInterp run parks the outer
     // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
     // journals, driver sym). Walker sub-walks do not enter here.
-    let mut driver = NestedTraceGuard::enter(driver);
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let mut frame_root = FrameRoot::new(frame);
+    let mut driver = NestedTraceGuard::enter(driver);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {
         CompileOnceStart::BackEdge => 18,

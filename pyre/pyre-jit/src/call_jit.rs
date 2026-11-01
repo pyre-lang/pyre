@@ -4110,10 +4110,20 @@ pub fn trace_and_compile_from_bridge(
         }
     }
 
+    // The live frame is a virtualizable GC object held by raw bridge-trace
+    // locals while retracing can collect. RPython keeps the virtualizable
+    // object GC-visible during retracing
+    // (`rpython/jit/metainterp/pyjitpl.py` `MetaInterp.interpret`); pyre
+    // roots the frame word so PyFrame's custom trace can forward
+    // `locals_cells_stack_w`. Resume rebuild, `start_bridge_tracing`, and
+    // `prepare_resume_from_failure` all allocate, so the root is taken
+    // before those calls and every later read goes through `FrameRoot::frame`.
+    let mut bridge_frame_root = frame.map(FrameRoot::new);
     // compile.py `_trace_and_compile_from_bridge` constructs a new
     // `MetaInterp(metainterp_sd, jitdriver_sd)`. The reused driver parks
     // the outer attempt for this whole function so `start_bridge_tracing`
     // and the `is_tracing()` checks below see only the bridge walk.
+    // gct_direct_call: incoming GC refs are rooted before a collecting park.
     let _nested = crate::eval::NestedTracePark::enter();
 
     let Some(green_key) = bridge_compile_preflight(descr_arc) else {
@@ -4143,22 +4153,14 @@ pub fn trace_and_compile_from_bridge(
     use crate::eval::build_jit_state;
     use crate::jit::state::PyreEnv;
 
-    let frame = frame.expect("pypyjit bridge holds the virtualizable PyFrame");
-
     let info = {
         let (_, info) = crate::eval::driver_pair();
         info.clone()
     };
 
-    // The live frame is a virtualizable GC object held by raw bridge-trace
-    // locals while retracing can collect. RPython keeps the virtualizable
-    // object GC-visible during retracing
-    // (`rpython/jit/metainterp/pyjitpl.py` `MetaInterp.interpret`); pyre
-    // roots the frame word so PyFrame's custom trace can forward
-    // `locals_cells_stack_w`. Resume rebuild, `start_bridge_tracing`, and
-    // `prepare_resume_from_failure` all allocate, so the root is taken
-    // before those calls and every later read goes through `FrameRoot::frame`.
-    let mut bridge_frame_root = FrameRoot::new(frame);
+    let mut bridge_frame_root = bridge_frame_root
+        .as_mut()
+        .expect("pypyjit bridge holds the virtualizable PyFrame");
 
     // pyjitpl.py handle_guard_failure / compile.py _trace_and_compile_from_bridge:
     // `initialize_state_from_guard_failure(resumedescr, deadframe)` calls
@@ -4279,7 +4281,7 @@ pub fn trace_and_compile_from_bridge(
     // `setup_bridge_sym` published the consume identity. Copy it onto the
     // host state word so later readers during this function see the live
     // frame, not the pre-`start_bridge_tracing` snapshot.
-    refresh_host_vable_frame(&mut jit_state, &mut bridge_frame_root);
+    refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
     // resume.py `rebuild_from_resumedata` ran once, inside
     // `start_bridge_tracing` (`rebuild_state_after_failure`); the portal's
     // `jd.mainjitcode` seats the frames (`call.py grab_initial_jitcodes`).
@@ -4401,7 +4403,7 @@ pub fn trace_and_compile_from_bridge(
 
     // `start_bridge_tracing` and `rebuild_portal_framestack_from_resumedata`
     // allocate. `set_valuestackdepth` writes through `jit_state.frame`.
-    refresh_host_vable_frame(&mut jit_state, &mut bridge_frame_root);
+    refresh_host_vable_frame(&mut jit_state, bridge_frame_root);
     let catch_level = if pending_exc && last_bridge_is_exception_guard {
         if is_multiframe_resume {
             // `resume_pc` (and thus `frame.last_instr`, set above) addresses the
@@ -4686,7 +4688,7 @@ pub fn trace_and_compile_from_bridge(
             // first question, and a walk that both committed its end state and
             // kept a finish-concrete stash still has to answer the second one
             // if the first handshake does not match.
-            stamp_ca_walk_frames(&mut bridge_frame_root, false, adopted_walk_end_state);
+            stamp_ca_walk_frames(bridge_frame_root, false, adopted_walk_end_state);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] ca-finish-noreplay at resume_pc={} key={}",
@@ -4757,7 +4759,7 @@ pub fn trace_and_compile_from_bridge(
             );
         }
         stamp_ca_walk_frames(
-            &mut bridge_frame_root,
+            bridge_frame_root,
             !allow_finish_direct_return && resume_via_blackhole,
             !allow_finish_direct_return && adopted_walk_end_state,
         );
@@ -4787,7 +4789,7 @@ pub fn trace_and_compile_from_bridge(
             );
         }
         stamp_ca_walk_frames(
-            &mut bridge_frame_root,
+            bridge_frame_root,
             !allow_finish_direct_return && resume_via_blackhole,
             !allow_finish_direct_return && adopted_walk_end_state,
         );
@@ -4820,7 +4822,7 @@ pub fn trace_and_compile_from_bridge(
         }
         let continue_compiled = compiled || adopted_walk_end_state;
         stamp_ca_walk_frames(
-            &mut bridge_frame_root,
+            bridge_frame_root,
             !allow_finish_direct_return && !continue_compiled,
             !allow_finish_direct_return && adopted_walk_end_state,
         );
@@ -4842,7 +4844,7 @@ pub fn trace_and_compile_from_bridge(
     // A committed walk has already executed the region into the live
     // frame; the blackhole replay must not run even on this abort path.
     stamp_ca_walk_frames(
-        &mut bridge_frame_root,
+        bridge_frame_root,
         !allow_finish_direct_return && !adopted_walk_end_state,
         !allow_finish_direct_return && adopted_walk_end_state,
     );

@@ -5795,23 +5795,16 @@ fn assemble_peeled_trace_with_jump_args(
     // do not infer the LABEL live-in from JUMP[i] (`.find()` is first-slot
     // on duplicates).
     let mut seen_body_defs = crate::FxIndexSet::default();
-    let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: crate::FxIndexSet<OpRef> = crate::FxIndexSet::default();
     // Combined-trace position → emitted clone, so remap hits bind to the
     // body clone producer instead of re-minting a position-only box (SSA:
     // a remapped arg's target clone was pushed in an earlier iteration).
     let mut emitted_at: rustc_hash::FxHashMap<OpRef, majit_ir::OpRc> =
         rustc_hash::FxHashMap::default();
-    for (op_idx, op) in p2_ops.iter().enumerate() {
+    for op in p2_ops.iter() {
+        if op.opcode == OpCode::Label {
+            panic!("LABEL unexpected in peel assembly p2_ops: {:?}", op,);
+        }
         let mut new_op = (**op).clone();
-        // compile.py never snapshots every body's arglist. Only the Label
-        // arm extends this vec; a Vec per p2 op was a 32 B malloc on
-        // every getfield/setfield (regex and/or 0.15 class).
-        let mut original_args: Vec<OpRef> = if op.opcode == OpCode::Label {
-            op.args_slice().iter().map(|a| a.to_opref()).collect()
-        } else {
-            Vec::new()
-        };
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos().get()) {
             new_op.pos().set(mapped_pos);
         }
@@ -5865,94 +5858,6 @@ fn assemble_peeled_trace_with_jump_args(
                 new_op.setarg(i, boxed);
             }
         }
-        if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = crate::FxIndexSet::default();
-            let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = crate::FxIndexSet::default();
-            let label_arg_set: crate::FxIndexSet<OpRef> = original_args
-                .iter()
-                .copied()
-                .filter(|arg| !arg.is_none())
-                .collect();
-            for later_op in p2_ops.iter().skip(op_idx + 1) {
-                let mut consider_arg = |arg: OpRef| {
-                    // unroll.py `_map_args` passes Const through unchanged
-                    // — inline-Const args (history.py/268/314) carry their
-                    // value on the OpRef itself, so they are never label-args.
-                    // `arg.is_constant()` short-circuits before `.raw()` (which
-                    // panics on inline-Const variants).
-                    if arg.is_none()
-                        || arg.is_constant()
-                        || constants.contains_key(&arg.raw())
-                        || label_arg_set.contains(&arg)
-                        || extra_inner_set.contains(&arg)
-                        || seen_after_label_defs.contains(&arg)
-                    {
-                        return;
-                    }
-                    // optimizer.py freezes op args at emit time;
-                    // walking ctx.get_box_replacement here would follow Const
-                    // forwarding that postprocess installed AFTER the body op
-                    // was emitted (corrupting already-emitted trace). The
-                    let resolved_arg = assembly_alias_remap.get(&arg).copied().unwrap_or(arg);
-                    let available_before_label = visible_before_label.contains(&arg)
-                        || visible_before_label.contains(&resolved_arg)
-                        || seen_body_defs.contains(&arg);
-                    if available_before_label {
-                        extra_inner_set.insert(arg);
-                        extra_inner_sources.push(arg);
-                    }
-                };
-                for a in later_op.args_slice().iter() {
-                    consider_arg(a.to_opref());
-                }
-                later_op.visit_failarg_oprefs(&mut consider_arg);
-                if later_op.result_type() != Type::Void && !later_op.pos().get().is_none() {
-                    seen_after_label_defs.insert(later_op.pos().get());
-                }
-            }
-            // RPython Box parity: do not dedup the inner-label extension
-            // against its existing args. Each source_arg collected from
-            // the later body is a distinct RPython Box; adding it as a
-            // separate slot matches `label_op.initarglist(label_op.getarglist()
-            // + sb.used_boxes)` (unroll.py:300) where RPython never filters
-            // by value or by box coincidence. The outer collection above
-            // already dedups by box identity (`extra_inner_set.contains`),
-            // so each source_arg appears at most once — which is the
-            // RPython-parity behavior for Box-keyed live-in sets.
-            // unroll.py:301 label_op.initarglist(label_op.getarglist() +
-            //                                    sb.used_boxes)
-            let mut extended_args: smallvec::SmallVec<[OpRef; 3]> = new_op
-                .getarglist_copy()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect();
-            for &source_arg in &extra_inner_sources {
-                // optimizer.py:614-625 freeze: do not follow ctx forwarding
-                // chains here; postprocess Const forwarding on body ops would
-                // otherwise leak into the extended Label's arg list, turning
-                // a runtime inputarg slot into a Const reference.
-                let resolved = assembly_alias_remap
-                    .get(&source_arg)
-                    .copied()
-                    .unwrap_or(source_arg);
-                let mapped_arg = remap_body_arg(
-                    resolved,
-                    &assembly_alias_remap,
-                    &body_result_remap,
-                    &seen_body_defs,
-                    &visible_before_label,
-                );
-                extended_args.push(mapped_arg);
-                original_args.push(source_arg);
-            }
-            let mut extended_args_box: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
-                smallvec::SmallVec::with_capacity(extended_args.len());
-            for a in &extended_args {
-                extended_args_box.push(ctx.materialize_operand_at(*a));
-            }
-            new_op.initarglist(extended_args_box);
-        }
         if new_op.opcode == OpCode::Jump {
             // unroll.py jump_to_preamble sends the live JUMP after
             // force_box / send_extra_operation rewrites. Body args reference
@@ -5984,35 +5889,19 @@ fn assemble_peeled_trace_with_jump_args(
                     start_label_args.get(i).copied().unwrap_or(arg)
                 })
                 .collect();
-            let target_label_args: Vec<OpRef> = current_inner_label_index
-                .and_then(|label_idx| {
-                    result
-                        .get(label_idx)
-                        .map(|op| op.args_slice().iter().map(|a| a.to_opref()).collect())
-                })
-                .unwrap_or_else(|| full_label_args.clone());
             let jump_target_id = new_op.getdescr().as_ref().map(majit_ir::descr_identity);
-            let local_label_id = match current_inner_label_index {
-                Some(label_idx) => result
-                    .get(label_idx)
-                    .and_then(|op| op.getdescr())
-                    .as_ref()
-                    .map(majit_ir::descr_identity),
-                None => loop_label_descr.as_ref().map(majit_ir::descr_identity),
-            };
+            let local_label_id = loop_label_descr.as_ref().map(majit_ir::descr_identity);
             let jump_targets_local_label = matches!(
                 (jump_target_id, local_label_id),
                 (Some(jump_id), Some(label_id)) if jump_id == label_id
             );
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] assemble_jump: inner_label={:?} redirected={} targets_local={} jump_target_descr={:?} local_label_descr={:?} original_args={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
-                    current_inner_label_index,
+                    "[jit] assemble_jump: redirected={} targets_local={} jump_target_descr={:?} local_label_descr={:?} mapped_base_args={:?} label_args={:?} filtered_extra_jump_args={:?}",
                     jump_was_redirected,
                     jump_targets_local_label,
                     jump_target_id,
                     local_label_id,
-                    original_args,
                     mapped_base_args,
                     label_args,
                     filtered_extra_jump_args,
@@ -6029,49 +5918,40 @@ fn assemble_peeled_trace_with_jump_args(
                 // consider_arg used_box appended to the LABEL after that
                 // call is the same extra and is concatenated here; a
                 // missing virtual-state (base) slot is a producer bug.
-                if current_inner_label_index.is_none() && jump_args.len() < extra_label_start_idx {
+                if jump_args.len() < extra_label_start_idx {
                     panic!(
                         "JUMP args ({}) != target LABEL args ({}): jump={:?} label={:?}",
                         jump_args.len(),
-                        target_label_args.len(),
+                        full_label_args.len(),
                         jump_args,
-                        target_label_args,
+                        full_label_args,
                     );
                 }
-                if jump_args.len() < target_label_args.len() {
-                    if current_inner_label_index.is_none()
-                        && jump_args.len() >= extra_label_start_idx
-                    {
-                        let have = jump_args.len() - extra_label_start_idx;
-                        if have < filtered_extra_jump_args.len() {
-                            jump_args.extend(filtered_extra_jump_args[have..].iter().copied());
+                if jump_args.len() < full_label_args.len() {
+                    let have = jump_args.len() - extra_label_start_idx;
+                    if have < filtered_extra_jump_args.len() {
+                        jump_args.extend(filtered_extra_jump_args[have..].iter().copied());
+                    }
+                    // consider_arg used_boxes appended to the LABEL
+                    // after `inline_short_preamble` ran: JUMP extra is
+                    // that box (`add_preamble_op` when preamble_op is
+                    // the used_box). Never fill a hole from the LABEL's
+                    // own input.
+                    let have = jump_args.len() - extra_label_start_idx;
+                    if have >= filtered_extra_jump_args.len() {
+                        let consider_have = have - filtered_extra_jump_args.len();
+                        if consider_have < appended_label_args.len() {
+                            jump_args.extend(appended_label_args[consider_have..].iter().copied());
                         }
-                        // consider_arg used_boxes appended to the LABEL
-                        // after `inline_short_preamble` ran: JUMP extra is
-                        // that box (`add_preamble_op` when preamble_op is
-                        // the used_box). Never fill a hole from the LABEL's
-                        // own input.
-                        let have = jump_args.len() - extra_label_start_idx;
-                        if have >= filtered_extra_jump_args.len() {
-                            let consider_have = have - filtered_extra_jump_args.len();
-                            if consider_have < appended_label_args.len() {
-                                jump_args
-                                    .extend(appended_label_args[consider_have..].iter().copied());
-                            }
-                        }
-                    } else if current_inner_label_index.is_some() {
-                        // extra_inner_sources were appended to this inner
-                        // LABEL; they are loop-carried unchanged.
-                        jump_args.extend(target_label_args[jump_args.len()..].iter().copied());
                     }
                 }
-                if jump_args.len() != target_label_args.len() {
+                if jump_args.len() != full_label_args.len() {
                     panic!(
                         "JUMP args ({}) != target LABEL args ({}): jump={:?} label={:?}",
                         jump_args.len(),
-                        target_label_args.len(),
+                        full_label_args.len(),
                         jump_args,
-                        target_label_args,
+                        full_label_args,
                     );
                 }
             }
@@ -6113,56 +5993,6 @@ fn assemble_peeled_trace_with_jump_args(
                 }
             }
         }
-        // Jump args fill existing label slots. The `full_label_args` scan
-        // skips Jump so those args are not appended as extra live-ins.
-        if new_op.opcode != OpCode::Jump
-            && let Some(label_idx) = current_inner_label_index
-        {
-            let mut extra_live_args = Vec::new();
-            let label_args: smallvec::SmallVec<[OpRef; 3]> = result[label_idx]
-                .args_slice()
-                .iter()
-                .map(|a| a.to_opref())
-                .collect();
-            let mut consider_arg = |arg: OpRef| {
-                // unroll.py `_map_args` passes Const through; inline-Const
-                // (history.py:227/268/314) carries its value on the OpRef and
-                // is never an inner-label-extension candidate. Short-circuit
-                // before `.raw()` (panics on inline-Const variants).
-                if arg.is_none()
-                    || arg.is_constant()
-                    || constants.contains_key(&arg.raw())
-                    || defs_since_inner_label.contains(&arg)
-                    || label_args.contains(&arg)
-                    || extra_live_args.contains(&arg)
-                {
-                    return;
-                }
-                extra_live_args.push(arg);
-            };
-            for a in new_op.args_slice().iter() {
-                consider_arg(a.to_opref());
-            }
-            new_op.visit_failarg_oprefs(&mut consider_arg);
-            if !extra_live_args.is_empty() {
-                let existing: crate::FxIndexSet<OpRef> = result[label_idx]
-                    .args_slice()
-                    .iter()
-                    .map(|a| a.to_opref())
-                    .collect();
-                let mut new_args: smallvec::SmallVec<[majit_ir::operand::Operand; 3]> =
-                    (0..result[label_idx].num_args())
-                        .map(|i| result[label_idx].arg(i))
-                        .collect();
-                new_args.extend(
-                    extra_live_args
-                        .into_iter()
-                        .filter(|arg| !existing.contains(arg))
-                        .map(|arg| ctx.materialize_operand_at(arg)),
-                );
-                result[label_idx].initarglist(new_args);
-            }
-        }
         // RPython parity: each guard in the assembled trace owns a
         // distinct ResumeGuardDescr with a globally unique fail_index.
         // optimizeopt::store_final_boxes_in_guard (`optimizeopt/mod.rs`)
@@ -6183,13 +6013,8 @@ fn assemble_peeled_trace_with_jump_args(
             emitted_at.insert(new_rc.pos().get(), new_rc.clone());
         }
         result.push(new_rc);
-        if op.opcode == OpCode::Label {
-            current_inner_label_index = Some(result.len() - 1);
-            defs_since_inner_label.clear();
-        }
         if op.result_type() != Type::Void && !op.pos().get().is_none() {
             seen_body_defs.insert(op.pos().get());
-            defs_since_inner_label.insert(result.last().unwrap().pos().get());
         }
     }
 
