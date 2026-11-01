@@ -9676,6 +9676,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+        let _ops_live = self.publish_live_ops(&optimized_ops);
         self.last_quasi_immutable_deps = quasi_immutable_deps;
 
         // compile.py:302-308: vectorization post-pass. Condition is
@@ -9686,6 +9687,7 @@ impl<M: Clone> MetaInterp<M> {
         // `cpu.vector_ext` collapsed to a byte width (0 means absent/disabled,
         // non-zero means is_enabled()). The unroll-free retry is the simple-loop
         // path (compile.py compile_simple_loop), which is not vectorized.
+        drop(_ops_live);
         let optimized_ops = {
             let driver_vec = false; // jitdriver_sd.vec
             let (vectorize, vec_all, vec_cost) = self.snapshot_compiling_vec_params();
@@ -9710,6 +9712,7 @@ impl<M: Clone> MetaInterp<M> {
                 optimized_ops
             }
         };
+        let _ops_live = self.publish_live_ops(&optimized_ops);
         let opt_time = Instant::now().saturating_duration_since(optimize_start);
         let num_ops_after = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
@@ -9772,10 +9775,12 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+        drop(_ops_live);
         let (root_inputargs, mut optimized_ops) = match renamed_root_args {
             Some(args) => densify_root_loop_inputargs(&args, optimized_ops),
             None => (trace.inputargs_cloned(), optimized_ops),
         };
+        let _ops_live = self.publish_live_ops(&optimized_ops);
         if retried_without_unroll
             && !optimized_ops
                 .first()
@@ -9798,6 +9803,7 @@ impl<M: Clone> MetaInterp<M> {
             label_op.pos().set(majit_ir::OpRef::NONE);
             optimized_ops.insert(0, OpRc::new(label_op));
         }
+        drop(_ops_live);
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
             optimized_ops,
@@ -9817,6 +9823,7 @@ impl<M: Clone> MetaInterp<M> {
                 return CompileOutcome::Cancelled;
             }
         };
+        let _ops_live = self.publish_live_ops(&optimized_ops);
 
         // RPython virtualizable parity: standard virtualizable fields and
         // arrays stay in the trace as first-class virtualizable boxes.
@@ -9824,7 +9831,9 @@ impl<M: Clone> MetaInterp<M> {
         // the traced virtualizable values in the live-input layout, and
         // `vable_*` operations keep the hot path on boxes instead of
         // re-materializing `GetfieldRaw*`/`GetarrayitemRaw*` entry ops.
+        drop(_ops_live);
         let (mut inputargs, optimized_ops) = (inputargs, optimized_ops);
+        let _ops_live = self.publish_live_ops(&optimized_ops);
 
         // Reject an unsound cross-loop-CUT self loop: it can class-guard a
         // LABEL slot that the closing JUMP feeds back a `Const` NULL — an
@@ -9857,8 +9866,10 @@ impl<M: Clone> MetaInterp<M> {
         if crate::majit_log_enabled() {
             eprintln!("[jit] normalize_closing_jump_args start");
         }
+        drop(_ops_live);
         let mut compiled_ops =
             compile::normalize_closing_jump_args(optimized_ops, &constants, final_num_inputs);
+        let _ops_live = self.publish_live_ops(&compiled_ops);
         if crate::majit_log_enabled() || crate::diag_enabled() {
             eprintln!(
                 "[jit] compiled loop: {} ops before opt -> {} ops after opt ({:.1}% reduction)",
@@ -10206,6 +10217,7 @@ impl<M: Clone> MetaInterp<M> {
                 // on the compiling `jitdriver_sd.warmstate`. Extra-driver
                 // compile leftover `active_jitdriver_sd` is that driver.
                 self.remember_compiled_graph_write();
+                drop(_ops_live);
                 self.staticdata.log_compile(
                     green_key,
                     num_ops_before,
@@ -10945,11 +10957,13 @@ impl<M: Clone> MetaInterp<M> {
             Some(p) => p,
             None => return false,
         };
+        let _partial_live = self.publish_live_ops(&partial.ops);
         let mut start_state = match self.exported_state.take() {
             Some(s) => s,
             None => {
                 // `compile_retrace` returning None leaves `partial_trace` on
                 // the metainterp (`reached_loop_header` keeps tracing).
+                drop(_partial_live);
                 self.partial_trace = Some(partial);
                 return false;
             }
@@ -11319,11 +11333,13 @@ impl<M: Clone> MetaInterp<M> {
                 self.tracing = Some(ctx);
                 // `reached_loop_header` keeps `partial_trace` and
                 // `retracing_from` when `compile_retrace` returns None.
+                drop(_partial_live);
                 self.partial_trace = Some(partial);
                 self.retracing_from = retracing_from_kept;
                 return false;
             }
         };
+        let _body_live = self.publish_live_ops(&body_ops);
         let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // compile.py:384-390: merge loop_info deps first, then deps carried
         // from the exported start_state.
@@ -11342,8 +11358,11 @@ impl<M: Clone> MetaInterp<M> {
         //
         // pyre parity: partial.ops now stores Phase 1 optimized preamble
         // ops (JUMP excluded), matching RPython's partial_trace.operations.
+        drop(_body_live);
+        drop(_partial_live);
         let mut combined_ops = partial.ops;
         combined_ops.extend(body_ops);
+        let _combined_live = self.publish_live_ops(&combined_ops);
         // history.py:227/268/314 parity: `op.args[j]` carries inline
         // `ConstX.value` directly; the retrace boundary no longer needs
         // a separate `constants` side-table merge.
@@ -11357,6 +11376,7 @@ impl<M: Clone> MetaInterp<M> {
         // a shifted `[bridge_inputarg_base..)` namespace, exactly like
         // RPython's fresh InputArg object identities.
         let root_inputargs: Vec<InputArgRc> = partial.inputargs.clone();
+        drop(_combined_live);
         let (inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
                 Ok(normalized) => normalized,
@@ -11370,9 +11390,12 @@ impl<M: Clone> MetaInterp<M> {
                     return false;
                 }
             };
+        let _combined_live = self.publish_live_ops(&combined_ops);
 
+        drop(_combined_live);
         let combined_ops =
             compile::normalize_closing_jump_args(combined_ops, &constants, final_num_inputs);
+        let _combined_live = self.publish_live_ops(&combined_ops);
 
         {
             let _s = crate::debug::scope("jit-log-opt-bridge");
@@ -11444,6 +11467,7 @@ impl<M: Clone> MetaInterp<M> {
         // (virtualstate.py). Installing a retrace as the front door
         // therefore feeds a collapsed arg list from a positional value list.
         if let Some(bridge) = retrace_resumekey {
+            drop(_combined_live);
             let attached = self.attach_retrace_to_source_guard(
                 bridge,
                 green_key,
@@ -11466,7 +11490,9 @@ impl<M: Clone> MetaInterp<M> {
         // contract is reds-only and virtualizable fields are reloaded from
         // the heap object at entry.
         let mut inputargs = inputargs;
+        drop(_combined_live);
         let mut combined_ops = combined_ops;
+        let _combined_live = self.publish_live_ops(&combined_ops);
         // compile.py send_loop_to_backend: forget_optimization_info on the
         // operations and inputargs before the virtualizable reload rewrites
         // them through `_forwarded`.
@@ -11597,6 +11623,7 @@ impl<M: Clone> MetaInterp<M> {
                 // LABEL.
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.remember_compiled_graph_write();
+                drop(_combined_live);
                 self.staticdata.log_compile(
                     green_key,
                     num_ops_before,
@@ -11670,6 +11697,7 @@ impl<M: Clone> MetaInterp<M> {
         num_combined_ops: usize,
         quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
     ) -> bool {
+        let _combined_live = self.publish_live_ops(&combined_ops);
         let Some(fail_descr) = bridge.source_descr.as_fail_descr() else {
             crate::debug::log_one(
                 "jit-abort",
@@ -11810,7 +11838,9 @@ impl<M: Clone> MetaInterp<M> {
                 // new_loop)` with `new_loop.original_jitcell_token` = the
                 // source JCT (compile.py:801), so every bridge-internal
                 // `ResumeDescr.rd_loop_token` inherits the source identity.
+                drop(_combined_live);
                 let mut combined_ops = combined_ops;
+                let _combined_live = self.publish_live_ops(&combined_ops);
                 self.record_loop_or_bridge(&source_jct, &combined_ops, bridge_trace_id);
                 self.stats.retraces_compiled += 1;
                 if crate::majit_log_enabled() {
@@ -11849,6 +11879,7 @@ impl<M: Clone> MetaInterp<M> {
                 let new_high_water = compute_next_global_opref(&inputargs, &combined_ops);
                 self.next_global_opref = self.next_global_opref.max(new_high_water);
                 self.remember_compiled_graph_write();
+                drop(_combined_live);
                 self.staticdata.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_bridge {

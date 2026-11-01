@@ -1239,6 +1239,12 @@ impl UnrollOptimizer {
                 }
             }
         };
+        // Phase-1 optimizer and its memo are gone; the emitted preamble
+        // guards still own their resume storage through phase 2 and peeled-trace
+        // assembly. Upstream the preamble op list lives on the compiling frame
+        // between `preamble_data.optimize_trace` and `loop_data.optimize_trace`
+        // (`compile.py compile_loop`).
+        let _p1_ops_live = self.publish_ops_vec(&p1_ops);
         self.clear_compile_snapshot_roots();
         // unroll.py end_args carry type via Box; export_state already
         // populated `exported_state.end_arg_types` from ctx.
