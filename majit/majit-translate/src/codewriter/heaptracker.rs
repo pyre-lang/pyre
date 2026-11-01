@@ -188,8 +188,14 @@ pub fn set_testing_vtable_for_gcstruct<V>(
 /// `get_field_descr(gccache, INNER, name)` (`heaptracker.py:68-71`), so
 /// `w_class` is a row of every outer object's list, keyed `(PyObject,
 /// w_class)`.
+///
+/// A containment path whose last component is that word (`ob_header.ob_type`
+/// on an instance) is the same unnumbered header word. Upstream
+/// `all_fielddescrs` skips `typeptr` by bare name at every recursion level
+/// (`heaptracker.py` `if name == 'typeptr': continue`).
 pub(crate) fn is_header_word(_struct_name: &str, field_name: &str) -> bool {
-    field_name == "typeptr" || field_name == "ob_type"
+    let leaf = field_name.rsplit('.').next().unwrap_or(field_name);
+    leaf == "typeptr" || leaf == "ob_type"
 }
 
 pub fn all_fielddescrs(
@@ -387,6 +393,17 @@ fn all_fielddescrs_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_word_matches_last_path_component() {
+        assert!(is_header_word("PyObject", "ob_type"));
+        assert!(is_header_word("PyObject", "typeptr"));
+        assert!(is_header_word("W_BytesObject", "ob_header.ob_type"));
+        assert!(is_header_word("W_BytesObject", "ob_header.typeptr"));
+        assert!(!is_header_word("PyObject", "w_class"));
+        assert!(!is_header_word("W_BytesObject", "ob_header.w_class"));
+        assert!(!is_header_word("Method", "ob"));
+    }
 
     #[test]
     fn struct_hint_helpers_match_heaptracker_predicates() {

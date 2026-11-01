@@ -687,12 +687,31 @@ pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
 /// against `w_class_descr()`, which installs via `w_class_current_qmut`.
 /// Process-wide layout owner for header quasi-immuts. One space, one
 /// watcher set — a field of this prebuilt, not a naked module static.
+#[repr(C)]
 struct ObjectLayout {
-    w_class_watchers: crate::quasiimmut::QuasiImmutField,
+    w_class_watchers: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    w_class_watchers_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(ObjectLayout, w_class_watchers, w_class_watchers_lock);
+
+impl ObjectLayout {
+    #[inline]
+    fn w_class_watchers(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.w_class_watchers, &self.w_class_watchers_lock)
+    }
+}
+
+impl Drop for ObjectLayout {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe { self.w_class_watchers().reclaim() };
+    }
 }
 
 static OBJECT_LAYOUT: ObjectLayout = ObjectLayout {
-    w_class_watchers: crate::quasiimmut::QuasiImmutField::new(),
+    w_class_watchers: crate::quasiimmut::null_mutate_word(),
+    w_class_watchers_lock: crate::quasiimmut::null_mutate_lock(),
 };
 
 /// Host identity of the process-wide `ObjectLayout` prebuilt
@@ -703,15 +722,15 @@ pub fn object_layout_static_addr() -> *const () {
 
 /// `quasiimmut.py get_current_qmut_instance` for `PyObject.w_class`.
 pub fn w_class_current_qmut() -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-    OBJECT_LAYOUT.w_class_watchers.get_current_qmut_instance()
+    OBJECT_LAYOUT.w_class_watchers().get_current_qmut_instance()
 }
 
 /// Invalidate loops that folded a `w_class` read. Call after a published
 /// object's class changes (`descr_set___class__`, exception retag).
 #[inline]
 pub fn notify_w_class_mutated() {
-    if OBJECT_LAYOUT.w_class_watchers.is_installed() {
-        OBJECT_LAYOUT.w_class_watchers.invalidate();
+    if OBJECT_LAYOUT.w_class_watchers().is_installed() {
+        OBJECT_LAYOUT.w_class_watchers().invalidate();
     }
 }
 

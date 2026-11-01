@@ -5,7 +5,7 @@
 //! inner functions.
 
 use crate::pyobject::*;
-use crate::quasiimmut::QuasiImmutField;
+use crate::quasiimmut::{QuasiImmut, QuasiImmutLock, null_mutate_lock, null_mutate_word};
 use pyre_macros::pyre_class;
 use std::sync::Arc;
 
@@ -37,7 +37,19 @@ pub struct CellFamily {
     /// ['ever_mutated?']`). The owner is a `Box::into_raw` leak that is
     /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
     /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
-    pub mutate_ever_mutated: QuasiImmutField,
+    pub mutate_ever_mutated: std::sync::atomic::AtomicPtr<QuasiImmut>,
+    pub mutate_ever_mutated_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(CellFamily, mutate_ever_mutated, mutate_ever_mutated_lock);
+
+impl Drop for CellFamily {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe {
+            self.mutate_ever_mutated().reclaim();
+        }
+    }
 }
 
 /// Host `CellFamily` is a `Box::into_raw`'d host allocation, never a GC object.
@@ -46,12 +58,21 @@ pub struct CellFamily {
 pub const _alloc_flavor_CellFamily: &str = "raw";
 
 impl CellFamily {
+    #[inline]
+    pub fn mutate_ever_mutated(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_ever_mutated,
+            &self.mutate_ever_mutated_lock,
+        )
+    }
+
     /// nestedscope.py `CellFamily.__init__`.
     pub fn new(name: String) -> Self {
         Self {
             name,
             ever_mutated: std::cell::Cell::new(false),
-            mutate_ever_mutated: QuasiImmutField::new(),
+            mutate_ever_mutated: null_mutate_word(),
+            mutate_ever_mutated_lock: null_mutate_lock(),
         }
     }
 
@@ -62,22 +83,22 @@ impl CellFamily {
         if self.ever_mutated.get() == v {
             return;
         }
-        if self.mutate_ever_mutated.is_installed() {
+        if self.mutate_ever_mutated().is_installed() {
             unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
         }
         self.ever_mutated.set(v);
     }
 
     pub fn current_ever_mutated_qmut(&self) -> Arc<crate::quasiimmut::QuasiImmut> {
-        self.mutate_ever_mutated.get_current_qmut_instance()
+        self.mutate_ever_mutated().get_current_qmut_instance()
     }
 
     pub fn ever_mutated_qmut_installed(&self) -> bool {
-        self.mutate_ever_mutated.is_installed()
+        self.mutate_ever_mutated().is_installed()
     }
 
     pub fn force_ever_mutated_qmut(&self) {
-        self.mutate_ever_mutated.invalidate();
+        self.mutate_ever_mutated().invalidate();
     }
 }
 

@@ -6314,6 +6314,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     base,
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 result,
             );
@@ -6331,6 +6332,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     item_ty: search_value_type_of(&result),
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 result,
@@ -6354,6 +6356,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     item_ty,
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 false,
             );

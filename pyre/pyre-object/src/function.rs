@@ -244,7 +244,20 @@ pub struct StaticMethod {
     /// `Arc`, so the compiler never re-resolves this owner and a sweep
     /// mid-compile is safe; the sweep hook is `{static,class}method_destructor`
     /// in `pyre-jit/src/eval.rs`.
-    pub mutate_w_function: crate::quasiimmut::QuasiImmutField,
+    pub mutate_w_function: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_w_function_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(StaticMethod, mutate_w_function, mutate_w_function_lock);
+
+impl StaticMethod {
+    #[inline]
+    pub fn mutate_w_function(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_w_function,
+            &self.mutate_w_function_lock,
+        )
+    }
 }
 
 /// Field offsets of the inline `PyObjectRef` slots within `StaticMethod`,
@@ -278,7 +291,8 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
                     ob: header,
                     w_function: func,
                     w_dict: PY_NULL,
-                    mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
+                    mutate_w_function: crate::quasiimmut::null_mutate_word(),
+                    mutate_w_function_lock: crate::quasiimmut::null_mutate_lock(),
                 },
             );
         }
@@ -289,7 +303,8 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob: header,
         w_function: func,
         w_dict: PY_NULL,
-        mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_w_function: crate::quasiimmut::null_mutate_word(),
+        mutate_w_function_lock: crate::quasiimmut::null_mutate_lock(),
     })
 }
 
@@ -318,7 +333,7 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
         // pays one load.
         if (*(obj as *const StaticMethod))
-            .mutate_w_function
+            .mutate_w_function()
             .is_installed()
         {
             crate::quasiimmut::sweep_quasi_immut_field(
@@ -345,7 +360,7 @@ pub unsafe fn w_staticmethod_current_w_function_qmut(
     }
     Some(
         (*(obj as *const StaticMethod))
-            .mutate_w_function
+            .mutate_w_function()
             .get_current_qmut_instance(),
     )
 }
@@ -440,7 +455,20 @@ pub struct ClassMethod {
     /// `Arc`, so the compiler never re-resolves this owner and a sweep
     /// mid-compile is safe; the sweep hook is `{static,class}method_destructor`
     /// in `pyre-jit/src/eval.rs`.
-    pub mutate_w_function: crate::quasiimmut::QuasiImmutField,
+    pub mutate_w_function: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_w_function_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(ClassMethod, mutate_w_function, mutate_w_function_lock);
+
+impl ClassMethod {
+    #[inline]
+    pub fn mutate_w_function(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_w_function,
+            &self.mutate_w_function_lock,
+        )
+    }
 }
 
 /// Field offsets of the inline `PyObjectRef` slots within `ClassMethod`, the
@@ -473,7 +501,8 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
                     ob: header,
                     w_function: func,
                     w_dict: PY_NULL,
-                    mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
+                    mutate_w_function: crate::quasiimmut::null_mutate_word(),
+                    mutate_w_function_lock: crate::quasiimmut::null_mutate_lock(),
                 },
             );
         }
@@ -484,7 +513,8 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob: header,
         w_function: func,
         w_dict: PY_NULL,
-        mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_w_function: crate::quasiimmut::null_mutate_word(),
+        mutate_w_function_lock: crate::quasiimmut::null_mutate_lock(),
     })
 }
 
@@ -513,7 +543,7 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
         // pays one load.
         if (*(obj as *const ClassMethod))
-            .mutate_w_function
+            .mutate_w_function()
             .is_installed()
         {
             crate::quasiimmut::sweep_quasi_immut_field(
@@ -540,7 +570,7 @@ pub unsafe fn w_classmethod_current_w_function_qmut(
     }
     Some(
         (*(obj as *const ClassMethod))
-            .mutate_w_function
+            .mutate_w_function()
             .get_current_qmut_instance(),
     )
 }

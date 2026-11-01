@@ -8951,15 +8951,14 @@ mod tests {
         );
     }
 
-    /// Spike for the wasm-JITFRAME refactor: prove the shared
-    /// `MiniMarkGC` forwards a JitFrame's interior Ref item through the
-    /// `jf_gcmap` custom-trace when the frame is discovered via the jitframe
-    /// shadow stack. This is the exact GC path the orthodox wasm loop would
-    /// depend on — a non-moving old-gen JitFrame whose live Ref item slots are
-    /// traced by `jf_gcmap` during a minor collection (`do_collect_nursery`
-    /// Phase 1c → `trace_and_update_object` → `jitframe_custom_trace`). The
-    /// wasm backend has none of the feeders yet; this confirms the collector
-    /// side works so the feeders can be built.
+    /// An old-gen JitFrame that was written to is barriered (as `llmodel.py`
+    /// `execute_token` / `_reload_frame_if_necessary` do) and so is in the
+    /// remembered set. A minor collection walks old objects that point into
+    /// the nursery (`IncrementalMiniMarkGC.collect_oldrefs_to_nursery`) and
+    /// the jitframe shadow-stack root (`collect_roots_in_nursery`), and traces
+    /// the frame's live Ref item slots through `jf_gcmap` (`jitframe_trace`).
+    /// The young object reachable only through item slot 0 is forwarded and
+    /// the slot rewritten.
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
         let _compile_guard = failguard::lock_cpu();

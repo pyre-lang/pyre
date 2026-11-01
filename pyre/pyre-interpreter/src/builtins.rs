@@ -20357,6 +20357,8 @@ fn builtin_globals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     // `ec.gettopframe_nohidden().get_w_globals()` and has no frameless branch;
     // [3.15-spec] the frameless branch follows `builtin_globals_impl` /
     // `_PyEval_GetGlobalsFromRunningMain` (C source v3.15.1).
+    // `Python/bltinmodule.c` `builtin_globals_impl` is unchanged between
+    // v3.15.0 (the `lib-python` pin) and v3.15.1.
     let frame = topframe_nohidden();
     if frame.is_null() {
         return Ok(pyre_object::w_none());

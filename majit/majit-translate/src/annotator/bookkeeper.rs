@@ -2947,6 +2947,15 @@ impl Bookkeeper {
         self: &Rc<Self>,
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
+        // `lltype.GcOpaqueType('GCREF')` has no ClassDef (`llmemory.py`
+        // `GCREF`). A minted `SomeInstance(GCREFOpaque)` unions with
+        // `SomePtr(GCREF)` and raises (`llannotation.py`
+        // `pairtype(SomePtr, SomeObject).union`).
+        if is_gcref_type_spelling(root) {
+            return Err(AnnotatorError::new(format!(
+                "lltype.GcOpaqueType has no ClassDef: {root}"
+            )));
+        }
         let determinism_trace = crate::determinism_trace_enabled();
         if determinism_trace {
             eprintln!("[DTRACE-CLASS] struct_root root={root}");
@@ -2971,6 +2980,9 @@ impl Bookkeeper {
         let mut graph: Vec<String> = Vec::new();
         while let Some(n) = worklist.pop() {
             if graph.contains(&n) {
+                continue;
+            }
+            if is_gcref_type_spelling(&n) {
                 continue;
             }
             // Register the node's identity ClassDef in `descs` (RPython's
@@ -4267,9 +4279,7 @@ impl Bookkeeper {
         // must project the same way, or `getitem` of a `call_once` args
         // tuple Blocks (`binaryop.py` `tuple_integer_getitem` on Impossible).
         if is_gcref_type_spelling(stripped) {
-            return crate::translator::rtyper::llannotation::lltype_to_annotation(
-                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
-            );
+            return gcref_ptr_annotation();
         }
         match stripped {
             "i8" | "i16" | "i32" | "i64" | "isize" => {
@@ -4358,9 +4368,10 @@ impl Bookkeeper {
         }
         if let Some(inner) = strip_generic_one(stripped, "Option<") {
             // `Option<fn>` is the nullable `Ptr(FuncType)`, not
-            // `union(SomePtr, s_None)`. `s_None` is a classdef-less
-            // instance, and that union collapses to a GC ref while the
-            // value itself is an int-bank address.
+            // `union(SomePtr, s_None)`. `s_None` is `SomeNone`
+            // (`annotator/model.py` `s_None`); `pairtype(SomeObject,
+            // SomeNone).union` noneify's (`binaryop.py`). A function
+            // pointer is an int-bank address.
             if let Some(s_fn) = fn_ptr_somevalue_for_spelling_in(inner.trim(), Some(self)) {
                 return s_fn;
             }
@@ -5761,12 +5772,24 @@ pub(crate) fn normalize_class_qualname(name: &str) -> String {
 /// `llannotation.py` `lltype_to_annotation` maps GCREF to `SomePtr`;
 /// `__cast_instance_intrinsic` must not mint a `GCREFOpaque` classdef
 /// (`pairtype(SomePtr, SomeObject).union` refuses Instance ∪ Ptr).
+///
+/// Prefixes (`*mut`, `*const`, `&`) are peeled so one predicate covers
+/// `GCREF`, `GCREFOpaque`, `*mut GCREFOpaque`, `header::GCREFOpaque`,
+/// `gc_hook::GCREFOpaque`.
 pub(crate) fn is_gcref_type_spelling(stripped: &str) -> bool {
+    let stripped = peel_ref_and_ptr_prefixes(stripped);
     stripped == "GCREF"
         || stripped == "gcref"
         || stripped == "GCREFOpaque"
         || stripped.ends_with("::GCREF")
         || stripped.ends_with("::GCREFOpaque")
+}
+
+/// `llmemory.py` `GCREF = lltype.Ptr(lltype.GcOpaqueType('GCREF'))`.
+pub(crate) fn gcref_ptr_annotation() -> super::model::SomeValue {
+    crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    )
 }
 
 /// Walk `field_ty`'s type-string structure and collect every bare-named
@@ -5792,6 +5815,9 @@ fn collect_referenced_struct_names(
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" | "f32"
         | "f64" | "bool" | "String" | "str" | "char" | "()" => return,
         _ => {}
+    }
+    if is_gcref_type_spelling(stripped) {
+        return;
     }
     for wrapper in [
         "Vec<",
@@ -13091,6 +13117,34 @@ mod tests {
             t.items[0]
         );
         assert!(matches!(t.items[1], SomeValue::Impossible));
+    }
+
+    #[test]
+    fn getuniqueclassdef_for_struct_root_gcref_has_no_classdef() {
+        let bk = bk();
+        let mut reg = crate::front::StructFieldRegistry::default();
+        for root in [
+            "header::GCREFOpaque",
+            "GCREFOpaque",
+            "gc_hook::GCREFOpaque",
+            "GCREF",
+        ] {
+            reg.fields
+                .insert(root.to_string(), Vec::<(String, String)>::new());
+        }
+        bk.set_struct_fields(Rc::new(reg));
+        for root in [
+            "header::GCREFOpaque",
+            "GCREFOpaque",
+            "*mut GCREFOpaque",
+            "gc_hook::GCREFOpaque",
+            "GCREF",
+        ] {
+            assert!(
+                bk.getuniqueclassdef_for_struct_root(root).is_err(),
+                "lltype.GcOpaqueType has no ClassDef: {root}"
+            );
+        }
     }
 
     #[test]

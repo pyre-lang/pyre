@@ -342,6 +342,7 @@ fn byte_at(string_byte_view: bool, slice: Variable, index: Variable) -> OpKind {
             index,
             array_type_id: Some("[u8]".to_string()),
             nolength: crate::front::typestr::nolength_from_array_type_id(Some("[u8]")),
+            gckind: crate::front::typestr::gckind_from_array_type_id(Some("[u8]")),
             pure: false,
         }
     }

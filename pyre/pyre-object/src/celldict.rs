@@ -818,8 +818,11 @@ pub struct ModuleDictStrategy {
     /// names and `rclass.py InstanceRepr._setup_repr` adds as
     /// `('mutate_' + name, OBJECTPTR)` for
     /// `celldict.py ModuleDictStrategy._immutable_fields_ = ["version?"]`.
-    pub mutate_version: crate::quasiimmut::QuasiImmutField,
+    pub mutate_version: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_version_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
 }
+
+crate::quasi_immut_words!(ModuleDictStrategy, mutate_version, mutate_version_lock);
 
 /// MiniMark-allocated by `gc_alloc_storage_box` with the tid from
 /// `module_dict_strategy_gc_type_id`; this impl declares the gckind only (allocation keeps that
@@ -857,14 +860,27 @@ impl Default for ModuleDictStrategy {
     }
 }
 
+impl Drop for ModuleDictStrategy {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe { self.mutate_version().reclaim() };
+    }
+}
+
 impl ModuleDictStrategy {
     /// `celldict.py __init__`.
     pub fn new() -> Self {
         Self {
             version: VersionTag::fresh(),
             caches: parking_lot::Mutex::new(None),
-            mutate_version: crate::quasiimmut::QuasiImmutField::new(),
+            mutate_version: crate::quasiimmut::null_mutate_word(),
+            mutate_version_lock: crate::quasiimmut::null_mutate_lock(),
         }
+    }
+
+    #[inline]
+    pub fn mutate_version(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_version, &self.mutate_version_lock)
     }
 
     /// `quasiimmut.py get_current_qmut_instance` for the `version?`
@@ -872,13 +888,13 @@ impl ModuleDictStrategy {
     /// `mutated()` reached later in the same trace finds the field non-null and
     /// the recording can carry the instance to `compile.py:204-207`.
     pub fn current_version_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.mutate_version.get_current_qmut_instance()
+        self.mutate_version().get_current_qmut_instance()
     }
 
     /// `pyjitpl.py MIFrame.opimpl_jit_force_quasi_immutable mutatebox.nonnull()` — whether some trace or loop is
     /// watching `version?` right now.
     pub fn version_qmut_installed(&self) -> bool {
-        self.mutate_version.is_installed()
+        self.mutate_version().is_installed()
     }
 
     /// `quasiimmut.py do_force_quasi_immutable`, which the tracer calls
@@ -886,7 +902,7 @@ impl ModuleDictStrategy {
     /// already taken returns early, so the interpreter re-running the opcode
     /// after the abort forces nothing a second time.
     pub fn force_version_qmut(&self) {
-        self.mutate_version.invalidate();
+        self.mutate_version().invalidate();
     }
 
     /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
@@ -899,7 +915,7 @@ impl ModuleDictStrategy {
     pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
         match mutatefieldname {
             "mutate_version" => {
-                if !self.mutate_version.is_installed() {
+                if !self.mutate_version().is_installed() {
                     return;
                 }
                 unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_version) };
@@ -1653,7 +1669,7 @@ mod tests {
         // notify (via mutated) must not panic, and `_invalidate_now` unlinks
         // the instance whether or not any flag could still be upgraded.
         strategy.mutated();
-        assert!(!strategy.mutate_version.is_installed());
+        assert!(!strategy.mutate_version().is_installed());
     }
 
     #[test]

@@ -1147,7 +1147,13 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
 ///   `ValueType` (the residual really produces an integer / float / bool);
 /// - output is itself a foreign **opaque** ADT (`BigInt` → `BigInt`,
 ///   the `Add`/`Sub`/`Mul`/`clone` cluster) → `Ref(None)`, the
-///   classdef-less `SomeInstance` shell `bigint_from` produces;
+///   classdef-less `SomeInstance` shell `bigint_from` produces,
+///   except a str-family result (`is_str_family_class_root`: rust-heap
+///   `String`, `Wtf8Buf`, …) keeps `Ref(Some(root))` so the residual
+///   annotates `SomeString` (`annotator/model.py` `SomeString`,
+///   `s_str0()`). Dropping that root minted the classdef-less Instance
+///   `pairtype(SomeObject, SomeObject).union` cannot join with
+///   `String::new()` (`binaryop.py`);
 /// - output is a payload-carrying enum (`GcAllocOutcome`) →
 ///   `Ref(Some(root))`, the intern key a caller `match` on
 ///   `Allocated`/`Failed`/`NoRoute` getattr's `__discriminant` through;
@@ -1353,11 +1359,13 @@ pub(in crate::front::mir) fn first_input_is_adt_free(
 /// or `None` to decline (see [`collect_foreign_opaque_method_externals`]).
 /// A scalar literal output keeps its `ValueType`; `()` is `Void`
 /// (`history.py` `getkind`, `Vec::set_len` / `Vec::resize`); an
-/// opaque-ADT output projects to `Ref(None)`; a payload-carrying enum
-/// keeps `Ref(Some(root))` when `tyref_to_value_type` painted a class
-/// root (`unaryop.py` `SomeInstance.getattr` needs `self.classdef`).
-/// A payload enum with no class root is declined. A fieldless enum,
-/// tuple, reference, or non-opaque struct is declined.
+/// opaque-ADT output projects to `Ref(None)` except a str-family result
+/// (`is_str_family_class_root`) which keeps `Ref(Some(root))`; a
+/// payload-carrying enum keeps `Ref(Some(root))` when
+/// `tyref_to_value_type` painted a class root (`unaryop.py`
+/// `SomeInstance.getattr` needs `self.classdef`). A payload enum with
+/// no class root is declined. A fieldless enum, tuple, reference, or
+/// non-opaque struct is declined.
 pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
     output: &TyRef,
     llbc: &Llbc,
@@ -1381,7 +1389,14 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //
         // - the result ADT is itself a foreign opaque type (the
         //   `BigInt`-returning arithmetic cluster) → classdef-less
-        //   `SomeInstance`, the shell `bigint_from` produces;
+        //   `SomeInstance`, the shell `bigint_from` produces, except a
+        //   str-family result (`is_str_family_class_root`: rust-heap
+        //   `String`, …) keeps the class root so
+        //   `foreign_opaque_method_return_shell` seeds `s_str0()`
+        //   (`annotator/model.py` `SomeString`). Dropping it to
+        //   `Ref(None)` minted the classdef-less Instance
+        //   `pairtype(SomeObject, SomeObject).union` cannot join with
+        //   `String::new()` (`binaryop.py`);
         // - the result is a payload-carrying enum (`GcAllocOutcome`)
         //   whose class root `tyref_to_value_type` already painted →
         //   keep `Ref(Some(root))` so registration intern's the
@@ -1392,12 +1407,21 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         ValueType::Ref(root) => {
             let def_id = output_adt_def_id_free(output, llbc)?;
             let td = llbc.type_by_id(def_id)?;
+            let str_family_root = root
+                .as_ref()
+                .filter(|r| is_str_family_class_root(r))
+                .cloned()
+                .or_else(|| {
+                    tyref_is_rust_heap_string(output, llbc).then(|| {
+                        class_identity_spelling(&td.item_meta.name_path(), no_tombstoned_leaves())
+                    })
+                });
             match &td.kind {
-                TypeDeclKind::Opaque => Some(ValueType::Ref(None)),
+                TypeDeclKind::Opaque => Some(ValueType::Ref(str_family_root)),
                 TypeDeclKind::Enum(_) if !type_decl_is_fieldless_enum(td, llbc) => {
                     root.map(|r| ValueType::Ref(Some(r)))
                 }
-                _ if td.published_struct_copy => Some(ValueType::Ref(None)),
+                _ if td.published_struct_copy => Some(ValueType::Ref(str_family_root)),
                 _ => None,
             }
         }
@@ -4463,7 +4487,10 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // pair(SomeString, SomeInstance).union() handler.  The raw-pointer form
     // is the same translated value when a Rust object field owns the buffer
     // behind `*mut Wtf8Buf` (`W_UnicodeObject.value`).
-    // A Rust-heap `String` is not rstr `STR`; seed it as `SomeInstance(String)`.
+    // A rust-heap `String` is not rstr `STR`; the `ValueType` stays
+    // `Ref` so `ll_strconcat` does not consume a `{cap, ptr, len}`
+    // header. `valuetype_to_someshell` shells that Ref as `s_str0()`
+    // (`annotator/model.py` `SomeString`).
     if tyref_is_rust_heap_string(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }
@@ -4861,12 +4888,19 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// A field type that is itself an inlined `lltype.Struct`, not a pointer
 /// word and not a type the rtyper already represents as one value.
 ///
-/// `heaptracker.py all_fielddescrs` recurses on `isinstance(FIELD,
+/// `heaptracker.all_fielddescrs` recurses on `isinstance(FIELD,
 /// lltype.Struct)` and emits one descr per leaf; a `Ptr`, `Box`, or
-/// `Vec` stays a single stored word.
+/// `Vec` stays a single stored word. `Transformer.zero_contents` is the
+/// same split: a Struct field is walked, a Ptr is one `setfield` of the
+/// STRUCT's own name (`get_field_descr`). A transparent GC handle's
+/// field-row spelling is that pointer
+/// ([`transparent_handle_field_spelling`]).
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<&'l TypeDecl> {
     let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
     let obj = node.as_object()?;
@@ -4888,6 +4922,17 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
         return None;
     }
     if field_ty_is_inline_vec(ty, llbc) || tyref_is_string_value(ty, llbc) {
+        return None;
+    }
+    if transparent_handle_field_spelling(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
+    {
         return None;
     }
     Some(td)
@@ -4967,6 +5012,29 @@ pub(in crate::front::mir) fn struct_copy_owner_keys(
     (owner_root, owner_id)
 }
 
+pub(in crate::front::mir) fn type_decl_struct_field_offset(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    field_idx: usize,
+) -> Option<u64> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    td.layout_for_target(llbc, &target)
+        .and_then(|layout| layout.struct_field_offset(field_idx))
+}
+
+/// Leaves of by-value struct `td`, relative to `td`.
+///
+/// A leaf peels the leading offset-0 hops of its containment path: owner is
+/// the deepest struct reached through hops that are all at offset 0, and
+/// name is the rest of the path (dotted only if a nonzero hop remains).
+/// A direct scalar, pointer, or pair field `f` of `td` is owned by `td`
+/// with an empty `super_path`. A leaf of a nested by-value field `m` is
+/// composed with `nest_inline_leaf`: at offset 0 the hop joins the `super`
+/// chain and the inner descr stays (`heaptracker.all_fielddescrs` /
+/// `Transformer.zero_contents` use the inner struct's descr on the outer
+/// object); a nonzero hop, or an unknown Charon offset, spells the remaining
+/// path on `td`. Pair-field (`pair_len_field_name`) leaves of a nested
+/// struct go through the same composition.
 pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     td: &TypeDecl,
     llbc: &Llbc,
@@ -4974,7 +5042,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     depth: usize,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Vec<(FieldDescriptor, ValueType)> {
+) -> Vec<InlineLeaf> {
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return Vec::new();
     };
@@ -4996,51 +5064,65 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
         if tyref_pair_field_kind(&f.ty, llbc).is_some() {
             let len = pair_len_field_name(&name);
             for fname in [name, len] {
-                leaves.push((
-                    FieldDescriptor::new(fname, Some(owner_root.clone()))
+                leaves.push(InlineLeaf {
+                    field: FieldDescriptor::new(fname, Some(owner_root.clone()))
                         .with_owner_id(Some(owner_id))
                         .with_base_is_deref(false),
-                    ValueType::Unsigned,
-                ));
+                    super_path: String::new(),
+                    ty: ValueType::Unsigned,
+                });
             }
             continue;
         }
-        if let Some(nested) = tyref_by_value_struct_decl(&f.ty, llbc) {
-            leaves.extend(collect_by_value_struct_leaves(
+        if let Some(nested) = tyref_by_value_struct_decl(
+            &f.ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ) {
+            let at_offset_zero = type_decl_struct_field_offset(td, llbc, i) == Some(0);
+            let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
+                .with_owner_id(Some(owner_id))
+                .with_base_is_deref(false);
+            for leaf in collect_by_value_struct_leaves(
                 nested,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
                 depth - 1,
                 raw_alloc_flavor_structs,
-            ));
+            ) {
+                leaves.push(nest_inline_leaf(&container_field, at_offset_zero, &leaf));
+            }
             continue;
         }
-        leaves.push((
-            FieldDescriptor::new(name, Some(owner_root.clone()))
+        leaves.push(InlineLeaf {
+            field: FieldDescriptor::new(name, Some(owner_root.clone()))
                 .with_owner_id(Some(owner_id))
                 .with_base_is_deref(false)
                 .with_inline_vec(field_ty_is_inline_vec(&f.ty, llbc)),
-            tyref_to_attr_value_type_for_struct_field(
+            super_path: String::new(),
+            ty: tyref_to_attr_value_type_for_struct_field(
                 &f.ty,
                 td,
                 llbc,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
             ),
-        ));
+        });
     }
     leaves
 }
 
 /// Leaves of `owner.field` when that field is an inlined by-value struct.
 ///
-/// `None` keeps the existing one-word copy.  `Some` is declaration order
-/// through the inner struct's own descriptors (`owner_root` = the inner
-/// struct), matching a nested `FieldRead` of `frame.ob_header.w_class`
-/// whose base is the outer object and whose descriptor belongs to
-/// `PyObject`.  `typeptr`-like header words are ordinary leaves: this is
-/// a copy of an existing value, not an allocation.
+/// `None` keeps the existing one-word copy.  `Some` is whether `field` sits
+/// at offset 0 in `owner`, plus declaration-order leaves relative to the
+/// inner owner (`collect_by_value_struct_leaves` on the nested decl).
+/// `typeptr`-like header words are ordinary leaves: this is a copy of an
+/// existing value, not an allocation. A deeper by-value sub-struct's
+/// leaves peel leading offset-0 hops (`nest_inline_leaf`).
 pub(in crate::front::mir) fn inline_struct_field_leaves(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -5048,23 +5130,33 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
     owner: &str,
     field_name: &str,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Option<Vec<(FieldDescriptor, ValueType)>> {
+) -> Option<crate::model::InlineStructExpansion> {
     let td = type_decl_by_owner_root(llbc, owner)?;
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return None;
     };
-    let field = fields
+    let (field_idx, field) = fields
         .iter()
-        .find(|f| f.name.as_deref() == Some(field_name))?;
-    let nested = tyref_by_value_struct_decl(&field.ty, llbc)?;
-    Some(collect_by_value_struct_leaves(
-        nested,
+        .enumerate()
+        .find(|(_, f)| f.name.as_deref() == Some(field_name))?;
+    let nested = tyref_by_value_struct_decl(
+        &field.ty,
         llbc,
         tombstoned,
         gc_struct_ids,
-        16,
         raw_alloc_flavor_structs,
-    ))
+    )?;
+    Some(crate::model::InlineStructExpansion {
+        at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
+        leaves: collect_by_value_struct_leaves(
+            nested,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            16,
+            raw_alloc_flavor_structs,
+        ),
+    })
 }
 
 /// Whether the pointee of exactly one raw-pointer layer is a string-family
@@ -10812,6 +10904,43 @@ pub(in crate::front::mir) fn charon_adt_to_ast_string(
         .or_else(|| id.and_then(|i| i.as_str()).map(str::to_string))
         .unwrap_or_else(|| "?".into());
     format!("??adt_id_{key}")
+}
+
+/// FieldRow.ty of a named by-value STRUCT: the crate-stripped TypeDecl
+/// path `resolve_adt_field` stamps on FieldWrite.owner_root
+/// (`class_identity_spelling`). `charon_adt_to_ast_string` is the ADT
+/// leaf; `consider_struct` / `all_fielddescrs` / `get_field_descr` key
+/// on the STRUCT. Pointer, reference, array, and builtin layouts keep
+/// the spelling `tyref_to_field_layout_string` already produced.
+pub(in crate::front::mir) fn field_row_struct_identity(
+    ty: &TyRef,
+    llbc: &Llbc,
+    layout: &str,
+) -> Option<String> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    if adt.get("builtin").is_some_and(|b| !b.is_null()) {
+        return None;
+    }
+    let def_id = adt.get("id")?.as_u64()?;
+    let td = llbc.type_by_id(def_id)?;
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    let name_path = td.item_meta.name_path();
+    let leaf = name_path.rsplit("::").next().unwrap_or(&name_path);
+    let layout_base = layout.split('<').next().unwrap_or(layout);
+    if layout_base != leaf {
+        return None;
+    }
+    let identity = strip_crate_prefix(&name_path);
+    if identity.is_empty() {
+        return None;
+    }
+    let suffix = layout.strip_prefix(leaf)?;
+    Some(majit_ir::descr::canonical_struct_name(&format!(
+        "{identity}{suffix}"
+    )))
 }
 
 /// Format a Charon builtin ADT id (`Box`/`Slice`/`Str`/`Array`).

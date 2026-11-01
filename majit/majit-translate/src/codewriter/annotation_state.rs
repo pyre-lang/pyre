@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue};
+use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str0};
 use crate::model::ValueType;
 
 /// Classdef-less `Ref` shells are not counted in a thread-local.
@@ -70,10 +70,10 @@ pub(crate) fn dump_classdef_less_ref_census() {}
 /// |--------------------|------------------------|--------------------------|
 /// | `Int`              | `Integer(SomeInteger)` | `model.py` -> `SomeValue::Integer` arm. |
 /// | `Float`            | `Float(SomeFloat)`     | `model.py` -> `SomeValue::Float` arm. |
-/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py:64-70`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  This fallback projection keeps all Ref variants classdef-less → `GcRef` via `rclass.py`. |  allow-line-citation
+/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` or `SomeString` for a str-family payload | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py` `lltype_to_annotation`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  A `Ref` whose payload is `is_str_family_class_root` (`String`, `str`, `Wtf8Buf`, …) is `s_str0()` (`annotator/model.py` `SomeString`), the same seed `__str_const` / `ConstValue::ByteStr` uses; `rstr.py` has one string type.  Other Ref variants stay classdef-less → `GcRef` via `rclass.py`. |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
-/// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs`'s `binding`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell — that bridging conflated an *annotation-stage* lattice node with the **legacy** `resolve_types(Unknown) -> ConcreteType::Unknown -> GcRef` resolver-stage backfill. |
+/// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs`'s `binding`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell. `resolve_types` likewise panics on leftover Unknown (`rtyper.py setconcretetype`). |
 ///
 /// Returns `None` only for `ValueType::Unknown`; every other variant
 /// projects to a definite `SomeValue` shell.
@@ -128,21 +128,34 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             crate::annotator::model::SomeStringBuilder::new(),
         )),
         ValueType::Ref(payload) => {
+            // A rust-heap `String` / `&str` / `Wtf8Buf` is still
+            // `ValueType::Ref` so `ll_strconcat` does not consume a
+            // `{cap, ptr, len}` header (`tyref_to_value_type`). The
+            // annotation is `SomeString` (`annotator/model.py`
+            // `SomeString`, `s_str0()`): `rstr.py` has one string type,
+            // the same seed `__str_const` / `ConstValue::ByteStr` uses.
+            // `binaryop.py` `pairtype(SomeObject, SomeObject).union`
+            // raises, so a classdef-less `SomeInstance` here cannot
+            // join `String::new()`.
+            if let Some(shell) = str_family_ref_shell(payload.as_deref()) {
+                return Some(shell);
+            }
             // RPython typed pointers lift to `SomePtr(ll_ptrtype)`
-            // (`llannotation.py:64-70`), but the correct Ptr must come
-            // from the producer (annotator with bookkeeper / host-class
-            // registry) writing `Variable.annotation` directly — not
-            // from a process-global root-string lookup here.  A global
+            // (`llannotation.py` `lltype_to_annotation`), but the
+            // correct Ptr must come from the producer (annotator with
+            // bookkeeper / host-class registry) writing
+            // `Variable.annotation` directly — not from a
+            // process-global root-string lookup here.  A global
             // bare-name index conflates cross-module same-name structs
             // and bypasses RPython's object-identity-based lltype cache.
             // The MIR front-end does not attach a per-`&Foo`-input
             // lltype `Ptr` to `Variable.annotation` (the faithful
-            // counterpart of `lltype.py
-            // _ptrEntry.compute_annotation`), so every `Ref` input
-            // shells to the classdef-less `SomeInstance` here rather
-            // than fabricating a `Ptr` from a bare name.  Routing a
-            // host-registry lookup back into *this* shell projector
-            // would be the rejected bare-name path.
+            // counterpart of `lltype.py`
+            // `_ptrEntry.compute_annotation`), so every other `Ref`
+            // input shells to the classdef-less `SomeInstance` here
+            // rather than fabricating a `Ptr` from a bare name.
+            // Routing a host-registry lookup back into *this* shell
+            // projector would be the rejected bare-name path.
             record_ref_payload(payload.as_deref());
             Some(ref_fallback_instance())
         }
@@ -170,10 +183,10 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // side gap rather than silently bridging it to `GcRef` via
             // a fabricated `SomeInstance(None)` shell — that bridging
             // conflated the annotation-stage lattice node with the
-            // **legacy** resolver-stage backfill
-            // (`resolve_types(Unknown) -> ConcreteType::Unknown ->
-            // GcRef`).  Convergence path: precise producer-side
-            // `set_some` for every `Variable`.
+            // **legacy** resolver-stage Unknown leftover
+            // (`rtyper.py setconcretetype` / `bindingrepr`).
+            // Convergence path: precise producer-side `set_some`
+            // for every `Variable`.
             None
         }
         ValueType::Void => Some(SomeValue::Impossible),
@@ -182,6 +195,13 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
 
 fn ref_fallback_instance() -> SomeValue {
     SomeValue::Instance(SomeInstance::new(None, false, BTreeMap::new()))
+}
+
+/// `s_str0()` when `payload` is `is_str_family_class_root`.
+fn str_family_ref_shell(payload: Option<&str>) -> Option<SomeValue> {
+    payload
+        .filter(|root| crate::front::mir::is_str_family_class_root(root))
+        .map(|_| s_str0())
 }
 
 /// Reduce a `SomeValue` lattice node to its `ValueType` discriminator.
@@ -267,6 +287,35 @@ mod tests {
             }
             other => panic!("both Ref payloads must stay classdef-less, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn str_family_ref_annotates_somestring_and_unions_with_string_new() {
+        // `is_str_family_class_root` / `s_str0()`: a rust-heap `String`,
+        // `&str`, or `Wtf8Buf` is `SomeString` (`annotator/model.py`
+        // `SomeString`), the same seed `__str_const` / `ConstValue::ByteStr`
+        // uses. `String::new()` is `SomeString` (`string_constructor`).
+        // `binaryop.py` `pairtype(SomeObject, SomeObject).union` raises
+        // on String ∪ Instance, so the classdef-less `Ref` fallback
+        // cannot join that constructor.
+        use crate::annotator::model::{SomeString, union};
+        let s_new = SomeValue::String(SomeString::new(false, false));
+        for root in ["string::String", "String", "str", "Wtf8Buf"] {
+            let shell = valuetype_to_someshell(&ValueType::Ref(Some(root.to_string())))
+                .unwrap_or_else(|| panic!("{root} Ref must project"));
+            assert!(
+                matches!(shell, SomeValue::String(_)),
+                "str-family Ref({root}) must be SomeString, got {shell:?}"
+            );
+            union(&shell, &s_new).unwrap_or_else(|e| {
+                panic!("str-family Ref({root}) must union with String::new(): {e}")
+            });
+        }
+        let unnamed = valuetype_to_someshell(&ValueType::Ref(None)).expect("opaque Ref projects");
+        assert!(
+            matches!(&unnamed, SomeValue::Instance(inst) if inst.classdef.is_none()),
+            "unnamed Ref stays classdef-less, got {unnamed:?}"
+        );
     }
 
     #[test]

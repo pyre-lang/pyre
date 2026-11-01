@@ -24,28 +24,40 @@ pub struct GilReadyState {
     /// 0 until the first `setup_threads`, then 1.
     pub gil_ready: i64,
     /// Hidden `mutate_gil_ready` for the field spelled `gil_ready?`.
-    pub mutate_gil_ready: crate::quasiimmut::QuasiImmutField,
+    pub mutate_gil_ready: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_gil_ready_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(GilReadyState, mutate_gil_ready, mutate_gil_ready_lock);
+
+impl GilReadyState {
+    #[inline]
+    pub fn mutate_gil_ready(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_gil_ready, &self.mutate_gil_ready_lock)
+    }
 }
 
 const _: () = assert!(std::mem::offset_of!(GilReadyState, gil_ready) == 0);
 const _: () = assert!(std::mem::offset_of!(GilReadyState, mutate_gil_ready) == 8);
-const _: () = assert!(
-    std::mem::size_of::<GilReadyState>()
-        == 8 + std::mem::size_of::<crate::quasiimmut::QuasiImmutField>()
-);
+const _: () = assert!(std::mem::size_of::<GilReadyState>() == 8 + 2 * std::mem::size_of::<usize>());
 
 /// `static mut` so a translated read is a field load of the live cell,
 /// not the initializer folded into the flow graph.
 pub static mut GIL_READY_STATE: GilReadyState = GilReadyState {
     gil_ready: 0,
-    mutate_gil_ready: crate::quasiimmut::QuasiImmutField::new(),
+    mutate_gil_ready: crate::quasiimmut::null_mutate_word(),
+    mutate_gil_ready_lock: crate::quasiimmut::null_mutate_lock(),
 };
 
 /// `quasiimmut.py get_current_qmut_instance` for `GILThreadLocals.gil_ready`.
 pub fn gil_ready_current_qmut() -> Arc<crate::quasiimmut::QuasiImmut> {
     // Raw place: edition 2024 rejects a reference to `static mut`.
     // SAFETY: same single-writer protocol as [`gil_ready_word`].
-    unsafe { (*(&raw const GIL_READY_STATE.mutate_gil_ready)).get_current_qmut_instance() }
+    unsafe {
+        (*(&raw const GIL_READY_STATE))
+            .mutate_gil_ready()
+            .get_current_qmut_instance()
+    }
 }
 
 /// Plain field read of [`GIL_READY_STATE`]. Not `dont_look_inside`.
@@ -76,7 +88,7 @@ pub fn publish_gil_ready() {
     // place for a `static mut` field.
     unsafe {
         let state = &raw mut GIL_READY_STATE;
-        (*state).mutate_gil_ready.invalidate_then_store(|| {
+        (*state).mutate_gil_ready().invalidate_then_store(|| {
             (*state).gil_ready = 1;
         });
     }

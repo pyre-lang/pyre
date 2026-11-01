@@ -410,6 +410,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                         base: site.iter_arg.clone(),
                         array_type_id: array_type_id.clone(),
                         nolength: false,
+                        gckind: crate::model::ArrayGcKind::Gc,
                     },
                 );
                 FunctionGraph::set_concretetype_of_inline(&len, ConcreteType::Signed);
@@ -482,6 +483,9 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             array_type_id.as_deref(),
                         ),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            array_type_id.as_deref(),
+                        ),
                         pure: false,
                     },
                     site.item.clone(),
@@ -512,6 +516,9 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                         item_ty: item_ty.clone(),
                         array_type_id: array_type_id.clone(),
                         nolength: crate::front::typestr::nolength_from_array_type_id(
+                            array_type_id.as_deref(),
+                        ),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
                             array_type_id.as_deref(),
                         ),
                         pure: false,
@@ -902,6 +909,7 @@ mod tests {
                 base: l.clone(),
                 array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.into()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
         );
         let iterated = if enumerate {

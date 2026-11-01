@@ -837,6 +837,9 @@ impl<'a> Lowering<'a> {
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             alias.array_type_id.as_deref(),
                         ),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            alias.array_type_id.as_deref(),
+                        ),
                     }
                 } else if let Some(owner) = self.string_array_remove_owner() {
                     // Tail of RPython `ll_delitem_nonneg`: after
@@ -895,6 +898,9 @@ impl<'a> Lowering<'a> {
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                             STRING_GCREF_GCARRAY_TYPE_ID,
                         )),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )),
                     }
                 } else if let Some(local) = inner_local
                     && !self.index_elem_alias.contains_key(&local)
@@ -933,6 +939,9 @@ impl<'a> Lowering<'a> {
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                            array_type_id.as_str(),
+                        )),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
                             array_type_id.as_str(),
                         )),
                     }
@@ -1019,13 +1028,49 @@ impl<'a> Lowering<'a> {
                     // recursion; `jtransform.py rewrite_op_getsubstruct`).
                     // The typeptr leaf stays for `rewrite_op_setfield` /
                     // `is_typeptr_getset` to drop on a vtable object.
-                    if let Some(nested) = tyref_by_value_struct_decl(dest_ty, self.llbc) {
+                    if let Some(nested) = tyref_by_value_struct_decl(
+                        dest_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ) {
                         let src = value.as_variable().cloned().ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
                             ))
                         })?;
-                        self.emit_inlined_struct_leaf_copy(mir_bb, &base, &src, nested);
+                        let at_offset_zero = self
+                            .struct_field_offset_from_payload(&field_base_ty, field_payload)
+                            == Some(0);
+                        let container_field = match self
+                            .resolve_adt_field(&field_base_ty, field_payload)
+                        {
+                            Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
+                                FieldDescriptor::new(field_name, Some(owner_root))
+                                    .with_owner_id(owner_id)
+                                    .with_owner_declared_gc(container_declared_gc(
+                                        &field_base_ty,
+                                        self.llbc,
+                                        self.gc_struct_ids,
+                                        self.immutable_fields,
+                                    ))
+                                    .with_base_is_deref(base_is_deref)
+                                    .with_host_index(host_index)
+                            }
+                            None => {
+                                FieldDescriptor::new(field_label_from_payload(field_payload), None)
+                                    .with_base_is_deref(base_is_deref)
+                            }
+                        };
+                        self.emit_inlined_struct_leaf_copy(
+                            mir_bb,
+                            &base,
+                            &src,
+                            nested,
+                            &container_field,
+                            at_offset_zero,
+                        );
                         return Ok(());
                     }
                     // Resolve the field through its TypeDecl exactly
@@ -1184,6 +1229,9 @@ impl<'a> Lowering<'a> {
                         index: idx_var,
                         value: value.clone(),
                         item_ty,
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            projection_array_type_id.as_deref(),
+                        ),
                         array_type_id: projection_array_type_id,
                         nolength: projection_array_nolength,
                     }
@@ -1994,10 +2042,18 @@ impl<'a> Lowering<'a> {
                     }
                     // A prebuilt singleton kept in a `OnceLock<usize>` reads
                     // back as the registered object itself
-                    // ([`Lowering::prebuilt_once_value_locals`]); the word it
-                    // is stored as is already that GC reference.
+                    // ([`Lowering::prebuilt_once_value_locals`]). The word is
+                    // a GCREF `ConstRefAddr` (`const_ref_gcref_constant`).
+                    // Dest `PyObjectRef` is `lltype.cast_opaque_ptr`
+                    // (`lltype.py` `ann_cast_opaque_ptr`); aliasing would
+                    // keep `SomePtr(GCREF)` on a `SomeInstance(PyObject)`
+                    // slot (`pairtype(SomePtr, SomeObject).union`).
                     if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
-                        return Ok((None, arg));
+                        match self.ptr_cast_marker(Some(&ValueType::Ref(None)), None, dest_ty, &arg)
+                        {
+                            Some((op, res)) => return Ok((Some(op), res)),
+                            None => return Ok((None, arg)),
+                        }
                     }
                     let src_width = match &operand {
                         Operand::Copy(place) | Operand::Move(place) => {
@@ -2209,13 +2265,16 @@ impl<'a> Lowering<'a> {
                             res,
                         ));
                     }
-                    // `p as usize as *mut T` is `lltype.cast_opaque_ptr`.
-                    // Fold the int→ptr half back to the original GC pointer
-                    // so OptEarlyForce does not force_box a virtual
-                    // W_IntObject (`jtransform.py rewrite_op_cast_opaque_ptr`).
-                    // A flavor-raw dest is int-banked (`rclass.py getgcflavor`);
-                    // folding would leave a GC `*const ()` actual against
-                    // FUNC.ARGS Int. Fall through to `ptr_cast_marker`.
+                    // `p as usize as *mut T` is `lltype.cast_opaque_ptr`
+                    // (`lltype.py` `ann_cast_opaque_ptr`). Recover the
+                    // original GC pointer so OptEarlyForce does not
+                    // force_box a virtual W_IntObject
+                    // (`jtransform.py rewrite_op_cast_opaque_ptr`), then
+                    // narrow to the dest class: a GCREF orig used as
+                    // `PyObjectRef` must become `SomeInstance(PyObject)`,
+                    // not keep `SomePtr(GCREF)`. A flavor-raw dest is
+                    // int-banked (`rclass.py getgcflavor`); folding would
+                    // leave a GC `*const ()` actual against FUNC.ARGS Int.
                     if matches!(dst_kind, ValueType::Ref(_))
                         && flavor_raw_pointer_class_root(
                             dest_ty,
@@ -2226,7 +2285,15 @@ impl<'a> Lowering<'a> {
                         .is_none()
                         && let Some(orig) = self.cast_ptr_to_int_src.get(&arg).cloned()
                     {
-                        return Ok((None, orig));
+                        match self.ptr_cast_marker(
+                            Some(&ValueType::Ref(None)),
+                            None,
+                            dest_ty,
+                            &orig,
+                        ) {
+                            Some((op, res)) => return Ok((Some(op), res)),
+                            None => return Ok((None, orig)),
+                        }
                     }
                     // `promote(p as usize) as *mut T` (`jit.py` `promote`,
                     // `Function.getcode`). The promote result is a new
@@ -5936,6 +6003,9 @@ impl<'a> Lowering<'a> {
                                     &self.raw_alloc_flavor_structs,
                                 )
                             },
+                            gckind: crate::front::typestr::gckind_from_array_type_id(
+                                array_type_id.as_deref(),
+                            ),
                             array_type_id,
                             nolength,
                             pure: false,
@@ -6251,6 +6321,9 @@ impl<'a> Lowering<'a> {
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
+                            gckind: crate::front::typestr::gckind_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
                             pure: false,
                         },
                     });
@@ -6283,6 +6356,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
                         },
                     });

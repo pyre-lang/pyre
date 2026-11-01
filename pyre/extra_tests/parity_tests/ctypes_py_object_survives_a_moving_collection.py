@@ -1,7 +1,7 @@
 # CPython-suite gap: test_ctypes never reads a py_object back after a
 # collection, so nothing there reaches a relocated target.
 # parity-tests reason: this guards a pyre/PyPy moving-GC allocation invariant.
-# pyre-check: pypy-diverges: its container slot is zero-based, so `.value` and `repr` of a fresh py_object raise IndexError on an empty table and answer the first stored object once one exists (measured on PyPy 7.3.20); CFuncPtr.__call__ propagates KeyboardInterrupt and returns None on restype conversion failure rather than reporting both unraisable with the restype's zero value
+# pyre-check: pypy-diverges: its container slot is zero-based, so `.value` and `repr` of a fresh py_object raise IndexError on an empty table and answer the first stored object once one exists (measured on PyPy 7.3.20); CFuncPtr.__call__ propagates KeyboardInterrupt from a callback rather than reporting it unraisable
 # ArgumentError from callback from_param is str(e) without the `argument i: ExcType: ` prefix
 # pypy binds _SimpleCData.__init__(value=), so c_int(value=3).value is 3 there; _SimpleCData ignores keywords
 # import ctypes builds byte-swapped simple types through a metaclass `__init__` whose `type` argument must survive the collecting `type.__call__`; callback ArgumentError message and result-conversion unraisable follow 3.15
@@ -408,7 +408,7 @@ try:
         for fn in (bad, boom):
             F = ctypes.CFUNCTYPE(rt)
             try:
-                print(getattr(rt, "__name__", rt), fn.__name__, "->", repr(F(fn)()))
+                F(fn)(); print(getattr(rt, "__name__", rt), fn.__name__, "returned")
             except BaseException as e:
                 print(getattr(rt, "__name__", rt), fn.__name__, "raised", type(e).__name__)
 finally:

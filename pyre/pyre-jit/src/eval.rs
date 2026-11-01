@@ -626,10 +626,10 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // construction twin: a type compiled against and never frozen still holds
     // the instance.  `flag_patma_collection?` is the `_abc` twin: a type
     // compiled against and never registered still holds the instance.
-    unsafe { (*t).mutate_version_tag.reclaim() };
-    unsafe { (*t).mutate_w_name.reclaim() };
-    unsafe { (*t).mutate_flag_cpython_immutabletype.reclaim() };
-    unsafe { (*t).mutate_flag_patma_collection.reclaim() };
+    unsafe { (*t).mutate_version_tag().reclaim() };
+    unsafe { (*t).mutate_w_name().reclaim() };
+    unsafe { (*t).mutate_flag_cpython_immutabletype().reclaim() };
+    unsafe { (*t).mutate_flag_patma_collection().reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` / `w_fdel?` instances on sweep.
@@ -652,9 +652,9 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `W_Property` prefix, so the same cast covers that layout.
 unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
-    unsafe { (*p).mutate_fget.reclaim() };
-    unsafe { (*p).mutate_fset.reclaim() };
-    unsafe { (*p).mutate_fdel.reclaim() };
+    unsafe { (*p).mutate_fget().reclaim() };
+    unsafe { (*p).mutate_fset().reclaim() };
+    unsafe { (*p).mutate_fdel().reclaim() };
 }
 
 /// The `w_function?` counterpart of [`property_destructor`] for `staticmethod`.
@@ -666,7 +666,7 @@ unsafe fn property_destructor(obj_addr: usize) {
 /// that layout.
 unsafe fn staticmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::StaticMethod;
-    unsafe { (*m).mutate_w_function.reclaim() };
+    unsafe { (*m).mutate_w_function().reclaim() };
 }
 
 /// The `classmethod` twin of [`staticmethod_destructor`].
@@ -678,7 +678,7 @@ unsafe fn staticmethod_destructor(obj_addr: usize) {
 /// that layout.
 unsafe fn classmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::ClassMethod;
-    unsafe { (*m).mutate_w_function.reclaim() };
+    unsafe { (*m).mutate_w_function().reclaim() };
 }
 
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).

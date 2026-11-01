@@ -179,7 +179,8 @@ mod super_tests {
 /// Python property descriptor object.
 ///
 /// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc |
-/// mutate_fget | mutate_fset | mutate_fdel]`
+/// mutate_fget | mutate_fget_lock | mutate_fset | mutate_fset_lock |
+/// mutate_fdel | mutate_fdel_lock]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY", user_layout)]
 #[majit_macros::jit_immutable_fields("fget?", "fset?", "fdel?")]
 pub struct W_Property {
@@ -214,13 +215,37 @@ pub struct W_Property {
     /// its own instance; `property_destructor` in `pyre-jit/src/eval.rs` takes
     /// it back on sweep instead.  `W_TypeObject` and `Function`'s inline
     /// `mutate_<name>` fields carry the same pattern.
-    pub mutate_fget: crate::quasiimmut::QuasiImmutField,
+    pub mutate_fget: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_fget_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// Hidden `mutate_fset` (`quasiimmut.py get_mutate_field_name` of pyre
     /// `fset`; upstream `w_fset?`).
-    pub mutate_fset: crate::quasiimmut::QuasiImmutField,
+    pub mutate_fset: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_fset_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// Hidden `mutate_fdel` (`quasiimmut.py get_mutate_field_name` of pyre
     /// `fdel`; upstream `w_fdel?`).
-    pub mutate_fdel: crate::quasiimmut::QuasiImmutField,
+    pub mutate_fdel: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_fdel_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(W_Property, mutate_fget, mutate_fget_lock);
+crate::quasi_immut_words!(W_Property, mutate_fset, mutate_fset_lock);
+crate::quasi_immut_words!(W_Property, mutate_fdel, mutate_fdel_lock);
+
+impl W_Property {
+    #[inline]
+    pub fn mutate_fget(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_fget, &self.mutate_fget_lock)
+    }
+
+    #[inline]
+    pub fn mutate_fset(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_fset, &self.mutate_fset_lock)
+    }
+
+    #[inline]
+    pub fn mutate_fdel(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_fdel, &self.mutate_fdel_lock)
+    }
 }
 
 /// Allocate a new property object.
@@ -250,9 +275,12 @@ pub fn w_property_new(
             w_doc: PY_NULL,
             w_name: PY_NULL,
             getter_doc: false,
-            mutate_fget: crate::quasiimmut::QuasiImmutField::new(),
-            mutate_fset: crate::quasiimmut::QuasiImmutField::new(),
-            mutate_fdel: crate::quasiimmut::QuasiImmutField::new(),
+            mutate_fget: crate::quasiimmut::null_mutate_word(),
+            mutate_fget_lock: crate::quasiimmut::null_mutate_lock(),
+            mutate_fset: crate::quasiimmut::null_mutate_word(),
+            mutate_fset_lock: crate::quasiimmut::null_mutate_lock(),
+            mutate_fdel: crate::quasiimmut::null_mutate_word(),
+            mutate_fdel_lock: crate::quasiimmut::null_mutate_lock(),
         },
         crate::gc_roots::shadow_stack_get(base + 3),
     )
@@ -305,13 +333,13 @@ pub unsafe fn w_property_reinit(
     // version tag, which is the only other pin a fold over `obj.name` holds.
     // The `is_installed` test is `pyjitpl.py`'s `mutatebox.nonnull()` — a
     // property no loop watches pays one load.
-    if (*prop).mutate_fget.is_installed() {
+    if (*prop).mutate_fget().is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fget);
     }
-    if (*prop).mutate_fset.is_installed() {
+    if (*prop).mutate_fset().is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fset);
     }
-    if (*prop).mutate_fdel.is_installed() {
+    if (*prop).mutate_fdel().is_installed() {
         crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fdel);
     }
     (*prop).fget = fget;
@@ -341,7 +369,7 @@ pub unsafe fn w_property_current_fget_qmut(
     }
     Some(
         (*(obj as *const W_Property))
-            .mutate_fget
+            .mutate_fget()
             .get_current_qmut_instance(),
     )
 }
@@ -358,7 +386,7 @@ pub unsafe fn w_property_current_fset_qmut(
     }
     Some(
         (*(obj as *const W_Property))
-            .mutate_fset
+            .mutate_fset()
             .get_current_qmut_instance(),
     )
 }
@@ -375,7 +403,7 @@ pub unsafe fn w_property_current_fdel_qmut(
     }
     Some(
         (*(obj as *const W_Property))
-            .mutate_fdel
+            .mutate_fdel()
             .get_current_qmut_instance(),
     )
 }
