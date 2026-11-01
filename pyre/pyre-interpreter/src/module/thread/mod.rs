@@ -229,6 +229,8 @@ pub fn ensure_runtime_thread() {
 
 #[cold]
 fn enter_runtime_thread() {
+    // `_make_wrapper_for` enters a callback through this (`rgil.acquire_maybe_in_new_thread`).
+    majit_rlib::rffi::set_acquire_maybe_in_new_thread(enter_external_callback_from_foreign_thread);
     RUNTIME_THREAD_ENTERED.with(|entered| entered.set(true));
     majit_gc::gc_sync::register_thread();
     majit_gc::shadow_stack::register_mutator();

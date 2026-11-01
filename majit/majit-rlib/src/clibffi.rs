@@ -25,8 +25,6 @@ pub type FFI_CLOSUREP = *mut ffi_closure;
 pub type FFI_ABI = ffi_abi;
 /// `clibffi.VOIDPP`.
 pub type VOIDPP = *mut VOIDP;
-/// `clibffi.CALLBACK_TP` as declared for `c_ffi_prep_closure_loc`.
-pub type CALLBACK_TP = unsafe extern "C" fn(FFI_CIFP, VOIDP, VOIDPP, VOIDP);
 
 /// `cConfig.FFI_OK`.
 pub const FFI_OK: INT = libffi_sys::ffi_status_FFI_OK as INT;
@@ -281,7 +279,7 @@ crate::rffi::llexternal!(
 
 crate::rffi::llexternal!(
     pub c_ffi_prep_closure_loc = "ffi_prep_closure_loc",
-    [FFI_CLOSUREP, FFI_CIFP, CALLBACK_TP, VOIDP, VOIDP],
+    [FFI_CLOSUREP, FFI_CIFP, unsafe extern "C" fn(FFI_CIFP, VOIDP, VOIDPP, VOIDP), VOIDP, VOIDP],
     INT,
     compilation_info = ECI
 );
@@ -540,12 +538,7 @@ unsafe fn _ll_callback(_ffi_cif: FFI_CIFP, ll_res: VOIDP, ll_args: VOIDPP, ll_us
     unsafe { (userdata.callback)(ll_args, ll_res, ll_userdata as *mut UserData) };
 }
 
-unsafe extern "C" fn ll_callback(
-    ffi_cif: FFI_CIFP,
-    ll_res: VOIDP,
-    ll_args: VOIDPP,
-    ll_userdata: VOIDP,
-) {
+fn ll_callback(ffi_cif: FFI_CIFP, ll_res: VOIDP, ll_args: VOIDPP, ll_userdata: VOIDP) {
     crate::rposix::_errno_after(RFFI_ERR_ALL | RFFI_ALT_ERRNO);
     unsafe { _ll_callback(ffi_cif, ll_res, ll_args, ll_userdata) };
     crate::rposix::_errno_before(RFFI_ERR_ALL | RFFI_ALT_ERRNO);
@@ -822,6 +815,7 @@ mod tests {
 
     #[test]
     fn callback_funcptr_round_trip_through_raw_funcptr() {
+        crate::rffi::set_acquire_maybe_in_new_thread(majit_gc::gc_sync::enter_external_callback);
         let argtypes = [ffi_type_sint()];
         let cb = CallbackFuncPtr::new(&argtypes, ffi_type_sint(), add_one, 0, FUNCFLAG_CDECL, 0)
             .expect("CallbackFuncPtr");

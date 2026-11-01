@@ -514,7 +514,7 @@ unsafe fn do_invoke(
 }
 
 #[cfg(any(unix, windows))]
-unsafe extern "C" fn invoke_callback(
+fn invoke_callback(
     _ffi_cif: majit_rlib::clibffi::FFI_CIFP,
     ll_res: majit_rlib::rffi::VOIDP,
     ll_args: majit_rlib::clibffi::VOIDPP,
@@ -527,8 +527,6 @@ unsafe extern "C" fn invoke_callback(
         unsafe { std::ptr::write_bytes(ll_res.cast::<u8>(), 0, SIZE_OF_FFI_ARG) };
     }
     let invoked = catch_unwind(AssertUnwindSafe(|| {
-        let _callback =
-            pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
         if let Some(w_callback) = super::hide_reveal::reveal_callback(ll_userdata.cast::<u8>()) {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
@@ -552,8 +550,6 @@ unsafe extern "C" fn invoke_callback(
     }));
     if invoked.is_err() {
         let _ = catch_unwind(AssertUnwindSafe(|| {
-            let _callback =
-                pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
             if let Some(w_callback) = super::hide_reveal::reveal_callback(ll_userdata.cast::<u8>())
                 && let Ok(callback) = callback_arg(w_callback)
             {

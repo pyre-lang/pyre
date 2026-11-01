@@ -263,8 +263,6 @@ mod imp {
         args: *const *const c_void,
         userdata: &ThunkUserdata,
     ) {
-        let _callback =
-            pyre_interpreter::module::thread::enter_external_callback_from_foreign_thread();
         let wref = unsafe { *userdata.slot } as *const pyre_object::weakref::Weakref;
         let obj = unsafe { pyre_object::weakref::w_weakref_deref(wref) };
         if obj.is_null() {

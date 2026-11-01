@@ -2358,6 +2358,9 @@ pub(crate) enum DecoratorAttr {
     /// `analyze_external_call` alone, so it only speaks for a funcobj that
     /// ends up with no graph.
     GcEffects,
+    /// `rffi.py llexternal` `canraise=False` on the C function
+    /// (`canraise.py analyze_external_call`).
+    FuncptrCannotRaise,
 }
 
 impl DecoratorAttr {
@@ -2395,6 +2398,7 @@ impl DecoratorAttr {
             // rlib/jit.py — @not_in_trace sets func.oopspec = "jit.not_in_trace()"
             "not_in_trace" => Self::Oopspec("jit.not_in_trace".to_string()),
             "gc_effects" => Self::GcEffects,
+            "funcptr_canraise_false" => Self::FuncptrCannotRaise,
             _ => return None,
         })
     }
@@ -2464,6 +2468,10 @@ impl FuncObjAttrs {
                 }
                 DecoratorAttr::GcEffects => {
                     func.random_effects_on_gcobjs = true;
+                    None
+                }
+                DecoratorAttr::FuncptrCannotRaise => {
+                    func.canraise = false;
                     None
                 }
             };
@@ -10726,6 +10734,7 @@ impl CallControl {
                 DecoratorAttr::CloseStack => self.mark_close_stack(path),
                 DecoratorAttr::CannotCollect => self.mark_cannot_collect(path),
                 DecoratorAttr::GcEffects => self.mark_external_gc_effects(path),
+                DecoratorAttr::FuncptrCannotRaise => self.mark_external_cannot_raise(path),
             }
         }
     }
@@ -10833,6 +10842,11 @@ impl CallControl {
     /// with no graph.
     pub fn mark_external_gc_effects(&mut self, path: CallPath) {
         self.func_effects_mut(&path).random_effects_on_gcobjs = true;
+    }
+
+    /// `rffi.py llexternal` `canraise=False` on the C function (`canraise.py analyze_external_call`).
+    pub fn mark_external_cannot_raise(&mut self, path: CallPath) {
+        self.func_effects_mut(&path).canraise = false;
     }
 
     /// RPython: collectanalyze.py:31-33 —

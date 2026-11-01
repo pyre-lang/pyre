@@ -2602,9 +2602,9 @@ fn canonical_startup_dir(dir: &Path) -> Wtf8Buf {
 }
 
 /// `script_dir` is the shadowing-check anchor (`config->sys_path_0`'s
-/// directory); `path0` is the literal entry `add_sys_path_0` later prepends to
-/// `sys.path` — `""` for `-c` / stdin / the REPL, the cwd for `-m`, the
-/// script's directory for a script.
+/// directory), recorded only with a `path0`; `path0` is the literal entry
+/// `add_sys_path_0` later prepends to `sys.path` — `""` for `-c` / stdin /
+/// the REPL, the cwd for `-m`, the script's directory for a script.
 // Startup-only caller of `install_builtin_modules`, matching PyPy's
 // `ObjSpace.make_builtins` / `setup_builtin_modules` host phase.  User code
 // can mutate `sys.path` later, but never re-enters this process bootstrap.
@@ -2617,7 +2617,9 @@ pub fn init_sys_path(script_dir: &Path, path0: Option<&std::ffi::OsStr>) {
     // code can mutate `sys.path`.  Module origins are absolute canonical paths,
     // so store the canonical absolute form here for the directory comparison to
     // hold for a relative script argument or a symlinked working directory.
-    *SYS_PATH_0.lock() = Some(canonical_startup_dir(script_dir));
+    // A `None` path0 records no anchor either, as `pymain_run_python` sets
+    // `config->sys_path_0` only alongside the entry.
+    *SYS_PATH_0.lock() = path0.map(|_| canonical_startup_dir(script_dir));
 
     // `pymain_run_python` prepends `sys.path[0]` only after `site` has run, so
     // `site.removeduppaths()` never absolutizes the `-c` / REPL empty entry into
