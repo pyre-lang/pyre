@@ -5927,9 +5927,13 @@ pub(crate) fn fuse_boxing_alloc_with(
             else {
                 return own();
             };
-            // `_first_struct` answers only for a field zero that is itself an
-            // `lltype.Struct`; a pointer to a constructed struct is one word.
-            if expand_inline_struct(level_owner, first).is_none() {
+            // `_first_struct` is the substructure at offset 0
+            // (`lltype.Struct._first_struct`). A field zero that Rust places
+            // at a nonzero offset is not a parent: the chain stops, and
+            // `resolve_header_plan` decides on the level alone.
+            if expand_inline_struct(level_owner, first)
+                .is_none_or(|expansion| !expansion.at_offset_zero)
+            {
                 return own();
             }
             let parent = match unique_store_at_each(graph, level, first, level_locations) {
@@ -17071,6 +17075,144 @@ mod tests {
             )),
             "every level of the dead aggregate chain must be swept: {:#?}",
             ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn first_struct_chain_stops_when_field_zero_is_not_at_offset_zero() {
+        // `heaptracker.py _has_gcstruct_a_vtable` walks `GCSTRUCT._first_struct()`,
+        // and `lltype.Struct._first_struct` is the substructure at offset 0.
+        // A field zero that Rust places at a nonzero offset is not a parent:
+        // the chain is length one and `resolve_header_plan` decides on
+        // `Derived` alone, which stores no header. The offset-0 expansion is
+        // the parent walk that flattens onto the outer owner.
+        type Var = crate::flowspace::model::Variable;
+        let cast_instance = |to: &str, arg: &Var| crate::model::cast_instance_call(to, arg.clone());
+        let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor::new(name, Some(owner.to_string())),
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let ctor = |name: &str| OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor(name),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some(name.into())),
+        };
+        let mut attrs = numeric_boxing_attrs();
+        attrs.insert(
+            "Base".to_string(),
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("args".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        attrs.insert(
+            "Derived".to_string(),
+            vec![
+                ("base".to_string(), ValueType::Ref(Some("Base".into()))),
+                ("extra".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let w_class = graph.alloc_value_var();
+        let args = graph.alloc_value_var();
+        let extra = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![w_class.clone(), args.clone(), extra.clone()];
+        let ty_addr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let ob_type = graph
+            .push_op_var(entry, cast_instance("PyType", &ty_addr), true)
+            .unwrap();
+        let header = graph.push_op_var(entry, ctor("PyObject"), true).unwrap();
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&header, "w_class", "PyObject", &w_class),
+            false,
+        );
+        let base = graph.push_op_var(entry, ctor("Base"), true).unwrap();
+        graph.push_op_var(entry, field(&base, "ob_header", "Base", &header), false);
+        graph.push_op_var(entry, field(&base, "args", "Base", &args), false);
+        let agg = graph.push_op_var(entry, ctor("Derived"), true).unwrap();
+        graph.push_op_var(entry, field(&agg, "base", "Derived", &base), false);
+        graph.push_op_var(entry, field(&agg, "extra", "Derived", &extra), false);
+        let raw = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("Derived".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(raw.clone()));
+
+        let expand = |at_offset_zero: bool| {
+            move |owner: &str, field: &str| {
+                (owner == "Derived" && field == "base")
+                    .then(|| test_inline_expansion(at_offset_zero, Vec::new()))
+            }
+        };
+
+        let mut nonzero = graph.clone();
+        fuse_boxing_alloc_with(&mut nonzero, &attrs, &expand(false));
+        assert!(
+            !nonzero
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "a field zero at a nonzero offset is not a `_first_struct` parent: \
+             the chain of length one leaves Derived without a header"
+        );
+
+        assert_eq!(fuse_boxing_alloc_with(&mut graph, &attrs, &expand(true)), 1);
+        prune_dead_boxing_remnants(&mut graph);
+        let ops = &graph.block(entry).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner, vtable }
+                    if owner == "Derived" && *vtable == 4357049520
+            )),
+            "offset 0 is `_first_struct`: the longer chain stamps the outer owner: {:#?}",
+            ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
+        let stores: Vec<(&str, Option<&str>, &LinkArg)> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &raw => {
+                    Some((field.name.as_str(), field.owner_root.as_deref(), value))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores,
+            vec![
+                ("w_class", Some("PyObject"), &LinkArg::Value(w_class)),
+                ("args", Some("Base"), &LinkArg::Value(args)),
+                ("extra", Some("Derived"), &LinkArg::Value(extra)),
+            ],
         );
     }
 
