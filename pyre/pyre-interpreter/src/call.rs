@@ -2379,11 +2379,13 @@ fn call_user_function_from_call_kw(
         }
     }
 
+    // `pycode.py` `PyCode.funcrun`: `sig = self._signature`.
     let signature = {
         let func_now = roots.get(func_slot);
-        let code_ptr = unsafe { crate::get_pycode(func_now) };
-        let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
-        user_function_signature(code)
+        let w_code = unsafe { crate::getcode(func_now) };
+        let sig_ptr = unsafe { (*(w_code as *const crate::pycode::PyCode))._signature };
+        debug_assert!(!sig_ptr.is_null(), "PyCode._signature");
+        unsafe { &*sig_ptr }
     };
     let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
 
@@ -2434,7 +2436,7 @@ fn call_user_function_from_call_kw(
         pyre_object::PY_NULL,
         &mut scope_w,
         &fnname,
-        &signature,
+        signature,
         defaults_arg,
         w_kw_defs,
     )?;
@@ -2452,50 +2454,6 @@ fn read_root_run(
         out.push(roots.get(base + index));
     }
     out
-}
-
-/// `pycode.py make_signature`.
-///
-/// `gateway::Signature` stores `&'static str` for literal builtin names.
-/// `co_varnames` lives in the code body. `PyCode.funcrun` only needs those
-/// names for `Arguments.parse_into_scope`. The function is rooted for that
-/// call, and `pycode.rs release_code_object_body` clears `co_varnames` only
-/// after the last wrapper is gone. `parse_into_scope` turns an `ArgErr`
-/// (which clones the `Signature`) into a string before returning, so the
-/// borrowed names do not escape this call.
-fn user_function_signature(code: &crate::CodeObject) -> crate::gateway::Signature {
-    let kwonlyargcount = code.kwonlyarg_count as usize;
-    let mut argcount = code.arg_count as usize + kwonlyargcount;
-    let posonlyargcount = code.posonlyarg_count as usize;
-    let mut argnames = Vec::with_capacity(argcount);
-    for index in 0..argcount {
-        argnames.push(code_varname(code.varnames[index].as_str()));
-    }
-    let varargname = if code.flags.contains(crate::CodeFlags::VARARGS) {
-        let name = code_varname(code.varnames[argcount].as_str());
-        argcount += 1;
-        Some(name)
-    } else {
-        None
-    };
-    let kwargname = if code.flags.contains(crate::CodeFlags::VARKEYWORDS) {
-        Some(code_varname(code.varnames[argcount].as_str()))
-    } else {
-        None
-    };
-    crate::gateway::Signature::new(
-        argnames,
-        varargname,
-        kwargname,
-        kwonlyargcount,
-        posonlyargcount,
-    )
-}
-
-fn code_varname(name: &str) -> &'static str {
-    // SAFETY: `name` points into `co_varnames` for the `parse_into_scope` call.
-    // See `user_function_signature`.
-    unsafe { &*(name as *const str) }
 }
 
 /// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
@@ -3575,11 +3533,11 @@ fn signature_accepts_keywords(sig: &crate::Signature) -> bool {
 }
 
 fn signature_cls_constructor(sig: &crate::Signature) -> bool {
-    sig.argnames.first().copied() == Some("cls")
+    sig.argnames.first().map(|name| name.as_ref()) == Some("cls")
 }
 
 fn signature_method_self(sig: &crate::Signature) -> bool {
-    sig.argnames.first().copied() == Some("self") && sig.posonlyargcount >= 1
+    sig.argnames.first().map(|name| name.as_ref()) == Some("self") && sig.posonlyargcount >= 1
 }
 
 /// Clinic METH_KEYWORDS wrappers report the function name
@@ -3626,7 +3584,7 @@ fn clinic_first_unfilled_required(
         if npos > i {
             continue;
         }
-        let name = sig.argnames[i];
+        let name = sig.argnames[i].as_ref();
         let filled_by_kw = keyword_names_w
             .iter()
             .any(|&w_name| keyword_name_utf8(&keyword_name_text(w_name)) == Some(name));
@@ -6878,6 +6836,116 @@ except TypeError as e:
             get_str(w_globals, "r_bound_missing"),
             "A.m() missing 1 required positional argument: 'a'"
         );
+    }
+
+    /// `pycode.py` `make_signature` for posonly, kwonly, `CO_VARARGS`, and
+    /// `CO_VARKEYWORDS`. `PyCode.__init__` stores it on `PyCode._signature`,
+    /// and both `PyCode.funcrun` CALL_KW reads use that pointer.
+    #[test]
+    fn call_kw_reads_stored_make_signature() {
+        let define = "\
+def f(a, b, /, c, *args, d, **kwargs):
+    return (a, b, c, args[0], d, kwargs['z'])
+";
+        let roots = pyre_object::gc_roots::push_roots();
+        let w_globals = run_snippet(define);
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_globals);
+
+        let signature_ptr = stored_signature_ptr(roots.get(slot));
+        {
+            let sig = unsafe { &*signature_ptr };
+            let w_code = function_code(roots.get(slot));
+            let built = crate::pycode::make_signature(unsafe {
+                &*(w_code as *const crate::pycode::PyCode)
+            });
+            assert_eq!(*sig, built);
+            assert_eq!(
+                sig.argnames
+                    .iter()
+                    .map(|name| name.as_ref())
+                    .collect::<Vec<_>>(),
+                vec!["a", "b", "c", "d"]
+            );
+            assert!(
+                sig.argnames
+                    .iter()
+                    .all(|name| matches!(name, std::borrow::Cow::Owned(_)))
+            );
+            assert_eq!(sig.varargname.as_deref(), Some("args"));
+            assert!(matches!(
+                sig.varargname.as_ref(),
+                Some(std::borrow::Cow::Owned(_))
+            ));
+            assert_eq!(sig.kwargname.as_deref(), Some("kwargs"));
+            assert!(matches!(
+                sig.kwargname.as_ref(),
+                Some(std::borrow::Cow::Owned(_))
+            ));
+            assert_eq!(sig.posonlyargcount, 2);
+            assert_eq!(sig.kwonlyargcount, 1);
+        }
+
+        exec_in_globals("r1 = f(1, 2, 3, 9, d=4, z=5)\n", roots.get(slot));
+        let globals = roots.get(slot);
+        assert_eq!(stored_signature_ptr(globals), signature_ptr);
+        expect_ints(globals, "r1", &[1, 2, 3, 9, 4, 5]);
+
+        exec_in_globals("r2 = f(1, 2, 3, 8, d=4, z=6)\n", roots.get(slot));
+        let globals = roots.get(slot);
+        assert_eq!(stored_signature_ptr(globals), signature_ptr);
+        expect_ints(globals, "r2", &[1, 2, 3, 8, 4, 6]);
+
+        unsafe {
+            (&mut (*signature_ptr).argnames)[0] = std::borrow::Cow::Owned("renamed".to_string());
+        }
+        exec_in_globals(
+            "\
+try:
+    f(d=1)
+except TypeError as e:
+    r_err = str(e)
+",
+            roots.get(slot),
+        );
+        let globals = roots.get(slot);
+        assert_eq!(stored_signature_ptr(globals), signature_ptr);
+        assert_eq!(
+            get_str(globals, "r_err"),
+            "f() missing 3 required positional arguments: 'renamed', 'b', and 'c'"
+        );
+    }
+
+    fn exec_in_globals(
+        source: &str,
+        globals: pyre_object::PyObjectRef,
+    ) -> pyre_object::PyObjectRef {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        // `initialize_frame_scopes` already aliased `w_locals` to this
+        // frame's own globals. Point both at the caller's dict so
+        // LOAD_NAME / STORE_NAME see the function `f` defined there.
+        frame.set_w_globals(globals);
+        let globals = frame.get_w_globals();
+        frame.setdictscope(globals, false).expect("setdictscope");
+        frame
+            .execute_frame(None, None)
+            .expect("call_kw stored signature snippet");
+        frame.get_w_globals()
+    }
+
+    fn function_code(w_globals: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+        let func = unsafe { pyre_object::w_dict_getitem_str(w_globals, "f") }.expect("f");
+        assert!(unsafe { crate::is_function(func) });
+        unsafe { crate::getcode(func) }
+    }
+
+    fn stored_signature_ptr(w_globals: pyre_object::PyObjectRef) -> *mut crate::gateway::Signature {
+        let w_code = function_code(w_globals);
+        let sig_ptr = unsafe { (*(w_code as *const crate::pycode::PyCode))._signature };
+        assert!(!sig_ptr.is_null());
+        sig_ptr
     }
 }
 

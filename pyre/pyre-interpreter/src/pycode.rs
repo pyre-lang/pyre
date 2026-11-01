@@ -572,6 +572,15 @@ pub const _immutable_fields_Signature: &str =
 /// immutable on `PyCode`. The body's name tables and kind bytes are
 /// [`_immutable_fields_CodeObject`]. `source_path` stays mutable
 /// (`fix_code_filenames`).
+///
+/// `PyCode._signature` is absent from `jit_immutable_fields`. A trace
+/// constant `PyCode` stays rooted only while it remains a `ConstPtr`
+/// operand: `rewrite.py` `gcrefs_output_list` becomes the loop token's
+/// `GcTable` (`register_gc_table`). `optimize_GETFIELD_GC_I` folds an
+/// `is_always_pure` field of that constant to a `ConstInt` and deletes the
+/// getfield, so the wrapper can leave the list while a baked pointer
+/// remains. `pycode_destructor` frees the box `make_signature` built.
+/// `code_ptr` stays listed because that body is not freed.
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("w_globals?", "code_ptr")]
 pub struct PyCode {
@@ -838,6 +847,14 @@ pub struct PyCode {
     /// `pycode.py` keeps per-code JIT state on `PyCode` (`jit_cells`); this
     /// is the same owner for the pyre-only shape latch.
     pub jit_shape: std::sync::atomic::AtomicU8,
+    /// `pycode.py` `PyCode.__init__` stores `self._signature = make_signature(self)`.
+    ///
+    /// `Signature.__init__` owns `argnames`, `varargname`, and `kwargname`.
+    /// Names taken from `co_varnames` are `Cow::Owned`, so this host box
+    /// lives exactly as long as the wrapper. `pycode_destructor` frees it
+    /// on the same path as `filename_bytes`. Not a GC reference:
+    /// `walk_enrolled_code_roots` does not trace it.
+    pub _signature: *mut crate::gateway::Signature,
 }
 
 pyre_object::quasi_immut_words!(PyCode, mutate_w_globals, mutate_w_globals_lock);
@@ -1038,10 +1055,48 @@ pub fn unpack_text_tuple(_space: PyObjectRef, w_str_tuple: PyObjectRef) -> Vec<S
     Vec::new()
 }
 
-/// Compatibility API for building a signature-like object.
-pub fn make_signature(_code: &PyCode) -> PyObjectRef {
-    let _ = _code;
-    pyre_object::w_none()
+/// `pycode.py` `make_signature`.
+///
+/// `Signature.__init__` owns `argnames`, `varargname`, and `kwargname`.
+/// Names taken from `co_varnames` are `Cow::Owned`. `PyCode.__init__`
+/// stores the result on `PyCode._signature`. `PyCode.funcrun` reads it.
+pub fn make_signature(code: &PyCode) -> crate::gateway::Signature {
+    debug_assert!(
+        !code.code_ptr.is_null()
+            && (code.code_ptr as usize) % std::mem::align_of::<crate::CodeObject>() == 0,
+        "make_signature"
+    );
+    let body = unsafe { &*code.code_ptr };
+    let kwonlyargcount = body.kwonlyarg_count as usize;
+    let mut argcount = body.arg_count as usize + kwonlyargcount;
+    let posonlyargcount = body.posonlyarg_count as usize;
+    let mut argnames = Vec::with_capacity(argcount);
+    for index in 0..argcount {
+        argnames.push(std::borrow::Cow::Owned(
+            body.varnames[index].as_str().to_string(),
+        ));
+    }
+    let varargname = if body.flags.contains(crate::CodeFlags::VARARGS) {
+        let name = std::borrow::Cow::Owned(body.varnames[argcount].as_str().to_string());
+        argcount += 1;
+        Some(name)
+    } else {
+        None
+    };
+    let kwargname = if body.flags.contains(crate::CodeFlags::VARKEYWORDS) {
+        Some(std::borrow::Cow::Owned(
+            body.varnames[argcount].as_str().to_string(),
+        ))
+    } else {
+        None
+    };
+    crate::gateway::Signature {
+        argnames,
+        varargname,
+        kwargname,
+        kwonlyargcount,
+        posonlyargcount,
+    }
 }
 
 /// pycode.py _compute_args_as_cellvars
@@ -1437,12 +1492,25 @@ fn w_code_new_owned(
         mutate_w_globals: pyre_object::quasiimmut::null_mutate_word(),
         mutate_w_globals_lock: pyre_object::quasiimmut::null_mutate_lock(),
         jit_shape: std::sync::atomic::AtomicU8::new(JIT_SHAPE_UNCOMPUTED),
+        _signature: std::ptr::null_mut(),
     };
     // The raw-address JIT compatibility seam described above requires a
     // stable wrapper address. `malloc_typed_stable` is still a managed
     // allocation: unlike the prebuilt allocator it can be reclaimed by a
     // major collection, but it is born in oldgen and never relocates.
     let obj = pyre_object::lltype::malloc_typed_stable(obj) as PyObjectRef;
+    if code_ptr_aligned {
+        // `pycode.py` `PyCode.__init__`: `self._signature = make_signature(self)`.
+        // Host box, not a GC reference, so it is stored before the later
+        // const and name allocations. `pycode_destructor` frees it on the
+        // same path as `filename_bytes`.
+        let signature = Box::into_raw(Box::new(unsafe {
+            make_signature(&*(obj as *const PyCode))
+        }));
+        unsafe {
+            (*(obj as *mut PyCode))._signature = signature;
+        }
+    }
     // PyPy's ast compiler has already wrapped every entry before PyCode.__init__
     // (`assemble.py add_const`). Pin the freshly allocated wrapper while
     // recursive code constants and managed scalar constants allocate, then
@@ -4972,6 +5040,13 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     if !code.filename_bytes.is_null() {
         drop(unsafe { Box::from_raw(code.filename_bytes) });
         code.filename_bytes = std::ptr::null_mut();
+    }
+    if !code._signature.is_null() {
+        // `PyCode._signature` is the host box `make_signature` built.
+        // `Signature.__init__` owns the names, so the box lives exactly
+        // as long as the wrapper.
+        drop(unsafe { Box::from_raw(code._signature) });
+        code._signature = std::ptr::null_mut();
     }
     if !code.co_code_bytes.is_null() {
         drop(unsafe { Box::from_raw(code.co_code_bytes) });
