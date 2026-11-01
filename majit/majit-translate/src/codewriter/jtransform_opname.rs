@@ -3350,25 +3350,28 @@ mod tests {
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }
 
-    /// `build_ll_call_lookup_function_helper_graph` calls `ll_dict_lookup`
-    /// with a Void `T` (`lowlevel_type_const(TYPE_LONG)`). Lowering drops
-    /// that operand rather than materialising it.
+    /// `build_ll_call_lookup_function_helper_graph` calls each width's
+    /// `ll_dict_lookup__T` with a Void `T` (`lowlevel_type_const(TYPE_*)`).
+    /// Lowering drops that operand rather than materialising it. The else
+    /// arm is `ll_dict_create_initial_index(d)`.
     #[test]
     fn lower_graph_lowers_ll_call_lookup_function_dropping_void_t() {
         use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
-        use crate::translator::rtyper::lltypesystem::rordereddict::build_ll_call_lookup_function_helper_graph;
+        use crate::translator::rtyper::lltypesystem::rordereddict::{
+            build_ll_call_lookup_function_helper_graph, index_width_rows,
+        };
 
         let dict_ptr = STRPTR.clone();
         let key_lltype = LowLevelType::Signed;
-        let ensure_ft = FuncType {
+        let create_ft = FuncType {
             args: vec![dict_ptr.clone()],
             result: LowLevelType::Void,
         };
-        let ensure_fn = functionptr(
-            ensure_ft,
-            "ll_ensure_indexes",
+        let create_fn = functionptr(
+            create_ft,
+            "ll_dict_create_initial_index",
             None,
-            Some("ll_ensure_indexes".to_string()),
+            Some("ll_dict_create_initial_index".to_string()),
         );
         let lookup_ft = FuncType {
             args: vec![
@@ -3380,18 +3383,27 @@ mod tests {
             ],
             result: LowLevelType::Signed,
         };
-        let lookup_fn = functionptr(
-            lookup_ft,
-            "ll_dict_lookup",
-            None,
-            Some("ll_dict_lookup".to_string()),
-        );
+        let lookup_fns = index_width_rows()
+            .into_iter()
+            .map(|(func, t, _)| {
+                let name = format!("ll_dict_lookup__{}", t.short_name());
+                let lookup_fn = functionptr(lookup_ft.clone(), &name, None, Some(name.clone()));
+                (
+                    func,
+                    t,
+                    Constant::with_concretetype(
+                        ConstValue::LLPtr(Box::new(lookup_fn)),
+                        LowLevelType::Void,
+                    ),
+                )
+            })
+            .collect();
         let helper = build_ll_call_lookup_function_helper_graph(
             "ll_call_lookup_function",
             dict_ptr,
             key_lltype,
-            Constant::with_concretetype(ConstValue::LLPtr(Box::new(ensure_fn)), LowLevelType::Void),
-            Constant::with_concretetype(ConstValue::LLPtr(Box::new(lookup_fn)), LowLevelType::Void),
+            lookup_fns,
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(create_fn)), LowLevelType::Void),
         )
         .expect("build_ll_call_lookup_function_helper_graph");
 
@@ -3404,19 +3416,28 @@ mod tests {
                 }
             }
         }
+        let widths = index_width_rows();
         assert_eq!(
-            calls,
-            vec![
-                (
-                    crate::model::CallTarget::function_path(["ll_ensure_indexes"]),
-                    1
-                ),
-                (
-                    crate::model::CallTarget::function_path(["ll_dict_lookup"]),
-                    4
-                ),
-            ],
-            "lookup keeps d, key, hash, flag and drops Void T"
+            calls.len(),
+            widths.len() + 1,
+            "one lookup per width plus create_initial_index, got {calls:?}"
+        );
+        for (_, t, _) in &widths {
+            let name = format!("ll_dict_lookup__{}", t.short_name());
+            assert!(
+                calls.iter().any(|(target, argc)| {
+                    *target == crate::model::CallTarget::function_path([name.as_str()])
+                        && *argc == 4
+                }),
+                "lookup keeps d, key, hash, flag and drops Void T ({name}), got {calls:?}"
+            );
+        }
+        assert!(
+            calls.iter().any(|(target, argc)| {
+                *target == crate::model::CallTarget::function_path(["ll_dict_create_initial_index"])
+                    && *argc == 1
+            }),
+            "else arm is ll_dict_create_initial_index(d), got {calls:?}"
         );
     }
 
