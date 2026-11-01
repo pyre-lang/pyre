@@ -3472,10 +3472,22 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
     if let Some(array) = descr_ref.as_array_descr() {
         return Operand::descr(DescrOperand::Bh(BhDescr::from_array_descr(array)));
     }
+    // `jtransform.py handle_regular_call`: the leading descr of
+    // `inline_call_*` is the callee JitCode (`AbstractDescr`).
+    if let Some(jc) = descr_ref.as_jitcode_descr() {
+        let idx = jc.jitcode_index();
+        let jitcode = pyre_jit_trace::jitcode_runtime::get_runtime_jitcode_by_index(idx)
+            .unwrap_or_else(|| {
+                panic!(
+                    "flatten_descr_by_ptr: JitCode index {idx} is missing from the runtime table"
+                )
+            });
+        return Operand::descr(DescrOperand::JitCode(jitcode));
+    }
     panic!(
         "flatten_descr_by_ptr: unmapped DescrByPtr {} — only PyFrame vinfo \
          array_field / array / static_field descrs, FieldDescr, ArrayDescr, \
-         and CallDescrStub are recognised today",
+         CallDescrStub, and JitCode descrs are recognised today",
         descr_ref.repr()
     )
 }

@@ -2399,6 +2399,26 @@ fn emit_vable_getfield_ref(
     )
 }
 
+/// `jtransform.py rewrite_op_getfield` virtualizable int branch: `-live-`
+/// then `getfield_vable_i` of `[v_inst, descr]`.
+fn emit_vable_getfield_int(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    frame_var: super::flow::Variable,
+    field_idx: u16,
+    offset: i64,
+) -> super::flow::Variable {
+    record_graph_op(block, super::flatten::OPNAME_LIVE, Vec::new(), None, offset);
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "getfield_vable_i",
+        vable_getfield_ref_graph_args(frame_var.into(), field_idx),
+        Kind::Int,
+        offset,
+    )
+}
+
 /// `jtransform.py rewrite_op_hint` promote: `-live-` then
 /// `{kind}_guard_value`.
 fn emit_do_promote(
@@ -2606,16 +2626,13 @@ fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
 ///
 /// `ec.space.reverse_debugging` is constant false. Every jitcode emits this
 /// at each instruction start (`frame_var` is that jitcode's own frame).
-/// The three continue paths (null `debugdata`, null `w_f_trace`, residual)
+/// The three continue paths (null `debugdata`, null `w_f_trace`, inline_call)
 /// join and the opcode body continues.
 ///
-/// `next_instr = r_uint(self.last_instr)` is served by the residual helper
-/// (`bh_bytecode_only_trace_jitted` rebases through
-/// `set_last_instr_from_next_instr`); the jitcode then continues the current
-/// opcode, so a trace-function jump (`fset_f_lineno`) taken inside
-/// compiled/blackholed code continues at the old opcode — the same gap as
-/// `emit_jump_absolute_tick`'s `jumpto = r_uint(self.last_instr)`
-/// (`interp_jit.py PyFrame.jump_absolute`).
+/// `ec.bytecode_only_trace(self)` is `jtransform.py handle_regular_call` of
+/// the translator jitcode `bytecode_only_trace__AccessDirect_None`. After
+/// the call, `next_instr = r_uint(self.last_instr)` is a vable `last_instr`
+/// reload (`dispatch_bytecode`).
 fn emit_dispatch_bytecode_jitted_trace_arm(
     code: &CodeObject,
     graph: &mut super::flow::FunctionGraph,
@@ -2624,8 +2641,6 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     frame_var: super::flow::Variable,
     ec_var: super::flow::Variable,
     py_pc: usize,
-    bytecode_only_trace_fn_idx: u16,
-    bytecode_only_trace_flavor: CallFlavor,
     catch_for_pc: &[Option<u16>],
     catch_sites: &[ExceptionCatchSite],
     unwind_memo: &mut Vec<SharedUnwindEntry>,
@@ -2683,17 +2698,29 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     );
     arm_blocks.push(tr_armed.block());
 
-    let _ = record_residual_call_graph_op(
+    use super::flow::{FlowListOfKind, SpaceOperationArg};
+    let jitcode_index =
+        pyre_jit_trace::jitcode_runtime::bytecode_only_trace_access_directly_jitcode_index()
+            .expect("bytecode_only_trace__AccessDirect_None jitcode");
+    let _frame_out = emit_graph_op_with_result(
         graph,
         &tr_armed.block(),
-        bytecode_only_trace_fn_idx,
-        bytecode_only_trace_flavor,
-        majit_ir::RuntimeHelperKind::None,
-        vec![],
-        vec![ec_var.into(), frame_var.into()],
-        vec![],
-        vec![Kind::Ref, Kind::Ref],
-        ResKind::Void,
+        "inline_call_r_r",
+        vec![
+            pyre_jit_trace::descr::make_jitcode_descr(jitcode_index).into(),
+            SpaceOperationArg::ListOfKind(FlowListOfKind::new(
+                Kind::Ref,
+                vec![ec_var.into(), frame_var.into()],
+            )),
+        ],
+        Kind::Ref,
+        py_pc as i64,
+    );
+    let _next_instr = emit_vable_getfield_int(
+        graph,
+        &tr_armed.block(),
+        frame_var,
+        VABLE_LAST_INSTR_FIELD_IDX,
         py_pc as i64,
     );
     if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
@@ -4473,7 +4500,6 @@ struct FnPtrIndices {
     clear_in_flight_exception_fn: HelperHandle,
     bytecode_trace_jitted_slow_fn: HelperHandle,
     eval_lazy_import_name_fn: HelperHandle,
-    bytecode_only_trace_jitted_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -5251,14 +5277,6 @@ fn register_helper_fn_pointers(
         cpu.eval_lazy_import_name_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `dispatch_bytecode` jitted arm residual: `bytecode_only_trace` runs
-    // the frame's `w_f_trace` and may execute Python → `MayForce`.
-    // Appended last so every pre-existing helper index remains stable.
-    let bytecode_only_trace_jitted_fn = bind(
-        assembler,
-        cpu.bytecode_only_trace_jitted_fn as *const (),
-        CallFlavor::MayForce,
-    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -5370,7 +5388,6 @@ fn register_helper_fn_pointers(
         clear_in_flight_exception_fn,
         bytecode_trace_jitted_slow_fn,
         eval_lazy_import_name_fn,
-        bytecode_only_trace_jitted_fn,
     }
 }
 
@@ -7592,11 +7609,6 @@ impl CodeWriter {
                     idx: eval_lazy_import_name_fn_idx,
                     flavor: _eval_lazy_import_name_fn_flavor,
                 },
-            bytecode_only_trace_jitted_fn:
-                HelperHandle {
-                    idx: bytecode_only_trace_jitted_fn_idx,
-                    flavor: bytecode_only_trace_jitted_fn_flavor,
-                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // Every per-code Python body carries the portal markers because all
@@ -9072,7 +9084,9 @@ impl CodeWriter {
         // is the pycode green: `rewrite_op_hint` promote, then either
         // `jit_merge_point` or the dropped `can_enter_jit` argument.
         //
-        // The remaining vable scalar variants (`getfield_vable_i/f`,
+        // `getfield_vable_i` production sites call `emit_vable_getfield_int`
+        // (`dispatch_bytecode` `next_instr = r_uint(self.last_instr)`).
+        // The remaining vable scalar variants (`getfield_vable_f`,
         // `setfield_vable_r/f`) have assembler dispatch arms but no
         // production emit site today; those arms already require the same
         // canonical `[v_inst, ... descr]` operand shape.
@@ -10052,8 +10066,6 @@ impl CodeWriter {
                                 frame_var,
                                 ec_var,
                                 py_pc,
-                                bytecode_only_trace_jitted_fn_idx,
-                                bytecode_only_trace_jitted_fn_flavor,
                                 &catch_for_pc,
                                 &catch_sites,
                                 &mut unwind_memo,
@@ -20055,13 +20067,21 @@ mod tests {
             opnames.contains(&"getfield_gc_r"),
             "non-null debugdata arm reads FrameDebugData.w_f_trace, got {opnames:?}"
         );
+        assert!(
+            opnames.contains(&"inline_call_r_r"),
+            "armed arm inline_calls bytecode_only_trace__AccessDirect_None, got {opnames:?}"
+        );
+        assert!(
+            opnames.contains(&"getfield_vable_i"),
+            "armed arm reloads last_instr after bytecode_only_trace, got {opnames:?}"
+        );
         let residual_void = opnames
             .iter()
             .filter(|&&name| name == "residual_call_r_v")
             .count();
         assert!(
-            residual_void >= 2,
-            "armed arm residual-calls bytecode_only_trace (plus jump_absolute tick), got {opnames:?}"
+            residual_void >= 1,
+            "jump_absolute tick residual-calls bytecode_trace, got {opnames:?}"
         );
     }
 

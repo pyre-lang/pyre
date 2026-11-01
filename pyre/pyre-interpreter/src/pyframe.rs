@@ -2566,7 +2566,7 @@ pub fn report_stack_underflow(frame: &PyFrame) {
 /// Only a frame carrying its own `f_trace` does.  Such a frame owes a `line`
 /// event at every instruction that can start one, fired by `ec.bytecode_trace`
 /// from the dispatch loop.  A compiled loop fires those later from
-/// `dispatch_bytecode`'s jitted arm (`bytecode_only_trace` residual).
+/// `dispatch_bytecode`'s jitted arm (`inline_call` of `bytecode_only_trace`).
 ///
 /// Neither hook that installs globally is here, and both are deliberate.
 /// `executioncontext.py settrace` keeps the JIT on and widens `trace_limit`

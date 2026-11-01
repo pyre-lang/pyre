@@ -1492,6 +1492,7 @@ impl ExecutionContext {
         Ok(pyre_object::gc_roots::shadow_stack_get(retval_slot))
     }
 
+    #[majit_macros::always_inline]
     #[inline(always)]
     pub fn bytecode_trace(
         &mut self,
@@ -1558,6 +1559,7 @@ impl ExecutionContext {
     /// per-frame trace is unset (so a later `frame.f_trace = cb`
     /// observes the unmodified instr_prev_plus_one and can fire its
     /// first `line` event correctly).
+    #[majit_macros::always_inline]
     #[inline(always)]
     /// Answers the frame, because the tracer arm below runs Python and a frame
     /// a compiled trace built moves there.  Returning it puts the reload on the
@@ -1576,7 +1578,7 @@ impl ExecutionContext {
             return Ok(frame);
         }
         let f_trace_is_none = unsafe { (*frame).get_w_f_trace().is_null() };
-        if f_trace_is_none || self.is_tracing != 0 || self.w_tracefunc.is_null() {
+        if f_trace_is_none || self.is_tracing != 0 || self.gettrace().is_null() {
             return Ok(frame);
         }
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
@@ -1633,6 +1635,8 @@ impl ExecutionContext {
         if frame.is_null() {
             return Ok(());
         }
+        // `code = frame.getcode() # promote the frame!` (`run_trace_func`).
+        let _code = unsafe { (*frame).getcode() };
         // Reached only with a tracer installed, so the anchor is already on the
         // slow path.  `getorcreatedebug` allocates a nursery `FrameDebugData`
         // and the events below run Python, so take it before either.

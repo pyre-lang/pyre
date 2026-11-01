@@ -14567,6 +14567,74 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
     );
 }
 
+/// `walker_implement_guard_value` mints `ConstPtr` for a Ref box
+/// (`executor.py constant_from_op`).
+#[test]
+fn walker_implement_guard_value_mints_const_ref_for_a_ref_box() {
+    let mut tc = fresh_trace_ctx();
+    let concrete_ptr: usize = 0xfeed_face;
+    let source = tc.const_ref(concrete_ptr as i64);
+    let value_opref = tc.record_op(majit_ir::OpCode::SameAsR, &[source]);
+    assert_eq!(value_opref.ty(), Some(Type::Ref));
+    let regs_r = [value_opref];
+    let regs_i = [OpRef::None];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let promoted = walker_implement_guard_value(&mut wc, 0, value_opref, concrete_ptr as i64)
+        .expect("Ref box must mint ConstPtr");
+    let (last_opcode, last_args0, last_args1) = {
+        let ops = wc.trace_ctx.ops();
+        let last = ops.last().expect("GUARD_VALUE");
+        let args = last.getarglist();
+        (last.opcode, args[0].clone(), args[1].clone())
+    };
+    assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
+    assert_eq!(last_args0.to_opref(), value_opref);
+    assert_eq!(
+        wc.trace_ctx.const_type(last_args1.to_opref()),
+        Some(Type::Ref)
+    );
+    assert_eq!(
+        wc.trace_ctx.const_value(last_args1.to_opref()),
+        Some(concrete_ptr as i64)
+    );
+    assert_eq!(promoted, last_args1.to_opref());
+}
+
 /// `int_guard_value/i` records `GuardValue(value, ConstInt(concrete))`
 /// through the same bank-parameterized body as the Ref and Float variants.
 #[test]

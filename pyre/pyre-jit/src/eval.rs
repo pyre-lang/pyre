@@ -10111,7 +10111,7 @@ fn eval_with_jit_inner(
     // `eval_loop_jit`'s `bytecode_trace` fires its `line` events, including
     // an `f_lineno` jump (`set_last_instr_from_next_instr` then `continue`).
     // Compiled code fires later `line` events from `dispatch_bytecode`'s
-    // jitted arm (`bytecode_only_trace` residual after `last_instr`).
+    // jitted arm (`inline_call` of `bytecode_only_trace` after `last_instr`).
     // `is_being_profiled` is a green on
     // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
     // and is not tested here.
@@ -11398,7 +11398,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) lives in the
         // per-CodeObject JitCode: after each `last_instr` store the codewriter
         // emits the `debugdata` and `w_f_trace` null tests and, past both,
-        // a residual `bytecode_only_trace`.  This body is never
+        // `inline_call` of `bytecode_only_trace`.  This body is never
         // traced — pyre records from that JitCode via `run_perfn_walk`.  `we_are_jitted()`
         // here would be a runtime thread-local set only while cranelift-compiled code is
         // on the stack, not the folded compile-time constant upstream's translator sees,

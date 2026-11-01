@@ -662,6 +662,9 @@ static NEWUTF8_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// graph so `_super_check` and `W_Super.getattribute` are traced from their
 /// generated JitCodes, as PyPy traces their RPython owners.
 static LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Generated `bytecode_only_trace__AccessDirect_None` body. Leaf name is
+/// unique (`FunctionDesc.cachedgraph` alt_name).
+static BYTECODE_ONLY_TRACE_AD_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 
 /// Scan the build-time names index for the unique entry equal to `name`.
 ///
@@ -854,6 +857,13 @@ pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {
         compute_pathed_jitcode_index("pyre_interpreter::eval::load_super_attr_value_w")
     }))?;
     get_jitcode_by_index(idx)
+}
+
+/// `jtransform.py handle_regular_call` target for `dispatch_bytecode`'s
+/// jitted arm: `ec.bytecode_only_trace(self)` on an AccessDirect frame.
+pub fn bytecode_only_trace_access_directly_jitcode_index() -> Option<usize> {
+    *BYTECODE_ONLY_TRACE_AD_JITCODE_INDEX
+        .get_or_init(|| compute_named_jitcode_index("bytecode_only_trace__AccessDirect_None"))
 }
 
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
