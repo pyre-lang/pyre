@@ -978,6 +978,9 @@ impl<'a> Lowering<'a> {
         let owner_start = n_locals + len_shadow.iter().flatten().count();
         let owner_shadow = pair_owner_shadows_of(&len_shadow, owner_start);
         let n_slots = owner_start + owner_shadow.iter().flatten().count();
+        // `pair_owner_shadows_of` numbers the owner shadows consecutively
+        // from `owner_start`.
+        let owner_slots = owner_start..n_slots;
         // A body returning a pair slice or a window takes the address of
         // the caller's length slot as a trailing parameter. A STR-view
         // local 0 has no length shadow and still needs the slot.
@@ -1453,7 +1456,7 @@ impl<'a> Lowering<'a> {
                     stamp_rust_vec_header(&var, &local.ty, llbc);
                     stamp_raw_u8_ccharp(&var, &local.ty, llbc);
                 }
-                if owner_shadow.iter().any(|slot| *slot == Some(local_idx)) {
+                if owner_slots.contains(&local_idx) {
                     crate::model::FunctionGraph::set_concretetype_of_inline(
                         &var,
                         crate::model::ConcreteType::GcRef,

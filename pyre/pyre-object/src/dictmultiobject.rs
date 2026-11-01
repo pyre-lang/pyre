@@ -8832,13 +8832,16 @@ mod tests {
         42
     }
 
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static RAISING_EQ_CALLS: AtomicU32 = AtomicU32::new(0);
+    // Per-thread like the `eq_w` hook it counts for (`EQ_W_HOOK`), so tests
+    // running in parallel do not share the count.
+    thread_local! {
+        static RAISING_EQ_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
 
     /// An `eq_w` hook that always raises: it records the call, signals the
     /// error flag, and returns `false` (the Rust `Eq` callback cannot raise).
     unsafe fn raising_eq(a: PyObjectRef, _b: PyObjectRef) -> bool {
-        RAISING_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
+        RAISING_EQ_CALLS.with(|c| c.set(c.get() + 1));
         crate::dict_eq_hook::signal_eq_error(a);
         false
     }
@@ -8868,14 +8871,14 @@ mod tests {
             // Seed one entry while the bucket is empty (no comparison runs).
             w_dict_store(dict, k1, w_int_new(1));
 
-            RAISING_EQ_CALLS.store(0, Ordering::Relaxed);
+            RAISING_EQ_CALLS.with(|c| c.set(0));
             crate::dict_eq_hook::register_eq_w_hook(raising_eq);
             let result = w_dict_store_checked(dict, k2, w_int_new(2));
             crate::dict_eq_hook::clear_eq_w_hook();
 
             assert!(result.is_err());
             // The probe stopped at the first raising comparison.
-            assert_eq!(RAISING_EQ_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(RAISING_EQ_CALLS.with(std::cell::Cell::get), 1);
             // The dict is unchanged: k1 intact, k2 never inserted.
             assert_eq!(w_int_get_value(w_dict_lookup(dict, k1).unwrap()), 1);
             assert!(w_dict_lookup(dict, k2).is_none());
@@ -8927,7 +8930,7 @@ mod tests {
             let k2 = w_long_new(huge + BigInt::from(1));
             w_dict_store(dict, k1, w_int_new(1));
 
-            RAISING_EQ_CALLS.store(0, Ordering::Relaxed);
+            RAISING_EQ_CALLS.with(|c| c.set(0));
             crate::dict_eq_hook::register_eq_w_hook(raising_eq);
             let miss = scan_dict_key_reentrant(dict, 42, k2);
             crate::dict_eq_hook::clear_eq_w_hook();
@@ -8935,19 +8938,23 @@ mod tests {
             assert_eq!(miss, SCAN_DICT_KEY_MISS);
             assert!(take_dict_key_error());
             assert!(!take_dict_key_error());
-            assert_eq!(RAISING_EQ_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(RAISING_EQ_CALLS.with(std::cell::Cell::get), 1);
             assert_eq!(w_int_get_value(w_dict_lookup(dict, k1).unwrap()), 1);
             assert!(w_dict_lookup(dict, k2).is_none());
         }
     }
 
-    static TUPLE_LADDER_EQ_CALLS: AtomicU32 = AtomicU32::new(0);
+    // Per-thread like the `eq_w` hook it counts for (`EQ_W_HOOK`), so tests
+    // running in parallel do not share the count.
+    thread_local! {
+        static TUPLE_LADDER_EQ_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
 
     /// Counts `eq_w` and answers unequal, so a ladder hit is a successful
     /// lookup with a zero count, and a probe that broke is a miss plus a
     /// nonzero count.
     unsafe fn tuple_ladder_eq_false(_a: PyObjectRef, _b: PyObjectRef) -> bool {
-        TUPLE_LADDER_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
+        TUPLE_LADDER_EQ_CALLS.with(|c| c.set(c.get() + 1));
         false
     }
 
@@ -8965,9 +8972,9 @@ mod tests {
             assert!(crate::is_specialised_tuple_oo(stored));
             w_dict_store(dict, stored, w_int_new(7));
             let lookup = crate::w_tuple_new(vec![w_str_new("i"), w_str_new("marker")]);
-            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            TUPLE_LADDER_EQ_CALLS.with(|c| c.set(0));
             let found = w_dict_lookup(dict, lookup);
-            assert_eq!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(TUPLE_LADDER_EQ_CALLS.with(std::cell::Cell::get), 0);
             assert_eq!(w_int_get_value(found.unwrap()), 7);
 
             let stored3 = crate::w_tuple_new(vec![
@@ -8983,9 +8990,9 @@ mod tests {
                 w_str_new("marker"),
                 w_str_new("odd_only"),
             ]);
-            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            TUPLE_LADDER_EQ_CALLS.with(|c| c.set(0));
             let found3 = w_dict_lookup(dict, lookup3);
-            assert_eq!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(TUPLE_LADDER_EQ_CALLS.with(std::cell::Cell::get), 0);
             assert_eq!(w_int_get_value(found3.unwrap()), 8);
 
             // `_ii` hashes by the unboxed ints, so the second pair shares a
@@ -8994,9 +9001,9 @@ mod tests {
             assert!(crate::is_specialised_tuple_ii(ii_stored));
             w_dict_store(dict, ii_stored, w_int_new(9));
             let ii_lookup = crate::w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
-            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            TUPLE_LADDER_EQ_CALLS.with(|c| c.set(0));
             assert!(w_dict_lookup(dict, ii_lookup).is_none());
-            assert!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed) >= 1);
+            assert!(TUPLE_LADDER_EQ_CALLS.with(std::cell::Cell::get) >= 1);
 
             let w_class = crate::w_type_new("TupleSub", crate::PY_NULL, std::ptr::null_mut());
             let sub_stored = crate::w_tuple_subclass_new_array_backed(
@@ -9008,9 +9015,9 @@ mod tests {
                 vec![w_str_new("i"), w_str_new("marker")],
                 w_class,
             );
-            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            TUPLE_LADDER_EQ_CALLS.with(|c| c.set(0));
             assert!(w_dict_lookup(dict, sub_lookup).is_none());
-            assert!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed) >= 1);
+            assert!(TUPLE_LADDER_EQ_CALLS.with(std::cell::Cell::get) >= 1);
             crate::dict_eq_hook::clear_eq_w_hook();
         }
     }

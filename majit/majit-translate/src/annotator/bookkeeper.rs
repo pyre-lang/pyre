@@ -424,6 +424,12 @@ pub struct Bookkeeper {
     /// getattr attaches.  `None` for unit-test fixtures that build the
     /// bookkeeper directly.
     pub enum_variant_by_discriminant: RefCell<Option<Rc<HashMap<String, HashMap<i64, String>>>>>,
+    /// TODO: no upstream equivalent.  The keys of
+    /// `enum_variant_by_discriminant` with their crate prefix stripped
+    /// (`strip_crate_prefix`), sorted and deduplicated, so
+    /// `intern_class_by_qualname` can binary-search a crate-stripped
+    /// spelling instead of scanning every key.
+    enum_variant_stripped_keys: RefCell<Vec<String>>,
     /// TODO: no upstream equivalent.  Interning table mapping a struct
     /// type-root name to its canonical host class `HostObject`.  Because
     /// `HostObject` equality is `Arc` pointer identity (`impl PartialEq for
@@ -1283,6 +1289,7 @@ impl Bookkeeper {
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             struct_fields: RefCell::new(None),
             enum_variant_by_discriminant: RefCell::new(None),
+            enum_variant_stripped_keys: RefCell::new(Vec::new()),
             struct_root_classes: RefCell::new(HashMap::new()),
             exception_carrier: RefCell::new(None),
             exception_carrier_handle: RefCell::new(None),
@@ -1618,6 +1625,13 @@ impl Bookkeeper {
     /// [`Self::enum_variant_narrowing_knowntypedata`].  Idempotent: a
     /// second call overwrites the previous map.
     pub fn set_enum_variant_by_discriminant(&self, map: Rc<HashMap<String, HashMap<i64, String>>>) {
+        let mut stripped: Vec<String> = map
+            .keys()
+            .map(|k| crate::front::mir::strip_crate_prefix(k))
+            .collect();
+        stripped.sort_unstable();
+        stripped.dedup();
+        *self.enum_variant_stripped_keys.borrow_mut() = stripped;
         *self.enum_variant_by_discriminant.borrow_mut() = Some(map);
     }
 
@@ -3802,9 +3816,11 @@ impl Bookkeeper {
                                 .is_some_and(|map| {
                                     map.contains_key(candidate)
                                         || map.contains_key(spelled.as_str())
-                                        || map.keys().any(|k| {
-                                            crate::front::mir::strip_crate_prefix(k) == spelled
-                                        })
+                                        || self
+                                            .enum_variant_stripped_keys
+                                            .borrow()
+                                            .binary_search(&spelled)
+                                            .is_ok()
                                 });
                             if in_variant_table
                                 || reg.enum_base_registry_key(candidate).is_some()
