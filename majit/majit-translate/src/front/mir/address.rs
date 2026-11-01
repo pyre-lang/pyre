@@ -515,16 +515,26 @@ impl<'a> Lowering<'a> {
     /// [`pygraph_initial_block`] already records that parameter as
     /// `Int`. `Rvalue::Ref` of a primitive aliases the scalar, so the
     /// call would pass the word where the callee dereferences an
-    /// address (`*hash_out = digest`). An argument whose place type is
-    /// already a raw pointer is not spilled here.
-    /// [`attach_aliasing_raw_arguments`] passes the spill address when
-    /// that pointer names the spilled place. An `&mut i64` parameter
-    /// is the word on both sides and is left alone. A byte pointer
-    /// stays `Ref`.
+    /// address (`*hash_out = digest`). rustc's `&mut x` → `*mut T`
+    /// coercion is `_r = &mut x; _p = &raw mut (*_r)`: the call
+    /// operand is already a raw pointer whose value is that word, and
+    /// that pointer is spilled too. A raw pointer that is already an
+    /// address (a parameter, or `&raw mut (*p)` of a real pointer) is
+    /// not. [`attach_aliasing_raw_arguments`] passes the spill address
+    /// when another raw argument names the spilled place. A looked-inside
+    /// `&prim` / `&mut prim` parameter is the word on both sides and is
+    /// left alone. A residual callee ([`fun_decl_is_dont_look_inside`])
+    /// whose declared parameter is `&prim` / `&mut prim` is spilled the
+    /// same way as `*const` / `*mut` of that scalar; `&mut` copies the
+    /// word back out (`scoped_alloc` / `_rewrite_raw_malloc`). A residual
+    /// generic `&Q` / `&mut Q` uses `substituted_signature` with the
+    /// call's `concrete_type_args` so `Q = i64` spills and `Q` a
+    /// struct does not. A byte pointer stays `Ref`.
     pub(in crate::front::mir) fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
         arg_tys: &[Option<TyRef>],
+        arg_locals: &[Option<usize>],
     ) -> Vec<RawScalarBorrowSpill> {
         let CallFunc::Regular(reg) = func else {
             return Vec::new();
@@ -535,21 +545,66 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return Vec::new();
         };
+        let callee_dont_look_inside = fun_decl_is_dont_look_inside(fd, self.dont_look_inside);
+        // `fn f<Q>(x: &Q)` keeps `Q` as a TypeVar (`monomorphize:false`).
+        // `pair_or_window_fun_inputs` already instantiates that signature
+        // through `concrete_type_args` / `substituted_signature`.
+        let substituted = callee_dont_look_inside
+            .then(|| crate::front::clause_spec::concrete_type_args(&reg.generics, self.llbc))
+            .flatten()
+            .map(|(types, consts)| {
+                crate::front::clause_spec::substituted_signature(
+                    &fd.signature,
+                    self.llbc,
+                    &types,
+                    &consts,
+                )
+            });
+        let inputs = substituted
+            .as_ref()
+            .map(|sig| sig.inputs.as_slice())
+            .unwrap_or(fd.signature.inputs.as_slice());
         let mut spills = Vec::new();
-        for (index, declared) in fd.signature.inputs.iter().enumerate() {
-            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+        for (index, declared) in inputs.iter().enumerate() {
+            let declared_raw = raw_scalar_address_value_type(declared, self.llbc).is_some();
+            let declared_residual_ref =
+                callee_dont_look_inside && tyref_is_ref_of_primitive(declared, self.llbc);
+            if !declared_raw && !declared_residual_ref {
                 continue;
             }
             let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            if !tyref_is_ref_of_primitive(passed, self.llbc) {
-                continue;
-            }
-            let Some(param_node) = tyref_peel_one_raw_ptr_node(declared, self.llbc) else {
+            let param_node = if declared_raw {
+                tyref_peel_one_raw_ptr_node(declared, self.llbc)
+            } else {
+                tyref_peel_one_ref_node(declared, self.llbc)
+            };
+            let Some(param_node) = param_node else {
                 continue;
             };
-            let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
+            let declared_mut = if declared_raw {
+                raw_ptr_kind_is_mut(declared, self.llbc)
+            } else {
+                ref_kind_is_mut(declared, self.llbc)
+            };
+            let (arg_node, copy_out) = if tyref_is_ref_of_primitive(passed, self.llbc) {
+                let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
+                    continue;
+                };
+                (arg_node, declared_mut && ref_kind_is_mut(passed, self.llbc))
+            } else if raw_scalar_address_value_type(passed, self.llbc).is_some()
+                && self
+                    .raw_scalar_arg_aliases_primitive_word(arg_locals.get(index).copied().flatten())
+            {
+                let Some(arg_node) = tyref_peel_one_raw_ptr_node(passed, self.llbc) else {
+                    continue;
+                };
+                (
+                    arg_node,
+                    declared_mut && raw_ptr_kind_is_mut(passed, self.llbc),
+                )
+            } else {
                 continue;
             };
             let param_pointee = TyRef::Other(param_node.clone());
@@ -574,8 +629,6 @@ impl<'a> Lowering<'a> {
             {
                 continue;
             }
-            let copy_out =
-                raw_ptr_kind_is_mut(declared, self.llbc) && ref_kind_is_mut(passed, self.llbc);
             spills.push(RawScalarBorrowSpill {
                 fun_id: *id,
                 index,
@@ -703,9 +756,17 @@ impl<'a> Lowering<'a> {
                 )));
             }
         }
+        // A residual callee is not entered. The result type is the ABI
+        // (`raw_scalar_dest_holds_thin_spill_address`). Walking the body
+        // would treat a trait call that receives `&Q` (`Hash::hash`) as
+        // leaking the spill through the `u64` hash.
+        let residual_callee = self
+            .llbc
+            .fn_by_id(fun_id)
+            .is_some_and(|fd| fun_decl_is_dont_look_inside(fd, self.dont_look_inside));
         if !groups.is_empty()
-            && (self.raw_scalar_spill_result_escapes(dest_ty)
-                || callee_returns_spill_address(self.llbc, fun_id, &tracked))
+            && (self.raw_scalar_dest_holds_thin_spill_address(dest_ty)
+                || (!residual_callee && callee_returns_spill_address(self.llbc, fun_id, &tracked)))
         {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: raw scalar spill address would escape through the call result"
@@ -845,23 +906,58 @@ impl<'a> Lowering<'a> {
         false
     }
 
+    /// Dest type of a spilled call: a thin scalar pointer (`*mut i64`)
+    /// in the result can be the spilled address. A GCREF / `*mut
+    /// PyObject` (`Option<GCREF>`) is a heap object, not that word.
+    fn raw_scalar_dest_holds_thin_spill_address(&self, ty: &TyRef) -> bool {
+        let mut pending = vec![clone_tyref(ty)];
+        let mut seen = Vec::new();
+        while let Some(ty) = pending.pop() {
+            let key = spill_ty_identity(&ty);
+            if seen.iter().any(|seen| seen == &key) {
+                continue;
+            }
+            seen.push(key);
+            if raw_scalar_address_value_type(&ty, self.llbc).is_some()
+                || tyref_is_ref_of_primitive(&ty, self.llbc)
+            {
+                return true;
+            }
+            if tyref_is_raw_pointer(&ty, self.llbc) || output_type_is_ref(&ty, self.llbc) {
+                continue;
+            }
+            match spill_address_payloads(&ty, self.llbc, self.static_addrs.error_carrier) {
+                SpillPayloads::Unclassified => return true,
+                SpillPayloads::Types(types) => pending.extend(types),
+            }
+        }
+        false
+    }
+
     /// A raw parameter that is not a spill still names an address.
     /// When that address is the spilled place, pass the spill pointer:
     /// `*p = 1; return *q` stays one word. An address-sized integer
     /// whose [`pointer_place_of_local`] names that place is the same
     /// pointer (`type_holds_full_address`): `q = &mut x as *mut i64 as
     /// usize` is passed the spill pointer, and that integer does not
-    /// copy the pointee back. A field projection is that integer when
-    /// its stored operand names a place (`constant_field_path`,
-    /// `spill_address_source`). An integer literal
-    /// (`const_expr_literal`) stays the caller's value. An
-    /// address-sized integer this walk cannot place leaves the call
-    /// unlowered: a parameter, a call result, arithmetic, or `pair.0`
-    /// whose operand is not a single place. A pointer this walk cannot
-    /// place, or a pointer or integer that covers the spilled place,
-    /// leaves the call unlowered. Only a thin scalar pointer shares
-    /// the copy-out. A pointer or that integer packed into a tuple,
-    /// struct, enum, or array is still the caller's place
+    /// copy the pointee back. A `&T` / `&mut T` (a Charon `Ref`, not a
+    /// raw pointer) is judged like a raw pointer by its pointee, never
+    /// as an address-sized integer: a reference to a non-scalar cannot
+    /// name the `&prim` spill through its declared type. A field
+    /// projection is that integer when its stored operand names a
+    /// place (`constant_field_path`, `spill_address_source`). An
+    /// integer literal (`const_expr_literal`) stays the caller's
+    /// value. The pointee word itself (`hash` beside `&mut keyhash`)
+    /// and a plain integer that was never a pointer (`hash_known`)
+    /// stay the caller's value: they hold the scalar, not its address.
+    /// A raw pointer whose declared type is not a thin scalar address
+    /// (`*mut PyObject`) cannot be `q` for this word. A `*mut i64`
+    /// with no referent still leaves the call unlowered, and so does a
+    /// call result, arithmetic, or `pair.0` whose operand is not a
+    /// single place. A pointer or integer that covers the spilled
+    /// place leaves the call unlowered. Only a thin scalar pointer
+    /// shares the copy-out. A pointer or that integer packed into a
+    /// tuple, struct, enum, or array is still the caller's place
     /// (`local_hides_spill_alias`): the aggregate is not rewritten, so
     /// the call stays unlowered. A field that names another place
     /// stays, and so does a tuple of integer literals. A tuple of
@@ -887,11 +983,14 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             let raw = tyref_is_raw_pointer(declared, self.llbc);
+            // A Charon `Ref` (`&T` / `&mut T`) is judged by its pointee
+            // like a raw pointer, not as an address-sized integer.
+            let is_ref = !raw && tyref_peel_one_ref_node(declared, self.llbc).is_some();
             // `usize` / `u64` can be the spilled address with the pointer
             // bits still intact. A narrower integer cannot name it.
-            let address_int = !raw && type_holds_full_address(declared, self.llbc);
+            let address_int = !raw && !is_ref && type_holds_full_address(declared, self.llbc);
             let arg_local = arg_locals.get(index).copied().flatten();
-            if !raw && !address_int {
+            if !raw && !is_ref && !address_int {
                 let hides = match arg_local {
                     Some(local) => self.local_hides_spill_alias(local, groups, 0),
                     None => self.raw_scalar_spill_result_escapes(declared),
@@ -905,13 +1004,20 @@ impl<'a> Lowering<'a> {
                 return Err(self.unspilled_raw_argument(mir_bb));
             };
             // A literal is not the spilled address. A place this walk
-            // cannot name (`pair.0`, a parameter, a call result) stays
-            // unlowered. `spill_address_source` follows a field when its
-            // stored operand names one place.
+            // cannot name stays unlowered unless the operand cannot be
+            // that address: the pointee word, a plain integer, a raw
+            // pointer that is not a thin scalar address, or a `&T` /
+            // `&mut T` whose pointee is not a thin scalar address. A
+            // reference to a non-scalar cannot name the `&prim` spill
+            // through its declared type. `spill_address_source`
+            // follows a field when its stored operand names one place.
             let place = match self.spill_address_source(op, 0) {
-                SpillAddressSource::Constant if !raw => continue,
+                SpillAddressSource::Constant if !raw && !is_ref => continue,
                 SpillAddressSource::Place(place) => place,
                 SpillAddressSource::Constant | SpillAddressSource::Unknown => {
+                    if self.unplaced_argument_is_independent_of_spill(declared, op, groups, raw) {
+                        continue;
+                    }
                     return Err(self.unspilled_raw_argument(mir_bb));
                 }
             };
@@ -936,12 +1042,29 @@ impl<'a> Lowering<'a> {
             }
             let Some(group_index) = exact else {
                 // `q = &pair` names `pair`, not the spilled word. A field
-                // of `pair` can still be that word.
+                // of `pair` can still be that word. A `&T` / `&mut T`
+                // whose pointee is not a thin scalar cannot name the
+                // `&prim` spill through its declared type. rustc
+                // reborrows `&self` as `&(*self)`, so this walk names a
+                // Projection; type-level hides on that referent (pointer
+                // fields of `RDict` / `SomeStruct`) are not the spill. A
+                // Local packing (`&pair` holding `*mut i64`) still hides.
+                if is_ref
+                    && !matches!(place.kind, PlaceKind::Local(_))
+                    && self.unplaced_argument_is_independent_of_spill(declared, op, groups, raw)
+                {
+                    continue;
+                }
                 if self.place_payload_hides_spill_alias(&place, groups, 0) {
                     return Err(self.unspilled_raw_argument(mir_bb));
                 }
                 continue;
             };
+            // `Copy` of the i64 local is that place without being an
+            // address. `q = &mut x as usize` still attaches.
+            if !raw && self.operand_is_plain_integer_word(op, groups, 0) {
+                continue;
+            }
             if raw {
                 // A slice or a byte pointer carries more than this word.
                 if raw_scalar_address_value_type(declared, self.llbc).is_none() {
@@ -961,6 +1084,110 @@ impl<'a> Lowering<'a> {
         LowerError::Unsupported(format!(
             "bb{mir_bb}: raw scalar spill address would escape through an unspilled raw argument"
         ))
+    }
+
+    /// `spill_address_source` could not name this operand. A `*mut i64`
+    /// with no referent might still be `q` in `*p = 1; return *q`. A
+    /// pointer to an ADT, a byte pointer, and a slice cannot be that
+    /// `q` through the declared type. A `&T` / `&mut T` is independent
+    /// unless it is a reference to a primitive
+    /// (`tyref_is_ref_of_primitive`, the type `raw_scalar_borrow_spills`
+    /// spills): `&RDict`, `&[T]`, `&str` and `&SomeStruct` cannot name
+    /// the `&prim` spill; `&i64` and `&mut usize` can. An address-sized
+    /// integer that is the pointee or a plain word (`hash`, `hash_known`)
+    /// cannot either.
+    fn unplaced_argument_is_independent_of_spill(
+        &self,
+        declared: &TyRef,
+        op: &Operand,
+        groups: &[RawScalarAddressGroup],
+        raw: bool,
+    ) -> bool {
+        if raw {
+            return raw_scalar_address_value_type(declared, self.llbc).is_none();
+        }
+        if tyref_peel_one_ref_node(declared, self.llbc).is_some() {
+            return !tyref_is_ref_of_primitive(declared, self.llbc);
+        }
+        self.operand_is_plain_integer_word(op, groups, 0)
+    }
+
+    /// Integer bits that were never a pointer: the spilled word, a
+    /// parameter, or a `Use` of one of those. A call result, a
+    /// projected store, arithmetic, and `q = &mut x as usize` are not.
+    fn operand_is_plain_integer_word(
+        &self,
+        op: &Operand,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        match op {
+            Operand::Const(value) => self.const_is_integer_literal(value),
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.place_is_plain_integer_word(place, groups, depth)
+            }
+        }
+    }
+
+    fn place_is_plain_integer_word(
+        &self,
+        place: &Place,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        if tyref_is_raw_pointer(&place.ty, self.llbc)
+            || !type_holds_full_address(&place.ty, self.llbc)
+        {
+            return false;
+        }
+        if groups.iter().any(|group| {
+            group
+                .place
+                .as_ref()
+                .is_some_and(|group_place| places_alias(group_place, place))
+        }) && self.place_holds_aliased_primitive_word(place)
+        {
+            return true;
+        }
+        let PlaceKind::Local(id) = &place.kind else {
+            return false;
+        };
+        let local = *id as usize;
+        if self.local_is_call_dest(local) || self.local_has_projected_store(local) {
+            return false;
+        }
+        if self.pointer_place_of_local(local, 0).is_some() {
+            return false;
+        }
+        for (bb_idx, block) in self.body.body.iter().enumerate() {
+            if !self.forward_reached[bb_idx] {
+                continue;
+            }
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Rvalue::Use(op, _) = rvalue else {
+                    return false;
+                };
+                if !self.operand_is_plain_integer_word(&op, groups, depth + 1) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// `pair = (q,)` with `q` naming the spilled place. The aggregate
@@ -1024,23 +1251,48 @@ impl<'a> Lowering<'a> {
             .map(|decl| clone_tyref(&decl.ty))
     }
 
-    pub(in crate::front::mir) fn local_is_call_dest(&self, local: usize) -> bool {
-        self.call_dest_locals
-            .get_or_init(|| {
-                let mut out = bit_set::BitSet::new();
-                for (bb_idx, block) in self.body.body.iter().enumerate() {
-                    if !self.forward_reached[bb_idx] {
-                        continue;
-                    }
-                    if let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc)
-                        && let PlaceKind::Local(id) = call.dest.kind
-                    {
-                        out.insert(id as usize);
-                    }
+    fn call_dests(&self) -> &CallDestLocals {
+        self.call_dest_locals.get_or_init(|| {
+            let mut dests = bit_set::BitSet::new();
+            let mut unique: Vec<Option<(RegularCall, Vec<Operand>)>> = Vec::new();
+            for (bb_idx, block) in self.body.body.iter().enumerate() {
+                if !self.forward_reached[bb_idx] {
+                    continue;
                 }
-                out
-            })
-            .contains(local)
+                if let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc)
+                    && let PlaceKind::Local(id) = call.dest.kind
+                {
+                    let local = id as usize;
+                    if dests.contains(local) {
+                        if local < unique.len() {
+                            unique[local] = None;
+                        }
+                    } else if let CallFunc::Regular(reg) = &call.func {
+                        if unique.len() <= local {
+                            unique.resize_with(local + 1, || None);
+                        }
+                        unique[local] = Some((reg.clone(), call.args.clone()));
+                    }
+                    dests.insert(local);
+                }
+            }
+            CallDestLocals { dests, unique }
+        })
+    }
+
+    fn local_is_call_dest(&self, local: usize) -> bool {
+        self.call_dests().dests.contains(local)
+    }
+
+    /// Single argument of a unique `is_ptr_identity_cast` that writes
+    /// `local`. Every other call destination stays unnamed.
+    fn ptr_identity_cast_operand(&self, local: usize) -> Option<Operand> {
+        let (reg, args) = self.call_dests().unique.get(local)?.as_ref()?;
+        if args.len() == 1 && self.is_ptr_identity_cast(reg) {
+            Some(args[0].clone())
+        } else {
+            None
+        }
     }
 
     /// `pair.0 = q` after `pair` was built. The field write is the value
@@ -1137,10 +1389,13 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Place named by an address-sized integer or raw pointer operand.
-    /// A literal is [`SpillAddressSource::Constant`]. A field is the
-    /// place stored in that field (`constant_field_path`). Depth above
-    /// 8 is the same bound as [`pointer_place_of_local`].
+    /// Place named by an address-sized integer, a raw pointer, or a
+    /// `&T` / `&mut T` operand. A reference is judged by its pointee
+    /// like a raw pointer: a `&T` to a non-scalar cannot name the
+    /// `&prim` spill through its declared type. A literal is
+    /// [`SpillAddressSource::Constant`]. A field is the place stored in
+    /// that field (`constant_field_path`). Depth above 8 is the same
+    /// bound as [`pointer_place_of_local`].
     pub(in crate::front::mir) fn spill_address_source(
         &self,
         op: &Operand,
@@ -1151,7 +1406,7 @@ impl<'a> Lowering<'a> {
         }
         match op {
             Operand::Const(value) => {
-                if self.const_is_integer_literal(value) {
+                if self.const_is_integer_literal(value) || self.const_is_trait_const(value) {
                     SpillAddressSource::Constant
                 } else {
                     SpillAddressSource::Unknown
@@ -1170,6 +1425,17 @@ impl<'a> Lowering<'a> {
             .is_some_and(|literal| literal.get("Scalar").is_some())
     }
 
+    /// A `TraitConst` is a type-level value (`T::SIZE`), not the address
+    /// of a spilled local. The selected impl's literal is folded later
+    /// (`resolved_trait_const_op`); an unresolved `Clause` is the same
+    /// bits for this walk.
+    fn const_is_trait_const(&self, value: &serde_json::Value) -> bool {
+        self.llbc
+            .const_expr_kind(value)
+            .and_then(|kind| kind.as_object().map(|obj| obj.contains_key("TraitConst")))
+            .unwrap_or(false)
+    }
+
     pub(in crate::front::mir) fn place_address_source(
         &self,
         place: &Place,
@@ -1181,7 +1447,15 @@ impl<'a> Lowering<'a> {
         match &place.kind {
             PlaceKind::Local(id) => {
                 let local = *id as usize;
-                if self.local_is_call_dest(local) || self.local_has_projected_store(local) {
+                if self.local_has_projected_store(local) {
+                    return SpillAddressSource::Unknown;
+                }
+                if self.local_is_call_dest(local) {
+                    // A pointer cast is the same address (`lltype.cast_pointer`,
+                    // `rffi.cast`). The dest names the place its operand names.
+                    if let Some(arg) = self.ptr_identity_cast_operand(local) {
+                        return self.spill_address_source(&arg, depth + 1);
+                    }
                     return SpillAddressSource::Unknown;
                 }
                 if let Some(named) = self.pointer_place_of_local(local, 0) {
@@ -1453,7 +1727,19 @@ impl<'a> Lowering<'a> {
         depth: u8,
     ) -> bool {
         match &place.kind {
-            PlaceKind::Local(id) => self.local_hides_spill_alias(*id as usize, groups, depth),
+            PlaceKind::Local(id) => {
+                let local = *id as usize;
+                // A whole local that is one pointer or scalar word is the
+                // named slot (`&mut rooted_class`). It does not pack the
+                // spilled field the way `pair` does in `q = &pair`.
+                if let Some(ty) = self.mir_local_ty(local)
+                    && (tyref_is_raw_pointer(&ty, self.llbc)
+                        || tyref_is_primitive_scalar(&ty, self.llbc))
+                {
+                    return self.projected_store_hides_spill_alias(local, groups, depth + 1);
+                }
+                self.local_hides_spill_alias(local, groups, depth)
+            }
             _ => self.raw_scalar_spill_result_escapes(&place.ty),
         }
     }
@@ -3606,7 +3892,11 @@ pub(in crate::front::mir) fn call_address_escape(
         return clean_address_escape();
     }
     let CallFunc::Regular(reg) = &call.func else {
-        return unclassified_address_escape();
+        // Target is not the spill address (`indirect_target_address`).
+        // A Dynamic callee borrows the pointer for the call and writes
+        // through it then (`copy_out`), the `lltype.scoped_alloc` buffer
+        // contract of a raw pointer passed to a call.
+        return clean_address_escape();
     };
     match &reg.kind {
         CallKind::Fun(FunId::Regular { id }) => function_address_escape(llbc, *id, &entry, stack),

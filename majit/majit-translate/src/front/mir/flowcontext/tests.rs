@@ -185,7 +185,10 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     )
     .expect("substituted entries_item_ptr body");
     crate::test_support::with_lowering(llbc, |context| {
-        let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+        let struct_fields = super::struct_field_registry_from_rows(
+            &context.struct_fields,
+            &context.foreign_callables,
+        );
         let accum = super::AccumulatorFacts::build(llbc, &body);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -8393,19 +8396,20 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
     });
 }
 
-/// `complex_add` calls `complex_val(a).unwrap()` / `complex_val(b).unwrap()`.
-/// Each stays one regular call of the extracted core body
+/// `complex_operands` calls `complex_val(roots.get(base)).unwrap()` /
+/// `complex_val(roots.get(base + 1)).unwrap()`. Each stays one regular call
+/// of the extracted core body
 /// `match self { Some(v) => v, None => <diverging Never call> }`.
 /// That body lowers; its None arm is `RaiseImplicit` and
 /// `remove_assertion_errors` prunes it.
 #[test]
-fn complex_add_keeps_regular_call_to_core_unwrap() {
+fn complex_operands_keeps_regular_call_to_core_unwrap() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
     };
-    let caller =
-        crate::test_support::lower_function(llbc, "complex_add").expect("lower complex_add");
+    let caller = crate::test_support::lower_function(llbc, "complex_operands")
+        .expect("lower complex_operands");
     assert_eq!(
         core_impl_call_count(&caller, "unwrap", "option"),
         2,
@@ -8419,11 +8423,11 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
         .any(call_leaf_is_diverging_panic);
     assert!(
         !leftover_divergent,
-        "complex_add must not residualize the Never abort callee"
+        "complex_operands must not residualize the Never abort callee"
     );
     assert!(
         !graph_has_live_assertion_branch(&caller),
-        "complex_add must not keep a live AssertionError raise after simplify"
+        "complex_operands must not keep a live AssertionError raise after simplify"
     );
     assert_extracted_core_body_lowers(llbc, "::option::<Impl>::unwrap");
 }
