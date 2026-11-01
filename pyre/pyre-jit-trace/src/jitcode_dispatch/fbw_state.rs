@@ -113,10 +113,11 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
 }
 
 /// True when two live frames share a `w_code`.  Used with
-/// [`fbw_effective_multiframe_depth`] so a raising leaf through two
+/// [`fbw_effective_multiframe_depth`] so a leaf reached through two
 /// copies of the same intermediate is classified as recursive/duplicate
 /// (then bounded only by `max_unroll_recursion`) rather than as a
-/// distinct three-frame chain.
+/// distinct call chain.  `_opimpl_recursive_call` (`pyjitpl.py`) then
+/// `perform_call`s a different callable with no total-framestack cap.
 pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
     let mut seen = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -147,8 +148,10 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 /// distinct `shape → mid → leaf` chain compiles the exception-edge bridge
 /// the way `finishframe_exception` does (`ChangeFrame` into the catching
 /// middle), so that shape is admitted to depth 3.  Recursive / duplicate
-/// raising is bounded only by `max_unroll_recursion`, the same as
-/// value-returning recursion: a middle `SubRaise` after `finishframe` is
+/// raising *and* a value-returning leaf under an ambient self-rec unroll
+/// (duplicate `w_code` already on the stack) are bounded only by
+/// `max_unroll_recursion`: `_opimpl_recursive_call` `perform_call`s the
+/// new callable, and a middle `SubRaise` after `finishframe` is
 /// `finishframe_exception` over the remaining shallower frames.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
@@ -199,6 +202,17 @@ mod recursion_depth_policy_tests {
 
     #[test]
     fn value_returning_recursion_is_bounded_only_by_max_unroll_recursion() {
+        assert_eq!(fbw_effective_multiframe_depth(false, true), usize::MAX);
+    }
+
+    #[test]
+    fn value_returning_leaf_under_selfrec_unroll_is_perform_call() {
+        // Ambient duplicate `w_code` (the rec/step unroll) plus a new
+        // value-returning callee is `perform_call` (`pyjitpl.py`): no
+        // total-framestack cap.  Same `recursive_or_duplicate` bit the
+        // raising path already passed.
+        let frames = [frame(7, true), frame(7, true), frame(9, false)];
+        assert!(framestack_has_duplicate_w_code(&frames));
         assert_eq!(fbw_effective_multiframe_depth(false, true), usize::MAX);
     }
 
@@ -768,7 +782,7 @@ pub fn restore_walk_tls() {
     super::set_list_append_suspend_bookmark(parked.list_append_suspend_bookmark);
 }
 
-fn visit_pyobject_ref(
+pub(crate) fn visit_pyobject_ref(
     slot: &mut pyre_object::PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
@@ -1547,9 +1561,9 @@ pub(crate) fn fbw_generator_stack_store_at(
 /// The three are otherwise armed separately, each by the site that makes its
 /// own kind of write, because every frame those sites reach was built by the
 /// walk writing it: a decline discards the frame, so only the one field the
-/// caller reads back needs an undo.  A resumed generator's frame is the object
-/// the generator will next be resumed from, so a declined walk owes it back
-/// whole — locals, operand stack, depth and coordinate alike.
+/// caller reads back needs an undo. The portal's live frame and a resumed
+/// generator survive the walk, so a declined walk owes either one back whole
+/// — locals, operand stack, depth and coordinate alike.
 ///
 /// Arming at the store rather than at walk entry keeps the same snapshot: each
 /// note is first-write-per-frame wins, so whichever store gets there first
@@ -1558,9 +1572,9 @@ pub(crate) fn fbw_generator_stack_store_at(
 /// The locals note takes the whole `locals_cells_stack_w` array rather than the
 /// `nlocals` prefix its other caller passes.  That caller excludes the operand
 /// stack deliberately, so a rollback cannot revert a stack slot another
-/// walk-time write owns; here there is no other writer — the frame is suspended
-/// and this walk is the only thing running on it — and the operand stack is
-/// exactly where a resumed generator's yield state lives.
+/// walk-time write owns. Here the walk also mirrors operand-stack writes, so
+/// preserving only the locals would leave popped iterator slots cleared when
+/// the interpreter resumes its pre-walk coordinate.
 pub(crate) fn fbw_arm_durable_frame_undo(frame: usize) {
     if frame == 0 {
         return;

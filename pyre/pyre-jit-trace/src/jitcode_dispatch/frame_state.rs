@@ -126,6 +126,15 @@ pub struct WalkFrameStateData {
     /// inlined Python walk frame (`WalkFrameStateData` is created for each
     /// inlined callee and for generator resume in `run_sub_jitcode_walk_from`).
     pub unroll_iterations: usize,
+    /// `_get_opimpl_method` (`pyjitpl.py`) sets `self.pc = position` after
+    /// decoding dest and before the opimpl. Abort convert copies that pc
+    /// (`blackhole.py` `_copy_data_from_miframe`). A residual that already
+    /// wrote dest (dest may alias an operand colour, as `newlist_from_array`
+    /// does) must resume here so the blackhole does not re-run the call.
+    pub residual_call_next_pc: Option<usize>,
+    /// `make_result_of_lastop` has populated dest. Together with
+    /// [`Self::residual_call_next_pc`] this is the convert resume pc.
+    pub residual_dest_written: bool,
 }
 
 impl Default for WalkFrameStateData {
@@ -142,6 +151,8 @@ impl Default for WalkFrameStateData {
             inline_w_globals: 0,
             inline_w_code: 0,
             unroll_iterations: 1,
+            residual_call_next_pc: None,
+            residual_dest_written: false,
         }
     }
 }

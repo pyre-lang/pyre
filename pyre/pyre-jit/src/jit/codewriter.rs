@@ -9615,81 +9615,48 @@ impl CodeWriter {
                         {
                             *top = fresh_ref_value(&mut graph);
                         }
-                        if let Some(exc_value) = current_state.stack.last().cloned() {
-                            if matches!(
+                        if let Some(exc_value) = current_state.stack.last().cloned()
+                            && matches!(
                                 pyre_interpreter::decode_instruction_at(code, py_pc),
                                 Some((Instruction::Copy { .. }, _))
-                            ) && handler_entry_has_explicit_raise_source(
-                                code,
-                                &catch_sites,
-                                py_pc,
-                            ) {
-                                // Catch dispatch has already stored the
-                                // propagated exception in the frame's top stack
-                                // slot.  Reload that durable slot while giving
-                                // the shadow graph the definition it needs to
-                                // keep the exception and lasti colours distinct.
-                                // Re-reading `last_exc_value` is not sound after
-                                // a clearing residual, and the current-exception
-                                // slot can still name the older exception whose
-                                // handler raised this one.
-                                let stack_slot =
-                                    stack_base_absolute + current_depth.saturating_sub(1) as usize;
-                                let stack_idx: super::flow::FlowValue =
-                                    super::flow::Constant::signed(stack_slot as i64).into();
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "getarrayitem_vable_r",
-                                    vable_getarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        stack_idx.into(),
-                                    ),
-                                    Some(exc_value),
-                                    py_pc as i64,
-                                );
-                            } else {
-                                // The generic (non-explicit-raise) handler entry
-                                // reads the propagated exception from the field to
-                                // give the slot a distinct colour, but that leaves
-                                // the operand in a register only.  A blackhole /
-                                // deopt handoff that resumes the interpreter at this
-                                // handler reads the frame's value-stack array and
-                                // finds an empty top slot, so `PushExcInfo`
-                                // underflows.  Materialize the exception on the
-                                // durable slot as well — the interpreter unwinder
-                                // (`eval.rs` `handle_exception` `frame.push(exc)`)
-                                // and the explicit-raise arm's slot the
-                                // `getarrayitem_vable_r` above reads both keep it
-                                // there.  On the standard virtualizable
-                                // `setarrayitem_vable_r` costs no compiled op; it
-                                // updates the operand image the blackhole hands back
-                                // and the resume snapshots restore.  `depth_at_pc`
-                                // already publishes `vsd = base + current_depth`, so
-                                // no `emit_vsd!` is needed.
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "last_exc_value",
-                                    Vec::new(),
-                                    Some(exc_value.clone()),
-                                    py_pc as i64,
-                                );
-                                let stack_slot =
-                                    stack_base_absolute + current_depth.saturating_sub(1) as usize;
-                                let stack_idx: super::flow::FlowValue =
-                                    super::flow::Constant::signed(stack_slot as i64).into();
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "setarrayitem_vable_r",
-                                    vable_setarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        stack_idx.into(),
-                                        exc_value.into(),
-                                    ),
-                                    None,
-                                    py_pc as i64,
-                                );
-                            }
+                            )
+                            && handler_entry_has_explicit_raise_source(code, &catch_sites, py_pc)
+                        {
+                            // Catch dispatch has already stored the
+                            // propagated exception in the frame's top stack
+                            // slot.  Reload that durable slot while giving
+                            // the shadow graph the definition it needs to
+                            // keep the exception and lasti colours distinct.
+                            // Re-reading `last_exc_value` is not sound after
+                            // a clearing residual, and the current-exception
+                            // slot can still name the older exception whose
+                            // handler raised this one.
+                            let stack_slot =
+                                stack_base_absolute + current_depth.saturating_sub(1) as usize;
+                            let stack_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(stack_slot as i64).into();
+                            record_graph_op(
+                                &current_block.block(),
+                                "getarrayitem_vable_r",
+                                vable_getarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    stack_idx.into(),
+                                ),
+                                Some(exc_value),
+                                py_pc as i64,
+                            );
                         }
+                        // Generic handler: `flatten.py` `generate_last_exc`
+                        // materialises the exception on the catch-landing
+                        // link, and `pyframe.py` `execute_frame` runs
+                        // `handle_operation_error` before
+                        // `dispatch(pycode, next_instr, ec)`, so the
+                        // valuestack already holds it.  A FunctionEntry
+                        // portal at this pc (`function_entry_for` /
+                        // `first_op_offset`) is the handler bytecode
+                        // (`last_instr` then `PUSH_EXC_INFO`
+                        // `getarrayitem_vable_r`), not a second
+                        // `last_exc_value` producer.
                     }
                     // The walker emits one block-identity `Label(block)`
                     // at block entry (`flatten.py` parity).  Per-PC
@@ -18148,6 +18115,47 @@ mod tests {
             ops.iter()
                 .any(|op| { op.pc > prev_save.pc && op.opname.starts_with("setarrayitem_vable") }),
             "the runtime pop still happens after the prev-save"
+        );
+    }
+
+    #[test]
+    fn function_entry_at_handler_pc_does_not_decode_last_exc_value_first() {
+        // `pyframe.py` `execute_frame` runs `handle_operation_error` before
+        // `dispatch`, so a FunctionEntry at a handler pc already has the
+        // exception on the valuestack. The generic `last_exc_value` landing
+        // uses offset -1 (`flatten.py` `generate_last_exc`); `pc_first_insn_pos`
+        // then names `PUSH_EXC_INFO`'s frame read.
+        let code = first_nested_function_code(
+            "def f():\n    try:\n        {}[0]\n    except KeyError:\n        pass\n",
+        );
+        let handler_pc = (0..code.instructions.len())
+            .find(|&pc| {
+                matches!(
+                    pyre_interpreter::decode_instruction_at(&code, pc),
+                    Some((Instruction::PushExcInfo, _))
+                )
+            })
+            .expect("handler starts at PUSH_EXC_INFO");
+        let w_code = pyre_interpreter::box_code_constant(&code);
+        let code = unsafe { &*(pyre_interpreter::w_code_get_ptr(w_code) as *const CodeObject) };
+        let writer = CodeWriter::new();
+        let pyjit = writer.transform_graph_to_jitcode(code).unwrap();
+        assert!(!pyjit.has_abort, "try/except handler must lower");
+        let entry = pyjit
+            .function_entry_for(handler_pc)
+            .expect("handler pc has a function-entry coordinate");
+        let marker = pyjit
+            .resume_marker_offset(handler_pc)
+            .expect("handler has a block-head -live-");
+        assert!(
+            marker < entry,
+            "FunctionEntry must start after the block-head -live- that precedes last_exc_value"
+        );
+        let op = pyre_jit_trace::jitcode_runtime::decode_op_at(&pyjit.jitcode.code, entry)
+            .expect("function-entry insn decodes");
+        assert_ne!(
+            op.key, "last_exc_value/>r",
+            "FunctionEntry at a handler pc must not start at the generic last_exc landing"
         );
     }
 

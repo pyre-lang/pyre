@@ -15502,79 +15502,17 @@ fn init_type_type(ns: PyObjectRef) {
             )
         );
     }
-    // type.__call__(cls, *args, **kwargs) — PyPy typeobject.py
-    // W_TypeObject.descr_call(self, __args__).  The implicit
-    // instantiation path handles `Cls()` directly, but a custom metaclass
-    // whose `__call__` delegates via `super().__call__(...)` needs this
-    // entry to preserve the complete Arguments shape while resolving to the
-    // default __new__/__init__ behaviour.
+    // type.__call__(cls, *args, **kwargs) — typeobject.py
+    // `W_TypeObject.descr_call(self, __args__)`. Named interp2app wrapper so
+    // WRAP_PREFIX BFS can seed the look-inside graph.
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "__call__",
-            crate::make_builtin_function_with_signature(
+            crate::gateway::make_builtin_function_passthrough1(
                 "__call__",
-                |args| {
-                    let Some(&cls) = args.first().filter(|cls| !cls.is_null()) else {
-                        return Err(crate::PyError::type_error(
-                            "type.__call__() takes at least 1 argument (0 given)",
-                        ));
-                    };
-                    let packed_args = args.get(1).copied().unwrap_or(PY_NULL);
-                    let packed_kwargs = args.get(2).copied().unwrap_or(PY_NULL);
-                    if packed_args.is_null() || !unsafe { pyre_object::is_tuple(packed_args) } {
-                        return Err(crate::PyError::type_error(
-                            "type.__call__() internal *args must be a tuple",
-                        ));
-                    }
-                    if packed_kwargs.is_null() || !unsafe { pyre_object::is_dict(packed_kwargs) } {
-                        return Err(crate::PyError::type_error(
-                            "type.__call__() internal **kwargs must be a dict",
-                        ));
-                    }
-
-                    // PyPy's Arguments is GC-traced across descr_call.  Keep the
-                    // packed containers and every unpacked positional rooted while
-                    // specialised tuple items are boxed and the keyword entries
-                    // are materialised for pyre's flat call ABI.
-                    let roots = pyre_object::gc_roots::push_roots();
-                    let root_base = roots.pin_roots(&[cls, packed_args, packed_kwargs]);
-                    let nargs = unsafe { pyre_object::w_tuple_len(roots.get(root_base + 1)) };
-                    for index in 0..nargs {
-                        let value = unsafe {
-                            pyre_object::w_tuple_getitem(roots.get(root_base + 1), index as i64)
-                        }
-                        .expect("index is in the packed type.__call__ argument range");
-                        let _ = roots.pin_root(value);
-                    }
-                    // `descr_call` reads its keyword names off the `Arguments`
-                    // the caller built, where `keyword_names_w` holds the
-                    // mapping's own key objects.  pyre's builtin ABI hands this
-                    // arm a packed dict instead, so unpack it with
-                    // `_combine_starstarargs_wrapped` rather than copying each
-                    // key's text, which would rebuild the name as an exact
-                    // `str` and drop a `str` subclass the mapping supplied.
-                    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
-                    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
-                    crate::argument::combine_starstarargs_wrapped(
-                        &mut keyword_names_w,
-                        &mut keywords_w,
-                        roots.get(root_base + 2),
-                        roots.get(root_base),
-                    )?;
-                    // The unpack reaches the mapping's `keys()`, so the packed
-                    // positionals are read from their slots after it.
-                    let positional: Vec<PyObjectRef> = (0..nargs)
-                        .map(|index| roots.get(root_base + 3 + index))
-                        .collect();
-                    crate::call::type_call_instantiate_with_kwargs(
-                        roots.get(root_base),
-                        &positional,
-                        &keyword_names_w,
-                        &keywords_w,
-                    )
-                },
-                crate::Signature::new(vec!["cls"], Some("args"), Some("kwargs"), 0, 1),
+                crate::call::__majit_wrap_type_descr_call,
+                crate::call::type_descr_call_args,
             )
         )
     };

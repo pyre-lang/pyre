@@ -1083,22 +1083,32 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
         {
             continue;
         }
-        // Both free functions and impl-owned functions are collected,
-        // keyed on `name_path()` — the segment vector
-        // `call_target_segments` emits for a `CallKind::Fun(Regular)`
-        // in this file.  An impl method usually lowers to
-        // `CallTarget::Method` (resolved via the receiver classdef), but a
-        // receiver-less associated function (`Owner::new() -> ()/bool`) and
-        // any impl method reached through an `FnDef` constant fall back to
-        // `CallTarget::FunctionPath { name_path }`,
-        // whose lookup is served only by this registry — skipping impl
-        // owners would leave those call sites "not registered".
-        let segments: Vec<String> = fd
+        // Both free functions and impl-owned functions are collected.
+        // `name_path()` is the `CallKind::Fun(Regular)` spelling.  When
+        // `Lowering::impl_method_owner` declines `CallTarget::Method`
+        // (raw-storage ADT, associated fn, field-name collision),
+        // `unspecialized_fun_segments` emits the Type-split
+        // `impl_method_owner_for_fundecl` path instead
+        // (`executioncontext::ExecutionContext::settrace`).  Three-plus-
+        // segment keys cannot leaf-match, so a stub keyed only on
+        // `name_path` (`…::<Impl>::settrace`) misses that callsite.
+        // `ExecutionContext.settrace` is `@jit.dont_look_inside`; emit both
+        // so the FunctionPath the declined-Method arm emits resolves.
+        let name_path: Vec<String> = fd
             .item_meta
             .name_path()
             .split("::")
             .map(String::from)
             .collect();
+        let mut keys = vec![name_path];
+        if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+            let mut type_split: Vec<String> =
+                owner_qualified.split("::").map(String::from).collect();
+            type_split.push(leaf);
+            if keys.iter().all(|k| k != &type_split) {
+                keys.push(type_split);
+            }
+        }
         // Prefer the Charon body's declared parameter names
         // (`locals[1..=argc]`, the same source the regular lowering reads
         // at `local.name`); fall back to positional `arg{N}` when the body
@@ -1112,7 +1122,13 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
                     .unwrap_or_else(|| format!("arg{i}"))
             })
             .collect();
-        out.push((segments, Signature::new(argnames, None, None), token));
+        for segments in keys {
+            out.push((
+                segments,
+                Signature::new(argnames.clone(), None, None),
+                token.clone(),
+            ));
+        }
     }
     out
 }
@@ -9406,6 +9422,12 @@ pub(in crate::front::mir) fn ref_return_is_single_word(ast: &str) -> bool {
     if ast.starts_with("*mut ") || ast.starts_with("*const ") {
         return true;
     }
+    // `PyObjectRef` is the GC pointer word (`GCREF`). `Result<PyObjectRef,PyError>`
+    // projects to this payload (`dont_look_inside_return_token`); a residual
+    // `@jit.dont_look_inside` method that returns that word needs the shell.
+    if ast == "PyObjectRef" {
+        return true;
+    }
     // `Result<T,PyError>` — `tyref_to_ast_string` comma-joins type args
     // without spaces, so split the payload off the trailing `,PyError>`.
     if let Some(args) = ast
@@ -10703,7 +10725,7 @@ pub(in crate::front::mir) fn tyref_adt_map<'l>(
 /// payload — the spelling a static `Some(..)`/`Ok(..)` construction already
 /// mints.  Extracts `ty`'s `{"Adt": …}` node (as [`tyref_tuple_suffix`]
 /// does) and defers to [`adt_head_instantiation_suffix`], already RC2-gated
-/// (an `f32`/`()`/`""` argument yields `None`).  Fail-closed: a
+/// (an `f32`/`""` argument yields `None`).  Fail-closed: a
 /// missing `Adt` node, a non-enum type, or a deferred argument yields `""` —
 /// the bare owner, unchanged.
 pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {

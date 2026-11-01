@@ -287,17 +287,21 @@ impl MemoryManagerInner {
     /// self.alive_loops.clear()
     /// debug_stop("jit-mem-releaseall")
     /// ```
-    pub fn release_all_loops(&mut self) {
+    pub fn release_all_loops(&mut self) -> Vec<Arc<JitCellToken>> {
         let _scope = crate::debug::scope("jit-mem-releaseall");
         crate::debug::debug_print(&format!("Loop tokens cleared: {}", self.alive_loops.len()));
         // memmgr.py `release_all_loops` drops every `alive_loops` entry
         // and lets the GC free unreachable tokens. Drain first so the
         // trial deletion below can tell a still-held token from garbage.
+        // Return the drained Arcs; `next_generation` yields the same Vec
+        // after `_kill_old_loops_now`. Callers that only need the drop
+        // discard it (`memmgr.py release_all_loops` returns nothing).
         let evicted_tokens: Vec<Arc<JitCellToken>> = std::mem::take(&mut self.alive_loops)
             .into_iter()
             .map(|(_, token)| token)
             .collect();
         self.trial_delete_keepalive_tokens(&evicted_tokens);
+        evicted_tokens
     }
 
     /// Clear `keepalive_tokens` only on tokens that are garbage after
@@ -458,7 +462,7 @@ impl MemoryManager {
     }
 
     /// `memmgr.py` `release_all_loops`.
-    pub fn release_all_loops(&mut self) {
+    pub fn release_all_loops(&mut self) -> Vec<Arc<JitCellToken>> {
         self.inner.borrow_mut().release_all_loops()
     }
 
@@ -691,5 +695,19 @@ mod tests {
             .upgrade()
             .expect("externally held token keeps its targets");
         assert!(keepalive_holds(&executing, &target));
+    }
+
+    #[test]
+    fn release_all_loops_returns_every_alive_token() {
+        let a = Arc::new(JitCellToken::new(1));
+        let b = Arc::new(JitCellToken::new(2));
+        let mut mgr = MemoryManager::new(1);
+        mgr.keep_loop_alive(&a);
+        mgr.keep_loop_alive(&b);
+        let evicted = mgr.release_all_loops();
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.iter().any(|t| Arc::ptr_eq(t, &a)));
+        assert!(evicted.iter().any(|t| Arc::ptr_eq(t, &b)));
+        assert_eq!(mgr.alive_count(), 0);
     }
 }

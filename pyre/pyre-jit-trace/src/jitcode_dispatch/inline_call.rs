@@ -1624,10 +1624,13 @@ pub(crate) fn helper_resume_reaches_blocker(
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
         return true;
     };
+    // Runtime-installed payloads (`install_codeless_jitcode`) live in
+    // `MetaInterpStaticData.jitcodes`, not the build-time `JITCODE_CELLS`
+    // table `get_jitcode_ref_by_index` reads. The payload already in
+    // hand is the body to scan.
+    let payload = std::sync::Arc::clone(&pjc);
     let scan = || {
-        let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-            return true;
-        };
+        let jitcode = &payload.jitcode;
         let descrs = crate::jitcode_runtime::descr_ref_table();
         let entry_array_lengths: Vec<(usize, usize)> =
             entry_array_len.map(|len| (0, len)).into_iter().collect();
@@ -4778,6 +4781,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 .discard_innermost_virtualref_if_frame(frame.as_usize());
         }
     };
+
     // `direct_assembler_call` records CALL_ASSEMBLER on the portal reds
     // after `vrefs_after_residual_call`. With no token,
     // `do_recursive_call`'s `assembler_call=False` arm records
@@ -4843,6 +4847,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     if let Some(displaced) = displaced_portal_call_frame {
         ctx.session.borrow_mut().portal_call_frame = displaced;
     }
+
     let exec = match exec {
         Ok(exec) => exec,
         Err(e) => {
@@ -4919,6 +4924,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 }
                 return Err(e);
             }
+
         }
     }
     // `opimpl_jit_merge_point` pops the frame holding the merge point
@@ -4948,7 +4954,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // `topframeref` — including when the snapshot aborts
     // (`GuardSnapshotVableUntyped`). The self-recursive fold uses the same
     // slot for `record_ec_leave_frame_chain`.
-    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope);
+    let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope.clone());
     if snapshot.is_ok() {
         flush_pending_residual_locals_adopt(ctx);
     }
@@ -4993,7 +4999,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope)?;
 
-    if record_init_none_check {
+    if let Some((instance, instance_concrete)) = constructor_result {
         // `W_TypeObject.descr_call` checks every successful `__init__`
         // result (`if not space.is_w(w_result, space.w_None)`), after
         // `get_and_call_args` returns. Record that tail after this
@@ -5024,7 +5030,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
                 crate::ctor_continuation::bh_check_init_returned_none
             ) as *const (),
             &[ca_result],
-            &[majit_ir::Type::Ref],
+            &[Type::Ref],
             majit_metainterp::default_effect_info(),
         );
         if matches!(
@@ -9870,21 +9876,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // raises after `finishframe`.  Distinct raising depth is 3; recursive
     // / duplicate raising is unbounded here (`max_unroll_recursion` is the
     // sole remaining bound).  `perform_call` has no such cap; see
-    // `fbw_effective_multiframe_depth`.  A value-returning chain (no raise)
-    // inlines to the full depth either way.
-    // Value-returning recursion still keys only on this callee's own
-    // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
-    // only a raising-chain safety valve: it must not promote an unrelated
-    // value-returning callee to the unbounded recursive cap.
-    let effective_multiframe_depth = fbw_effective_multiframe_depth(
-        contains_raise,
-        if contains_raise {
-            recursive_portal_present
-                || framestack_has_duplicate_w_code(&ctx.session.borrow().framestack)
-        } else {
-            recursive_portal_present
-        },
-    );
+    // `fbw_effective_multiframe_depth`.
+    //
+    // `_opimpl_recursive_call` (`pyjitpl.py`) inlines a *different* callable
+    // through `perform_call` with no total-framestack depth gate: only the
+    // same-greenkey count is compared to `max_unroll_recursion`.  The generic
+    // cap is a cost valve for a distinct non-recursive chain.  An ambient
+    // recursive unroll already has duplicate `w_code` on the framestack
+    // (the `rec`/`step` chain); a new leaf at that depth is `perform_call`,
+    // not another unroll of the portal.  Raising chains already used this
+    // bit so a middle `SubRaise` could `finishframe_exception` through the
+    // remaining frames; value-returning uses it for the same `perform_call`
+    // reason.
+    let recursive_or_duplicate = recursive_portal_present
+        || framestack_has_duplicate_w_code(&ctx.session.borrow().framestack);
+    let effective_multiframe_depth =
+        fbw_effective_multiframe_depth(contains_raise, recursive_or_duplicate);
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so an unseeded caller-boundary resume is not part of that
@@ -11073,7 +11080,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `MetaInterp.newframe` owns the callee's frame and scratch allocations.
     // A declined inline discards them along with the callee body, so measure
     // its lifetime before emitting the frame rather than at body entry.
-    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
+    let callee_entry_pos = ctx.trace_ctx.get_trace_position();
+    let callee_entry_trace_index = callee_entry_pos._index;
     // Each precondition below answers "can the multiframe seed serve this
     // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
     // did-not-inline answer, which every caller follows to the ordinary
@@ -11363,6 +11371,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // them above the paused-caller-frame gate lets its try-block decline use
     // the same Entry-carrier predicates as a zero-effect sub-walk abort.
     let unjournaled_before_subwalk = fbw_has_unjournaled_effect();
+    let abort_latched_before_subwalk = super::residual_call::abort_blackhole_latched();
     let executed_effects_before = fbw_executed_effect_count();
     let is_top_inline = !ctx.fbw_mode.inline_subwalk;
     let abort_flush_call_jitcode_coord: Option<(u32, usize)> = if is_top_inline {
@@ -11585,6 +11594,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callee_class_of_last_exc_is_const,
         mut operator_tail_caller,
         deferred_portal_leave,
+        midbody_latched,
+        subwalk_nothing_applied,
     ) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -11597,6 +11608,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             state.current_exception_seed_concrete = parent_state.current_exception_seed_concrete;
             state.outer_active_boxes = inline_outer_active_boxes;
         }
+        // Capture before `sub_wc` takes `ctx.trace_ctx`. The CALL lives in
+        // this walk's jitcode; the callee sub-walk's `inline_callee_consts`
+        // names the body being entered, not the caller.
+        let walk_jc_index = ctx.walk_jitcode_index();
+        let caller_resume_pc = op.next_pc;
         let mut sub_wc = WalkContext {
             frame_state: callee_state,
             // Path-1: resolve scalar static-field reads off this callee's own
@@ -11851,25 +11867,59 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `can_inline_callable` never found, the same callee was re-inlined on
         // the next attempt, and the root took neither the disable nor
         // `prepare_trace_segmenting`'s permanent stamp.
-        // pyjitpl.py `perform_call` → `newframe` then `ChangeFrame`, then
-        // `_interpret` runs `blackhole_if_trace_too_long` after that step.
-        // The log entry must exist before the abort: a too-long check that
-        // ran first left `portal_trace_positions` empty, so
-        // `find_biggest_function` named no callee and
+        // pyjitpl.py `perform_call` → `newframe` then `setup_call` then
+        // `ChangeFrame`; `_interpret` runs `blackhole_if_trace_too_long`
+        // after that step. The log entry must exist before the abort: a
+        // too-long check that ran first left `portal_trace_positions`
+        // empty, so `find_biggest_function` named no callee and
         // `prepare_trace_segmenting` wrote `JC_DONT_TRACE_HERE` on the portal.
+        // `allboxes` is greens then reds (`interp_jit.py`
+        // `['next_instr', 'is_being_profiled', 'pycode']` + `['frame', 'ec']`).
+        let w_code_ptr = pyre_object::gc_roots::shadow_stack_get(inline_code_slot);
+        let next_instr_box = sub_wc.trace_ctx.const_int(0);
+        let profiled_box = sub_wc.trace_ctx.const_int(is_being_profiled as i64);
+        let pycode_box = sub_wc.trace_ctx.const_ref(w_code_ptr as i64);
+        let mut argboxes = vec![
+            (majit_metainterp::JitArgKind::Int, next_instr_box, 0),
+            (
+                majit_metainterp::JitArgKind::Int,
+                profiled_box,
+                is_being_profiled as i64,
+            ),
+            (
+                majit_metainterp::JitArgKind::Ref,
+                pycode_box,
+                w_code_ptr as i64,
+            ),
+        ];
+        if callee_frame_seeded {
+            let frame_bits = match sub_wc.trace_ctx.concrete_of_opref(ca_callee_frame) {
+                Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                _ => 0,
+            };
+            let ec_bits = match sub_wc.trace_ctx.concrete_of_opref(ca_callee_ec) {
+                Some(majit_ir::Value::Ref(g)) => g.0 as i64,
+                _ => 0,
+            };
+            argboxes.push((
+                majit_metainterp::JitArgKind::Ref,
+                ca_callee_frame,
+                frame_bits,
+            ));
+            argboxes.push((majit_metainterp::JitArgKind::Ref, ca_callee_ec, ec_bits));
+        }
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
                 callee_green_key.get_uhash(),
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
-                crate::driver::make_green_key_typed(
-                    pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
-                    0,
-                    is_being_profiled,
-                ),
+                crate::driver::make_green_key_typed(w_code_ptr as *const (), 0, is_being_profiled),
             ),
             None,
+            &argboxes,
+            walk_jc_index,
+            caller_resume_pc,
         );
         // `_interpret` checks `blackhole_if_trace_too_long` after the
         // `run_one_step` that `newframe`s, before the callee's first
@@ -12015,6 +12065,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             _ => None,
         };
+        let mut midbody_latched = false;
         if let Some((abort_pc, abort_kind)) = midbody_abort {
             if is_top_inline && !unjournaled_before_subwalk {
                 crate::trace::fbw_diag::bump(crate::trace::fbw_diag::MIDBODY_LATCH);
@@ -12228,7 +12279,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     })
                 })();
                 match payload {
-                    Ok(payload) => fbw_set_midbody_abort_resume(payload),
+                    Ok(payload) => {
+                        fbw_set_midbody_abort_resume(payload);
+                        midbody_latched = true;
+                    }
                     Err(reason) => {
                         if fbw_debug_abort_enabled() {
                             eprintln!(
@@ -12246,11 +12300,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // level; a pre-call clone of `InlineParentFrame` is unrooted.
         let operator_tail_caller =
             operator_tail.and_then(|_| _inline_frame.rooted_immediate_caller());
+        let subwalk_nothing_applied = fbw_executed_effect_count() == executed_effects_before
+            && !unjournaled_before_subwalk
+            && !fbw_has_unjournaled_effect();
         (
             result,
             class_of_last_exc_is_const,
             operator_tail_caller,
             deferred_portal_leave,
+            midbody_latched,
+            subwalk_nothing_applied,
         )
     };
     // `executioncontext.py leave`, in execute_frame's `finally`. The
@@ -12332,6 +12391,40 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         Err(e) => {
             if fbw_inline_diag_enabled() {
                 eprintln!("[inline-abort] callee sub-walk err: {e:?}");
+            }
+            // `do_residual_or_indirect_call` (`pyjitpl.py`) residualizes a
+            // callee it cannot follow; the enclosing trace continues.
+            // A mid-body latch that rebuilt the callee still returns the
+            // error so `convert_and_run_from_pyjitpl` (`blackhole.py`)
+            // adopts it. An effect-free LBC whose rebuild did not latch
+            // has no such carrier: aborting here discarded the parent
+            // walk (the portal never reached its own `loop_header` /
+            // `reached_loop_header`) and the interpreter replay re-ran
+            // the CALL. `cut_declined_subwalk` removes the callee
+            // MIFrame, so the abort image this sub-walk latched from it
+            // is dropped too; otherwise `convert_and_run_from_pyjitpl`
+            // re-enters a callee whose CALL the parent executes as a
+            // residual.
+            if !midbody_latched
+                && subwalk_nothing_applied
+                && !abort_latched_before_subwalk
+                && matches!(
+                    e,
+                    DispatchError::LoopBearingCalleeInlineUnsupported {
+                        blackhole_required: false,
+                        ..
+                    }
+                )
+            {
+                // `opimpl_jit_merge_point` consumes the callee's
+                // `seen_loop_header_for_jdindex` before CALL_ASSEMBLER.
+                // Residualizing without that merge must not leave the
+                // stamp for the portal's next merge point.
+                ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+                let _ = ctx.trace_ctx.seen_loop_header_jit_pc.take();
+                super::residual_call::reset_single_frame_blackhole();
+                cut_declined_subwalk(ctx, callee_entry_pos);
+                return resolved_inline_decline(op.pc, line!());
             }
             // A seeded inline abort latches the live framestack in `walk`
             // and converts through `convert_and_run_from_pyjitpl`
