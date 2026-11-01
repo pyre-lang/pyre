@@ -77,6 +77,14 @@ pub const HEAP_DUMP_EIO: i32 = 5;
 static CONST_PTR_TABLE_TEST_LOCK: parking_lot::ReentrantMutex<()> =
     parking_lot::ReentrantMutex::new(());
 
+/// The deferred-major request probe and the eval-breaker GC bit are
+/// process-global, so every arming site waits behind the tests that install
+/// the probe. Reentrant so a test that already holds it can still allocate
+/// (and arm) on the same thread.
+#[cfg(test)]
+static DEFERRED_MAJOR_PROBE_TEST_LOCK: parking_lot::ReentrantMutex<()> =
+    parking_lot::ReentrantMutex::new(());
+
 /// Hold [`CONST_PTR_TABLE_TEST_LOCK`] for a test that interns a ConstPtr.
 /// Drop drains the young list with a no-op visitor so this test's fake
 /// addresses never reach a later collection as young roots.
@@ -271,6 +279,14 @@ fn deferred_major_request_wanted() -> bool {
         .is_some_and(|probe| probe())
 }
 
+fn arm_deferred_major_if_wanted() {
+    #[cfg(test)]
+    let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
+    if deferred_major_request_wanted() {
+        majit_ir::eval_breaker_word::set_gc();
+    }
+}
+
 /// Consume a pending request, reporting whether one was armed.
 ///
 /// Clear it whether or not the caller goes on to collect: the bit is the
@@ -284,6 +300,8 @@ pub fn take_deferred_major_request() -> bool {
 /// dispatch.  Hosts use this when collection is required for semantics rather
 /// than because an allocation crossed the collector's threshold.
 pub fn request_deferred_major_collection() {
+    #[cfg(test)]
+    let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
     majit_ir::eval_breaker_word::set_gc();
 }
 
@@ -3362,8 +3380,8 @@ impl MiniMarkGC {
         if !Self::oldgen_birth_diagnostics_enabled()
             && ((type_id as usize) >= self.types.len() || self.type_alloc_is_plain(type_id))
         {
-            if self.threshold_reached(total_size) && deferred_major_request_wanted() {
-                majit_ir::eval_breaker_word::set_gc();
+            if self.threshold_reached(total_size) {
+                arm_deferred_major_if_wanted();
             }
             return GcRef(obj_addr);
         }
@@ -3422,8 +3440,8 @@ impl MiniMarkGC {
         // reached until a major completes, so arming past a consumer that
         // refuses re-arms on every following allocation.
         // See [`DEFERRED_MAJOR_REQUEST_PROBE`].
-        if self.threshold_reached(total_size) && deferred_major_request_wanted() {
-            majit_ir::eval_breaker_word::set_gc();
+        if self.threshold_reached(total_size) {
+            arm_deferred_major_if_wanted();
         }
         GcRef(obj_addr)
     }
@@ -11025,8 +11043,8 @@ impl GcAllocator for MiniMarkGC {
         // request, and the interpreter safepoint answers it where the root set
         // is known; `finish_alloc_in_oldgen` records why pyre can only defer
         // the answer.
-        if self.threshold_reached(total_size) && deferred_major_request_wanted() {
-            majit_ir::eval_breaker_word::set_gc();
+        if self.threshold_reached(total_size) {
+            arm_deferred_major_if_wanted();
         }
         if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
             return obj;
@@ -12802,6 +12820,16 @@ mod tests {
         gc.roots.clear();
     }
 
+    /// Uninstalls the deferred-major probe and clears the GC bit, even when the test panics.
+    struct ClearDeferredMajorProbe;
+
+    impl Drop for ClearDeferredMajorProbe {
+        fn drop(&mut self) {
+            set_deferred_major_request_probe(None);
+            majit_ir::eval_breaker_word::take_gc();
+        }
+    }
+
     /// A born-old allocation that crosses the next-major threshold asks for a
     /// collection the way `external_malloc` (incminimark.py) does — and
     /// asks the consumer first, every time.
@@ -12812,13 +12840,10 @@ mod tests {
     /// fails continuously and the guard grows a bridge chain that stops
     /// returning to the dispatch loop, starving the rest of the eval-breaker
     /// word — signals included.
-    /// The deferred-major tests install the process-global request probe and
-    /// read the process-global eval-breaker bit, so they run one at a time.
-    static DEFERRED_MAJOR_PROBE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
     #[test]
     fn born_old_allocation_past_the_threshold_asks_the_consumer_every_time() {
         let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
+        let _clear = ClearDeferredMajorProbe;
         fn refuse() -> bool {
             false
         }
@@ -12863,6 +12888,7 @@ mod tests {
     #[test]
     fn collecting_young_large_births_past_the_threshold_run_minors_not_majors() {
         let _guard = DEFERRED_MAJOR_PROBE_TEST_LOCK.lock();
+        let _clear = ClearDeferredMajorProbe;
         fn accept() -> bool {
             true
         }
