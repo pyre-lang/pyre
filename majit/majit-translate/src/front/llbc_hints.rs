@@ -1635,29 +1635,29 @@ mod tests {
 
     #[test]
     fn alloc_flavor_raw_enum_variant_inherits_enum_identity() {
-        let raw = HashSet::from(["mapdict::MapNode".to_string()]);
+        let raw = HashSet::from(["shape::Kind".to_string()]);
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "mapdict::MapNode::Terminator"
+            "shape::Kind::Circle"
         ));
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "pyre_object::mapdict::MapNode::Terminator"
+            "pyre_object::shape::Kind::Circle"
         ));
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "*const pyre_object::mapdict::MapNode::Terminator"
+            "*const pyre_object::shape::Kind::Circle"
         ));
         assert!(super::alloc_flavor_raw_contains(
             &raw,
-            "&mapdict::MapNode::Terminator"
+            "&shape::Kind::Circle"
         ));
-        assert!(super::alloc_flavor_raw_contains(&raw, "mapdict::MapNode"));
+        assert!(super::alloc_flavor_raw_contains(&raw, "shape::Kind"));
         assert!(!super::alloc_flavor_raw_contains(
             &raw,
-            "mapdict::Other::Terminator"
+            "shape::Other::Circle"
         ));
-        assert!(!super::alloc_flavor_raw_contains(&raw, "Terminator"));
+        assert!(!super::alloc_flavor_raw_contains(&raw, "Circle"));
     }
 
     fn names(variants: &[&str]) -> Vec<String> {

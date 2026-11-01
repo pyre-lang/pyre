@@ -788,7 +788,7 @@ pub fn emit_exception_new_inline(
                     ctx.const_ref(0)
                 } else {
                     let term = unsafe { pyre_object::typeobject::w_type_get_terminator(obj) };
-                    ctx.const_ref(pyre_object::mapdict::map_ref_node_start(term) as i64)
+                    ctx.const_ref(term as i64)
                 }
             }
             _ => ctx.const_ref(0),

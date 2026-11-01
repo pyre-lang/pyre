@@ -13078,9 +13078,13 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // a contradictory pair is folded out by the optimizer's constant-class
     // handling, which discards the trace rather than reading a wild slot.
     let layout_type_addr = unsafe { (*concrete_obj).ob_type as i64 };
-    // Every guard below appends to `opencoder.py Trace._ops` and can
-    // minor-collect. Box `w_type` before the first one; `w_type` is a copy.
+    // Mint ConstPtr boxes for live GC refs so later uses read the forwarded
+    // word (`history.py` `ConstPtr.value`). Guard/snapshot emission writes a
+    // Rust `TraceRecordBuffer` and does not collect; the contended
+    // `instance_lock` (`before_external_block`) on the store-add commit path
+    // is the safepoint that can minor-collect nursery maps.
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let map_const = ctx.trace_ctx.const_ref(map as i64);
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(layout_type_addr);
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
@@ -13122,10 +13126,14 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
-    // GuardClass and the version-tag pin can minor-collect.
     // `concrete_obj` is a copy; the receiver box is `obj`
-    // (`RefFrontendOp` / `getref_base`).
+    // (`RefFrontendOp` / `getref_base`). `map` is a copy taken before
+    // GuardClass / the version-tag pin; read the forwarded word off the
+    // ConstPtr minted above (`pyjitpl.py` promotes live boxes).
     let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);
+    let map = walker_concrete_ref_object(ctx, map_const)
+        .map(|p| p as pyre_interpreter::objspace::std::mapdict::MapRef)
+        .unwrap_or(map);
     specialize::walker_promote_instance_map(ctx, op_pc, obj, concrete_obj, map)?;
     Ok(())
 }
@@ -13624,10 +13632,10 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
 /// the GC rewriter runs, exactly as `walker_pin_namespace_version` relies on.
 ///
 /// Walker `QUASIIMMUT_FIELD` arg0 is the GC object start: a `MapRef`
-/// (`mapdict.py AbstractAttribute`) or a `CachedAttributeHolder`. Inlined
-/// `Terminator` / `PlainAttribute` payloads are not interned; their
-/// descr offsets include `MAP_NODE_TERMINATOR_OFFSET` /
-/// `MAP_NODE_PLAIN_OFFSET` so `quasiimmut.py get_current_qmut_instance`
+/// (`mapdict.py AbstractAttribute`) or a `CachedAttributeHolder`.
+/// `Terminator` / `PlainAttribute` inline the parent as field zero
+/// (`GcStruct._first_struct`); descr offsets are `offset_of!` from
+/// that start so `quasiimmut.py get_current_qmut_instance`
 /// (`struct_ptr + mutate offset`) lands on the mutate word.
 ///
 /// `walker_flush_guard_not_invalidated` drains a pending flag, so consecutive
@@ -13688,11 +13696,10 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
     if term.is_null() {
         return Ok(());
     }
-    let map = (term as usize).wrapping_sub(pyre_object::mapdict::MAP_NODE_TERMINATOR_OFFSET);
     walker_pin_mapdict_quasi_field(
         ctx,
         op_pc,
-        map as i64,
+        term as i64,
         crate::descr::terminator_allow_unboxing_descr(),
     )
 }

@@ -1514,33 +1514,29 @@ mod tests {
     }
 
     #[test]
-    fn enum_base_variant_field_type_is_harvested_mapnode_terminator() {
+    fn enum_base_variant_field_type_is_harvested_from_variant_keys() {
         let mut reg = StructFieldRegistry::default();
         let disc = vec![("__discriminant".to_string(), "i64".to_string())];
-        let terminator = vec![("terminator".to_string(), "*const MapNode".to_string())];
-        reg.fields
-            .insert("mapdict::MapNode".to_string(), disc.clone());
-        reg.fields.insert("MapNode".to_string(), disc);
+        let payload = vec![("payload".to_string(), "*const Kind".to_string())];
+        reg.fields.insert("shape::Kind".to_string(), disc.clone());
+        reg.fields.insert("Kind".to_string(), disc);
         for key in [
-            "mapdict::MapNode::Terminator",
-            "MapNode::Terminator",
-            "mapdict::MapNode::Plain",
-            "MapNode::Plain",
+            "shape::Kind::Circle",
+            "Kind::Circle",
+            "shape::Kind::Square",
+            "Kind::Square",
         ] {
-            reg.fields.insert(key.to_string(), terminator.clone());
+            reg.fields.insert(key.to_string(), payload.clone());
         }
         assert_eq!(
-            reg.owner_or_variant_field_type("mapdict::MapNode", "terminator"),
-            Some("*const MapNode")
+            reg.owner_or_variant_field_type("shape::Kind", "payload"),
+            Some("*const Kind")
         );
         assert_eq!(
-            reg.owner_or_variant_field_type("MapNode", "terminator"),
-            Some("*const MapNode")
+            reg.owner_or_variant_field_type("Kind", "payload"),
+            Some("*const Kind")
         );
-        assert!(
-            reg.owner_or_variant_field_type("MapNode", "no_such")
-                .is_none()
-        );
+        assert!(reg.owner_or_variant_field_type("Kind", "no_such").is_none());
     }
 
     #[test]

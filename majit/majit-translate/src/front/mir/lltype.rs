@@ -2125,7 +2125,7 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     // A raw struct's fields are addresses and scalars. A GC pointer field
     // would be `getfield_raw_r`; `rewrite_op_getfield` raises only for a
     // non-pure `getfield_raw_r`, so an `_immutable_fields_` GC field is
-    // still raw storage (`MapNodeTerminatorView.w_cls`).
+    // still raw storage (an `_immutable_fields_` GCREF on a raw overlay).
     let def_id = adt_node_def_id(node)?;
     let mut stack = Vec::new();
     if !adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
