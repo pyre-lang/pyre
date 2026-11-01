@@ -20955,9 +20955,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
     let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
 
     if helper == majit_ir::RuntimeHelperKind::LoadImport {
-        // `PyFrame.get_builtin` returns this field directly on every normal
-        // frame.  The null/EC fallback is uncommon and remains residual.
-        let w_builtin = frame.w_builtin;
+        // The field selects between a picked builtin and `space.builtin`,
+        // so its nullity or identity is pinned.
+        let field = frame.w_builtin;
+        let w_builtin = frame.get_builtin();
         if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
             return Ok(false);
         }
@@ -20975,21 +20976,22 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
             return Ok(false);
         }
 
-        // The cell fold below bakes the builtin module's dict, so pin the
-        // frame field that owns that choice.  A custom per-frame builtin (or
-        // any future rebinding of the field) side-exits before using the old
-        // dict.  Rebinding builtins.__import__ itself is covered by the module
-        // dict's quasi-immutable version and mutable-cell read.
-        let live_builtin = crate::state::opimpl_getfield_gc_r(
+        let live = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             frame_op,
             crate::descr::pyframe_w_builtin_descr(),
         );
-        walker_guard_stamped_ref_unless_const(ctx, op_pc, live_builtin, w_builtin)?;
-        if live_builtin.is_constant()
-            && ctx.trace_ctx.const_value(live_builtin) != Some(w_builtin as i64)
-        {
-            return Ok(false);
+        if field.is_null() {
+            if !live.is_constant() {
+                walker_guard_stamped_isnull(ctx, op_pc, live)?;
+            } else if ctx.trace_ctx.const_value(live) != Some(0) {
+                return Ok(false);
+            }
+        } else {
+            walker_guard_stamped_ref_unless_const(ctx, op_pc, live, field)?;
+            if live.is_constant() && ctx.trace_ctx.const_value(live) != Some(field as i64) {
+                return Ok(false);
+            }
         }
         return emit_namespace_cell_fold(
             ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false, true,

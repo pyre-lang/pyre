@@ -20271,22 +20271,18 @@ pub fn exec_or_eval(
             return Err(err);
         }
     };
-    // Python 3.14 always selects the builtin namespace supplied through an
-    // explicit exec/eval globals dict.  PyPy expresses the same selection as
-    // `space.builtin.pick_builtin(w_globals)` when
-    // `objspace.honor__builtins__` is enabled.  Keep Pyre's global PyPy
-    // configuration unchanged, but apply that exact selection to the frame
-    // constructed by this exec/eval path.
-    //
-    // `moduledef.py:95-100` has a common-case identity exit when the globals
-    // entry is already `space.builtin`.  Preserve that shape as an
-    // allocation-free exact-dict probe: imported modules overwhelmingly carry
-    // this entry, and must not enter the general mapping dispatch again.
+    // [3.15-spec] exec/eval always select the builtin namespace from the
+    // explicit globals dict. PyPy: `space.builtin.pick_builtin(w_globals)`
+    // only under `honor__builtins__`.
+    // `moduledef.py` has a common-case identity exit when the globals
+    // entry is already `space.builtin`; preserve that as an
+    // allocation-free exact-dict probe so imported modules do not
+    // re-enter the mapping dispatch.
     let current_globals = frame.get_w_globals();
     let keeps_existing_builtin = unsafe {
         pyre_object::is_dict(current_globals)
             && pyre_object::w_dict_getitem_str(current_globals, "__builtins__")
-                .is_some_and(|w_builtin| std::ptr::eq(w_builtin, frame.w_builtin))
+                .is_some_and(|w_builtin| std::ptr::eq(w_builtin, frame.get_builtin()))
     };
     if !keeps_existing_builtin {
         // `pick_builtin_obj_checked` can invoke a dict-subclass `__getitem__`

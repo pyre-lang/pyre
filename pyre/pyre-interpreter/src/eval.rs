@@ -1301,14 +1301,9 @@ pub unsafe fn walk_pyframe_roots_area(
                 visitor(&mut *(generator_slot as *mut majit_ir::GcRef));
                 let yielding_slot = &mut (*(frame)).w_yielding_from as *mut PyObjectRef;
                 visitor(&mut *(yielding_slot as *mut majit_ir::GcRef));
-                // pyframe.py:115-116 `self.builtin = ...` — the picked
-                // builtin Module is a GC root.  Pyre stores it on
-                // `frame.w_builtin` so `frame.get_builtin()` returns
-                // the same object PyPy would; the LOAD_GLOBAL fallback
-                // (`load_global_value` at eval.rs) reaches the
-                // builtin's globals through `w_module_get_w_dict(self
-                // .w_builtin)` — there is no separate storage-keyed
-                // fast path field anymore.
+                // The field is unset except on honored frames; `get_builtin`
+                // falls back to `space.builtin` when it is unset.  The field
+                // is still a GCREF slot the walker must forward.
                 let w_builtin_slot = &mut (*(frame)).w_builtin as *mut PyObjectRef;
                 visitor(&mut *(w_builtin_slot as *mut majit_ir::GcRef));
                 let w_builtin = (*frame).w_builtin;
@@ -3266,14 +3261,12 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
         };
         // `_load_global` (pyopcode.py) reads the builtins through the METHOD
-        // `self.get_builtin()`, not the `builtin` field.  Under the default
-        // `honor__builtins__=False` the constructor never assigns that field
-        // (pyframe.py) and the method answers `space.builtin` without
-        // consulting the frame at all, so the field being unset must not be
-        // observable here.  A frame the JIT materialized from a virtual is
-        // exactly such a frame: reading the raw field made the builtins leg
-        // silently find nothing there, raising `NameError` for a builtin that
-        // plainly exists.
+        // `self.get_builtin()`, not the raw `builtin` field.  The field is
+        // unset except on honored frames; `get_builtin` falls back to
+        // `space.builtin` when it is unset, so a JIT-materialized frame with
+        // a null field still sees the space builtin.  Reading the raw field
+        // made the builtins leg silently find nothing there, raising
+        // `NameError` for a builtin that plainly exists.
         if use_cache
             && let Some(value) =
                 unsafe { load_global_cache_hit(self.pycode as PyObjectRef, nameindex) }
