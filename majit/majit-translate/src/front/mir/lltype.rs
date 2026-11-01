@@ -1029,9 +1029,13 @@ pub(in crate::front::mir) fn pointer_elem_pointee_is_gc(
 
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
 ///
-/// References return `None`. Their flow value stays the address;
-/// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
-/// or a `Rvalue::Ref`, not for a call result.
+/// References return `None`. Inside a looked-inside graph `Rvalue::Ref`
+/// of a primitive aliases the scalar word; [`tyref_scalar_pointee_value_type`]
+/// names the pointee for a parameter or a `Rvalue::Ref`, not for a call
+/// result. A residual (`dont_look_inside`) callee whose declared parameter
+/// is `&prim` / `&mut prim` (including a generic `&Q` instantiated to a
+/// copy scalar) still dereferences an address; [`raw_scalar_borrow_spills`]
+/// spills that word (`scoped_alloc` / `_rewrite_raw_malloc`).
 pub(in crate::front::mir) fn raw_scalar_address_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -4310,15 +4314,17 @@ pub(in crate::front::mir) fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> boo
     }
     // PhantomData / BuildHasherDefault stay Void via the ADT leaf,
     // including a `type T = BuildHasherDefault<H>` alias
-    // (`type_node_peel_aliases`). Uninhabited atoms and `Option<!>`
-    // use TyKind / empty-enum identity (`Struct._names_without_voids`
-    // drops a field whose lowered type IS Void).
+    // (`type_node_peel_aliases`). A published copy may keep the
+    // marker as `{"id": {"Path": "core::marker::PhantomData"}}` when
+    // the dest crate has no matching TypeDecl (`adt_node_name_path`).
+    // Uninhabited atoms and `Option<!>` use TyKind / empty-enum
+    // identity (`Struct._names_without_voids` drops a field whose
+    // lowered type IS Void).
     if tyref_node(ty, llbc)
         .and_then(|n| type_node_peel_aliases(n, llbc))
-        .and_then(adt_node_def_id)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            let path = td.item_meta.name_path_str();
+        .and_then(|n| adt_node_name_path(n, llbc))
+        .is_some_and(|path| {
+            let path = path.as_str();
             let leaf = path
                 .split('<')
                 .next()
@@ -7022,7 +7028,8 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// [`tyref_one_word_handle_payload_field`], the Field-projection
 /// identity); `all_fielddescrs` does not recurse, so
 /// `PyreDecodeContext.pos_delta` is one
-/// `getfield(PyreDecodeContext, "pos_delta")`.
+/// `getfield(PyreDecodeContext, "pos_delta")`. A `repr(transparent)` scalar wrapper
+/// is that word ([`tyref_transparent_inner_value_type`]); copying its fields would getattr them on Integer and `getfield_raw_r` a marker.
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
@@ -7765,11 +7772,34 @@ pub(in crate::front::mir) fn container_identity_deref_owner(
 
 /// The qualified declaration path of a `TyRef`'s base ADT, after
 /// stripping `Ref` / hash-cons wrappers.  `None` for non-ADT types.
+///
+/// [`apply_published_structs`] remaps a harvested field onto a dest
+/// numeric id when that crate has a matching TypeDecl; otherwise the
+/// id stays `{"Path": ...}`. [`type_decl_ref_adt_id`] reads only a
+/// number, so a Path-form marker would miss
+/// `type_str_leaf_is_void_zst` without this arm.
 pub(in crate::front::mir) fn adt_path_of_tyref(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let node = tyref_node(ty, llbc)?;
     let node = strip_ty_wrappers(node, llbc)?;
-    let id = adt_node_def_id(node)?;
-    Some(llbc.type_by_id(id)?.item_meta.name_path())
+    adt_node_name_path(node, llbc)
+}
+
+/// Qualified path of an already-stripped ADT node. A numeric `id` is
+/// the TypeDecl `name_path`; a Path-form id is that string when the
+/// dest crate has no matching TypeDecl (`apply_published_structs`).
+fn adt_node_name_path(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
+    let adt = node.as_object()?.get("Adt")?.as_object()?;
+    match adt.get("builtin").and_then(serde_json::Value::as_str) {
+        None | Some("Box") => {}
+        Some(_) => return None,
+    }
+    if let Some(id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        return Some(llbc.type_by_id(id)?.item_meta.name_path_str().to_string());
+    }
+    adt.get("id")?
+        .get("Path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// `majit_gc::hook_cell::FnPtrCell<F>` — a `global_hook!` cell. Keyed on
@@ -8191,7 +8221,10 @@ pub(in crate::front::mir) fn unique_nonzst_field(
     decl: &TypeDecl,
     llbc: &Llbc,
 ) -> Option<(usize, String)> {
-    if decl.published_struct_copy {
+    // A published copy keeps the defining crate's `repr(transparent)`
+    // layout and field list (`apply_published_structs`), so its
+    // unique sized field is still that field; any other published copy is refused.
+    if decl.published_struct_copy && !decl.is_repr_transparent() {
         return None;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -8827,9 +8860,17 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     }) {
         return Some(inner);
     }
+    // An unpublished Opaque has no field list; the bank above is its
+    // only peel. A published copy is a Struct that still carries
+    // `repr.transparent` from the foreign layout, so the unique
+    // scalar-word field is the ABI the same way a defining-crate
+    // Struct is.
+    if matches!(&decl.kind, TypeDeclKind::Opaque) {
+        return None;
+    }
     let path = decl.item_meta.name_path();
     match &decl.kind {
-        TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
+        TypeDeclKind::Struct(fields) => {
             // Whole-input layout discovery links the public wrapper to the
             // bottom scalar even when Charon marks only an inner carrier as
             // `repr(transparent)`. This applies through a borrow as well:
