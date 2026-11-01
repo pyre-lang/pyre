@@ -5412,9 +5412,11 @@ impl Optimizer {
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
         // recorder input op verbatim (args re-resolved) or an Emit-minted
         // producer, so emit may append that same Rc — no second ResOperation().
+        // That append is `Optimizer.emit` (`reuse = true`). A replaced op is a
+        // new `ResOperation` and stays on `emit_operation_inner(..., false)`.
         let emitted_rc = if !replaced {
             let rc = minted.unwrap_or_else(|| op_rc.clone());
-            self.emit_operation_inner(rc.clone(), ctx, true)?;
+            self.emit(rc.clone(), ctx)?;
             rc
         } else {
             let created = OpRc::new((*current_op).clone());
@@ -5456,6 +5458,103 @@ impl Optimizer {
         self.emit_operation_inner(created, ctx, reuse)
     }
 
+    /// optimizer.py `Optimizer.emit_extra`: no forwarding, end of the chain.
+    pub(super) fn emit_extra(
+        &mut self,
+        op: majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        self.emit(op, ctx)
+    }
+
+    /// optimizer.py `Optimizer.emit`.
+    ///
+    /// `returns_bool_result` → `getintbound(op).make_bool()` and the
+    /// constant-IntBound → `ConstInt` forward already run inside
+    /// `emit_operation_inner` after `ctx.emit_rc`. They stay there: the
+    /// appended box has to be the `_forwarded` host, and
+    /// `adopt_live_synthetic` overwrites a pre-emit bound.
+    ///
+    /// `reuse` is `true`. The unreplaced final-emit path
+    /// (`propagate_from_pass_range`, `!replaced`) appends the same `OpRc`
+    /// (`_newoperations.append(op)`). `let _ = reuse` — `emit_rc` appends
+    /// the `OpRc` the caller handed in, so the flag does not pick a
+    /// different object. The replaced fall-through keeps `reuse = false`
+    /// and calls `emit_operation_inner` directly.
+    fn emit(
+        &mut self,
+        op: majit_ir::OpRc,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        self.emit_operation_inner(op, ctx, true)
+    }
+
+    /// Roll back an `emit_operation_inner` that returns before its success
+    /// path. The success path is what consumes the deferred guard
+    /// postprocess; a guard-replace `Ok` and every early `Err` leave it
+    /// for the caller. `emit_op_rc` / `emit_for_force_rc_with` catch
+    /// `InvalidLoop`, signal, and continue, so `in_final_emission` must
+    /// not stay stuck.
+    fn restore_emit_shelter(
+        ctx: &mut OptContext,
+        saved_in_final_emission: bool,
+        saved_pending_mark: &mut Option<OpRef>,
+        saved_pending_class: &mut Option<super::PendingGuardClassPostprocess>,
+    ) {
+        ctx.in_final_emission = saved_in_final_emission;
+        if ctx.pending_mark_last_guard.is_none() {
+            ctx.pending_mark_last_guard = saved_pending_mark.take();
+        }
+        if ctx.pending_guard_class_postprocess.is_none() {
+            ctx.pending_guard_class_postprocess = saved_pending_class.take();
+        }
+    }
+
+    /// rewrite.py `postprocess_GUARD_NONNULL` / `postprocess_GUARD_CLASS`,
+    /// run once the guard (or the op that inherited the deferred callback)
+    /// is in `new_operations`.
+    fn apply_deferred_guard_postprocess(
+        ctx: &mut OptContext,
+        pending_mark: Option<OpRef>,
+        pending_class: Option<super::PendingGuardClassPostprocess>,
+    ) {
+        if let Some(opref) = pending_mark
+            && let Some(b) = ctx.get_box_replacement_operand_opt(opref)
+        {
+            ctx.mark_last_guard(&b);
+        }
+        if let Some(pp) = pending_class {
+            // rewrite.py postprocess_GUARD_CLASS:
+            //   update_last_guard = not old_guard or isinstance(descr, ResumeAtPositionDescr)
+            //   make_constant_class(arg0, expectedclassbox, update_last_guard)
+            //
+            // Delegate to `Optimizer::make_constant_class` rather than
+            // inlining a fresh `PtrInfo::known_class` overwrite — the
+            // helper preserves existing `Instance` / `Virtual` PtrInfo
+            // (fields, descr, cached_vinfo, virtual state) and only
+            // refreshes `_known_class`, matching upstream
+            // `optimizer.py` where `isinstance(opinfo,
+            // InstancePtrInfo)` mutates in place.
+            // optimizer.py `make_constant_class` always updates
+            // `_forwarded` — `materialize_operand_at` materializes the Box so the
+            // write is never silently skipped. Same materializer feeds
+            // the `last_guard_pos` read; `info.py
+            // get_last_guard_pos` reads the PtrInfo field (None if no
+            // PtrInfo, mapped to -1 = "no guard recorded").
+            let pp_obj_box = ctx.get_box_replacement_operand_opt(pp.obj);
+            let old_guard_pos = pp_obj_box
+                .as_ref()
+                .and_then(|b| ctx.last_guard_pos(b))
+                .map(|p| p as i32)
+                .unwrap_or(-1);
+            let update_last_guard =
+                old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
+            if let Some(b) = &pp_obj_box {
+                Self::make_constant_class(ctx, b, pp.class_val, update_last_guard);
+            }
+        }
+    }
+
     fn emit_operation_inner(
         &mut self,
         mut op: majit_ir::OpRc,
@@ -5465,11 +5564,28 @@ impl Optimizer {
         // RPython optimizer.py: _emit_operation is on the Optimizer (last
         // "pass" in the chain). Any force_box called here should emit directly,
         // matching RPython's Optimizer.emit_extra which just calls self.emit(op).
+        //
+        // Re-entrant for a nested NEW*/SETFIELD*/STRSETITEM/COPYSTRCONTENT/
+        // INT_ADD: those are not guards, so they do not take
+        // `pending_for_guard` (`emit_guard_operation` is the only taker).
+        // Shelter the deferred guard postprocess across that nested emit so
+        // a child append cannot run `mark_last_guard` before this op is in
+        // `new_operations`. `in_final_emission` is saved and restored on
+        // every exit, including `Err` — `emit_op_rc` continues after
+        // `signal_invalid_loop`.
         let saved_in_final_emission = ctx.in_final_emission;
         ctx.in_final_emission = true;
+        let mut saved_pending_mark = ctx.pending_mark_last_guard.take();
+        let mut saved_pending_class = ctx.pending_guard_class_postprocess.take();
 
         // A deferred `InvalidLoop` from the pass walk aborts before emission.
         if let Some(e) = ctx.take_invalid_loop() {
+            Self::restore_emit_shelter(
+                ctx,
+                saved_in_final_emission,
+                &mut saved_pending_mark,
+                &mut saved_pending_class,
+            );
             return Err(e);
         }
 
@@ -5479,12 +5595,26 @@ impl Optimizer {
         // read info off op.arg(i).
         for i in 0..op.num_args() {
             let arg = self.force_box(&op.arg(i), ctx);
-            self.flush_queued_producer(arg.to_opref(), ctx)?;
+            if let Err(e) = self.flush_queued_producer(arg.to_opref(), ctx) {
+                Self::restore_emit_shelter(
+                    ctx,
+                    saved_in_final_emission,
+                    &mut saved_pending_mark,
+                    &mut saved_pending_class,
+                );
+                return Err(e);
+            }
             op.setarg(i, arg);
         }
         // force_box may force a virtual whose materialization defers an
         // `InvalidLoop`; abort before the emit / `expect` sites below.
         if let Some(e) = ctx.take_invalid_loop() {
+            Self::restore_emit_shelter(
+                ctx,
+                saved_in_final_emission,
+                &mut saved_pending_mark,
+                &mut saved_pending_class,
+            );
             return Err(e);
         }
 
@@ -5551,7 +5681,15 @@ impl Optimizer {
                     );
                     crate::compile::copy_all_attributes_from(&new_descr, &old_descr);
                     ctx.replace_new_operation(target_pos, op.clone());
-                    ctx.in_final_emission = saved_in_final_emission;
+                    // Guard replacement returns before the postprocess
+                    // consume. Put the sheltered callbacks back; do not run
+                    // them here.
+                    Self::restore_emit_shelter(
+                        ctx,
+                        saved_in_final_emission,
+                        &mut saved_pending_mark,
+                        &mut saved_pending_class,
+                    );
                     return Ok(());
                 }
             }
@@ -5566,6 +5704,12 @@ impl Optimizer {
             // emit_guard_operation may defer an `InvalidLoop` (e.g. a pending
             // SETARRAYITEM index that is not a non-negative constant).
             if let Some(e) = ctx.take_invalid_loop() {
+                Self::restore_emit_shelter(
+                    ctx,
+                    saved_in_final_emission,
+                    &mut saved_pending_mark,
+                    &mut saved_pending_class,
+                );
                 return Err(e);
             }
         } else {
@@ -5659,42 +5803,17 @@ impl Optimizer {
         }
         // optimizer.py: run deferred postprocess after emit.
         // RPython calls OptimizationResult.callback() → propagate_postprocess.
-        // rewrite.py: postprocess_GUARD_NONNULL → mark_last_guard
-        if let Some(opref) = ctx.pending_mark_last_guard.take()
-            && let Some(b) = ctx.get_box_replacement_operand_opt(opref)
-        {
-            ctx.mark_last_guard(&b);
-        }
-        if let Some(pp) = ctx.pending_guard_class_postprocess.take() {
-            // rewrite.py postprocess_GUARD_CLASS:
-            //   update_last_guard = not old_guard or isinstance(descr, ResumeAtPositionDescr)
-            //   make_constant_class(arg0, expectedclassbox, update_last_guard)
-            //
-            // Delegate to `Optimizer::make_constant_class` rather than
-            // inlining a fresh `PtrInfo::known_class` overwrite — the
-            // helper preserves existing `Instance` / `Virtual` PtrInfo
-            // (fields, descr, cached_vinfo, virtual state) and only
-            // refreshes `_known_class`, matching upstream
-            // `optimizer.py` where `isinstance(opinfo,
-            // InstancePtrInfo)` mutates in place.
-            // optimizer.py `make_constant_class` always updates
-            // `_forwarded` — `materialize_operand_at` materializes the Box so the
-            // write is never silently skipped. Same materializer feeds
-            // the `last_guard_pos` read; `info.py
-            // get_last_guard_pos` reads the PtrInfo field (None if no
-            // PtrInfo, mapped to -1 = "no guard recorded").
-            let pp_obj_box = ctx.get_box_replacement_operand_opt(pp.obj);
-            let old_guard_pos = pp_obj_box
-                .as_ref()
-                .and_then(|b| ctx.last_guard_pos(b))
-                .map(|p| p as i32)
-                .unwrap_or(-1);
-            let update_last_guard =
-                old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
-            if let Some(b) = &pp_obj_box {
-                Self::make_constant_class(ctx, b, pp.class_val, update_last_guard);
-            }
-        }
+        // The values sheltered at entry are this emit's callbacks. Anything
+        // assigned on `ctx` during the body (a nested non-direct walk) is
+        // applied after them.
+        Self::apply_deferred_guard_postprocess(
+            ctx,
+            saved_pending_mark.take(),
+            saved_pending_class.take(),
+        );
+        let pending_mark = ctx.pending_mark_last_guard.take();
+        let pending_class = ctx.pending_guard_class_postprocess.take();
+        Self::apply_deferred_guard_postprocess(ctx, pending_mark, pending_class);
         ctx.in_final_emission = saved_in_final_emission;
         // A post-emit `make_constant_box` / postprocess may have deferred an
         // `InvalidLoop`; surface it so the driver abandons the trace.

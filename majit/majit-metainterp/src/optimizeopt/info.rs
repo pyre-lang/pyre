@@ -1248,17 +1248,22 @@ fn force_box_emit(
     ) -> majit_ir::OpRc {
         let direct = ctx.in_final_emission || ctx.force_direct;
         if direct {
-            // optimizer.py `Optimizer.emit_extra` → `emit` →
-            // `_emit_operation`: `arg = self.force_box(op.getarg(i))`.
-            for i in 0..op.num_args() {
-                let arg = if let Some(opt) = optimizer.as_deref_mut() {
-                    opt.force_box(&op.arg(i), ctx)
-                } else {
-                    ctx.force_box_inline(&op.arg(i))
-                };
-                op.setarg(i, arg);
+            if let Some(opt) = optimizer.as_deref_mut() {
+                // optimizer.py `Optimizer.emit_extra` → `emit` →
+                // `_emit_operation`: force every arg, then append. The
+                // same `OpRc` (`clone` bumps the refcount) so `setarg`
+                // lands on this box.
+                if let Err(crate::optimize::InvalidLoop(reason)) = opt.emit_extra(op.clone(), ctx) {
+                    ctx.signal_invalid_loop(reason);
+                }
+            } else {
+                // No optimizer (`force_box_inline`, direct unit tests).
+                for i in 0..op.num_args() {
+                    let arg = ctx.force_box_inline(&op.arg(i));
+                    op.setarg(i, arg);
+                }
+                ctx.emit_rc(op.clone());
             }
-            ctx.emit_rc(op.clone());
         } else if let Some(opt) = optimizer.as_deref_mut() {
             if let Err(crate::optimize::InvalidLoop(reason)) =
                 opt.emit_extra_immediate(ctx.current_pass_idx, &op, ctx)
@@ -2652,6 +2657,185 @@ mod tests {
             .expect("newop.set_forwarded(self)");
         assert!(matches!(info, PtrInfo::Struct(_)));
         assert!(!info.is_virtual());
+    }
+
+    fn two_passon() -> (crate::optimizeopt::optimizer::Optimizer, OptContext) {
+        let mut opt = crate::optimizeopt::optimizer::Optimizer::new();
+        opt.add_pass(Box::new(PassOnOpt));
+        opt.add_pass(Box::new(PassOnOpt));
+        let mut ctx = OptContext::new(8);
+        ctx.current_pass_idx = 0;
+        ctx.in_final_emission = false;
+        ctx.force_direct = false;
+        (opt, ctx)
+    }
+
+    fn virtual_with_field(
+        ctx: &mut OptContext,
+        field_type: Type,
+        name: &'static str,
+        value: Operand,
+    ) -> (Operand, OpRc) {
+        let field: Arc<dyn FieldDescr> = Arc::new(ForceFieldDescr {
+            offset: 16,
+            field_size: 8,
+            field_type,
+            name,
+        });
+        let descr: DescrRef = Arc::new(ForceSizeDescr {
+            all_fields: vec![field],
+            gc_fields: vec![],
+            w_class: 0,
+        });
+        let mut info = PtrInfo::virtual_struct(descr.clone());
+        info.setfield(0, value);
+        let new_rc = OpRc::new(Op::with_descr(OpCode::New, &[], descr));
+        let virtual_box = Operand::from_bound_op(&new_rc);
+        ctx.set_ptr_info(&virtual_box, info);
+        (virtual_box, new_rc)
+    }
+
+    fn str_virtual(variant: VStringVariant, lgtop: Option<Operand>, length: i32) -> PtrInfo {
+        PtrInfo::Str(StrPtrInfo {
+            lenbound: None,
+            lgtop,
+            mode: 0,
+            length,
+            variant,
+            last_guard_pos: -1,
+            avpi: AbstractVirtualPtrInfo::new(),
+        })
+    }
+
+    /// Every non-const, non-input, non-absent arg must be an op already
+    /// present earlier in `new_operations`.
+    fn assert_args_defined_before_use(ops: &[OpRc]) {
+        let trace: Vec<_> = ops.iter().map(|op| (op.opcode, op.pos().get())).collect();
+        for (i, op) in ops.iter().enumerate() {
+            for a in 0..op.num_args() {
+                let arg = op.arg(a);
+                if arg.is_constant() || arg.is_inputarg() || arg.is_none() {
+                    continue;
+                }
+                let pos = arg.to_opref();
+                let defined_at = ops.iter().position(|earlier| earlier.pos().get() == pos);
+                assert!(
+                    arg.is_resop() && defined_at.is_some_and(|at| at < i),
+                    "op {i} {:?} arg {a} {pos:?} is not defined before use; trace={trace:?}",
+                    op.opcode
+                );
+            }
+        }
+    }
+
+    /// A container field that is a virtual slice (non-constant start, length
+    /// > 2) of another virtual string. `copy_str_content` emits
+    /// COPYSTRCONTENT through `Optimizer.emit_extra`, so the source is
+    /// forced before the copy is appended.
+    #[test]
+    fn force_slice_field_source_newstr_precedes_copystrcontent() {
+        let (mut opt, mut ctx) = two_passon();
+        let source_rc = OpRc::new(Op::new(
+            OpCode::Newstr,
+            &[Operand::const_from_value(Value::Int(3))],
+        ));
+        source_rc.pos().set(OpRef::ref_op(100));
+        let source_box = Operand::from_bound_op(&source_rc);
+        ctx.set_ptr_info(
+            &source_box,
+            str_virtual(
+                VStringVariant::Plain(VStringPlainInfo {
+                    _chars: vec![None, None, None],
+                }),
+                None,
+                3,
+            ),
+        );
+        let (start, start_root) =
+            crate::history::test_support::bound_inputarg_operand(Type::Int, 0);
+        let length = Operand::const_from_value(Value::Int(3));
+        let slice_rc = OpRc::new(Op::new(OpCode::Newstr, &[length.clone()]));
+        slice_rc.pos().set(OpRef::ref_op(101));
+        let slice_box = Operand::from_bound_op(&slice_rc);
+        ctx.set_ptr_info(
+            &slice_box,
+            str_virtual(
+                VStringVariant::Slice(VStringSliceInfo {
+                    s: source_box,
+                    start,
+                    lgtop: length.clone(),
+                }),
+                Some(length),
+                3,
+            ),
+        );
+        let (container, container_rc) = virtual_with_field(&mut ctx, Type::Ref, "slice", slice_box);
+
+        opt.force_box(&container, &mut ctx);
+
+        let _roots = (source_rc, slice_rc, container_rc, start_root);
+        assert!(!ctx.in_final_emission);
+        assert!(!ctx.force_direct);
+        let ops = &ctx.new_operations;
+        assert_eq!(
+            ops.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+            vec![
+                OpCode::New,
+                OpCode::Newstr,
+                OpCode::Newstr,
+                OpCode::Copystrcontent,
+                OpCode::SetfieldGc,
+            ]
+        );
+        assert_args_defined_before_use(ops);
+        let copy_at = ops
+            .iter()
+            .position(|op| op.opcode == OpCode::Copystrcontent)
+            .expect("length > inline threshold emits COPYSTRCONTENT");
+        let src_pos = ops[copy_at].arg(0).to_opref();
+        let src_at = ops
+            .iter()
+            .position(|op| op.pos().get() == src_pos)
+            .expect("COPYSTRCONTENT source is an emitted op");
+        assert!(src_at < copy_at, "source NEWSTR precedes COPYSTRCONTENT");
+        assert_eq!(ops[src_at].opcode, OpCode::Newstr);
+    }
+
+    /// Materializing a container whose field is itself virtual counts every
+    /// appended op, including the child's direct `emit_extra`.
+    #[test]
+    fn force_nested_virtual_increments_opt_ops_emitted() {
+        let (mut opt, mut ctx) = two_passon();
+        let (inner, inner_rc) = virtual_with_field(
+            &mut ctx,
+            Type::Int,
+            "payload",
+            Operand::const_from_value(Value::Int(42)),
+        );
+        let (outer, outer_rc) = virtual_with_field(&mut ctx, Type::Ref, "child", inner);
+        let before = opt.opt_ops_emitted;
+        let before_len = ctx.new_operations.len();
+
+        opt.force_box(&outer, &mut ctx);
+
+        let _roots = (inner_rc, outer_rc);
+        let appended = ctx.new_operations.len() - before_len;
+        assert_eq!(
+            ctx.new_operations
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                OpCode::New,
+                OpCode::New,
+                OpCode::SetfieldGc,
+                OpCode::SetfieldGc,
+            ]
+        );
+        assert_eq!(opt.opt_ops_emitted - before, appended);
+        assert_eq!(appended, 4);
+        assert!(!ctx.in_final_emission);
+        assert!(!ctx.force_direct);
     }
 
     #[test]
