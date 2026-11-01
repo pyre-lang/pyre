@@ -1,7 +1,8 @@
 use super::{
     adt_field_read_value_type, charon_type_value_to_ast_string, dont_look_inside_return_token,
-    json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, no_tombstoned_leaves,
-    raw_field_address_value_type, shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
+    is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
+    json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type,
+    shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
     tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
     tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
@@ -27,6 +28,229 @@ use crate::front::mir::tests::{
     vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_local,
     window_meta, window_mut_slice, window_place, window_shared_slice, window_slice, window_span,
 };
+
+#[test]
+fn crate_prefixed_utf8str_is_str_family() {
+    assert!(is_str_family_class_root(
+        "pyre_object::unicodeobject::Utf8Str"
+    ));
+    assert!(is_str_family_class_root(
+        "pyre_object::unicodeobject::UnicodeValueStorage"
+    ));
+    assert!(is_str_family_class_root("unicodeobject::Utf8Str"));
+    assert!(is_str_family_class_root("Utf8Str"));
+    assert!(!is_str_family_class_root("other::Utf8Str"));
+    assert!(!is_str_family_class_root("other::Wtf8Buf"));
+    assert!(!is_str_family_class_root(
+        "other_crate::nested::unicodeobject::Utf8Str"
+    ));
+    assert!(!is_str_family_class_root(
+        "pyre_object::lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(!is_str_family_class_root(
+        "lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(!is_str_family_class_root("LowlevelStringHeader"));
+    assert!(!is_str_family_class_root("other::LowlevelStringHeader"));
+    assert!(is_rstr_str_layout_declaration(
+        "pyre_object::lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(is_rstr_str_layout_declaration(
+        "lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(is_rstr_str_layout_declaration("LowlevelStringHeader"));
+    assert!(!is_rstr_str_layout_declaration(
+        "other::LowlevelStringHeader"
+    ));
+    assert!(!is_rstr_str_layout_declaration("other::Utf8Str"));
+    assert!(!is_rstr_str_layout_declaration("alloc::string::String"));
+    assert!(!is_rstr_str_layout_declaration("string::String"));
+    assert!(is_str_family_class_root("string::String"));
+    // Family tables keep the dict-key wrappers; layout (`node_is_string_value`) does not.
+    assert!(is_str_family_class_root("celldict::StrKey"));
+    assert!(is_str_family_class_root("dictmultiobject::BytesKey"));
+    assert!(is_str_family_class_root("pyre_object::celldict::StrKey"));
+    assert!(!is_rstr_str_layout_declaration("celldict::StrKey"));
+    assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
+}
+
+/// `node_is_string_value` identifies the rstr `STR` layout set by
+/// declaration path, not the last path component. `other::Utf8Str` is a
+/// different type. `StrKey` / `BytesKey` wrap a STR pointer.
+#[test]
+fn node_is_string_value_uses_declaration_identity() {
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let lookalike = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["other", "Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let header = serde_json::json!({
+        "def_id": 2,
+        "item_meta": window_meta(&["pyre_object", "lowlevel_string", "LowlevelStringHeader"], true),
+        "kind": {"Struct": []}
+    });
+    let header_lookalike = serde_json::json!({
+        "def_id": 3,
+        "item_meta": window_meta(&["other", "LowlevelStringHeader"], true),
+        "kind": {"Struct": []}
+    });
+    let rust_heap = serde_json::json!({
+        "def_id": 4,
+        "item_meta": window_meta(&["alloc", "string", "String"], true),
+        "kind": {"Struct": []}
+    });
+    let str_key = serde_json::json!({
+        "def_id": 5,
+        "item_meta": window_meta(&["pyre_object", "celldict", "StrKey"], true),
+        "kind": {"Struct": []}
+    });
+    let bytes_key = serde_json::json!({
+        "def_id": 6,
+        "item_meta": window_meta(&["pyre_object", "dictmultiobject", "BytesKey"], true),
+        "kind": {"Struct": []}
+    });
+    let str_key_lookalike = serde_json::json!({
+        "def_id": 7,
+        "item_meta": window_meta(&["other", "StrKey"], true),
+        "kind": {"Struct": []}
+    });
+    let utf8_leaf = serde_json::json!({
+        "def_id": 8,
+        "item_meta": window_meta(&["Utf8Str"], true),
+        "kind": {"Struct": []}
+    });
+    let bytes_leaf = serde_json::json!({
+        "def_id": 9,
+        "item_meta": window_meta(&["BytesBlock"], true),
+        "kind": {"Struct": []}
+    });
+    let header_leaf = serde_json::json!({
+        "def_id": 10,
+        "item_meta": window_meta(&["LowlevelStringHeader"], true),
+        "kind": {"Struct": []}
+    });
+    let llbc = window_llbc(
+        vec![
+            utf8,
+            lookalike,
+            header,
+            header_lookalike,
+            rust_heap,
+            str_key,
+            bytes_key,
+            str_key_lookalike,
+            utf8_leaf,
+            bytes_leaf,
+            header_leaf,
+        ],
+        vec![],
+    );
+    let adt = |id: u64| {
+        TyRef::Other(serde_json::json!({
+            "Adt": {"id": id, "builtin": null, "generics": window_empty_generics()}
+        }))
+    };
+    let raw = |id: u64| {
+        TyRef::Other(serde_json::json!({
+            "RawPtr": [{
+                "Adt": {"id": id, "builtin": null, "generics": window_empty_generics()}
+            }, "Mut"]
+        }))
+    };
+    assert!(super::tyref_is_string_value(&adt(0), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(1), &llbc));
+    // Header is the lltype `{hash, len}` overlay (`STR_LENGTH_FIELD_CLASS_ROOTS`),
+    // rstr `STR` layout (`is_rstr_str_layout_declaration`).
+    assert!(super::tyref_is_string_value(&adt(2), &llbc));
+    assert!(is_rstr_str_layout_declaration(
+        "pyre_object::lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(!super::tyref_is_string_value(&adt(3), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(4), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(5), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(6), &llbc));
+    assert!(!super::tyref_is_string_value(&adt(7), &llbc));
+    // Crate-root leaves of the old layout set stay string values;
+    // `other::Utf8Str` above does not.
+    assert!(super::tyref_is_string_value(&adt(8), &llbc));
+    assert!(super::tyref_is_string_value(&adt(9), &llbc));
+    assert!(super::tyref_is_string_value(&adt(10), &llbc));
+    assert!(super::tyref_raw_ptr_pointee_is_string_value(&raw(0), &llbc));
+    assert!(!super::tyref_raw_ptr_pointee_is_string_value(
+        &raw(1),
+        &llbc
+    ));
+    assert!(super::tyref_raw_ptr_pointee_is_string_value(&raw(2), &llbc));
+    assert!(!super::tyref_raw_ptr_pointee_is_string_value(
+        &raw(3),
+        &llbc
+    ));
+    assert!(!super::tyref_raw_ptr_pointee_is_string_value(
+        &raw(4),
+        &llbc
+    ));
+    assert!(!super::tyref_raw_ptr_pointee_is_string_value(
+        &raw(5),
+        &llbc
+    ));
+    assert!(!super::tyref_raw_ptr_pointee_is_string_value(
+        &raw(6),
+        &llbc
+    ));
+    assert!(matches!(
+        tyref_to_value_type(&adt(0), &llbc),
+        ValueType::Str
+    ));
+    assert!(!matches!(
+        tyref_to_value_type(&adt(5), &llbc),
+        ValueType::Str
+    ));
+    assert!(!matches!(
+        tyref_to_value_type(&raw(5), &llbc),
+        ValueType::Str
+    ));
+    assert!(!matches!(
+        tyref_to_value_type(&raw(6), &llbc),
+        ValueType::Str
+    ));
+}
+
+/// `shadow_stack_get(base) as *mut UnicodeValueStorage` in the real
+/// `function_new_impl` body must lower to `__cast_instance_intrinsic`
+/// with a Utf8Str-family root and `result_ty == Str`
+/// (`op_gc_restore_root` recasts to `Ptr(STR)`).
+#[test]
+fn function_new_impl_reload_emits_cast_instance_str() {
+    let interp = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(interp).exists() {
+        return;
+    }
+    let llbc = Llbc::load(interp).expect("load pyre-interpreter LLBC");
+    let graph =
+        crate::front::mir::lower_function(&llbc, "pyre_interpreter::function::function_new_impl")
+            .expect("lower function_new_impl");
+    let casts: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { result_ty, .. } => crate::model::cast_instance_root(&op.kind)
+                .map(|root| (root.to_string(), result_ty.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        casts
+            .iter()
+            .any(|(root, ty)| { is_str_family_class_root(root) && matches!(ty, ValueType::Str) }),
+        "function_new_impl reload must dest-is-str; casts={casts:?}"
+    );
+}
 
 mod slice_or_vec_container_root_spelling_tests {
     use crate::front::mir::slice_or_vec_container_root_spelling;

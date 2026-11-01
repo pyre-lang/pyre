@@ -2632,10 +2632,11 @@ impl<'a> Lowering<'a> {
                 // directions ([`Lowering::ptr_cast_marker`]). `lltype.cast_pointer`
                 // (`lltype.py`) is pointer-to-pointer. UnaryOp Cast already
                 // calls `ptr_cast_marker` without a Charon kind gate;
-                // `ptr_cast_marker` requires both sides Ref, so an int-to-ptr
-                // Scalar still falls through. A flavor-raw dest must reach
-                // the marker even when Charon spells the kind as something
-                // other than `RawPtr` (`*const () as *const CodeObject`).
+                // `ptr_cast_marker` requires a Ref source, so an int-to-ptr
+                // Scalar still falls through. A flavor-raw dest, and a dest
+                // rstr `STR` (`*mut Utf8Str` / `shadow_stack_get as *mut Utf8Str`),
+                // must reach the marker even when Charon spells the kind as
+                // something other than `RawPtr` (`*const () as *const CodeObject`).
                 let dest_flavor_raw = flavor_raw_pointer_class_root(
                     &ty,
                     self.llbc,
@@ -2662,7 +2663,17 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok((None, self.emit_gc_ref_as_ccharp(mir_bb, v)));
                 }
-                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw)
+                let dest_is_str = matches!(
+                    tyref_to_value_type_with(
+                        &ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ),
+                    ValueType::Str
+                ) || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc);
+                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str)
                     && let Some((op, res)) = self
                         .ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                         .or_else(|| {
@@ -4091,7 +4102,7 @@ impl<'a> Lowering<'a> {
     /// The marker call a same-bank pointer-to-pointer reinterpret lowers
     /// to, or `None` when the cast simply aliases its operand.
     ///
-    /// Two shapes share this decision, so both `Cast` lowering arms route
+    /// Three shapes share this decision, so both `Cast` lowering arms route
     /// through here:
     ///
     /// * **erase** — `p as *mut u8` drops the pointee class.  Aliasing
@@ -4109,10 +4120,21 @@ impl<'a> Lowering<'a> {
     ///   straight through agree on one annotation.
     /// * **narrow** — `obj as *const RegisteredStruct`; see
     ///   `__cast_instance_intrinsic` below.
+    /// * **dest-Str** — `shadow_stack_get(slot) as *mut Utf8Str` (or the
+    ///   `{hash, len}` overlay). Src is a GCREF / `PyObjectRef`
+    ///   (`ValueType::Ref`); dest layout is rstr `STR`
+    ///   (`is_rstr_str_layout_declaration`, `ValueType::Str`). `Ref` and
+    ///   `Str` share bank 1, so aliasing keeps `SomePtr(GCREF)` on a
+    ///   `*mut Utf8Str` local and `mergeinputargs` panics `Ptr ∪ String`.
+    ///   Upstream `op_gc_restore_root` recasts with the livevar's own
+    ///   lltype (`cast_adr_to_ptr` → `Ptr(STR)` / `SomeString`);
+    ///   `GCRefRepr.convert_from_to` is `cast_opaque_ptr` onto
+    ///   `r_to.lowleveltype`. Stamp `__cast_instance_intrinsic` with
+    ///   `ValueType::Str`, not
+    ///   [`Self::instance_narrow_for_type`]'s default `Ref(Some(root))`.
     ///
-    /// Both are pointer-to-pointer only: a `Ref` source is required, since
-    /// an `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
-    /// territory and must alias instead.
+    /// A `Ref` source is required: an `addr_usize as *const Struct`
+    /// reinterpret is `cast_int_to_ptr` territory and must alias instead.
     pub(in crate::front::mir) fn ptr_cast_marker(
         &mut self,
         src_kind: Option<&ValueType>,
@@ -4120,18 +4142,41 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         arg: &Variable,
     ) -> Option<(OpKind, Variable)> {
-        if !matches!(src_kind, Some(ValueType::Ref(_)))
-            || !matches!(
-                tyref_to_value_type_with(
-                    dest_ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs
-                ),
-                ValueType::Ref(_)
-            )
+        if !matches!(src_kind, Some(ValueType::Ref(_))) {
+            return None;
+        }
+        let dest_kind = tyref_to_value_type_with(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        // Dest-Str restore: GCREF → rstr `STR` pointer. Upstream
+        // `LLFrame.op_gc_restore_root` recasts with the livevar's own
+        // lltype (`cast_adr_to_ptr`); `GCRefRepr.convert_from_to` is
+        // `cast_opaque_ptr` onto `r_to.lowleveltype`. Every dest whose
+        // layout is rstr `STR` (`is_rstr_str_layout_declaration`) takes
+        // the same Ptr(STR) restore. The blackhole `{hash, len}` overlay
+        // is that layout; its `.length` FieldRead is `len(s)`
+        // (`LLHelpers.ll_strlen`). Wrappers around a STR pointer
+        // (`celldict::StrKey` / `dictmultiobject::BytesKey`) are not this
+        // layout. The dest must already be `ValueType::Str` or a raw
+        // pointer to that layout (`tyref_raw_ptr_pointee_is_string_value`).
+        if (matches!(dest_kind, ValueType::Str)
+            || tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc))
+            && let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
+            && is_rstr_str_layout_declaration(&root)
         {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            return Some((
+                crate::model::cast_instance_call_result(root, arg.clone(), ValueType::Str),
+                res,
+            ));
+        }
+        if !matches!(dest_kind, ValueType::Ref(_)) {
             return None;
         }
         let (segments, result_ty) =

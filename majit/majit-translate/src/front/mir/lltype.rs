@@ -4748,8 +4748,44 @@ pub(crate) const STR_LENGTH_FIELD_CLASS_ROOTS: &[&str] = &[
 pub(crate) const STR_OOPSPEC_CLASS_ROOTS: &[&str] =
     &["unicodeobject::Utf8Str", "bytesobject::BytesBlock"];
 
+/// TypeDecl `name_path` of the rstr `STR` / WTF-8 declarations, crate kept.
+///
+/// `class_identity_spelling` / [`STR_FAMILY_CLASS_ROOTS`] store the
+/// crate-stripped form (`unicodeobject::Utf8Str`). FunDecl `name_path`
+/// keeps the crate (`pyre_object::unicodeobject::Utf8Str`); exact
+/// membership of the stripped table misses that spelling, so
+/// `__cast_instance_intrinsic` dest-is-str-family would not fire and
+/// `shadow_stack_get as *mut Utf8Str` would stay `Ptr(GCREF)`.
+/// `jtransform.py Transformer._handle_stroruni_call` checks `SoU.TO ==
+/// rstr.STR` — the concrete type, not a suffix of an enclosing path.
+pub(crate) const STR_FAMILY_DECLARED_PATHS: &[&str] = &[
+    "pyre_object::unicodeobject::Utf8Str",
+    "pyre_object::unicodeobject::UnicodeValueStorage",
+    "pyre_object::bytesobject::BytesBlock",
+    "pyre_object::dictmultiobject::BytesKey",
+    "pyre_object::celldict::StrKey",
+    "rustpython_wtf8::Wtf8",
+    "rustpython_wtf8::Wtf8Buf",
+];
+
 pub(crate) fn is_str_family_class_root(root: &str) -> bool {
-    STR_FAMILY_CLASS_ROOTS.contains(&root) || is_rust_heap_string_root(root) || root == "str"
+    STR_FAMILY_CLASS_ROOTS.contains(&root)
+        || STR_FAMILY_DECLARED_PATHS.contains(&root)
+        || is_rust_heap_string_root(root)
+        || root == "str"
+}
+
+/// lltype identity of the rstr `STR` `{hash, len}` overlay
+/// ([`STR_LENGTH_FIELD_CLASS_ROOTS`]). One crate-prefix peel while the
+/// remainder stays module-qualified: `other::LowlevelStringHeader` is a
+/// different type. Dest overlay uses this so `bh_lowlevel_string_len`
+/// stays `Ptr(STR)` FieldRead, not a raw `SomePtr` recast.
+fn is_str_length_overlay_declaration(path: &str) -> bool {
+    if is_str_length_field_class_root(path) {
+        return true;
+    }
+    let stripped = strip_crate_prefix(path);
+    stripped != path && stripped.contains("::") && is_str_length_field_class_root(&stripped)
 }
 
 pub(crate) fn is_str_length_field_class_root(root: &str) -> bool {
@@ -4771,6 +4807,47 @@ fn is_declared_wtf8_owner(owner: &str) -> bool {
 /// the crate-prefixed FunDecl `name_path` segments.
 fn is_declared_wtf8buf_owner(owner: &str) -> bool {
     matches!(owner, "Wtf8Buf" | "rustpython_wtf8::Wtf8Buf")
+}
+
+/// Crate-root leaves of the rstr `STR` layout set. The last-component
+/// match accepted these names; declaration-path identity keeps them
+/// when the path *is* the leaf (`charon_adt_to_ast_string` field
+/// spelling) and still rejects `other::Utf8Str` (a crate-prefix peel
+/// requires the remainder to stay module-qualified).
+const STR_LAYOUT_LEAVES: &[&str] = &[
+    "Wtf8",
+    "Wtf8Buf",
+    "Utf8Str",
+    "UnicodeValueStorage",
+    "BytesBlock",
+    "LowlevelStringHeader",
+];
+
+/// Layout is rstr `STR` (`[hash, length, chars]`): the WTF-8 wrappers,
+/// `Utf8Str` / `UnicodeValueStorage`, `BytesBlock`, and the blackhole
+/// `{hash, len}` overlay `LowlevelStringHeader`. Identity is the
+/// declaration path (module-qualified overlay / WTF-8 owners, one
+/// crate-prefix peel while the remainder stays module-qualified, or
+/// an exact crate-root leaf), so `other::Utf8Str` is a different type.
+/// `celldict::StrKey` / `dictmultiobject::BytesKey` wrap a STR pointer
+/// and are not this layout.
+/// Dest-Str restore (`ptr_cast_marker`) uses this set: `op_gc_restore_root`
+/// recasts with the livevar's own lltype, and `GCRefRepr.convert_from_to`
+/// is `cast_opaque_ptr` onto `r_to.lowleveltype`.
+pub(crate) fn is_rstr_str_layout_declaration(path: &str) -> bool {
+    is_str_length_overlay_declaration(path)
+        || is_wtf8_str_layout_declaration(path)
+        || STR_LAYOUT_LEAVES.contains(&path)
+}
+
+fn is_wtf8_str_layout_declaration(path: &str) -> bool {
+    if is_declared_wtf8_owner(path) || is_declared_wtf8buf_owner(path) {
+        return true;
+    }
+    let stripped = strip_crate_prefix(path);
+    stripped != path
+        && stripped.contains("::")
+        && (is_declared_wtf8_owner(&stripped) || is_declared_wtf8buf_owner(&stripped))
 }
 
 /// `Wtf8::new` / `Wtf8Buf::from_string` / `From<&str> for Wtf8Buf` — the
@@ -5183,30 +5260,17 @@ pub(in crate::front::mir) fn node_is_string_value(node: &serde_json::Value, llbc
     if node.get("Adt").and_then(type_decl_ref_builtin) == Some("Str") {
         return true;
     }
-    // Named string ADTs whose layout is rstr `STR` (`[hash, length, chars]`):
-    // the WTF-8 wrappers, `Utf8Str` / `UnicodeValueStorage`,
-    // `BytesBlock` (`type BytesBlock = Utf8Str`, `W_BytesObject._value`),
-    // and `LowlevelStringHeader` (the `{hash, len}` view
-    // `bh_lowlevel_string_len` loads; `rstr.py` `STR`). Dest overlay must
-    // not recast that header as a raw `SomePtr` — `ann_cast_int_to_ptr`
-    // of `Ptr(STR)` is the string itself, and `ll_strlen` is `len(s.chars)`.
-    // `alloc::string::String` is a Rust-heap `{cap, ptr, len}` header and
-    // is not this family (`tyref_is_rust_heap_string`).
+    // Named ADTs whose layout is rstr `STR` (`[hash, length, chars]`).
+    // Identity is the concrete declaration path, not the last path
+    // component: [`is_rstr_str_layout_declaration`]. Dest-Str restore
+    // uses the same set (`op_gc_restore_root`). Dest overlay must
+    // not recast `LowlevelStringHeader` as a raw `SomePtr` —
+    // `ann_cast_int_to_ptr` of `Ptr(STR)` is the string itself, and
+    // `ll_strlen` is `len(s.chars)`. `alloc::string::String` is a
+    // Rust-heap `{cap, ptr, len}` header (`tyref_is_rust_heap_string`).
     adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| {
-            matches!(
-                td.item_meta.name_path().rsplit("::").next(),
-                Some(
-                    "Wtf8"
-                        | "Wtf8Buf"
-                        | "Utf8Str"
-                        | "UnicodeValueStorage"
-                        | "BytesBlock"
-                        | "LowlevelStringHeader"
-                )
-            )
-        })
+        .is_some_and(|td| is_rstr_str_layout_declaration(td.item_meta.name_path_str()))
 }
 
 /// Whether `reg` resolves to a `Deref::deref` / `DerefMut::deref_mut`
@@ -8895,8 +8959,8 @@ pub(in crate::front::mir) fn typevar_bound_index(node: &serde_json::Value) -> Op
 /// trait decl's leaf name `Into` (a `From<String>` bound has the same
 /// generics shape but means the *opposite* conversion).
 ///
-/// The target test is [`node_is_string_value`], whose family is `str`,
-/// `Wtf8`, `Wtf8Buf`, `Utf8Str`, `BytesBlock`.
+/// The target test is [`node_is_string_value`], whose family is the
+/// rstr `STR` layout (`is_rstr_str_layout_declaration`).
 pub(in crate::front::mir) fn typevar_bounded_by_into_string_value(
     var_index: u64,
     fn_generics: &serde_json::Value,

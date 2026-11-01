@@ -4362,6 +4362,12 @@ fn str_family_class_roots_reject_lookalikes() {
     assert!(!super::is_str_family_class_root("other::Utf8Str"));
     assert!(!super::is_str_family_class_root("other::Wtf8Buf"));
     assert!(!super::is_str_family_class_root("other::BytesBlock"));
+    assert!(!super::is_str_family_class_root(
+        "other::LowlevelStringHeader"
+    ));
+    assert!(!super::is_str_family_class_root(
+        "lowlevel_string::LowlevelStringHeader"
+    ));
     assert!(!super::is_str_length_field_class_root("other::Utf8Str"));
     assert!(super::is_str_length_field_class_root(
         "unicodeobject::Utf8Str"

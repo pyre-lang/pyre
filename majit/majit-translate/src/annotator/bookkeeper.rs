@@ -4317,7 +4317,13 @@ impl Bookkeeper {
             // queries it with the slice, so the key cell is the same
             // `SomeString`. A nominal key instance cannot union with
             // that slice.
-            _ if crate::front::mir::is_str_family_class_root(stripped) => {
+            // The `{hash, len}` overlay is the same rstr `STR` layout
+            // (`is_rstr_str_layout_declaration`); dest-Str restore
+            // (`op_gc_restore_root`) and `LLHelpers.ll_strlen` read it as
+            // the string itself.
+            _ if crate::front::mir::is_str_family_class_root(stripped)
+                || crate::front::mir::is_rstr_str_layout_declaration(stripped) =>
+            {
                 return super::model::s_str0();
             }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque
@@ -7273,6 +7279,26 @@ mod tests {
             bk.project_struct_field_type("other::Wtf8Buf"),
             crate::annotator::model::s_str0(),
             "an unrelated Wtf8Buf declaration is not the rstr STR family"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("lowlevel_string::LowlevelStringHeader"),
+            crate::annotator::model::s_str0(),
+            "LowlevelStringHeader is the rstr STR overlay (`op_gc_restore_root`)"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("pyre_object::lowlevel_string::LowlevelStringHeader"),
+            crate::annotator::model::s_str0(),
+            "crate-prefixed overlay spelling is the same STR layout"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("LowlevelStringHeader"),
+            crate::annotator::model::s_str0(),
+            "crate-root overlay leaf is the same STR layout"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("other::LowlevelStringHeader"),
+            crate::annotator::model::s_str0(),
+            "an unrelated LowlevelStringHeader declaration is not rstr STR"
         );
     }
 

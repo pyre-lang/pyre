@@ -40,6 +40,13 @@ for name, body in [
 ]:
     with open(os.path.join(root, "hflpkg", name), "w") as f:
         f.write(body)
+os.mkdir(os.path.join(root, "é"))
+for name, body in [
+    ("__init__.py", "X = 1\n"),
+    ("sub.py", "Y = 2\n"),
+]:
+    with open(os.path.join(root, "é", name), "w", encoding="utf-8") as f:
+        f.write(body)
 sys.path.insert(0, root)
 
 # `*` expands `__all__` and imports each name in it; a submodule the package
@@ -337,8 +344,37 @@ hflpkg2.__name__ = FormatsToPkg("wrongname")
 __import__("hflpkg2", {}, {}, ["b"], 0)
 assert "hflpkg2.b" in sys.modules, "the __name__ override was not formatted"
 
+# A non-ASCII name is wrapped with a code-point length (`newtext`), so
+# `len(module.__name__)` and slicing match the identifier, not UTF-8 bytes.
+mod_na = __import__("é")
+assert mod_na.__name__ == "é", mod_na.__name__
+assert len(mod_na.__name__) == 1, len(mod_na.__name__)
+assert mod_na.__name__[:1] == "é", mod_na.__name__[:1]
+assert mod_na.__name__[0] == "é", mod_na.__name__[0]
+
+sub_na = __import__("é.sub", fromlist=["Y"])
+assert sub_na.__name__ == "é.sub", sub_na.__name__
+assert len(sub_na.__name__) == 5, len(sub_na.__name__)
+assert sub_na.__name__[:1] == "é", sub_na.__name__[:1]
+assert sub_na.Y == 2
+
+head_na = __import__("é.sub")
+assert head_na.__name__ == "é", head_na.__name__
+assert len(head_na.__name__) == 1, len(head_na.__name__)
+
+# Empty-fromlist dotted import of a cached submodule re-wraps the head STR
+# when the parent is gone (`dunder_import_absolute_head`).
+del sys.modules["é"]
+head_na = __import__("é.sub")
+assert head_na.__name__ == "é", head_na.__name__
+assert len(head_na.__name__) == 1, len(head_na.__name__)
+assert head_na.__name__[:1] == "é", head_na.__name__[:1]
+assert head_na.__name__[0] == "é", head_na.__name__[0]
+assert list(head_na.__name__) == ["é"], list(head_na.__name__)
+
 sys.path.remove(root)
 shutil.rmtree(root, ignore_errors=True)
+
 
 def handle_fromlist_native_importer():
     import os

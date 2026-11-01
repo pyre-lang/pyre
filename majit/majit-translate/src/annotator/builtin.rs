@@ -5054,6 +5054,77 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_utf8str_root_projects_someptr_gcref_to_somestring() {
+        // Dest-is-str arm of `__cast_instance_intrinsic`: a GCREF
+        // `SomePtr` operand (`shadow_stack_get`) recast onto a
+        // Utf8Str-family root is `SomeString`, not `Ptr ∪ String`.
+        let bk = bk();
+        let s_gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        assert!(
+            matches!(s_gcref, SomeValue::Ptr(_)),
+            "GCREF source must be SomePtr, got {s_gcref:?}"
+        );
+        for root in [
+            "unicodeobject::Utf8Str",
+            "pyre_object::unicodeobject::Utf8Str",
+            "Utf8Str",
+        ] {
+            let s_root = bk
+                .immutablevalue(&ConstValue::byte_str(root))
+                .expect("Utf8Str root constant");
+            let out = call_builtin(
+                &bk,
+                crate::runtime_names::shims::CAST_INSTANCE,
+                &[Some(s_gcref.clone()), Some(s_root)],
+                &no_kwds(),
+            )
+            .unwrap_or_else(|e| panic!("{root} dest-is-str SomePtr GCREF: {e}"));
+            assert!(
+                matches!(out, SomeValue::String(_)),
+                "{root} must project dest as SomeString, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_lowlevel_string_header_root_projects_somestring() {
+        // Dest-Str restore of the `{hash, len}` overlay: GCREF recast
+        // onto that root is `SomeString` (`op_gc_restore_root` /
+        // `GCRefRepr.convert_from_to`). `LLHelpers.ll_strlen` then
+        // reads `.length` as `len(s)`.
+        let bk = bk();
+        let s_gcref = crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        );
+        assert!(
+            matches!(s_gcref, SomeValue::Ptr(_)),
+            "GCREF source must be SomePtr, got {s_gcref:?}"
+        );
+        for root in [
+            "lowlevel_string::LowlevelStringHeader",
+            "pyre_object::lowlevel_string::LowlevelStringHeader",
+            "LowlevelStringHeader",
+        ] {
+            let s_root = bk
+                .immutablevalue(&ConstValue::byte_str(root))
+                .expect("LowlevelStringHeader root constant");
+            let out = call_builtin(
+                &bk,
+                crate::runtime_names::shims::CAST_INSTANCE,
+                &[Some(s_gcref.clone()), Some(s_root)],
+                &no_kwds(),
+            )
+            .unwrap_or_else(|e| panic!("{root} dest-is-str SomePtr GCREF: {e}"));
+            assert!(
+                matches!(out, SomeValue::String(_)),
+                "{root} must project dest as SomeString, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
     fn cast_instance_intrinsic_object_root_accepts_str_gcref() {
         let bk = bk();
         let s_str = SomeValue::String(SomeString::default());

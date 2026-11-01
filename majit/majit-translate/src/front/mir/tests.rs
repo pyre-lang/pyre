@@ -755,6 +755,352 @@ fn flavor_raw_ptr_narrow_from_unit_emits_cast_instance() {
     );
 }
 
+/// `shadow_stack_get(slot) as *mut Utf8Str`: GCREF / `PyObjectRef` recast
+/// onto rstr `STR`. UnaryOp Cast and Rvalue RawPtr both emit
+/// `__cast_instance_intrinsic` with a Utf8Str-family root and
+/// `result_ty == ValueType::Str`.
+#[test]
+fn gcref_cast_to_utf8str_emits_cast_instance_str() {
+    use crate::model::{OpKind, ValueType};
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let n = usize_ty();
+    let gcref = type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let utf8 = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_str_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_str_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [gcref, utf8],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_utf8str_str_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                ) && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
+                    super::lltype::is_str_family_class_root(root)
+                        && majit_ir::descr::class_root_leaf(root) == "Utf8Str"
+                })
+            })
+        })
+    };
+    let unary_graph =
+        super::lower_function(&llbc, "unary_str_cast").expect("lower UnaryOp Cast to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&unary_graph),
+        "UnaryOp Cast GCREF as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_str_cast")
+        .expect("lower Rvalue RawPtr Cast to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&rvalue_graph),
+        "Rvalue::Cast RawPtr GCREF as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+/// Ref-source cast onto `LowlevelStringHeader` takes the dest-Str arm:
+/// that overlay is rstr `STR` (`is_rstr_str_layout_declaration`), so
+/// `op_gc_restore_root` restores Ptr(STR). The following `.length` read
+/// is `len(s)` (`LLHelpers.ll_strlen`).
+#[test]
+fn gcref_cast_to_lowlevel_string_header_emits_cast_instance_str() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::model::{OpKind, ValueType};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let header_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [header_adt.clone(), "Mut"]});
+    let n = usize_ty();
+    let gcref = type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let header = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["pyre_object", "lowlevel_string", "LowlevelStringHeader"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n.clone(), "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_header_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_header_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let length_place = serde_json::json!({
+        "kind": {"Projection": [
+            {
+                "kind": {"Projection": [
+                    place(2, &dest_ty),
+                    "Deref"
+                ]},
+                "ty": header_adt.clone()
+            },
+            {"Field": [null, 1]}
+        ]},
+        "ty": n.clone()
+    });
+    let header_len = serde_json::json!({
+        "def_id": 2,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "header_len"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [src_ty.clone()],
+            "output": n.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": n.clone()},
+                {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()},
+                {"index": 2, "name": "h", "span": span, "ty": dest_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(2, &dest_ty),
+                            {"Cast": [
+                                "RawPtr",
+                                {"Move": place(1, &src_ty)},
+                                dest_ty.clone()
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &n),
+                            {"Use": [{"Copy": length_place}, "No"]}
+                        ]}
+                    }
+                ],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [gcref, header],
+            "fun_decls": [unary, rvalue, header_len],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let has_str_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                ) && crate::model::cast_instance_root(&op.kind).is_some()
+            })
+        })
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_header_cast")
+        .expect("lower UnaryOp Cast to *mut LowlevelStringHeader");
+    assert!(
+        has_str_cast(&unary_graph),
+        "UnaryOp Cast GCREF as *mut LowlevelStringHeader emits dest-Str restore; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_header_cast")
+        .expect("lower Rvalue RawPtr Cast to *mut LowlevelStringHeader");
+    assert!(
+        has_str_cast(&rvalue_graph),
+        "Rvalue::Cast RawPtr GCREF as *mut LowlevelStringHeader emits dest-Str restore; graph={}",
+        rvalue_graph.dump()
+    );
+    let len_graph =
+        super::lower_function(&llbc, "header_len").expect("lower GCREF cast then header.length");
+    assert!(
+        has_str_cast(&len_graph),
+        "header_len GCREF as *mut LowlevelStringHeader emits dest-Str restore; graph={}",
+        len_graph.dump()
+    );
+    let length_read = graph_ops(&len_graph).iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "length"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(crate::front::mir::is_str_length_field_class_root)
+        )
+    });
+    assert!(
+        length_read,
+        "header.length is FieldRead length (`LLHelpers.ll_strlen`); graph={}",
+        len_graph.dump()
+    );
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&len_graph, &registry)
+        .expect("lift GCREF restore then header.length");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let has_len = lifted.graph.borrow().iterblocks().iter().any(|block| {
+        block
+            .borrow()
+            .operations
+            .iter()
+            .any(|op| op.opname == "len")
+    });
+    assert!(
+        has_len,
+        "header.length must lift as len (`LLHelpers.ll_strlen`)"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let gcref_ann = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
+    let cells: Vec<Option<SomeValue>> = (0..n_inputs).map(|_| Some(gcref_ann.clone())).collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .expect("GCREF restore then header.length must annotate as string length");
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    assert!(
+        matches!(s_ret, SomeValue::Integer(_)),
+        "header.length must annotate as SomeInteger (`SomeString.len`), got {s_ret:?}"
+    );
+}
+
 /// Lower one `pyre_object` function by its full `name_path`.
 pub(in crate::front::mir) fn lower_object_fn(name_path: &str) -> crate::model::FunctionGraph {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
