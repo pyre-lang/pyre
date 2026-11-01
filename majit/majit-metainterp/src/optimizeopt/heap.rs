@@ -5021,6 +5021,10 @@ mod tests {
             .as_mut()
             .expect("OptHeap state taken")
             .cache_field(&obj, &tracefunc_ref);
+        assert!(
+            tracefunc_ref.is_always_pure(),
+            "kept ? field is always-pure (`get_field_descr` is_pure != False)"
+        );
 
         heap.state
             .borrow_mut()
