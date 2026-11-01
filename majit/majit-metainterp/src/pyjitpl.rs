@@ -2203,9 +2203,7 @@ fn default_issubclass(typeptr: i64, bounding_class: i64) -> bool {
 /// `self.resumekey` (`pyjitpl.py handle_guard_failure(self,
 /// resumedescr, deadframe)`) — the descr Arc itself is the canonical
 /// bridge-source identity.  Pyre carries the same Arc in
-/// `source_descr`; `(trace_id, fail_index)` remain only as pyre-side
-/// indices for per-trace fail_descr arrays and the not-yet-retired
-/// `(green_key, trace_id, fail_index)` lookup helpers.
+/// `source_descr`.
 ///
 /// `code_ptr` is the code address for the bridge's green key, enabling
 /// any PC to map back to a green key via the same hash function used by
@@ -2213,15 +2211,14 @@ fn default_issubclass(typeptr: i64, bounding_class: i64) -> bool {
 #[derive(Debug, Clone)]
 pub struct BridgeTraceInfo {
     pub green_key: u64,
-    pub trace_id: u64,
-    pub fail_index: u32,
     pub code_ptr: usize,
-    /// `pyjitpl.py:2890` `resumedescr` parity: the descr Arc returned
-    /// by `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
-    /// same Arc the optimizer stamped on `op.descr` and the same Arc
-    /// `compile.py _trace_and_compile_from_bridge` threads as
-    /// `self`.  Carried explicitly so the bridge-compile path reads
-    /// the source Arc directly.
+    /// `resumedescr` (`pyjitpl.py handle_guard_failure`): the descr Arc
+    /// returned by `cpu.get_latest_descr(deadframe)` (`history.py
+    /// get_latest_descr`) — the same Arc the optimizer stamped on
+    /// `op.descr` and the same Arc `compile.py
+    /// _trace_and_compile_from_bridge` threads as `self`.  Carried
+    /// explicitly so the bridge-compile path reads the source Arc
+    /// directly.
     pub source_descr: std::sync::Arc<dyn majit_ir::Descr>,
 }
 
@@ -2798,8 +2795,8 @@ pub struct MetaInterp<M: Clone> {
     /// directly on `MetaInterp`.  Single source of truth; the JitDriver
     /// reads this via accessors and never duplicates it.
     pub(crate) active_trace_session: Option<ActiveTraceSession<M>>,
-    /// `pyjitpl.py:2890` `self.resumekey` parity: bridge-origin descr
-    /// Arc + indexing tuple, populated by `start_retrace_from_guard`
+    /// `self.resumekey` (`pyjitpl.py handle_guard_failure`):
+    /// bridge-origin descr Arc, populated by `start_retrace_from_guard`
     /// when entering a bridge trace and consumed by the bridge close
     /// path.  Kept outside `ActiveTraceSession` because the bridge
     /// entry installs `self.resumekey` *before* the trace's
@@ -10472,9 +10469,9 @@ impl<M: Clone> MetaInterp<M> {
     /// The snapshot is optimized as a bridge; on success the bridge is
     /// compiled and installed, on failure retrace_needed may be set.
     ///
-    /// `bridge_origin`: if Some((trace_id, fail_index)), the trace started
-    /// from a guard failure (ResumeGuardDescr). If None, the trace started
-    /// from the interpreter (ResumeFromInterpDescr / entry bridge).
+    /// `from_guard`: true when the trace started at a failing guard
+    /// (`ResumeGuardDescr` resumekey). false when there is no guard
+    /// origin (`ResumeFromInterpDescr` / entry bridge).
     ///
     /// Returns `CompileOutcome::Compiled` if the bridge was successfully
     /// compiled and installed. The caller should switch to compiled code.
@@ -10487,9 +10484,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         finish_args: &[OpRef],
-        bridge_origin: Option<(u64, u32)>,
+        from_guard: bool,
     ) -> CompileOutcome {
-        let outcome = self.compile_trace_inner(green_key, finish_args, bridge_origin, None, None);
+        let outcome = self.compile_trace_inner(green_key, finish_args, from_guard, None, None);
         self.compile_snapshot_refs.clear();
         outcome
     }
@@ -10509,7 +10506,13 @@ impl<M: Clone> MetaInterp<M> {
         // assertion against the entry bridge's own inputargs.
         self.pending_frontend_boxes = None;
         self.pending_frontend_box_types = None;
-        self.compile_trace_inner(green_key, finish_args, None, None, Some(original_green_key))
+        self.compile_trace_inner(
+            green_key,
+            finish_args,
+            false,
+            None,
+            Some(original_green_key),
+        )
     }
 
     /// compile_trace with ends_with_jump=false (FINISH).
@@ -10517,16 +10520,10 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         finish_args: &[OpRef],
-        bridge_origin: Option<(u64, u32)>,
+        from_guard: bool,
         finish_descr: majit_ir::DescrRef,
     ) -> CompileOutcome {
-        self.compile_trace_inner(
-            green_key,
-            finish_args,
-            bridge_origin,
-            Some(finish_descr),
-            None,
-        )
+        self.compile_trace_inner(green_key, finish_args, from_guard, Some(finish_descr), None)
     }
 
     /// compile.py `compile_trace` + `ResumeFromInterpDescr.compile_and_attach`
@@ -10545,7 +10542,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         finish_args: &[OpRef],
-        bridge_origin: Option<(u64, u32)>,
+        from_guard: bool,
         finish_descr: Option<majit_ir::DescrRef>,
         entry_bridge: Option<u64>,
     ) -> CompileOutcome {
@@ -10724,122 +10721,121 @@ impl<M: Clone> MetaInterp<M> {
         if crate::majit_log_enabled() {
             let label = if ends_with_jump { "jump" } else { "finish" };
             eprintln!(
-                "[jit] compile_trace({}): key={}, ops={}, origin={:?}",
+                "[jit] compile_trace({}): key={}, ops={}, from_guard={}",
                 label,
                 green_key,
                 bridge_ops.len(),
-                bridge_origin,
+                from_guard,
             );
         }
 
-        let outcome = match bridge_origin {
-            Some((trace_id, fail_index)) => {
-                // compile.py — ResumeGuardDescr path: attach bridge
-                // to the existing guard that failed.
-                // The `green_key` parameter here is the JUMP TARGET's key
-                // (from CloseLoopWithArgs) when the bridge closes as a jump
-                // into another compiled loop, but the fail_descr belongs to
-                // the ORIGIN guard. RPython reaches the origin via
-                // `resumekey.rd_loop_token`; pyre stores it in
-                // `active_trace_session.bridge.green_key`.
-                let origin_key = self.bridge_info().map(|b| b.green_key).unwrap_or(green_key);
-                // `pyjitpl.py` `handle_guard_failure(self,
-                // resumedescr, deadframe)` parity: the source descr Arc
-                // is `self.resumekey` (== the descr
-                // `cpu.get_latest_descr(deadframe)` returned).  Pyre
-                // carries it on `BridgeTraceInfo.source_descr`
-                // (populated by `start_retrace_from_guard`).  No
-                // `(trace_id, fail_index)` reverse lookup.
-                let descr_arc = match self.bridge_info() {
-                    Some(b) => b.source_descr.clone(),
-                    None => {
-                        if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
-                            ctx.cut_trace(cut_at);
-                        }
-                        self.jitlog_trace_aborted();
-                        return CompileOutcome::Cancelled;
-                    }
-                };
-                let fail_descr = descr_arc
-                    .as_fail_descr()
-                    .expect("bridge source op.descr must implement FailDescr");
-                // The `@@@GUARD` line in `record_guard_failure_event` names the
-                // coordinate a failure arrived at; this names the coordinate a
-                // bridge attached to. Only both together answer the question
-                // that log exists for — whether a coordinate that keeps
-                // arriving was ever bridged at all, or is bridged and still
-                // returning. Ordered against `@@@GUARD` in one stream, a
-                // failure after this line for the same coordinate is a bridge
-                // that did not take.
-                if guardlog_enabled() {
-                    eprintln!("@@@BRIDGE tid={trace_id} fail={fail_index}");
-                }
-                let success = self.compile_bridge(
-                    origin_key,
-                    green_key,
-                    fail_index,
-                    &descr_arc,
-                    bridge_ops,
-                    &bridge_inputargs,
-                    finish_args,
-                    bridge_constants,
-                    snapshot_boxes,
-                    snapshot_frame_sizes,
-                    snapshot_vable_boxes,
-                    snapshot_vref_boxes,
-                    snapshot_frame_pcs,
-                    call_pure_results,
-                    ends_with_jump,
-                );
-                if success {
-                    CompileOutcome::Compiled {
-                        green_key: 0,
-                        from_retry: false,
-                    }
-                } else {
-                    crate::mc_diag_bump(53); // compile_bridge returned false
-                    CompileOutcome::Cancelled
-                }
-            }
-            None => {
-                // compile.py — ResumeFromInterpDescr path:
-                // compile a fresh entry bridge and attach it to the
-                // original interpreter green key.
-                let Some(original_green_key) = entry_bridge else {
-                    if crate::closedbg_enabled() {
-                        eprintln!("@@@CANCEL-SITE line={}", line!());
-                    }
-                    crate::mc_diag_bump(32); // compile_trace: no entry-bridge data
+        let outcome = if from_guard {
+            // compile.py — ResumeGuardDescr path: attach bridge
+            // to the existing guard that failed.
+            // The `green_key` parameter here is the JUMP TARGET's key
+            // (from CloseLoopWithArgs) when the bridge closes as a jump
+            // into another compiled loop, but the fail_descr belongs to
+            // the ORIGIN guard. RPython reaches the origin via
+            // `resumekey.rd_loop_token`; pyre stores it in
+            // `active_trace_session.bridge.green_key`.
+            let origin_key = self.bridge_info().map(|b| b.green_key).unwrap_or(green_key);
+            // `pyjitpl.py` `handle_guard_failure(self,
+            // resumedescr, deadframe)` parity: the source descr Arc
+            // is `self.resumekey` (== the descr
+            // `cpu.get_latest_descr(deadframe)` returned).  Pyre
+            // carries it on `BridgeTraceInfo.source_descr`
+            // (populated by `start_retrace_from_guard`).  No
+            // `(trace_id, fail_index)` reverse lookup.
+            let descr_arc = match self.bridge_info() {
+                Some(b) => b.source_descr.clone(),
+                None => {
                     if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
                         ctx.cut_trace(cut_at);
                     }
                     self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
-                };
-                self.publish_orig_vable(entry_vable);
-                let success = self.compile_entry_bridge(
-                    green_key,
-                    original_green_key,
-                    entry_driver_descriptor,
-                    &bridge_ops,
-                    &bridge_inputargs,
-                    finish_args,
-                    bridge_constants,
-                    snapshot_boxes,
-                    snapshot_frame_sizes,
-                    snapshot_vable_boxes,
-                    snapshot_vref_boxes,
-                    snapshot_frame_pcs,
-                );
-                if success {
-                    CompileOutcome::Compiled {
-                        green_key: original_green_key,
-                        from_retry: false,
-                    }
-                } else {
-                    crate::mc_diag_bump(31); // compile_trace: entry bridge failed
-                    CompileOutcome::Cancelled
                 }
+            };
+            let fail_descr = descr_arc
+                .as_fail_descr()
+                .expect("bridge source op.descr must implement FailDescr");
+            let trace_id = fail_descr.trace_id();
+            let fail_index = fail_descr.fail_index_per_trace();
+            // The `@@@GUARD` line in `record_guard_failure_event` names the
+            // coordinate a failure arrived at; this names the coordinate a
+            // bridge attached to. Only both together answer the question
+            // that log exists for — whether a coordinate that keeps
+            // arriving was ever bridged at all, or is bridged and still
+            // returning. Ordered against `@@@GUARD` in one stream, a
+            // failure after this line for the same coordinate is a bridge
+            // that did not take.
+            if guardlog_enabled() {
+                eprintln!("@@@BRIDGE tid={trace_id} fail={fail_index}");
+            }
+            let success = self.compile_bridge(
+                origin_key,
+                green_key,
+                fail_index,
+                &descr_arc,
+                bridge_ops,
+                &bridge_inputargs,
+                finish_args,
+                bridge_constants,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+                call_pure_results,
+                ends_with_jump,
+            );
+            if success {
+                CompileOutcome::Compiled {
+                    green_key: 0,
+                    from_retry: false,
+                }
+            } else {
+                crate::mc_diag_bump(53); // compile_bridge returned false
+                CompileOutcome::Cancelled
+            }
+        } else {
+            // compile.py — ResumeFromInterpDescr path:
+            // compile a fresh entry bridge and attach it to the
+            // original interpreter green key.
+            let Some(original_green_key) = entry_bridge else {
+                if crate::closedbg_enabled() {
+                    eprintln!("@@@CANCEL-SITE line={}", line!());
+                }
+                crate::mc_diag_bump(32); // compile_trace: no entry-bridge data
+                if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
+                    ctx.cut_trace(cut_at);
+                }
+                self.jitlog_trace_aborted();
+                return CompileOutcome::Cancelled;
+            };
+            self.publish_orig_vable(entry_vable);
+            let success = self.compile_entry_bridge(
+                green_key,
+                original_green_key,
+                entry_driver_descriptor,
+                &bridge_ops,
+                &bridge_inputargs,
+                finish_args,
+                bridge_constants,
+                snapshot_boxes,
+                snapshot_frame_sizes,
+                snapshot_vable_boxes,
+                snapshot_vref_boxes,
+                snapshot_frame_pcs,
+            );
+            if success {
+                CompileOutcome::Compiled {
+                    green_key: original_green_key,
+                    from_retry: false,
+                }
+            } else {
+                crate::mc_diag_bump(31); // compile_trace: entry bridge failed
+                CompileOutcome::Cancelled
             }
         };
         if use_byte_iter && let Some(ctx) = self.tracing.as_mut() {
@@ -15179,14 +15175,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// pyjitpl.py: close_bridge — compile_trace wrapper that
     /// maps CompileOutcome to BridgeCompileResult.
-    pub fn close_bridge(
-        &mut self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-        finish_args: &[OpRef],
-    ) -> BridgeCompileResult {
-        let outcome = self.compile_trace(green_key, finish_args, Some((trace_id, fail_index)));
+    pub fn close_bridge(&mut self, green_key: u64, finish_args: &[OpRef]) -> BridgeCompileResult {
+        let outcome = self.compile_trace(green_key, finish_args, true);
         self.classify_compile_outcome(outcome)
     }
 
@@ -15194,11 +15184,9 @@ impl<M: Clone> MetaInterp<M> {
     pub fn send_bridge_to_backend(
         &mut self,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
         finish_args: &[OpRef],
     ) -> BridgeCompileResult {
-        self.close_bridge(green_key, trace_id, fail_index, finish_args)
+        self.close_bridge(green_key, finish_args)
     }
 }
 
@@ -16458,8 +16446,6 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
         fail_values: &[i64],
     ) -> Option<BridgeRetraceResult> {
         // pyjitpl.py `handle_guard_failure` opening, line-by-line:
@@ -16508,8 +16494,6 @@ impl<M: Clone> MetaInterp<M> {
         // applying it here would refuse an ordinary bridge when the
         // warm-state cell was cleared but the source descr still names
         // a live token.
-
-        let norm_tid = trace_id;
 
         // RPython compile.py invent_fail_descr_for_op:
         // GUARD_EXCEPTION / GUARD_NO_EXCEPTION → ResumeGuardExcDescr.
@@ -16690,8 +16674,6 @@ impl<M: Clone> MetaInterp<M> {
         // depends on it, and tests do not exercise that branch.
         self.set_bridge_trace_info(BridgeTraceInfo {
             green_key,
-            trace_id,
-            fail_index,
             code_ptr: 0,
             source_descr: descr_arc,
         });
@@ -16947,12 +16929,9 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
         fail_values: &[i64],
     ) -> Option<BridgeRetraceResult> {
-        let retrace =
-            self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, fail_values)?;
+        let retrace = self.start_retrace_from_guard(descr_arc, green_key, fail_values)?;
         self.prepare_exception_resumption(retrace.is_exception_guard);
         Some(retrace)
     }
@@ -17193,7 +17172,6 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `descr_arc` is the failed guard (`cpu.get_latest_descr(deadframe)`).
     /// `green_key` identifies the loop containing the guard.
-    /// `fail_index` identifies which guard failed.
     /// `live_values` are the concrete values at the guard failure point.
     ///
     /// Returns `true` if retracing was started, `false` if not possible.
@@ -17201,18 +17179,12 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         green_key: u64,
-        fail_index: u32,
         live_values: &[i64],
     ) -> bool {
         if !(descr_arc.is_resume_guard() || descr_arc.is_resume_guard_copied()) {
             return false;
         }
-        let trace_id = descr_arc
-            .as_fail_descr()
-            .map(|d| d.trace_id())
-            .filter(|&id| id != 0)
-            .unwrap_or(0);
-        self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, live_values)
+        self.start_retrace_from_guard(descr_arc, green_key, live_values)
             .is_some()
     }
 
@@ -19507,7 +19479,7 @@ impl<M: Clone> MetaInterp<M> {
     /// `compile_exit_frame_with_exception` each make.  Dispatch:
     ///
     /// - `bridge.is_some()` → `compile_trace_finish(bridge_key, ...,
-    ///   bridge_origin, finish_descr)` records the trailing FINISH via
+    ///   from_guard=true, finish_descr)` records the trailing FINISH via
     ///   `recorder.finish()` and drives the bridge compile.
     /// - `bridge.is_none()` → `finish_and_compile(...)` —
     ///   the root-trace equivalent.
@@ -19560,12 +19532,8 @@ impl<M: Clone> MetaInterp<M> {
                         crate::make_finish_fail_descr_typed(finish_arg_types.clone(), false)
                     })
             };
-            let outcome = self.compile_trace_finish(
-                bridge.green_key,
-                finish_args,
-                Some((bridge.trace_id, bridge.fail_index)),
-                finish_descr,
-            );
+            let outcome =
+                self.compile_trace_finish(bridge.green_key, finish_args, true, finish_descr);
             // pyjitpl.py `raise_if_successful`: a compiled bridge leaves via
             // `ContinueRunningNormally`, not the `SwitchToBlackhole` catch in
             // `MetaInterp._interpret`.  It therefore clears the live tracing
@@ -32270,11 +32238,6 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let fail_descr = descr_arc
-            .as_fail_descr()
-            .expect("test fixture guard should carry a ResumeGuardDescr");
-        let trace_id = fail_descr.trace_id();
-        let fail_index = fail_descr.fail_index_per_trace();
         let source_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("live source token");
@@ -32286,13 +32249,7 @@ mod tests {
         assert!(majit_backend::descr_owning_jct(descr_arc.as_fail_descr().unwrap()).is_some());
 
         let retrace = meta
-            .start_retrace_from_guard(
-                descr_arc,
-                green_key.get_uhash(),
-                trace_id,
-                fail_index,
-                &[42],
-            )
+            .start_retrace_from_guard(descr_arc, green_key.get_uhash(), &[42])
             .expect("live loop_token_wref starts a bridge without compiled_loops");
         assert_eq!(retrace.fail_types, vec![Type::Int]);
         assert_eq!(meta.active_jitdriver_sd, Some(source_driver));
@@ -32332,16 +32289,12 @@ mod tests {
             .get_procedure_token(green_key.get_uhash())
             .expect("compiled origin token");
         let descr_arc = crate::jitdriver::compiled_token_guard_descr(origin_token.as_ref(), 0);
-        let (trace_id, fail_index) = {
-            let fail_descr = descr_arc.as_fail_descr().expect("compiled guard descr");
-            (fail_descr.trace_id(), fail_descr.fail_index_per_trace())
-        };
         descr_arc
             .as_fail_descr()
             .unwrap()
             .set_rd_loop_token_clt(origin_token.compiled_loop_token_expect());
 
-        assert!(meta.start_retrace(descr_arc.clone(), green_key.get_uhash(), fail_index, &[0]));
+        assert!(meta.start_retrace(descr_arc.clone(), green_key.get_uhash(), &[0]));
         {
             let ctx = meta.trace_ctx().expect("should be tracing bridge");
             let i0 = OpRef::input_arg_int(0);
@@ -32366,7 +32319,7 @@ mod tests {
         let outcome = meta.compile_trace_finish(
             green_key.get_uhash(),
             &[OpRef::input_arg_int(0)],
-            Some((trace_id, fail_index)),
+            true,
             finish_descr,
         );
         assert!(

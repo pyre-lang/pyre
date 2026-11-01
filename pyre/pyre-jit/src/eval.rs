@@ -12227,9 +12227,7 @@ fn handle_fail(
         }
         // compile.py record_loop_or_bridge registers dependencies
         // for every compiled bridge, independent of its next resolution.
-        if let Some((green_key, _, _)) =
-            crate::call_jit::bridge_source_identity_from_descr(descr_arc)
-        {
+        if let Some(green_key) = crate::call_jit::bridge_source_green_key_from_descr(descr_arc) {
             register_quasi_immutable_deps(green_key);
         }
         match resolution {
