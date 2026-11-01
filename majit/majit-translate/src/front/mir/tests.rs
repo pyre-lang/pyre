@@ -27913,6 +27913,90 @@ fn one_word_handle_by_value_struct_decl_is_none() {
     );
 }
 
+/// An outer struct whose field is a `repr(transparent)` generic wrapper
+/// instantiated at a two-word struct. The wrapper's unique non-ZST
+/// field is itself that struct (`heaptracker.all_fielddescrs` walks the
+/// instantiated STRUCT); the wrapper adds no container segment, so a
+/// nonzero hop on the outer field is `{container}.{leaf}` of the
+/// payload (`nest_inline_leaf`).
+#[test]
+fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
+    let i64_ty = interior_i64();
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let pair = interior_struct(
+        2,
+        &["fixture", "Pair"],
+        &[("a", i64_ty.clone()), ("b", i64_ty.clone())],
+        16,
+        &[0, 8],
+        false,
+    );
+    let wrapper = transparent_unique_field_decl(1, &["fixture", "Wrap"], typevar);
+    let wrapper_pair_ty = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [interior_adt(2)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let outer = interior_struct(
+        0,
+        &["fixture", "Outer"],
+        &[("tag", i64_ty), ("cell", wrapper_pair_ty.clone())],
+        24,
+        &[0, 8],
+        false,
+    );
+    let llbc = llbc_with_types("fixture", vec![outer, wrapper, pair], vec![]);
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    let outer_td = llbc.type_by_id(0).expect("Outer decl");
+    let wrapper_td = llbc.type_by_id(1).expect("Wrap decl");
+    let outer_ty = TyRef::Other(interior_adt(0));
+    let wrapper_ty = TyRef::Other(wrapper_pair_ty);
+    let src_leaves = super::collect_by_value_struct_leaves(
+        wrapper_td,
+        &wrapper_ty,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        16,
+        &raw_alloc,
+    );
+    assert_eq!(
+        src_leaves
+            .iter()
+            .map(|leaf| (leaf.field.name.as_str(), leaf.ty.clone()))
+            .collect::<Vec<_>>(),
+        vec![("a", ValueType::Int), ("b", ValueType::Int)]
+    );
+    let dest_leaves = super::collect_by_value_struct_leaves(
+        outer_td,
+        &outer_ty,
+        &llbc,
+        tomb,
+        &gc_struct_ids,
+        16,
+        &raw_alloc,
+    );
+    assert_eq!(
+        dest_leaves
+            .iter()
+            .map(|leaf| (leaf.field.name.as_str(), leaf.ty.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tag", ValueType::Int),
+            ("cell.a", ValueType::Int),
+            ("cell.b", ValueType::Int)
+        ]
+    );
+}
+
 /// Generic `{u64, u64, T}` `repr(C)` whose layout offsets are unresolved.
 /// `Align` does not change field offsets (`llmemory.offsetof`).
 fn generic_repr_c_inner_decl(payload_ty: serde_json::Value) -> serde_json::Value {

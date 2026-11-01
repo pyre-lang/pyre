@@ -5155,6 +5155,20 @@ pub(in crate::front::mir) fn type_decl_struct_field_offset(
 
 /// Leaves of by-value struct `td`, relative to `td`.
 ///
+/// `instantiated` is the use-site type of `td` (generic arguments
+/// included). Each field type is resolved with
+/// [`substitute_spill_typevars`] before the walk decides whether the
+/// field is a nested by-value struct — `heaptracker.all_fielddescrs`
+/// walks the instantiated STRUCT.
+///
+/// A `#[repr(transparent)]` wrapper ([`TypeDecl::is_repr_transparent`] /
+/// [`tyref_transparent_nonzst_field`]) whose unique non-ZST field is a
+/// by-value struct contributes that payload's leaves with the payload's
+/// own field spelling. The wrapper has no layout of its own, so it adds
+/// no container segment (`transparent_by_value_inner_fields` /
+/// `celldict.py` `erase({})`). An ordinary nested struct still goes
+/// through `nest_inline_leaf`.
+///
 /// A leaf peels the leading offset-0 hops of its containment path: owner is
 /// the deepest struct reached through hops that are all at offset 0, and
 /// name is the rest of the path (dotted only if a nonzero hop remains).
@@ -5168,6 +5182,7 @@ pub(in crate::front::mir) fn type_decl_struct_field_offset(
 /// struct go through the same composition.
 pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     td: &TypeDecl,
+    instantiated: &TyRef,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -5181,18 +5196,24 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
         return Vec::new();
     }
     let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
+    let owner_node = tyref_node(instantiated, llbc).and_then(|n| strip_ty_wrappers(n, llbc));
+    let transparent_payload_idx =
+        tyref_transparent_nonzst_field(instantiated, llbc).map(|(idx, _)| idx);
     let mut leaves = Vec::new();
     for (i, f) in fields.iter().enumerate() {
         let name = f
             .name
             .clone()
             .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(i));
-        if tyref_is_void_zst(&f.ty, llbc)
-            && !tyref_keeps_empty_class_instance(&f.ty, llbc, tombstoned)
+        let field_ty = owner_node
+            .and_then(|owner| substitute_spill_typevars(&f.ty, owner, llbc))
+            .unwrap_or_else(|| clone_tyref(&f.ty));
+        if tyref_is_void_zst(&field_ty, llbc)
+            && !tyref_keeps_empty_class_instance(&field_ty, llbc, tombstoned)
         {
             continue;
         }
-        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+        if tyref_pair_field_kind(&field_ty, llbc).is_some() {
             let len = pair_len_field_name(&name);
             for fname in [name, len] {
                 leaves.push(InlineLeaf {
@@ -5206,24 +5227,30 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
             continue;
         }
         if let Some(nested) = tyref_by_value_struct_decl(
-            &f.ty,
+            &field_ty,
             llbc,
             tombstoned,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         ) {
-            let at_offset_zero = type_decl_struct_field_offset(td, llbc, i) == Some(0);
-            let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
-                .with_owner_id(Some(owner_id))
-                .with_base_is_deref(false);
-            for leaf in collect_by_value_struct_leaves(
+            let nested_leaves = collect_by_value_struct_leaves(
                 nested,
+                &field_ty,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
                 depth - 1,
                 raw_alloc_flavor_structs,
-            ) {
+            );
+            if transparent_payload_idx == Some(i) {
+                leaves.extend(nested_leaves);
+                continue;
+            }
+            let at_offset_zero = type_decl_struct_field_offset(td, llbc, i) == Some(0);
+            let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
+                .with_owner_id(Some(owner_id))
+                .with_base_is_deref(false);
+            for leaf in nested_leaves {
                 leaves.push(nest_inline_leaf(&container_field, at_offset_zero, &leaf));
             }
             continue;
@@ -5232,10 +5259,10 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
             field: FieldDescriptor::new(name, Some(owner_root.clone()))
                 .with_owner_id(Some(owner_id))
                 .with_base_is_deref(false)
-                .with_inline_vec(field_ty_is_inline_vec(&f.ty, llbc)),
+                .with_inline_vec(field_ty_is_inline_vec(&field_ty, llbc)),
             super_path: String::new(),
             ty: tyref_to_attr_value_type_for_struct_field(
-                &f.ty,
+                &field_ty,
                 td,
                 llbc,
                 gc_struct_ids,
@@ -5281,6 +5308,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
         at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
         leaves: collect_by_value_struct_leaves(
             nested,
+            &field.ty,
             llbc,
             tombstoned,
             gc_struct_ids,

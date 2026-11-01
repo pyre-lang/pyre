@@ -1710,11 +1710,13 @@ impl<'a> Lowering<'a> {
         dest: &Variable,
         src: &Variable,
         nested: &TypeDecl,
+        dest_ty: &TyRef,
         container_field: &FieldDescriptor,
         at_offset_zero: bool,
     ) {
         let leaves = collect_by_value_struct_leaves(
             nested,
+            dest_ty,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
