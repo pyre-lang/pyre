@@ -21365,7 +21365,7 @@ fn collect_guards(
         // separately and registered against the freshly-allocated descr's
         // Arc address below — the registration cannot live inside the
         // constructor because the callsite still mutates the descr in place
-        // (`set_source_op_index`, `is_exit_frame_with_exception`,
+        // (`is_exit_frame_with_exception`,
         // `meta_descr`) before wrapping it in `Arc::new`.
         let external_jump_target: Option<majit_ir::DescrRef> = if is_external_jump {
             Some(
@@ -21461,7 +21461,7 @@ fn collect_guards(
                 // normally stamps op.descr to a ResumeGuardDescr via
                 // store_final_boxes_in_guard) synthesize a
                 // ResumeGuardDescr so the descr identity exists for
-                // fail-index / source-op-index stamping.
+                // fail-index stamping.
                 majit_backend::make_resume_guard_descr_typed(fail_arg_types.to_vec())
             };
             // Stamp the per-trace fail_index and trace_id onto the
@@ -21471,7 +21471,7 @@ fn collect_guards(
             // path stays unreached.
             // Merged recompile does not stamp an existing descr. The
             // original compile already published trace id, fail index,
-            // fail-arg types, and source op index.
+            // and fail-arg types.
             if !preserve_descrs
                 && (descr.is_resume_guard() || descr.is_resume_guard_copied())
                 && let Some(fd) = descr.as_fail_descr()
@@ -21481,14 +21481,6 @@ fn collect_guards(
                 if fd.fail_arg_types().is_empty() {
                     fd.set_fail_arg_types(fail_arg_types.to_vec());
                 }
-            }
-            // The per-emission setter publishes into a ResumeGuardDescr
-            // slot reached directly off `descr`.  Gate on Resume-family
-            // ownership — non-Resume descrs (PropagateExceptionDescr
-            // attached via compile_tmp_callback, etc.) carry no such slot
-            // and the trait-default panic would fire otherwise.
-            if !preserve_descrs && (descr.is_resume_guard() || descr.is_resume_guard_copied()) {
-                as_fd(&descr).set_source_op_index(op_idx);
             }
             if !preserve_descrs && let Some(target) = external_jump_target {
                 fail_descr_set_external_jump_target(&descr, target);
@@ -29337,7 +29329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compiled_guard_source_op_index_and_fail_arg_types() {
+    fn test_compiled_guard_fail_arg_types() {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
@@ -29371,7 +29363,6 @@ mod tests {
 
         let descr = test_loop_guard_descr(&token);
         let fd = as_fd(&descr);
-        assert_eq!(fd.source_op_index(), Some(1));
         assert_eq!(fd.fail_arg_types(), &[Type::Ref, Type::Int]);
     }
 
@@ -30061,7 +30052,6 @@ mod tests {
             .as_fail_descr()
             .expect("raw exit carries a FailDescr");
         assert_eq!(fd.fail_index(), 0);
-        assert_eq!(fd.source_op_index(), Some(2));
         assert!(!jit_exc_is_pending());
     }
 
@@ -32744,7 +32734,6 @@ mod tests {
             .as_fail_descr()
             .expect("raw exit carries a FailDescr");
         assert_eq!(fd.fail_index(), 0);
-        assert_eq!(fd.source_op_index(), Some(3));
         assert_eq!(*may_force_void_values().lock(), vec![0, 1, 10]);
     }
 

@@ -183,13 +183,6 @@ pub struct ResumeGuardDescr {
     /// Set when `compile_bridge` declined this guard for a deterministic
     /// structural reason (`Backend::bridge_decline_is_terminal`).
     pub bridge_declined_terminally: AtomicBool,
-    /// Codegen-time trace-op index for the originating guard op
-    /// (`pyjitpl._compile_one_block` parity — the live op object passed
-    /// at compile time has an implicit index in `loop.operations`).
-    /// Used at the backend→metainterp interop boundary.  Migrated here from
-    /// the meta Arc is the single source of truth.  `None` for synthetic
-    /// FINISH / external-JUMP descrs that have no associated trace op.
-    pub source_op_index: UnsafeCell<Option<usize>>,
     /// This guard is the eval-breaker word's back-edge poll, not a check on
     /// traced values.  Stamped once per emission by the optimizer, which is
     /// where the guard's condition chain is still in hand; read by the
@@ -359,7 +352,6 @@ impl Descr for ResumeGuardDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
-            source_op_index: UnsafeCell::new(None),
             back_edge_poll: AtomicBool::new(false),
             trace_info: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target: OnceLock::new(),
@@ -519,14 +511,6 @@ impl FailDescr for ResumeGuardDescr {
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
         unsafe { *self.rd_loop_token_clt.get() = Some(typed) };
     }
-    fn source_op_index(&self) -> Option<usize> {
-        // Safety: single-threaded JIT.
-        unsafe { *self.source_op_index.get() }
-    }
-    fn set_source_op_index(&self, source_op_index: usize) {
-        // Safety: single-threaded JIT.
-        unsafe { *self.source_op_index.get() = Some(source_op_index) };
-    }
     fn is_back_edge_poll(&self) -> bool {
         self.back_edge_poll.load(Ordering::Relaxed)
     }
@@ -632,7 +616,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
-        source_op_index: UnsafeCell::new(None),
         back_edge_poll: AtomicBool::new(false),
         trace_info: AtomicPtr::new(std::ptr::null_mut()),
         external_jump_target: OnceLock::new(),
@@ -641,20 +624,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
 }
 
 impl ResumeGuardDescr {
-    /// Read the codegen-time `source_op_index`.  `None`
-    /// when codegen has not yet stamped one (synthetic descrs minted
-    /// outside `_compile_one_block`).
-    pub fn source_op_index(&self) -> Option<usize> {
-        // Safety: single-threaded JIT.
-        unsafe { *self.source_op_index.get() }
-    }
-
-    /// Write the codegen-time `source_op_index`.
-    pub fn set_source_op_index(&self, source_op_index: usize) {
-        // Safety: single-threaded JIT.
-        unsafe { *self.source_op_index.get() = Some(source_op_index) };
-    }
-
     /// Publish the per-trace `CompiledTraceInfo` into the descr-local
     /// atomic cell.  Any previously published Arc is
     /// reclaimed by the swap.

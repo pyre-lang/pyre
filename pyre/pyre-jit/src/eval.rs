@@ -15191,10 +15191,9 @@ pub(crate) fn decode_and_restore_guard_failure(
 ) -> Option<DecodedGuardFailure> {
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit] guard-fail trace_id={} fail_idx={} source_op={:?} rd_numb={}",
+            "[jit] guard-fail trace_id={} fail_idx={} rd_numb={}",
             descr.trace_id(),
             descr.fail_index_per_trace(),
-            descr.source_op_index(),
             descr.rd_numb().map_or(0, <[_]>::len),
         );
     }

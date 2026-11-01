@@ -4988,16 +4988,9 @@ impl<'a> AssemblerARM64<'a> {
             faillocs,
             deadframe_slot_for_loc,
         );
-        // Stamp source_op_index directly on the meta descr (UnsafeCell slot
-        // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
-        // resume_guard_descr.rs); readers use `fd.source_op_index()` so
-        // no side-table is needed.
         // Production deopt decodes the descr's `rd_numb`
         // (`ResumeGuardDescr.get_resumestorage`); the backend keeps no
         // recovery-layout cache.
-        if descr_fd.is_resume_guard() || descr_fd.is_resume_guard_copied() {
-            descr_fd.set_source_op_index(op_index);
-        }
         // `llsupport/assembler.py guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py _attrs_`) receives the

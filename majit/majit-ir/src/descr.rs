@@ -5564,34 +5564,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Pyre-only per-emission slot: index of the trace op that produced
-    /// this guard at codegen.  Classified per-emission alongside
-    /// `history.py AbstractFailDescr._attrs_` `rd_locs` /
-    /// `adr_jump_offset` — `assembler.py:279`
-    /// `guardtok.faildescr.rd_locs = positions` writes onto the per-
-    /// emitted descr without chasing `prev`, and the source op index
-    /// shares that classification (one codegen emission = one op).
-    /// Default `None` for non-resume FailDescrs.  Overridden on both
-    /// `ResumeGuardDescr` and `ResumeGuardCopiedDescr` so the cranelift
-    /// backend never has to chase `prev_descr` to find the storage —
-    /// the chase would conflate multiple `ResumeGuardCopiedDescr`
-    /// siblings sharing a donor (optimizer.py:691 / optimizeopt/mod.rs).
-    fn source_op_index(&self) -> Option<usize> {
-        None
-    }
-
-    /// Pyre-only per-emission slot write.  See `source_op_index` for
-    /// the per-emission rationale.  Default panics — only Resume-family
-    /// guards own the slot.  Callers must gate by
-    /// `is_resume_guard() || is_resume_guard_copied()`.
-    fn set_source_op_index(&self, _source_op_index: usize) {
-        panic!(
-            "set_source_op_index invoked on a FailDescr that does not \
-             carry the per-emission source_op_index slot (only \
-             ResumeGuardDescr / ResumeGuardCopiedDescr own it)"
-        );
-    }
-
     /// Pyre-only per-emission slot: this guard is the eval-breaker word's
     /// back-edge poll rather than a check on traced values.
     ///
