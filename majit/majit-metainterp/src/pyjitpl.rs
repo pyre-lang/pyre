@@ -3205,10 +3205,12 @@ impl<M: Clone> MetaInterp<M> {
         self.executing_tokens.borrow_mut().push(Arc::clone(token));
     }
 
-    /// Pop the innermost executing token; it must be `token`.
+    /// Pop the innermost executing token and record the run
+    /// (`warmstate.py execute_assembler` `keep_loop_alive(loop_token)`).
     fn leave_execute(&mut self, token: &Arc<JitCellToken>) {
         let popped = self.executing_tokens.borrow_mut().pop().unwrap();
         debug_assert!(Arc::ptr_eq(&popped, token));
+        self.memory_manager.keep_loop_alive(token);
     }
 
     /// MiniMark traces `alive_loops`, every `execute_assembler` frame's
@@ -3224,6 +3226,18 @@ impl<M: Clone> MetaInterp<M> {
         for token in self.executing_tokens.borrow().iter() {
             if !tokens.iter().any(|seen| Arc::ptr_eq(seen, token)) {
                 tokens.push(Arc::clone(token));
+            }
+        }
+        // The bridge being traced holds its source loop's token as
+        // `pyjitpl.py MetaInterp.resumekey_original_loop_token`, which the GC traces.
+        if let Some(token) = self
+            .tracing
+            .as_ref()
+            .or(self.compile_tracing.as_ref())
+            .and_then(|c| c.resumekey_original_loop_token().cloned())
+        {
+            if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
+                tokens.push(token);
             }
         }
         // `history.py JitCellToken.record_jump_to` keeps the JUMP
@@ -6812,10 +6826,10 @@ impl<M: Clone> MetaInterp<M> {
             &mut TraceCtx,
             &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
             &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<i64>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<i64>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<i64>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
         self.with_trace_ctx_and_framestack(
@@ -6836,10 +6850,10 @@ impl<M: Clone> MetaInterp<M> {
             &mut crate::pyjitpl::MIFrameStack,
             &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
             &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
-            &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<i64>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<i64>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<i64>,
+            &dyn Fn(&Arc<JitCellToken>, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
         // Keep the recorder in `compile_tracing` while the runtime closures
@@ -6974,8 +6988,19 @@ impl<M: Clone> MetaInterp<M> {
         // recursive-call concrete recursive-callee execution: run the compiled loop
         // through the JITFRAME-ABI `execute_token_raw` and decode the int
         // FINISH output (mirrors `run_compiled_raw_detailed_with_values`).
-        let recursive_exec = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
+        let executing_tokens = &*self.executing_tokens;
+        let memory_manager = &self.memory_manager;
+        // Registers the callee's token like `enter_execute` (`warmstate.py execute_assembler` keeps `loop_token` live through `func_execute_token`).
+        let execute_registered = |token: &Arc<JitCellToken>, reds: &[Value]| {
+            executing_tokens.borrow_mut().push(Arc::clone(token));
             let result = runtime_state.borrow_mut().execute_token_raw(token, reds);
+            let popped = executing_tokens.borrow_mut().pop().unwrap();
+            debug_assert!(Arc::ptr_eq(&popped, token));
+            memory_manager.keep_loop_alive(token);
+            result
+        };
+        let recursive_exec = |token: &Arc<JitCellToken>, reds: &[Value]| -> Option<i64> {
+            let result = execute_registered(token, reds);
             if result.is_finish {
                 result.outputs.first().copied()
             } else {
@@ -6986,16 +7011,16 @@ impl<M: Clone> MetaInterp<M> {
         // packing (`execute_token_raw` stores a ref as its `GcRef` bits and a
         // float as `f64::to_bits()`, both into `outputs`), so the int decode
         // shape carries through unchanged.
-        let recursive_exec_ref = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
-            let result = runtime_state.borrow_mut().execute_token_raw(token, reds);
+        let recursive_exec_ref = |token: &Arc<JitCellToken>, reds: &[Value]| -> Option<i64> {
+            let result = execute_registered(token, reds);
             if result.is_finish {
                 result.outputs.first().copied()
             } else {
                 None
             }
         };
-        let recursive_exec_float = |token: &JitCellToken, reds: &[Value]| -> Option<i64> {
-            let result = runtime_state.borrow_mut().execute_token_raw(token, reds);
+        let recursive_exec_float = |token: &Arc<JitCellToken>, reds: &[Value]| -> Option<i64> {
+            let result = execute_registered(token, reds);
             if result.is_finish {
                 result.outputs.first().copied()
             } else {
@@ -7004,8 +7029,8 @@ impl<M: Clone> MetaInterp<M> {
         };
         // Void runs the callee for its side effects; a finished loop yields
         // `Some(())`, an unfinished one `None`.
-        let recursive_exec_void = |token: &JitCellToken, reds: &[Value]| -> Option<()> {
-            let result = runtime_state.borrow_mut().execute_token_raw(token, reds);
+        let recursive_exec_void = |token: &Arc<JitCellToken>, reds: &[Value]| -> Option<()> {
+            let result = execute_registered(token, reds);
             result.is_finish.then_some(())
         };
         let result = f(
@@ -13479,8 +13504,8 @@ impl<M: Clone> MetaInterp<M> {
     /// released. `Err` is the deadframe from any other exit; the caller
     /// dispatches `fail_descr.handle_fail`.
     ///
-    /// `keep_loop_alive(loop_token)` runs after `func_execute_token` on
-    /// both arms (`warmstate.py execute_assembler`).
+    /// `keep_loop_alive(loop_token)` runs in `leave_execute`
+    /// (`warmstate.py execute_assembler`).
     pub fn poll_raw_int_finish(
         &mut self,
         procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
@@ -13495,14 +13520,10 @@ impl<M: Clone> MetaInterp<M> {
         self.leave_execute(procedure_token);
         match outcome {
             Ok(value) => {
-                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
                 Ok(value)
             }
-            Err(frame) => {
-                self.keep_compiled_token_alive(procedure_token);
-                Err(frame)
-            }
+            err => err,
         }
     }
 
@@ -13525,14 +13546,10 @@ impl<M: Clone> MetaInterp<M> {
         self.leave_execute(procedure_token);
         match outcome {
             Ok(value) => {
-                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
                 Ok(value)
             }
-            Err(frame) => {
-                self.keep_compiled_token_alive(procedure_token);
-                Err(frame)
-            }
+            err => err,
         }
     }
 
@@ -13542,8 +13559,8 @@ impl<M: Clone> MetaInterp<M> {
     /// frame released. `Err` is the deadframe from any other exit; the caller
     /// dispatches `fail_descr.handle_fail`.
     ///
-    /// `keep_loop_alive(loop_token)` runs after `func_execute_token` on
-    /// both arms (`warmstate.py execute_assembler`).
+    /// `keep_loop_alive(loop_token)` runs in `leave_execute`
+    /// (`warmstate.py execute_assembler`).
     pub fn poll_raw_ref_finish(
         &mut self,
         procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
@@ -13558,14 +13575,10 @@ impl<M: Clone> MetaInterp<M> {
         self.leave_execute(procedure_token);
         match outcome {
             Ok(value) => {
-                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
                 Ok(value)
             }
-            Err(frame) => {
-                self.keep_compiled_token_alive(procedure_token);
-                Err(frame)
-            }
+            err => err,
         }
     }
 
@@ -13585,14 +13598,10 @@ impl<M: Clone> MetaInterp<M> {
         self.leave_execute(procedure_token);
         match outcome {
             Ok(value) => {
-                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
                 Ok(value)
             }
-            Err(frame) => {
-                self.keep_compiled_token_alive(procedure_token);
-                Err(frame)
-            }
+            err => err,
         }
     }
 
@@ -14616,44 +14625,6 @@ impl<M: Clone> MetaInterp<M> {
                 continue;
             }
             fd.store_hash(self.warm_state_for_driver(compiling_jd).fetch_next_hash());
-        }
-    }
-
-    /// Check whether a bridge was actually compiled and attached for a guard.
-    /// Used by jit_bridge_compile_for_guard to distinguish successful bridge
-    /// compilation from trace abort (`pyjitpl.py` handle_guard_failure).
-    ///
-    /// The failing descr is in hand (`bridge_info().source_descr`); callers
-    /// already try `bridge_attached` on it. The live procedure token is the
-    /// remaining backend query (`get_procedure_token`).
-    pub fn bridge_was_compiled(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
-        // The guard being asked about is the trace session's own origin, and
-        // its descr is in hand (`pyjitpl.py handle_guard_failure`'s
-        // `resumedescr`); the backend answers off that descr without a walk
-        // over the token's code blocks.
-        if let Some(info) = self.bridge_info()
-            && info.trace_id == trace_id
-            && info.fail_index == fail_index
-            && let Some(fd) = info.source_descr.as_fail_descr()
-            && let Some(attached) = self.backend.bridge_attached(fd)
-        {
-            return attached;
-        }
-        if let Some(token) = self.get_procedure_token(green_key)
-            && self
-                .backend
-                .bridge_was_compiled(&token, trace_id, fail_index)
-        {
-            return true;
-        }
-        false
-    }
-
-    /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
-    #[allow(dead_code)]
-    fn cut_tentative_op(&mut self, cut_at: crate::recorder::TracePosition) {
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.cut_trace(cut_at);
         }
     }
 
@@ -29509,6 +29480,7 @@ mod tests {
             key.get_uhash()
         );
     }
+
     use crate::resume::{FrameSlotSource, ReconstructedValue, ResolvedPendingFieldWrite};
     use crate::test_greens::{gk, gk_with_uhash};
     use majit_ir::descr::{CallDescr, Descr, EffectInfo, ExtraEffect, LoopTargetDescr};
@@ -30682,9 +30654,9 @@ mod tests {
     /// `warmstate.py execute_assembler` holds `loop_token` as a stack local
     /// through `func_execute_token`. MiniMark traces that local even after
     /// `MemoryManager.next_generation` has dropped the token from
-    /// `alive_loops`; `executing_tokens` is that stack local. After
-    /// `leave_execute` the token is only a Rust `Arc` the collector does
-    /// not see.
+    /// `alive_loops`; `executing_tokens` is that stack local. `leave_execute`
+    /// then `keep_loop_alive`s the token, so the collector still sees it via
+    /// `alive_loops`.
     #[test]
     fn compiled_graph_root_walk_follows_the_executing_token() {
         let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
@@ -30716,9 +30688,10 @@ mod tests {
         meta.leave_execute(&token);
         seen.clear();
         meta.walk_rd_consts_refs(|slot| seen.push(slot.0));
-        assert!(
-            seen.is_empty(),
-            "a token held only by a Rust Arc after leave_execute is not a root"
+        assert_eq!(
+            seen,
+            vec![0x93_0000_A000],
+            "leave_execute keep_loop_alive records the run, so the token stays a root via alive_loops"
         );
     }
 
@@ -31601,14 +31574,7 @@ mod tests {
         let origin_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("compiled origin token");
-        let descr_arc = meta
-            .backend
-            .compiled_fail_descr_layouts(origin_token.as_ref())
-            .into_iter()
-            .flatten()
-            .find(|layout| layout.fail_index == 0 && !layout.is_finish)
-            .and_then(|layout| layout.descr)
-            .expect("compiled guard descr");
+        let descr_arc = crate::jitdriver::compiled_token_guard_descr(origin_token.as_ref(), 0);
         let (trace_id, fail_index) = {
             let fail_descr = descr_arc.as_fail_descr().expect("compiled guard descr");
             (fail_descr.trace_id(), fail_descr.fail_index_per_trace())
@@ -31653,7 +31619,7 @@ mod tests {
         assert_eq!(meta.stats.bridges_compiled, 1);
         assert!(
             meta.backend
-                .bridge_was_compiled(&origin_token, trace_id, fail_index),
+                .bridge_attached(descr_arc.as_fail_descr().unwrap()),
             "the kept origin token must own the attached FINISH bridge"
         );
     }

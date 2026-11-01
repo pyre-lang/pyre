@@ -19,8 +19,7 @@ use std::borrow::Cow;
 /// * `RdVirtualInfo` variants (resoperation.rs).  `PartialEq`
 ///   (resoperation.rs) uses `opt_descr_ptr_eq` (Arc::ptr_eq),
 ///   matching `history.py:125 id(descr)`.
-/// * `ExitVirtualLayout` (`majit-backend/src/lib.rs`) and
-///   `ExitPendingFieldLayout` (`majit-backend/src/lib.rs`) compare
+/// * `ExitPendingFieldLayout` (`majit-backend/src/lib.rs`) compares
 ///   descrs via `opt_descr_ptr_eq` for the same reason.
 /// * `ResolvedPendingFieldWrite` / `EncodedPendingFieldWrite`
 ///   (`majit-metainterp/src/resume.rs`) and
@@ -5350,7 +5349,7 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Per-trace fail-index assigned by `compile.rs::build_guard_metadata`.
+    /// Per-trace fail-index assigned by `compile.rs stamp_guard_descr_trace_positions`.
     ///
     /// Pyre-only: pyre's runtime exit path uses a `(trace_id, fail_index)`
     /// key where `fail_index` is the per-trace numbering the optimizer
@@ -5358,18 +5357,18 @@ pub trait FailDescr: Descr {
     /// = i` semantics).  The descr's structural `fail_index` is allocated
     /// from a global counter (`alloc_fail_index`), so a separate slot
     /// captures the per-trace key for lookup parity.  Default 0 — non-
-    /// resume FailDescrs are not threaded through `build_guard_metadata`.
+    /// resume FailDescrs are not threaded through `stamp_guard_descr_trace_positions`.
     fn fail_index_per_trace(&self) -> u32 {
         0
     }
 
-    /// `build_guard_metadata` per-trace fail-index stamp setter.  Default
+    /// `stamp_guard_descr_trace_positions` per-trace fail-index stamp setter.  Default
     /// panic — only `ResumeGuardDescr`-family descrs override.
     fn set_fail_index_per_trace(&self, _fail_index: u32) {
         panic!(
             "set_fail_index_per_trace invoked on a FailDescr that does not \
              carry a per-trace fail_index slot (only ResumeGuardDescr-family \
-             descrs reach the build_guard_metadata pipeline)"
+             descrs reach the stamp_guard_descr_trace_positions pipeline)"
         );
     }
 

@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use majit_gc::shadow_stack::ShadowRoot;
 use majit_ir::{DescrRef, GcRef};
 
-use crate::ExitRecoveryLayout;
 use crate::jitframe::{FIRST_ITEM_OFFSET, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame};
 
 /// The host-heap frame a deadframe owns, and its release.
@@ -607,13 +606,6 @@ pub struct JitFrameDeadFrame {
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
-    /// Side-channel: caller-prefix layout passed into
-    /// `wrap_call_assembler_deadframe_with_caller_prefix` at deadframe
-    /// interception.  When `Some`,
-    /// the exit's recovery layout is prefixed by this value.  Replaces the old
-    /// overlay descr synthesis — the deadframe's `fail_descr` keeps the
-    /// callee's own Arc identity rather than being swapped for a synthetic one.
-    pub call_assembler_caller_layout: Option<ExitRecoveryLayout>,
     /// Keeps the frame memory alive for non-GC allocations, and decides where
     /// it goes when this deadframe dies. See [`FrameHeapOwner`].
     _heap_owner: Option<FrameHeapOwner>,
@@ -642,7 +634,6 @@ impl JitFrameDeadFrame {
             jf_root,
             fail_descr,
             latest_descr,
-            call_assembler_caller_layout: None,
             _heap_owner: heap_owner,
         }
     }
@@ -661,7 +652,6 @@ impl JitFrameDeadFrame {
             jf_root: JitFrameRoot::Slot(ShadowRoot::new(jf_gcref)),
             fail_descr,
             latest_descr,
-            call_assembler_caller_layout: None,
             _heap_owner: None,
         }
     }

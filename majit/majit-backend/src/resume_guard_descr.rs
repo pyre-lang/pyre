@@ -178,7 +178,7 @@ pub struct ResumeGuardDescr {
     pub status: AtomicU64,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
     pub trace_id: AtomicU64,
-    /// Pyre-only: per-trace `fail_index` assigned by `build_guard_metadata`.
+    /// Pyre-only: per-trace `fail_index` assigned by `stamp_guard_descr_trace_positions`.
     pub fail_index_per_trace: AtomicU32,
     /// Set when `compile_bridge` declined this guard for a deterministic
     /// structural reason (`Backend::bridge_decline_is_terminal`).
@@ -186,8 +186,7 @@ pub struct ResumeGuardDescr {
     /// Codegen-time trace-op index for the originating guard op
     /// (`pyjitpl._compile_one_block` parity — the live op object passed
     /// at compile time has an implicit index in `loop.operations`).
-    /// Used at the backend→metainterp interop boundary
-    /// (`FailDescrLayout::source_op_index`).  Migrated here from
+    /// Used at the backend→metainterp interop boundary.  Migrated here from
     /// the meta Arc is the single source of truth.  `None` for synthetic
     /// FINISH / external-JUMP descrs that have no associated trace op.
     pub source_op_index: UnsafeCell<Option<usize>>,
@@ -548,7 +547,7 @@ impl FailDescr for ResumeGuardDescr {
             // pyre's single-JIT-thread invariant (RPython GIL parity):
             // `set_trace_info_any` and `Drop::drop` only run on the JIT
             // compiler thread.  Reads happen either from the same thread
-            // (codegen helpers like `fail_descr_trace_info`) or from JIT-
+            // (codegen helpers) or from JIT-
             // baked code executed under the same GIL-equivalent
             // serialization.  A re-publishing `set_trace_info_any` cannot
             // interleave between this load and the strong-count bump,

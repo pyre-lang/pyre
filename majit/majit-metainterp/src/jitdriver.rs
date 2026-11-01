@@ -1,4 +1,4 @@
-use majit_backend::{Backend, ExitValueSourceLayout};
+use majit_backend::Backend;
 
 use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
 
@@ -9570,10 +9570,6 @@ impl<S: JitState> JitDriver<S> {
         let savedata = result.savedata;
         let deadframe = result.deadframe.take();
 
-        // `warmstate.py execute_assembler`: `memory_manager.keep_loop_alive`
-        // on the token it ran.
-        self.meta.keep_compiled_token_alive(procedure_token);
-
         if is_finish {
             let typed_values = std::mem::take(&mut result.typed_values);
             drop(result);
@@ -11117,16 +11113,8 @@ impl<S: JitState> JitDriver<S> {
         // path once a bridge is attached. A later `must_compile` FIRED
         // here is a pyre re-entry; walking again can abort setup and
         // terminally decline the working source.
-        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
-        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
-        // `bridge_attached` returns `Some(false)` while the guard still
-        // owns its recovery stub; `None` falls back to the token map.
-        let already_compiled = match self.meta.backend.bridge_attached(descr_fd) {
-            Some(attached) => attached,
-            None => self
-                .meta
-                .bridge_was_compiled(green_key, trace_id, fail_index),
-        };
+        // The descr's mark answers (`assembler.py patch_jump_for_descr`).
+        let already_compiled = self.meta.backend.bridge_attached(descr_fd);
         if already_compiled {
             return false;
         }
@@ -11857,6 +11845,39 @@ fn abort_blackhole_restore_banks<'a>(
     )
 }
 
+/// First non-finish fail descr at `fail_index` on the compiled token.
+/// Walks `asmmemmgr_gcreftracers` the way `assembler.py
+/// get_asmmemmgr_gcreftracers` keeps the descrs: dynasm registers a
+/// `FailDescrStore`, cranelift a `Vec<DescrRef>`.
+#[cfg(test)]
+pub(crate) fn compiled_token_guard_descr(
+    token: &majit_backend::JitCellToken,
+    fail_index: u32,
+) -> majit_ir::DescrRef {
+    let clt = token.compiled_loop_token_expect();
+    let tracers = clt.asmmemmgr_gcreftracers.lock();
+    for tracer in tracers.iter() {
+        if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+            if let Some(descr) = store.iter().enumerate().find_map(|(idx, cell)| {
+                (idx as u32 == fail_index
+                    && cell.descr.as_fail_descr().is_some_and(|fd| !fd.is_finish()))
+                .then(|| cell.descr.clone())
+            }) {
+                return descr;
+            }
+        } else if let Some(descrs) = tracer.downcast_ref::<Vec<majit_ir::DescrRef>>()
+            && let Some(descr) = descrs.iter().enumerate().find_map(|(idx, descr)| {
+                (idx as u32 == fail_index
+                    && descr.as_fail_descr().is_some_and(|fd| !fd.is_finish()))
+                .then(|| descr.clone())
+            })
+        {
+            return descr;
+        }
+    }
+    panic!("compiled guard descr")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11907,13 +11928,7 @@ mod tests {
         fail_index: u32,
     ) -> majit_ir::DescrRef {
         let token = meta.get_procedure_token(green_key).expect("compiled token");
-        meta.backend
-            .compiled_fail_descr_layouts(token.as_ref())
-            .into_iter()
-            .flatten()
-            .find(|layout| layout.fail_index == fail_index && !layout.is_finish)
-            .and_then(|layout| layout.descr)
-            .expect("compiled guard descr")
+        compiled_token_guard_descr(token.as_ref(), fail_index)
     }
 
     fn start_hash_trace(meta: &mut MetaInterp<()>, key: &majit_ir::GreenKey, live: &[i64]) {

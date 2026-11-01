@@ -4766,16 +4766,16 @@ pub fn trace_and_compile_from_bridge(
         return bridge_resolution_from_bool(!resume_via_blackhole);
     }
 
-    // pyjitpl.py:2982-2983 / 3095-3099 parity:
     // compile_trace() "raises in case it works". In pyre the bridge can
     // already be attached during this step even if jit_merge_point_keyed()
     // did not surface DetailedDriverRunOutcome::Jump yet. Stop tracing as
-    // soon as the backend metadata shows that the bridge is attached.
+    // soon as `assembler.py patch_jump_for_descr` has marked the guard.
     let compiled = {
         let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp()
-            .bridge_was_compiled(green_key, trace_id, fail_index)
+        use majit_backend::Backend;
+        descr_arc
+            .as_fail_descr()
+            .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
     };
     if compiled {
         let (driver, _) = crate::eval::driver_pair();
@@ -5118,11 +5118,14 @@ fn trace_bridge_via_interpret(
     // PyObject. `jitdriver.rs` skips a zero cell for the same reason.
     let _guard_exc_root = (guard_exc != 0 && majit_gc::gc_owns_object(guard_exc as usize))
         .then(|| majit_metainterp::blackhole::GuardExcRoot::park(guard_exc));
+    // `assembler.py patch_jump_for_descr` marks the guard once a bridge
+    // is attached; skip a second walk of the same source.
     {
         let (driver, _) = crate::eval::driver_pair();
-        if driver
-            .meta_interp()
-            .bridge_was_compiled(green_key, trace_id, fail_index)
+        use majit_backend::Backend;
+        if descr_arc
+            .as_fail_descr()
+            .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
         {
             return BridgeResolution::ResumeBlackhole;
         }
@@ -9020,9 +9023,7 @@ pub extern "C" fn bh_clear_in_flight_exception() {
 }
 
 /// On-demand resume callback (pyre-jit side).  Registered into cranelift
-/// via `register_resumedata_deopt` (eval.rs:init_callbacks) and called
-/// from the `recovery_layout_ref()` consumer sites that have migrated off
-/// the pre-baked `ExitRecoveryLayout` cache.
+/// via `register_resumedata_deopt` (eval.rs:init_callbacks).
 ///
 /// PyPy parity target: `pyjitpl.py rebuild_state_after_failure
 /// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`

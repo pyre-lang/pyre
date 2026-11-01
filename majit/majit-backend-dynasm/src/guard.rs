@@ -14,8 +14,7 @@
 // `AbstractFailDescr._attrs_` (`history.py`).  Resume code
 // (`resume.py`) decodes recovery on demand from
 // `rd_numb / rd_consts / rd_virtuals / rd_pendingfields` via
-// `ResumeGuardDescr.get_resumestorage`.  At deopt,
-// `FailDescrLayout.recovery_layout` is `None`.
+// `ResumeGuardDescr.get_resumestorage`.
 
 // FAIL_ARG_LOCS_TABLE removed: duplicates `rd_locs`
 // (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
@@ -50,44 +49,6 @@ pub use majit_backend::llmodel::decode_rd_loc_slot;
 // eliminated the last constructor of the wrapper.  All readers reach
 // the descr through `DescrRef` and dispatch trait methods on
 // `&dyn FailDescr`.
-
-/// `compile.py:849` build a FailDescrLayout snapshot for any FailDescr
-/// descr identity (post Phase C-1 cascade — `find_descr_by_ptr` returns
-/// `DescrRef`, so the layout extractor takes the trait object plus the
-/// data-pointer address used to key backend-static side-tables
-/// (`SOURCE_OP_INDEX_TABLE`, `RECOVERY_LAYOUT_TABLE`)).
-///
-/// `fail_index` / `trace_id` are explicit caller arguments rather than
-/// reads off `fd.fail_index_per_trace()` / `fd.trace_id()` so the
-/// `fail_descrs` Vec position can be the identity source.  Singleton
-/// FINISH descrs (`compile.py _DoneWithThisFrameDescr` /
-/// `ExitFrameWithExceptionDescrRef`) share an Arc across emissions and
-/// answer the trait-default `0` for both methods; the layout pipeline
-/// must read position from the Vec, not from the descr.
-pub fn layout_for_fail_descr(
-    descr: &majit_ir::DescrRef,
-    fail_index: u32,
-    trace_id: u64,
-) -> majit_backend::FailDescrLayout {
-    let fd = descr
-        .as_fail_descr()
-        .expect("layout_for_fail_descr requires a Descr that exposes the FailDescr trait");
-    let fail_arg_types = fd.fail_arg_types();
-    majit_backend::FailDescrLayout {
-        fail_index,
-        fail_arg_types: fail_arg_types.to_vec(),
-        is_finish: fd.is_finish(),
-        is_exception_exit: fd.is_exit_frame_with_exception(),
-        trace_id,
-        source_op_index: fd.source_op_index(),
-        frame_stack: None,
-        // Backend does not cache recovery_layout. Production deopt
-        // decodes the descr's `rd_numb` (`ResumeGuardDescr.get_resumestorage`).
-        recovery_layout: None,
-        trace_info: None,
-        descr: Some(descr.clone()),
-    }
-}
 
 // `Debug`, `impl Descr`, `impl FailDescr` for the removed
 // `DynasmFailDescr` all went away with the struct.  The metainterp

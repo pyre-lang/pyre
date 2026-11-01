@@ -4926,7 +4926,7 @@ impl<'a> AssemblerARM64<'a> {
         // ResumeGuardDescr (`op.descr`).  See x86 counterpart for rationale:
         // routing the writes through the trait at codegen time lets readers
         // consume the canonical metainterp identity before
-        // `build_guard_metadata` (`compile.rs`) re-stamps.
+        // `stamp_guard_descr_trace_positions` (`compile.rs`) re-stamps.
         if let Some(d) = op.getdescr()
             && (d.is_resume_guard() || d.is_resume_guard_copied())
             && let Some(fd) = d.as_fail_descr()
@@ -4990,8 +4990,8 @@ impl<'a> AssemblerARM64<'a> {
         );
         // Stamp source_op_index directly on the meta descr (UnsafeCell slot
         // owned by ResumeGuardDescr / ResumeGuardCopiedDescr per
-        // resume_guard_descr.rs); `layout_for_fail_descr` reads it back
-        // via `fd.source_op_index()` so no side-table is needed.
+        // resume_guard_descr.rs); readers use `fd.source_op_index()` so
+        // no side-table is needed.
         // Production deopt decodes the descr's `rd_numb`
         // (`ResumeGuardDescr.get_resumestorage`); the backend keeps no
         // recovery-layout cache.

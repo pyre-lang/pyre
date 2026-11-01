@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use majit_backend::eager::CompiledIr;
-use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
+use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 use majit_ir::{Const, ConstMap, DescrRef, FailDescr, GcRef, InputArgRc, Op, OpCode, OpRc, Value};
 
 #[derive(Default)]

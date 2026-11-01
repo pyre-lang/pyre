@@ -447,7 +447,7 @@ impl MemoryManager {
     }
 
     /// `memmgr.py` `keep_loop_alive(looptoken)`.
-    pub fn keep_loop_alive(&mut self, looptoken: &Arc<JitCellToken>) {
+    pub fn keep_loop_alive(&self, looptoken: &Arc<JitCellToken>) {
         self.inner.borrow_mut().keep_loop_alive(looptoken)
     }
 

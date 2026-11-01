@@ -2038,17 +2038,12 @@ fn test_ffi_call_exception_propagation() {
     );
 }
 
-// Frame-stack metadata integration tests
-
-// Test: Guard failure preserves frame-stack metadata in describe_deadframe
-
 #[test]
-fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
+fn test_compiled_guard_failure_preserves_fail_args() {
     // Trace: input(x) -> result = x + 5 -> cmp = result < 100
     //        -> guard_true(cmp) -> finish(result)
     // Execute with x=50: guard passes, finish returns 55.
     // Execute with x=200: result=205, 205 < 100 is false, guard fails.
-    // Verify the DeadFrame carries frame_stack metadata.
     let mut rec = Trace::new();
     let x = rec.record_input_arg(Type::Int);
 
@@ -2081,25 +2076,10 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     assert_eq!(descr.fail_index(), 0, "x=200 should fail guard");
     // Guard saves input args: x=200
     assert_eq!(backend.get_int_value(&frame, 0), 200);
-
-    // Backend `describe_deadframe` reports `frame_stack` /
-    // `recovery_layout` as None (same contract as dynasm
-    // `layout_for_fail_descr`). Production deopt decodes the descr's
-    // `rd_numb` (`ResumeGuardDescr.get_resumestorage`).
-    let layout = backend
-        .describe_deadframe(&frame)
-        .expect("describe_deadframe should return a layout");
-    assert_eq!(layout.fail_index, 0);
-    assert!(
-        layout.frame_stack.is_none(),
-        "backend describe_deadframe reports no frame_stack"
-    );
 }
 
-// Test: Bridge guard failure carries frame-stack metadata
-
 #[test]
-fn test_compiled_bridge_guard_failure_has_frame_stack() {
+fn test_compiled_bridge_guard_failure() {
     // Main loop: input(i, sum) -> sum2 = sum + i -> i2 = i - 1
     //            -> cmp = i2 > 0 -> guard_true(cmp) -> jump(i2, sum2)
     let mut rec = Trace::new();
@@ -2171,21 +2151,10 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
     let descr = backend.get_latest_descr(&frame);
     // Bridge guard failure should have a fail_index from the bridge
     assert!(!descr.is_finish(), "bridge guard should fail, not finish");
-
-    // See test_compiled_guard_failure_preserves_frame_stack_metadata.
-    let layout = backend
-        .describe_deadframe(&frame)
-        .expect("bridge guard failure should produce a layout");
-    assert!(
-        layout.frame_stack.is_none(),
-        "backend describe_deadframe reports no frame_stack"
-    );
 }
 
-// Test: CallAssemblerI callee guard failure propagates frame_stack
-
 #[test]
-fn test_call_assembler_callee_guard_failure_frame_stack() {
+fn test_compiled_callee_guard_failure_preserves_fail_args() {
     // Compile a callee trace with a guard that fails:
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
     let callee_inputargs = vec![InputArg::new_int_rc(0)];
@@ -2225,21 +2194,10 @@ fn test_call_assembler_callee_guard_failure_frame_stack() {
     let descr = backend.get_latest_descr(&frame);
     assert_eq!(descr.fail_index(), 0);
     assert_eq!(backend.get_int_value(&frame, 0), 5);
-
-    // See test_compiled_guard_failure_preserves_frame_stack_metadata.
-    let layout = backend
-        .describe_deadframe(&frame)
-        .expect("callee guard failure should have a layout");
-    assert!(
-        layout.frame_stack.is_none(),
-        "backend describe_deadframe reports no frame_stack"
-    );
 }
 
-// Test: Frame-stack slot_types match fail_arg_types for mixed Int+Float
-
 #[test]
-fn test_frame_stack_slot_types_match_fail_arg_types() {
+fn test_compiled_guard_failure_preserves_int_and_float_fail_args() {
     // Trace with mixed Int and Float fail args:
     //   input(x_int, x_float) -> cmp = x_int > 0 -> guard_true(cmp, fail_args=[x_int, x_float])
     //   -> finish(x_int)
@@ -2278,21 +2236,10 @@ fn test_frame_stack_slot_types_match_fail_arg_types() {
         (backend.get_float_value(&frame, 1) - 2.5).abs() < 1e-10,
         "float fail arg should be preserved"
     );
-
-    // fail_arg_types still flow through `FailDescr` directly;
-    // frame_stack metadata is now metainterp-owned (see
-    // test_compiled_guard_failure_preserves_frame_stack_metadata).
-    let layout = backend
-        .describe_deadframe(&frame)
-        .expect("mixed-type guard failure should have a layout");
     assert_eq!(
-        layout.fail_arg_types,
-        vec![Type::Int, Type::Float],
+        descr.fail_arg_types(),
+        &[Type::Int, Type::Float],
         "fail_arg_types should be [Int, Float]"
-    );
-    assert!(
-        layout.frame_stack.is_none(),
-        "backend describe_deadframe reports no frame_stack"
     );
 }
 

@@ -6945,7 +6945,7 @@ impl majit_backend::Backend for WasmBackend {
                 .expect("source loop disappeared between borrows");
             // Append the bridge's exit descrs to the source loop's flat
             // `fail_descrs` and record the slice they occupy, keyed by the
-            // source guard's `fail_index`. `compiled_bridge_fail_descr_layouts`
+            // source guard's `fail_index`. `bridge_attached`
             // maps a source guard back to that range. `start` is captured inside the same `borrow_mut`
             // critical section as the `extend`, so the range stays in lockstep
             // with the vec.
@@ -7058,102 +7058,26 @@ impl majit_backend::Backend for WasmBackend {
         })
     }
 
-    /// `compile.py` store_hash relies on a per-guard fail-descr layout
-    /// to know which exits are real guards (vs FINISH) and to count them.
-    /// `assign_guard_hashes` fetches one jitcounter hash per non-finish guard
-    /// from this list, so without it no guard ever gets a hash, `must_compile`
-    /// never fires, and a hot guard exit round-trips to the host forever instead
-    /// of triggering a bridge. Build one layout per exit from the metainterp
-    /// `ResumeGuardDescr` the optimizer stamped on the guard (`meta_descr`); the
-    /// wasm backend keeps no machine-code recovery metadata (resume runs through
-    /// `get_resumestorage` on that descr), so the
-    /// recovery / rd_* / gc-slot fields stay empty. Consumers read
-    /// `is_finish` and `source_op_index` from this list and the resume
-    /// payload from the descr Arc.
-    fn compiled_fail_descr_layouts(
-        &self,
-        token: &JitCellToken,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let compiled = token
+    /// `compile_bridge` records each attach in the source loop's
+    /// `bridge_descr_ranges`; the host build does not clear
+    /// `adr_jump_offset` ("patched"), so read the record for this descr.
+    fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> bool {
+        let Some(token) = majit_backend::descr_owning_jct(descr) else {
+            return false;
+        };
+        let Some(compiled) = token
             .compiled
             .get()
-            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())?;
-        let trace_id = compiled.trace_id;
-        let descrs = compiled.fail_descrs.borrow();
-        let layouts = descrs
-            .iter()
-            .enumerate()
-            .map(|(position, wfd)| {
-                let meta = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
-                majit_backend::FailDescrLayout {
-                    fail_index: position as u32,
-                    source_op_index: meta.and_then(|fd| fd.source_op_index()),
-                    trace_id,
-                    trace_info: None,
-                    fail_arg_types: wfd.fail_arg_types.clone(),
-                    is_finish: wfd.is_finish,
-                    is_exception_exit: meta
-                        .map(|fd| fd.is_exit_frame_with_exception())
-                        .unwrap_or(false),
-                    recovery_layout: None,
-                    frame_stack: None,
-                    descr: wfd.meta_descr.clone(),
-                }
-            })
-            .collect();
-        Some(layouts)
-    }
-
-    /// `compile.py` store_hash: stamp the jitcounter hashes assigned by
-    /// `compile_bridge` appends a bridge's exit descrs to the source loop's flat
-    /// `fail_descrs` and records their `(source_fail_index, start, count)` slice
-    /// in `bridge_descr_ranges`. Return one layout per descr in that slice.
-    /// `fail_index` is the 0-based position within the bridge's own
-    /// fail-descr list (matching the native backends'
-    /// `compiled_bridge_fail_descr_layouts`); `trace_id` is the
-    /// bridge's own id, stamped on each appended `WasmFailDescr`.
-    fn compiled_bridge_fail_descr_layouts(
-        &self,
-        original_token: &JitCellToken,
-        source_trace_id: u64,
-        source_fail_index: u32,
-    ) -> Option<Vec<majit_backend::FailDescrLayout>> {
-        let compiled = original_token
-            .compiled
-            .get()
-            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())?;
-        // The most recently chained bridge at this source guard (last range).
-        let (start, count) = compiled
+            .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+        else {
+            return false;
+        };
+        let (trace_id, fail_index) = (descr.trace_id(), descr.fail_index_per_trace());
+        compiled
             .bridge_descr_ranges
             .borrow()
             .iter()
-            .rev()
-            .find(|r| r.0 == source_trace_id && r.1 == source_fail_index)
-            .map(|&(_, _, start, count)| (start, count))?;
-        let descrs = compiled.fail_descrs.borrow();
-        let layouts = descrs
-            .get(start..start + count)?
-            .iter()
-            .enumerate()
-            .map(|(position, wfd)| {
-                let meta = wfd.meta_descr.as_ref().and_then(|m| m.as_fail_descr());
-                majit_backend::FailDescrLayout {
-                    fail_index: position as u32,
-                    source_op_index: meta.and_then(|fd| fd.source_op_index()),
-                    trace_id: wfd.trace_id,
-                    trace_info: None,
-                    fail_arg_types: wfd.fail_arg_types.clone(),
-                    is_finish: wfd.is_finish,
-                    is_exception_exit: meta
-                        .map(|fd| fd.is_exit_frame_with_exception())
-                        .unwrap_or(false),
-                    recovery_layout: None,
-                    frame_stack: None,
-                    descr: wfd.meta_descr.clone(),
-                }
-            })
-            .collect();
-        Some(layouts)
+            .any(|r| r.0 == trace_id && r.1 == fail_index)
     }
 
     fn execute_token(&self, token: &JitCellToken, args: &[Value]) -> DeadFrame {

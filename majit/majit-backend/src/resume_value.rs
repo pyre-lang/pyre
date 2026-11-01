@@ -14,8 +14,6 @@ use majit_ir::resumedata::{
 };
 use majit_ir::{ArrayDescrInfo, Const, DescrRef, FieldDescrInfo};
 
-use crate::ExitValueSourceLayout;
-
 /// Tagged source for a value that must be reconstructed on resume.
 ///
 /// This is the majit equivalent of the tagged numbering used by
@@ -111,17 +109,13 @@ impl ResumeValueSource {
     }
 }
 
-/// Cross-crate impl methods for `ResumeValueLayoutSummary` — these
-/// reference both `ResumeValueSource` (this module) and
-/// `ExitValueSourceLayout` (also in `majit-backend`), so they live
-/// alongside the moved enum.
+/// Cross-crate impl methods for `ResumeValueLayoutSummary`.
 pub trait ResumeValueLayoutSummaryExt {
     /// `resume.py:226` raw fail-arg position lookup — falls back to
     /// `fail_arg_index` when the explicit `raw_fail_arg_position`
     /// override is absent.
     fn raw_fail_arg_position_or_fallback(&self) -> usize;
     fn to_resume_source(&self) -> ResumeValueSource;
-    fn to_exit_source(&self, virtual_offset: usize) -> ExitValueSourceLayout;
 }
 
 impl ResumeValueLayoutSummaryExt for ResumeValueLayoutSummary {
@@ -144,23 +138,6 @@ impl ResumeValueLayoutSummaryExt for ResumeValueLayoutSummary {
             }
             ResumeValueKind::Uninitialized => ResumeValueSource::Uninitialized,
             ResumeValueKind::Unavailable => ResumeValueSource::Unavailable,
-        }
-    }
-
-    fn to_exit_source(&self, virtual_offset: usize) -> ExitValueSourceLayout {
-        match self.kind {
-            ResumeValueKind::FailArg => {
-                ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position_or_fallback())
-            }
-            ResumeValueKind::Constant => ExitValueSourceLayout::Constant(
-                self.constant.expect("missing constant value"),
-                self.constant_type.expect("missing constant type"),
-            ),
-            ResumeValueKind::Virtual => ExitValueSourceLayout::Virtual(
-                self.virtual_index.expect("missing virtual index") + virtual_offset,
-            ),
-            ResumeValueKind::Uninitialized => ExitValueSourceLayout::Uninitialized,
-            ResumeValueKind::Unavailable => ExitValueSourceLayout::Unavailable,
         }
     }
 }
@@ -187,57 +164,6 @@ pub struct FrameInfo {
     pub pc: u64,
     /// Mapping from slot index to a tagged resume source.
     pub slot_map: Vec<FrameSlotSource>,
-}
-
-/// Free function constructor (replaces the moved
-/// `ResumeValueLayoutSummary::from_exit_value_source` inherent method
-/// — cross-crate orphan rule prevents defining inherent impls on a
-/// foreign type, so the conversion lives as a `pub fn`).
-pub fn resume_value_layout_summary_from_exit_value_source(
-    source: &ExitValueSourceLayout,
-) -> ResumeValueLayoutSummary {
-    match source {
-        ExitValueSourceLayout::ExitValue(index) => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::FailArg,
-            fail_arg_index: *index,
-            raw_fail_arg_position: Some(*index),
-            constant: None,
-            constant_type: None,
-            virtual_index: None,
-        },
-        ExitValueSourceLayout::Constant(value, ty) => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::Constant,
-            fail_arg_index: 0,
-            raw_fail_arg_position: None,
-            constant: Some(*value),
-            constant_type: Some(*ty),
-            virtual_index: None,
-        },
-        ExitValueSourceLayout::Virtual(index) => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::Virtual,
-            fail_arg_index: 0,
-            raw_fail_arg_position: None,
-            constant: None,
-            constant_type: None,
-            virtual_index: Some(*index),
-        },
-        ExitValueSourceLayout::Uninitialized => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::Uninitialized,
-            fail_arg_index: 0,
-            raw_fail_arg_position: None,
-            constant: None,
-            constant_type: None,
-            virtual_index: None,
-        },
-        ExitValueSourceLayout::Unavailable => ResumeValueLayoutSummary {
-            kind: ResumeValueKind::Unavailable,
-            fail_arg_index: 0,
-            raw_fail_arg_position: None,
-            constant: None,
-            constant_type: None,
-            virtual_index: None,
-        },
-    }
 }
 
 /// Description of a virtual object that needs materialization on resume.
