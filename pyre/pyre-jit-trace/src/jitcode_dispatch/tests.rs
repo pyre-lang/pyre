@@ -2715,22 +2715,26 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         startpoints: Some([0_usize, 1].into_iter().collect()),
         ..Default::default()
     });
-    let miframe = super::residual_call::build_trace_too_long_single_frame_miframe(
+    let handoff = super::residual_call::build_trace_too_long_single_frame_miframe(
         &wc,
         std::sync::Arc::new(runtime_jc),
         1,
     )
     .expect("an arbitrary post-step pc must not require a -live- marker");
-    assert_eq!(miframe.pc, 1);
+    assert_eq!(handoff.miframe.pc, 1);
     assert_eq!(
-        miframe.ref_value_for_blackhole(1),
+        handoff.banks.ref_word(1),
         Some(exc_obj_ptr as i64),
         "the complete-bank image must retain non-constant register concrete values",
     );
     assert_eq!(
-        miframe.ref_value_for_blackhole(2),
+        handoff.banks.ref_word(2),
         Some(forwarded_obj_ptr as i64),
         "the complete-bank image must prefer the GC-forwarded Box payload",
+    );
+    assert!(
+        handoff.miframe.ref_regs.iter().all(Option::is_none),
+        "FBW abort fill must leave MIFrame ref slots unset",
     );
 
     // A pc the jitcode does not name as an instruction start is refused: the
@@ -16149,7 +16153,7 @@ fn jit_force_virtual_wrong_arity_fails_loud() {
         .expect("call descr")
         .get_extra_info();
     let allboxes = vec![regs_i[0]];
-    let call = std::panic::AssertUnwindSafe(|| {
+    let mut call = std::panic::AssertUnwindSafe(|| {
         walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
     });
     #[cfg(debug_assertions)]
@@ -16228,7 +16232,7 @@ fn jit_force_virtual_missing_standard_box_fails_loud() {
         .expect("call descr")
         .get_extra_info();
     let allboxes = vec![func, vref];
-    let call = std::panic::AssertUnwindSafe(|| {
+    let mut call = std::panic::AssertUnwindSafe(|| {
         walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
     });
     #[cfg(debug_assertions)]
@@ -18904,10 +18908,98 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let miframe = super::residual_call::build_trace_too_long_single_frame_miframe(&wc, jitcode, 4)
+    let handoff = super::residual_call::build_trace_too_long_single_frame_miframe(&wc, jitcode, 4)
         .expect("helper banks must fill at a post-step pc");
-    assert_eq!(miframe.pc, 4);
-    assert_eq!(miframe.jitcode.name(), "helper_too_long_fill");
+    assert_eq!(handoff.miframe.pc, 4);
+    assert_eq!(handoff.miframe.jitcode.name(), "helper_too_long_fill");
+}
+
+/// FBW abort fill is `_copy_data_from_miframe` (`blackhole.py`) reading
+/// `box.getref_base()` into the blackhole banks. It must not intern a
+/// `ConstPtr` into `const_ptr_table` to carry that word.
+#[test]
+fn abort_fill_hands_off_raw_ref_words_without_interning() {
+    const LIVE: usize = 0xC2_AB07_FEED_0001;
+    const SENTINEL_A: usize = 0xC2_AB07_FEED_00A0;
+    const SENTINEL_B: usize = 0xC2_AB07_FEED_00B0;
+    let live = majit_ir::GcRef(LIVE);
+    assert!(
+        majit_ir::const_ptr_table::index_of_current(live).is_none(),
+        "the live word must not already occupy a const_ptr_table slot"
+    );
+    let _restore_a = crate::RestoreConstPtr::intern(SENTINEL_A);
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let opref = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(opref, Value::Ref(live));
+    let regs_r = [opref];
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: vec![ConcreteValue::Ref(LIVE as pyre_object::PyObjectRef)],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("abort_fill_raw_ref");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![0, 0],
+        c_num_regs_r: 1,
+        startpoints: Some([0_usize, 1].into_iter().collect()),
+        ..Default::default()
+    });
+    let handoff = super::residual_call::build_trace_too_long_single_frame_miframe(
+        &wc,
+        std::sync::Arc::new(runtime_jc),
+        1,
+    )
+    .expect("fill must succeed for a concrete live ref");
+    let _restore_b = crate::RestoreConstPtr::intern(SENTINEL_B);
+    assert_ne!(
+        _restore_a.index, _restore_b.index,
+        "sentinel intern must allocate two distinct const_ptr_table slots"
+    );
+    assert_eq!(
+        handoff.banks.ref_word(0),
+        Some(LIVE as i64),
+        "the handed-off ref word must equal the concrete"
+    );
+    assert!(
+        handoff.miframe.ref_regs.iter().all(Option::is_none),
+        "MIFrame ref slots stay unset; the value lives on the abort banks"
+    );
+    assert!(
+        majit_ir::const_ptr_table::index_of_current(live).is_none(),
+        "the live word must not have been interned"
+    );
 }
 
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.

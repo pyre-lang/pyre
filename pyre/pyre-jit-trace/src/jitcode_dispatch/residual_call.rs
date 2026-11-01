@@ -654,8 +654,23 @@ impl MirrorStackImage {
     }
 }
 
+/// One FBW abort frame: jitcode/pc on the MIFrame, typed `setarg_*` words
+/// on the banks. `_copy_data_from_miframe` (`blackhole.py`) reads
+/// `box.getint()` / `getref_base()` / `getfloatstorage()`; these banks
+/// are those raw words. The MIFrame register slots stay `None`.
+pub(crate) struct AbortHandoffFrame {
+    pub(crate) miframe: majit_metainterp::MIFrame,
+    pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
+}
+
+fn abort_handoff_from_minted(miframe: majit_metainterp::MIFrame) -> AbortHandoffFrame {
+    let banks = majit_metainterp::BlackholeAbortBanks::from_miframe_const_boxes(&miframe);
+    AbortHandoffFrame { miframe, banks }
+}
+
 pub(crate) struct LatchedSingleFrameBlackhole {
     pub(crate) miframe: majit_metainterp::MIFrame,
+    pub(crate) banks: majit_metainterp::BlackholeAbortBanks,
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
     /// The walker's resolved operand-stack image, captured by whichever latch
@@ -674,6 +689,7 @@ pub(crate) struct LatchedSingleFrameBlackhole {
 
 pub(crate) struct LatchedMultiFrameBlackhole {
     pub(crate) framestack: majit_metainterp::MIFrameStack,
+    pub(crate) banks: Vec<majit_metainterp::BlackholeAbortBanks>,
     pub(crate) last_exc_value: i64,
     pub(crate) raising_exception: bool,
     pub(crate) mirror_stack: Option<MirrorStackImage>,
@@ -713,10 +729,7 @@ pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
             return false;
         };
         let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
-        let vable_frame = latched
-            .miframe
-            .ref_value_for_blackhole(frame_reg as usize)
-            .unwrap_or(0) as usize;
+        let vable_frame = latched.banks.ref_word(frame_reg as usize).unwrap_or(0) as usize;
         vable_frame != 0 && mirror.capture_for(vable_frame).is_some()
     })
 }
@@ -825,6 +838,7 @@ pub(crate) fn stage_test_helper_abort_image() {
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
         *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
             framestack: majit_metainterp::MIFrameStack::empty(),
+            banks: Vec::new(),
             last_exc_value: 0,
             raising_exception: false,
             mirror_stack: None,
@@ -1192,7 +1206,7 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     paused: Option<&LiveFrameRegs>,
     origin: &'static str,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     if ctx.fbw_mode.snapshot_sym.is_null() {
         latchdbg!("origin={origin} paused-portal no-snapshot-sym");
         return None;
@@ -1223,10 +1237,11 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
         crate::state::pyjitcode_for_jitcode_index(index)
             .and_then(|pjc| parent_call_result_color(&pjc, pc))
     });
-    let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
-        &mut miframe,
+        &mut banks,
         &paused.registers_i,
         &paused.registers_r,
         &paused.registers_f,
@@ -1234,7 +1249,7 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
         paused.frame_state(),
         skip_result,
     )
-    .then_some(miframe)
+    .then_some(AbortHandoffFrame { miframe, banks })
 }
 
 /// Insert ancestor helper frames immediately below the latched innermost.
@@ -1242,9 +1257,7 @@ fn build_paused_portal_miframe<Sym: WalkSym>(
 /// `convert_and_run_from_pyjitpl` copies every `MIFrame` outermost-first.
 /// The innermost walk latches `[python…, grandchild]`; this restores the
 /// helpers that `SubWalkDriver` still holds between them.
-pub(crate) fn splice_helper_frames_before_innermost(
-    helpers: Vec<majit_metainterp::MIFrame>,
-) -> bool {
+pub(crate) fn splice_helper_frames_before_innermost(helpers: Vec<AbortHandoffFrame>) -> bool {
     if helpers.is_empty() {
         return true;
     }
@@ -1256,10 +1269,15 @@ pub(crate) fn splice_helper_frames_before_innermost(
         let Some(innermost) = latched.framestack.pop() else {
             return false;
         };
-        for frame in helpers {
-            latched.framestack.push(frame);
+        let Some(innermost_banks) = latched.banks.pop() else {
+            return false;
+        };
+        for helper in helpers {
+            latched.framestack.push(helper.miframe);
+            latched.banks.push(helper.banks);
         }
         latched.framestack.push(innermost);
+        latched.banks.push(innermost_banks);
         true
     })
 }
@@ -1275,14 +1293,15 @@ pub(crate) fn build_helper_parent_miframe(
     concrete_registers_i: &[ConcreteValue],
     frame_state: &WalkFrameState,
     skip_result: Option<(char, usize)>,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     if !instruction_starts_at(&jitcode, resume_pc) {
         return None;
     }
-    let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     fill_abort_miframe_register_banks(
         trace_ctx,
-        &mut miframe,
+        &mut banks,
         registers_i,
         registers_r,
         registers_f,
@@ -1290,7 +1309,7 @@ pub(crate) fn build_helper_parent_miframe(
         frame_state,
         skip_result,
     )
-    .then_some(miframe)
+    .then_some(AbortHandoffFrame { miframe, banks })
 }
 
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
@@ -1333,7 +1352,8 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             latchdbg!("origin={origin} no-snapshot-sym-jitcode");
             return false;
         };
-        let Some(miframe) = build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
+        let Some(AbortHandoffFrame { miframe, banks }) =
+            build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
         else {
             latchdbg!("origin={origin} sf-build-miframe");
             return false;
@@ -1359,9 +1379,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             cf_addr
         };
         let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
-        let vable_frame = miframe
-            .ref_value_for_blackhole(frame_reg as usize)
-            .unwrap_or(0) as usize;
+        let vable_frame = banks.ref_word(frame_reg as usize).unwrap_or(0) as usize;
         if vable_frame == 0
             || vable_frame != root_addr
             || crate::state::capture_frame_locals(vable_frame).is_none()
@@ -1395,6 +1413,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
                 miframe,
+                banks,
                 last_exc_value,
                 raising_exception: false,
                 mirror_stack,
@@ -1403,13 +1422,13 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         });
         true
     } else if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.transparent_helper_subwalk {
-        let Some(framestack) =
+        let Some((framestack, banks)) =
             build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong, origin)
         else {
             latchdbg!("origin={origin} mf-build-miframe");
             return false;
         };
-        if !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
+        if !multi_frame_blackhole_preflight(ctx, &framestack, &banks, origin) {
             latchdbg!("origin={origin} mf-preflight");
             return false;
         }
@@ -1448,6 +1467,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
                 framestack,
+                banks,
                 last_exc_value,
                 raising_exception: false,
                 mirror_stack: Some(mirror_stack),
@@ -1558,7 +1578,7 @@ pub(crate) fn codeless_level_may_stop_blackhole(
 
 /// Ancestor helpers, outermost first, may stop the blackhole. The already
 /// latched innermost level is the in-flight callee of the last helper.
-pub(crate) fn spliced_helpers_may_stop_blackhole(helpers: &[majit_metainterp::MIFrame]) -> bool {
+pub(crate) fn spliced_helpers_may_stop_blackhole(helpers: &[AbortHandoffFrame]) -> bool {
     if helpers.is_empty() {
         return false;
     }
@@ -1569,11 +1589,11 @@ pub(crate) fn spliced_helpers_may_stop_blackhole(helpers: &[majit_metainterp::MI
             .map(|frame| level_may_raise(frame, false))
             .unwrap_or(true)
     });
-    for frame in helpers.iter().rev() {
-        if codeless_level_may_stop_blackhole(frame, deeper_may_raise) {
+    for helper in helpers.iter().rev() {
+        if codeless_level_may_stop_blackhole(&helper.miframe, deeper_may_raise) {
             return true;
         }
-        deeper_may_raise = level_may_raise(frame, deeper_may_raise);
+        deeper_may_raise = level_may_raise(&helper.miframe, deeper_may_raise);
     }
     false
 }
@@ -1731,6 +1751,7 @@ fn reachable_op_labels(
 fn multi_frame_blackhole_preflight<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     framestack: &majit_metainterp::MIFrameStack,
+    banks: &[majit_metainterp::BlackholeAbortBanks],
     origin: &'static str,
 ) -> bool {
     if ctx.trace_ctx.virtualizable_info().is_none() || ctx.fbw_mode.snapshot_sym.is_null() {
@@ -1784,7 +1805,10 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             // below, once every Python level has been checked.
             continue;
         }
-        let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {
+        let Some(frame_ptr) = banks
+            .get(index)
+            .and_then(|frame_banks| frame_banks.ref_word(frame_reg as usize))
+        else {
             latchdbg!(
                 "origin={origin} pf-frame-ptr-unset index={index}/{} jitcode={} frame_reg={frame_reg}",
                 framestack.frames.len(),
@@ -2052,7 +2076,7 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode: std::sync::Arc<majit_metainterp::jitcode::JitCode>,
     resume_pc: usize,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     // The blackhole `setposition`s straight onto this coordinate and dispatches
     // there, so it has to start an instruction. Dropping the `-live-`
     // requirement above widened the pc domain to every post-step position, and
@@ -2077,8 +2101,10 @@ pub(crate) fn build_trace_too_long_single_frame_miframe<Sym: WalkSym>(
         }
         return None;
     }
-    let mut miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
-    fill_trace_too_long_register_banks(ctx, &mut miframe).then_some(miframe)
+    let miframe = majit_metainterp::MIFrame::new(jitcode, resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
+    fill_trace_too_long_register_banks(ctx, &mut banks)
+        .then_some(AbortHandoffFrame { miframe, banks })
 }
 
 /// Whether `pc` is an instruction boundary of `jitcode`.
@@ -2131,11 +2157,11 @@ fn instruction_starts_at(jitcode: &majit_metainterp::jitcode::JitCode, pc: usize
 /// reconstructs the singleton instead of refusing — see there.
 fn fill_trace_too_long_register_banks<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
-    miframe: &mut majit_metainterp::MIFrame,
+    banks: &mut majit_metainterp::BlackholeAbortBanks,
 ) -> bool {
     fill_abort_miframe_register_banks(
         ctx.trace_ctx,
-        miframe,
+        banks,
         ctx.registers_i,
         ctx.registers_r,
         ctx.registers_f,
@@ -2175,7 +2201,7 @@ fn fill_trace_too_long_register_banks<Sym: WalkSym>(
 /// `_setup_return_value_*` writes that color when the callee finishes.
 fn fill_abort_miframe_register_banks(
     trace_ctx: &TraceCtx,
-    miframe: &mut majit_metainterp::MIFrame,
+    banks: &mut majit_metainterp::BlackholeAbortBanks,
     registers_i: &RegisterBank,
     registers_r: &RegisterBank,
     registers_f: &RegisterBank,
@@ -2193,7 +2219,7 @@ fn fill_abort_miframe_register_banks(
             }
         };
     }
-    for color in 0..miframe.int_regs.len() {
+    for color in 0..banks.registers_i.len() {
         if skip_result == Some(('i', color)) {
             continue;
         }
@@ -2207,10 +2233,10 @@ fn fill_abort_miframe_register_banks(
                     _ => None,
                 })
         {
-            miframe.int_regs[color] = Some(OpRef::const_int(value));
+            banks.registers_i[color] = Some(value);
             continue;
         }
-        if miframe.int_regs[color].is_none() {
+        if banks.registers_i[color].is_none() {
             let Some(opref) = registers_i.get(color) else {
                 continue;
             };
@@ -2221,11 +2247,11 @@ fn fill_abort_miframe_register_banks(
                 s2dbg!("int color={color} opref={opref:?} has no concrete");
                 return false;
             };
-            miframe.int_regs[color] = Some(OpRef::const_int(value));
+            banks.registers_i[color] = Some(value);
         }
     }
 
-    for color in 0..miframe.ref_regs.len() {
+    for color in 0..banks.registers_r.len() {
         if skip_result == Some(('r', color)) {
             continue;
         }
@@ -2259,18 +2285,20 @@ fn fill_abort_miframe_register_banks(
         // NULL, and `is_true(NULL)` is false, sending a `while` straight to its
         // exit arm and dropping every remaining iteration.
         if let Some(value) = forwarded.or(from_shadow) {
-            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(value as usize)));
+            let pin = owner_root_if_gc(value as usize);
+            let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
+            banks.registers_r[color] = Some(live as i64);
         } else if opref.is_some_and(|value| value != OpRef::NONE) {
             s2dbg!("ref color={color} opref={opref:?} has no concrete");
             return false;
         }
     }
 
-    for color in 0..miframe.float_regs.len() {
+    for color in 0..banks.registers_f.len() {
         if skip_result == Some(('f', color)) {
             continue;
         }
-        if miframe.float_regs[color].is_some() {
+        if banks.registers_f[color].is_some() {
             continue;
         }
         let Some(opref) = registers_f.get(color) else {
@@ -2283,7 +2311,7 @@ fn fill_abort_miframe_register_banks(
             s2dbg!("float color={color} opref={opref:?} has no concrete");
             return false;
         };
-        miframe.float_regs[color] = Some(OpRef::const_float(value));
+        banks.registers_f[color] = Some(value.to_bits() as i64);
     }
     true
 }
@@ -2345,7 +2373,7 @@ fn build_parent_miframe<Sym: WalkSym>(
     parent: &InlineParentFrame,
     origin: &'static str,
     index: usize,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32) else {
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -2381,7 +2409,7 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
     pjc: &crate::pyjitcode::PyJitCode,
     origin: &'static str,
     index: usize,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     let Some(resume_pc) = parent.resume_marker_jit_pc else {
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -2400,7 +2428,8 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
         }
         return None;
     }
-    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    let miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     for (color, &boxed) in parent.boxes.iter().enumerate() {
         let Some(majit_ir::Value::Ref(gc)) = ctx.trace_ctx.concrete_of_opref(boxed) else {
             if fbw_debug_abort_enabled() {
@@ -2411,21 +2440,21 @@ fn build_codeless_continuation_parent<Sym: WalkSym>(
             }
             return None;
         };
-        if color >= miframe.ref_regs.len() {
+        if color >= banks.registers_r.len() {
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: continuation \
                      ref color {color} out of range (len {})",
-                    miframe.ref_regs.len()
+                    banks.registers_r.len()
                 );
             }
             return None;
         }
         let pin = owner_root_if_gc(gc.0);
         let live = pin.as_ref().map_or(gc, |p| p.get());
-        miframe.ref_regs[color] = Some(OpRef::const_ptr(live));
+        banks.registers_r[color] = Some(live.0 as i64);
     }
-    Some(miframe)
+    Some(AbortHandoffFrame { miframe, banks })
 }
 
 /// Whether the operator-tail resume image can be captured at all.
@@ -2515,6 +2544,7 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
         mirror_stack
     };
     let mut framestack = majit_metainterp::MIFrameStack::empty();
+    let mut banks = Vec::new();
     {
         let session = ctx.session.borrow();
         for (index, parent) in session
@@ -2523,68 +2553,88 @@ fn prepare_operator_tail_latch<Sym: WalkSym>(
             .flat_map(|inline| inline.parents.iter())
             .enumerate()
         {
-            let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
+            let Some(handoff) = build_parent_miframe(ctx, parent, origin, index) else {
                 latchdbg!("origin={origin} enclosing index={index}");
                 return None;
             };
-            framestack.push(miframe);
+            framestack.push(handoff.miframe);
+            banks.push(handoff.banks);
         }
     }
     let enclosing = framestack.frames.len();
     if let Some(caller) = caller {
-        let Some(caller_mf) = build_parent_miframe(ctx, caller, origin, enclosing) else {
+        let Some(handoff) = build_parent_miframe(ctx, caller, origin, enclosing) else {
             latchdbg!("origin={origin} caller");
             return None;
         };
-        framestack.push(caller_mf);
+        framestack.push(handoff.miframe);
+        banks.push(handoff.banks);
     }
-    let mut tail_parent = super::operator_continuation_parent_frame(tail, receiver)?;
-    if let Some(result) = result {
-        let stamped = match ctx.trace_ctx.concrete_of_opref(result) {
+    let tail_parent = super::operator_continuation_parent_frame(tail, receiver)?;
+    // r0 is the dunder result (`_setup_return_value_r`). Keep the live word
+    // on the abort banks; do not mint a ConstPtr into `boxes`. Format still
+    // carries the receiver in boxes[1], which `build_codeless` copies.
+    let mut result_pins = Vec::new();
+    let result_word = if let Some(result) = result {
+        Some(match ctx.trace_ctx.concrete_of_opref(result) {
             Some(majit_ir::Value::Ref(gc)) if gc != majit_ir::GcRef::NO_CONCRETE => {
                 let pin = owner_root_if_gc(gc.0);
-                let live = pin.as_ref().map_or(gc, |p| p.get());
-                OpRef::const_ptr(live)
+                let live = pin.as_ref().map_or(gc.0, |p| p.get().0);
+                result_pins.push(pin);
+                live as i64
             }
             Some(majit_ir::Value::Int(i)) => {
                 let boxed = pyre_object::w_int_new(i);
                 let pin = owner_root_if_gc(boxed as usize);
                 let live = pin.as_ref().map_or(boxed as usize, |p| p.get().0);
-                OpRef::const_ptr(majit_ir::GcRef(live))
+                result_pins.push(pin);
+                live as i64
             }
             _ => {
                 latchdbg!("origin={origin} result-concrete");
                 return None;
             }
-        };
-        // r0 is the dunder result. Format keeps the receiver in boxes[1].
-        tail_parent.boxes[0] = stamped;
-    }
+        })
+    } else {
+        None
+    };
     let pjc = crate::state::pyjitcode_for_jitcode_index(tail_parent.jitcode_index as i32)?;
     let tail_index = if caller.is_some() {
         enclosing + 1
     } else {
         enclosing
     };
-    let tail_mf = build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, tail_index)?;
-    framestack.push(tail_mf);
+    let mut tail_mf =
+        build_codeless_continuation_parent(ctx, &tail_parent, &pjc, origin, tail_index)?;
+    if let Some(word) = result_word {
+        let Some(slot) = tail_mf.banks.registers_r.get_mut(0) else {
+            latchdbg!("origin={origin} result-r0");
+            return None;
+        };
+        *slot = Some(word);
+    }
+    framestack.push(tail_mf.miframe);
+    banks.push(tail_mf.banks);
     // The preflight judges a stack that ends in a real frame below the
     // codeless tail. Without the caller the stack is not that shape yet;
     // `can_latch_operator_tail_return` runs it once the caller is built.
-    if caller.is_some() && !multi_frame_blackhole_preflight(ctx, &framestack, origin) {
+    if caller.is_some() && !multi_frame_blackhole_preflight(ctx, &framestack, &banks, origin) {
         return None;
     }
     let last_exc_value = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(value) => value as i64,
         _ => 0,
     };
-    Some(LatchedMultiFrameBlackhole {
+    let image = LatchedMultiFrameBlackhole {
         framestack,
+        banks,
         last_exc_value,
         raising_exception: false,
         mirror_stack: Some(mirror_stack),
         origin,
-    })
+    };
+    drop(result_pins);
+    Some(image)
 }
 
 fn copy_captured_parent_blackhole<Sym: WalkSym>(
@@ -2593,11 +2643,12 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
     concrete: &InlineParentBlackhole,
     origin: &'static str,
     index: usize,
-) -> Option<majit_metainterp::MIFrame> {
-    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
+) -> Option<AbortHandoffFrame> {
+    let miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), concrete.resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
     for &(color, value) in &concrete.int_values {
-        let bank_len = miframe.int_regs.len();
-        let Some(slot) = miframe.int_regs.get_mut(color) else {
+        let bank_len = banks.registers_i.len();
+        let Some(slot) = banks.registers_i.get_mut(color) else {
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: int color {color} \
@@ -2606,11 +2657,11 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
             }
             return None;
         };
-        *slot = Some(OpRef::const_int(value));
+        *slot = Some(value);
     }
     for &(color, value) in &concrete.ref_values {
-        let bank_len = miframe.ref_regs.len();
-        let Some(slot) = miframe.ref_regs.get_mut(color) else {
+        let bank_len = banks.registers_r.len();
+        let Some(slot) = banks.registers_r.get_mut(color) else {
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: ref color {color} \
@@ -2621,7 +2672,7 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
         };
         let pin = owner_root_if_gc(value as usize);
         let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
-        *slot = Some(OpRef::const_ptr(majit_ir::GcRef(live)));
+        *slot = Some(live as i64);
     }
     for &(color, opref) in &concrete.float_values {
         let Some(majit_ir::Value::Float(value)) = ctx.trace_ctx.concrete_of_opref(opref) else {
@@ -2633,8 +2684,8 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
             }
             return None;
         };
-        let bank_len = miframe.float_regs.len();
-        let Some(slot) = miframe.float_regs.get_mut(color) else {
+        let bank_len = banks.registers_f.len();
+        let Some(slot) = banks.registers_f.get_mut(color) else {
             if fbw_debug_abort_enabled() {
                 eprintln!(
                     "[s2-build-decline] origin={origin} frame {index}: float color {color} \
@@ -2643,9 +2694,9 @@ fn copy_captured_parent_blackhole<Sym: WalkSym>(
             }
             return None;
         };
-        *slot = Some(OpRef::const_float(value));
+        *slot = Some(value.to_bits() as i64);
     }
-    Some(miframe)
+    Some(AbortHandoffFrame { miframe, banks })
 }
 
 fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
@@ -2654,7 +2705,7 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
     pjc: &crate::pyjitcode::PyJitCode,
     origin: &'static str,
     index: usize,
-) -> Option<majit_metainterp::MIFrame> {
+) -> Option<AbortHandoffFrame> {
     let Some(resume_pc) = parent_resume_pc(parent, pjc) else {
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -2690,8 +2741,9 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
     let result = parent
         .call_jitcode_pc
         .and_then(|pc| parent_call_result_color(pjc, pc));
-    let mut miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
-    for color in 0..miframe.int_regs.len() {
+    let miframe = majit_metainterp::MIFrame::new(pjc.jitcode.clone(), resume_pc);
+    let mut banks = majit_metainterp::BlackholeAbortBanks::sized_for(&miframe);
+    for color in 0..banks.registers_i.len() {
         if result == Some(('i', color)) {
             continue;
         }
@@ -2710,9 +2762,9 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
             }
             return None;
         };
-        miframe.int_regs[color] = Some(OpRef::const_int(value));
+        banks.registers_i[color] = Some(value);
     }
-    for color in 0..miframe.ref_regs.len() {
+    for color in 0..banks.registers_r.len() {
         if result == Some(('r', color)) {
             continue;
         }
@@ -2744,7 +2796,7 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
         if let Some(value) = forwarded.or(from_shadow) {
             let pin = owner_root_if_gc(value as usize);
             let live = pin.as_ref().map_or(value as usize, |p| p.get().0);
-            miframe.ref_regs[color] = Some(OpRef::const_ptr(majit_ir::GcRef(live)));
+            banks.registers_r[color] = Some(live as i64);
         } else {
             if fbw_debug_abort_enabled() {
                 eprintln!(
@@ -2755,7 +2807,7 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
             return None;
         }
     }
-    for color in 0..miframe.float_regs.len() {
+    for color in 0..banks.registers_f.len() {
         if result == Some(('f', color)) {
             continue;
         }
@@ -2774,9 +2826,9 @@ fn build_parent_miframe_from_live_banks<Sym: WalkSym>(
             }
             return None;
         };
-        miframe.float_regs[color] = Some(OpRef::const_float(value));
+        banks.registers_f[color] = Some(value.to_bits() as i64);
     }
-    Some(miframe)
+    Some(AbortHandoffFrame { miframe, banks })
 }
 
 #[derive(Clone, Copy)]
@@ -2790,7 +2842,10 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     resume_pc: usize,
     innermost_build: InnermostMiframeBuild,
     origin: &'static str,
-) -> Option<majit_metainterp::MIFrameStack> {
+) -> Option<(
+    majit_metainterp::MIFrameStack,
+    Vec<majit_metainterp::BlackholeAbortBanks>,
+)> {
     macro_rules! s2dbg {
         ($($a:tt)*) => {
             if fbw_debug_abort_enabled() {
@@ -2810,6 +2865,7 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     }
     let session = ctx.session.borrow();
     let mut frames = majit_metainterp::MIFrameStack::empty();
+    let mut banks = Vec::new();
     if session.at_portal() {
         if !ctx.fbw_mode.transparent_helper_subwalk {
             s2dbg!(
@@ -2828,7 +2884,8 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
             s2dbg!("origin={origin} paused-portal declined");
             return None;
         };
-        frames.push(portal);
+        frames.push(portal.miframe);
+        banks.push(portal.banks);
     } else {
         for (index, parent) in session
             .framestack
@@ -2836,10 +2893,11 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
             .flat_map(|inline| inline.parents.iter())
             .enumerate()
         {
-            let Some(miframe) = build_parent_miframe(ctx, parent, origin, index) else {
+            let Some(handoff) = build_parent_miframe(ctx, parent, origin, index) else {
                 return None;
             };
-            frames.push(miframe);
+            frames.push(handoff.miframe);
+            banks.push(handoff.banks);
         }
         drop(session);
     }
@@ -2886,6 +2944,7 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
     let innermost = match innermost_build {
         InnermostMiframeBuild::LiveMarker(lastop_result) => {
             build_single_frame_miframe(ctx, innermost_jitcode, resume_pc, lastop_result)
+                .map(abort_handoff_from_minted)
         }
         InnermostMiframeBuild::TraceTooLong => {
             build_trace_too_long_single_frame_miframe(ctx, innermost_jitcode, resume_pc)
@@ -2895,12 +2954,13 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         s2dbg!("origin={origin} innermost build_single_frame_miframe declined");
         return None;
     };
-    frames.push(innermost);
+    frames.push(innermost.miframe);
+    banks.push(innermost.banks);
     s2built!(
         "origin={origin} BUILT multi-frame depth={}",
         frames.frames.len()
     );
-    Some(frames)
+    Some((frames, banks))
 }
 
 /// TLS cell pointer for the store-journal root area: the undo stays armed
@@ -6953,8 +7013,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                         (!sym.jitcode().is_null())
                             .then(|| (&(*sym.jitcode()).payload).jitcode.clone())
                     };
-                    if let Some(miframe) = jitcode.and_then(|jitcode| {
+                    if let Some(handoff) = jitcode.and_then(|jitcode| {
                         build_single_frame_miframe(ctx, jitcode, resume_pc, lastop_result)
+                            .map(abort_handoff_from_minted)
                     }) {
                         // `ctx` is the root walk on this arm
                         // (`framestack.is_empty() && !inline_subwalk`).  It
@@ -6967,14 +7028,15 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                             eprintln!(
                                 "[latch-accept] origin=escape-flush single-frame pc={} \
                                  jitcode={:?} index={:?}",
-                                miframe.pc,
-                                miframe.jitcode.name(),
-                                miframe.jitcode.try_index(),
+                                handoff.miframe.pc,
+                                handoff.miframe.jitcode.name(),
+                                handoff.miframe.jitcode.try_index(),
                             );
                         }
                         FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
                             *slot.borrow_mut() = Some(LatchedSingleFrameBlackhole {
-                                miframe,
+                                miframe: handoff.miframe,
+                                banks: handoff.banks,
                                 last_exc_value,
                                 raising_exception,
                                 mirror_stack,
@@ -7007,7 +7069,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 // `synth/getframe_while_escaping_read_frame_identity` is the
                 // regression guard.
                 } else if ctx.fbw_mode.inline_subwalk
-                    && let Some(framestack) = build_multi_frame_miframe(
+                    && let Some((framestack, banks)) = build_multi_frame_miframe(
                         ctx,
                         resume_pc,
                         InnermostMiframeBuild::LiveMarker(lastop_result),
@@ -7035,6 +7097,7 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
                         *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
                             framestack,
+                            banks,
                             last_exc_value,
                             raising_exception,
                             mirror_stack: capture_root_parent_resume_stack(ctx),

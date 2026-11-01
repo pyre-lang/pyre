@@ -10142,21 +10142,22 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
         }
     }
-    // The vable-force and trace-too-long MIFrame images survive the dispatch
-    // unwind in TLS. Their Option<i64> Ref banks are not otherwise visible to
-    // the collector, so forward every populated color until the walk-end
-    // handler takes the latch. The adopters bridge the pre-drive publication
-    // window and the blackhole drivers then install their own packed roots.
-    //
-    // A `MIFrame` stores each Ref register as the box itself. ConstPtr
-    // in `ref_regs` is a table index. The latch is the holder while
-    // `walk_active_trace_refs` cannot see the frame.
+    // The vable-force and trace-too-long abort images survive the dispatch
+    // unwind in TLS. FBW abort carries raw i64 ref words on `banks`; those
+    // are not ConstPtr indexes, so forward each live word in place until the
+    // walk-end handler takes the latch. Vable-escape still mints Const boxes
+    // onto the MIFrame and harvests them, so `trace_const_ptr` stays for that
+    // path. The adopters bridge the pre-drive publication window and the
+    // blackhole drivers then install their own packed roots.
     let single_frame_blackhole = unsafe { &mut *(*area.single_frame_blackhole).as_ptr() };
     if let Some(latched) = single_frame_blackhole.as_mut() {
-        // `ConstPtr` in `ref_regs` is a table index. This latch is the
-        // holder while `walk_active_trace_refs` cannot see the frame.
         for slot in latched.miframe.ref_regs.iter().flatten() {
             slot.trace_const_ptr(visitor);
+        }
+        for slot in latched.banks.registers_r.iter_mut().flatten() {
+            if *slot != 0 {
+                visitor(unsafe { &mut *(slot as *mut i64).cast() });
+            }
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
@@ -10176,9 +10177,15 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     let multi_frame_blackhole = unsafe { &mut *(*area.multi_frame_blackhole).as_ptr() };
     if let Some(latched) = multi_frame_blackhole.as_mut() {
         for frame in latched.framestack.frames.iter_mut() {
-            // Both halves, for the reason the single-frame arm gives.
             for slot in frame.ref_regs.iter().flatten() {
                 slot.trace_const_ptr(visitor);
+            }
+        }
+        for frame_banks in latched.banks.iter_mut() {
+            for slot in frame_banks.registers_r.iter_mut().flatten() {
+                if *slot != 0 {
+                    visitor(unsafe { &mut *(slot as *mut i64).cast() });
+                }
             }
         }
         if latched.last_exc_value != 0 {

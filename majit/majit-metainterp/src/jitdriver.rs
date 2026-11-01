@@ -222,20 +222,30 @@ pub fn drive_single_frame_blackhole(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
     mut last_exc_value: i64,
     raising_exception: bool,
+    mut abort_banks: Option<&mut crate::blackhole::BlackholeAbortBanks>,
 ) -> SingleFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "single-frame");
     // The MIFrame is handed here from a force-time TLS latch.  Publish its Ref
     // values before leasing/building the interpreter because first use of the
     // pooled builder may allocate.  Option<i64> is not a contiguous root area,
     // so keep an index-parallel packed root vector and copy forwarding updates
-    // back before copy_data_from_miframe reads the MIFrame.
-    let mut ref_roots: Vec<(usize, i64)> = (0..miframe.ref_regs.len())
-        .filter_map(|index| {
-            miframe
-                .ref_value_for_blackhole(index)
-                .map(|value| (index, value))
-        })
-        .collect();
+    // back into the abort banks (FBW) or ConstPtr table (MetaInterp freeze).
+    let mut ref_roots: Vec<(usize, i64)> = if let Some(banks) = abort_banks.as_ref() {
+        banks
+            .registers_r
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.map(|value| (index, value)))
+            .collect()
+    } else {
+        (0..miframe.ref_regs.len())
+            .filter_map(|index| {
+                miframe
+                    .ref_value_for_blackhole(index)
+                    .map(|value| (index, value))
+            })
+            .collect()
+    };
     let root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     let mut packed_ref_roots: Vec<i64> = ref_roots.iter().map(|(_, value)| *value).collect();
     // `MetaInterp.last_exc_value` is not necessarily present in an MIFrame
@@ -267,7 +277,11 @@ pub fn drive_single_frame_blackhole(
         builder.debug_assert_cpu(cpu);
         for ((index, value), forwarded) in ref_roots.iter_mut().zip(&packed_ref_roots) {
             *value = *forwarded;
-            miframe.set_forwarded_ref_value(*index, *forwarded);
+            if let Some(banks) = abort_banks.as_mut() {
+                banks.registers_r[*index] = Some(*forwarded);
+            } else {
+                miframe.set_forwarded_ref_value(*index, *forwarded);
+            }
         }
         if let Some(index) = exception_root {
             last_exc_value = packed_ref_roots[index];
@@ -279,7 +293,11 @@ pub fn drive_single_frame_blackhole(
         builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
         builder.acquire_interp()
     };
-    bh.copy_data_from_miframe(miframe);
+    if let Some(banks) = abort_banks.as_ref() {
+        bh.copy_data_from_abort_banks(miframe, banks);
+    } else {
+        bh.copy_data_from_miframe(miframe);
+    }
     bh.state_field_layout = state_field_layout;
     bh.virtualizable_info = virtualizable_info;
     bh.virtualizable_ptr = virtualizable_ptr;
@@ -405,15 +423,28 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
     per_frame: Option<&[(i64, usize)]>,
     on_enter_level: Option<&dyn Fn(i64)>,
     on_leave_level: Option<&dyn Fn(i64)>,
+    mut abort_banks: Option<&mut [crate::blackhole::BlackholeAbortBanks]>,
 ) -> MultiFrameBlackholeResult {
     bh_entry_stale_exc_report(last_exc_value, raising_exception, "multi-frame");
     let mut ref_locations = Vec::new();
     let mut packed_ref_roots = Vec::new();
-    for (frame_index, frame) in framestack.frames.iter().enumerate() {
-        for color in 0..frame.ref_regs.len() {
-            if let Some(value) = frame.ref_value_for_blackhole(color) {
-                ref_locations.push((frame_index, color));
-                packed_ref_roots.push(value);
+    if let Some(banks) = abort_banks.as_ref() {
+        debug_assert_eq!(banks.len(), framestack.frames.len());
+        for (frame_index, frame_banks) in banks.iter().enumerate() {
+            for (color, slot) in frame_banks.registers_r.iter().enumerate() {
+                if let Some(value) = *slot {
+                    ref_locations.push((frame_index, color));
+                    packed_ref_roots.push(value);
+                }
+            }
+        }
+    } else {
+        for (frame_index, frame) in framestack.frames.iter().enumerate() {
+            for color in 0..frame.ref_regs.len() {
+                if let Some(value) = frame.ref_value_for_blackhole(color) {
+                    ref_locations.push((frame_index, color));
+                    packed_ref_roots.push(value);
+                }
             }
         }
     }
@@ -433,11 +464,22 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
             metainterp_sd.op_catch_exception,
             metainterp_sd.op_rvmprof_code,
         );
-        for ((frame_index, color), forwarded) in ref_locations
-            .into_iter()
-            .zip(packed_ref_roots.iter().copied())
-        {
-            framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
+        if let Some(banks) = abort_banks.as_mut() {
+            for ((frame_index, color), forwarded) in ref_locations
+                .iter()
+                .copied()
+                .zip(packed_ref_roots.iter().copied())
+            {
+                banks[frame_index].registers_r[color] = Some(forwarded);
+            }
+        } else {
+            for ((frame_index, color), forwarded) in ref_locations
+                .iter()
+                .copied()
+                .zip(packed_ref_roots.iter().copied())
+            {
+                framestack.frames[frame_index].set_forwarded_ref_value(color, forwarded);
+            }
         }
         if let Some(index) = exception_root {
             last_exc_value = packed_ref_roots[index];
@@ -446,6 +488,7 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
         builder.setup_jitdrivers_sd(std::sync::Arc::clone(bh_jitdrivers_sd(metainterp_sd)));
     });
 
+    let abort_banks_shared = abort_banks.as_deref();
     let mut terminal = None;
     let outcome = crate::blackhole::convert_and_run_from_pyjitpl(
         builder,
@@ -460,6 +503,7 @@ pub fn drive_multi_frame_blackhole<P: crate::blackhole::BlackholeInterpPool>(
             per_frame,
             on_enter_level,
             on_leave_level,
+            abort_banks: abort_banks_shared,
         }),
         Some(&mut terminal),
     );
@@ -3378,6 +3422,7 @@ impl<S: JitState> JitDriver<S> {
             staticdata.as_ref(),
             last_exc_value,
             raising_exception,
+            None,
             None,
             None,
             None,
