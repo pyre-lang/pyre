@@ -5322,7 +5322,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
             .as_ref()
             .and_then(|meta| meta.as_fail_descr())
             .map(|fd| fd.adr_jump_offset())
-            .filter(|&addr| addr != 0);
+            .filter(|&addr| addr > crate::PENDING_NO_CELL);
         let addr = if let Some(addr) = from_list.or(preexisting.map(|addr| addr as u32)) {
             addr
         } else if *bridge_cells_base != 0 {

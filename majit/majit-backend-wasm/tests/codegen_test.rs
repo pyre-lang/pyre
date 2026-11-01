@@ -7668,6 +7668,8 @@ impl majit_ir::descr::FailDescr for HostFailDescr {
     fn fail_arg_types(&self) -> &[Type] {
         &self.arg_types
     }
+
+    fn set_adr_jump_offset(&self, _offset: usize) {}
 }
 
 /// A two-input loop whose single LABEL sits at the entry, so
