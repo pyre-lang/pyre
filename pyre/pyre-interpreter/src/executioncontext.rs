@@ -3111,6 +3111,61 @@ pub extern "C" fn space_decrement_ticker_jit_abi(ec: *mut ExecutionContext, by: 
     space_decrement_ticker(ec, by as isize) as i64
 }
 
+/// One-word C-ABI entry for [`ExecutionContext::bytecode_only_trace`].
+///
+/// `call.py CallControl.get_jitcode` stores `getfunctionptr(graph)` as
+/// `JitCode.fnaddr`. The source graph is a Rust `Result` method; blackhole
+/// `bhimpl_inline_call_*` calls the one-word Ref ABI
+/// (`get_jitcode_calldescr`: two Ref args, Ref result — the live frame).
+/// `Err` publishes through [`crate::runtime_ops::jit_publish_residual_error_ref`].
+#[inline(never)]
+pub extern "C" fn bytecode_only_trace_jit_abi(
+    ec: *mut ExecutionContext,
+    frame: *mut PyFrame,
+) -> i64 {
+    majit_ir::icf_identity!("executioncontext::bytecode_only_trace_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::bytecode_only_trace(ec, frame) {
+        Ok(frame) => frame as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as i64,
+    }
+}
+
+/// One-word C-ABI entry for [`ExecutionContext::call_trace`].
+///
+/// Same `getfunctionptr` / `bhimpl_inline_call_*` pairing as
+/// [`bytecode_only_trace_jit_abi`]. `Result<(), PyError>` lowers to void
+/// (`get_jitcode_calldescr` FUNC.RESULT); the ignored word is 0, and `Err`
+/// publishes through [`crate::runtime_ops::jit_publish_residual_error`].
+#[inline(never)]
+pub extern "C" fn call_trace_jit_abi(ec: *mut ExecutionContext, frame: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("executioncontext::call_trace_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::call_trace(ec, frame) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+/// One-word C-ABI entry for [`ExecutionContext::run_trace_func`].
+///
+/// Same void-result pairing as [`call_trace_jit_abi`].
+#[inline(never)]
+pub extern "C" fn run_trace_func_jit_abi(ec: *mut ExecutionContext, frame: *mut PyFrame) -> i64 {
+    majit_ir::icf_identity!("executioncontext::run_trace_func_jit_abi");
+    // SAFETY: the residual's first slot is the execution context the walked
+    // graph read it from; it outlives the call.
+    let ec = unsafe { &mut *ec };
+    match ExecutionContext::run_trace_func(ec, frame) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
 pub struct AsyncAction {
     pub space: PyObjectRef,
     _action_index: isize,

@@ -5235,6 +5235,44 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::eval::frame_anchor_release",
         crate::eval::frame_anchor_release_jit_abi,
     );
+    // `call.py CallControl.get_jitcode` stores `getfunctionptr(graph)` as
+    // `JitCode.fnaddr`. These three look-inside graphs are Rust `Result`
+    // methods; blackhole `bhimpl_inline_call_*` calls the word ABI.
+    // Bind the origin reloc keys the shells already carry, plus the
+    // crate-qualified aliases `runtime_fnaddr_by_path` exact-matches.
+    cpa2!(
+        &mut entries,
+        "executioncontext::ExecutionContext::bytecode_only_trace",
+        "pyre_interpreter::executioncontext::ExecutionContext::bytecode_only_trace",
+        crate::executioncontext::bytecode_only_trace_jit_abi,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::ExecutionContext::bytecode_only_trace",
+        crate::executioncontext::bytecode_only_trace_jit_abi,
+    );
+    cpa2!(
+        &mut entries,
+        "executioncontext::ExecutionContext::call_trace",
+        "pyre_interpreter::executioncontext::ExecutionContext::call_trace",
+        crate::executioncontext::call_trace_jit_abi,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::ExecutionContext::call_trace",
+        crate::executioncontext::call_trace_jit_abi,
+    );
+    cpa2!(
+        &mut entries,
+        "executioncontext::ExecutionContext::run_trace_func",
+        "pyre_interpreter::executioncontext::ExecutionContext::run_trace_func",
+        crate::executioncontext::run_trace_func_jit_abi,
+    );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::ExecutionContext::run_trace_func",
+        crate::executioncontext::run_trace_func_jit_abi,
+    );
     pa1!(
         &mut entries,
         "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
@@ -7662,6 +7700,83 @@ mod tests {
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+        }
+
+        let bytecode_only_trace_shim =
+            crate::executioncontext::bytecode_only_trace_jit_abi as *const () as usize as i64;
+        let call_trace_shim =
+            crate::executioncontext::call_trace_jit_abi as *const () as usize as i64;
+        let run_trace_func_shim =
+            crate::executioncontext::run_trace_func_jit_abi as *const () as usize as i64;
+        let bytecode_only_trace_raw: fn(
+            &mut crate::executioncontext::ExecutionContext,
+            *mut crate::PyFrame,
+        ) -> Result<*mut crate::PyFrame, crate::PyError> =
+            crate::executioncontext::ExecutionContext::bytecode_only_trace;
+        let call_trace_raw: fn(
+            &mut crate::executioncontext::ExecutionContext,
+            *mut crate::PyFrame,
+        ) -> Result<(), crate::PyError> = crate::executioncontext::ExecutionContext::call_trace;
+        let run_trace_func_raw: fn(
+            &mut crate::executioncontext::ExecutionContext,
+            *mut crate::PyFrame,
+        ) -> Result<(), crate::PyError> = crate::executioncontext::ExecutionContext::run_trace_func;
+        let bytecode_only_trace_raw = bytecode_only_trace_raw as *const () as usize as i64;
+        let call_trace_raw = call_trace_raw as *const () as usize as i64;
+        let run_trace_func_raw = run_trace_func_raw as *const () as usize as i64;
+        for (path, expected, raw) in [
+            (
+                "executioncontext::ExecutionContext::bytecode_only_trace",
+                bytecode_only_trace_shim,
+                bytecode_only_trace_raw,
+            ),
+            (
+                "pyre_interpreter::executioncontext::ExecutionContext::bytecode_only_trace",
+                bytecode_only_trace_shim,
+                bytecode_only_trace_raw,
+            ),
+            (
+                "pyre_interpreter::ExecutionContext::bytecode_only_trace",
+                bytecode_only_trace_shim,
+                bytecode_only_trace_raw,
+            ),
+            (
+                "executioncontext::ExecutionContext::call_trace",
+                call_trace_shim,
+                call_trace_raw,
+            ),
+            (
+                "pyre_interpreter::executioncontext::ExecutionContext::call_trace",
+                call_trace_shim,
+                call_trace_raw,
+            ),
+            (
+                "pyre_interpreter::ExecutionContext::call_trace",
+                call_trace_shim,
+                call_trace_raw,
+            ),
+            (
+                "executioncontext::ExecutionContext::run_trace_func",
+                run_trace_func_shim,
+                run_trace_func_raw,
+            ),
+            (
+                "pyre_interpreter::executioncontext::ExecutionContext::run_trace_func",
+                run_trace_func_shim,
+                run_trace_func_raw,
+            ),
+            (
+                "pyre_interpreter::ExecutionContext::run_trace_func",
+                run_trace_func_shim,
+                run_trace_func_raw,
+            ),
+        ] {
+            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+            assert_ne!(
+                bindings.get(path).copied(),
+                Some(raw),
+                "{path} must not publish the raw Result method"
+            );
         }
     }
 
