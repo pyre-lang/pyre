@@ -1019,6 +1019,38 @@ fn long_rshift_erases_the_closure_capture_bracket() {
     }
 }
 
+/// `__majit_wrap_dict_descr_keys` pins an incoming `&[PyObjectRef]` then
+/// a later `pin_root`. Scalar replacement answers `get(base)` from the
+/// list and `get(len)` from the extra slot so the codewriter never sees
+/// the bracket (`gctransform` `push_roots` runs after `make_jitcodes`).
+#[test]
+fn dict_descr_keys_erases_the_incoming_slice_bracket() {
+    if !std::path::Path::new(OBJECT_LLBC).is_file()
+        || !std::path::Path::new(INTERPRETER_LLBC).is_file()
+    {
+        eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
+        return;
+    }
+    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
+    let touching = majit_translate::front::mir::harvest_root_stack_touching_paths(&object);
+    interpreter.set_root_stack_effects(vec![object.crate_name().to_string()], touching);
+    let context = LowerContext::new(&interpreter);
+    let graph = lower_fun(&interpreter, &context, "__majit_wrap_dict_descr_keys");
+    for leaf in [
+        "push_roots",
+        "pin_roots",
+        "shadow_stack_get",
+        "root_scope_close",
+    ] {
+        assert_eq!(
+            calls_to(&graph, leaf),
+            0,
+            "__majit_wrap_dict_descr_keys still calls {leaf} after the incoming-slice bracket was erased"
+        );
+    }
+}
+
 /// `__majit_wrap_cdata_call` pins the incoming `&[PyObjectRef]` and copies
 /// the tail through `shadow_stack_copy_range`. Production harvests
 /// pyre-object's root-stack effects before lowering pyre-module, the same
