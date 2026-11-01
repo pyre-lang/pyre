@@ -5349,13 +5349,18 @@ pub(crate) fn fuse_boxing_alloc_with(
                 if !lifetime.vars.contains(b) || field.name.as_str() != field_name {
                     continue;
                 }
+                // A store is this creation's only when its base may alias
+                // this creation (`BaseMallocRemover.flowin`).
+                let mut roots = Vec::new();
+                if !store_roots(graph, b, &mut roots) {
+                    return None;
+                }
+                if !roots.contains(&queried) {
+                    continue;
+                }
                 if block_idx == definition.0 && op_idx <= definition.1 {
                     continue;
                 }
-                // A store on a sibling creation (another incoming of a phi)
-                // is in the `compute_lifetimes` union but is not a write of
-                // this producer; `store_roots` lists those producers and
-                // requires them to agree.
                 if !reaches_avoiding_barriers(graph, definition, (block_idx, op_idx), &[]) {
                     continue;
                 }
@@ -5601,67 +5606,75 @@ pub(crate) fn fuse_boxing_alloc_with(
     /// Resolve `var` to producer variables through `Block.inputargs` phis
     /// and `IDENTITY_OPS` (`compute_lifetimes` unions both). Stores name
     /// producers rather than phis, and every incoming root must later agree.
-    /// `depth` terminates loop-carried phis. Upstream records the same
-    /// relation by unioning link args with inputargs in
-    /// `rpython/translator/backendopt/malloc.py:169`; this local pass recovers
-    /// those endpoints on demand.
-    fn store_roots(
-        graph: &FunctionGraph,
-        var: &Variable,
-        depth: u32,
-        out: &mut Vec<Variable>,
-    ) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        if let Some(op) = graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .find(|o| o.result.as_ref() == Some(var))
-        {
-            if let Some(operand) = identity_operand(&op.kind) {
-                return store_roots(graph, operand, depth.saturating_sub(1), out);
+    /// `BaseMallocRemover.compute_lifetimes` records the same relation in a
+    /// `UnionFind(LifeTime)`: `union` over `IDENTITY_OPS` operands and over
+    /// each link's `args` / `target.inputargs`. A cycle is visited once
+    /// (the union is idempotent); this local pass recovers those endpoints
+    /// on demand.
+    fn store_roots(graph: &FunctionGraph, var: &Variable, out: &mut Vec<Variable>) -> bool {
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+        )]
+        fn visit(
+            graph: &FunctionGraph,
+            var: &Variable,
+            visited: &mut HashSet<Variable>,
+            out: &mut Vec<Variable>,
+        ) -> bool {
+            if !visited.insert(var.clone()) {
+                return true;
             }
-            out.push(var.clone());
-            return true;
-        }
-        let Some((target_id, slot)) = graph.blocks.iter().find_map(|b| {
-            b.inputargs
+            if let Some(op) = graph
+                .blocks
                 .iter()
-                .position(|arg| arg == var)
-                .map(|slot| (b.id, slot))
-        }) else {
-            return false;
-        };
-        for block in &graph.blocks {
-            for link in &block.exits {
-                if link.target != target_id {
-                    continue;
+                .flat_map(|b| &b.operations)
+                .find(|o| o.result.as_ref() == Some(var))
+            {
+                if let Some(operand) = identity_operand(&op.kind) {
+                    return visit(graph, operand, visited, out);
                 }
-                // A link whose arity does not cover the slot is a malformed
-                // edge; refuse rather than read past it.
-                let Some(arg) = link.args.get(slot).and_then(LinkArg::as_variable) else {
-                    return false;
-                };
-                if !store_roots(graph, arg, depth - 1, out) {
-                    return false;
+                out.push(var.clone());
+                return true;
+            }
+            let Some((target_id, slot)) = graph.blocks.iter().find_map(|b| {
+                b.inputargs
+                    .iter()
+                    .position(|arg| arg == var)
+                    .map(|slot| (b.id, slot))
+            }) else {
+                return false;
+            };
+            for block in &graph.blocks {
+                for link in &block.exits {
+                    if link.target != target_id {
+                        continue;
+                    }
+                    // A link whose arity does not cover the slot is a malformed
+                    // edge; refuse rather than read past it.
+                    let Some(arg) = link.args.get(slot).and_then(LinkArg::as_variable) else {
+                        return false;
+                    };
+                    if !visit(graph, arg, visited, out) {
+                        return false;
+                    }
                 }
             }
+            !out.is_empty()
         }
-        !out.is_empty()
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+        )]
+        let mut visited = HashSet::new();
+        visit(graph, var, &mut visited, out)
     }
-    fn refers_to_alloc(
-        graph: &FunctionGraph,
-        var: &Variable,
-        alloc: &Variable,
-        depth: u32,
-    ) -> bool {
+    fn refers_to_alloc(graph: &FunctionGraph, var: &Variable, alloc: &Variable) -> bool {
         if var == alloc {
             return true;
         }
         let mut roots = Vec::new();
-        store_roots(graph, var, depth, &mut roots)
+        store_roots(graph, var, &mut roots)
             && !roots.is_empty()
             && roots.iter().all(|root| root == alloc)
     }
@@ -5685,7 +5698,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 let Some(dest) = args[0].as_variable() else {
                     continue;
                 };
-                if !refers_to_alloc(graph, dest, alloc, 8) {
+                if !refers_to_alloc(graph, dest, alloc) {
                     continue;
                 }
                 let Some(value) = args[1].as_variable() else {
@@ -5722,7 +5735,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 let Some(value) = args[1].as_variable() else {
                     continue;
                 };
-                if refers_to_alloc(graph, value, alloc, 8) {
+                if refers_to_alloc(graph, value, alloc) {
                     found.push((bi, oi));
                 }
             }
@@ -5747,7 +5760,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 let Some(operand) = args[0].as_variable() else {
                     continue;
                 };
-                if !refers_to_alloc(graph, operand, alloc, 8) {
+                if !refers_to_alloc(graph, operand, alloc) {
                     continue;
                 }
                 let Some(result) = op.result.clone() else {
@@ -5928,7 +5941,7 @@ pub(crate) fn fuse_boxing_alloc_with(
             };
             let (parent, parent_locations) = parent;
             let mut roots = Vec::new();
-            if !store_roots(graph, &parent, 8, &mut roots) {
+            if !store_roots(graph, &parent, &mut roots) {
                 return own();
             }
             let Some((root, others)) = roots.split_first() else {
@@ -6045,7 +6058,7 @@ pub(crate) fn fuse_boxing_alloc_with(
         };
         let header_locations = store.locations;
         let mut roots = Vec::new();
-        if !store_roots(graph, &header, 8, &mut roots) {
+        if !store_roots(graph, &header, &mut roots) {
             crate::decline::record(
                 VTABLE_GATE,
                 "header-roots-unresolvable",
@@ -6428,7 +6441,7 @@ pub(crate) fn fuse_boxing_alloc_with(
             // variable a `core::ptr::write` arm stores, which is what
             // `sink_fused_boxing_aggregates_at_raw_writes` matches on.
             let mut agg_roots = Vec::new();
-            if !store_roots(graph, &agg_operand, 8, &mut agg_roots) {
+            if !store_roots(graph, &agg_operand, &mut agg_roots) {
                 crate::decline::record(
                     FUSE_GATE,
                     "aggregate-roots-unresolvable",
@@ -15792,6 +15805,251 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_long_identity_chain_still_fuses() {
+        // Ten `same_as` hops between the creation and the `FieldWrite` base.
+        // `store_roots` used to refuse at depth 8; `compute_lifetimes` unions
+        // the whole `IDENTITY_OPS` chain with no budget.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let mut base = agg;
+        for _ in 0..10 {
+            base = graph
+                .push_op_var(
+                    entry,
+                    OpKind::UnaryOp {
+                        op: "same_as".into(),
+                        operand: base,
+                        result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+        }
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&base, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&base, "floatval", LinkArg::Value(payload.clone())),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![base.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "a long IDENTITY_OPS chain must still fuse"
+        );
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ..
+            } => {
+                assert_eq!(base, &ret);
+                assert_eq!(field.name, "floatval");
+                assert_eq!(value, &payload);
+            }
+            other => panic!("expected floatval FieldWrite, got {other:?}"),
+        }
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must not survive"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_loop_carried_phi_resolves() {
+        // The creation flows through a loop header phi; a back edge feeds
+        // the phi with itself. `BaseMallocRemover.compute_lifetimes` unions
+        // that cycle once; fusion must match the non-loop case.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let (header_block, header_args) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(entry, header_block, vec![agg]);
+        let phi = header_args[0].clone();
+        let cond = graph
+            .push_op_var(header_block, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (body, body_args) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(header_block).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            header_block,
+            vec![
+                Link::from_variables(
+                    &graph,
+                    vec![phi.clone()],
+                    header_block,
+                    Some(ExitCase::Bool(true)),
+                ),
+                Link::from_variables(&graph, vec![phi.clone()], body, Some(ExitCase::Bool(false))),
+            ],
+        );
+        let carried = body_args[0].clone();
+        let payload = graph
+            .push_op_var(body, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, body, FLOAT_TYPE_ADDR);
+        let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: Some("W_FloatObject".into()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
+                scalar_word: None,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        graph.push_op_var(body, field(&carried, "ob_header", &header), false);
+        graph.push_op_var(body, field(&carried, "floatval", &payload), false);
+        let ret = graph
+            .push_op_var(
+                body,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![carried.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(body, Some(ret.clone()));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "a loop-carried phi must still fuse"
+        );
+        let ops = &graph.block(body).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ..
+            } => {
+                assert_eq!(base, &ret);
+                assert_eq!(field.name, "floatval");
+                assert_eq!(value, &payload);
+            }
+            other => panic!("expected floatval FieldWrite, got {other:?}"),
+        }
+        assert_eq!(stamped_vtables(&graph), vec![FLOAT_TYPE_ADDR]);
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must not survive"
+        );
+    }
+
+    #[test]
     fn fuse_boxing_alloc_resolves_a_header_that_crosses_a_link() {
         // The header reaches malloc as a phi while its stores remain on the
         // producer variable. Resolve that producer first, and require all
@@ -15992,6 +16250,186 @@ mod tests {
                 "{shape}: malloc_typed residual must survive exactly when the cluster declines"
             );
         }
+    }
+
+    /// `h1` then `h2` in one block, then `x = phi(h1, h2)`.
+    /// `compute_lifetimes` unions the two creations; `BaseMallocRemover.flowin`
+    /// still starts a flattened field map at each creation and updates it
+    /// only from setfields whose base aliases that creation.
+    fn sequential_headers_merged_into_phi(phi_store_addr: Option<i64>) -> FunctionGraph {
+        type Var = crate::flowspace::model::Variable;
+        const A: i64 = 4357049520;
+        const B: i64 = 4357049600;
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let h1 = push_boxing_header(&mut graph, entry, A);
+        let h2 = push_boxing_header(&mut graph, entry, B);
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (join, join_args) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::from_variables(&graph, vec![h1], join, Some(ExitCase::Bool(true))),
+                Link::from_variables(&graph, vec![h2], join, Some(ExitCase::Bool(false))),
+            ],
+        );
+        let x = join_args[0].clone();
+        if let Some(addr) = phi_store_addr {
+            let ob_type = graph
+                .push_op_var(join, OpKind::ConstRefAddr(addr), true)
+                .unwrap();
+            let instantiate_arg = graph
+                .push_op_var(join, OpKind::ConstRefAddr(addr), true)
+                .unwrap();
+            let w_class = graph
+                .push_op_var(
+                    join,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec![
+                                "runtime_object".into(),
+                                "object_model".into(),
+                                "get_instantiate".into(),
+                            ],
+                            fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
+                        },
+                        args: crate::model::call_args(vec![instantiate_arg]),
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_op_var(join, field(&x, "ob_type", "PyObject", &ob_type), false);
+            graph.push_op_var(join, field(&x, "w_class", "PyObject", &w_class), false);
+        }
+        let payload = graph
+            .push_op_var(join, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let agg = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(join, field(&agg, "ob_header", "W_FloatObject", &x), false);
+        graph.push_op_var(
+            join,
+            field(&agg, "floatval", "W_FloatObject", &payload),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(join, Some(ret));
+        graph
+    }
+
+    fn stamped_vtables(graph: &FunctionGraph) -> Vec<i64> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::NewWithVtable { vtable, .. } => Some(*vtable),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_sequential_headers_do_not_share_stores() {
+        // h1 = header A; h2 = header B; x = phi(h1, h2); malloc uses x.
+        // Reachability from h1's definition still sees h2's store, but
+        // `BaseMallocRemover.flowin` does not treat that store as h1's.
+        // Each root keeps its own type, so the plan declines rather than
+        // stamping B on both.
+        const A: i64 = 4357049520;
+        const B: i64 = 4357049600;
+        let mut graph = sequential_headers_merged_into_phi(None);
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
+        let vtables = stamped_vtables(&graph);
+        assert!(
+            vtables.is_empty() || (vtables.contains(&A) && vtables.contains(&B)),
+            "A root must resolve to A and B root to B, or the plan declines; \
+             never stamp B on both. fused={fused} vtables={vtables:?}"
+        );
+        assert!(
+            !vtables.iter().all(|&v| v == B) || vtables.is_empty(),
+            "must never resolve both incoming roots to B; vtables={vtables:?}"
+        );
+        if fused == 0 {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                            if segments.last().map(String::as_str) == Some("malloc_typed")
+                    )
+                }),
+                "declining plan must leave malloc_typed residual"
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_phi_store_after_merge_is_seen_by_both_roots() {
+        // A setfield on the phi after the merge aliases both creations
+        // (`BaseMallocRemover.flowin`) and kills each root's earlier store
+        // on that path. Both roots must see C.
+        const C: i64 = 4357049680;
+        let mut graph = sequential_headers_merged_into_phi(Some(C));
+        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
+        let vtables = stamped_vtables(&graph);
+        assert_eq!(fused, 1, "a store on the phi must be visible to both roots");
+        assert_eq!(
+            vtables,
+            vec![C],
+            "both roots must resolve to the phi store, not a sibling creation"
+        );
     }
 
     #[test]
