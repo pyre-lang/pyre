@@ -11474,6 +11474,8 @@ impl<S: JitState> JitDriver<S> {
                         virtual_count,
                         S::mint_bridge_array_descr,
                         &all_virtuals,
+                        frontend_fail_values,
+                        &retrace.fail_types,
                     )
                 }
             };

@@ -15973,6 +15973,8 @@ mod tests {
             virtuals.len(),
             crate::descr::make_array_descr,
             &[Some(direct_object)],
+            &[],
+            &[],
         );
         <PyreJitState as majit_metainterp::JitState>::prepare_bridge_resume(
             &mut sym,
