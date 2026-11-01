@@ -6198,11 +6198,10 @@ fn lltype_for_named_ref(
 /// - `Ref(None)` is `llmemory.GCREF` (`Ptr(Opaque)`).
 ///
 /// One equally erased scalar shape is admitted, but only at the producer
-/// which proves it: `front::option_closure_select` replaces
-/// `Option::unwrap_or_else` with the direct discriminant diamond RPython's
-/// closure-free source would have built and synthesizes a closure
-/// `call_once` in the `None` arm, and `front::iter_adapter` synthesizes
-/// `call_mut` for `map(...).collect()`.  Charon retains the concrete
+/// which proves it: the extracted `core::option::<Impl>::unwrap_or_else`
+/// body matches on the receiver and calls the `None`-arm closure as `f()`,
+/// and `front::iter_adapter` synthesizes `call_mut` for
+/// `map(...).collect()`.  Charon retains the concrete
 /// `FnOnce::Output` / `FnMut::Output` as that op's `result_ty` but does not
 /// monomorphize it into the registered closure method, so the real rtyper
 /// can default the live result to `Void`.  For that synthesized closure

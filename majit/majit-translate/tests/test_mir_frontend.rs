@@ -21,10 +21,9 @@ fn load_corpus() -> &'static Llbc {
     LLBC.get_or_init(|| Llbc::load(CORPUS).expect("load corpus.ullbc"))
 }
 
-/// BFS the set of blocks reachable from the graph's startblock. The
-/// `bool_then` / `option_question_mark` rewrites can leave the pre-split
-/// framestate merge block unreachable, so the reachable-only assertions
-/// filter against this set.
+/// BFS the set of blocks reachable from the graph's startblock. Count
+/// assertions walk this set so leftover merge blocks after a combinator
+/// body is extracted do not inflate the totals.
 fn reachable_blocks(
     graph: &majit_translate::model::FunctionGraph,
 ) -> std::collections::HashSet<majit_translate::model::BlockId> {
@@ -906,11 +905,12 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
     );
 }
 
-/// `bool::then_some` stays an ordinary call to the extracted core body;
-/// the Some/None diamond lives in that graph. `bool::then` still rewrites
-/// at the caller: its closure `call_once` is not a function-item unpack.
+/// `bool::then` / `bool::then_some` stay ordinary calls of the extracted
+/// core bodies (`if self { Some(f()) } else { None }` /
+/// `if self { Some(t) } else { None }`). The Some/None diamond and
+/// `then`'s `FnOnce::call_once` live in those graphs, not in the caller.
 #[test]
-fn bool_then_lifts_to_short_circuit_diamond() {
+fn bool_then_keeps_regular_call_to_core_body() {
     use majit_translate::front::mir::{LowerContext, lower_fun_decl};
     use majit_translate::model::{CallTarget, ExitSwitch, FunctionGraph, OpKind};
 
@@ -980,20 +980,22 @@ fn bool_then_lifts_to_short_circuit_diamond() {
     let llbc = load_corpus();
 
     let then_graph = lower_function(llbc, "bool_then_closure").expect("lowering");
-    let (call_once, bool_branches, _some_ctor, _none_ctor) = diamond_counts(&then_graph);
+    let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&then_graph);
     assert_eq!(
         residual_bool_calls(&then_graph, "then"),
-        0,
-        "then: the caller rewrite consumes the residual call"
+        1,
+        "then: caller keeps a regular call to the core body"
     );
-    assert!(
-        call_once >= 1,
-        "then: the rewrite arm invokes the closure (call_once={call_once})"
+    assert_eq!(
+        call_once, 0,
+        "then: call_once lives in the core body, not the caller (call_once={call_once})"
     );
-    assert!(
-        bool_branches >= 1,
-        "then: the caller hosts the short-circuit branch (branches={bool_branches})"
+    assert_eq!(
+        bool_branches, 0,
+        "then: the caller does not host the Some/None diamond (branches={bool_branches})"
     );
+    assert_eq!(some_ctor, 0, "then: Some is built in the core body");
+    assert_eq!(none_ctor, 0, "then: None is built in the core body");
 
     let some_graph = lower_function(llbc, "bool_then_some").expect("lowering");
     let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&some_graph);
@@ -1010,138 +1012,169 @@ fn bool_then_lifts_to_short_circuit_diamond() {
     assert_eq!(some_ctor, 0, "then_some: Some is built in the core body");
     assert_eq!(none_ctor, 0, "then_some: None is built in the core body");
 
-    let mut lowered_core_bodies = 0usize;
-    for artefact in [llbc, load_llbc(INTERPRETER_LLBC)] {
-        let ctx = LowerContext::new(artefact);
-        for fd in artefact.iter_fun_decls() {
-            if !fd.has_unstructured_body() {
-                continue;
-            }
-            let path = fd.item_meta.name_path();
-            if !path.ends_with("::bool::<Impl>::then_some") {
-                continue;
-            }
-            let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
-            let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let ctx = LowerContext::new(interpreter);
+    let mut lowered_then = 0usize;
+    let mut lowered_then_some = 0usize;
+    for fd in interpreter.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let path = fd.item_meta.name_path();
+        let is_then = path.ends_with("::bool::<Impl>::then");
+        let is_then_some = path.ends_with("::bool::<Impl>::then_some");
+        if !is_then && !is_then_some {
+            continue;
+        }
+        let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+        let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
+        assert!(
+            bool_branches >= 1,
+            "{path}: core body branches on self (call_once={call_once}, \
+             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+        );
+        assert!(
+            some_ctor >= 1,
+            "{path}: then arm builds Some (call_once={call_once}, \
+             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+        );
+        assert!(
+            none_ctor >= 1,
+            "{path}: else arm builds None (call_once={call_once}, \
+             branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+        );
+        if is_then {
             assert!(
-                bool_branches >= 1,
-                "{path}: core body branches on self (call_once={call_once}, \
+                call_once >= 1,
+                "{path}: then arm invokes f() as call_once (call_once={call_once}, \
                  branches={bool_branches}, some={some_ctor}, none={none_ctor})"
             );
-            assert!(
-                some_ctor >= 1,
-                "{path}: then arm builds Some (call_once={call_once}, \
-                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-            );
-            assert!(
-                none_ctor >= 1,
-                "{path}: else arm builds None (call_once={call_once}, \
-                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
-            );
+            lowered_then += 1;
+        } else {
             assert_eq!(
                 call_once, 0,
                 "{path}: then_some wraps the value, no call_once"
             );
-            lowered_core_bodies += 1;
+            lowered_then_some += 1;
         }
     }
-    let _ = lowered_core_bodies;
+    assert_eq!(
+        lowered_then, 1,
+        "extracted then FunDecl bodies must lower, got {lowered_then}"
+    );
+    assert_eq!(
+        lowered_then_some, 1,
+        "extracted then_some FunDecl bodies must lower, got {lowered_then_some}"
+    );
 }
 
-/// `option_question_mark`'s `let v = opt?` lifts the residual
-/// `Try::branch(opt)` / `ControlFlow` diamond into a direct switch on
-/// `opt.__discriminant`: `Some` extracts `opt.__pos_0` and continues,
-/// `None` builds a normal `None` return value.
-///
-/// The owners are the per-instantiation `Option<i64>` root, not the bare
-/// template: the fixture's own `Some(v + addend)` writes `__pos_0` under the
-/// suffixed root, so a bare read would take the payload off a different
-/// classdef than the one the producer wrote.
+/// `option_question_mark`'s `let v = opt?` is a regular call of
+/// `core::option::<Impl>::branch`, a switch on the ControlFlow
+/// discriminant, and a regular `from_residual` on the Break arm.
+/// The caller-side rewrite that used to consume residual `branch`
+/// (Method count 0, one Option disc switch, a None ctor) is gone:
+/// those counts move into the extracted helper graphs.
 #[test]
 fn option_question_mark_lifts_to_direct_option_switch() {
-    use majit_translate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
-    const OPTION_ROOT: &str = "core::option::Option<i64>";
-    const SOME_ROOT: &str = "core::option::Option<i64>::Some";
+    use majit_translate::model::{CallTarget, ExitSwitch, FieldDescriptor, OpKind};
     let llbc = load_corpus();
     let graph = lower_function(llbc, "option_question_mark").expect("lowering");
 
     let reachable = reachable_blocks(&graph);
-
-    let mut residual_branch = 0usize;
-    let mut direct_option_switch = 0usize;
-    let mut some_payload_reads = 0usize;
-    let mut none_ctor = 0usize;
+    let mut branch_calls = 0usize;
+    let mut from_residual_calls = 0usize;
+    let mut cf_disc_switches = 0usize;
     for b in &graph.blocks {
         if !reachable.contains(&b.id) {
             continue;
         }
-        let mut last_disc: Option<i64> = None;
-        let mut option_disc_read = None;
         for op in &b.operations {
             match &op.kind {
                 OpKind::Call {
-                    target: CallTarget::Method { name, .. },
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root,
+                            ..
+                        },
                     ..
-                } if name == "branch" => residual_branch += 1,
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some(OPTION_ROOT) =>
+                } if name == "branch"
+                    && receiver_root.as_deref().is_some_and(|root| {
+                        majit_ir::descr::strip_instantiation_suffix(
+                            majit_ir::descr::class_root_leaf(root),
+                        ) == "Option"
+                    }) =>
                 {
-                    option_disc_read = op.result.clone();
+                    branch_calls += 1;
                 }
-                OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref() == Some(SOME_ROOT) =>
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("branch")
+                    && segments.iter().any(|s| s == "option") =>
                 {
-                    some_payload_reads += 1;
+                    branch_calls += 1;
                 }
-                OpKind::ConstInt(d) => last_disc = Some(*d),
-                OpKind::FieldWrite { field, .. }
-                    if field.name == "__discriminant"
-                        && field.owner_root.as_deref() == Some(OPTION_ROOT)
-                        && last_disc == Some(0) =>
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root,
+                            ..
+                        },
+                    ..
+                } if name == "from_residual"
+                    && receiver_root.as_deref().is_some_and(|root| {
+                        majit_ir::descr::strip_instantiation_suffix(
+                            majit_ir::descr::class_root_leaf(root),
+                        ) == "Option"
+                    }) =>
                 {
-                    none_ctor += 1;
+                    from_residual_calls += 1;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("from_residual")
+                    && segments.iter().any(|s| s == "option") =>
+                {
+                    from_residual_calls += 1;
                 }
                 _ => {}
             }
         }
-        if let (Some(ExitSwitch::Value(sw)), Some(disc)) = (&b.exitswitch, option_disc_read)
-            && *sw == disc
-        {
-            let mut cases: Vec<i64> = b
-                .exits
-                .iter()
-                .filter_map(|l| match &l.exitcase {
-                    Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::Int(
-                        i,
-                    ))) => Some(*i),
-                    Some(ExitCase::Const(majit_translate::flowspace::model::ConstValue::UInt(
-                        i,
-                    ))) => Some(*i as i64),
-                    _ => None,
-                })
-                .collect();
-            cases.sort_unstable();
-            if cases == [0, 1] {
-                direct_option_switch += 1;
+        if let Some(ExitSwitch::Value(sw)) = &b.exitswitch {
+            let on_cf = b.operations.iter().any(|op| {
+                op.result.as_ref() == Some(sw)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead {
+                            field: FieldDescriptor { name, owner_root, .. },
+                            ..
+                        } if name == "__discriminant"
+                            && owner_root
+                                .as_deref()
+                                .is_some_and(|o| o.contains("ControlFlow"))
+                    )
+            });
+            if on_cf {
+                cf_disc_switches += 1;
             }
         }
     }
 
     assert_eq!(
-        residual_branch, 0,
-        "the residual `Try::branch` call must be replaced",
+        branch_calls, 1,
+        "caller keeps one regular call of the extracted Option branch body; was 0 while the rewrite consumed residual Method branch"
     );
     assert_eq!(
-        direct_option_switch, 1,
-        "the rewrite must leave one direct Option discriminant switch",
+        cf_disc_switches, 1,
+        "caller switches on the ControlFlow discriminant; the rewrite used to leave one Option disc switch instead"
     );
-    assert!(
-        some_payload_reads >= 1,
-        "the Some arm extracts the Option payload",
+    assert_eq!(
+        from_residual_calls, 1,
+        "Break arm is a regular from_residual call; the rewrite inlined a None ctor instead"
     );
-    assert_eq!(none_ctor, 1, "the None arm builds the normal None return");
 }
 
 /// A field read through a raw object pointer retains the pointee's declared
@@ -2174,11 +2207,17 @@ fn a_borrowed_primitive_banks_by_its_container() {
 
     assert_eq!(
         payloads("slice_get_tag_dispatch"),
-        vec![(
-            "core::option::Option<u8>::Some".to_string(),
-            ValueType::Unsigned
-        )],
-        "the `?` payload of an `Option<&u8>` is the byte, not a pointer to it",
+        vec![
+            (
+                "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue".to_string(),
+                ValueType::Unsigned
+            ),
+            (
+                "ops::control_flow::ControlFlow<Option<Never>,u8>::Break".to_string(),
+                ValueType::Ref(Some("option::Option<Never>".to_string()))
+            ),
+        ],
+        "Option<&u8> `?` is ControlFlow: Continue payload is the byte (Unsigned), Break is Option<Never>; was Option<u8>::Some while the rewrite inlined the diamond",
     );
     assert_eq!(
         payloads("range_start_index"),

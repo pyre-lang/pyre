@@ -1455,10 +1455,12 @@ pub struct RootStackState {
     /// crates it calls into, so none of its bodies can reach the stack
     /// except through a callback analysed at the call site.
     pub(in crate::front::mir) root_api_is_visible: bool,
-    /// `GraphAnalyzer._analyzed_calls`, keyed by `FunDecl` id.
+    /// `GraphAnalyzer._analyzed_calls`, keyed by graph identity: a generic
+    /// instantiation uses `spec_leaf` (`FunctionDesc.cachedgraph`); a
+    /// non-generic declaration uses its `FunDecl` id.
     pub(in crate::front::mir) analyzed_calls: std::cell::RefCell<
         crate::tool::algo::unionfind::UnionFind<
-            u64,
+            String,
             crate::translator::backendopt::graphanalyze::Dependency<bool>,
         >,
     >,
@@ -1478,13 +1480,15 @@ pub struct RootStackState {
 /// The impl bodies behind each trait method of one artefact.
 #[derive(Default)]
 pub(in crate::front::mir) struct TraitMethodBodies {
-    /// `(trait decl id, method index)` -> every impl's body for it.
-    pub(in crate::front::mir) by_trait: std::collections::HashMap<(u64, u64), Vec<u64>>,
     /// `(trait impl id, method index)` -> that impl's body.
     pub(in crate::front::mir) by_impl: std::collections::HashMap<(u64, u64), u64>,
 }
 
 pub(in crate::front::mir) type RootStackTracker =
+    crate::translator::backendopt::graphanalyze::DependencyTracker<bool, String>;
+
+/// The tracker over [`RootStackState::scope_constructors`], keyed by `FunDecl` id.
+pub(in crate::front::mir) type ScopeConstructorTracker =
     crate::translator::backendopt::graphanalyze::DependencyTracker<bool, u64>;
 
 impl RootStackState {
@@ -1506,7 +1510,7 @@ impl RootStackState {
             root_api_is_local,
             root_api_is_visible,
             analyzed_calls: std::cell::RefCell::new(crate::tool::algo::unionfind::UnionFind::new(
-                |_: &u64| crate::translator::backendopt::graphanalyze::Dependency::new(false),
+                |_: &String| crate::translator::backendopt::graphanalyze::Dependency::new(false),
             )),
             trait_methods: std::cell::OnceCell::new(),
             scope_constructors: std::cell::RefCell::new(
@@ -1537,12 +1541,12 @@ impl<'a> RootStackAnalyzer<'a> {
     /// result. A declaration with no body answers from the flag the link
     /// step set on that `FunDecl` when its identity matched a defining crate.
     pub(in crate::front::mir) fn fn_returns_owned_scope(&self, id: u64) -> bool {
-        self.fn_returns_owned_scope_in(id, &mut RootStackTracker::new())
+        self.fn_returns_owned_scope_in(id, &mut ScopeConstructorTracker::new())
     }
 
     /// `analyze_direct_call` for the owned-scope question: `seen` merges a recursive cycle of
     /// constructors into one result, so the answer does not depend on which member is asked first.
-    fn fn_returns_owned_scope_in(&self, id: u64, seen: &mut RootStackTracker) -> bool {
+    fn fn_returns_owned_scope_in(&self, id: u64, seen: &mut ScopeConstructorTracker) -> bool {
         if !seen.enter(id, &mut self.state.scope_constructors.borrow_mut()) {
             return seen.get_cached_result(id, &mut self.state.scope_constructors.borrow_mut());
         }
@@ -1581,7 +1585,9 @@ impl<'a> RootStackAnalyzer<'a> {
         seen: &mut RootStackTracker,
     ) -> bool {
         match &reg.kind {
-            CallKind::Fun(FunId::Regular { id }) => self.analyze_direct_call(*id, seen),
+            CallKind::Fun(FunId::Regular { id }) => {
+                self.analyze_direct_call(*id, Some(&reg.generics), seen)
+            }
             // Builtins: arithmetic, `Box::new`, slice indexing.
             CallKind::Fun(FunId::Other(_)) => false,
             CallKind::Trait(v) => self.analyze_trait_call(v, seen),
@@ -1595,11 +1601,19 @@ impl<'a> RootStackAnalyzer<'a> {
         }
     }
 
-    /// `analyze_direct_call`, with the `DependencyTracker` that merges a
-    /// recursive cycle into one result.
+    /// `analyze_direct_call` (`graphanalyze.py` `GraphAnalyzer.analyze_direct_call`).
+    ///
+    /// The callee graph is the one the call's concrete generic arguments
+    /// select (`specialize.py` `specialize_argtype` / `FunctionDesc.cachedgraph`,
+    /// `clause_spec` substitution). An unresolved clause has no graph:
+    /// `indirect_call` with `graphs is None` is `top_result` (this analyzer:
+    /// `root_api_is_visible`, the same unknown-target answer as
+    /// `analyze_external_call`). A generic template without those
+    /// arguments is not a graph.
     pub(in crate::front::mir) fn analyze_direct_call(
         &self,
         id: u64,
+        generics: Option<&serde_json::Value>,
         seen: &mut RootStackTracker,
     ) -> bool {
         let Some(fd) = self.llbc.fn_by_id(id) else {
@@ -1620,27 +1634,105 @@ impl<'a> RootStackAnalyzer<'a> {
         if drop_glue && !fd.has_unstructured_body() {
             return false;
         }
-        if fd.body.is_none() {
+        // No `funcobj.graph`: `analyze` (`graphanalyze.py`) routes a
+        // missing graph through `analyze_external_call` when the
+        // declaration is external, else `top_result`. Charon spells that
+        // missing graph as a non-Unstructured body (`Opaque` / `Missing`
+        // / `null`), including a generic item whose instance arguments
+        // are concrete — those arguments do not create a graph.
+        if !fd.has_unstructured_body() {
             return self.analyze_external_call(fd);
         }
-        if !seen.enter(id, &mut self.state.analyzed_calls.borrow_mut()) {
-            return seen.get_cached_result(id, &mut self.state.analyzed_calls.borrow_mut());
-        }
-        let result = match fd.unstructured() {
-            Some(mut body) => {
-                elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
-                    regular_call_name_path(reg, self.llbc)
-                });
-                elaborate_vec_drops(self.llbc, &mut body);
-                self.analyze_body(&body, seen)
-            }
-            // A tagged but unreadable drop body used to take the body-less
-            // drop-glue branch too. Keep that answer after the cheap tag check.
-            None if drop_glue => false,
-            None => self.analyze_external_call(fd),
+        let specialized = if crate::front::clause_spec::decl_is_generic(fd) {
+            let Some(g) = generics else {
+                return true;
+            };
+            let Some(trait_refs) =
+                crate::front::clause_spec::concrete_trait_refs_or_empty(g, self.llbc)
+            else {
+                return true;
+            };
+            let Some((types, const_generics)) =
+                crate::front::clause_spec::concrete_type_args(g, self.llbc)
+            else {
+                return true;
+            };
+            Some((trait_refs, types, const_generics))
+        } else {
+            None
         };
-        seen.leave_with(id, result, &mut self.state.analyzed_calls.borrow_mut());
+        let key = self.direct_call_key(id, generics);
+        if !seen.enter(key.clone(), &mut self.state.analyzed_calls.borrow_mut()) {
+            return seen.get_cached_result(key, &mut self.state.analyzed_calls.borrow_mut());
+        }
+        let result = match specialized {
+            Some((trait_refs, types, const_generics)) => {
+                match crate::front::clause_spec::substituted_unstructured(
+                    fd,
+                    self.llbc,
+                    &trait_refs,
+                    &types,
+                    &const_generics,
+                ) {
+                    Some(mut body) => {
+                        elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
+                            regular_call_name_path(reg, self.llbc)
+                        });
+                        elaborate_vec_drops(self.llbc, &mut body);
+                        self.analyze_body(&body, seen)
+                    }
+                    None => {
+                        if fd.has_unstructured_body() {
+                            true
+                        } else {
+                            self.analyze_external_call(fd)
+                        }
+                    }
+                }
+            }
+            None => match fd.unstructured() {
+                Some(mut body) => {
+                    elaborate_explicit_root_closes(self.llbc, &mut body, &|reg| {
+                        regular_call_name_path(reg, self.llbc)
+                    });
+                    elaborate_vec_drops(self.llbc, &mut body);
+                    self.analyze_body(&body, seen)
+                }
+                // A tagged but unreadable drop body used to take the body-less
+                // drop-glue branch too. Keep that answer after the cheap tag check.
+                None if drop_glue => false,
+                None => self.analyze_external_call(fd),
+            },
+        };
+        seen.leave_with(key, result, &mut self.state.analyzed_calls.borrow_mut());
         result
+    }
+
+    /// Cache key for one graph: `spec_leaf` of a concrete generic
+    /// instantiation, else the `FunDecl` id (`FunctionDesc.cachedgraph`).
+    fn direct_call_key(&self, id: u64, generics: Option<&serde_json::Value>) -> String {
+        let Some(fd) = self.llbc.fn_by_id(id) else {
+            return id.to_string();
+        };
+        if !crate::front::clause_spec::decl_is_generic(fd) {
+            return id.to_string();
+        }
+        let Some(g) = generics else {
+            return id.to_string();
+        };
+        if crate::front::clause_spec::concrete_trait_refs_or_empty(g, self.llbc).is_none()
+            || crate::front::clause_spec::concrete_type_args(g, self.llbc).is_none()
+        {
+            return id.to_string();
+        }
+        let leaf = fd
+            .item_meta
+            .name_path()
+            .rsplit("::")
+            .next()
+            .unwrap_or("fn")
+            .to_string();
+        crate::front::clause_spec::spec_leaf(&leaf, id, g, self.llbc)
     }
 
     /// `analyze_external_call`: a declaration with no body in this artefact.
@@ -1673,14 +1765,17 @@ impl<'a> RootStackAnalyzer<'a> {
     }
 
     /// Whether the body with this `FunDecl` id can change the root stack.
+    /// A generic template is not a graph (`FunctionDesc.cachedgraph`); the
+    /// harvest skips it, and a call without concrete arguments is unknown.
     pub(in crate::front::mir) fn fn_touches_root_stack(&self, id: u64) -> bool {
         let mut seen = RootStackTracker::new();
-        self.analyze_direct_call(id, &mut seen)
+        self.analyze_direct_call(id, None, &mut seen)
     }
 
-    /// Every body a trait method call may reach: the impl the call selected,
-    /// or every impl of the trait when the call is still generic, plus the
-    /// trait's default body.  No body at all is an unknown callee.
+    /// The one impl body a resolved trait method names, or `top_result`
+    /// when the clause is still a type variable (`graphanalyze.py`
+    /// `analyze` `indirect_call` with `graphs is None`). Never every impl
+    /// of the trait.
     pub(in crate::front::mir) fn analyze_trait_call(
         &self,
         v: &serde_json::Value,
@@ -1694,61 +1789,42 @@ impl<'a> RootStackAnalyzer<'a> {
         else {
             return true;
         };
-        let bodies = self
-            .state
-            .trait_methods
-            .get_or_init(|| trait_method_bodies(self.llbc));
-        let mut targets: Vec<u64> = Vec::new();
-        if let Some(impl_id) = traitref_impl_id(traitref, self.llbc, 0) {
-            targets.extend(bodies.by_impl.get(&(impl_id, method)).copied());
-        } else if let Some(trait_id) = traitref_decl_id(traitref, self.llbc, 0) {
-            // A still-generic `Drop::drop` (or the `Destruct` drop glue that
-            // reaches it) destroys a value whose type the
-            // caller chose.  The only destructors that change the root stack
-            // are guards closing their own bracket, and a guard reaches a
-            // generic drop only by being passed in by value: the body that
-            // handed it over is the one charged, because its pins then run
-            // outside any close it owns.  The close itself truncates to the
-            // guard's save point, which drops no pin its opener did not see
-            // made.
-            if self.llbc.trait_by_id(trait_id).is_some_and(|decl| {
-                matches!(
-                    decl.item_meta.name_path().as_str(),
-                    "core::ops::drop::Drop" | "core::marker::Destruct"
-                )
-            }) {
-                return false;
-            }
-            targets.extend(
-                bodies
-                    .by_trait
-                    .get(&(trait_id, method))
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            );
-        }
-        // Only a provided default is a body; a required method's declaration
-        // carries none to analyse, and every impl is already listed.
-        if let Some(decl) = traitref_decl_id(traitref, self.llbc, 0)
-            .and_then(|trait_id| trait_default_method_id(self.llbc, trait_id, method))
-            && self
-                .llbc
-                .fn_by_id(decl)
-                .is_some_and(|fd| fd.unstructured().is_some())
+        if let Some((fn_id, generics)) = crate::front::clause_spec::trait_impl_method(v, self.llbc)
         {
-            targets.push(decl);
+            return self.analyze_direct_call(fn_id, Some(&generics), seen);
         }
-        // No body in this artefact implements the method.  An artefact that
-        // does not name the root-stack API reaches it only through an impl a
-        // crate built on top of it supplies, which is a callback, as in
-        // `analyze_external_call`.
-        if targets.is_empty() {
+        // `TraitRefKind::BuiltinOrAuto` is a selected empty implementation
+        // (`NoopDestruct` and the other auto traits), not an unresolved
+        // clause: `analyze` walks `funcobj.graph` when one exists, and this
+        // kind has none. `CallKind::Fun(Other)` is the same bottom.
+        if traitref_unwrap(traitref, self.llbc, 0)
+            .and_then(|obj| obj.get("kind"))
+            .and_then(|kind| kind.get("BuiltinOrAuto"))
+            .is_some()
+        {
+            return false;
+        }
+        if let Some(impl_id) = traitref_impl_id(traitref, self.llbc, 0) {
+            let bodies = self
+                .state
+                .trait_methods
+                .get_or_init(|| trait_method_bodies(self.llbc));
+            if let Some(&target) = bodies.by_impl.get(&(impl_id, method)) {
+                return self.analyze_direct_call(target, None, seen);
+            }
+            if let Some(default) = traitref_decl_id(traitref, self.llbc, 0)
+                .and_then(|trait_id| trait_default_method_id(self.llbc, trait_id, method))
+            {
+                return self.analyze_direct_call(default, None, seen);
+            }
+            // Resolved impl, no body in this artefact: same as a missing
+            // graph (`analyze_external_call` of an unknown target).
             return self.state.root_api_is_visible;
         }
-        targets
-            .into_iter()
-            .any(|target| self.analyze_direct_call(target, seen))
+        // Unresolved clause: `indirect_call` with `graphs is None` is
+        // `top_result` when this artefact can name the API, and a
+        // callback from a crate above when it cannot.
+        self.state.root_api_is_visible
     }
 
     /// The function items a block names as values rather than calls, such as
@@ -1925,8 +2001,7 @@ pub(in crate::front::mir) fn trait_method_bodies(llbc: &Llbc) -> TraitMethodBodi
             else {
                 continue;
             };
-            let (Some(trait_id), Some(index), Some(body)) = (
-                key.first().and_then(serde_json::Value::as_u64),
+            let (Some(index), Some(body)) = (
                 key.get(1).and_then(serde_json::Value::as_u64),
                 method
                     .get("skip_binder")
@@ -1935,10 +2010,6 @@ pub(in crate::front::mir) fn trait_method_bodies(llbc: &Llbc) -> TraitMethodBodi
             ) else {
                 continue;
             };
-            out.by_trait
-                .entry((trait_id, index))
-                .or_default()
-                .push(body);
             out.by_impl.insert((impl_id, index), body);
         }
     }
@@ -4869,9 +4940,16 @@ pub(crate) fn harvest_root_stack_touching_paths_with(
     root_state: &RootStackState,
 ) -> Vec<String> {
     let analyzer = RootStackAnalyzer::new(llbc, root_state);
+    // A generic template is not a graph (`FunctionDesc.cachedgraph`);
+    // `analyze_direct_call` walks the instantiation the call's concrete
+    // arguments select.
     let mut touching: Vec<String> = llbc
         .iter_local_fns()
-        .filter(|fd| fd.body.is_some() && analyzer.fn_touches_root_stack(fd.def_id))
+        .filter(|fd| {
+            fd.body.is_some()
+                && !crate::front::clause_spec::decl_is_generic(fd)
+                && analyzer.fn_touches_root_stack(fd.def_id)
+        })
         .map(|fd| fd.item_meta.name_path())
         .collect();
     touching.sort();
@@ -6078,6 +6156,29 @@ pub(in crate::front::mir) fn host_field_index(
         u32::try_from(variant_idx.unwrap_or(0)).ok()?,
         u32::try_from(field_idx).ok()?,
     ))
+}
+
+/// Field index of a Charon `Field` payload: `[null, i]` or named
+/// `{"Adt": ...}` with a null variant. Enum variant indices decline.
+pub(in crate::front::mir) fn field_projection_index(payload: &serde_json::Value) -> Option<usize> {
+    let arr = payload.as_array()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    let idx = arr.get(1)?.as_u64()? as usize;
+    if arr[0].is_null() {
+        return Some(idx);
+    }
+    if arr[0].as_u64().is_some() {
+        return None;
+    }
+    let adt = arr[0].as_object()?.get("Adt")?;
+    if let Some(parts) = adt.as_array()
+        && parts.get(1).is_some_and(|variant| !variant.is_null())
+    {
+        return None;
+    }
+    Some(idx)
 }
 
 /// `[null, i]` or `[variant, i]`. `None` when the payload is a named

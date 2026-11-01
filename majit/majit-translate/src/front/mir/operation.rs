@@ -1495,6 +1495,18 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
+        // Thin `Box<T>` is one pointer word to `T` (`type_node_is_thin_box`).
+        // FieldWrite of `Buffer::Sub.parent` must intern the Buffer
+        // pointee (`bookkeeper.py` `getuniqueclassdef`), not a
+        // classdef-less Box wrapper.
+        if type_node_is_thin_box(node, self.llbc) {
+            let pointee = type_node_box_pointee(node, self.llbc)?;
+            return adt_node_class_root_with(
+                strip_ty_wrappers(pointee, self.llbc)?,
+                self.llbc,
+                self.tombstoned_leaves,
+            );
+        }
         if let Some(reference) = node.as_object()?.get("Ref") {
             let pointee = reference.as_array()?.get(1)?;
             return adt_node_class_root_with(
@@ -3306,23 +3318,33 @@ impl<'a> Lowering<'a> {
                 // = null, `Some(p)` = the non-null pointer.  Its
                 // discriminant is the pointer-null test `base != null`
                 // (`None` = 0, `Some` = 1), not a `__discriminant` field off
-                // a two-word aggregate base (there is none).  Emit the null
-                // pointer, then compare — a `ne` on two `Ref` operands
-                // lowers to `ptr_ne` (`jtransform`), and its `Int` result
-                // feeds the match switch exactly as a `__discriminant` read
-                // would.  The null is a `null_mut()` call, not a
-                // `ConstRefNull`: `null_mut()` rtypes to `convert_const(None)`
-                // on the result repr (`rbuiltin::rtype_ptr_null`), so it
-                // adapts to the `base` pointer's own `InstanceRepr` and the
-                // `ptr_ne` sees two same-repr operands.  A `ConstRefNull` is a
-                // fixed GCREF `_ptr`, which cannot rtype against an
-                // `InstanceRepr(PyObject)` base at the `ne`.  Modelling the
-                // maybe-null pointer this way is the orthodox representation
-                // (RPython has no `Option`; a maybe-null `Ptr` tests
-                // `ptr_nonzero`).
+                // a two-word aggregate base (there is none).  An instance
+                // `Ref` is-None is `Constant(None)` compared with `is_`
+                // (`rnone.py` `rtype_is_None`;
+                // `pairtype(NoneRepr, Repr).convert_from_to` is
+                // `inputconst(r_to, None)`), via
+                // [`FunctionGraph::push_niche_is_some`]. Int-bank
+                // (`null_raw` / `null_fn`) and string / list windows emit
+                // a typed null through `push_niche_null_ptr`, then `is_` /
+                // `eq(..., False)`.
                 if self.tyref_is_niche_option_ptr(&place.ty) {
                     let option_ty = clone_tyref(&place.ty);
-                    let base = self.resolve_place(mir_bb, place)?;
+                    let mut base = self.resolve_place(mir_bb, place)?;
+                    let null_cast = self.option_niche_null_cast(&option_ty);
+                    if self.option_niche_int_null(&option_ty).is_none()
+                        && crate::model::niche_is_none_uses_const_none(null_cast.as_ref())
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        self.graph.push_niche_is_some(
+                            bb_id,
+                            base,
+                            None,
+                            null_cast.as_ref(),
+                            res.clone(),
+                        );
+                        self.niche_disc_vars.insert(res.id());
+                        return Ok((None, res));
+                    }
                     let nullc = self.push_niche_null_ptr(mir_bb, &option_ty);
                     // Preserve PyPy's identity test: first compute
                     // `base is None`, then negate that bool for the Rust
@@ -3338,6 +3360,32 @@ impl<'a> Lowering<'a> {
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let bb_id = self.emit_bb(mir_bb);
+                    // `null_raw(T)` is `lltype.nullptr(T)` (`SomePtr`).
+                    // `is_` of that null against the Address word is
+                    // IntegerRepr vs PtrRepr (`pairtype.py` `rtype_is_`).
+                    // Enum: retype the Address word as `Ptr(T)` the same
+                    // way `Some.__pos_0` does (`lltype.py` `cast_int_to_ptr`).
+                    // Struct: the Option overlay is already that
+                    // `Ptr(Struct Raw)` (`tyref_niche_option_payload_paint`
+                    // int-bank SomePtr). Stamp both sides so `rtype_is_`
+                    // sees one lltype; `_rewrite_cmp_ptrs` then emits
+                    // `int_eq` / `int_is_zero` (`history.py` `getkind` of
+                    // a raw Ptr). Recasting a GCREF overlay through
+                    // `__cast_instance_intrinsic` identity-folds and
+                    // leaves `is_/ri`.
+                    if let Some(ptr_ty) = self.payload_storage_raw_ptr_lltype(&option_ty) {
+                        if self.payload_storage_raw_pointee_is_struct(&option_ty) {
+                            base.set_concretetype(Some(ptr_ty.clone()));
+                            nullc.set_concretetype(Some(ptr_ty));
+                        } else {
+                            base = emit_dest_typed_cast_int_to_ptr(
+                                &mut self.graph,
+                                bb_id,
+                                base,
+                                ptr_ty,
+                            );
+                        }
+                    }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(is_none.clone()),
                         kind: OpKind::BinOp {
@@ -3428,7 +3476,35 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     self.immutable_fields,
                 );
-                let base = self.resolve_place(mir_bb, place)?;
+                let recast_tagged_sum =
+                    crate::front::result_exc::tyref_is_option(&place.ty, self.llbc);
+                let mut base = self.resolve_place(mir_bb, place)?;
+                // A tagged split Option intern's a BASE class with
+                // `__discriminant` (`register_ref_enum_instantiation_rows`).
+                // Spec-copy inputargs can still be classdef-less
+                // (`adt_node_class_root_identity` paint-None of the caller).
+                // `getattr __discriminant` then fails rtype
+                // (`rclass.py` `InstanceRepr.getclsfield`). Recast to the
+                // interned class the same way a variant FieldRead recasts
+                // (`cast_instance_call` of `owner_root`). ControlFlow of a
+                // `?` diamond and a Result match are not that interned
+                // Option class: recasting them inserts a `cast_instance`
+                // the Result-match rewriter does not
+                // attribute to the forwarded scrutinee.
+                if let Some(root) = owner_root.as_ref()
+                    && root.contains('<')
+                    && recast_tagged_sum
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let narrowed = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(narrowed.clone()),
+                        kind: crate::model::cast_instance_call(root.clone(), base),
+                    });
+                    base = narrowed;
+                }
                 Ok((
                     Some(OpKind::FieldRead {
                         base,
@@ -3978,10 +4054,6 @@ impl<'a> Lowering<'a> {
         &self,
         dest_ty: &TyRef,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-        use crate::flowspace::model::ConstValue;
-        use crate::translator::rtyper::lltypesystem::lltype::{
-            GcKind, LowLevelType, Ptr, Struct, frozendict,
-        };
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
@@ -3993,6 +4065,23 @@ impl<'a> Lowering<'a> {
         )?;
         let id = adt_node_def_id(node)?;
         let decl = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Struct(_) = &decl.kind else {
+            return None;
+        };
+        self.raw_struct_ptr_lltype(decl)
+    }
+
+    /// `Ptr(Struct)` of a storage-raw overlay (`lltype.py`
+    /// `ann_cast_int_to_ptr`). Shared by dest overlay (`*const MapNode`)
+    /// and a pointer-niche Option whose payload is `&RawStruct`.
+    pub(in crate::front::mir) fn raw_struct_ptr_lltype(
+        &self,
+        decl: &TypeDecl,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            GcKind, LowLevelType, Ptr, Struct, frozendict,
+        };
         let TypeDeclKind::Struct(fields) = &decl.kind else {
             return None;
         };
@@ -4023,6 +4112,104 @@ impl<'a> Lowering<'a> {
         }
         let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
         Some(LowLevelType::Ptr(Box::new(ptr)))
+    }
+
+    /// PTRTYPE of a niche-Option payload that is a pointer to a storage-raw
+    /// ADT (`Option<&MappedObj>`, `Option<&OwnedFd>`). `lltype.cast_int_to_ptr(PTRTYPE, addr)`
+    /// returns `SomePtr(PTRTYPE)` (`lltype.py` `ann_cast_int_to_ptr`). The
+    /// Option word itself stays the Address `rnone.py` `rtype_is_None`
+    /// compares for an int-bank enum; a raw-struct borrow Option is already
+    /// `Ptr(Struct)` (`tyref_niche_option_payload_paint`) and Discriminant
+    /// stamps the null to that PTRTYPE. A fn-ptr
+    /// niche has no ADT pointee and yields `None`. Enum PTRTYPE is
+    /// `raw_enum_base_ptr_lltype` of the harvest enum-base row, gated by
+    /// `ty_is_raw_address`. Struct PTRTYPE is the overlay `Ptr(Struct)` of
+    /// a pointee whose declared `_gckind` is Raw (`declared_raw_adt_node` /
+    /// `history.getkind` of `Ptr(TO)` from `TO._gckind`). A GcType seed
+    /// stays Instance (`rclass.py` `InstanceRepr._setup_repr`).
+    pub(in crate::front::mir) fn payload_storage_raw_ptr_lltype(
+        &self,
+        option_ty: &TyRef,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        let payload = self.payload_storage_raw_payload(option_ty)?;
+        let decl = self.payload_storage_raw_pointee_decl(option_ty)?;
+        match &decl.kind {
+            TypeDeclKind::Enum(_) => {
+                if !ty_is_raw_address(
+                    &payload,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                ) {
+                    return None;
+                }
+                let name = raw_address_owner_root(
+                    &payload,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )?;
+                crate::annotator::bookkeeper::raw_enum_base_ptr_lltype(self.struct_fields?, &name)
+            }
+            TypeDeclKind::Struct(_) => self.raw_struct_ptr_lltype(decl),
+            _ => None,
+        }
+    }
+
+    fn payload_storage_raw_payload(&self, option_ty: &TyRef) -> Option<TyRef> {
+        if tyref_option_payload_is_fn_ptr(option_ty, self.llbc) {
+            return None;
+        }
+        crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+    }
+
+    fn payload_storage_raw_pointee_decl(&self, option_ty: &TyRef) -> Option<&TypeDecl> {
+        let payload = self.payload_storage_raw_payload(option_ty)?;
+        let payload_node =
+            tyref_node(&payload, self.llbc).and_then(|n| type_node_peel_aliases(n, self.llbc))?;
+        let pointee = one_level_pointer_pointee(payload_node, self.llbc)?;
+        let pointee = strip_ty_indirections(pointee, self.llbc).unwrap_or(pointee);
+        let adt = declared_raw_adt_node(
+            pointee,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        )?;
+        let id = adt_node_def_id(adt)?;
+        let decl = self.llbc.type_by_id(id)?;
+        if type_decl_is_fieldless_enum(decl, self.llbc) {
+            return None;
+        }
+        Some(decl)
+    }
+
+    /// Declared pointee of a pointer-niche Option is a raw `Struct`
+    /// (`TypeDeclKind`), so Discriminant stamps both `is_` operands to
+    /// that `Ptr(Struct)` bank. An Enum pointee keeps the int-bank 2-cast shape.
+    pub(in crate::front::mir) fn payload_storage_raw_pointee_is_struct(
+        &self,
+        option_ty: &TyRef,
+    ) -> bool {
+        self.payload_storage_raw_pointee_decl(option_ty)
+            .is_some_and(|decl| matches!(decl.kind, TypeDeclKind::Struct(_)))
+    }
+
+    /// Class-root spelling of a storage-raw struct pointee (`Ptr(Struct)._name`),
+    /// the same leaf `null_raw` takes
+    /// (`raw_ptr_null_constant` / `raw_struct_ptr_annotation`).
+    pub(in crate::front::mir) fn payload_storage_raw_struct_root(
+        &self,
+        option_ty: &TyRef,
+    ) -> Option<String> {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        match self.payload_storage_raw_ptr_lltype(option_ty)? {
+            LowLevelType::Ptr(p) => match p.TO {
+                PtrTarget::Struct(st) if !st._name.is_empty() => Some(st._name),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// 2-arg `cast_int_to_ptr(PTRTYPE, addr)` when dest is a raw overlay.
@@ -4986,16 +5173,34 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let payload = elem.as_object()?.get("Field")?;
-        // Named `{"Adt": ...}` only. `resolve_adt_field` does not decode
-        // that container, so a nonzero offset would otherwise collapse to
-        // the parent pointer (`resolve_place`'s unmatched projection).
-        // An index pair `[null, i]` / `[variant, i]` is a `FieldRead`.
-        // `mark_place_address_of` sets `taken_by_address`, and
-        // `rewrite_op_getsubstruct` turns that read into the interior
-        // address. Returning the parent variable would give the field's
-        // consumer the container's type; casting that GC pointer onto the
-        // raw field struct is not `getsubstruct`.
-        self.inline_substruct_named_adt_offset(place, payload)
+        let owner_node = strip_ty_wrappers(tyref_node(&inner.ty, self.llbc)?, self.llbc)?;
+        let owner_id = adt_node_def_id(owner_node)?;
+        let owner = self.llbc.type_by_id(owner_id)?;
+        if !matches!(owner.kind, TypeDeclKind::Struct(_)) {
+            return None;
+        }
+        // A classdef-less `repr(C)` pointee is `rewrite_op_getsubstruct`
+        // (`int_add(p, offsetof)`). Index pair `[null, i]`
+        // (`indexed_field_parts`) and named `{"Adt": ...}` both name
+        // field `i`. A GC inline struct keeps the named-Adt path: an
+        // index pair on a class is a `FieldRead`; treating it as
+        // `getsubstruct` would alias the field to the parent.
+        let classdef_less =
+            adt_node_class_root_identity(owner_node, self.llbc, self.tombstoned_leaves).is_none();
+        if classdef_less {
+            let field_idx = field_projection_index(payload)?;
+            let subst = adt_node_type_subst(owner_node, self.llbc);
+            let subst = subst_bind_projected_field(
+                self.llbc,
+                owner,
+                &subst,
+                field_idx,
+                &tyref_json(&place.ty),
+            );
+            repr_c_struct_field_offset(self.llbc, owner, &subst, field_idx)
+        } else {
+            self.inline_substruct_named_adt_offset(place, payload)
+        }
     }
 
     /// `{"Adt": ...}` field container. `None` when the payload is an index
@@ -5059,10 +5264,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
-    /// `rewrite_op_getsubstruct` does.  Offset zero is `p` itself.  A nonzero
-    /// offset takes the same deferred refusal `rewrite_op_getfield` gives a
-    /// nonzero `getsubstruct`: an interior address cannot enter the Ref bank,
-    /// so the graph aborts the trace when it reaches the access.
+    /// `jtransform.py rewrite_op_getsubstruct` does. Offset zero is `p`
+    /// itself. A nonzero offset on a classdef-less `repr(C)` pointee is
+    /// `int_add(p, offsetof)` (`_gckind == 'raw'`). A GC interior address
+    /// still takes the deferred `RawAddr` refusal: it cannot enter the
+    /// Ref bank.
     pub(in crate::front::mir) fn lower_inline_substruct_address(
         &mut self,
         mir_bb: usize,
@@ -5075,18 +5281,73 @@ impl<'a> Lowering<'a> {
             unreachable!("inline_substruct_field_offset matched a projection");
         };
         let base = self.resolve_place(mir_bb, clone_place(inner))?;
-        if offset != 0 {
-            let bb_id = self.emit_bb(mir_bb);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::Abort {
-                    kind: crate::model::UnknownKind::UnsupportedExpr {
-                        variant: crate::model::UnsupportedExprKind::RawAddr,
-                    },
-                },
-            });
+        if offset == 0 {
+            return Ok(Some(base));
         }
+        let classdef_less = tyref_node(&inner.ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .is_some_and(|node| {
+                adt_node_class_root_identity(node, self.llbc, self.tombstoned_leaves).is_none()
+            });
+        if classdef_less {
+            return Ok(Some(
+                self.emit_raw_substruct_address(mir_bb, base, offset, &place.ty),
+            ));
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Abort {
+                kind: crate::model::UnknownKind::UnsupportedExpr {
+                    variant: crate::model::UnsupportedExprKind::RawAddr,
+                },
+            },
+        });
         Ok(Some(base))
+    }
+
+    /// `rewrite_op_getsubstruct` for a raw pointee: `int_add(p, offset)`.
+    ///
+    /// A field whose declared type is a GC class is an interior pointer
+    /// into the allocation — the same `cast_ptr_to_int` + add +
+    /// `cast_int_to_ptr` + `cast_instance` sequence
+    /// [`Self::emit_array_tail_item_ptr`] already emits for a class
+    /// living at a byte offset. A classdef-less field stays in the int
+    /// bank (`rewrite_raw_substruct_address`,
+    /// [`Self::items_block_item_address`]).
+    pub(in crate::front::mir) fn emit_raw_substruct_address(
+        &mut self,
+        mir_bb: usize,
+        base: Variable,
+        offset: u64,
+        field_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(root) = tyref_class_root_with(field_ty, self.llbc, self.tombstoned_leaves) {
+            return self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+        }
+        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, base);
+        let off = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let off_n = i64::try_from(offset).expect("substruct offset fits in Signed");
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(off.clone()),
+            kind: OpKind::ConstInt(off_n),
+        });
+        let sum = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: addr,
+                rhs: off,
+                result_ty: ValueType::Int,
+            },
+        });
+        sum
     }
 
     pub(in crate::front::mir) fn place_ref_is_address_of(place: &Place) -> bool {
@@ -5528,7 +5789,23 @@ impl<'a> Lowering<'a> {
                     // treats a fieldless enum. A zero-sized marker in the same
                     // struct still has no bytes. Emitting a FieldRead would
                     // try to dereference that word as an aggregate base.
-                    if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc) {
+                    //
+                    // A one-word std handle that is not `repr(transparent)`
+                    // (a pointer plus ZST markers) is the same declared
+                    // layout: the unique sized field *is* the word
+                    // (`lltype.Ptr` of a one-field struct). [`deref_cast_root`]
+                    // refuses to reinterpret that word as `T` — it addresses
+                    // the refcount header — so this projection is the header
+                    // pointer, not a `getfield` of a classdef-less instance.
+                    if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc)
+                        .or_else(|| {
+                            tyref_one_word_handle_payload_field(
+                                &inner.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            )
+                        })
+                    {
                         if field_name == name {
                             let wrapper_ty = clone_tyref(&inner.ty);
                             let base = self.resolve_place(mir_bb, *inner)?;
@@ -5564,8 +5841,49 @@ impl<'a> Lowering<'a> {
                     // rtype clsfield).  Alias the base value with no field read,
                     // mirroring the fieldless-enum discriminant collapse and the
                     // `Discriminant` niche fold above.
+                    //
+                    // A GC-instance payload still needs the ordinary
+                    // `__cast_instance_intrinsic` so `f(t)` / a closure
+                    // `call_once` Args tuple sees `SomeInstance(T)` rather
+                    // than a classdef-less word (`rclass.py`
+                    // `InstanceRepr._setup_repr`). An int-bank raw-address
+                    // niche (`Option<&MappedObj>`, `Option<fn>`,
+                    // `Option<&RawStruct>`) keeps the Address / SomePtr
+                    // word for Discriminant / `is_` / `null_raw`
+                    // (`rnone.py` `rtype_is_None`). The Some payload of a
+                    // storage-raw enum pointer is that same word retyped as
+                    // `Ptr(T)` (`lltype.py` `cast_int_to_ptr` /
+                    // `ann_cast_int_to_ptr`); a fn-ptr niche and a
+                    // storage-raw struct overlay stay identity.
+                    // Promoting the Address to Instance is the
+                    // `Ptr ∪ Instance` union `project_struct_rows` refuses.
                     if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
-                        return self.resolve_place(mir_bb, *inner);
+                        let option_ty = clone_tyref(&inner.ty);
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        // Storage-raw ADT pointer first (`lltype.py`
+                        // `cast_int_to_ptr`): a Struct overlay is already
+                        // `Ptr(Struct Raw)` (`tyref_niche_option_payload_paint`),
+                        // so identity wins over the `cast_instance`
+                        // class-root arm. Enum keeps the Address → Ptr 2-cast.
+                        if let Some(ptr_ty) = self.payload_storage_raw_ptr_lltype(&option_ty) {
+                            if self.payload_storage_raw_pointee_is_struct(&option_ty) {
+                                return Ok(base);
+                            }
+                            let bb_id = self.emit_bb(mir_bb);
+                            return Ok(emit_dest_typed_cast_int_to_ptr(
+                                &mut self.graph,
+                                bb_id,
+                                base,
+                                ptr_ty,
+                            ));
+                        }
+                        if self.option_niche_is_int_bank(&option_ty) {
+                            return Ok(base);
+                        }
+                        if let Some(root) = self.option_niche_payload_class_root(&option_ty) {
+                            return Ok(self.cast_ref_word(mir_bb, base, &root));
+                        }
+                        return Ok(base);
                     }
                     // A niche u8-window `Option` (`Option<&[u8]>` / Charon
                     // `Option<[u8]>`) is the window itself: `None` is a null
@@ -7109,7 +7427,8 @@ impl<'a> Lowering<'a> {
                 .1 == majit_ir::value::Type::Void
                     || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc))
                     || ((result_owner == "Tuple" || result_owner == "Array")
-                        && name.starts_with("__pos_"));
+                        && name.starts_with("__pos_"))
+                    || crate::front::result_exc::type_spelling_is_uninhabited(&field_ty);
                 AggregateField {
                     name,
                     void,
@@ -7204,10 +7523,12 @@ impl<'a> Lowering<'a> {
         let name_path = td.item_meta.name_path();
         let head_adt = head.as_object();
         let type_leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);
-        // Crate prefix in front of the identity, so joining `owner_path` with
-        // the identity (plus suffix) still yields the full declaration path.
-        // A crate-root tombstone keeps the crate in the identity, so the
-        // prefix is empty.
+        // Struct intern keys a dotted `owner_path.join(".")` path
+        // (`flowspace_adapter` struct-ctor arm). Keep the crate segment
+        // so that join still yields the declaration path. A crate-root
+        // tombstone keeps the crate in the identity, so the prefix is
+        // empty. Enum variant intern does not use this prefix: it spells
+        // [`enum_ctor_class_identity`] alone (harvested `canon_base`).
         let owner_path = if name_path == type_leaf {
             Vec::new()
         } else if let Some(prefix) = name_path
@@ -7292,7 +7613,6 @@ impl<'a> Lowering<'a> {
             }
             (TypeDeclKind::Enum(variants), Some(idx)) => {
                 let v = variants.get(idx as usize)?;
-                let mut variant_owner = owner_path;
                 // A reference-payload workspace enum instantiation
                 // constructs into its per-instantiation variant class
                 // (`Result<Tuple>::Ok`), the same spelling the receiver
@@ -7308,14 +7628,18 @@ impl<'a> Lowering<'a> {
                 // that TypeDeclRef when the head has no type arguments,
                 // rather than intern the bare template (`Option::Some`)
                 // and union every payload onto one `__pos_0`.
+                //
+                // Owner identity is [`enum_ctor_class_identity`] — the
+                // harvested `canon_base` / `variant_canon` spelling
+                // (`class_identity_spelling` plus suffix). Do not re-prefix
+                // the crate: that would intern a second class for one
+                // TypeDecl (`bookkeeper.py` `getuniqueclassdef(cls)`).
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
                 let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
-                let leaf = match suffix {
-                    Some(suffix) => majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix),
-                    None => type_leaf,
-                };
-                variant_owner.push(leaf);
+                let leaf =
+                    enum_ctor_class_identity(&name_path, suffix.as_deref(), self.tombstoned_leaves);
+                let variant_owner = vec![leaf];
                 // Same dest/head substitution as the Struct arm: a field
                 // whose declaration is a type variable (`Option<T>::Some`
                 // `__pos_0: T`) has to see `()` / `i64` / … so

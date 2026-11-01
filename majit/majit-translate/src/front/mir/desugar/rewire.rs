@@ -2,14 +2,30 @@
 
 use super::*;
 
+/// `FunctionDesc.cachedgraph` copy: `{leaf}__spec_{readable}_{hash}`.
+/// The template path is what the core-callee predicates match.
+fn template_leaf_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let Some((parent, leaf)) = path.rsplit_once("::") else {
+        return std::borrow::Cow::Borrowed(path);
+    };
+    match leaf.split_once("__spec_") {
+        Some((head, _)) => std::borrow::Cow::Owned(format!("{parent}::{head}")),
+        None => std::borrow::Cow::Borrowed(path),
+    }
+}
+
 /// `core::result::<Impl>::map_err` / `std::result::Result::map_err`.
 ///
 /// The leaf name `map_err` is not enough: an extension trait can publish
 /// the same method on `Result` and Charon still emits `CallTarget::Method`.
 /// Gate on the resolved callee path so a foreign `map_err` stays residual.
+/// A specialized copy keeps that path with a `cachedgraph` leaf.
 pub(in crate::front::mir) fn is_core_result_map_err_path(path: &str) -> bool {
     matches!(
-        path.split("::").collect::<Vec<_>>().as_slice(),
+        template_leaf_path(path)
+            .split("::")
+            .collect::<Vec<_>>()
+            .as_slice(),
         ["core" | "std", "result", "<Impl>" | "Result", "map_err"]
             | ["result", "<Impl>" | "Result", "map_err"]
     )
@@ -882,7 +898,7 @@ pub(in crate::front::mir) fn rewire_option_filter_diamond(
     flow_result: Variable,
     name: &str,
 ) -> Result<(), String> {
-    use crate::front::option_map_or::emit_narrow;
+    use crate::front::option_variant::emit_narrow;
     use crate::front::option_variant::{
         close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
     };
@@ -1064,7 +1080,7 @@ pub(in crate::front::mir) fn emit_disc_callable(
     } else {
         site.call_result_ty.clone()
     };
-    crate::front::option_closure_select::emit_callable(
+    crate::front::result_exc::emit_callable(
         graph,
         block,
         env,
@@ -1088,7 +1104,7 @@ pub(in crate::front::mir) fn build_disc_arm(
     is_then: bool,
     name: &str,
 ) -> Result<Variable, String> {
-    use crate::front::option_map_or::emit_narrow;
+    use crate::front::option_variant::emit_narrow;
     use crate::front::option_variant::{emit_option_variant, emit_sum_variant, map_source};
 
     match (site.kind, is_then) {
@@ -1131,7 +1147,7 @@ pub(in crate::front::mir) fn build_disc_arm(
         }
         (DiscCombinator::OptionOkOrElse, false) => {
             let env = disc_callable_env(site, sources, inputs, extra, name)?;
-            let err = crate::front::option_closure_select::emit_callable(
+            let err = crate::front::result_exc::emit_callable(
                 graph,
                 block,
                 env,
@@ -1515,7 +1531,7 @@ impl CombinatorArmExits<'_> {
         } else {
             site.call_result_ty.clone()
         };
-        let value = crate::front::option_closure_select::emit_callable(
+        let value = crate::front::result_exc::emit_callable(
             graph,
             block,
             env,
@@ -1534,7 +1550,7 @@ impl CombinatorArmExits<'_> {
         let value = if self.raising_callable {
             value
         } else {
-            crate::front::option_map_or::emit_narrow(graph, block, value, &site.call_result_class)
+            crate::front::option_variant::emit_narrow(graph, block, value, &site.call_result_class)
         };
         let remap_arg = |arg: &LinkArg, fresh: &[(&Option<LinkArg>, &Variable)]| match arg {
             LinkArg::Value(v) if v == self.flow_result => Some(LinkArg::Value(value.clone())),
@@ -2450,7 +2466,7 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
     return_owners: Option<&ResultTryReturnOwners>,
 ) -> Result<(), String> {
     use crate::flowspace::model::Constant;
-    use crate::front::option_map_or::emit_narrow;
+    use crate::front::option_variant::emit_narrow;
     use crate::front::option_variant::{emit_sum_variant, map_source};
     use crate::front::result_exc::{
         assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,

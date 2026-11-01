@@ -252,8 +252,8 @@ fn build_trait_assoc_index(rows: &[serde_json::Value]) -> TraitAssocIndex {
 ///
 /// The corpus holds ~208 k of these across the three pyre artefacts —
 /// 66 MB of JSON that costs 1.60 GB as `Value` trees (21.4× measured),
-/// while the consumers (`front::mir`, `front::result_exc`,
-/// `front::option_try`) reach only the ids their lowered functions
+/// while the consumers (`front::mir`, `front::result_exc`)
+/// reach only the ids their lowered functions
 /// mention.  Parsing on demand keeps the untouched majority at raw size.
 #[derive(Debug)]
 pub(crate) struct DedupBody {

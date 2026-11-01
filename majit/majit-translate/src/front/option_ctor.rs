@@ -58,7 +58,9 @@ fn is_core_option_path(head: &[String], tail: &str) -> bool {
         format!("{}::{tail}", head.join("::"))
     };
     let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
-    base == "core::option::Option"
+    // Recast dest (`resolve_aggregate_adt`) spells the harvested
+    // identity (`class_identity_spelling` of the TypeDecl `name_path`).
+    base == "core::option::Option" || base == "option::Option"
 }
 
 /// The variant-leaf spelling: `(leaf, discriminant)` for a niladic
@@ -135,5 +137,19 @@ mod tests {
             "Some",
         );
         assert_eq!(option_variant_ctor_tag(&wrong_head), None);
+    }
+
+    #[test]
+    fn identity_spelling_matches_name_path_owner() {
+        let ident = CallTarget::synthetic_transparent_ctor_with_owner(
+            owner(&["option::Option<i64>"]),
+            "Some",
+        );
+        assert_eq!(option_variant_ctor_tag(&ident), Some(("Some", 1)));
+        let ident_none = CallTarget::synthetic_transparent_ctor_with_owner(
+            owner(&["option::Option<i64>"]),
+            "None",
+        );
+        assert_eq!(option_variant_ctor_tag(&ident_none), Some(("None", 0)));
     }
 }

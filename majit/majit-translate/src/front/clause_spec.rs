@@ -236,13 +236,12 @@ fn residual_spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     spec_type_name(v, llbc, depth, true)
 }
 
-/// `generics.types` / `generics.const_generics` when neither list contains
-/// a depth-0 type or const-generic variable. `None` leaves the callee
-/// unspecialized.
-pub(crate) fn concrete_type_args(
-    generics: &Value,
-    llbc: &Llbc,
-) -> Option<(Vec<Value>, Vec<Value>)> {
+/// `generics.types` / `generics.const_generics`, peeling a region binder.
+/// Unlike [`concrete_type_args`], a nested TypeVar (a closure `F` whose
+/// trait-ref JSON still names a variable) does not drop the lists: intern
+/// still substitutes `Option<T>` from `types[0]` (`specialize.py`
+/// `FunctionDesc.cachedgraph`).
+pub(crate) fn generic_args_lists(generics: &Value) -> (Vec<Value>, Vec<Value>) {
     let generics = peel_generic_args(generics);
     let types = generics
         .get("types")
@@ -254,6 +253,17 @@ pub(crate) fn concrete_type_args(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    (types, const_generics)
+}
+
+/// `generics.types` / `generics.const_generics` when neither list contains
+/// a depth-0 type or const-generic variable. `None` leaves the callee
+/// unspecialized.
+pub(crate) fn concrete_type_args(
+    generics: &Value,
+    llbc: &Llbc,
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    let (types, const_generics) = generic_args_lists(generics);
     let open = |items: &[Value], space: Space| {
         items
             .iter()
@@ -577,7 +587,12 @@ pub(crate) fn substituted_signature(
     }
 }
 
-fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value]) -> TyRef {
+pub(crate) fn subst_tyref(
+    ty: &TyRef,
+    llbc: &Llbc,
+    types: &[Value],
+    const_generics: &[Value],
+) -> TyRef {
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {
@@ -1821,6 +1836,87 @@ mod tests {
             wrapped.pointer("/skip_binder"),
             Some(&replacement),
             "{wrapped}"
+        );
+    }
+
+    /// `Deduplicated` of a generic Adt whose `types` intern a TypeVar
+    /// unwraps; slot 0 becomes the replacement (`ArcInner.data`).
+    #[test]
+    fn substitute_type_vars_unwraps_deduplicated_adt_containing_typevar() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let typevar = json!({"TypeVar": {"Bound": [0, 0]}});
+        let inner_adt = json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"Deduplicated": 2}],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let replacement = json!({
+            "Adt": {
+                "id": 152,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [{"Value": [2, typevar]}],
+                        "output": {"Value": [387, inner_adt]}
+                    },
+                    "body": null
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert_eq!(
+            llbc.dedup_body(2),
+            Some(&json!({"TypeVar": {"Bound": [0, 0]}}))
+        );
+        let mut place = json!({"ty": {"Deduplicated": 387}});
+        substitute_type_vars(&mut place, &llbc, &[replacement.clone()], &[]);
+        assert_eq!(
+            place,
+            json!({
+                "ty": {
+                    "Adt": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [],
+                            "types": [replacement],
+                            "const_generics": [],
+                            "trait_refs": []
+                        },
+                        "builtin": null
+                    }
+                }
+            }),
+            "{place}"
         );
     }
 

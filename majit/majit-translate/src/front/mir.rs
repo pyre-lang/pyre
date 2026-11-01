@@ -712,9 +712,26 @@ fn ref_enum_instantiation_of_adt(
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     let def_id = type_decl_ref_adt_id(adt)?;
     let name_path = llbc.type_by_id(def_id)?.item_meta.name_path();
+    let node = {
+        let mut m = serde_json::Map::new();
+        m.insert("Adt".into(), serde_json::Value::Object(adt.clone()));
+        serde_json::Value::Object(m)
+    };
+    // A pointer-niche Option is the null word (`tyref_is_niche_option`,
+    // including Option of a thin Arc/Rc/Box and OwnerRootGuard). Intern of
+    // a tagged variant class would mint `__pos_0` on a ClassDef the
+    // FieldRead identity fold never reads; CAST then getattr a missing attr.
+    if lltype::tyref_is_niche_option(&TyRef::Other(node), llbc) {
+        return None;
+    }
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
-    // `Deref::Target` class so the payload attr and the cast agree.
+    // `Deref::Target` class so the payload attr and the cast agree. A
+    // pointer-niche Option payload is `*mut` of the pointee: CAST
+    // strips `&`, and intern of `Option<&T>` as `Option<T>` would
+    // getattr a tagged class over a pointer word. Type-arg nodes from
+    // call generics are hash-consed (`Value` / `Deduplicated`); intern
+    // ROW peels those wrappers so the niche test sees the Option ADT.
     let args = render_adt_payload_type_args(
         adt,
         llbc,
@@ -750,6 +767,12 @@ fn ref_enum_instantiation_of_adt(
 ///     these pre-mints the variant subclasses before
 ///     `assign_inheritance_ids`; otherwise the discriminant narrowing mints
 ///     them lazily afterwards, unnumbered (per-graph Skip→legacy walker).
+///   - CONCRETE CALLEE SIGNATURES — a `RegularCall` `Fun { id }` whose
+///     generic arguments are already concrete
+///     (`clause_spec::concrete_type_args`) specialises the callee
+///     signature (`substituted_signature`). The caller's locals need not
+///     name the enum: `Option::map`'s first input is `Option<T>`, and the
+///     substituted `T` intern the instantiation the spec copy will read.
 fn collect_ref_enum_instantiations(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -757,7 +780,17 @@ fn collect_ref_enum_instantiations(
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Vec<RefEnumInst> {
     let mut found: std::collections::HashSet<RefEnumInst> = std::collections::HashSet::new();
+    let mut queue: Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut seen: std::collections::HashSet<(u64, String)> = std::collections::HashSet::new();
     let filtered = module_filter.is_some() || function_filter.is_some();
+    // TypeDecl field types (`Vec<Option<T>>` on a struct) are not in any
+    // Unstructured body. Walk them when the harvest is whole-program so a
+    // payload that only lives in a field still intern's its variant rows.
+    if !filtered {
+        for td in llbc.iter_type_decls() {
+            intern_enums_from_type_decl(llbc, gc_struct_ids, td, &mut found);
+        }
+    }
     for fd in llbc.iter_local_fns() {
         if filtered {
             if fd.is_global_initializer().is_some() {
@@ -770,57 +803,249 @@ fn collect_ref_enum_instantiations(
                 continue;
             }
         }
+        intern_enums_from_signature(llbc, gc_struct_ids, fd, &mut found);
         let Some(u) = fd.unstructured() else {
             continue;
         };
-        // Constructor heads that exist only on an `on_unwind` cleanup chain
-        // are not part of the lowered body. The local-type scan below still
-        // sees an instantiation a normal block only reads.
-        let forward_blocks = forward_reachable_mask(llbc, &u);
-        for (bb_idx, bb) in u.body.iter().enumerate() {
-            if !forward_blocks[bb_idx] {
-                continue;
-            }
-            for st in &bb.statements {
-                let Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, _))) = st.stmt_kind_ref()
-                else {
-                    continue;
-                };
-                if let Some(head) = kind
-                    .get("Adt")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|adt| adt.first())
-                    .and_then(serde_json::Value::as_object)
-                    && let Some(pair) = ref_enum_instantiation_of_adt(head, llbc, gc_struct_ids)
-                {
-                    found.insert(pair);
-                }
-                // The aggregate head is sometimes a bare type_id with no
-                // `generics`. The destination place still carries the
-                // instantiated ADT, the same source constructors and
-                // field reads use for the ClassDef key.
-                if let Some(adt) = tyref_adt_map(&place.ty, llbc)
-                    && let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids)
-                {
-                    found.insert(pair);
-                }
-            }
+        intern_enums_from_unstructured(llbc, gc_struct_ids, &u, &mut found);
+        intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
+    }
+    // Spec copies are not in original LLBC (`specialize.py`
+    // `FunctionDesc.cachedgraph`). Walk each concrete generic callee
+    // through its substituted signature and body so `Option<T>` locals
+    // inside `map` / nested RegularCalls intern before numbering.
+    while let Some((id, types, const_generics, trait_refs)) = queue.pop() {
+        let Some(callee) = llbc.fn_by_id(id) else {
+            continue;
+        };
+        let sig = crate::front::clause_spec::substituted_signature(
+            &callee.signature,
+            llbc,
+            &types,
+            &const_generics,
+        );
+        for ty in sig.inputs.iter().chain(std::iter::once(&sig.output)) {
+            intern_enum_from_ty(llbc, gc_struct_ids, ty, &mut found);
         }
-        for local in &u.locals.locals {
-            let Some(adt) = tyref_node(&local.ty, llbc)
-                .and_then(|n| strip_ty_wrappers(n, llbc))
-                .and_then(serde_json::Value::as_object)
-                .and_then(|n| n.get("Adt"))
-                .and_then(serde_json::Value::as_object)
-            else {
-                continue;
-            };
-            if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids) {
-                found.insert(pair);
-            }
+        if let Some(u) = crate::front::clause_spec::substituted_unstructured(
+            callee,
+            llbc,
+            &trait_refs,
+            &types,
+            &const_generics,
+        ) {
+            intern_enums_from_unstructured(llbc, gc_struct_ids, &u, &mut found);
+            intern_enqueue_generic_calls(llbc, &u, &mut queue, &mut seen);
         }
     }
     found.into_iter().collect()
+}
+
+fn intern_enum_from_ty(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    ty: &TyRef,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+) {
+    intern_enum_from_ty_at(llbc, gc_struct_ids, ty, found, 0);
+}
+
+fn intern_enum_from_ty_at(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    ty: &TyRef,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+    depth: usize,
+) {
+    if depth > 12 {
+        return;
+    }
+    let Some(adt) = tyref_adt_map(ty, llbc) else {
+        return;
+    };
+    if let Some(pair) = ref_enum_instantiation_of_adt(adt, llbc, gc_struct_ids) {
+        found.insert(pair);
+    }
+    // Nested payloads (`Vec<Option<T>>`, `HashMap<K, Option<T>>`) are
+    // not the head ADT. Walk the type arguments so a tagged Option that
+    // only appears inside another constructor still intern's.
+    let Some(types) = type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+    else {
+        return;
+    };
+    for t in types {
+        intern_enum_from_ty_at(
+            llbc,
+            gc_struct_ids,
+            &TyRef::Other(t.clone()),
+            found,
+            depth + 1,
+        );
+    }
+}
+
+fn intern_enums_from_signature(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    fd: &FunDecl,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+) {
+    for ty in fd
+        .signature
+        .inputs
+        .iter()
+        .chain(std::iter::once(&fd.signature.output))
+    {
+        intern_enum_from_ty(llbc, gc_struct_ids, ty, found);
+    }
+}
+
+fn intern_enums_from_type_decl(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    td: &TypeDecl,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+) {
+    match &td.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            for f in fields {
+                intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found);
+            }
+        }
+        TypeDeclKind::Enum(variants) => {
+            for v in variants {
+                for f in &v.fields {
+                    intern_enum_from_ty(llbc, gc_struct_ids, &f.ty, found);
+                }
+            }
+        }
+        TypeDeclKind::Alias(body) => {
+            intern_enum_from_ty(llbc, gc_struct_ids, &TyRef::Other(body.clone()), found);
+        }
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
+    }
+}
+
+fn intern_enums_from_unstructured(
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    u: &Unstructured,
+    found: &mut std::collections::HashSet<RefEnumInst>,
+) {
+    // Constructor heads that exist only on an `on_unwind` cleanup chain
+    // are not part of the lowered body. The local-type scan below still
+    // sees an instantiation a normal block only reads.
+    let forward_blocks = forward_reachable_mask(llbc, u);
+    for (bb_idx, bb) in u.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
+            intern_enum_from_ty(llbc, gc_struct_ids, &call.dest.ty, found);
+            for arg in &call.args {
+                match arg {
+                    Operand::Copy(place) | Operand::Move(place) => {
+                        intern_enum_from_ty(llbc, gc_struct_ids, &place.ty, found);
+                    }
+                    Operand::Const(_) => {}
+                }
+            }
+        }
+        for st in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
+                continue;
+            };
+            intern_enum_from_ty(llbc, gc_struct_ids, &place.ty, found);
+            match rvalue {
+                Rvalue::Aggregate(kind, _) => {
+                    if let Some(head) = kind
+                        .get("Adt")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|adt| adt.first())
+                        .and_then(serde_json::Value::as_object)
+                        && let Some(pair) = ref_enum_instantiation_of_adt(head, llbc, gc_struct_ids)
+                    {
+                        found.insert(pair);
+                    }
+                }
+                Rvalue::Discriminant(src) => {
+                    intern_enum_from_ty(llbc, gc_struct_ids, &src.ty, found);
+                }
+                _ => {}
+            }
+        }
+    }
+    for local in &u.locals.locals {
+        intern_enum_from_ty(llbc, gc_struct_ids, &local.ty, found);
+    }
+}
+
+fn intern_enqueue_generic_calls(
+    llbc: &Llbc,
+    u: &Unstructured,
+    queue: &mut Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)>,
+    seen: &mut std::collections::HashSet<(u64, String)>,
+) {
+    let forward_blocks = forward_reachable_mask(llbc, u);
+    for (bb_idx, bb) in u.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        intern_enqueue_regular_call(llbc, reg, queue, seen);
+    }
+}
+
+fn intern_enqueue_regular_call(
+    llbc: &Llbc,
+    reg: &RegularCall,
+    queue: &mut Vec<(u64, Vec<Value>, Vec<Value>, Vec<Value>)>,
+    seen: &mut std::collections::HashSet<(u64, String)>,
+) {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return;
+    };
+    let Some(callee) = llbc.fn_by_id(*id) else {
+        return;
+    };
+    if !crate::front::clause_spec::decl_is_generic(callee) {
+        return;
+    }
+    // A later type arg may still name a TypeVar (closure `F` trait-ref
+    // JSON). `concrete_type_args` would drop the whole call; intern still
+    // needs `Option<T>` from `types[0]` (`specialize.py`
+    // `FunctionDesc.cachedgraph`). A leftover TypeVar suffix is skipped
+    // by `intern_enum_from_ty`.
+    let (types, const_generics) = crate::front::clause_spec::generic_args_lists(&reg.generics);
+    if types.is_empty() && const_generics.is_empty() {
+        return;
+    }
+    let key = (*id, serde_json::to_string(&types).unwrap_or_default());
+    if !seen.insert(key) {
+        return;
+    }
+    let trait_refs = intern_call_trait_refs(&reg.generics);
+    queue.push((*id, types, const_generics, trait_refs));
+}
+
+fn intern_call_trait_refs(generics: &Value) -> Vec<Value> {
+    generics
+        .get("trait_refs")
+        .or_else(|| {
+            generics
+                .get("skip_binder")
+                .and_then(|binder| binder.get("trait_refs"))
+        })
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Substitute the instantiation's concrete type args into a variant
@@ -962,9 +1187,17 @@ fn register_ref_enum_instantiation_rows(
         // discriminant-map mirror.
         let leaf_survived = enum_variant_by_discriminant.contains_key(&leaf);
         let mut bases: Vec<&str> = vec![name.as_str()];
+        // FieldRead / getuniqueclassdef owner_root is crate-stripped
+        // (`class_identity_spelling` / `strip_crate_prefix`):
+        // `option::Option<CodePoint>::Some`, not `core::option::Option<…>`.
+        // A withdrawn leaf still needs this key; the qualified intern
+        // spelling is not the lookup lowering emits. The bare leaf stays
+        // gated: it collides across modules sharing an enum name.
+        if !canon_base.is_empty() && canon_base != name {
+            bases.push(canon_base.as_str());
+        }
         if leaf_survived {
             bases.push(leaf.as_str());
-            bases.push(canon_base.as_str());
         }
         for v in variants {
             if v.fields.is_empty() {
@@ -979,12 +1212,16 @@ fn register_ref_enum_instantiation_rows(
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = field_decl_name(i, f);
-                let concrete = substitute_field_type(
-                    &f.ty,
-                    &inst.args,
+                let concrete = intern_payload_registry_spelling(
                     llbc,
-                    gc_struct_ids,
-                    &std::collections::HashSet::<String>::new(),
+                    &substitute_field_type(
+                        &f.ty,
+                        &inst.args,
+                        llbc,
+                        gc_struct_ids,
+                        &std::collections::HashSet::<String>::new(),
+                    ),
+                    struct_fields,
                 );
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
@@ -997,6 +1234,18 @@ fn register_ref_enum_instantiation_rows(
                     let len = pair_len_field_name(&fname);
                     rows.push(field_decl_row(i, f, "usize"));
                     rows.push(crate::front::semantic::FieldRow::named(len, "usize"));
+                    continue;
+                }
+                // A sole unresolved associated-type projection is one GC
+                // word (`InstanceRepr`), the same intern Opaque payloads
+                // take. Nested unresolved stays fail-closed.
+                if lltype::type_arg_is_whole_unresolved_projection(trimmed) {
+                    if !single_field {
+                        registrable = false;
+                        break;
+                    }
+                    intern_projection_payload_spelling(trimmed, struct_fields);
+                    rows.push(field_decl_row(i, f, concrete));
                     continue;
                 }
                 // Register a field only when it is layout-safe for the
@@ -1019,6 +1268,9 @@ fn register_ref_enum_instantiation_rows(
             }
             if !registrable {
                 continue;
+            }
+            for row in &rows {
+                intern_opaque_payload_spelling(llbc, &row.ty, struct_fields);
             }
             // Mirror the unsuffixed dual-publish so the suffixed variant path
             // the narrowing builds — `canonical_struct_name("{base}{suffix}")
@@ -1043,6 +1295,165 @@ fn register_ref_enum_instantiation_rows(
                 record_struct_id(struct_ids, key, sid);
             }
         }
+        // Suffixed enum BASE (`{base}{suffix}`): copy the unsuffixed
+        // `__discriminant` row so `getuniqueclassdef` of a tagged
+        // instantiation (`Option<char>`) has a classdef (`rclass.py`
+        // `getuniqueclassdef`). `lookup_fields` strips `<…>`; the
+        // bookkeeper exact-key (`reg.fields.get`) consumes this spelling.
+        // Copy the `__discriminant` row even when the unsuffixed base
+        // carries extra rows. Requiring the exact `[__discriminant]`
+        // sentinel dropped a tagged primitive instantiation
+        // (`Option<char>`) whose template later gained a payload alias.
+        let disc_rows = bases.iter().find_map(|base| {
+            struct_fields.fields.get(*base).and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.name == "__discriminant")
+                    .cloned()
+                    .map(|row| vec![row])
+            })
+        });
+        if let Some(disc_rows) = disc_rows {
+            for base in &bases {
+                struct_fields
+                    .fields
+                    .entry(format!("{base}{}", inst.suffix))
+                    .or_insert_with(|| disc_rows.clone());
+            }
+        }
+        for arg in &inst.args {
+            intern_opaque_payload_spelling(
+                llbc,
+                &intern_payload_registry_spelling(llbc, arg, struct_fields),
+                struct_fields,
+            );
+        }
+    }
+}
+
+/// Empty registry row for a whole-arg unresolved associated-type
+/// projection. `intern_opaque_payload_spelling` looks up an Opaque
+/// TypeDecl and skips `??`; this spelling has none. One GC word
+/// (`InstanceRepr`), same as that Opaque arm.
+fn intern_projection_payload_spelling(
+    spelling: &str,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+) {
+    let spelling = spelling.trim();
+    if !lltype::type_arg_is_whole_unresolved_projection(spelling) {
+        return;
+    }
+    struct_fields
+        .fields
+        .entry(spelling.to_string())
+        .or_insert_with(Vec::new);
+}
+
+/// Intern payload field types render as a TypeDecl leaf
+/// (`charon_adt_to_ast_string`). The intern pass runs per LLBC, before
+/// the cross-crate `harden_duplicate_leaf_metadata` that withdraws a
+/// duplicate last-segment. A leaf still present in this crate's
+/// `struct_fields` can vanish from the merged registry; `project_struct_field_type`
+/// of that spelling is then Impossible and getattr of the interned
+/// variant's `__pos_0` blocks. Map a TypeDecl leaf onto the unique
+/// declaration whose crate-stripped path or full `name_path` is already
+/// registered, even while the leaf alias still exists. Two TypeDecls
+/// sharing the leaf keep the original spelling (fail-closed). The intern
+/// `<…>` class suffix is unchanged: CAST owner_root still uses the leaf
+/// render.
+fn intern_payload_registry_spelling(
+    llbc: &Llbc,
+    spelling: &str,
+    struct_fields: &crate::front::semantic::StructFieldRegistry,
+) -> String {
+    let spelling = spelling.trim();
+    if spelling.is_empty()
+        || spelling.contains('<')
+        || spelling.contains("::")
+        || spelling.starts_with('*')
+        || spelling.starts_with('&')
+        || spelling.starts_with('[')
+        || spelling.starts_with('(')
+    {
+        return spelling.to_string();
+    }
+    let mut resolved: Option<String> = None;
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+        if spelling != leaf {
+            continue;
+        }
+        // A fieldless enum is its discriminant integer, not a ClassDef.
+        // Unique-leaf remap to the declared tag width so getattr of
+        // `Result::Err.__pos_0` is Integer (`tyref_to_value_type`).
+        if let Some(int_ty) = fieldless_enum_payload_int_ty(td, llbc) {
+            match resolved.as_ref() {
+                Some(prev) if prev != &int_ty => return spelling.to_string(),
+                Some(_) => {}
+                None => resolved = Some(int_ty),
+            }
+            continue;
+        }
+        let canon = strip_crate_prefix(&name);
+        let key = if !canon.is_empty() && struct_fields.fields.contains_key(&canon) {
+            canon
+        } else if struct_fields.fields.contains_key(&name) {
+            name
+        } else {
+            continue;
+        };
+        match resolved.as_ref() {
+            Some(prev) if prev != &key => return spelling.to_string(),
+            Some(_) => {}
+            None => resolved = Some(key),
+        }
+    }
+    resolved.unwrap_or_else(|| spelling.to_string())
+}
+
+/// Publish an empty struct row for a `TypeDeclKind::Opaque` payload the
+/// interned variant names. `derive_program_metadata` skips Opaque decls,
+/// so `project_struct_field_type` of that leaf was Impossible and
+/// Blocked getattr of `Some.__pos_0` (`rclass.py` `s_getattr`). An empty
+/// registry entry is the same registered-struct arm a Struct TypeDecl
+/// already takes; the payload stays one GC word (`InstanceRepr`).
+fn intern_opaque_payload_spelling(
+    llbc: &Llbc,
+    spelling: &str,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+) {
+    let spelling = spelling.trim();
+    if spelling.is_empty()
+        || spelling.contains("??")
+        || is_primitive_payload_type(spelling)
+        || spelling.contains('<')
+        || spelling.starts_with('*')
+        || spelling.starts_with('&')
+        || spelling.starts_with('[')
+        || spelling.starts_with('(')
+    {
+        return;
+    }
+    for td in llbc.iter_type_decls() {
+        if !matches!(td.kind, TypeDeclKind::Opaque) {
+            continue;
+        }
+        let name = td.item_meta.name_path();
+        let leaf = name.rsplit("::").next().unwrap_or(name.as_str());
+        let canon = strip_crate_prefix(&name);
+        if spelling != name && spelling != leaf && spelling != canon {
+            continue;
+        }
+        for key in [name.as_str(), canon.as_str(), leaf] {
+            if key.is_empty() {
+                continue;
+            }
+            struct_fields
+                .fields
+                .entry(key.to_string())
+                .or_insert_with(Vec::new);
+        }
+        return;
     }
 }
 
@@ -1694,6 +2105,14 @@ impl<'l> CrateLowering<'l> {
         if fun_decl_is_jit_conditional_call(fd) {
             return false;
         }
+        // A foreign generic template is not a graph of this artefact
+        // (`specialize.py` `FunctionDesc.cachedgraph`). Spec copies are
+        // declared from the caller's concrete arguments. A local generic
+        // template stays: this artefact's own `cachedgraph` (`execute_opcode_step`
+        // with a clause) is the dispatcher the codewriter looks up.
+        if crate::front::clause_spec::decl_is_generic(fd) && !fd.item_meta.is_local {
+            return false;
+        }
         let fn_path = decl_fn_path(&module_path, &name);
         !self.state.not_rpython.contains(&fn_path)
     }
@@ -1852,7 +2271,11 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+        if result_exc_ok_is_unit(
+            &fd.signature.output,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        ) {
             graph.return_type = Some("()".to_string());
         }
         Some(stamp.apply(graph))
@@ -2062,7 +2485,18 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+        // Local 0 is the return place. A clause-spec body is the FunDecl
+        // with type arguments substituted, so that local is the instantiated
+        // output. The template signature still names the generic Result.
+        let output = spec
+            .body
+            .body
+            .locals
+            .locals
+            .first()
+            .map(|local| &local.ty)
+            .unwrap_or(&fd.signature.output);
+        if result_exc_ok_is_unit(output, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
         }
         spec.header.graph_stamp().apply(graph)
@@ -4755,6 +5189,22 @@ pub(crate) fn class_identity_spelling(
     }
 }
 
+/// Instantiated enum class identity: [`class_identity_spelling`] plus a
+/// `<…>` suffix. Harvested `struct_fields` (`derive_program_metadata`
+/// `canon_base`) and recast dest (`resolve_aggregate_adt` variant owner)
+/// share this spelling (`bookkeeper.py` `getuniqueclassdef(cls)`).
+pub(crate) fn enum_ctor_class_identity(
+    name_path: &str,
+    suffix: Option<&str>,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let identity = class_identity_spelling(name_path, tombstoned);
+    match suffix {
+        Some(s) if !s.is_empty() => majit_ir::descr::with_instantiation_suffix(&identity, s),
+        _ => identity,
+    }
+}
+
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
     DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
@@ -5612,13 +6062,15 @@ fn instance_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// A `Result<(), PyError>` scoped callee returns void after the
 /// exception-link lowering; its returnblock is widened so the call
 /// descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
+/// `output` is the body's declared return type: the FunDecl signature
+/// for a template, local 0 after substitution for a clause spec.
 fn result_exc_ok_is_unit(
-    fd: &FunDecl,
+    output: &TyRef,
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> bool {
-    crate::front::result_exc::tyref_is_result_of_carrier(&fd.signature.output, llbc, error_carrier)
-        && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc)
+    crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, error_carrier)
+        && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc)
 }
 
 fn lower_unstructured_with_static_addrs_and_attrs(
@@ -5668,32 +6120,46 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // sites the body lowering captured.  Both run before
     // `simplify_lowered_graph` so the freed shell ops feed the same
     // dead-op sweep the Abort → RaiseImplicit fold uses.
+    //
+    // Local 0 is the return place. A clause-spec body is the FunDecl
+    // with type arguments substituted, so that local is the instantiated
+    // output. The template signature still names the generic Result.
+    let output = if spec_body {
+        u.locals
+            .locals
+            .first()
+            .map(|local| &local.ty)
+            .unwrap_or(&fd.signature.output)
+    } else {
+        &fd.signature.output
+    };
     let result_exc_callee = crate::front::result_exc::tyref_is_result_of_carrier(
-        &fd.signature.output,
+        output,
         llbc,
         static_addrs.error_carrier,
     );
-    let result_exc_ok_is_unit = result_exc_ok_is_unit(fd, llbc, static_addrs.error_carrier);
+    let result_exc_ok_is_unit =
+        result_exc_callee && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         lo.emit_pending_vec_frees();
         lo.graph.return_class_root = dont_look_inside_return_class_root(
-            &fd.signature.output,
+            output,
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
         lo.graph.return_can_be_none = dont_look_inside_return_can_be_none(
-            &fd.signature.output,
+            output,
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
         lo.graph.return_is_str =
-            dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
+            dont_look_inside_return_is_str(output, llbc, static_addrs.error_carrier);
         lo.graph.return_container_root = dont_look_inside_return_container_root(
-            &fd.signature.output,
+            output,
             llbc,
             static_addrs.error_carrier,
             gc_struct_ids,
@@ -5763,15 +6229,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.graph.name, site.call_once_owner
             )));
         }
-        // Before simplify and `result_exc`. Simplify renames the call's
-        // result, and `result_exc` turns `map_err(...)?` into a rewrap
-        // handler that is not the Err shell this rewrite bypasses. The
-        // value-encoded Ok/Err arms are what `result_exc` then lowers,
-        // the same order as an explicit `match`.
-        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
-            &mut lo.graph,
-            &lo.result_map_err_sites,
-        );
+        // Carrier map_err rewrite waits until after result_exc hung
+        // LastException on the dest-is-carrier call. Extra-simplify still
+        // runs first: it may rename the recorded result variable.
+
         // `map(it, f).collect()` denotes a loop. Rewrite it at the
         // construction site — where `f` is a concrete closure ADT —
         // into `Vec::new` + `next` + `call_mut` + `push` BEFORE the extra
@@ -5802,7 +6263,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
-            || !lo.option_try_sites.is_empty()
             || !lo.result_try_sites.is_empty()
             || !lo.disc_combinator_sites.is_empty()
             || !lo.slice_index_rangefrom_sites.is_empty()
@@ -5848,7 +6308,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         // `map`/`and_then` on a carrier Result is an if/else on the receiver
         // (`DiscCombinatorSite::carrier_recv`); build it before the carrier
-        // becomes exception edges, as `result_map_err` does below.
+        // becomes exception edges.
         let (carrier_disc_sites, disc_combinator_sites): (Vec<_>, Vec<_>) = lo
             .disc_combinator_sites
             .iter()
@@ -5900,6 +6360,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
         }
+        // After result_exc: the dest-is-carrier call block now has
+        // LastException. Err calls the mapper and raises; a declined
+        // site stays the extracted helper graph.
+        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
+            &mut lo.graph,
+            &lo.result_map_err_sites,
+        );
         let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
             0
         } else {
@@ -6082,42 +6549,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.layout_accessor_sites,
             );
         }
-        // The `Option` `?` rewrite (`front::option_try`) consumes the same
-        // `Try::branch` / `ControlFlow` diamond as `result_exc`, but its break
-        // arm returns a freshly-built `None` to this graph's returnblock.  It
-        // only rewrites inside Option-returning functions; every other shape
-        // declines and leaves the residual `branch` Skip intact.
-        let option_try_stats = if lo.option_try_sites.is_empty() {
-            crate::front::option_try::OptionTryStats::default()
-        } else {
-            // The `?`-None return owner is spelled per-instantiation to match
-            // source constructors reaching the returnblock, including integer
-            // payloads; niche-pointer values have no aggregate owner.
-            let return_owner = lo.resolve_option_return_owner(&fd.signature.output);
-            let return_niche = lo.tyref_is_niche_option_ptr(&fd.signature.output);
-            let return_scalar_niche =
-                !return_niche && tyref_option_nonzero_scalar(&fd.signature.output, lo.llbc);
-            let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
-            let return_niche_null_cast = lo.option_niche_null_cast(&fd.signature.output);
-            let return_int_null = lo.option_niche_int_null(&fd.signature.output);
-            crate::front::option_try::rewire_option_try_call_sites(
-                &mut lo.graph,
-                &lo.option_try_sites,
-                return_owner.as_deref(),
-                return_niche,
-                return_scalar_niche,
-                return_narrow_root.as_deref(),
-                return_niche_null_cast.as_ref(),
-                return_int_null.as_ref(),
-            )
-        };
-        // Non-carrier `Result` `?` is the same ControlFlow diamond as
-        // `option_try`, with Ok/Err polarity and an `Err` return instead of
-        // `None`.  Exception-carrier Results are already rewritten above.
+        // Non-carrier `Result` `?` is the ControlFlow diamond with Ok/Err
+        // polarity and an `Err` return.  Option `?` is a regular call of
+        // the extracted `core::option::<Impl>::branch` body.  Exception-carrier
+        // Results are already rewritten above.
         let result_try_stats = if lo.result_try_sites.is_empty() {
             ResultTryStats::default()
         } else {
-            let return_owners = lo.resolve_result_return_owners(&fd.signature.output);
+            let return_owners = lo.resolve_result_return_owners(output);
             rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
         };
         // A `?` whose diamond did not match still has `Try::branch`.
@@ -6125,16 +6564,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `same_as`. Anything left is the match: read the discriminant
         // and build `Continue` / `Break`.
         lower_result_branch_to_control_flow(&mut lo.graph);
-        // The `bool::then` short-circuit rewrite splits the residual `then`
-        // call block into a `Some`/`None` diamond. `then_some` is translated
-        // from its core body; only `then` stays on this rewrite because its
-        // closure `call_once` is not a function-item unpack. Gate the
-        // reachability sweep on an actual rewrite.
-        let bool_then_rewritten = if lo.bool_then_sites.is_empty() {
-            0
-        } else {
-            crate::front::bool_then::rewire_bool_then_call_sites(&mut lo.graph, &lo.bool_then_sites)
-        };
         // The `<[T]>::first(slice)` length-checked `Option<&T>` diamond rewrite
         // (`front::slice_first`) splits the residual `first` call block into a
         // guarded `Some`/`None` diamond (`if len(slice) > 0`). It runs on the
@@ -6213,69 +6642,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.saturating_sub_sites,
             )
         };
-        // The `Option::unwrap` guard rewrite (`front::option_unwrap`) splits the
-        // residual `unwrap` call block into a `__discriminant` guard whose
-        // `Some` arm extracts `__pos_0` and whose `None` arm raises the implicit
-        // `AssertionError`; fail-safe, gate the
-        // reachability sweep on an actual rewrite.
-        let unwrap_rewritten = if lo.unwrap_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_unwrap::rewire_unwrap_call_sites(&mut lo.graph, &lo.unwrap_sites)
-        };
-        // The `Option::expect` guard rewrite (`front::option_expect`) splits the
-        // residual `expect` call block into a `__discriminant` guard the same
-        // way `unwrap` does — its `Some` arm extracts `__pos_0`, its `None` arm
-        // raises the implicit `AssertionError` and drops the panic message; same
-        // fail-safe contract, gate the reachability sweep on an actual rewrite.
-        let expect_rewritten = if lo.expect_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_expect::rewire_expect_call_sites(&mut lo.graph, &lo.expect_sites)
-        };
-        let result_expect_rewritten = crate::front::option_unwrap::rewire_result_expect_sites(
-            &mut lo.graph,
-            &lo.result_expect_sites,
-        );
-        // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
-        // splits the residual `map_or` call block into a `__discriminant`
-        // diamond whose `Some` arm calls the closure, same post-lowering shape
-        // and fail-safe contract as `unwrap_or`; gate the reachability sweep on
-        // an actual rewrite.
-        let map_or_rewritten = if lo.map_or_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_map_or::rewire_map_or_call_sites(&mut lo.graph, &lo.map_or_sites)
-        };
-        // The `Option::map`/`and_then`/`unwrap_or_else` closure-select rewrite
-        // (`front::option_closure_select`) splits the residual call block into a
-        // `__discriminant` diamond, same post-lowering shape and fail-safe
-        // contract as `map_or`; gate the reachability sweep on an actual
-        // rewrite.
-        let closure_select_outcome = if lo.closure_select_sites.is_empty() {
-            crate::front::option_closure_select::ClosureSelectRewriteOutcome::default()
-        } else {
-            crate::front::option_closure_select::rewire_closure_select_call_sites(
-                &mut lo.graph,
-                &lo.closure_select_sites,
-            )
-        };
-        // This late combinator pass synthesizes `call_once` sites after the
-        // first Result-exception pass.  A closure returning
-        // `Result<T, PyError>` uses the translated exception ABI, while
-        // `map`/`unwrap_or_else` retain that Result as an ordinary value.
-        // Apply the same custom-consumer catch-and-rewrap rule as a source MIR
-        // call so the combinator receives an `Ok`/`Err` shell again.
-        if !closure_select_outcome.result_exc_calls.is_empty() {
-            crate::front::result_exc::rewire_result_exc_call_sites(
-                &mut lo.graph,
-                &closure_select_outcome.result_exc_calls,
-                result_exc_callee,
-                static_addrs.error_carrier,
-            )
-            .map_err(LowerError::Unsupported)?;
-        }
-        let closure_select_rewritten = closure_select_outcome.rewritten;
+        // Option/Result unwrap and plain Result expect are regular calls of
+        // the extracted core bodies
+        // (`match self { Some(v)/Ok(v) => v, None/Err => <diverging Never call> }`).
+        // The Never callee is `RaiseImplicit` (`TermKind::Abort`);
+        // `remove_assertion_errors` then prunes that arm. Carrier
+        // `Result<T, PyError>` unwrap/expect stay on `result_exc`.
         let option_ok_or_else_disc = disc_combinator_sites
             .iter()
             .any(|site| site.kind == DiscCombinator::OptionOkOrElse);
@@ -6310,11 +6682,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // ctors and tail-forwarded calls, so that aggregate stays `Ref` and
         // `graph_result_kind` reports `r` against the scalar `FUNC.RESULT`
         // (`dont_look_inside_return_token`). Checked-arith's second callee rule
-        // and the late closure-select rewire can still rebuild shells, so this
-        // runs after both. `exceptiontransform.py` `transform_completely` carries
-        // `T` on the normal edge and raises on the error edge.
+        // can still rebuild shells, so this runs after both.
+        // `exceptiontransform.py` `transform_completely` carries `T` on the
+        // normal edge and raises on the error edge.
         let scalar_shell_owners = if result_exc_callee {
-            lo.resolve_result_owners(&fd.signature.output)
+            lo.resolve_result_owners(output)
         } else {
             None
         };
@@ -6340,20 +6712,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_call_rewritten > 0
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
-            || option_try_stats.rewritten > 0
             || result_try_stats.rewritten > 0
             || !lo.result_try_sites.is_empty()
-            || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
             || slice_is_ascii_rewritten > 0
             || saturating_add_rewritten > 0
             || saturating_sub_rewritten > 0
-            || unwrap_rewritten > 0
-            || expect_rewritten > 0
-            || result_expect_rewritten > 0
-            || map_or_rewritten > 0
-            || closure_select_rewritten > 0
             || !lo.disc_combinator_sites.is_empty()
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);

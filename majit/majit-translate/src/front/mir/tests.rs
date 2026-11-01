@@ -1412,14 +1412,11 @@ fn is_some_fold_real_callable_w() {
     assert!(disc_reads >= 1, "the fold reads the Option __discriminant");
 }
 
-/// Anchor the `Option::or_else` fold to the real lowered IR of
-/// `space_int` — `lookup(obj, "__int__").or_else(|| lookup(obj,
-/// "__index__"))`.  `or_else` takes `self` by value (like the sibling
-/// closure-select combinators), so the by-value receiver resolution
-/// applies.  After the fold no residual `or_else` Method call survives,
-/// the discriminant diamond branches, and the `Some` arm forwards the
-/// receiver (no `Some::__pos_0` read introduced by the rewrite).  Ignored
-/// by default (loads the real LLBC).
+/// Anchor `Option::or_else` to the real lowered IR of `space_int` —
+/// `lookup(obj, "__int__").or_else(|| lookup(obj, "__index__"))`.
+/// The caller keeps a regular call to the extracted core body; the
+/// Some/None diamond lives in that body. Ignored by default (loads
+/// the real LLBC).
 #[test]
 #[ignore]
 fn or_else_fold_real_space_int() {
@@ -1438,29 +1435,19 @@ fn or_else_fold_real_space_int() {
                 &op.kind,
                 OpKind::Call { target: CallTarget::Method { name, .. }, .. }
                     if name == "or_else"
+            ) || matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("or_else")
+                    && segments.iter().any(|s| s == "option")
             )
         })
         .count();
     assert_eq!(
-        or_else_calls, 0,
-        "residual or_else Method call removed by the fold"
-    );
-    // The niladic `None`-arm closure lowers to a `call_once` Method call.
-    let call_once = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, .. }
-                    if name == "call_once"
-            )
-        })
-        .count();
-    assert!(
-        call_once >= 1,
-        "the None arm calls the or_else closure via call_once"
+        or_else_calls, 1,
+        "space_int keeps one regular call to the core or_else body, got {or_else_calls}"
     );
 }
 
@@ -3966,6 +3953,9 @@ fn str_header_family(graph: &crate::model::FunctionGraph) -> std::collections::H
                     continue;
                 };
                 for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    let Some(arg) = arg.as_variable() else {
+                        continue;
+                    };
                     if family.contains(&arg.id()) && family.insert(input.id()) {
                         grew = true;
                     }
@@ -5257,6 +5247,9 @@ fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
                     continue;
                 };
                 for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    let Some(arg) = arg.as_variable() else {
+                        continue;
+                    };
                     if str_ids.contains(&arg.id()) && str_ids.insert(input.id()) {
                         grew = true;
                     }
@@ -12592,6 +12585,25 @@ pub(in crate::front::mir) fn llbc_with_types(
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
 ) -> Llbc {
+    llbc_with_types_impls(crate_name, types, funs, vec![])
+}
+
+pub(in crate::front::mir) fn llbc_with_types_impls(
+    crate_name: &str,
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
+    llbc_with_types_traits(crate_name, types, funs, vec![], trait_impls)
+}
+
+fn llbc_with_types_traits(
+    crate_name: &str,
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    trait_decls: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -12600,11 +12612,27 @@ pub(in crate::front::mir) fn llbc_with_types(
             "type_decls": types,
             "fun_decls": funs,
             "global_decls": [],
-            "trait_decls": [],
-            "trait_impls": []
+            "trait_decls": trait_decls,
+            "trait_impls": trait_impls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+}
+
+pub(in crate::front::mir) fn unit_fn_ptr() -> serde_json::Value {
+    serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": {"Tuple": []},
+                "is_unsafe": false
+            }
+        }
+    })
+}
+
+pub(in crate::front::mir) fn option_shared_ref(def: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": ["Erased", def, "Shared"]})
 }
 
 pub(in crate::front::mir) fn adt_node(def_id: u64) -> serde_json::Value {
@@ -12613,6 +12641,39 @@ pub(in crate::front::mir) fn adt_node(def_id: u64) -> serde_json::Value {
             "id": def_id,
             "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
         }
+    })
+}
+
+pub(in crate::front::mir) fn control_flow_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["ops", 0]},
+                {"Ident": ["control_flow", 0]},
+                {"Ident": ["ControlFlow", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Continue",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Break",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [1, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
     })
 }
 
@@ -12734,16 +12795,36 @@ fn option_i64_ty() -> serde_json::Value {
     option_adt_node(0, option_int_arg(true))
 }
 
-fn option_impl_seg() -> serde_json::Value {
+fn option_impl_seg_for(opt_ty: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Impl": {"Ty": {
-        "skip_binder": {"Value": [0, option_i64_ty()]},
+        "skip_binder": {"Value": [0, opt_ty]},
         "kind": "InherentImplBlock"
     }}})
 }
 
 fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
+    option_map_or_typed_fn_item_llbc(
+        option_i64_ty(),
+        interior_i64(),
+        vec![option_enum(0)],
+        fn_item,
+        None,
+    )
+}
+
+/// `core::option::<Impl>::map_or` FunDecl plus a caller, with a chosen
+/// `Option<P>` payload. Some's payload is `Field[1, 0]` on `self`, matching
+/// the extracted Charon body. `gc_type_id` is the payload pointee's
+/// `GcType` impl (`history.getkind` / declared `_gckind`).
+fn option_map_or_typed_fn_item_llbc(
+    opt_ty: serde_json::Value,
+    payload_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    fn_item: serde_json::Value,
+    gc_type_id: Option<u64>,
+) -> Llbc {
     let i64_ty = interior_i64();
-    let opt_ty = option_i64_ty();
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
     let fn_id = fn_item
         .get("def_id")
         .and_then(serde_json::Value::as_u64)
@@ -12754,13 +12835,28 @@ fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
             "generics": empty_generics()
         }
     });
+    let self_place = interior_place(1, &opt_ty);
+    let disc_place = interior_place(4, &disc_ty);
+    let ret_place = interior_place(0, &i64_ty);
+    let default_place = interior_place(2, &i64_ty);
+    // Extracted `core::option::<Impl>::map_or` spells Some's payload as
+    // `Field[1, 0]` on `self` (variant Some, field 0). A `Downcast` then
+    // `Field[null, 0]` collapses: the variant-less Field is not an enum
+    // payload, so the Copy is the Option word and From-identity never
+    // reads `__pos_0`.
+    let payload_place = serde_json::json!({
+        "kind": {
+            "Projection": [self_place.clone(), {"Field": [1, 0]}]
+        },
+        "ty": payload_ty
+    });
     let map_or = serde_json::json!({
         "def_id": 1,
         "item_meta": {
             "name": [
                 {"Ident": ["core", 0]},
                 {"Ident": ["option", 0]},
-                option_impl_seg(),
+                option_impl_seg_for(&opt_ty),
                 {"Ident": ["map_or", 0]}
             ],
             "span": interior_span(),
@@ -12778,7 +12874,62 @@ fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
             "inputs": [opt_ty.clone(), i64_ty.clone(), fn_ty.clone()],
             "output": i64_ty.clone()
         },
-        "body": "Opaque"
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 3,
+                    "locals": [
+                        interior_local(0, None, &i64_ty),
+                        interior_local(1, Some("self"), &opt_ty),
+                        interior_local(2, Some("default"), &i64_ty),
+                        interior_local(3, Some("f"), &fn_ty),
+                        interior_local(4, Some("disc"), &disc_ty)
+                    ]
+                },
+                "body": [
+                    interior_bb(
+                        vec![interior_assign(
+                            disc_place.clone(),
+                            serde_json::json!({"Discriminant": self_place.clone()})
+                        )],
+                        serde_json::json!({
+                            "span": interior_span(),
+                            "kind": {"Switch": {
+                                "discr": {"Copy": disc_place.clone()},
+                                "targets": {"SwitchInt": [
+                                    null,
+                                    [
+                                        [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                        [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                                    ],
+                                    2
+                                ]}
+                            }}
+                        }),
+                    ),
+                    interior_bb(
+                        vec![],
+                        interior_call(
+                            fn_id,
+                            vec![interior_copy(payload_place)],
+                            ret_place.clone(),
+                            4,
+                            3,
+                        ),
+                    ),
+                    interior_bb(
+                        vec![interior_assign(
+                            ret_place.clone(),
+                            interior_use(default_place),
+                        )],
+                        interior_return(),
+                    ),
+                    interior_bb(vec![], interior_unwind()),
+                    interior_bb(vec![], interior_return()),
+                ]
+            }
+        }
     });
     let caller = interior_caller(
         "map_or_fn_item",
@@ -12813,45 +12964,70 @@ fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
             interior_bb(vec![], interior_return()),
         ],
     );
-    llbc_with_types(
-        "fixture",
-        vec![option_enum(0)],
-        vec![caller, map_or, fn_item],
-    )
+    option_map_or_llbc(type_decls, vec![caller, map_or, fn_item], gc_type_id)
 }
 
-fn graph_has_map_or(graph: &FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::Method { name, .. },
-                ..
-            } if name == "map_or"
-        ) || matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.last().map(String::as_str) == Some("map_or")
-        )
-    })
+fn option_map_or_llbc(
+    type_decls: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    gc_type_id: Option<u64>,
+) -> Llbc {
+    match gc_type_id {
+        Some(id) => llbc_with_types_traits(
+            "fixture",
+            type_decls,
+            funs,
+            vec![gctype_trait_decl()],
+            vec![gctype_impl_row(id)],
+        ),
+        None => llbc_with_types("fixture", type_decls, funs),
+    }
 }
 
-fn graph_has_fn_const(graph: &FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call { target, .. } if crate::model::fn_const_segments(target).is_some()
-        )
-    })
+fn map_or_call_count(graph: &FunctionGraph) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "map_or"
+            ) || matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("map_or")
+            )
+        })
+        .count()
 }
 
-/// `opt.map_or(-1, i64::from)` with reflexive `From<i64> for i64`: residual
-/// `map_or` and the 0-arg `__fn_const` define are gone; the Some arm is
-/// identity on the payload (ordinary `is_reflexive_from`).
+fn lower_map_or_core_body(llbc: &Llbc) -> FunctionGraph {
+    let ctx = super::LowerContext::new(llbc);
+    for fd in llbc.iter_fun_decls() {
+        if fd
+            .item_meta
+            .name_path()
+            .ends_with("::option::<Impl>::map_or")
+        {
+            return super::lower_fun_decl(&ctx, fd)
+                .unwrap_or_else(|e| panic!("lower map_or body: {e}"));
+        }
+    }
+    panic!("fixture has no map_or FunDecl");
+}
+
+/// `opt.map_or(-1, i64::from)` with reflexive `From<i64> for i64`: the
+/// caller keeps a regular call to the core `map_or` body; inside that
+/// body `f(t)` with `f = From::from` is identity (`is_reflexive_from`).
 #[test]
 fn map_or_i64_from_fn_item_is_identity_select() {
+    use crate::model::ExitSwitch;
     let from = interior_opaque(
         2,
         &["core", "convert", "<Impl>", "from"],
@@ -12859,54 +13035,69 @@ fn map_or_i64_from_fn_item_is_identity_select() {
         interior_i64(),
     );
     let llbc = option_map_or_fn_item_llbc(from);
-    let graph = lower_interior(&llbc, "map_or_fn_item");
-    assert!(
-        !graph_has_map_or(&graph),
-        "residual map_or must be rewritten; ops={:?}",
-        graph_ops(&graph)
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    assert_eq!(
+        caller.blocks[caller.startblock.0].exits.len(),
+        1,
+        "the Some/None diamond lives in the core body, not at the caller"
+    );
+
+    let body = lower_map_or_core_body(&llbc);
+    assert_eq!(
+        map_or_call_count(&body),
+        0,
+        "the core body is the match, not a recursive map_or; ops={:?}",
+        graph_ops(&body)
     );
     assert!(
-        !graph_has_fn_const(&graph),
-        "function-item define must not survive; ops={:?}",
-        graph_ops(&graph)
-    );
-    assert!(
-        !graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .any(|op| matches!(
+        !body.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
                 &op.kind,
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("from")
-            )),
-        "reflexive From is identity, not a residual from call; ops={:?}",
-        graph_ops(&graph)
+            )
+        }),
+        "reflexive From is identity inside the body, not a residual from call; ops={:?}",
+        graph_ops(&body)
     );
     assert!(
-        graph
-            .blocks
+        body.blocks
             .iter()
             .flat_map(|b| &b.operations)
             .any(|op| matches!(
                 &op.kind,
                 OpKind::FieldRead { field, .. } if field.name == "__pos_0"
             )),
-        "the Some arm still reads the payload"
+        "the Some arm still reads the payload; ops={:?}",
+        graph_ops(&body)
     );
+    let branches = body
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.exits.len() == 2 || matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+        })
+        .count();
     assert_eq!(
-        graph.blocks[graph.startblock.0].exits.len(),
-        2,
-        "A branches to Some/None arms"
+        branches, 1,
+        "the core body branches to Some/None arms, got {branches}"
     );
 }
 
-/// `opt.map_or(-1, plus_one)` with a local function item: residual `map_or`
-/// and `__fn_const` are gone; the Some arm calls `plus_one` directly.
+/// `opt.map_or(-1, plus_one)` with a local function item: the caller
+/// keeps a regular `map_or` call; the core body calls `plus_one`
+/// directly as `f(t)`.
 #[test]
 fn map_or_plus_one_fn_item_calls_the_function() {
+    use crate::model::ExitSwitch;
     let plus_one = interior_opaque(
         2,
         &["fixture", "plus_one"],
@@ -12914,18 +13105,21 @@ fn map_or_plus_one_fn_item_calls_the_function() {
         interior_i64(),
     );
     let llbc = option_map_or_fn_item_llbc(plus_one);
-    let graph = lower_interior(&llbc, "map_or_fn_item");
-    assert!(
-        !graph_has_map_or(&graph),
-        "residual map_or must be rewritten; ops={:?}",
-        graph_ops(&graph)
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
     );
-    assert!(
-        !graph_has_fn_const(&graph),
-        "function-item define must not survive; ops={:?}",
-        graph_ops(&graph)
+    assert_eq!(
+        caller.blocks[caller.startblock.0].exits.len(),
+        1,
+        "the Some/None diamond lives in the core body, not at the caller"
     );
-    let named: Vec<_> = graph
+
+    let body = lower_map_or_core_body(&llbc);
+    let named: Vec<_> = body
         .blocks
         .iter()
         .flat_map(|b| &b.operations)
@@ -12943,204 +13137,1844 @@ fn map_or_plus_one_fn_item_calls_the_function() {
         named.len(),
         1,
         "the Some arm calls plus_one; ops={:?}",
-        graph_ops(&graph)
+        graph_ops(&body)
     );
     let OpKind::Call { args, .. } = &named[0].kind else {
         panic!("plus_one call");
     };
     assert_eq!(args.len(), 1, "the Some arm calls plus_one(payload)");
-    assert_eq!(
-        graph.blocks[graph.startblock.0].exits.len(),
-        2,
-        "A branches to Some/None arms"
-    );
-}
-
-/// Anchor the `?`-operator fold to the real lowered IR of
-/// `baseobjspace::lookup` (`let w_type = type(obj)?; lookup_in_type(..)`).
-/// The break arm (`None => return None`) narrows the `from_residual`
-/// result through a `__cast_instance_intrinsic` recast; before the break-arm
-/// purity gate peeled that recast, `option_try` declined and the residual
-/// `Try::branch` Method-call stayed, walling ~50 heads reaching `lookup`.
-/// After: zero residual `branch` Method-call.  Ignored by default (loads
-/// the ~440MB real LLBC); run with `cargo test -p majit-translate --lib
-/// option_try_recast_break_arm_real -- --ignored`.
-#[test]
-#[ignore]
-fn option_try_recast_break_arm_real_lookup() {
-    use crate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
-    let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
-    let branch_calls = graph
+    let branches = body
         .blocks
         .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
-                    if name == "branch" && args.len() == 1
-            )
+        .filter(|block| {
+            block.exits.len() == 2 || matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
         })
         .count();
     assert_eq!(
-        branch_calls, 0,
-        "lookup: residual Try::branch Method-call after the recast-break-arm fold"
+        branches, 1,
+        "the core body branches to Some/None arms, got {branches}"
     );
-    // `lookup`'s `r#type(obj)?` is a niche `Option<NonNull>` `?`, rewritten
-    // by `option_try` into a `ne` pointer null-test switch.  Because the
-    // switch value is a `SomeBool` (`ne`), the some/none exits MUST carry
-    // `ExitCase::Bool`, not `ExitCase::Const(Int)` — else rtype rejects the
-    // bool exitswitch against Int cases ("not a bool: Int(1)").
-    let mut niche_try_switches = 0usize;
-    for b in &graph.blocks {
-        let Some(ExitSwitch::Value(sw)) = &b.exitswitch else {
-            continue;
-        };
-        let switches_on_ne = b.operations.iter().any(|op| {
-            op.result.as_ref() == Some(sw)
-                && matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne")
-        });
-        if !switches_on_ne {
-            continue;
-        }
-        for l in &b.exits {
-            assert!(
-                matches!(&l.exitcase, Some(ExitCase::Bool(_))),
-                "lookup: niche `?` null-test switch exit must be ExitCase::Bool, got {:?}",
-                l.exitcase
-            );
-        }
-        niche_try_switches += 1;
-    }
-    assert!(
-        niche_try_switches >= 1,
-        "lookup: expected a niche `?` `ne` null-test switch block"
-    );
+}
 
-    // The `?` break arm returns the enclosing `Option<PyObjectRef>`'s
-    // `None`.  That type is a nullable PyObject pointer, not a constructed
-    // Rust `Option::None` instance.  Pin both halves of the representation:
-    // no Option None ctor survives, and a null pointer narrowed to
-    // PyObject is forwarded to the return block.
-    assert!(
-        !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor {
-                        name,
-                        owner_path,
-                        ..
-                    },
-                    ..
-                } if name == "None" && owner_path.iter().any(|part| part == "Option")
-            )
-        }),
-        "lookup: niche `?` break arm must not construct Option::None"
-    );
-    let null_results: Vec<_> = graph
+fn map_or_null_targets(graph: &FunctionGraph) -> Vec<String> {
+    graph
         .blocks
         .iter()
-        .flat_map(|b| &b.operations)
+        .flat_map(|block| &block.operations)
         .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } if target.to_string().starts_with("core::ptr::null") => {
+                Some(target.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn map_or_producer_ty(graph: &FunctionGraph, var: &Variable) -> ValueType {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => ValueType::Int,
+                OpKind::Input { ty, .. } => ty.clone(),
+                OpKind::Call { result_ty, .. } => result_ty.clone(),
+                OpKind::BinOp { result_ty, .. } => result_ty.clone(),
+                OpKind::FieldRead { ty, .. } => ty.clone(),
+                other => panic!("unexpected is_ operand producer: {other:?}"),
+            };
+        }
+    }
+    panic!("no producer for is_ operand");
+}
+
+fn map_or_value_bank(ty: &ValueType) -> char {
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+        ValueType::Float => 'f',
+        _ => 'v',
+    }
+}
+
+/// Payload enum used as a raw-address niche (`Option<&RawEnum>`): not
+/// fieldless, no GcType, one word of layout so the shared-ref Option is
+/// the null-pointer niche.
+fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["RawEnum", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Empty",
+                "fields": [],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Word",
+                "fields": [{"name": null, "ty": interior_i64(), "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]},
+        "layout": interior_layout(8, &[0], false)
+    })
+}
+
+/// `opt.map_or(default, f)` on `Option<fn()>`: the core body tests the
+/// niche word against `null_fn` (`rnone.py` `rtype_is_None`).
+#[test]
+fn map_or_niche_fn_option_body_tests_against_null_fn() {
+    let fn_ty = unit_fn_ptr();
+    let opt_ty = option_adt_node(0, fn_ty.clone());
+    let take = interior_opaque(2, &["fixture", "take"], vec![fn_ty.clone()], interior_i64());
+    let llbc = option_map_or_typed_fn_item_llbc(opt_ty, fn_ty, vec![option_enum(0)], take, None);
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    let body = lower_map_or_core_body(&llbc);
+    assert_eq!(
+        map_or_null_targets(&body),
+        vec!["core::ptr::null_fn".to_string()],
+        "Option<fn> discriminant uses null_fn; ops={:?}",
+        graph_ops(&body)
+    );
+}
+
+/// `opt.map_or(default, f)` on `Option<&RawEnum>`: a raw-enum borrow is
+/// an int-bank Address, so the niche null shares that bank and `is_`
+/// operands agree (`rnone.py` `rtype_is_None`).
+#[test]
+fn map_or_niche_raw_address_body_is_operands_agree() {
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), raw_address_payload_enum(1)],
+        take,
+        None,
+    );
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let mut saw_is = 0usize;
+    for block in &body.blocks {
+        for op in &block.operations {
+            let OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "is_" {
+                continue;
+            }
+            saw_is += 1;
+            let lhs_ty = map_or_producer_ty(&body, lhs);
+            let rhs_ty = map_or_producer_ty(&body, rhs);
+            assert_eq!(
+                map_or_value_bank(&lhs_ty),
+                map_or_value_bank(&rhs_ty),
+                "is_ mixed kinds {lhs_ty:?} vs {rhs_ty:?}; ops={:?}",
+                graph_ops(&body)
+            );
+            assert_eq!(
+                map_or_value_bank(&lhs_ty),
+                'i',
+                "raw-address niche opt is int-banked; ops={:?}",
+                graph_ops(&body)
+            );
+        }
+    }
+    assert_eq!(
+        saw_is,
+        1,
+        "niche map_or body emits one is_ null test; ops={:?}",
+        graph_ops(&body)
+    );
+    assert_eq!(
+        map_or_null_targets(&body),
+        vec!["core::ptr::null_raw".to_string()],
+        "Option<&RawEnum> discriminant uses null_raw; ops={:?}",
+        graph_ops(&body)
+    );
+}
+
+/// `Some.__pos_0` of `Option<&RawEnum>` retypes the Address word as
+/// `Ptr(RawEnum)` via 2-arg `lltype.cast_int_to_ptr` (`ann_cast_int_to_ptr`).
+#[test]
+fn map_or_niche_raw_address_some_payload_is_cast_int_to_ptr() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), raw_address_payload_enum(1)],
+        take,
+        None,
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let casts: Vec<&SpaceOperation> = graph_ops(&body)
+        .into_iter()
+        .filter(|op| match &op.kind {
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 ..
-            } if segments
-                == &[
-                    "core".to_string(),
-                    "ptr".to_string(),
-                    "null_mut".to_string(),
-                ] =>
+            } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        casts.len(),
+        2,
+        "Discriminant is_ and Some.__pos_0 each retype Address as Ptr(RawEnum); ops={:?}",
+        graph_ops(&body)
+    );
+    for (i, cast) in casts.iter().enumerate() {
+        let OpKind::Call {
+            args, result_ty, ..
+        } = &cast.kind
+        else {
+            panic!("cast_int_to_ptr is a Call");
+        };
+        assert_eq!(
+            args.len(),
+            2,
+            "cast[{i}] cast_int_to_ptr(PTRTYPE, int); args={args:?}"
+        );
+        assert!(
+            matches!(
+                &args[0],
+                crate::model::LinkArg::Const(c)
+                    if matches!(c.value, crate::flowspace::model::ConstValue::LowLevelType(_))
+            ),
+            "cast[{i}] PtrT is the raw Ptr constant, got {:?}",
+            args[0]
+        );
+        assert_eq!(
+            result_ty,
+            &ValueType::Int,
+            "cast[{i}] raw Ptr getkind is int; ops={:?}",
+            graph_ops(&body)
+        );
+        let result = cast
+            .result
+            .as_ref()
+            .expect("cast_int_to_ptr writes a result");
+        let ct = result.concretetype.borrow();
+        let Some(LowLevelType::Ptr(ptr)) = ct.as_ref() else {
+            panic!("cast[{i}] concretetype is Ptr(T), got {ct:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!("cast[{i}] Ptr of the raw enum, got {:?}", ptr.TO);
+        };
+        assert_eq!(st._name, "RawEnum");
+        assert_eq!(st._gckind, GcKind::Raw);
+    }
+}
+
+fn generic_option_map_decl(def_id: u64, option_id: u64) -> serde_json::Value {
+    let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let u = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(&["core", "option", "Option", "map"], false),
+        "generics": {
+            "types": [
+                {"index": 0, "name": "T"},
+                {"index": 1, "name": "U"}
+            ],
+            "trait_clauses": [],
+            "const_generics": []
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_adt_node(option_id, t), u.clone()],
+            "output": option_adt_node(option_id, u)
+        },
+        "body": "Missing"
+    })
+}
+
+fn intern_map_caller(
+    def_id: u64,
+    name: &str,
+    map_id: u64,
+    type_args: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let unit = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let call_generics = serde_json::json!({
+        "regions": [],
+        "types": type_args,
+        "const_generics": [],
+        "trait_refs": []
+    });
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(&["fixture", name], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit.clone()},
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [interior_local(0, None, &unit)]
+                },
+                "body": [
+                    interior_bb(
+                        vec![],
+                        serde_json::json!({
+                            "span": interior_span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": map_id},
+                                                "generics": call_generics
+                                            }
+                                        },
+                                        "args": [],
+                                        "dest": interior_place(0, &unit)
+                                    },
+                                    "target": 1,
+                                    "on_unwind": 2
+                                }
+                            }
+                        }),
+                    ),
+                    interior_bb(vec![], interior_return()),
+                    interior_bb(vec![], interior_unwind()),
+                ]
+            }
+        }
+    })
+}
+
+fn intern_option_from_map_call_llbc(
+    type_args: Vec<serde_json::Value>,
+    extra_types: Vec<serde_json::Value>,
+) -> Llbc {
+    let mut types = vec![option_enum(0)];
+    types.extend(extra_types);
+    llbc_with_types(
+        "fixture",
+        types,
+        vec![
+            intern_map_caller(0, "call_map", 1, type_args),
+            generic_option_map_decl(1, 0),
+        ],
+    )
+}
+
+fn generic_result_unwrap_decl(def_id: u64, result_id: u64) -> serde_json::Value {
+    let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let e = serde_json::json!({"TypeVar": {"Bound": [0, 1]}});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(&["core", "result", "Result", "unwrap"], false),
+        "generics": {
+            "types": [
+                {"index": 0, "name": "T"},
+                {"index": 1, "name": "E"}
+            ],
+            "trait_clauses": [],
+            "const_generics": []
+        },
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [result_adt_node(result_id, t, e)],
+            "output": {"TypeVar": {"Bound": [0, 0]}}
+        },
+        "body": "Missing"
+    })
+}
+
+fn intern_result_from_unwrap_call_llbc(
+    type_args: Vec<serde_json::Value>,
+    extra_types: Vec<serde_json::Value>,
+) -> Llbc {
+    let mut types = vec![result_enum(0)];
+    types.extend(extra_types);
+    llbc_with_types(
+        "fixture",
+        types,
+        vec![
+            intern_map_caller(0, "call_unwrap", 1, type_args),
+            generic_result_unwrap_decl(1, 0),
+        ],
+    )
+}
+
+fn fieldless_enum_decl(def_id: u64, path: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, true),
+        "kind": {"Enum": [
+            {"name": "Memory", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U32", "0"]}}},
+            {"name": "Overflow", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U32", "1"]}}}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 4,
+                "align": 4,
+                "discriminator": {"Branch": {"offset": 0, "int_ty": {"Unsigned": "U32"}}},
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": []}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]
+    })
+}
+
+fn field_row_ty<'a>(
+    fields: &'a crate::front::semantic::StructFieldRegistry,
+    owner: &str,
+    name: &str,
+) -> Option<&'a str> {
+    fields
+        .fields
+        .get(owner)
+        .and_then(|rows| rows.iter().find(|row| row.name == name))
+        .map(|row| row.ty.as_str())
+}
+
+/// Intern `Option<char>` BASE `__discriminant` and `Some.__pos_0` from a
+/// RegularCall's substituted callee signature. The caller has no Option local.
+#[test]
+fn intern_tagged_option_from_regular_call_substituted_signature() {
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let i64_ty = interior_i64();
+    let llbc = intern_option_from_map_call_llbc(vec![char_ty, i64_ty], vec![]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option<char>");
+    let disc = program
+        .struct_fields
+        .fields
+        .get("core::option::Option<char>");
+    let disc_names: Vec<&str> = disc
+        .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        disc_names,
+        vec!["__discriminant"],
+        "suffixed Option<char> BASE intern; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<char>::Some",
+            "__pos_0"
+        ),
+        Some("char")
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<char>::Some",
+            "__pos_0"
+        ),
+        Some("char"),
+        "crate-stripped intern key FieldRead looks up; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    let stripped_disc = program.struct_fields.fields.get("option::Option<char>");
+    let stripped_disc_names: Vec<&str> = stripped_disc
+        .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        stripped_disc_names,
+        vec!["__discriminant"],
+        "crate-stripped Option<char> BASE intern; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern still substitutes `Option<T>` when a later type argument (the
+/// closure `F`) contains a TypeVar in its trait-ref JSON.
+/// `concrete_type_args` would drop that call.
+#[test]
+fn intern_tagged_option_from_map_call_with_open_closure_arg() {
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let i64_ty = interior_i64();
+    let open_f = serde_json::json!({
+        "Adt": {
+            "id": 99,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": [{"TypeVar": {"Bound": [0, 0]}}]
+            },
+            "builtin": null
+        }
+    });
+    let llbc = intern_option_from_map_call_llbc(vec![char_ty, i64_ty, open_f], vec![]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option<char> with open F");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<char>::Some",
+            "__pos_0"
+        ),
+        Some("char"),
+        "open F must not drop intern of Option<T>; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    let stripped_disc = program.struct_fields.fields.get("option::Option<char>");
+    let stripped_disc_names: Vec<&str> = stripped_disc
+        .map(|rows| rows.iter().map(|row| row.name.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        stripped_disc_names,
+        vec!["__discriminant"],
+        "open F must not drop Option<char> BASE intern; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Interned `Option<char>::Some` and `Option<Value>::Some` keep distinct
+/// `__pos_0` payload types. The Value intern ROW is the TypeDecl identity
+/// (`value::Value` = `strip_crate_prefix` of `majit_ir::value::Value`),
+/// not the leaf (`Value`). CAST intern suffix stays the leaf (`<Value>`).
+/// `Option<String>` is a string-family niche (`tyref_is_string_adt`) so
+/// intern harvest skips it (`ref_enum_instantiation_of_adt`).
+#[test]
+fn interned_option_char_and_value_some_payloads_are_distinct() {
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let value_ty = adt_node(1);
+    let i64_ty = interior_i64();
+    let value_decl = interior_struct(
+        1,
+        &["majit_ir", "value", "Value"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), value_decl],
+        vec![
+            intern_map_caller(0, "call_map_char", 2, vec![char_ty, i64_ty.clone()]),
+            intern_map_caller(1, "call_map_value", 2, vec![value_ty, i64_ty]),
+            generic_option_map_decl(2, 0),
+        ],
+    );
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option payloads");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<char>::Some",
+            "__pos_0"
+        ),
+        Some("char"),
+        "keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<Value>::Some",
+            "__pos_0"
+        ),
+        Some("value::Value"),
+        "intern ROW is the TypeDecl identity, CAST suffix stays <Value>; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Option<Opaque>` spells `Some.__pos_0` as the declared
+/// payload leaf (`TypeDeclKind::Opaque`), not a neighbouring scalar.
+#[test]
+fn intern_tagged_option_of_opaque_payload_spells_declared_leaf() {
+    let opaque_ty = adt_node(1);
+    let i64_ty = interior_i64();
+    let opaque_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["rustpython_wtf8", "CodePoint"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(4, &[], false)
+    });
+    let llbc = intern_option_from_map_call_llbc(vec![opaque_ty, i64_ty], vec![opaque_decl]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option of Opaque");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<CodePoint>::Some",
+            "__pos_0"
+        ),
+        Some("CodePoint"),
+        "declared Opaque payload leaf; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    let opaque_rows = program.struct_fields.fields.get("CodePoint");
+    assert_eq!(
+        opaque_rows.map(|rows| rows.len()),
+        Some(0),
+        "Opaque payload TypeDecl interned as empty struct; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Interned `Option<Opaque>::Some.__pos_0` projects to a named Instance
+/// so getattr of that field is not lattice bottom.
+#[test]
+fn interned_option_opaque_some_pos0_is_named_instance() {
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let opaque_ty = adt_node(1);
+    let i64_ty = interior_i64();
+    let opaque_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["rustpython_wtf8", "CodePoint"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(4, &[], false)
+    });
+    let llbc = intern_option_from_map_call_llbc(vec![opaque_ty, i64_ty], vec![opaque_decl]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option of Opaque");
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(program.struct_fields));
+    bk.set_enum_variant_by_discriminant(Rc::new(program.enum_variant_by_discriminant));
+    let variant = bk
+        .getuniqueclassdef_for_enum_variant("option::Option<CodePoint>", "Some")
+        .expect("interned Option<CodePoint>::Some classdef");
+    let attr = variant
+        .borrow()
+        .attrs
+        .get("__pos_0")
+        .map(|a| a.s_value.clone());
+    let Some(SomeValue::Instance(payload)) = attr else {
+        panic!("Some.__pos_0 of Opaque intern spelling is named Instance, got {attr:?}")
+    };
+    assert_eq!(payload.classdef.is_some(), true);
+}
+
+/// Intern of `Result<Arguments, PyError>` spells `Ok.__pos_0` as the
+/// TypeDecl identity (`argument::Arguments`), not the shared leaf
+/// (`Arguments`). Three TypeDecls share that leaf; harden withdraws it.
+/// CAST intern suffix stays `<Arguments,PyError>`.
+#[test]
+fn interned_result_ok_payload_is_type_decl_identity_not_duplicate_leaf() {
+    let interp_args = interior_struct(
+        1,
+        &["pyre_interpreter", "argument", "Arguments"],
+        &[(
+            "argc",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let fmt_args = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["core", "fmt", "Arguments"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[], false)
+    });
+    let ruff_args = interior_struct(
+        3,
+        &["ruff_python_ast", "nodes", "Arguments"],
+        &[(
+            "args",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let pyerror = interior_struct(
+        4,
+        &["pyre_interpreter", "error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let llbc = intern_result_from_unwrap_call_llbc(
+        vec![adt_node(1), adt_node(4)],
+        vec![interp_args, fmt_args, ruff_args, pyerror],
+    );
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<Arguments, PyError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<Arguments,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("argument::Arguments"),
+        "intern ROW is the TypeDecl identity, CAST suffix stays <Arguments>; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "result::Result<Arguments,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("argument::Arguments"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Result<RBigInt, RBigIntError>` spells `Err.__pos_0` as the
+/// fieldless enum's signed discriminant integer (`i32` for a U32 fixture
+/// layout). Fieldless enums have no ClassDef (`derive_program_metadata`
+/// skips the base). CAST intern suffix stays `<RBigInt,RBigIntError>`.
+/// `Ok.__pos_0` is the Opaque TypeDecl identity.
+#[test]
+fn interned_result_err_fieldless_enum_payload_is_discriminant_int() {
+    let bigint = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["majit_rlib", "rbigint", "RBigInt"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[], false)
+    });
+    let err = fieldless_enum_decl(2, &["majit_rlib", "rbigint", "RBigIntError"]);
+    let llbc =
+        intern_result_from_unwrap_call_llbc(vec![adt_node(1), adt_node(2)], vec![bigint, err]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<RBigInt, RBigIntError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<RBigInt,RBigIntError>::Err",
+            "__pos_0"
+        ),
+        Some("i32"),
+        "fieldless Err intern ROW is the signed discriminant integer; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<RBigInt,RBigIntError>::Ok",
+            "__pos_0"
+        ),
+        Some("rbigint::RBigInt"),
+        "Ok intern ROW is the Opaque TypeDecl identity; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Result<(RBigInt, RBigInt), RBigIntError>` spells the same
+/// fieldless `Err.__pos_0` integer. CAST intern suffix stays
+/// `<(RBigInt,RBigInt),RBigIntError>`.
+#[test]
+fn interned_result_tuple_ok_fieldless_err_payload_is_discriminant_int() {
+    let bigint = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["majit_rlib", "rbigint", "RBigInt"], false),
+        "kind": "Opaque",
+        "layout": interior_layout(8, &[], false)
+    });
+    let err = fieldless_enum_decl(2, &["majit_rlib", "rbigint", "RBigIntError"]);
+    let pair = serde_json::json!({
+        "Adt": {
+            "id": 99,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [adt_node(1), adt_node(1)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let llbc = intern_result_from_unwrap_call_llbc(vec![pair, adt_node(2)], vec![bigint, err]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<(RBigInt, RBigInt), RBigIntError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<(RBigInt,RBigInt),RBigIntError>::Err",
+            "__pos_0"
+        ),
+        Some("i32"),
+        "tuple-Ok Result still intern's fieldless Err as signed integer; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of tagged `Option<Option<&MappedObj>>` spells `Some.__pos_0` as
+/// the inner niche pointer (`*mut` of the TypeDecl identity). CAST of
+/// `Option<&MappedObj>` strips `&`, so the leaf render is `Option<MappedObj>`
+/// — a tagged class whose getattr of `__pos_0` is `Instance`. The value is
+/// the nullable pointer. CAST intern suffix stays `<Option<MappedObj>>`.
+#[test]
+fn interned_tagged_option_of_niche_option_payload_is_pointer() {
+    let mapped = interior_struct(
+        1,
+        &["pyre_module", "module", "mmap", "interp_mmap", "MappedObj"],
+        &[(
+            "ptr",
+            serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let inner = option_adt_node(0, option_shared_ref(adt_node(1)));
+    let i64_ty = interior_i64();
+    let llbc = intern_option_from_map_call_llbc(vec![inner, i64_ty], vec![mapped]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option of niche Option<&MappedObj>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "intern ROW is the niche pointer, CAST suffix stays <Option<MappedObj>>; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "crate-stripped intern KEY matches CAST owner; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Production `bool::then` call generics hash-cons `T`
+/// (`{"Value": [id, Option<&MappedObj>]}`). Intern ROW peels that
+/// wrapper so the payload is still the niche pointer, not CAST's
+/// `Option<MappedObj>` leaf.
+#[test]
+fn interned_tagged_option_of_hashconsed_niche_option_payload_is_pointer() {
+    let mapped = interior_struct(
+        1,
+        &["pyre_module", "module", "mmap", "interp_mmap", "MappedObj"],
+        &[(
+            "ptr",
+            serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let inner = option_adt_node(0, option_shared_ref(adt_node(1)));
+    let wrapped = serde_json::json!({"Value": [90001, inner]});
+    let i64_ty = interior_i64();
+    let llbc = intern_option_from_map_call_llbc(vec![wrapped, i64_ty], vec![mapped]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option of hash-consed Option<&MappedObj>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "intern ROW peels Value wrapper; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "option::Option<Option<MappedObj>>::Some",
+            "__pos_0"
+        ),
+        Some("*mut module::mmap::interp_mmap::MappedObj"),
+        "crate-stripped intern KEY matches CAST owner after Value peel; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Intern of `Result<G<u8>, PyError>` keeps the CAST leaf render
+/// (`G<u8>`) as `Ok.__pos_0`. Identity-with-args (`g::G<u8>`) would be a
+/// different `struct_fields` key than CAST's `<G<u8>>` suffix.
+#[test]
+fn interned_result_ok_generic_payload_keeps_leaf_render() {
+    let g_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["majit_ir", "g", "G"], true),
+        "generics": {
+            "types": [{"index": 0, "name": "T"}],
+            "trait_clauses": [],
+            "const_generics": []
+        },
+        "kind": {"Struct": [
+            {"name": "item", "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}
+        ]},
+        "layout": interior_layout(8, &[0], false)
+    });
+    let pyerror = interior_struct(
+        2,
+        &["pyre_interpreter", "error", "PyError"],
+        &[(
+            "kind",
+            serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}}),
+        )],
+        8,
+        &[0],
+        false,
+    );
+    let g_u8 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let llbc = intern_result_from_unwrap_call_llbc(vec![g_u8, adt_node(2)], vec![g_decl, pyerror]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Result<G<u8>, PyError>");
+    assert_eq!(
+        field_row_ty(
+            &program.struct_fields,
+            "core::result::Result<G<u8>,PyError>::Ok",
+            "__pos_0"
+        ),
+        Some("G<u8>"),
+        "generic intern ROW stays the CAST leaf render; keys={:?}",
+        program.struct_fields.fields.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Interned `Option<char>` BASE carries `__discriminant` so rtype
+/// `getclsfield` of a tagged primitive Option succeeds
+/// (`rclass.py` `InstanceRepr._setup_repr`).
+#[test]
+fn interned_option_char_base_projects_discriminant() {
+    use crate::annotator::model::SomeValue;
+    use std::rc::Rc;
+
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let i64_ty = interior_i64();
+    let llbc = intern_option_from_map_call_llbc(vec![char_ty, i64_ty], vec![]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for interned Option<char>");
+    let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(program.struct_fields));
+    let classdef = bk
+        .getuniqueclassdef_for_struct_root("option::Option<char>")
+        .expect("interned Option<char> BASE classdef");
+    let attr = classdef
+        .borrow()
+        .attrs
+        .get("__discriminant")
+        .map(|a| a.s_value.clone());
+    let attr_kind = match attr {
+        Some(SomeValue::Integer(_)) => "Integer",
+        other => panic!("Option<char> BASE intern projects __discriminant, got {other:?}"),
+    };
+    assert_eq!(attr_kind, "Integer");
+}
+
+/// Recast dest (`resolve_aggregate_adt` variant owner) and field intern
+/// (`class_identity_spelling` plus suffix) yield one intern key
+/// (`bookkeeper.py` `getuniqueclassdef(cls)`).
+#[test]
+fn recast_dest_and_field_intern_share_control_flow_continue_key() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::front::StructFieldRegistry;
+    use std::rc::Rc;
+
+    let name_path = "core::ops::control_flow::ControlFlow";
+    let suffix = "<Option<Never>,u8>";
+    let tomb = super::no_tombstoned_leaves();
+    let recast_owner = super::enum_ctor_class_identity(name_path, Some(suffix), &tomb);
+    let recast = format!("{recast_owner}::Continue");
+    let field = format!(
+        "{}{suffix}::Continue",
+        super::class_identity_spelling(name_path, &tomb)
+    );
+    assert_eq!(recast, field);
+    assert_eq!(
+        recast,
+        "ops::control_flow::ControlFlow<Option<Never>,u8>::Continue"
+    );
+
+    // Prologue intern of the harvested key parents Continue/Break to the
+    // instantiation (`classdesc.py` `ClassDef.commonbase`). Recast dest
+    // spells that same key, so intern_enum_variant_host reuses it.
+    let bk = Rc::new(Bookkeeper::new());
+    let mut reg = StructFieldRegistry::default();
+    let template = "ops::control_flow::ControlFlow";
+    let inst = "ops::control_flow::ControlFlow<Option<Never>,u8>";
+    reg.fields.insert(
+        template.to_string(),
+        vec![("__discriminant".to_string(), "i64".to_string())],
+    );
+    reg.fields.insert(
+        inst.to_string(),
+        vec![("__discriminant".to_string(), "i64".to_string())],
+    );
+    for variant in ["Continue", "Break"] {
+        reg.fields.insert(
+            format!("{inst}::{variant}"),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+    }
+    bk.set_struct_fields(Rc::new(reg));
+    let first = bk.intern_class_by_qualname(&recast);
+    let from_host = bk.intern_enum_variant_host(inst, "Continue");
+    assert_eq!(
+        first, from_host,
+        "producer key must intern as intern_enum_variant_host"
+    );
+    let continue_cd = bk
+        .getuniqueclassdef_for_enum_variant(inst, "Continue")
+        .expect("Continue classdef");
+    let break_cd = bk
+        .getuniqueclassdef_for_enum_variant(inst, "Break")
+        .expect("Break classdef");
+    let common = ClassDef::commonbase(&continue_cd, &break_cd);
+    assert!(
+        common.is_some(),
+        "Continue and Break must share the instantiation parent"
+    );
+    assert!(
+        common
+            .as_ref()
+            .is_some_and(|cd| cd.borrow().name.contains(inst)),
+        "commonbase must be the instantiation, got {:?}",
+        common.map(|cd| cd.borrow().name.clone())
+    );
+}
+
+/// `Try::branch` of `Option<fn(…) -> *mut GCREFOpaque>` builds
+/// Continue/Break of that ControlFlow instantiation. The prologue
+/// intern_class_by_qualname of the variant key must parent both to
+/// the instantiation (`classdesc.py` `ClassDef.commonbase`).
+#[test]
+fn intern_class_by_qualname_parents_fn_payload_control_flow_variants() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::front::StructFieldRegistry;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    let bk = Rc::new(Bookkeeper::new());
+    let mut reg = StructFieldRegistry::default();
+    let template = "ops::control_flow::ControlFlow";
+    let inst = "ops::control_flow::ControlFlow<Option<Never>,fn(u32,usize) -> *mut GCREFOpaque>";
+    for key in [template, inst] {
+        reg.fields.insert(
+            key.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+    }
+    for variant in ["Continue", "Break"] {
+        for root in [template, inst] {
+            reg.fields.insert(
+                format!("{root}::{variant}"),
+                vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+            );
+        }
+    }
+    bk.set_struct_fields(Rc::new(reg));
+    let mut by_discr = HashMap::new();
+    by_discr.insert(0i64, "Continue".to_string());
+    by_discr.insert(1i64, "Break".to_string());
+    let mut map = HashMap::new();
+    map.insert(template.to_string(), by_discr.clone());
+    map.insert(inst.to_string(), by_discr);
+    bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+    let continue_host = bk.intern_class_by_qualname(&format!("{inst}::Continue"));
+    let break_host = bk.intern_class_by_qualname(&format!("{inst}::Break"));
+    let continue_cd = bk
+        .getuniqueclassdef(&continue_host)
+        .expect("Continue classdef");
+    let break_cd = bk.getuniqueclassdef(&break_host).expect("Break classdef");
+    let common = ClassDef::commonbase(&continue_cd, &break_cd);
+    assert!(
+        common.is_some(),
+        "fn-payload Continue/Break must share a ControlFlow parent, continue={} break={}",
+        continue_cd.borrow().name,
+        break_cd.borrow().name
+    );
+}
+
+/// Tagged `Option<char>` Discriminant recasts the classdef-less receiver
+/// onto the interned BASE class before getattr `__discriminant`
+/// (`rclass.py` `InstanceRepr.getclsfield`).
+#[test]
+fn tagged_option_char_discriminant_recasts_to_interned_class() {
+    use crate::model::{CallTarget, OpKind};
+
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let option_ty = option_adt_node(0, char_ty);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "char_disc"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_ty.clone()],
+            "output": disc_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &disc_ty),
+                window_local(1, &option_ty)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &disc_ty),
+                        {"Discriminant": window_place(
+                            serde_json::json!({"Local": 1}),
+                            &option_ty
+                        )}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![option_enum(0)], vec![caller]);
+    let graph = super::lower_function(&llbc, "char_disc")
+        .unwrap_or_else(|err| panic!("lower Option<char> Discriminant: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let recast_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str)
+                == Some(crate::runtime_names::shims::CAST_INSTANCE) =>
             {
-                op.result.clone()
+                let root = args.get(1).and_then(|arg| match arg {
+                    crate::model::LinkArg::Const(c) => match &c.value {
+                        crate::flowspace::model::ConstValue::ByteStr(bytes) => {
+                            std::str::from_utf8(bytes).ok()
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                })?;
+                root.contains("Option<char>")
+                    .then_some(op.result.as_ref()?.id())
             }
             _ => None,
         })
         .collect();
-    let narrowed_nulls: Vec<_> = graph
+    assert_eq!(
+        recast_ids.len(),
+        1,
+        "tagged Option<char> Discriminant recasts to interned class; graph={}",
+        graph.dump()
+    );
+    let disc_on_recast = ops
+        .iter()
+        .filter(|op| match &op.kind {
+            OpKind::FieldRead { field, base, .. } if field.name == "__discriminant" => {
+                recast_ids.contains(&base.id())
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        disc_on_recast,
+        1,
+        "getattr __discriminant reads the recast interned class; graph={}",
+        graph.dump()
+    );
+}
+
+/// A generic unspecialized template is not a SemanticProgram subject
+/// (`FunctionDesc.cachedgraph`).
+#[test]
+fn generic_unspecialized_template_is_not_a_subject() {
+    let unit = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let ret_body = serde_json::json!({
+        "Unstructured": {
+            "span": interior_span(),
+            "locals": {
+                "arg_count": 0,
+                "locals": [interior_local(0, None, &unit)]
+            },
+            "body": [interior_bb(vec![], interior_return())]
+        }
+    });
+    let concrete = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["fixture", "ok"], true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": unit.clone()},
+        "body": ret_body.clone()
+    });
+    let generic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "option", "Option", "map"], false),
+        "generics": {
+            "types": [{"index": 0, "name": "T"}],
+            "trait_clauses": [],
+            "const_generics": []
+        },
+        "signature": {"is_unsafe": false, "inputs": [t.clone()], "output": t},
+        "body": ret_body
+    });
+    let llbc = llbc_with_types("fixture", vec![], vec![concrete, generic]);
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build semantic program for admit_decl generic skip");
+    let ids: Vec<Option<u64>> = program.functions.iter().map(|f| f.fun_decl_id).collect();
+    assert_eq!(
+        ids.contains(&Some(0)),
+        true,
+        "non-generic caller is a subject; ids={ids:?} names={:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        ids.contains(&Some(1)),
+        false,
+        "generic unspecialized template is not a subject; ids={ids:?} names={:?}",
+        program
+            .functions
+            .iter()
+            .map(|f| &f.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `opt.map_or(default, f)` on `Option<&OwnedFd>`: Discriminant `is_`
+/// operands share the payload `Ptr(Struct)` lltype (`rnone.py`
+/// `rtype_is_None`). Overlay paint is int-bank SomePtr, so there is no
+/// GCREF `__cast_instance_intrinsic` recast; after rtype + jtransform
+/// the null test is `int_eq` / `int_is_zero` with `i` operands.
+#[test]
+fn map_or_niche_raw_struct_is_operands_agree() {
+    use crate::assembler::{Assembler, AssemblerExt};
+    use crate::flatten::flatten_graph;
+    use crate::model::{ConcreteType, NicheIntNull, getkind};
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let owned = interior_struct(
+        1,
+        &["fixture", "OwnedFd"],
+        &[(
+            "fd",
+            serde_json::json!({"Scalar": {"Integer": {"Signed": "I32"}}}),
+        )],
+        4,
+        &[0],
+        false,
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), owned],
+        take,
+        None,
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let mut saw_is = 0usize;
+    let mut is_ptr_ty = None;
+    for block in &body.blocks {
+        for op in &block.operations {
+            let OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "is_" {
+                continue;
+            }
+            saw_is += 1;
+            let lhs_ct = lhs.concretetype.borrow().clone();
+            let rhs_ct = rhs.concretetype.borrow().clone();
+            assert_eq!(
+                lhs_ct,
+                rhs_ct,
+                "is_ mixed concretetype {lhs_ct:?} vs {rhs_ct:?}; ops={:?}",
+                graph_ops(&body)
+            );
+            let Some(LowLevelType::Ptr(ptr)) = lhs_ct.as_ref() else {
+                panic!(
+                    "is_ operand is Ptr(Struct OwnedFd), got {lhs_ct:?}; ops={:?}",
+                    graph_ops(&body)
+                );
+            };
+            let PtrTarget::Struct(st) = &ptr.TO else {
+                panic!("is_ Ptr of OwnedFd, got {:?}", ptr.TO);
+            };
+            assert_eq!(st._name, "OwnedFd");
+            assert_eq!(st._gckind, GcKind::Raw);
+            is_ptr_ty = lhs_ct.clone();
+        }
+    }
+    assert_eq!(
+        saw_is,
+        1,
+        "niche map_or body emits one is_ null test; ops={:?}",
+        graph_ops(&body)
+    );
+    let int_casts = graph_ops(&body)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+            _ => false,
+        })
+        .count();
+    let instance_casts = graph_ops(&body)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.as_slice() == ["__cast_instance_intrinsic"],
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        int_casts,
+        0,
+        "Struct pointee Discriminant does not recast through cast_int_to_ptr; ops={:?}",
+        graph_ops(&body)
+    );
+    assert_eq!(
+        map_or_null_targets(&body),
+        vec!["core::ptr::null_raw".to_string()],
+        "Option<&RawStruct> discriminant uses null_raw; ops={:?}",
+        graph_ops(&body)
+    );
+    assert_eq!(
+        instance_casts,
+        0,
+        "overlay is already Ptr(Struct Raw); Discriminant and Some.__pos_0 do not recast a GCREF Input; ops={:?}",
+        graph_ops(&body)
+    );
+    let self_inputs: Vec<(ValueType, Option<String>)> = body
         .blocks
         .iter()
-        .flat_map(|b| &b.operations)
-        .filter_map(|op| {
-            let OpKind::Call { args, .. } = &op.kind else {
-                return None;
-            };
-            if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
-                && args
-                    .first()
-                    .and_then(crate::model::LinkArg::as_variable)
-                    .is_some_and(|v| null_results.contains(v))
-            {
-                op.result.clone()
-            } else {
-                None
-            }
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Input {
+                name,
+                ty,
+                class_root,
+                ..
+            } if name == "self" => Some((ty.clone(), class_root.clone())),
+            _ => None,
         })
         .collect();
+    assert_eq!(
+        self_inputs,
+        vec![(ValueType::Int, Some("OwnedFd".to_string()))],
+        "Option<&RawStruct> Input is int-bank SomePtr; class_root seeds raw_struct_ptr_annotation; ops={:?}",
+        graph_ops(&body)
+    );
+
+    let ptr_ty = is_ptr_ty.expect("is_ operands carry Ptr(Struct OwnedFd, Raw)");
+    assert_eq!(
+        getkind(&ptr_ty),
+        ConcreteType::Signed,
+        "raw Ptr getkind is int"
+    );
+
+    // Same lltype both sides of `is_` is what `rtype_is_` requires.
+    // jtransform then assembler: leftover `is_` of two int-bank raw Ptrs
+    // is `int_eq/ii>i` (or `int_is_zero` if the null folds); never `ptr_*`
+    // and never mixed `int_is_/ri`.
+    let mut is_graph = FunctionGraph::new("map_or_niche_raw_struct_is");
+    let overlay = is_graph
+        .push_op_var(
+            is_graph.startblock,
+            OpKind::Input {
+                name: "self".into(),
+                ty: ValueType::Int,
+                class_root: Some("OwnedFd".into()),
+            },
+            true,
+        )
+        .unwrap();
+    overlay.set_concretetype(Some(ptr_ty.clone()));
+    let start = is_graph.startblock;
+    let null = NicheIntNull::RawAddress(Some("OwnedFd".into())).push(&mut is_graph, start);
+    null.set_concretetype(Some(ptr_ty));
+    let result = is_graph
+        .push_op_var(
+            is_graph.startblock,
+            OpKind::BinOp {
+                op: "is_".to_string(),
+                lhs: overlay,
+                rhs: null,
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .unwrap();
+    FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::Signed);
+    is_graph.set_return(is_graph.startblock, Some(result));
+    let mut transformed = crate::jtransform::transform_graph(
+        &is_graph,
+        &crate::jtransform::GraphTransformConfig::default(),
+    )
+    .graph;
+    crate::regalloc::augment_canonical_exceptblock_on_graph(&mut transformed);
+    let mut regallocs = crate::regalloc::perform_all_register_allocations(&transformed);
+    let mut flat = flatten_graph(&transformed, &mut regallocs);
+    let mut asm = Assembler::new();
+    let _ = asm.assemble(&mut flat, &regallocs);
+    let keys: Vec<&str> = asm.insns.keys().map(String::as_str).collect();
     assert!(
-        graph
-            .blocks
-            .iter()
-            .any(|block| block.exits.iter().any(|link| {
-                link.target == graph.returnblock
-                    && link
-                        .args
-                        .iter()
-                        .any(|arg| matches!(arg, LinkArg::Value(v) if narrowed_nulls.contains(v)))
-            })),
-        "lookup: niche `?` break arm must return a PyObject-narrowed null"
+        keys.iter()
+            .any(|k| *k == "int_eq/ii>i" || *k == "int_is_zero/i>i"),
+        "raw-struct niche null test is int_eq/int_is_zero with i operands, got {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.starts_with("ptr_")
+            || k.starts_with("int_is_/")
+            || k.contains("int_eq/ri")
+            || k.contains("int_eq/ir")
+            || k.contains("int_eq/r")),
+        "raw-struct niche null test must not emit ptr_* or mixed int_eq/int_is_, got {keys:?}"
+    );
+}
+
+/// `Some.__pos_0` of `Option<&*mut WordHasher>` is a slot address, so it
+/// does not emit `__cast_instance_intrinsic` to the GC class.
+/// `Option<&WordHasher>` still emits exactly one.
+#[test]
+fn map_or_slot_ref_payload_is_not_the_pointee_class() {
+    let hasher = code_struct(1, &["hash", "WordHasher"]);
+    let take_i64 = interior_i64();
+    let gc_payload = option_shared_ref(adt_node(1));
+    let gc_opt = option_adt_node(0, gc_payload.clone());
+    let gc_take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![gc_payload.clone()],
+        take_i64.clone(),
+    );
+    let gc_llbc = option_map_or_typed_fn_item_llbc(
+        gc_opt,
+        gc_payload,
+        vec![option_enum(0), hasher.clone()],
+        gc_take,
+        Some(1),
+    );
+    let gc_body = lower_map_or_core_body(&gc_llbc);
+    let gc_roots: Vec<&str> = gc_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        gc_roots,
+        vec!["WordHasher"],
+        "Option<&WordHasher> still casts Some.__pos_0 to the pointee class; ops={:?}",
+        graph_ops(&gc_body)
+    );
+
+    let slot_payload = option_shared_ref(interior_raw_mut(adt_node(1)));
+    let slot_opt = option_adt_node(0, slot_payload.clone());
+    let slot_take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![slot_payload.clone()],
+        take_i64,
+    );
+    let slot_llbc = option_map_or_typed_fn_item_llbc(
+        slot_opt,
+        slot_payload,
+        vec![option_enum(0), hasher],
+        slot_take,
+        Some(1),
+    );
+    let slot_body = lower_map_or_core_body(&slot_llbc);
+    let slot_roots: Vec<&str> = slot_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        slot_roots.len(),
+        0,
+        "Option<&*mut WordHasher> must not cast the slot address to WordHasher; ops={:?} roots={slot_roots:?}",
+        graph_ops(&slot_body)
+    );
+}
+
+/// Residual call whose dest is `Option<P>`: the caller is a one-block
+/// Call of an Opaque FunDecl (`items_base_operand_llbc` residual shape).
+fn lower_residual_option_dest(payload: serde_json::Value) -> FunctionGraph {
+    let opt_ty = option_adt_node(0, payload);
+    let callee = interior_opaque(1, &["fixture", "residual_get"], vec![], opt_ty.clone());
+    let caller = interior_caller(
+        "call_residual",
+        0,
+        vec![],
+        opt_ty.clone(),
+        vec![interior_local(0, None, &opt_ty)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &opt_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), code_struct(1, &["fixture", "GcStruct"])],
+        vec![caller, callee],
+    );
+    lower_interior(&llbc, "call_residual")
+}
+
+fn residual_option_dest_cast_roots(graph: &FunctionGraph) -> Vec<&str> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect()
+}
+
+/// Residual dest `Option<&*mut GcStruct>` is a slot address (`rdict.py`
+/// `ll_get`): `option_residual_narrow_root` must not extra-peel it into
+/// class `GcStruct`. `Option<*mut GcStruct>` keeps today's payload-class
+/// trailing `__cast_instance_intrinsic`.
+#[test]
+fn residual_slot_ref_option_dest_is_not_the_pointee_class() {
+    let slot = lower_residual_option_dest(option_shared_ref(interior_raw_mut(adt_node(1))));
+    let slot_roots = residual_option_dest_cast_roots(&slot);
+    assert_eq!(
+        slot_roots.len(),
+        0,
+        "Option<&*mut GcStruct> residual dest must not recast the slot address; ops={:?} roots={slot_roots:?}",
+        graph_ops(&slot)
+    );
+
+    let raw = lower_residual_option_dest(interior_raw_mut(adt_node(1)));
+    let raw_roots = residual_option_dest_cast_roots(&raw);
+    assert_eq!(
+        raw_roots,
+        vec!["GcStruct"],
+        "Option<*mut GcStruct> residual dest keeps today's payload-class cast; ops={:?} roots={raw_roots:?}",
+        graph_ops(&raw)
+    );
+}
+
+/// `opt.map_or(default, f)` on `Option<&WordHasher>`: the Some payload
+/// is the niche pointer, narrowed to the pointee class so `f(t)` sees
+/// `SomeInstance(WordHasher)` (`rclass.py` `InstanceRepr._setup_repr`).
+#[test]
+fn map_or_reference_payload_class_is_narrowed() {
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), code_struct(1, &["hash", "WordHasher"])],
+        take,
+        Some(1),
+    );
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let roots: Vec<&str> = body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        roots,
+        vec!["WordHasher"],
+        "Some.__pos_0 of a GC-instance niche Option is cast to the pointee class; ops={:?}",
+        graph_ops(&body)
+    );
+}
+
+fn is_option_core_leaf_call(op: &crate::model::SpaceOperation, leaf: &str) -> bool {
+    use crate::model::{CallTarget, OpKind};
+    match &op.kind {
+        OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    ..
+                },
+            ..
+        } if name == leaf => receiver_root.as_deref().is_some_and(|root| {
+            let leaf =
+                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root));
+            leaf == "Option"
+        }),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            segments.last().map(String::as_str) == Some(leaf)
+                && segments.iter().any(|s| s == "option")
+        }
+        _ => false,
+    }
+}
+
+fn option_core_leaf_call_count(graph: &FunctionGraph, leaf: &str) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| is_option_core_leaf_call(op, leaf))
+        .count()
+}
+
+fn control_flow_disc_switch_count(graph: &FunctionGraph) -> usize {
+    use crate::model::{ExitSwitch, FieldDescriptor, OpKind};
+    graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            let Some(ExitSwitch::Value(sw)) = &block.exitswitch else {
+                return false;
+            };
+            block.operations.iter().any(|op| {
+                op.result.as_ref() == Some(sw)
+                    && matches!(
+                        &op.kind,
+                        OpKind::FieldRead {
+                            field: FieldDescriptor { name, owner_root, .. },
+                            ..
+                        } if name == "__discriminant"
+                            && owner_root
+                                .as_deref()
+                                .is_some_and(|o| o.contains("ControlFlow"))
+                    )
+            })
+        })
+        .count()
+}
+
+fn control_flow_pos0_owners(graph: &FunctionGraph) -> (Vec<String>, Vec<String>) {
+    let mut continues = Vec::new();
+    let mut breaks = Vec::new();
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldRead { field, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "__pos_0" {
+            continue;
+        }
+        let owner = field.owner_root.clone().unwrap_or_default();
+        if !owner.contains("ControlFlow") {
+            continue;
+        }
+        if owner.contains("Continue") {
+            continues.push(owner);
+        } else if owner.contains("Break") {
+            breaks.push(owner);
+        }
+    }
+    (continues, breaks)
+}
+
+/// `baseobjspace::lookup` (`let w_type = type(obj)?; lookup_in_type(..)`).
+/// Option `?` is a regular call of `core::option::<Impl>::branch`, a switch
+/// on the `ControlFlow` discriminant, and a regular call of `from_residual`
+/// on the Break arm. The caller-side rewrite that used to consume residual
+/// `branch` (forcing Method `"branch"` count 0, synthesizing a niche `ne`
+/// null-test and a PyObject-narrowed null return) is gone: those counts
+/// move into the extracted helper graphs. Ignored by default (loads the
+/// real LLBC); run with `cargo test -p majit-translate --lib
+/// option_try_recast_break_arm_real -- --ignored`.
+#[test]
+#[ignore]
+fn option_try_recast_break_arm_real_lookup() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let llbc = Llbc::load(path).expect("load real LLBC");
+    let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        1,
+        "lookup keeps one regular call of the extracted Option branch body; was 0 while the rewrite consumed residual Method branch"
+    );
+    assert_eq!(
+        control_flow_disc_switch_count(&graph),
+        1,
+        "lookup switches on the ControlFlow discriminant of branch's result; the rewrite used to replace this with a niche `ne` null-test"
+    );
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "from_residual"),
+        1,
+        "lookup's Break arm is a regular call of Option from_residual; the rewrite inlined None construction instead"
     );
 }
 
 /// `builtins::kwarg_get` opens with `let dict = kwargs?;` on its
-/// `Option<PyObjectRef>` parameter, so the `Try::branch` sits in the
-/// startblock after the parameters' `Input` ops and no block forwards the
-/// Option into it.  `option_try` splits the startblock before the branch
-/// and rewrites the `?` like any other site: no residual `branch` call.
+/// `Option<PyObjectRef>` parameter, so `Try::branch` sits in the
+/// startblock after the parameters' `Input` ops. The rewrite used to
+/// split the startblock and consume residual `branch` (count 0). The
+/// caller now keeps one regular branch call in the startblock and a
+/// ControlFlow discriminant switch; `from_residual` is the Break arm.
 /// Ignored by default (loads the real LLBC).
 #[test]
 #[ignore]
 fn option_try_on_a_parameter_real_kwarg_get() {
-    use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "kwarg_get").expect("lower kwarg_get");
-    let branch_calls = graph
-        .blocks
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        1,
+        "kwarg_get keeps one regular call of the extracted Option branch body; was 0 while the rewrite consumed residual Method branch"
+    );
+    let start_branch = graph.blocks[graph.startblock.0]
+        .operations
         .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
-                    if name == "branch" && args.len() == 1
-            )
-        })
+        .filter(|op| is_option_core_leaf_call(op, "branch"))
         .count();
     assert_eq!(
-        branch_calls, 0,
-        "kwarg_get: residual Try::branch Method-call on the parameter `?`"
+        start_branch, 1,
+        "kwargs? is in the startblock; the rewrite no longer splits before branch"
+    );
+    assert_eq!(
+        control_flow_disc_switch_count(&graph),
+        1,
+        "kwarg_get switches on the ControlFlow discriminant of branch's result"
+    );
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "from_residual"),
+        1,
+        "kwarg_get's Break arm is a regular call of Option from_residual"
     );
 }
 
-/// Real-LLBC anchor for the `Option::is_some_and` closure-select fold:
-/// `is_mmap` is `type(obj).is_some_and(|tp| ptr::eq(tp.as_ptr(),
-/// mmap_type()))`.  After the `option_closure_select` post-pass there must
-/// be no residual `is_some_and` `Method` call, and block A must branch two
-/// ways (the `Some`/`None` discriminant diamond).  `#[ignore]`d (loads the
-/// ~440MB real LLBC); run with `cargo test -p majit-translate --lib
-/// is_some_and_is_mmap_real -- --ignored`.
+/// Real-LLBC anchor for `Option::is_some_and`: `slot_del` is
+/// `w_list_getitem(...).is_some_and(|value| !value.is_null())`. The
+/// caller keeps a regular call to the extracted core body; the
+/// Some/None diamond lives in that body, not at the caller.
+/// `#[ignore]`d (loads the real LLBC); run with
+/// `cargo test -p majit-translate --lib is_some_and_slot_del_real -- --ignored`.
 #[test]
 #[ignore]
-fn is_some_and_is_mmap_real() {
+fn is_some_and_slot_del_real() {
     use crate::model::{CallTarget, OpKind};
-    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
     let llbc = Llbc::load(path).expect("load real LLBC");
-    let graph = super::lower_function(&llbc, "is_mmap").expect("lower is_mmap");
-    let residual = graph
+    let graph = super::lower_function(&llbc, "slot_del").expect("lower slot_del");
+    let is_some_and_calls = graph
         .blocks
         .iter()
         .flat_map(|b| b.operations.iter())
@@ -13149,17 +14983,24 @@ fn is_some_and_is_mmap_real() {
                 &op.kind,
                 OpKind::Call { target: CallTarget::Method { name, .. }, .. }
                     if name == "is_some_and"
+            ) || matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("is_some_and")
+                    && segments.iter().any(|s| s == "option")
             )
         })
         .count();
     assert_eq!(
-        residual, 0,
-        "is_mmap: residual is_some_and call after the closure-select rewrite"
+        is_some_and_calls, 1,
+        "slot_del keeps one regular call to the core is_some_and body, got {is_some_and_calls}"
     );
-    let branching = graph.blocks.iter().filter(|b| b.exits.len() == 2).count();
-    assert!(
-        branching >= 1,
-        "is_mmap: expected the Some/None discriminant branch (a 2-exit block)"
+    assert_eq!(
+        graph.blocks[graph.startblock.0].exits.len(),
+        1,
+        "the Some/None diamond lives in the core body, not at the caller"
     );
 }
 
@@ -14477,23 +16318,28 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
         residuals.is_empty(),
         "signed-to-usize conversion must not leave an opaque core call: {residuals:?}"
     );
-    let unwrap_residuals = graph
+    let unwrap_calls = graph
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "unwrap"
-            )
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "unwrap",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("unwrap")
+                    && segments.iter().any(|s| s == "result")
+            }
+            _ => false,
         })
         .count();
     assert_eq!(
-        unwrap_residuals, 0,
-        "checked conversion Result::unwrap must become a discriminant guard"
+        unwrap_calls, 1,
+        "checked conversion Result::unwrap stays one regular call of the core body"
     );
     for name in [
         "pyre_object::listobject::range_state_value",
@@ -14602,12 +16448,12 @@ fn range_list_length_lowers_signed_to_usize_try_from() {
 
 /// `complex_val` returns the RPython spelling of an optional pair.  The
 /// arithmetic helpers call `unwrap` only after their numeric dispatch has
-/// established the value is present, so the opaque Rust combinator must be
-/// translated to the ordinary payload guard instead of becoming a method
-/// lookup on an Option shell.
+/// established the value is present. The extracted core body is a regular
+/// call; its None arm is implicit AssertionError pruned by
+/// `remove_assertion_errors`.
 #[test]
 #[ignore]
-fn complex_arithmetic_unwraps_lower_to_payload_guards() {
+fn complex_arithmetic_unwraps_keep_regular_core_calls() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
@@ -14622,23 +16468,29 @@ fn complex_arithmetic_unwraps_lower_to_payload_guards() {
     ] {
         let graph = super::lower_function(&llbc, name)
             .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
-        let residuals: Vec<_> = graph
+        let unwrap_calls = graph
             .blocks
             .iter()
-            .enumerate()
-            .flat_map(|(block, bb)| {
-                bb.operations.iter().filter_map(move |op| match &op.kind {
-                    OpKind::Call {
-                        target: CallTarget::Method { name, .. },
-                        ..
-                    } if name == "unwrap" => Some((block, op.clone(), bb.exits.clone())),
-                    _ => None,
-                })
+            .flat_map(|bb| &bb.operations)
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "unwrap",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some("unwrap")
+                        && segments.iter().any(|s| s == "option")
+                }
+                _ => false,
             })
-            .collect();
-        assert!(
-            residuals.is_empty(),
-            "{name}: Option::unwrap must become a payload guard: {residuals:#?}"
+            .count();
+        let expected = if name.ends_with("complex_neg") { 1 } else { 2 };
+        assert_eq!(
+            unwrap_calls, expected,
+            "{name}: Option::unwrap stays a regular call of the core body, got {unwrap_calls}"
         );
     }
 }
@@ -14904,12 +16756,11 @@ fn niche_option_non_niche_payloads_remain_aggregate() {
     }
 }
 
-/// `Option<String>` match is RPython's nullable `SomeString`:
-/// `s is None` (`pairtype(SomeObject, SomeObject).is_`, rtyped by
-/// `rtype_is_` / `ptr_iszero`), and the `Some` payload is the string
-/// itself. The corpus `option_question_mark` `?` is a `Try::branch`
-/// match; injecting `alloc::string::String` as the Option payload
-/// pins that the front does not emit `getattr('__discriminant')`.
+/// `option_question_mark` with a String payload: Option `?` is a regular
+/// call of the extracted `branch` body plus a ControlFlow discriminant
+/// switch. The rewrite used to inline a niche null-test (`null_muts >= 1`,
+/// identity `is_`, zero Option `__discriminant` reads) at the caller;
+/// those counts now live in the helper graphs.
 #[test]
 fn niche_option_string_match_is_none_identity() {
     use crate::model::OpKind;
@@ -14920,28 +16771,22 @@ fn niche_option_string_match_is_none_identity() {
         false,
         true,
     );
-    let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
-    assert!(
-        null_muts >= 1,
-        "Option<String> None must lower to a null string pointer, got {null_muts}"
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        1,
+        "caller keeps one regular Option branch call; was consumed by the rewrite"
     );
     assert_eq!(
-        transparent_ctors, 0,
-        "Option<String> Some must be the string identity, with no Option aggregate"
+        control_flow_disc_switch_count(&graph),
+        1,
+        "caller switches on ControlFlow; the rewrite used to emit a niche `is_` null-test instead"
     );
-    let discriminant_reads = graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .filter(|op| {
-                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
-            })
-            .count();
     assert_eq!(
-        discriminant_reads, 0,
-        "Option<String> match must not read an aggregate __discriminant"
+        option_core_leaf_call_count(&graph, "from_residual"),
+        1,
+        "Break arm is from_residual; the rewrite inlined a null string pointer"
     );
-    let some_payload_reads = graph
+    let option_disc = graph
         .blocks
         .iter()
         .flat_map(|b| b.operations.iter())
@@ -14949,25 +16794,16 @@ fn niche_option_string_match_is_none_identity() {
             matches!(
                 &op.kind,
                 OpKind::FieldRead { field, .. }
-                    if field.name == "__pos_0"
-                        && field.owner_root.as_deref().is_some_and(|owner| {
-                            owner.contains("Option") && owner.ends_with("::Some")
+                    if field.name == "__discriminant"
+                        && field.owner_root.as_deref().is_some_and(|o| {
+                            o.contains("Option") && !o.contains("ControlFlow")
                         })
             )
         })
         .count();
     assert_eq!(
-        some_payload_reads, 0,
-        "Option<String> Some payload must be the string itself"
-    );
-    let has_is = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_"));
-    assert!(
-        has_is,
-        "Option<String> match must contain an identity null-test"
+        option_disc, 0,
+        "Option aggregate disc reads stay in the branch body, not at the caller"
     );
 }
 
@@ -15217,17 +17053,16 @@ fn niche_option_ext_eq_stays_a_call() {
     );
 }
 
-/// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)
-/// must fold its `gettypefor` match through the niche
-/// `Option<NonNull<PyObject>>` path now that `gettypefor` returns a
-/// one-word niche Option: the map_or rewrite uses a `ptr_ne` null-test
-/// (`base != null_mut()`), NOT an aggregate `__discriminant` FieldRead,
-/// and the null is a `null_mut()` call (repr-adaptive) rather than a
-/// fixed-GCREF `ConstRefNull`.  Guards against a regression where the
-/// niche detector stops recognising the `NonNull` payload (which would
-/// re-introduce the classdef-less `__discriminant` base) or where the
-/// null reverts to `ConstRefNull` (which cannot rtype against the
-/// pointer's `InstanceRepr`).  Ignored by default (loads the real LLBC).
+/// `gettypeobject` matches `gettypefor(..)` over a one-word niche
+/// `Option<NonNull<PyObject>>`. The Discriminant fold uses a `ptr_ne`
+/// null-test (`base != null_mut()`), NOT an aggregate `__discriminant`
+/// FieldRead, and the null is a `null_mut()` call (repr-adaptive)
+/// rather than a fixed-GCREF `ConstRefNull`.  Guards against a
+/// regression where the niche detector stops recognising the `NonNull`
+/// payload (which would re-introduce the classdef-less `__discriminant`
+/// base) or where the null reverts to `ConstRefNull` (which cannot
+/// rtype against the pointer's `InstanceRepr`).  Ignored by default
+/// (loads the real LLBC).
 #[test]
 #[ignore]
 fn niche_option_gettypeobject_folds_to_ptr_null_test() {
@@ -15261,7 +17096,7 @@ fn niche_option_gettypeobject_folds_to_ptr_null_test() {
         null_muts >= 1,
         "gettypeobject: expected a null_mut() feeding the niche ptr null-test"
     );
-    // The map_or niche discriminant contains a `ne` pointer null-test, and no
+    // The niche discriminant contains a `ne` pointer null-test, and no
     // `__discriminant` FieldRead survives on the niche `gettypefor` result.
     let has_ne = graph
         .blocks
@@ -15776,8 +17611,8 @@ fn utf8_string_builder_methods_lower_to_string_builder_markers() {
     }
 }
 
-/// `get_w_locals` is `getdebug_data().map_or(PY_NULL, |data| data.w_locals)`
-/// over `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
+/// `get_w_locals` matches `getdebug_data()` over
+/// `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
 /// `Some` payload must alias the base pointer (no aggregate `__pos_0`
 /// FieldRead), the same fold the `&mut`/`NonNull` niche arms already apply.
 /// Ignored by default (loads the real LLBC).
@@ -17285,6 +19120,25 @@ fn clear_references_niche_bool_then_has_no_option_aggregate() {
     );
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "clear_references").expect("lower clear_references");
+    let then_calls = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("then")
+                    && segments.iter().any(|s| s == "bool")
+            )
+        })
+        .count();
+    assert_eq!(
+        then_calls, 1,
+        "clear_references keeps one regular call to the core bool::then body"
+    );
     let option_aggregate_ops = graph
         .blocks
         .iter()
@@ -17306,46 +19160,8 @@ fn clear_references_niche_bool_then_has_no_option_aggregate() {
         .count();
     assert_eq!(
         option_aggregate_ops, 0,
-        "bool::then producing Option<PyObjectRef> must use RPython's nullable-pointer \
-             representation (Some(ptr)=ptr, None=null), not an Option aggregate"
-    );
-    let is_instance_narrow = |op: &crate::model::SpaceOperation| {
-        crate::model::cast_instance_root(&op.kind) == Some("PyObject")
-    };
-    let join = graph.blocks.iter().find_map(|block| {
-        let has_call_once = block.operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "call_once"
-            )
-        });
-        (has_call_once && block.operations.iter().any(is_instance_narrow))
-            .then(|| block.exits.first().map(|link| link.target))
-            .flatten()
-    });
-    assert!(
-        join.is_some(),
-        "the niche Some payload must retain PyObject/W_Root class identity across call_once"
-    );
-    let narrowed_none = graph.blocks.iter().any(|block| {
-        block.exits.first().map(|link| link.target) == join
-            && block.operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
-                        ..
-                    } if segments == &["core", "ptr", "null_mut"]
-                )
-            })
-            && block.operations.iter().any(is_instance_narrow)
-    });
-    assert!(
-        narrowed_none,
-        "the niche None arm must be the same nullable PyObject/W_Root repr as the Some arm"
+        "bool::then producing Option<PyObjectRef> is a regular call of the core body; \
+             the caller must not mint an Option aggregate around that niche pointer"
     );
 }
 
@@ -19990,26 +21806,22 @@ fn str_idx_params_unrooted_pos0_owners_are_option_i64() {
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "str_idx_params_unrooted")
         .expect("lower str_idx_params_unrooted");
-    let pos0: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|o| o.contains("Option")) =>
-            {
-                Some(field.owner_root.clone().unwrap_or_default())
-            }
-            _ => None,
-        })
-        .collect();
+    let (continues, breaks) = control_flow_pos0_owners(&graph);
+    assert_eq!(
+        continues.len(),
+        2,
+        "two Option<i64> `?` Continue payloads; was Option<i64>::Some.__pos_0 while the rewrite inlined the diamond, got {continues:?}"
+    );
     assert!(
-        !pos0.is_empty() && pos0.iter().all(|o| o.contains("<i64>")),
-        "expected Option<i64>::Some payload reads, got {pos0:?}"
+        continues.iter().all(|o| o.contains("i64")),
+        "Continue payload stays i64, got {continues:?}"
+    );
+    assert_eq!(breaks.len(), 2, "two Break residuals, got {breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
+        "Break residual is Option<Never>, got {breaks:?}"
     );
 }
 
@@ -20049,9 +21861,8 @@ fn iobase_peek_dict_does_not_getattr_template_option_some() {
 #[test]
 fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
     // `w_list_getitem_inner` does `ll_getitem_index(...)?` on
-    // `Option<usize>`. The payload read must key `Option<usize>::Some`,
-    // the same ClassDef the callee's `Some` constructor interned
-    // (`bookkeeper.py` `getuniqueclassdef(cls)`).
+    // `Option<usize>`. The caller now reads ControlFlow Continue/Break
+    // `__pos_0` (the rewrite used to inline Option<usize>::Some).
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
@@ -20059,26 +21870,22 @@ fn match_on_call_returned_option_usize_reads_instantiated_some_pos0() {
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph =
         super::lower_function(&llbc, "w_list_getitem_inner").expect("lower w_list_getitem_inner");
-    let pos0: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|o| o.contains("Option")) =>
-            {
-                Some(field.owner_root.clone().unwrap_or_default())
-            }
-            _ => None,
-        })
-        .collect();
+    let (continues, breaks) = control_flow_pos0_owners(&graph);
+    assert_eq!(
+        continues.len(),
+        7,
+        "seven Option<usize> `?` Continue payloads; was Option<usize>::Some.__pos_0 while the rewrite inlined the diamond, got {continues:?}"
+    );
     assert!(
-        !pos0.is_empty() && pos0.iter().all(|o| o.contains("<usize>")),
-        "expected Option<usize>::Some payload reads, got {pos0:?}"
+        continues.iter().all(|o| o.contains("usize")),
+        "Continue payload stays usize, got {continues:?}"
+    );
+    assert_eq!(breaks.len(), 7, "seven Break residuals, got {breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
+        "Break residual is Option<Never>, got {breaks:?}"
     );
 }
 
@@ -20091,26 +21898,22 @@ fn std_gc_array_size_does_not_getattr_template_option_some() {
     let llbc = Llbc::load(path).expect("load real LLBC");
     let graph = super::lower_function(&llbc, "pyre_object::object_array::std_gc_array_size")
         .expect("lower std_gc_array_size");
-    let pos0: Vec<String> = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter_map(|op| match &op.kind {
-            OpKind::FieldRead { field, .. }
-                if field.name == "__pos_0"
-                    && field
-                        .owner_root
-                        .as_deref()
-                        .is_some_and(|o| o.contains("Option")) =>
-            {
-                Some(field.owner_root.clone().unwrap_or_default())
-            }
-            _ => None,
-        })
-        .collect();
+    let (continues, breaks) = control_flow_pos0_owners(&graph);
+    assert_eq!(
+        continues.len(),
+        2,
+        "two usize::checked_add `?` Continue payloads; was Option<usize>::Some.__pos_0, got {continues:?}"
+    );
     assert!(
-        !pos0.is_empty() && pos0.iter().all(|o| o.contains("<usize>")),
-        "expected Option<usize>::Some payload reads, got {pos0:?}"
+        continues.iter().all(|o| o.contains("usize")),
+        "Continue payload stays usize, got {continues:?}"
+    );
+    assert_eq!(breaks.len(), 2, "two Break residuals, got {breaks:?}");
+    assert!(
+        breaks
+            .iter()
+            .all(|o| o.contains("Option<Never>") || o.contains("Option<Infallible>")),
+        "Break residual is Option<Never>, got {breaks:?}"
     );
     let some_owners: Vec<String> = graph
         .blocks
@@ -21942,8 +23745,9 @@ fn hash_long_has_no_residual_constant_accessors() {
 }
 
 /// `Option<usize>` has no null niche. `cap.checked_mul(..)?` in
-/// `try_typed_items_block_layout` is `Try::branch` on that enum, which
-/// must become a discriminant switch rather than `getattr("branch")`.
+/// `try_typed_items_block_layout` is a regular call of the extracted
+/// `branch` body plus a ControlFlow discriminant switch. Method `"branch"`
+/// count was 0 while the rewrite consumed the residual; it is now 2.
 #[test]
 fn try_typed_items_block_layout_branches_on_usize_discriminant() {
     let path = concat!(
@@ -21953,35 +23757,20 @@ fn try_typed_items_block_layout_branches_on_usize_discriminant() {
     let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
     let graph = super::lower_function(&llbc, "try_typed_items_block_layout")
         .expect("lower try_typed_items_block_layout");
-    let branch = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "branch"
-            )
-        })
-        .count();
-    assert_eq!(branch, 0, "Option<usize> ? left a residual branch call");
-    let discs = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. } if field.name == "__discriminant"
-            )
-        })
-        .count();
-    assert!(
-        discs >= 1,
-        "non-niche Option<usize> must switch on __discriminant"
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "branch"),
+        2,
+        "two Option<usize> `?` keep regular branch calls; was 0 while the rewrite consumed residual Method branch"
+    );
+    assert_eq!(
+        control_flow_disc_switch_count(&graph),
+        2,
+        "each `?` switches on the ControlFlow discriminant"
+    );
+    assert_eq!(
+        option_core_leaf_call_count(&graph, "from_residual"),
+        2,
+        "each Break arm is a regular from_residual call"
     );
 }
 
@@ -23731,13 +25520,13 @@ fn option_filter_repr_switch() {
 pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
     super::AggregateShape::Ctor(super::AggregateCtor {
         target: CallTarget::synthetic_transparent_enum_variant_ctor(
-            vec!["core".into(), "option".into(), "Option<i64>".into()],
+            vec!["option::Option<i64>".into()],
             "Some".to_string(),
             1,
         ),
-        result_owner: "core::option::Option<i64>::Some".into(),
+        result_owner: "option::Option<i64>::Some".into(),
         owner_id: None,
-        owner_path: vec!["core".into(), "option".into(), "Option<i64>".into()],
+        owner_path: vec!["option::Option<i64>".into()],
         ctor_name: "Some".into(),
         fields: vec![super::AggregateField {
             name: "__pos_0".into(),
@@ -23775,14 +25564,14 @@ pub(in crate::front::mir) fn some_ctor_ops(graph: &FunctionGraph) -> (usize, usi
 
 /// `Result::<i64, i64>::Ok` as the constructor shape.
 pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
-    let owner_path: Vec<String> = vec!["core".into(), "result".into(), "Result<i64,i64>".into()];
+    let owner_path: Vec<String> = vec!["result::Result<i64,i64>".into()];
     super::AggregateShape::Ctor(super::AggregateCtor {
         target: CallTarget::synthetic_transparent_enum_variant_ctor(
             owner_path.clone(),
             "Ok".to_string(),
             0,
         ),
-        result_owner: "core::result::Result<i64,i64>::Ok".into(),
+        result_owner: "result::Result<i64,i64>::Ok".into(),
         owner_id: None,
         owner_path,
         ctor_name: "Ok".into(),
@@ -25510,6 +27299,1018 @@ fn interior_field_transparent_pointee_stays_direct_ptradd() {
         )),
         "the transparent word is the pointer; ops={ops:?}"
     );
+}
+
+/// A one-word std handle whose unique sized field is a pointer is that
+/// pointer. `repr(transparent)` is not required: ZST markers sit beside
+/// the word (`lltype.Ptr` of a one-field struct is the field). A type
+/// parameter instantiated to an empty allocator is one of those markers.
+#[test]
+fn one_word_handle_unique_pointer_field_is_identity() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty);
+    let phantom = interior_struct(1, &["core", "marker", "PhantomData"], &[], 0, &[], false);
+    let global = interior_struct(2, &["alloc", "alloc", "Global"], &[], 0, &[], false);
+    let alloc_ty = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let handle = interior_struct(
+        0,
+        &["alloc", "sync", "Handle"],
+        &[
+            ("ptr", ptr_ty.clone()),
+            ("phantom", interior_adt(1)),
+            ("alloc", alloc_ty),
+        ],
+        8,
+        &[0, 8, 8],
+        false,
+    );
+    let handle_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [interior_adt(2)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(1, &handle_ty),
+                {"Field": [null, 0]}
+            ]
+        },
+        "ty": ptr_ty
+    });
+    let caller = interior_caller(
+        "read_ptr",
+        1,
+        vec![handle_ty.clone()],
+        ptr_ty.clone(),
+        vec![
+            interior_local(0, None, &ptr_ty),
+            interior_local(1, Some("h"), &handle_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &ptr_ty),
+                interior_use(field),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![handle, phantom, global], vec![caller]);
+    let graph = lower_interior(&llbc, "read_ptr");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "ptr"
+        )),
+        "the handle word is the unique pointer field; ops={ops:?}"
+    );
+}
+
+/// A by-value field whose type is a one-word handle (unique sized
+/// pointer plus ZST markers, `Rc` / `Arc`) is `lltype.Ptr`, so
+/// [`tyref_by_value_struct_decl`] is `None`.
+/// `heaptracker.all_fielddescrs` recurses only for
+/// `isinstance(FIELD, lltype.Struct)`; the Field-projection identity is
+/// [`tyref_one_word_handle_payload_field`]. An ordinary multi-word
+/// by-value struct is still walked (`Some`).
+#[test]
+fn one_word_handle_by_value_struct_decl_is_none() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty.clone());
+    let phantom = interior_struct(1, &["core", "marker", "PhantomData"], &[], 0, &[], false);
+    let global = interior_struct(2, &["alloc", "alloc", "Global"], &[], 0, &[], false);
+    let alloc_ty = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let handle = interior_struct(
+        0,
+        &["alloc", "rc", "Rc"],
+        &[
+            ("ptr", ptr_ty),
+            ("phantom", interior_adt(1)),
+            ("alloc", alloc_ty),
+        ],
+        8,
+        &[0, 8, 8],
+        false,
+    );
+    let pair = interior_struct(
+        3,
+        &["fixture", "Pair"],
+        &[("a", i64_ty.clone()), ("b", i64_ty)],
+        16,
+        &[0, 8],
+        false,
+    );
+    let handle_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [interior_adt(2)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let pair_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 3,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let llbc = llbc_with_types("fixture", vec![handle, phantom, global, pair], vec![]);
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(&handle_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_none(),
+        "a unique sized pointer plus ZST markers is lltype.Ptr, not an inlined STRUCT"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_some(),
+        "an ordinary multi-word by-value struct is still walked as an inlined STRUCT"
+    );
+}
+
+/// Generic `{u64, u64, T}` `repr(C)` whose layout offsets are unresolved.
+/// `Align` does not change field offsets (`llmemory.offsetof`).
+fn generic_repr_c_inner_decl(payload_ty: serde_json::Value) -> serde_json::Value {
+    let u64_ty = scalar_ty("U64");
+    serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": u64_ty, "attr_info": null},
+            {"name": "b", "ty": u64_ty, "attr_info": null},
+            {"name": "payload", "ty": payload_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    })
+}
+
+/// Index-pair field 2 of a generic `repr(C)` `{u64, u64, T}`: T align 8
+/// starts at 16, T align 32 starts at 32.
+#[test]
+fn generic_repr_c_index_pair_field_offset() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let wide = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Wide"], true),
+        "kind": {"Struct": [
+            {"name": "pad", "ty": u64_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 32,
+                "align": 32,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "C", "align_modif": null, "transparent": false}
+            }
+        }]
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![generic_repr_c_inner_decl(typevar), wide],
+        vec![],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[interior_adt(1)], 2),
+        Some(32)
+    );
+}
+
+/// Field type whose `layout_for_target` is None (unresolved offsets) but
+/// `size_align_for_target` still has size/align 8 (`json_ty_byte_size`).
+fn unresolved_offset_word_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Word"], true),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [{"chosen": null}]}],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }
+        }]
+    })
+}
+
+/// `{Word, Word, T}` `repr(C)`: Word is Opaque with size/align 8 and
+/// unresolved offsets, so the C walk uses `size_align_for_target`.
+#[test]
+fn generic_repr_c_offset_uses_size_align_when_layout_offsets_unresolved() {
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let word_ty = interior_adt(1);
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": word_ty.clone(), "attr_info": null},
+            {"name": "b", "ty": word_ty.clone(), "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![inner, unresolved_offset_word_decl()],
+        vec![],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[scalar_ty("U64")], 2),
+        Some(16)
+    );
+}
+
+/// `{Count, Count, T}` `repr(C)`: Count is a `repr(C)` word whose field
+/// is a transparent wrapper of `TraitType` (`Clause` Bound[0,0]). Two
+/// impls bind the assoc type differently so uniqueness cannot resolve
+/// it; the Adt node's `trait_refs` selects the u64 impl → offset 16.
+#[test]
+fn generic_repr_c_offset_resolves_clause_assoc_field() {
+    let u64_ty = scalar_ty("U64");
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let clause = serde_json::json!({
+        "kind": {"Clause": [{"Bound": [0, 0]}, {"regions": []}]},
+        "trait_decl_ref": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+    });
+    let projection = serde_json::json!({
+        "TraitType": [
+            clause,
+            0,
+            {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        ]
+    });
+    let wrap = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Wrap"], true),
+        "kind": {"Struct": [
+            {"name": "v", "ty": typevar.clone(), "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": true},
+                "variant_layouts": [{"field_offsets": [{"chosen": null}]}]
+            }
+        }]
+    });
+    let count = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "Count"], true),
+        "kind": {"Struct": [
+            {"name": "v", "ty": {
+                "Adt": {
+                    "id": 1,
+                    "generics": {
+                        "regions": [],
+                        "types": [projection],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": null, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let impl_ref = serde_json::json!({
+        "regions": [],
+        "regions_outlive": [],
+        "types_outlive": [],
+        "skip_binder": {
+            "kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}},
+            "trait_decl_ref": {"id": 0, "generics": {"regions": [], "types": [u64_ty.clone()], "const_generics": [], "trait_refs": []}}
+        }
+    });
+    let count_u64 = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": [impl_ref]
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": count_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": count_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": {"Align": 2}, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let binding = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ty}
+        })
+    };
+    let impl_row = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [ty]}},
+            "types": [binding(ty)],
+            "implied_trait_refs": []
+        })
+    };
+    let llbc = llbc_with_types_impls(
+        "fixture",
+        vec![inner, wrap, count],
+        vec![],
+        vec![impl_row(&u64_ty), impl_row(&u32_ty)],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+}
+
+/// `{Atomic<u64>, Atomic<u64>, T}` `repr(C)`: Atomic is Opaque, so the
+/// C walk uses [`tyref_atomic_arg`] — layout-identical to the inner
+/// scalar (`tyref_atomic_inner_value_type`) → offset 16.
+#[test]
+fn generic_repr_c_offset_atomic_word_is_inner_scalar() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let atomic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+        "kind": "Opaque",
+        "layout": []
+    });
+    let atomic_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": atomic_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": atomic_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": {"Align": 2}, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let llbc = llbc_with_types("fixture", vec![inner, atomic], vec![]);
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+}
+
+/// Charon layout scalar `{"Constant": {"Value": [id, [Integer, ty]]}}`.
+/// `layout_u64_resolved` reads it from the layout-expression table.
+fn layout_scalar_constant(id: u64, n: u64) -> serde_json::Value {
+    serde_json::json!({
+        "Value": [id, {"Constant": {"Value": [id, [
+            {"Integer": {"Unsigned": ["Usize", n.to_string()]}},
+            {"Deduplicated": 54}
+        ]]}}]
+    })
+}
+
+/// Nested `inhabited` proof Charon stores beside size/align. Depth 140
+/// exceeds serde's default recursion limit of 128 so `layout_values`
+/// must parse it with the limit disabled (`llmemory.sizeof`).
+fn deep_inhabited(depth: usize) -> serde_json::Value {
+    let mut v = serde_json::json!("True");
+    for _ in 0..depth {
+        v = serde_json::json!({"And": [v, "True"]});
+    }
+    v
+}
+
+/// Opaque payload whose layout is the live Charon shape: nested
+/// `chosen`/`Value`/`Constant`/`Integer` size, align
+/// `{chosen: {Deduplicated: 4}}` resolved through layout scalar 4 = 8.
+fn opaque_nested_chosen_payload_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "Payload"], true),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": {
+                    "chosen": {
+                        "Value": [1307, {"Constant": {"Value": [671, [
+                            {"Integer": {"Unsigned": ["Usize", "1352"]}},
+                            {"Deduplicated": 54}
+                        ]]}}]
+                    },
+                    "guarantee": null
+                },
+                "align": {"chosen": {"Deduplicated": 4}, "guarantee": null},
+                "discriminator": {"Known": 0},
+                "inhabited": deep_inhabited(140),
+                "variant_layouts": [],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }
+        }]
+    })
+}
+
+/// `{Atomic<u64>, Atomic<u64>, T}` `repr(C)`: T is Opaque with the nested
+/// Charon size/align JSON. Align 8 starts field 2 at 16
+/// (`llmemory.offsetof` / `rewrite_op_getsubstruct`).
+#[test]
+fn generic_repr_c_offset_opaque_nested_chosen_align() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let atomic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+        "kind": "Opaque",
+        "layout": []
+    });
+    let atomic_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": atomic_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": atomic_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [inner, atomic, opaque_nested_chosen_payload_decl()],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [layout_scalar_constant(4, 8)]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[interior_adt(2)], 2),
+        Some(16)
+    );
+}
+
+/// Live Arc::deref call site: T is `{Deduplicated: 43}` of the Opaque
+/// payload Adt, not an inline `{"Adt": ...}` node.
+#[test]
+fn generic_repr_c_offset_dedup_payload_arg() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let atomic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+        "kind": "Opaque",
+        "layout": []
+    });
+    let atomic_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": atomic_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": atomic_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [inner, atomic, opaque_nested_chosen_payload_decl()],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [
+            layout_scalar_constant(4, 8),
+            {"Value": [43, interior_adt(2)]}
+        ]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(
+            &llbc,
+            decl,
+            &[serde_json::json!({"Deduplicated": 43})],
+            2
+        ),
+        Some(16)
+    );
+}
+
+/// Owner subst still the interned TypeVar (`tyref_node` of a shared
+/// `Dedup` template). The Field place already holds the instantiated
+/// payload; bind that slot (`llmemory.offsetof`).
+#[test]
+fn generic_repr_c_offset_binds_field_place_when_owner_subst_is_typevar() {
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            generic_repr_c_inner_decl(typevar.clone()),
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": interior_meta(&["fixture", "Payload"], true),
+                "kind": "Opaque",
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [],
+                        "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+                    }
+                }]
+            }),
+        ],
+        vec![],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    let subst_before = vec![typevar];
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &subst_before, 2),
+        None
+    );
+    let subst_after =
+        super::subst_bind_projected_field(&llbc, decl, &subst_before, 2, &interior_adt(1));
+    assert_eq!(subst_after, vec![interior_adt(1)]);
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &subst_after, 2),
+        Some(16)
+    );
+}
+
+/// `repr(transparent)` unique-field wrapper (`Cell` / `UnsafeCell` shape).
+fn transparent_unique_field_decl(
+    def_id: u64,
+    path: &[&str],
+    field_ty: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, false),
+        "kind": {"Struct": [
+            {"name": "value", "ty": field_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": true},
+                "variant_layouts": [{"field_offsets": [0]}]
+            }
+        }]
+    })
+}
+
+/// `{Cell<u64>, Cell<u64>, T}` `repr(C)`: Cell / UnsafeCell are
+/// transparent Struct decls. Size/align of the count word is size/align
+/// of `u64` → offset 16 (`llmemory.offsetof`).
+#[test]
+fn generic_repr_c_offset_transparent_struct_word_is_inner_scalar() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafe_cell =
+        transparent_unique_field_decl(2, &["core", "cell", "UnsafeCell"], typevar.clone());
+    let cell_field = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [typevar.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell = transparent_unique_field_decl(1, &["core", "cell", "Cell"], cell_field);
+    let cell_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "rc", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": cell_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": cell_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let llbc = llbc_with_types("fixture", vec![inner, cell, unsafe_cell], vec![]);
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+}
+
+/// `&(*p).payload` on a classdef-less `repr(C)` pointee is
+/// `int_add(p, offsetof)` (`rewrite_op_getsubstruct`).
+#[test]
+fn raw_repr_c_substruct_borrow_emits_int_add() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let inner_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let ptr = interior_raw_mut(inner_ty.clone());
+    let ret = interior_shared(u64_ty.clone());
+    let field = interior_field(1, &ptr, &inner_ty, &u64_ty, 2);
+    let caller = interior_caller(
+        "borrow_payload",
+        1,
+        vec![ptr.clone()],
+        ret.clone(),
+        vec![
+            interior_local(0, None, &ret),
+            interior_local(1, Some("p"), &ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &ret),
+                serde_json::json!({
+                    "Ref": {"place": field, "kind": "Shared", "ptr_metadata": null}
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![generic_repr_c_inner_decl(typevar)],
+        vec![caller],
+    );
+    let graph = lower_interior(&llbc, "borrow_payload");
+    let ops = graph_ops(&graph);
+    let add_offsets: Vec<i64> = ops
+        .iter()
+        .filter_map(|op| {
+            let OpKind::BinOp { op: name, rhs, .. } = &op.kind else {
+                return None;
+            };
+            if name != "add" {
+                return None;
+            }
+            ops.iter().find_map(|c| match (&c.kind, c.result.as_ref()) {
+                (OpKind::ConstInt(n), Some(r)) if r == rhs => Some(*n),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(add_offsets, vec![16]);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::ConstInt(16)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::Abort { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .count(),
+        0
+    );
+}
+
+/// Live Arc::deref shape: Deref place ty is `Deduplicated` of generic
+/// `Inner<T>` (shared table still has the TypeVar); Field place ty is
+/// the instantiated payload. `subst_bind_projected_field` fills slot 0.
+#[test]
+fn raw_repr_c_substruct_borrow_dedup_owner_binds_field_place() {
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let inner_adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [{"Deduplicated": 2}],
+                "const_generics": [],
+                "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let payload = interior_adt(1);
+    let owner_ty = serde_json::json!({"Deduplicated": 387});
+    let field_ty = serde_json::json!({"Deduplicated": 43});
+    let ptr = interior_raw_mut(owner_ty.clone());
+    let ret = interior_shared(field_ty.clone());
+    let field = interior_field(1, &ptr, &owner_ty, &field_ty, 2);
+    let caller = interior_caller(
+        "borrow_payload",
+        1,
+        vec![ptr.clone()],
+        ret.clone(),
+        vec![
+            interior_local(0, None, &ret),
+            interior_local(1, Some("p"), &ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &ret),
+                serde_json::json!({
+                    "Ref": {"place": field, "kind": "Shared", "ptr_metadata": null}
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                generic_repr_c_inner_decl(typevar.clone()),
+                serde_json::json!({
+                    "def_id": 1,
+                    "item_meta": interior_meta(&["fixture", "Payload"], true),
+                    "kind": "Opaque",
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [],
+                            "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+                        }
+                    }]
+                })
+            ],
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [
+            {"Value": [2, typevar]},
+            {"Value": [387, inner_adt]},
+            {"Value": [43, payload]}
+        ]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = lower_interior(&llbc, "borrow_payload");
+    let ops = graph_ops(&graph);
+    let add_offsets: Vec<i64> = ops
+        .iter()
+        .filter_map(|op| {
+            let OpKind::BinOp { op: name, rhs, .. } = &op.kind else {
+                return None;
+            };
+            if name != "add" {
+                return None;
+            }
+            ops.iter().find_map(|c| match (&c.kind, c.result.as_ref()) {
+                (OpKind::ConstInt(n), Some(r)) if r == rhs => Some(*n),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(add_offsets, vec![16]);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .count(),
+        0
+    );
+}
+
+/// Live `ArcInner<MetaInterpStaticData>` offsetof. Ignored: loads pyre-jit.ullbc.
+#[test]
+#[ignore]
+fn live_arcinner_misd_offsetof_and_subst() {
+    let llbc = Llbc::load(crate::runtime_names::artifacts::JIT_ULLBC).expect("load pyre-jit.ullbc");
+    let misd = serde_json::json!({"Deduplicated": 43});
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let decl152 = llbc.type_by_id(152).expect("MISD");
+    assert_eq!(
+        decl152.size_align_for_target(&llbc, &target),
+        Some((Some(1352), Some(8)))
+    );
+    let inner = llbc.type_by_id(776).expect("ArcInner");
+    let subst = [misd.clone()];
+    let off = super::repr_c_struct_field_offset(&llbc, inner, &subst, 2);
+    let fd = llbc.fn_by_id(811).expect("Arc::deref");
+    let types = vec![misd, serde_json::json!({"Deduplicated": 20})];
+    let body = crate::front::clause_spec::substituted_unstructured(fd, &llbc, &[], &types, &[])
+        .expect("substituted deref body");
+    let mut field_offs = Vec::new();
+    for bb in &body.body {
+        for st in &bb.statements {
+            let Ok(majit_charon_reader::ullbc::StmtKind::Assign(_, rv)) = st.stmt_kind() else {
+                continue;
+            };
+            let place = match &rv {
+                majit_charon_reader::ullbc::Rvalue::Ref { place, .. }
+                | majit_charon_reader::ullbc::Rvalue::RawPtr { place, .. } => place,
+                _ => continue,
+            };
+            let majit_charon_reader::ullbc::PlaceKind::Projection(
+                inner_pl,
+                majit_charon_reader::ullbc::ProjectionElem::Tagged(elem),
+            ) = &place.kind
+            else {
+                continue;
+            };
+            let majit_charon_reader::ullbc::PlaceKind::Projection(
+                _,
+                majit_charon_reader::ullbc::ProjectionElem::Atom(deref),
+            ) = &inner_pl.kind
+            else {
+                continue;
+            };
+            if deref != "Deref" {
+                continue;
+            }
+            let Some(payload) = elem.as_object().and_then(|m| m.get("Field")) else {
+                continue;
+            };
+            let owner_node = super::strip_ty_wrappers(
+                super::tyref_node(&inner_pl.ty, &llbc).expect("owner node"),
+                &llbc,
+            )
+            .expect("owner stripped");
+            let owner_id = super::adt_node_def_id(owner_node).expect("owner id");
+            let owner = llbc.type_by_id(owner_id).expect("owner decl");
+            let field_idx = super::field_projection_index(payload).expect("field idx");
+            let subst = super::adt_node_type_subst(owner_node, &llbc);
+            let subst_b = super::subst_bind_projected_field(
+                &llbc,
+                owner,
+                &subst,
+                field_idx,
+                &super::tyref_json(&place.ty),
+            );
+            field_offs.push(super::repr_c_struct_field_offset(
+                &llbc, owner, &subst_b, field_idx,
+            ));
+        }
+    }
+    assert_eq!(off, Some(16));
+    assert_eq!(field_offs, vec![Some(16)]);
 }
 
 /// `entry_valid` on a real artefact: `(*entry_ptr(self).add(slot)).f_valid`

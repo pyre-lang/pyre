@@ -93,6 +93,11 @@ CHARON_CORE_INCLUDE = [
     # `Instance(Adt) ∪ Integer`.
     "--include",
     "core::ops::range::RangeInclusive",
+    # Declared `repr(transparent)` + unique field give the size/align of `Cell<T>` (= `T`).
+    "--include",
+    "core::cell::Cell",
+    "--include",
+    "core::cell::UnsafeCell",
     "--include",
     "core::cmp::impls::_::le",
     "--include",
@@ -115,11 +120,79 @@ CHARON_CORE_INCLUDE = [
     "--include",
     "core::bool::_::then_some",
     "--include",
+    "core::bool::_::then",
+    "--include",
     "core::option::_::is_none_or",
     "--include",
     "core::result::_::ok",
     "--include",
     "core::result::_::as_ref",
+    "--include",
+    "core::result::_::map_err",
+    "--include",
+    "core::option::_::map_or",
+    "--include",
+    "core::option::_::expect",
+    "--include",
+    "core::option::_::unwrap",
+    "--include",
+    "core::result::_::unwrap",
+    "--include",
+    "core::result::_::expect",
+    "--include",
+    "core::option::_::map",
+    "--include",
+    "core::option::_::and_then",
+    "--include",
+    "core::option::_::unwrap_or_else",
+    "--include",
+    "core::option::_::or_else",
+    "--include",
+    "core::option::_::is_some_and",
+    # Option `?` is `<Option<T> as Try>::branch` plus Break-arm
+    # `<Option<U> as FromResidual<Option<Infallible>>>::from_residual`.
+    # FunDecl names: `core::option::<Impl>::{branch,from_residual}`.
+    # Do not include `core::result::_::{branch,from_residual}` (carrier
+    # `result_exc` + `result_try_sites`) and do not include
+    # `core::ops::try_trait::_::branch` (that pattern drags Result).
+    # `core::ops::control_flow::ControlFlow` TypeDecl is already Enum.
+    "--include",
+    "core::option::_::branch",
+    "--include",
+    "core::option::_::from_residual",
+    # Deref of a refcounted handle is a field read of `data` past the
+    # counts; the body must be visible. Pattern shape matches
+    # `core::option::_::map_or`. Chain from extracted bodies:
+    # Deref -> inherent `inner()` -> `NonNull::as_ref` -> `as_ptr` ->
+    # `*mut T::cast_const`; Deref Field-projects `ArcInner`/`RcInner`
+    # (`data` / `value`); `inner` Field-projects `Arc`/`Rc` (`ptr`).
+    "--include",
+    "alloc::sync::_::deref",
+    "--include",
+    "alloc::rc::_::deref",
+    "--include",
+    "alloc::sync::_::inner",
+    "--include",
+    "alloc::rc::_::inner",
+    "--include",
+    "alloc::sync::ArcInner",
+    "--include",
+    "alloc::rc::RcInner",
+    "--include",
+    "alloc::sync::Arc",
+    "--include",
+    "alloc::rc::Rc",
+    "--include",
+    "core::ptr::non_null::_::as_ref",
+    "--include",
+    "core::ptr::non_null::_::as_ptr",
+    "--include",
+    "core::ptr::mut_ptr::_::cast_const",
+    # `MIFrame` is a foreign workspace struct whose fields stay
+    # `kind: Opaque` unless the type itself is included; `code_cursor`
+    # then reads as a named Struct field (`RangeInclusive` above).
+    "--include",
+    "majit_metainterp::pyjitpl::frame::MIFrame",
 ]
 CHARON_ARGS = [
     "--hide-marker-traits",

@@ -38,10 +38,10 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
-        // `core::panicking::*` / `std::panicking::*` (`assert_failed`,
-        // `panic`, `panic_fmt`, …) is a Rust abort. Upstream that is
-        // `ll_assert` / `fatalerror`: the same implicit AssertionError
-        // raise `TermKind::Abort` already closes a block with. Do not
+        // A declared-Never callee (`assert_failed`, `panic_fmt`, a
+        // `-> !` helper) is a Rust abort. Upstream that is `ll_assert`
+        // / `fatalerror`: the same implicit AssertionError raise
+        // `TermKind::Abort` already closes a block with. Do not
         // register a stub body for the panicking helper.
         if let CallFunc::Regular(reg) = &call.func
             && regular_call_is_panicking_abort(reg, self.llbc)
@@ -400,20 +400,14 @@ impl<'a> Lowering<'a> {
         // closure ADT, so `second_arg_ty` alone cannot name the callee.
         let second_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(1));
         let second_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(1));
-        // Third argument's MIR-declared type — `Option::map_or`'s closure env
-        // operand.  Captured before the operands are consumed so the
-        // `front::option_map_or` recording can resolve the closure ADT's
-        // `call_once` inherent-method owner.
+        // Third argument's MIR-declared type. Captured before the operands
+        // are consumed so a 3-arg Regular call (`items_block_set_ref`,
+        // `copy_nonoverlapping`) can classify that operand after `call.args`
+        // is moved.
         let third_arg_ty: Option<TyRef> = call.args.get(2).and_then(|op| match op {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
-        // Function-item identity of arg #2, captured before `call.args` is
-        // consumed.  `Option::map_or(opt, default, named_fn)` passes a `FnDef`
-        // constant (or a Copy/Move of a `FnDef`-typed local); that shape has
-        // no closure ADT, so `third_arg_ty` alone cannot name the callee.
-        let third_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(2));
-        let third_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(2));
         // A literal scalar index (`slice.get(1)`) has no Place type to retain
         // in `second_arg_ty`.  Charon still records the method's `I` type in
         // the regular-call generics, so classify the `get` before consuming
@@ -7428,12 +7422,12 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
         }
-        // `Result::expect`. The callee is that result-module item:
+        // Carrier `Result::expect` via FunDecl / FunctionPath spelling.
         // `core::result::<Impl>::expect` on the `Method` spelling, and
         // `result::Result::expect` when a raw `&Result` takes the static
         // `FunctionPath` (`impl_method_owner` declines the method hint).
-        // `as_ref` is a regular call to the extracted core body
-        // (`match *self { Ok(ref x) => Ok(x), Err(ref x) => Err(x) }`).
+        // A non-carrier Result expect is a regular call of the extracted
+        // core body. `as_ref` is already that shape.
         let result_expect_callee = callee_name_path.as_deref().is_some_and(|path| {
             let segs: Vec<&str> = path.split("::").collect();
             *segs.last().unwrap_or(&"") == "expect"
@@ -7452,12 +7446,6 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if first_arg_ty
-                .as_ref()
-                .is_some_and(|ty| crate::front::result_exc::tyref_is_result(ty, self.llbc))
-                && let Some(site) = self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.result_expect_sites.push(site);
             }
         }
         // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
@@ -8083,11 +8071,10 @@ impl<'a> Lowering<'a> {
         {
             self.from_size_align_expect_sites.push(site);
         }
-        // Capture `Try::branch(opt)` sites where the receiver is an
-        // `Option<T>`, the compiler-generated core call behind `opt?`.  The
-        // rewrite validates the surrounding `ControlFlow` diamond and the
-        // enclosing function's Option return before mutating; a miss leaves the
-        // residual `branch` call for the existing Skip fallback.
+        // Capture `Try::branch(res)` sites where the receiver is a
+        // non-carrier `Result`.  Option `?` is a regular call of the
+        // extracted `core::option::<Impl>::branch` body; Result `?` stays
+        // on `result_try_sites` / `result_exc`.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -8096,32 +8083,9 @@ impl<'a> Lowering<'a> {
             && args.len() == 1
             && name == "branch"
         {
-            if let Some(site) = self.recognize_option_try_site(
-                first_arg_ty.as_ref(),
-                &result_var,
-                args[0].as_variable(),
-            ) {
-                self.option_try_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var)
-            {
+            if let Some(site) = self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var) {
                 self.result_try_sites.push(site);
             }
-        }
-        // Capture `bool::then(cond, closure_env)` sites for the
-        // short-circuit `Option` diamond `front::bool_then` synthesizes.
-        // `then_some` is a regular call to the extracted core body.
-        if let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && fmt_path_ends_with(segments, &["bool", "<Impl>", "then"])
-            && let Some(site) =
-                self.recognize_bool_then_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
-        {
-            self.bool_then_sites.push(site);
         }
         // Capture `<[T]>::first(slice)` sites for the length-checked
         // `Option<&T>` diamond `front::slice_first` synthesizes.  `first` is a
@@ -8271,17 +8235,10 @@ impl<'a> Lowering<'a> {
                 self.carrier_combinator_sites.push(site);
             }
         }
-        // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
-        // sites for the discriminant guard `front::option_unwrap` synthesizes.
-        // Like `unwrap_or`, `unwrap`'s body is Opaque (foreign `core`) and its
-        // receiver is the enum ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver in `args[0]`, the sole argument).
-        // The exception-carrier Result is a `CarrierCombinatorSite` —
-        // `front::result_exc` fuses `unwrap` onto `LastException` with an
-        // implicit-`AssertionError` catch (`core` `Result::unwrap`;
-        // `simplify.py` `remove_assertion_errors`). Plain-error Result and
-        // Option keep the discriminant guard. A resolution miss leaves the
-        // residual call — an unregistered callee the rtyper census Skips.
+        // Capture carrier `Result<T, PyError>::unwrap(res)` for
+        // `front::result_exc` LastException fusion. Plain Option / Result
+        // unwrap are regular calls of the extracted core bodies. A
+        // non-carrier miss leaves that call.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -8296,24 +8253,12 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if let Some(site) =
-                self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
-            {
-                self.unwrap_sites.push(site);
             }
         }
-        // Capture `Option::expect(opt, msg)` and carrier
-        // `Result::expect(res, msg)` sites. Option keeps the discriminant
-        // guard `front::option_expect` synthesizes — the two-arg sibling of
-        // `unwrap`. Its body is Opaque (foreign `core`) and its receiver is
-        // the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver `args[0]`, panic message `args[1]`).
-        // The exception-carrier Result is a `CarrierCombinatorSite`
-        // (`interp_deque.py` `W_Deque.trimleft` / `popleft`; `core`
-        // `Result::expect`; the `msg` operand is dropped).
-        // `recognize_expect_site` confirms the receiver is an `Option`.
-        // A resolution miss leaves the residual call — an unregistered
-        // callee the rtyper census Skips.
+        // Carrier `Result::expect(res, msg)` (`interp_deque.py`
+        // `W_Deque.trimleft` / `popleft`; the `msg` operand is dropped).
+        // Option / plain Result expect are regular calls of the extracted
+        // core bodies.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -8328,73 +8273,12 @@ impl<'a> Lowering<'a> {
                 crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
             ) {
                 self.carrier_combinator_sites.push(site);
-            } else if let Some(site) = self.recognize_expect_site(
-                first_arg_ty.as_ref(),
-                &result_var,
-                args[0].as_variable(),
-            ) {
-                self.expect_sites.push(site);
             }
         }
-        // Capture `Option::map_or(opt, default, callable)` sites for the
-        // discriminant closure-select `front::option_map_or` synthesizes.
-        // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
-        // receiver is the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, callable
-        // `args[2]`).  The callable is a closure ADT (`third_arg_ty` →
-        // `call_once`) or a function item (`third_arg_fn_item` → a direct
-        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
-        // the callable needs the receiver type, the env type or `FnDef`
-        // path, and the result type (`call.dest.ty`), all in hand here;
-        // `recognize_map_or_site` also confirms the receiver is an `Option`.
-        // A resolution miss leaves the residual call — an unregistered callee
-        // the rtyper census Skips, so no graph regresses.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 3
-            && name == "map_or"
-            && let Some(mut site) = self.recognize_map_or_site(
-                first_arg_ty.as_ref(),
-                third_arg_ty.as_ref(),
-                third_arg_fn_item.clone(),
-                third_arg_fn_decl,
-                &call.dest.ty,
-                &result_var,
-            )
-        {
-            // Reflexive `From` / same-width integer `From` is identity on the
-            // payload (`is_reflexive_from` / `is_widening_int_from`).  Applied
-            // here with a RegularCall of the FunDecl the FnDef names — the
-            // same predicates the ordinary call-lowering arm uses — so
-            // `recognize_map_or_site` itself does not special-case `From`.
-            if site.fn_item_segments.is_some()
-                && let Some(fd) = third_arg_fn_decl
-            {
-                let reg = RegularCall {
-                    kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
-                    generics: serde_json::json!({
-                        "regions": [],
-                        "types": [],
-                        "const_generics": [],
-                        "trait_refs": []
-                    }),
-                };
-                if self.is_reflexive_from(&reg) || self.is_widening_int_from(&reg) {
-                    site.fn_item_ctor = Some(AggregateShape::Operand {
-                        index: 0,
-                        transparent: true,
-                    });
-                }
-            }
-            self.map_or_sites.push(site);
-        }
-        // `Result::map_err(result, closure)` is a foreign core combinator.
-        // Record the concrete receiver/result instantiations while their MIR
-        // types are available; the post-pass restores the ordinary Ok/Err
-        // diamond before exceptiontransform-style Result lowering runs.
+        // Carrier map_err: dest is Result of the exception carrier. The
+        // post-pass runs after result_exc hung LastException so the Err
+        // arm can call the mapper and raise. A plain Result dest stays a
+        // regular call of the extracted core body.
         let map_err_path = match &op_kind {
             OpKind::Call {
                 target: CallTarget::Method { name, .. },
@@ -8408,11 +8292,27 @@ impl<'a> Lowering<'a> {
             } if args.len() == 2 && segments.last().map(String::as_str) == Some("map_err") => {
                 Some(segments.join("::"))
             }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if args.len() == 2
+                && segments
+                    .last()
+                    .is_some_and(|leaf| leaf.starts_with("map_err__spec_")) =>
+            {
+                Some(segments.join("::"))
+            }
             _ => None,
         };
         if map_err_path
             .as_deref()
             .is_some_and(is_core_result_map_err_path)
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                &call.dest.ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
             && let Some(site) = self.recognize_result_map_err_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
@@ -8423,54 +8323,12 @@ impl<'a> Lowering<'a> {
         {
             self.result_map_err_sites.push(site);
         }
-        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, callable)` sites
-        // for the discriminant closure-select `front::option_closure_select`
-        // synthesizes.  All five combinators are Opaque (foreign `core`) with
-        // the `Option` ADT receiver, so `first_is_self` routes them to a
-        // two-arg `CallTarget::Method` (receiver `args[0]`, callable
-        // `args[1]`).  The callable is a closure ADT (`second_arg_ty` →
-        // `call_once`) or a function item (`second_arg_fn_item` → a direct
-        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
-        // the callable needs the receiver type, the env type or `FnDef`
-        // path, and the result type (`call.dest.ty`), all in hand here;
-        // `recognize_closure_select_site` also confirms the receiver is an
-        // `Option`.  A resolution miss leaves the residual call.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && let Some(kind) = match name.as_str() {
-                "map" => Some(crate::front::option_closure_select::ClosureCombinator::Map),
-                "and_then" => Some(crate::front::option_closure_select::ClosureCombinator::AndThen),
-                "unwrap_or_else" => {
-                    Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
-                }
-                "or_else" => Some(crate::front::option_closure_select::ClosureCombinator::OrElse),
-                "is_some_and" => {
-                    Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
-                }
-                _ => None,
-            }
-            && let Some(site) = self.recognize_closure_select_site(
-                kind,
-                first_arg_ty.as_ref(),
-                second_arg_ty.as_ref(),
-                second_arg_fn_item.clone(),
-                second_arg_fn_decl,
-                &call.dest.ty,
-                &result_var,
-            )
-        {
-            self.closure_select_sites.push(site);
-        }
         // Discriminant-switch combinators whose opaque core body is an
         // if/else on the receiver tag (plus `call_once` of a closure
         // argument when there is one).  Option `map`/`and_then`/
-        // `unwrap_or_else`/`or_else`/`is_some_and` already have
-        // their own capture above; this records the remaining Option/Result
-        // methods whose semantics are the same shape.
+        // `unwrap_or_else`/`or_else`/`is_some_and` are extracted core
+        // bodies (`CHARON_CORE_INCLUDE`); this records the remaining
+        // Option/Result methods whose semantics are the same shape.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -9469,6 +9327,28 @@ impl<'a> Lowering<'a> {
                     )
                     .is_some()
                 }) {
+                    return None;
+                }
+                // A `repr(transparent)` GC handle intern's as a subclass
+                // of `Deref::Target` (`error::PyError` under
+                // `error::PyErrorObject`). `CallTarget::Method` getattr
+                // looks at the payload class after `MutRef.value` / `.0`
+                // unwrap, and that classdict has no method source — the
+                // blocked `getattr(recv, leaf)` wall. The `&mut self`
+                // MutRef decline above does not cover `&self` methods
+                // (`resolved_w_type`) called from a MutRef cell. Route
+                // as FunctionPath so the FunDecl graph is a RegularCall
+                // (`call.py` `guess_call_kind` when `graphs_from` is set).
+                let owner_ty = type_decl_adt_tyref(adt_def_id);
+                if transparent_deref_target_class(
+                    &owner_ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .is_some()
+                {
                     return None;
                 }
                 // The ADT id above is still the wrapper. The name the

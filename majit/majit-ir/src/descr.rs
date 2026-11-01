@@ -805,6 +805,12 @@ pub fn positional_shape_id(name: &str) -> Option<StructId> {
     well_formed.then(|| StructId::from_canonical(name))
 }
 
+/// `>` that closes a generic argument group. `->` in a fn type
+/// argument (`ControlFlow<B, fn(A) -> R>`) is not a closer.
+fn is_generic_arg_close(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'>') && bytes.get(i.wrapping_sub(1)) != Some(&b'-')
+}
+
 /// The first balanced generic argument group in `name`, including brackets.
 /// A trailing enum variant (`Result<T>::Ok`) is deliberately excluded: the
 /// template [`StructId`] already distinguishes the base and each variant.
@@ -813,11 +819,10 @@ pub fn generic_args_span(name: &str) -> Option<&str> {
     let start = name.find('<')?;
     let bytes = name.as_bytes();
     let mut depth = 0usize;
-    for (offset, &byte) in bytes[start..].iter().enumerate() {
+    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
         match byte {
             b'<' => depth += 1,
-            b'>' if start + offset > 0 && bytes[start + offset - 1] == b'-' => {}
-            b'>' => {
+            b'>' if is_generic_arg_close(bytes, start + offset) => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
                     return Some(&name[start..=start + offset]);
@@ -1115,11 +1120,10 @@ pub fn strip_generic_args(name: &str) -> std::borrow::Cow<'_, str> {
     let bytes = name.as_bytes();
     let mut depth = 0usize;
     let mut end = None;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
+    for (i, b) in bytes.iter().copied().enumerate().skip(start) {
         match b {
             b'<' => depth += 1,
-            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
-            b'>' => {
+            b'>' if is_generic_arg_close(bytes, i) => {
                 depth -= 1;
                 if depth == 0 {
                     end = Some(i);
@@ -11969,6 +11973,13 @@ mod tests {
             strip_generic_args("Result::Ok"),
             std::borrow::Cow::Borrowed(_)
         ));
+        // `->` in a fn type argument is not a generic closer.
+        assert_eq!(
+            strip_generic_args(
+                "ops::control_flow::ControlFlow<Option<Never>,fn(u32,usize) -> *mut T>::Continue"
+            ),
+            "ops::control_flow::ControlFlow::Continue"
+        );
     }
 
     #[test]
@@ -12001,6 +12012,10 @@ mod tests {
         assert_eq!(
             strip_generic_args("option::Option<fn(*mut u8,*mut u8) -> Result<*mut u8,E>>::Some"),
             "option::Option::Some"
+        );
+        assert_eq!(
+            generic_args_span("ControlFlow<Option<Never>,fn(u32,usize) -> *mut T>"),
+            Some("<Option<Never>,fn(u32,usize) -> *mut T>")
         );
     }
 

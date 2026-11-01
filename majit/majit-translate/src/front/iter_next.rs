@@ -64,7 +64,7 @@
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::result_exc::{
     assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-    follow_single_exit, op_operand_vars, split_diamond_exits,
+    field_read_named_of_image, follow_single_exit, op_operand_vars, split_diamond_exits,
 };
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
@@ -1189,28 +1189,26 @@ fn rewire_one_next_site(
     // Block C has one of the two representation-faithful Option tests:
     //
     // * aggregate Option: `d = opt.__discriminant`; switch 0/1;
-    // * one-word niche Option: `d = bool((opt is null_mut()) == false)`;
-    //   switch false/true.  The direct `opt != null_mut()` spelling is also
-    //   accepted for artefacts extracted before the identity-null fold.
+    // * one-word niche Option: `d = bool((opt is None) == false)`;
+    //   switch false/true.  The None sentinel is `ConstNone`
+    //   (`rnone.py` `rtype_is_None`; `pairtype(NoneRepr, Repr).convert_from_to`
+    //   is `inputconst(r_to, None)`) or `null_mut` (`rtype_ptr_null` /
+    //   `convert_const(None)`).  The direct `opt != null_mut()` spelling is
+    //   also accepted for artefacts extracted before the identity-null fold.
     //
     // The latter is `ptr_nonzero` in an RPython graph. Rust uses it for a
     // by-value array/Vec iterator whose T is itself a non-null pointer. The
     // front folds the niche before this post-pass runs, so accepting both
     // shapes here is required for one list-iterator representation rather
     // than a separate Rust-specific iterator path.
+    //
+    // A tagged `Option<T>` Discriminant recasts the forwarded `opt` onto
+    // the interned class (`cast_instance_call` of `owner_root`) so
+    // `getattr __discriminant` hits the classdef. The Option still
+    // escapes on the diamond exits, so `peel_recast_chain_from` of
+    // `opt_c` aborts; the FieldRead is of the recast dest.
     let aggregate_disc =
-        graph.blocks[c]
-            .operations
-            .iter()
-            .enumerate()
-            .find_map(|(i, op)| match &op.kind {
-                OpKind::FieldRead { base, field, .. }
-                    if *base == opt_c && field.name == "__discriminant" =>
-                {
-                    op.result.clone().map(|r| (i, r))
-                }
-                _ => None,
-            });
+        field_read_named_of_image(&graph.blocks[c].operations, &opt_c, "__discriminant");
     let (none_link, some_link, aggregate_payload, branch_value_vars) = if let Some((
         disc_idx,
         disc_var,
@@ -1310,12 +1308,14 @@ fn rewire_one_next_site(
                     "{name}: block {c} lacks both an Option __discriminant read and a nullable-pointer test"
                 )
             })?;
-        // `push_niche_null_ptr` may have to recast the raw null to the
-        // Option payload's concrete pointer repr (for example Wtf8Buf's
-        // translated StringRepr).  RPython's `convert_const(None)` performs
-        // the same repr adaptation.  Follow only an exact chain of pure
-        // cast-pointer aliases back to `null_mut`; any other producer is not
-        // evidence of the None sentinel and declines.
+        // `push_niche_null_ptr` may recast the raw null to the Option
+        // payload's concrete pointer repr (for example Wtf8Buf's
+        // translated StringRepr).  `push_niche_is_some` with
+        // `niche_is_none_uses_const_none` emits `ConstNone` instead
+        // (`rnone.py` `rtype_is_None`; `pairtype(NoneRepr, Repr).convert_from_to`
+        // is `inputconst(r_to, None)`).  Follow only an exact chain of pure
+        // cast-pointer aliases back to `null_mut` or `ConstNone`; any other
+        // producer is not evidence of the None sentinel and declines.
         let mut null_source = null_var;
         let mut null_indices = Vec::new();
         loop {
@@ -1324,10 +1324,11 @@ fn rewire_one_next_site(
                 .enumerate()
                 .find(|(_, op)| op.result.as_ref() == Some(&null_source))
                 .ok_or_else(|| {
-                    format!("{name}: block {c} nullable-pointer test has no null_mut source")
+                    format!("{name}: block {c} nullable-pointer test has no None sentinel")
                 })?;
             null_indices.push(idx);
             match &op.kind {
+                OpKind::ConstNone => break,
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     args,
@@ -1338,7 +1339,7 @@ fn rewire_one_next_site(
                 }
                 _ => {
                     return Err(format!(
-                        "{name}: block {c} nullable-pointer test has no null_mut source"
+                        "{name}: block {c} nullable-pointer test has no None sentinel"
                     ));
                 }
             }
@@ -2020,6 +2021,210 @@ mod tests {
             native, 1,
             "native [__iter_next] replaces the residual and its recast"
         );
+    }
+
+    /// Identity-null niche whose None sentinel is `ConstNone` (`is_`),
+    /// the Discriminant spelling `push_niche_is_some` emits for an
+    /// instance-Ref (`rnone.py` `rtype_is_None`).  Counterpart of
+    /// `iter_next_fold_real_identity_null_niche`: that ignored LLBC test
+    /// records the same `for &x in &[PyObjectRef]` shape; this one
+    /// constructs the diamond and asserts the rewrite fires.
+    fn slice_iter_next_const_none_niche_graph(recast_none: bool) -> (FunctionGraph, Variable) {
+        let mut g = FunctionGraph::new("test_iter_next_const_none_niche");
+        let n = g.startblock;
+        let container = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "some".to_string(),
+                            "container".to_string(),
+                            "make".to_string(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let it = g
+            .push_op_var(
+                n,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![container]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (a, a_args) = g.create_block_with_arg_vars(1);
+        let it_a = a_args[0].clone();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: slice_iter_next_target(),
+                    args: crate::model::call_args(vec![it_a]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_args) = g.create_block_with_arg_vars(1);
+        let opt_c = c_args[0].clone();
+        let none = g.push_const_none(c);
+        let sentinel = if recast_none {
+            g.push_op_var(
+                c,
+                crate::model::cast_instance_call_result("GCREF", none, ValueType::Ref(None)),
+                true,
+            )
+            .unwrap()
+        } else {
+            none
+        };
+        let is_none = g
+            .push_op_var(
+                c,
+                OpKind::BinOp {
+                    op: "is_".to_string(),
+                    lhs: opt_c,
+                    rhs: sentinel,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let false_var = g.push_op_var(c, OpKind::ConstBool(false), true).unwrap();
+        let disc = g
+            .push_op_var(
+                c,
+                OpKind::BinOp {
+                    op: "eq".to_string(),
+                    lhs: is_none,
+                    rhs: false_var,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+
+        let (some_t, _some_args) = g.create_block_with_arg_vars(0);
+        g.set_return(some_t, None);
+        let (none_t, _none_args) = g.create_block_with_arg_vars(0);
+        g.set_return(none_t, None);
+
+        g.set_goto(n, a, vec![it]);
+        g.set_goto(a, c, vec![opt.clone()]);
+        g.set_branch(c, disc, some_t, Vec::new(), none_t, Vec::new());
+        (g, opt)
+    }
+
+    #[test]
+    fn const_none_identity_null_niche_rewrites_to_iter_next() {
+        for recast_none in [false, true] {
+            let (mut g, opt) = slice_iter_next_const_none_niche_graph(recast_none);
+            let rewritten = rewire_next_call_sites(&mut g, &[(opt, ValueType::Ref(None))]);
+            assert_eq!(
+                rewritten, 1,
+                "recast_none={recast_none}: ConstNone + is_ niche must fold"
+            );
+            let residual = g
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments
+                            == &[
+                                "slice".to_string(),
+                                "iter".to_string(),
+                                "Iter".to_string(),
+                                "next".to_string()
+                            ]
+                    )
+                })
+                .count();
+            assert_eq!(
+                residual, 0,
+                "recast_none={recast_none}: residual slice::iter::Iter::next must be gone"
+            );
+            let native: Vec<&crate::model::SpaceOperation> = g
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if is_iter_next_segments(segments)
+                    )
+                })
+                .collect();
+            assert_eq!(
+                native.len(),
+                1,
+                "recast_none={recast_none}: exactly one [__iter_next]"
+            );
+            match &native[0].kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id,
+                            specialization,
+                        },
+                    args,
+                    result_ty,
+                } => {
+                    assert_eq!(segments, &next_op_segments());
+                    assert_eq!(*fun_decl_id, None);
+                    assert_eq!(*specialization, crate::parse::GraphSpecialization::Regular);
+                    assert_eq!(args.len(), 1);
+                    assert_eq!(*result_ty, ValueType::Ref(None));
+                }
+                other => {
+                    panic!("recast_none={recast_none}: expected [__iter_next] Call, got {other:?}")
+                }
+            }
+            let next_block = g
+                .blocks
+                .iter()
+                .find(|b| {
+                    b.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments, .. },
+                                ..
+                            } if is_iter_next_segments(segments)
+                        )
+                    })
+                })
+                .expect("native next block");
+            assert_eq!(
+                next_block.exitswitch,
+                Some(ExitSwitch::LastException),
+                "recast_none={recast_none}: rewritten next closes with LastException"
+            );
+        }
     }
 
     fn chars_next_target() -> CallTarget {

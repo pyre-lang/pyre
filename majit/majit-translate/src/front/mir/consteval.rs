@@ -3833,6 +3833,255 @@ pub(in crate::front::mir) fn subst_type_args(
     body.clone()
 }
 
+/// True when field offsets follow declaration order of `repr(C)`.
+/// `Pack` changes offsets and is declined. An `Align` modifier does not
+/// (`ReprOptions::guarantees_fixed_field_order` is `repr_algo == C`).
+pub(in crate::front::mir) fn decl_repr_c_field_offsets(decl: &TypeDecl, target: &str) -> bool {
+    let Some(raw) = decl.layout.as_ref() else {
+        return false;
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(raw.get()) else {
+        return false;
+    };
+    let entry = if let Some(found) = entries
+        .iter()
+        .find(|entry| entry.get("key").and_then(serde_json::Value::as_str) == Some(target))
+    {
+        found
+    } else if entries.len() == 1 {
+        &entries[0]
+    } else {
+        return false;
+    };
+    let Some(repr) = entry.get("value").and_then(|value| value.get("repr")) else {
+        return false;
+    };
+    if repr
+        .get("align_modif")
+        .is_some_and(|modif| modif.get("Pack").is_some())
+    {
+        return false;
+    }
+    repr.get("repr_algo").and_then(serde_json::Value::as_str) == Some("C")
+}
+
+/// Depth-0 `Clause` index of a trait ref (`Bound[0, i]`), object or
+/// array Charon form. Used to substitute an ADT's `trait_refs` into a
+/// field type's `TraitType` projection.
+pub(in crate::front::mir) fn clause_bound0_index(
+    traitref: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<usize> {
+    let node = traitref_unwrap(traitref, llbc, 0)?;
+    let clause = node.get("kind")?.get("Clause")?;
+    let bound = if let Some(arr) = clause.as_array() {
+        arr.first()?.get("Bound")?
+    } else {
+        clause.get("Bound")?
+    };
+    let pair = bound.as_array()?;
+    if pair.first()?.as_u64()? != 0 {
+        return None;
+    }
+    Some(pair.get(1)?.as_u64()? as usize)
+}
+
+/// Byte size and alignment of an instantiated field type.
+///
+/// `layout_for_target` refuses a layout whose field offsets are still
+/// Deduplicated (`json_ty_byte_size`). [`TypeDecl::size_align_for_target`]
+/// still yields the two words. A `repr(C)` wrapper whose `Align`
+/// modifier made [`mem_size_align`] decline walks declaration order
+/// (`llmemory.offsetof`); unknown size or align declines.
+///
+/// A `TraitType` projection (`T::AtomicInner` on a `repr(C)` count
+/// word) is the selected impl's binding
+/// ([`resolve_trait_assoc_type_value`]); a depth-0 `Clause` uses the
+/// ADT node's `trait_refs`. `clauses` is that list from the enclosing
+/// instantiation; an Adt node with its own nonempty `trait_refs`
+/// replaces it.
+pub(in crate::front::mir) fn instantiated_field_size_align(
+    llbc: &Llbc,
+    ty: &serde_json::Value,
+    subst: &[serde_json::Value],
+    clauses: &[serde_json::Value],
+    depth: u8,
+) -> Option<(u64, u64)> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(sa) = mem_size_align(llbc, ty, subst, depth) {
+        return Some(sa);
+    }
+    let substituted = subst_type_args(llbc, ty, subst);
+    let body = tyexpr_body(llbc, &substituted)?;
+    if let Some(slot) = typevar_slot(body) {
+        let repl = subst.get(slot)?;
+        return instantiated_field_size_align(llbc, repl, &[], clauses, depth + 1);
+    }
+    if let Some(arr) = trait_type_projection_args(body) {
+        let value = clause_bound0_index(&arr[0], llbc)
+            .and_then(|i| clauses.get(i))
+            .and_then(|traitref| resolve_trait_assoc_type_value(traitref, &arr[1], llbc))
+            .or_else(|| resolve_trait_assoc_type_value(&arr[0], &arr[1], llbc))?;
+        return instantiated_field_size_align(llbc, value, subst, clauses, depth + 1);
+    }
+    // `Atomic<T>` is layout-identical to `T` (`tyref_atomic_inner_value_type`).
+    // The TypeDecl stays Opaque: including it peels `length_cell` to the
+    // inner integer and `getattr("value")` panics (`getfield_raw_r`).
+    {
+        let tyref = TyRef::Other(body.clone());
+        if let Some(arg) = tyref_atomic_arg(&tyref, llbc) {
+            return instantiated_field_size_align(llbc, arg, subst, clauses, depth + 1);
+        }
+    }
+    let adt = body.get("Adt").unwrap_or(body);
+    let id = adt.get("id")?.as_u64()?;
+    let decl = llbc.type_by_id(id)?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if let Some((size, align)) = decl.size_align_for_target(llbc, &target)
+        && let (Some(s), Some(a)) = (size, align)
+    {
+        return Some((s, a));
+    }
+    let args = adt
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|arg| subst_type_args(llbc, arg, subst))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let own_clauses = adt
+        .get("generics")
+        .and_then(|g| g.get("trait_refs"))
+        .and_then(serde_json::Value::as_array);
+    let nested_clauses: &[serde_json::Value] = match own_clauses {
+        Some(own) if !own.is_empty() => own,
+        _ => clauses,
+    };
+    if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            return None;
+        };
+        let field = fields.get(index)?;
+        return instantiated_field_size_align(
+            llbc,
+            &tyref_json(&field.ty),
+            &args,
+            nested_clauses,
+            depth + 1,
+        );
+    }
+    if !decl_repr_c_field_offsets(decl, &target) {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let mut offset = 0u64;
+    let mut max_align = 1u64;
+    for field in fields {
+        let (fs, fa) = instantiated_field_size_align(
+            llbc,
+            &tyref_json(&field.ty),
+            &args,
+            nested_clauses,
+            depth + 1,
+        )?;
+        let fa = fa.max(1);
+        offset = align_up_bytes(offset, fa)?;
+        offset = offset.checked_add(fs)?;
+        max_align = max_align.max(fa);
+    }
+    Some((align_up_bytes(offset, max_align)?, max_align))
+}
+
+/// Byte offset of field `field_idx` of a `repr(C)` struct at `subst`.
+///
+/// A resolved `layout_for_target` row is `llmemory.offsetof` (the
+/// recorded C layout, no `ll2ctypes`). A generic instantiation whose
+/// offsets are still Deduplicated walks declaration order: each field
+/// starts at the previous end rounded up to its alignment, using
+/// [`instantiated_field_size_align`] of the instantiated field type.
+/// Unknown size or align declines.
+pub(in crate::front::mir) fn repr_c_struct_field_offset(
+    llbc: &Llbc,
+    decl: &TypeDecl,
+    subst: &[serde_json::Value],
+    field_idx: usize,
+) -> Option<u64> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if let Some(layout) = decl.layout_for_target(llbc, &target)
+        && let Some(n) = layout.struct_field_offset(field_idx)
+        && n != u64::MAX
+    {
+        return Some(n);
+    }
+    if !decl_repr_c_field_offsets(decl, &target) {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let field = fields.get(field_idx)?;
+    let mut offset = 0u64;
+    for prior in fields.iter().take(field_idx) {
+        let (fs, fa) = instantiated_field_size_align(llbc, &tyref_json(&prior.ty), subst, &[], 0)?;
+        offset = align_up_bytes(offset, fa.max(1))?;
+        offset = offset.checked_add(fs)?;
+    }
+    let (_, fa) = instantiated_field_size_align(llbc, &tyref_json(&field.ty), subst, &[], 0)?;
+    align_up_bytes(offset, fa.max(1))
+}
+
+/// Bind the specialized Field place type into a still-open TypeVar slot.
+///
+/// `adt_node_type_subst` reads `generics.types` off the owner node.
+/// A `TyRef::Dedup` of a generic `repr(C)` template (`ArcInner<T>` /
+/// `RcInner<T>`) resolves through the shared table, so slot 0 is still
+/// the interned TypeVar. `substituted_unstructured` has already replaced
+/// the Field place's own type (the payload). That instantiated type is
+/// `llmemory.sizeof` of the field `llmemory.offsetof` needs.
+pub(in crate::front::mir) fn subst_bind_projected_field(
+    llbc: &Llbc,
+    owner: &TypeDecl,
+    subst: &[serde_json::Value],
+    field_idx: usize,
+    instantiated_field_ty: &serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let mut subst = subst.to_vec();
+    let TypeDeclKind::Struct(fields) = &owner.kind else {
+        return subst;
+    };
+    let Some(field) = fields.get(field_idx) else {
+        return subst;
+    };
+    let field_ty = tyref_json(&field.ty);
+    let Some(body) = tyexpr_body(llbc, &field_ty) else {
+        return subst;
+    };
+    let Some(slot) = typevar_slot(body) else {
+        return subst;
+    };
+    if slot == usize::MAX {
+        return subst;
+    }
+    let slot_is_open = match subst.get(slot) {
+        None => true,
+        Some(ty) => tyexpr_body(llbc, ty).is_some_and(|body| typevar_slot(body).is_some()),
+    };
+    if slot_is_open {
+        if subst.len() <= slot {
+            subst.resize(slot + 1, serde_json::Value::Null);
+        }
+        subst[slot] = instantiated_field_ty.clone();
+    }
+    subst
+}
+
 /// `OffsetOf([TypeDeclRef, variant, field])` → byte offset.
 pub(in crate::front::mir) fn eval_offset_of(llbc: &Llbc, off: &serde_json::Value) -> Option<u64> {
     let arr = off.as_array()?;

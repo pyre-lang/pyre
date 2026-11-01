@@ -51,7 +51,8 @@
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::result_exc::{
     assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-    collapse_trailing_recasts_onto, follow_single_exit, split_diamond_exits,
+    collapse_trailing_recasts_onto, field_read_named_of_image, follow_single_exit,
+    split_diamond_exits,
 };
 use crate::model::{
     CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType,
@@ -371,19 +372,11 @@ fn rewire_one_checked_arith_site(
     assert_single_pred(graph, c, &name)?;
 
     // Block C: `d = opt.__discriminant`; `switch d { 0 → None, 1 → Some }`.
+    // Tagged Option Discriminant recasts `opt` onto the interned class
+    // while `opt` still escapes on the diamond exits; the FieldRead is
+    // of the recast dest (`field_read_named_of_image`).
     let Some((disc_idx, disc_var)) =
-        graph.blocks[c]
-            .operations
-            .iter()
-            .enumerate()
-            .find_map(|(i, op)| match &op.kind {
-                OpKind::FieldRead { base, field, .. }
-                    if *base == opt_c && field.name == "__discriminant" =>
-                {
-                    op.result.clone().map(|r| (i, r))
-                }
-                _ => None,
-            })
+        field_read_named_of_image(&graph.blocks[c].operations, &opt_c, "__discriminant")
     else {
         return rewire_checked_arith_ok_or_else(
             graph,
@@ -812,7 +805,7 @@ fn rewire_checked_arith_ok_or_else(
     // `_ovf` link's undefined etype/evalue slots would feed garbage GC
     // pointers into the function-level handler.
     graph.blocks[c].operations.remove(ok_idx);
-    let err_value = crate::front::option_closure_select::emit_call_once(
+    let err_value = crate::front::result_exc::emit_call_once(
         graph,
         graph.blocks[c].id,
         env.into_variable(),

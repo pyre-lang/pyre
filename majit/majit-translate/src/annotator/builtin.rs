@@ -2103,9 +2103,15 @@ fn cast_instance_intrinsic(
     // return the projected string for any GC pointer source, while an
     // already-string source is the identity.
     if matches!(&projected, SomeValue::String(_)) {
+        // `SomeChar` is `SomeString` (`annmodel.py`). A recast onto a
+        // declared `string::String` payload (`Option<String>` unwrap
+        // merge, `rstr.py` `CharRepr` / `StringRepr`) projects the
+        // dest String; the source Char is the same string family, not
+        // a neighbouring char payload rule.
         return match operand {
             SomeValue::String(_) => Ok(operand.clone()),
-            SomeValue::Instance(_)
+            SomeValue::Char(_)
+            | SomeValue::Instance(_)
             | SomeValue::List(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
@@ -4735,6 +4741,32 @@ mod tests {
     }
 
     #[test]
+    fn lltype_cast_pointer_lowleveltype_ptr_rejects_instance_operand() {
+        // `ann_cast_pointer` asserts `isinstance(s_p, SomePtr)`. An
+        // overlay Instance → raw `Ptr(Struct)` is
+        // `__cast_instance_intrinsic` (`cast_instance_intrinsic`
+        // raw-root arm / `raw_struct_ptr_annotation`).
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
+        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            (*CCHARP).clone(),
+        ))));
+        assert!(s_ptrt.is_constant());
+        let s_inst = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
+        let err = lltype_cast_pointer(&bk, &[Some(s_ptrt), Some(s_inst)], &no_kwds()).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("casting of non-pointer"),
+        );
+    }
+
+    #[test]
     fn lltype_cast_pointer_accepts_constant_none_as_null() {
         // A constant-None operand is a null pointer (upstream null
         // constants are SomePtr and pass the lltype.py assert);
@@ -5122,6 +5154,28 @@ mod tests {
                 "{root} must project dest as SomeString, got {out:?}"
             );
         }
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_string_root_accepts_char() {
+        // Declared `string::String` payload recast of a `SomeChar`
+        // (`annmodel.py` `SomeChar` is `SomeString`). Dest stays String.
+        let bk = bk();
+        let s_char = SomeValue::Char(SomeChar::new(true));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("string::String"))
+            .expect("string::String root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_char), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("string-root cast_instance_intrinsic must accept SomeChar");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "string::String root must project dest as SomeString, got {out:?}"
+        );
     }
 
     #[test]

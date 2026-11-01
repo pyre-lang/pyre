@@ -4586,12 +4586,11 @@ fn init_someinstance_overrides(
                         // `legacy_annotator::setbinding` writes that shell
                         // into `Variable.annotation` for every reference-typed
                         // variable, discarding any `Ref(Some(root))` payload.
-                        // `project_struct_field_type` does not mint this for
-                        // an unregistered named root — that arm returns
-                        // `SomeValue::Impossible`.  It mints a classdef-less
-                        // `SomeInstance` only for a raw-pointer-to-scalar/unit
-                        // field and for the `"BigInt"` arm.  Any attr other
-                        // than the `is_null` ptr method above stays fail-loud.
+                        // `project_struct_field_type` mints this for a
+                        // raw-pointer-to-scalar/unit field and the
+                        // `"BigInt"` arm. Any attr other than the `is_null`
+                        // ptr method and `__discriminant` above stays
+                        // fail-loud.
                         panic!(
                             "AnnotatorError: SomeInstance.getattr({:?}) on classdef-less instance",
                             attr

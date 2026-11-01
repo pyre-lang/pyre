@@ -69,7 +69,6 @@
 //! treated as opaque ops.
 
 pub(crate) mod bigint_binop;
-pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod checked_arith_uint;
 pub(crate) mod clause_spec;
@@ -85,12 +84,7 @@ pub(crate) mod iter_next;
 pub(crate) mod join_chars;
 pub mod llbc_hints;
 pub mod mir;
-pub(crate) mod option_closure_select;
 pub(crate) mod option_ctor;
-pub(crate) mod option_expect;
-pub(crate) mod option_map_or;
-pub(crate) mod option_try;
-pub(crate) mod option_unwrap;
 pub(crate) mod option_variant;
 pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;

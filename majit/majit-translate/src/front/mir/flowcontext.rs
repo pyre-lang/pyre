@@ -447,12 +447,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `interp_deque.py` `W_Deque.trimleft` / `popleft`).
     pub(in crate::front::mir) carrier_combinator_sites:
         Vec<crate::front::result_exc::CarrierCombinatorSite>,
-    /// `Result::map_err(result, closure)` sites lowered to an explicit
-    /// Ok/Err closure-select before the exception-link pass consumes the
-    /// newly built result shells.
+    /// Dest-is-carrier `map_err` sites. The rewrite runs after
+    /// `result_exc` hung LastException: Ok forwards T, Err calls the
+    /// mapper and raises. A plain Result dest is the extracted helper.
     pub(in crate::front::mir) result_map_err_sites:
         Vec<crate::front::result_map_err::ResultMapErrSite>,
-    pub(in crate::front::mir) result_expect_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -502,14 +501,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `Layout::size` / `Layout::align` field accessors on a virtualized Layout.
     pub(in crate::front::mir) layout_accessor_sites:
         Vec<crate::front::from_size_align::LayoutAccessorSite>,
-    /// `Try::branch(opt)` call sites where `opt: Option<T>`, recorded for
-    /// the `Option` `?` rewiring pass (`front::option_try`) that runs after
-    /// body lowering completes.
-    pub(in crate::front::mir) option_try_sites: Vec<crate::front::option_try::OptionTrySite>,
-    /// `bool::then(cond, closure)` call sites recorded for the
-    /// short-circuit `Option` diamond the `front::bool_then` post-pass
-    /// synthesizes after the body lowering completes.
-    pub(in crate::front::mir) bool_then_sites: Vec<crate::front::bool_then::BoolThenSite>,
     /// `<[T]>::first(slice)` call sites recorded for the length-checked
     /// `Option<&T>` diamond the `front::slice_first` post-pass synthesizes
     /// after the body lowering completes (see
@@ -562,33 +553,14 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// `range_iter` candidate; both passes are consumer-gated.
     pub(in crate::front::mir) slice_index_range_sites:
         Vec<crate::front::slice_index::SliceIndexRangeSite>,
-    /// `Option::unwrap(opt)` call sites recorded for the discriminant guard the
-    /// `front::option_unwrap` post-pass synthesizes (see
-    /// [`crate::front::option_unwrap::UnwrapSite`]).
-    pub(in crate::front::mir) unwrap_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
-    /// `Option::expect(opt, msg)` call sites recorded for the discriminant
-    /// guard the `front::option_expect` post-pass synthesizes — the two-arg
-    /// sibling of `unwrap` (the panic message is dropped; see
-    /// [`crate::front::option_expect::ExpectSite`]).
-    pub(in crate::front::mir) expect_sites: Vec<crate::front::option_expect::ExpectSite>,
-    /// `Option::map_or(opt, default, closure)` call sites recorded for the
-    /// discriminant closure-select the `front::option_map_or` post-pass
-    /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
-    pub(in crate::front::mir) map_or_sites: Vec<crate::front::option_map_or::MapOrSite>,
-    /// `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` call sites
-    /// recorded for the discriminant closure-select the
-    /// `front::option_closure_select` post-pass synthesizes (see
-    /// [`crate::front::option_closure_select::ClosureSelectSite`]).
-    pub(in crate::front::mir) closure_select_sites:
-        Vec<crate::front::option_closure_select::ClosureSelectSite>,
     /// Option/Result combinators whose body is a discriminant switch (plus an
     /// optional closure `call_once`).  Captured here so the post-pass can
     /// replace the opaque core residual with the if/else the flow graph
     /// would have had if the source had been written that way.
     pub(in crate::front::mir) disc_combinator_sites: Vec<DiscCombinatorSite>,
     /// `Try::branch(res)` sites whose receiver is a non-carrier `Result`.
-    /// The Option sibling is [`Lowering::option_try_sites`]; exception-carrier
-    /// Results stay on [`Lowering::result_exc_call_results`].
+    /// Option `?` is a regular call of the extracted `core::option::<Impl>::branch`
+    /// body. Exception-carrier Results stay on [`Lowering::result_exc_call_results`].
     pub(in crate::front::mir) result_try_sites: Vec<ResultTrySite>,
     /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
@@ -829,6 +801,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                             .map(|_| tyref_to_ast_string(&local.ty, llbc))
                     })
                     .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                    .or_else(|| {
+                        niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
+                    })
                     .or_else(|| {
                         if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
                             None
@@ -1155,6 +1130,9 @@ impl<'a> Lowering<'a> {
                                 .map(|_| tyref_to_ast_string(&local.ty, llbc))
                         })
                         .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                        .or_else(|| {
+                            niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
+                        })
                         .or_else(|| {
                             if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
                                 None
@@ -1559,7 +1537,6 @@ impl<'a> Lowering<'a> {
             option_ok_or_else_try_sites: Vec::new(),
             carrier_combinator_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
-            result_expect_sites: Vec::new(),
             next_call_results: Vec::new(),
             map_collect_sites: Vec::new(),
             checked_arith_call_results: Vec::new(),
@@ -1570,8 +1547,6 @@ impl<'a> Lowering<'a> {
             from_size_align_expect_sites: Vec::new(),
             from_size_align_call_sites: Vec::new(),
             layout_accessor_sites: Vec::new(),
-            option_try_sites: Vec::new(),
-            bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
             slice_get_sites: Vec::new(),
             slice_is_ascii_sites: Vec::new(),
@@ -1582,10 +1557,6 @@ impl<'a> Lowering<'a> {
             slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
-            unwrap_sites: Vec::new(),
-            expect_sites: Vec::new(),
-            map_or_sites: Vec::new(),
-            closure_select_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),

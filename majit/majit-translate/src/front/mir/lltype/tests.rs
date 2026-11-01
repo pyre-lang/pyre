@@ -22,11 +22,12 @@ use crate::front::mir::tests::{
     i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
     kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
     mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
-    option_int_arg, range_contains_fixture, result_adt_node, result_enum, span_json, struct_decl,
-    trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout, type_decl_meta,
-    type_decl_struct, tyref_to_attr_value_type, usize_ty, vec_decl_json, vec_of, vec_type_decls,
-    vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_local,
-    window_meta, window_mut_slice, window_place, window_shared_slice, window_slice, window_span,
+    option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node, result_enum,
+    span_json, struct_decl, trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout,
+    type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr, usize_ty,
+    vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
+    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
+    window_shared_slice, window_slice, window_span,
 };
 
 #[test]
@@ -1546,6 +1547,59 @@ fn enum_suffix_keeps_unit_ok_when_err_splits() {
         None
     );
     assert_eq!(enum_instantiation_suffix_from_args(&["()".into()]), None);
+    // Nested unresolved args are not an instantiation: `Option<??scalar>`
+    // does not start with `??`, so prefix-only splitting interned
+    // `ControlFlow<Option<??scalar>, i64>` and getattr `from_residual`
+    // blocked on that classdef (`w_range_fields_i64` `?`).
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Option<??scalar>".into(), "i64".into()]),
+        None
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["i64".into(), "Option<??scalar>".into()]),
+        None
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Result<TypeVar, E>".into()]),
+        None
+    );
+    // Whole-arg unresolved associated type: the sibling concrete
+    // payload still intern's (`getuniqueclassdef`). Nested unresolved
+    // above stays out.
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["u32".into(), "??TraitType".into()]).as_deref(),
+        Some("<u32,??TraitType>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["??TraitType".into(), "i64".into()]).as_deref(),
+        Some("<??TraitType,i64>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["??TypeVar#0".into(), "i64".into()]),
+        None
+    );
+    // A leaked hasher `fn() -> ()` Instantiated arg is concrete (the
+    // `{"Tuple": []}` unit, not `??Tuple`).
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["WordHasher".into(), "fn() -> ()".into()]).as_deref(),
+        Some("<WordHasher,fn() -> ()>")
+    );
+    // Charon hash-cons `{"Value":[id,"Never"]}` is a type-name string.
+    // `??scalar` is not an instantiation; `Never` is.
+    let llbc = empty_llbc();
+    assert_eq!(
+        charon_type_value_to_ast_string(&serde_json::json!({"Value": [0, "Never"]}), &llbc, 0),
+        "Never"
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Never".into(), "BytecodeCorruption".into()])
+            .as_deref(),
+        Some("<Never,BytecodeCorruption>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Option<Never>".into(), "i64".into()]).as_deref(),
+        Some("<Option<Never>,i64>")
+    );
 }
 
 #[test]
@@ -2277,6 +2331,140 @@ fn trait_assoc_impl_ref_resolves_its_own_binding() {
     assert_eq!(
         super::resolve_trait_assoc_type_value(&clause, &assoc, &llbc),
         None
+    );
+}
+
+#[test]
+fn trait_assoc_pred_generics_select_among_impls() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let binding = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ty}
+        })
+    };
+    let row = |self_ty: &serde_json::Value, bound: &serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [self_ty]}},
+            "types": [binding(bound)],
+            "implied_trait_refs": []
+        })
+    };
+    let llbc = llbc_with_trait_impls(serde_json::json!([
+        row(&i64_ty, &bool_ty),
+        row(&char_ty, &i64_ty)
+    ]));
+    let assoc = serde_json::json!(0);
+    let clause = |self_ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"Clause": {"Bound": [0, 0]}},
+            "trait_decl_ref": {
+                "skip_binder": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [self_ty],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }
+        })
+    };
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&clause(&i64_ty), &assoc, &llbc),
+        Some(&bool_ty)
+    );
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&clause(&char_ty), &assoc, &llbc),
+        Some(&i64_ty)
+    );
+    let projection = |self_ty: &serde_json::Value| {
+        serde_json::json!({
+            "TraitType": [
+                clause(self_ty),
+                0,
+                {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+            ]
+        })
+    };
+    assert_eq!(
+        charon_type_value_to_ast_string(&projection(&i64_ty), &llbc, 0),
+        "bool"
+    );
+    assert_eq!(
+        super::enum_instantiation_suffix_from_args(&[
+            "u32".into(),
+            charon_type_value_to_ast_string(&projection(&i64_ty), &llbc, 0),
+        ])
+        .as_deref(),
+        Some("<u32,bool>")
+    );
+}
+
+#[test]
+fn trait_assoc_pred_generics_ambiguous_or_open_stay_unresolved() {
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let char_ty = serde_json::json!({"Scalar": "Char"});
+    let binding = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ty}
+        })
+    };
+    let row = |self_ty: &serde_json::Value, bound: &serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [self_ty]}},
+            "types": [binding(bound)],
+            "implied_trait_refs": []
+        })
+    };
+    let two_for_i64 = llbc_with_trait_impls(serde_json::json!([
+        row(&i64_ty, &bool_ty),
+        row(&i64_ty, &char_ty)
+    ]));
+    let assoc = serde_json::json!(0);
+    let clause = serde_json::json!({
+        "kind": {"Clause": {"Bound": [0, 0]}},
+        "trait_decl_ref": {
+            "skip_binder": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [i64_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }
+    });
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&clause, &assoc, &two_for_i64),
+        None
+    );
+    let open = serde_json::json!({
+        "kind": {"Clause": {"Bound": [0, 0]}},
+        "trait_decl_ref": {
+            "skip_binder": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"TypeVar": {"Bound": [0, 0]}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }
+    });
+    let one_impl = llbc_with_trait_impls(serde_json::json!([row(&i64_ty, &bool_ty)]));
+    // Unique-impl still answers when the predicate is open: there is
+    // only one impl of the trait.
+    assert_eq!(
+        super::resolve_trait_assoc_type_value(&open, &assoc, &one_impl),
+        Some(&bool_ty)
     );
 }
 
@@ -6347,6 +6535,205 @@ fn result_integer_instantiations_paint_distinct_class_roots() {
     );
 }
 
+/// `Option::map_or` stays a regular call to the extracted core body
+/// `match self { Some(t) => f(t), None => default }`. The Option repr
+/// is unchanged; only the caller rewrite is gone (`guess_call_kind`
+/// regular).
+#[test]
+fn option_map_or_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let caller = super::lower_function(&llbc, "get_or_create_extra_locals")
+        .expect("lower get_or_create_extra_locals");
+    let map_or_calls = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "map_or",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("map_or")
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        map_or_calls, 1,
+        "caller keeps one regular call to the core map_or body, got {map_or_calls}"
+    );
+
+    let ctx = super::LowerContext::new(&llbc);
+    let mut lowered_core_bodies = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let name_path = fd.item_meta.name_path();
+        if !name_path.ends_with("::option::<Impl>::map_or") {
+            continue;
+        }
+        let graph =
+            super::lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+        let has_disc = graph.blocks.iter().any(|block| {
+            matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                || block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                    )
+                })
+                || block.operations.iter().any(
+                    |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"),
+                )
+        });
+        assert!(has_disc, "{name_path}: core body matches on the Option tag");
+        let has_ft = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "call_once" || name == "call" || name == "call_mut",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    leaf == Some("call_once") || leaf == Some("call") || leaf == Some("call_mut")
+                }
+                _ => false,
+            })
+        });
+        assert!(
+            has_ft,
+            "{name_path}: core body calls f(t); ops={:?}",
+            graph_ops(&graph)
+        );
+        lowered_core_bodies += 1;
+    }
+    assert_eq!(
+        lowered_core_bodies, 1,
+        "extracted map_or FunDecl bodies must lower, got {lowered_core_bodies}"
+    );
+}
+
+/// `Option::{map, and_then, unwrap_or_else, or_else, is_some_and}` stay
+/// regular calls to the extracted core bodies. The Option repr is
+/// unchanged; only the caller rewrite is gone (`guess_call_kind`
+/// regular). Each body matches on the receiver tag and calls `f(x)` /
+/// `f()`.
+#[test]
+fn option_map_family_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let ctx = super::LowerContext::new(&llbc);
+    let leaves = [
+        "map",
+        "and_then",
+        "unwrap_or_else",
+        "or_else",
+        "is_some_and",
+    ];
+    for leaf in leaves {
+        let suffix = format!("::option::<Impl>::{leaf}");
+        let mut lowered_core_bodies = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            if !name_path.ends_with(&suffix) {
+                continue;
+            }
+            let graph = super::lower_fun_decl(&ctx, fd)
+                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let has_disc = graph.blocks.iter().any(|block| {
+                matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                    || block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                        )
+                    })
+                    || block.operations.iter().any(
+                        |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"),
+                    )
+            });
+            assert!(has_disc, "{name_path}: core body matches on the Option tag");
+            let has_ft = graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => name == "call_once" || name == "call" || name == "call_mut",
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => {
+                        let leaf = segments.last().map(String::as_str);
+                        leaf == Some("call_once")
+                            || leaf == Some("call")
+                            || leaf == Some("call_mut")
+                    }
+                    _ => false,
+                })
+            });
+            assert!(
+                has_ft,
+                "{name_path}: core body calls f(x)/f(); ops={:?}",
+                graph_ops(&graph)
+            );
+            lowered_core_bodies += 1;
+        }
+        assert_eq!(
+            lowered_core_bodies, 1,
+            "extracted {leaf} FunDecl bodies must lower, got {lowered_core_bodies}"
+        );
+    }
+
+    let caller = super::lower_function(&llbc, "install_applevel_builtins")
+        .expect("lower install_applevel_builtins");
+    let is_some_and_calls = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "is_some_and",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("is_some_and")
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        is_some_and_calls, 2,
+        "caller keeps two regular calls to the core is_some_and body, got {is_some_and_calls}"
+    );
+}
+
 #[test]
 fn result_with_pointer_like_err_still_paints_class_root() {
     // Result keeps its tag even when `E` is pointer-like
@@ -6389,16 +6776,124 @@ fn option_of_raw_pointer_stays_classdef_less() {
     );
 }
 
-fn unit_fn_ptr() -> serde_json::Value {
+/// FunDecl template `Option<v0>` is a parameter of `Try::branch`. Value
+/// paint stays classdef-less (recasting a call result onto the template
+/// unions `__pos_0`); the Input `class_root` is the harvested enum base
+/// so getattr `__discriminant` finds the template (`bookkeeper.py`
+/// `getuniqueclassdef`).
+#[test]
+fn option_of_type_parameter_param_seeds_enum_template() {
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let tomb = super::no_tombstoned_leaves();
+    let tvar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let node = option_adt_node(0, tvar);
+    assert_eq!(
+        super::adt_node_class_root_identity(&node, &llbc, &tomb),
+        None,
+        "value paint of Option<v0> stays classdef-less"
+    );
+    let ty = TyRef::Other(node.clone());
+    assert_eq!(
+        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "Option<v0> param seeds the harvested Option template"
+    );
+    let borrowed = TyRef::Other(option_shared_ref(node));
+    assert_eq!(
+        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "&Option<v0> param seeds the harvested Option template"
+    );
+}
+
+/// `Option<()>::branch` is a spec copy whose readable leaf is `__`
+/// (`valid_identifier("()")`). `()` does not split, so the param still
+/// seeds the harvested Option template for getattr `__discriminant`.
+#[test]
+fn option_of_unit_param_seeds_enum_template() {
+    let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
+    let tomb = super::no_tombstoned_leaves();
+    let unit = serde_json::json!({"Tuple": []});
+    let node = option_adt_node(0, unit);
+    assert_eq!(
+        super::adt_node_class_root_identity(&node, &llbc, &tomb),
+        None,
+        "value paint of Option<()> stays classdef-less"
+    );
+    let ty = TyRef::Other(node.clone());
+    assert_eq!(
+        super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "Option<()> param seeds the harvested Option template"
+    );
+    let borrowed = TyRef::Other(option_shared_ref(node));
+    assert_eq!(
+        super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
+        Some("option::Option".into()),
+        "&Option<()> param seeds the harvested Option template"
+    );
+}
+
+fn local_payload_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
     serde_json::json!({
-        "FnPtr": {
-            "skip_binder": {
-                "inputs": [],
-                "output": {"Tuple": []},
-                "is_unsafe": false
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["RawEnum", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Empty",
+                "fields": [],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Word",
+                "fields": [{"name": null, "ty": {"Value": [0, {"Literal": "Int"}]}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+/// A payload enum with no type arguments is not a FunDecl template.
+/// `tyref_split_core_enum_param_root` must not seed it; Input class_root
+/// comes from `adt_node_class_root_identity`.
+#[test]
+fn unsuffixed_local_payload_enum_param_is_not_a_template_seed() {
+    let llbc = llbc_with_types("fixture", vec![local_payload_enum(0)], vec![]);
+    let tomb = super::no_tombstoned_leaves();
+    let node = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
             }
         }
-    })
+    });
+    let ty = TyRef::Other(node.clone());
+    assert_eq!(
+        super::tyref_split_core_enum_param_root(&ty, &llbc, &tomb),
+        None,
+        "Buffer-shaped enum has no type args; do not seed the Option<()> path"
+    );
+    assert_eq!(
+        super::adt_node_class_root_identity(&node, &llbc, &tomb).as_deref(),
+        Some("RawEnum"),
+        "value/param paint still names the harvested identity"
+    );
 }
 
 /// A named word-sized tuple struct is a tagged Option payload, not a
@@ -6459,6 +6954,49 @@ fn option_of_shared_ref_to_generic_struct_is_niche() {
     assert_eq!(
         super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
         None
+    );
+}
+
+/// Thin `Arc<T>` / `Rc<T>` is a one-word owning pointer, so Option of
+/// either is the null niche. Fat `Arc<[T]>` keeps the tag.
+#[test]
+fn option_of_thin_arc_or_rc_is_niche() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            option_enum(0),
+            type_decl_struct(1, &["alloc", "sync", "Arc"], vec![]),
+            type_decl_struct(2, &["alloc", "rc", "Rc"], vec![]),
+            type_decl_struct(3, &["jit", "JitCode"], vec![]),
+        ],
+        vec![],
+    );
+    let tomb = super::no_tombstoned_leaves();
+    let jitcode = named_adt(3, vec![]);
+    let option_arc = option_adt_node(0, named_adt(1, vec![jitcode.clone()]));
+    let option_rc = option_adt_node(0, named_adt(2, vec![jitcode]));
+    let ty_arc = TyRef::Other(option_arc.clone());
+    let ty_rc = TyRef::Other(option_rc.clone());
+    assert!(
+        super::tyref_is_niche_option(&ty_arc, &llbc),
+        "Option of a thin Arc is the nullable pointer niche"
+    );
+    assert!(
+        super::tyref_is_niche_option(&ty_rc, &llbc),
+        "Option of a thin Rc is the nullable pointer niche"
+    );
+    assert_eq!(
+        super::adt_node_class_root_with(&option_arc, &llbc, &tomb),
+        None,
+        "niche Option of Arc must not intern a tagged class"
+    );
+    let fat_inner = serde_json::json!({
+        "Slice": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, null]
+    });
+    let option_fat = TyRef::Other(option_adt_node(0, named_adt(1, vec![fat_inner])));
+    assert!(
+        !super::tyref_is_niche_option(&option_fat, &llbc),
+        "Option of a fat Arc slice keeps the tag"
     );
 }
 
@@ -7001,10 +7539,6 @@ fn with_fixture_lowering(llbc: &Llbc, f: impl FnOnce(&super::Lowering<'_>)) {
     )
     .unwrap();
     f(&lowering);
-}
-
-fn option_shared_ref(def: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"Ref": ["Erased", def, "Shared"]})
 }
 
 #[test]
@@ -8185,7 +8719,14 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
         "elidable_nullable",
     ] {
         let row = leaf_of(&policy, leaf).unwrap_or_else(|| panic!("{leaf} must be registered"));
-        let token = if leaf == "word_result" { "i64" } else { "ref" };
+        // `sized_nullable` is `Option<*mut storage-raw Struct>`: overlay
+        // paint is int-bank SomePtr (`history.py` `getkind` of
+        // `Ptr(Struct Raw)`), so the residual token is `i64`. A Vec
+        // field keeps Nominal off that path (`adt_path_is_gc_container`).
+        let token = match leaf {
+            "word_result" | "sized_nullable" => "i64",
+            _ => "ref",
+        };
         assert_eq!(row.2.as_deref(), Some(token), "{leaf}");
     }
     for leaf in [

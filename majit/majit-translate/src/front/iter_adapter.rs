@@ -41,8 +41,7 @@ use crate::front::iter_next::{
     BackEdges, is_iter_op_segments, is_iterator_next_target, originates_from_iter_op,
     walk_back_to_source, walk_back_with,
 };
-use crate::front::option_map_or::emit_narrow;
-use crate::front::option_variant::{close_goto_mixed, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, emit_narrow, reproduce_exit_args};
 use crate::front::result_exc::{back_substitute, op_operand_vars};
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
@@ -576,7 +575,8 @@ pub(crate) struct MapCollectSite {
     /// `(x,)` args-tuple payload the synthesized `call_once` writes.
     pub payload_ty: ValueType,
     /// Concrete class of a reference payload, matching
-    /// `option_closure_select::ClosureSelectSite::payload_class_root`.
+    /// `InstanceRepr._setup_repr` (`rclass.py`) on the synthesized
+    /// `(x,)` tuple field.
     pub payload_class_root: Option<String>,
     /// `<X>` suffix for the closure `Args` tuple `(payload,)`.
     pub args_tuple_suffix: String,
