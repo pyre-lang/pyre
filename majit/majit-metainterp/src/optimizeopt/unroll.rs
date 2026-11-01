@@ -1,3 +1,6 @@
+use indexmap::{IndexMap, IndexSet};
+use majit_ir::operand::Operand;
+use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
 /// Loop unrolling pass (peel one iteration).
 ///
 /// Detects loops ending with a `Jump` back-edge and peels one iteration:
@@ -17,9 +20,7 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
-use indexmap::{IndexMap, IndexSet};
-use majit_ir::operand::Operand;
-use majit_ir::{DescrRef, GcRef, IndexMapExt, Op, OpCode, OpRc, OpRef, Type, Value};
+use std::cell::RefCell;
 
 use crate::history::TargetToken;
 use crate::optimizeopt::{
@@ -440,13 +441,13 @@ pub struct UnrollOptimizer {
     pub string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
     pub vrefinfo: Option<crate::virtualref::VirtualRefInfo>,
     pub pureop_historylength: usize,
-    /// Explicit `input_ops` seed for the phase optimizers, threaded from the
-    /// compile caller. `Some(ops)` on the non-cut finish path =
-    /// `preamble_data.base.operations()` — the recorder's `Rc<Op>` carrying
-    /// the authoritative Phase-1 `_forwarded`. `Some(empty)` on the cut path:
-    /// the cut trace's ops live in a remapped namespace, so no seed can
-    /// resolve cut-op lookups anyway; an empty seed states that. `None`
-    /// (retrace / fixtures) leaves `input_ops` empty.
+    /// Explicit `input_ops` seed flag for Phase 2, threaded from the compile
+    /// caller. On the peeled-loop path `Some(non-empty)` means Phase 2 binds
+    /// the Phase 1 reminted boxes (`p1_ops_in`), which carry Phase 1's
+    /// `_forwarded`. `Some(empty)` on the cut path: the cut trace's ops live
+    /// in a remapped namespace, so no seed can resolve cut-op lookups anyway.
+    /// `None` leaves `input_ops` empty. Retrace (no Phase 1 in the same call)
+    /// threads the recorder ops as the seed itself.
     pub phase2_input_ops_seed: Option<Vec<majit_ir::OpRc>>,
     /// MetaInterp-owned compile snapshot root slot list. Stored as an address
     /// because the unroll optimizer owns the inner phase optimizers while the
@@ -937,7 +938,7 @@ impl UnrollOptimizer {
         let _input_ops_root = self.publish_ops_span(ops);
         // compile.py: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
-        let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
+        let (mut exported_state, consts_p1, p1_ops, p1_ops_in_for_p2) = if let Some(pre_imported) =
             self.imported_state.take()
         {
             // RPython uses object identity for Boxes, so a TraceIterator over a
@@ -964,7 +965,7 @@ impl UnrollOptimizer {
             if self.phase1_patchguardop.is_none() {
                 self.phase1_patchguardop = pre_imported.patchguardop.clone();
             }
-            (pre_imported, constants.clone(), Vec::new())
+            (pre_imported, constants.clone(), Vec::new(), None)
         } else {
             // ── Phase 1: PreambleCompileData.optimize() ──
             // ── Phase 1: optimize_preamble (compile.py:275-276) ──
@@ -1203,7 +1204,7 @@ impl UnrollOptimizer {
                     };
                     final_exported_state.root_all_gcrefs();
                     self.final_exported_state = Some(final_exported_state);
-                    (state, consts_p1, p1_ops)
+                    (state, consts_p1, p1_ops, Some(p1_ops_in.clone()))
                 }
                 None => {
                     *constants = consts_p1;
@@ -1530,11 +1531,16 @@ impl UnrollOptimizer {
         // unroll.py:119-123 — Phase 2 (peeled loop) raises
         // SpeculativeError on speculative-fold paths; convert
         // to InvalidLoop so the caller's catch handles it.
-        // Seed Phase 2's `input_ops` from the recorder `Rc<Op>` (same `Rc`,
-        // same Phase-1 `_forwarded`) so `input_ops` is the authoritative
-        // producer store. A `Some(empty)` (cut path) leaves it empty.
+        // Seed Phase 2's `input_ops` from the Phase 1 boxes (which carry
+        // Phase 1's `_forwarded`). `Some(empty)` (cut path) stays empty.
         if let Some(seed) = &self.phase2_input_ops_seed {
-            opt_p2.explicit_input_ops_seed = Some(seed.clone());
+            opt_p2.explicit_input_ops_seed = if seed.is_empty() {
+                Some(Vec::new())
+            } else if let Some(p1_ops_in) = &p1_ops_in_for_p2 {
+                Some(p1_ops_in.clone())
+            } else {
+                Some(seed.clone())
+            };
         }
         let p2_ops = with_speculative_to_invalid_loop(|| {
             opt_p2.optimize_with_constants_and_inputs_at(
@@ -6102,16 +6108,28 @@ fn pick_virtual_state(
     None
 }
 
-pub struct OptUnroll {
+pub struct OptUnrollState {
     /// Buffer of ops received before the Jump back-edge.
     buffer: Vec<Op>,
     /// Whether a Jump was already seen (avoid double-unrolling).
     seen_jump: bool,
 }
 
+pub struct OptUnroll {
+    state: RefCell<OptUnrollState>,
+}
+
 impl OptUnroll {
     pub fn new() -> Self {
-        OptUnroll {
+        Self {
+            state: RefCell::new(OptUnrollState::new()),
+        }
+    }
+}
+
+impl OptUnrollState {
+    pub fn new() -> Self {
+        OptUnrollState {
             buffer: Vec::new(),
             seen_jump: false,
         }
@@ -6318,11 +6336,12 @@ impl Default for OptUnroll {
     }
 }
 
-impl Optimization for OptUnroll {
+impl OptUnrollState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         _op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // Only peel once per trace, and only for Jump (back-edge).
@@ -6370,6 +6389,24 @@ impl Optimization for OptUnroll {
     fn setup(&mut self) {
         self.buffer.clear();
         self.seen_jump = false;
+    }
+}
+
+impl Optimization for OptUnroll {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
+    }
+
+    fn setup(&self) {
+        self.state.borrow_mut().setup();
     }
 
     fn name(&self) -> &'static str {
@@ -7167,19 +7204,22 @@ mod tests {
 
     #[test]
     fn test_setup_resets_state() {
-        let mut pass = OptUnroll::new();
+        let pass = OptUnroll::new();
 
         // Simulate some state.
-        pass.buffer.push(Op::new(
-            OpCode::IntAdd,
-            &[rooted_resop_operand(Type::Int, 0)],
-        ));
-        pass.seen_jump = true;
+        {
+            let mut st = pass.state.borrow_mut();
+            st.buffer.push(Op::new(
+                OpCode::IntAdd,
+                &[rooted_resop_operand(Type::Int, 0)],
+            ));
+            st.seen_jump = true;
+        }
 
         pass.setup();
 
-        assert!(pass.buffer.is_empty());
-        assert!(!pass.seen_jump);
+        assert!(pass.state.borrow_mut().buffer.is_empty());
+        assert!(!pass.state.borrow_mut().seen_jump);
     }
 
     #[test]

@@ -121,13 +121,13 @@ fn checked_arithmetic_does_not_reuse_unchecked_arithmetic() {
         ));
         checked.pos().set(OpRef::int_op(3));
         assert!(matches!(
-            pure.propagate_forward(&checked, &checked, &mut ctx),
+            pure.propagate_forward(&checked, &checked, &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
         let guard = OpRc::new(Op::new(OpCode::GuardNoOverflow, &[]));
         guard.pos().set(OpRef::op_typed(4, Type::Void));
         assert!(matches!(
-            pure.propagate_forward(&guard, &guard, &mut ctx),
+            pure.propagate_forward(&guard, &guard, &mut None, &mut ctx),
             OptimizationResult::PassOn
         ));
     }

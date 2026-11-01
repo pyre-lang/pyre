@@ -233,7 +233,6 @@ mod residual_call;
 pub fn finalize_published_last_instr(frame: usize, last_instr: isize) {
     residual_call::finalize_published_last_instr(frame, last_instr);
 }
-use residual_call::PendingResidualLocalsAdopt;
 pub use residual_call::*;
 mod fbw_state;
 mod symbolic_fold;
@@ -2400,10 +2399,6 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// `None` for every other walk, which is what keeps the yield interception
     /// and the durable-frame journal off every path but this one.
     pub generator_resume: Option<GeneratorResumeSubwalk>,
-    /// Fastlocals a may-force residual wrote, adopted after `GUARD_NOT_FORCED`.
-    /// A resume capture between the residual and that guard can collect, so the
-    /// frame is rooted and the live values are re-read at flush.
-    pub pending_residual_locals_adopt: Option<std::rc::Rc<PendingResidualLocalsAdopt>>,
 }
 
 /// The suspended generator a resume sub-walk is running on.
@@ -2452,7 +2447,6 @@ impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
             class_of_last_exc_is_const: self.class_of_last_exc_is_const,
             generator_resume: self.generator_resume,
             subwalk_floor: self.subwalk_floor,
-            pending_residual_locals_adopt: self.pending_residual_locals_adopt.clone(),
         }
     }
 }
@@ -2496,7 +2490,6 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,
             generator_resume: None,
-            pending_residual_locals_adopt: None,
         }
     }
 }
@@ -4954,7 +4947,6 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            flush_pending_residual_locals_adopt(ctx);
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
@@ -4974,7 +4966,6 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    flush_pending_residual_locals_adopt(ctx);
     // `direct_assembler_call` returns the target driver's virtualizable red
     // box; `do_residual_call` records `KEEPALIVE` on it after
     // `GUARD_NOT_FORCED`.
@@ -5251,7 +5242,6 @@ fn dispatch_recursive_call<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    flush_pending_residual_locals_adopt(ctx);
     if raised {
         walker_record_guard_exception(ctx, op.pc)?;
         let exc = ctx
@@ -11138,7 +11128,6 @@ fn direct_libffi_call<Sym: WalkSym>(
     }
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    flush_pending_residual_locals_adopt(ctx);
     if ei.check_can_raise(false) {
         if resid_raised {
             walker_record_guard_exception(ctx, pc)?;
@@ -11428,7 +11417,6 @@ fn direct_call_release_gil<Sym: WalkSym>(
     // this guard.
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, pc)?;
-    flush_pending_residual_locals_adopt(ctx);
     // pyjitpl.py handle_possible_exception — emits GUARD_EXCEPTION
     // when the recording-time helper raised (then finishframe_exception:
     // surface `SubRaise` so the dead arm tail is not recorded onto the

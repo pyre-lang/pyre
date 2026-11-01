@@ -1,4 +1,4 @@
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
@@ -295,8 +295,8 @@ impl RecentPureOps {
 
 pub(crate) type SharedPureOps = Rc<RefCell<RecentPureOpTable>>;
 
-/// `Optimizer.passes` slot for OptPure. Cloned out of the vec before
-/// `propagate_with_optimizer`, so `force_box` can reenter this pass.
+/// `Optimizer.passes` slot for OptPure. Interior `RefCell` so `force_box`
+/// can reenter this pass through `self.optimizer`.
 pub type SharedOptPure = Rc<RefCell<OptPureState>>;
 
 /// `OptPure.get_pure_result` against a ring published into `OptContext`.
@@ -1353,18 +1353,6 @@ fn propagate_shared(
     OptimizationResult::PassOn
 }
 
-/// Driver entry. `passes[i]` is not borrowed: `state` was cloned from
-/// `pure_state_handle` first.
-pub(crate) fn propagate_with_optimizer(
-    state: &SharedOptPure,
-    optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
-    op: &Op,
-    op_rc: &majit_ir::OpRc,
-    ctx: &mut OptContext,
-) -> OptimizationResult {
-    propagate_shared(state, &mut Some(optimizer), op, op_rc, ctx)
-}
-
 impl OptPureState {
     fn set_pureop_historylength(&mut self, limit: usize) {
         self.cache = Rc::new(RefCell::new(RecentPureOpTable::new(limit)));
@@ -1502,8 +1490,8 @@ impl OptPureState {
     }
 }
 
-/// Pass object in `Optimizer.passes`. State is shared so the driver can
-/// clone `pure_state_handle` and drop the vec borrow before `force_box`.
+/// Pass object in `Optimizer.passes`. State is shared so `force_box` can
+/// reenter this pass through `self.optimizer`.
 pub struct OptPure {
     pub(crate) state: SharedOptPure,
 }
@@ -1613,34 +1601,30 @@ impl OptPure {
 }
 
 impl Optimization for OptPure {
-    fn set_pureop_historylength(&mut self, limit: usize) {
+    fn set_pureop_historylength(&self, limit: usize) {
         self.state.borrow_mut().set_pureop_historylength(limit);
     }
 
     fn propagate_forward(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        // Direct unit tests have no `Optimizer`. `force_box` keeps the queue.
-        propagate_shared(&self.state, &mut None, op, op_rc, ctx)
+        propagate_shared(&self.state, opt, op, op_rc, ctx)
     }
 
-    fn setup(&mut self) {
+    fn setup(&self) {
         self.state.borrow_mut().setup();
     }
 
-    fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
+    fn set_call_pure_results(&self, results: &crate::optimizeopt::util::ArgsDict) {
         self.state.borrow_mut().set_call_pure_results(results);
     }
 
     fn name(&self) -> &'static str {
         "pure"
-    }
-
-    fn pure_state_handle(&self) -> Option<SharedOptPure> {
-        Some(Rc::clone(&self.state))
     }
 
     /// pure.py `CallPureOptimizationResult` — the demoted CALL / un-demoted
@@ -1654,13 +1638,13 @@ impl Optimization for OptPure {
             || opcode.is_always_pure()
     }
 
-    fn propagate_postprocess(&mut self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
+    fn propagate_postprocess(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
         self.state
             .borrow_mut()
             .propagate_postprocess(op, op_rc, ctx);
     }
 
-    fn install_preamble_pure_ops(&mut self, ctx: &mut OptContext) {
+    fn install_preamble_pure_ops(&self, ctx: &mut OptContext) {
         self.state.borrow_mut().install_preamble_pure_ops(ctx);
     }
 
@@ -1926,18 +1910,19 @@ mod tests {
 
     #[test]
     fn downstream_remove_does_not_unrecord_a_pure_op() {
-        struct RemoveFirst(bool);
+        struct RemoveFirst(Cell<bool>);
         impl Optimization for RemoveFirst {
             fn name(&self) -> &'static str {
                 "remove-first"
             }
             fn propagate_forward(
-                &mut self,
+                &self,
                 _: &Op,
                 _: &OpRc,
+                _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
                 _: &mut OptContext,
             ) -> OptimizationResult {
-                if std::mem::replace(&mut self.0, true) {
+                if self.0.replace(true) {
                     OptimizationResult::PassOn
                 } else {
                     OptimizationResult::Remove
@@ -1953,7 +1938,7 @@ mod tests {
         );
         let mut optimizer = Optimizer::new();
         optimizer.add_pass(Box::new(OptPure::new()));
-        optimizer.add_pass(Box::new(RemoveFirst(false)));
+        optimizer.add_pass(Box::new(RemoveFirst(Cell::new(false))));
         let result = optimizer
             .optimize_with_constants_and_inputs_oprc(
                 &ops,
@@ -2335,7 +2320,7 @@ mod tests {
         let op0 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op0 = op0;
         op0.pos().set(OpRef::int_op(2));
-        let result0 = pass.propagate_forward(&op0, &OpRc::new(op0.clone()), &mut ctx);
+        let result0 = pass.propagate_forward(&op0, &OpRc::new(op0.clone()), &mut None, &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
         let op0_rc = OpRc::new(op0.clone());
         ctx.push_new_operation(op0_rc.clone());
@@ -2345,7 +2330,7 @@ mod tests {
         let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
         let mut op1 = op1;
         op1.pos().set(OpRef::int_op(3));
-        let result1 = pass.propagate_forward(&op1, &OpRc::new(op1.clone()), &mut ctx);
+        let result1 = pass.propagate_forward(&op1, &OpRc::new(op1.clone()), &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
 
@@ -3343,7 +3328,7 @@ mod tests {
         // input-op binding).
         let op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
+        let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_box_replacement_operand_opt(OpRef::int_op(2))
@@ -3362,7 +3347,7 @@ mod tests {
         let a1 = ctx.materialize_operand_at(OpRef::int_op(1));
         let mut op = Op::new(OpCode::IntAdd, &[a0.clone(), a1.clone()]);
         op.pos().set(OpRef::int_op(2));
-        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
+        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
         // Only `_newoperations` (pure.py:317) makes the producer a candidate.
@@ -3418,7 +3403,7 @@ mod tests {
                 majit_ir::OopSpecIndex::None,
             ),
         ));
-        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
+        let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
         // The demote routes the CALL through the remaining passes (Replace),
         // mirroring RPython's `self.emit(newop)`, so OptHeap still processes it.
         let emitted = match result {
@@ -3491,7 +3476,8 @@ mod tests {
             );
         }
         // OptRewrite demotes CallLoopinvariantI → CallI
-        let rewrite_result = rewrite.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
+        let rewrite_result =
+            rewrite.propagate_forward(&op, &OpRc::new(op.clone()), &mut None, &mut ctx);
         let demoted = match rewrite_result {
             OptimizationResult::Emit(emitted) => emitted,
             other => panic!("expected OptRewrite to emit demoted call, got {other:?}"),
@@ -3501,7 +3487,7 @@ mod tests {
         let demoted_rc = OpRc::new(demoted.clone());
         rewrite.propagate_postprocess(&demoted, &demoted_rc, &mut ctx);
         // OptPure sees the demoted CallI
-        let result = pass.propagate_forward(&demoted, &demoted_rc, &mut ctx);
+        let result = pass.propagate_forward(&demoted, &demoted_rc, &mut None, &mut ctx);
         match result {
             OptimizationResult::Emit(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
             OptimizationResult::PassOn => {} // PassOn is also acceptable

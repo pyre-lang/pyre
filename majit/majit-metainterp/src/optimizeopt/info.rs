@@ -2388,7 +2388,7 @@ mod tests {
         let mut len_op = Op::new(OpCode::ArraylenGc, &[array_arg]);
         len_op.pos().set(OpRef::int_op(40));
         let len_rc = OpRc::new(len_op);
-        let result = pure.propagate_forward(len_rc.as_ref(), &len_rc, &mut ctx);
+        let result = pure.propagate_forward(len_rc.as_ref(), &len_rc, &mut None, &mut ctx);
         assert!(
             matches!(result, crate::optimizeopt::OptimizationResult::Remove),
             "ARRAYLEN_GC on the forced array must fold, got {result:?}"
@@ -2484,9 +2484,10 @@ mod tests {
 
     impl crate::optimizeopt::Optimization for PassOnOpt {
         fn propagate_forward(
-            &mut self,
+            &self,
             _op: &Op,
             _op_rc: &OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             _ctx: &mut OptContext,
         ) -> crate::optimizeopt::OptimizationResult {
             crate::optimizeopt::OptimizationResult::PassOn
@@ -2504,9 +2505,10 @@ mod tests {
 
     impl crate::optimizeopt::Optimization for EmitAfterNew {
         fn propagate_forward(
-            &mut self,
+            &self,
             _op: &Op,
             _op_rc: &OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             _ctx: &mut OptContext,
         ) -> crate::optimizeopt::OptimizationResult {
             crate::optimizeopt::OptimizationResult::PassOn
@@ -2516,7 +2518,7 @@ mod tests {
             opcode == OpCode::New
         }
 
-        fn propagate_postprocess(&mut self, _op: &Op, _op_rc: &OpRc, ctx: &mut OptContext) {
+        fn propagate_postprocess(&self, _op: &Op, _op_rc: &OpRc, ctx: &mut OptContext) {
             ctx.emit(Op::new(
                 OpCode::IntAdd,
                 &[

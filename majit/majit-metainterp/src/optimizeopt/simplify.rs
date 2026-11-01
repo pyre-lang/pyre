@@ -1,3 +1,4 @@
+use majit_ir::{Op, OpCode};
 /// Late-stage simplification pass.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/simplify.py.
@@ -12,15 +13,27 @@
 ///    RECORD_KNOWN_RESULT, VIRTUAL_REF_FINISH, QUASIIMMUT_FIELD,
 ///    ASSERT_NOT_NONE) that were consumed by earlier passes.
 /// 4. Rewrites VIRTUAL_REF to SAME_AS_R (the virtualisation is resolved).
-use majit_ir::{Op, OpCode};
+use std::cell::RefCell;
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
-pub struct OptSimplify;
+pub struct OptSimplifyState;
+
+pub struct OptSimplify {
+    state: RefCell<OptSimplifyState>,
+}
 
 impl OptSimplify {
     pub fn new() -> Self {
-        OptSimplify
+        Self {
+            state: RefCell::new(OptSimplifyState::new()),
+        }
+    }
+}
+
+impl OptSimplifyState {
+    pub fn new() -> Self {
+        OptSimplifyState
     }
 
     /// Convert a CALL_PURE_* or CALL_LOOPINVARIANT_* to the corresponding CALL_*.
@@ -38,11 +51,12 @@ impl Default for OptSimplify {
     }
 }
 
-impl Optimization for OptSimplify {
+impl OptSimplifyState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         _op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         _ctx: &mut OptContext,
     ) -> OptimizationResult {
         match op.opcode {
@@ -83,6 +97,20 @@ impl Optimization for OptSimplify {
 
             _ => OptimizationResult::PassOn,
         }
+    }
+}
+
+impl Optimization for OptSimplify {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
     }
 
     fn name(&self) -> &'static str {

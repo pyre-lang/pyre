@@ -4143,22 +4143,13 @@ impl TraceCtx {
     /// box (unbox for `i = i + 1`) see a store the walker is about to record,
     /// and apply it a second time. Unstamped boxes stay unstamped;
     /// [`Self::virtualizable_entry_at`] reads the live virtualizable for those
-    /// slots. A residual that mutated the frame without going through
-    /// `vable_setarrayitem` uses [`Self::reload_virtualizable_boxes_from_heap`].
+    /// slots. A residual that forced the frame is reloaded with
+    /// `load_fields_from_virtualizable`.
     pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
-        self.refresh_virtualizable_from_heap(false);
+        self.refresh_virtualizable_from_heap();
     }
 
-    /// After a residual call whose body wrote the frame without going through
-    /// `vable_setarrayitem`, rebuild any stale stamped slot as a fresh
-    /// `Const*` from the heap (`vable_after_residual_call` / `read_boxes`
-    /// wrap). Existing boxes are never restamped with a value that is not
-    /// their own result.
-    pub fn reload_virtualizable_boxes_from_heap(&mut self) {
-        self.refresh_virtualizable_from_heap(true);
-    }
-
-    fn refresh_virtualizable_from_heap(&mut self, overwrite_stamped: bool) {
+    fn refresh_virtualizable_from_heap(&mut self) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr() else {
             return;
         };
@@ -4187,9 +4178,7 @@ impl TraceCtx {
             let ty = field.field_type;
             let bits = unsafe { info.read_field(heap_ptr, i) };
             let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
-            if let Some(new_box) =
-                self.refresh_vable_slot(boxes[i], ty, bits, concrete, overwrite_stamped)
-            {
+            if let Some(new_box) = self.refresh_vable_slot(boxes[i], ty, bits, concrete) {
                 replacements.push((i, new_box));
             }
         }
@@ -4205,9 +4194,7 @@ impl TraceCtx {
                 }
                 let bits = unsafe { info.read_array_item(heap_ptr, a_idx, item_idx) };
                 let concrete = crate::pyjitpl::heap_value_for_pub(ty, bits);
-                if let Some(new_box) =
-                    self.refresh_vable_slot(boxes[cursor], ty, bits, concrete, overwrite_stamped)
-                {
+                if let Some(new_box) = self.refresh_vable_slot(boxes[cursor], ty, bits, concrete) {
                     replacements.push((cursor, new_box));
                 }
                 cursor += 1;
@@ -4229,28 +4216,16 @@ impl TraceCtx {
     /// A `Const*` that disagrees is wrapped as a fresh `Const*`
     /// (`cpu.tsosvgcref_to_box` / `wrap(..., in_const_box)`). A non-const box
     /// stays as it is: unstamped slots are answered by
-    /// [`Self::virtualizable_entry_at`]'s heap fallback, and a residual reload
-    /// (`overwrite_stamped`) replaces a stale stamped box with a fresh
-    /// `Const*` (`vable_after_residual_call` / `read_boxes`).
+    /// [`Self::virtualizable_entry_at`]'s heap fallback.
     fn refresh_vable_slot(
         &mut self,
         opref: OpRef,
         ty: Type,
         bits: i64,
         concrete: Value,
-        overwrite_stamped: bool,
     ) -> Option<OpRef> {
         if opref.is_constant() {
             if opref.inline_const_to_value() == Some(concrete) {
-                return None;
-            }
-            return Some(self.wrap_heap_const(ty, bits, opref));
-        }
-        if !overwrite_stamped {
-            return None;
-        }
-        if self.box_carries_runtime_concrete(opref) {
-            if self.box_value(opref) == Some(concrete) {
                 return None;
             }
             return Some(self.wrap_heap_const(ty, bits, opref));

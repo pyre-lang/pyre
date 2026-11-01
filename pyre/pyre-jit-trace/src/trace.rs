@@ -992,7 +992,12 @@ fn try_commit_midbody_abort_inner(
     );
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = words.callee_py_pc as isize - 1;
-    let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
+    // The callee can collect, and the handled exception is restored on the
+    // error arm, so the saved word is a GC root (forwarded in place).
+    // `ObjectSlotRoot::new` that does not register (no GC hook) leaves
+    // behaviour unchanged.
+    let mut sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
+    let _sys_exc_value_pre_root = ObjectSlotRoot::new(&mut sys_exc_value_pre);
     // Everything between the preflight above and here — the callee frame
     // allocation, the local writes, the Int/Float boxing — can allocate and
     // therefore collect.  Re-verify immediately before the point of no return

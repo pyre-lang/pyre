@@ -60,7 +60,7 @@ fn r_kind_gcref_items_are_null_after_nursery_reuse() {
         gc.do_collect_nursery();
     });
 
-    let mut list = FixedSignedList::alloc_with_roots(4, true, &mut []);
+    let (mut list, _) = FixedSignedList::alloc_with_roots(4, true, &mut []);
     assert_eq!(
         &list[..],
         &[0, 0, 0, 0],
@@ -90,7 +90,7 @@ fn list_root_guard_reloads_array_after_minor() {
         obj
     });
 
-    let mut list = FixedSignedList::alloc_with_roots(1, true, &mut []);
+    let (mut list, _) = FixedSignedList::alloc_with_roots(1, true, &mut []);
     list.fill_from_code(&[obj.0 as i64], &[0], 0);
     let stale_list = list.as_gcref();
     let stale_item = obj;
@@ -119,8 +119,8 @@ fn list_root_guard_indexes_null_slots() {
     // Skip-null `push` shifted later slots: `get(1)` would name `c`.
     // `walk_stack_root` already skips a null `content`.
     let _install = install();
-    let a = FixedSignedList::alloc_with_roots(1, true, &mut []);
-    let c = FixedSignedList::alloc_with_roots(1, true, &mut []);
+    let (a, _) = FixedSignedList::alloc_with_roots(1, true, &mut []);
+    let (c, _) = FixedSignedList::alloc_with_roots(1, true, &mut []);
     let stale_a = a.as_gcref();
     let stale_c = c.as_gcref();
     let guard = ListRootGuard::push(&[stale_a, GcRef(0), stale_c]);

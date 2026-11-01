@@ -755,6 +755,14 @@ pub fn request_stw(collect_fn: impl FnOnce(&mut MiniMarkGC)) {
     });
 }
 
+/// Stop every other registered mutator and run `f` on this thread while they are parked.
+/// Unlike [`request_stw`], `f` gets no `&mut MiniMarkGC`, so it may allocate, run write
+/// barriers, or trigger a collection (which nests through [`quiesce_mutators`]).
+pub fn stop_the_world<R>(f: impl FnOnce() -> R) -> R {
+    let _stw = quiesce_mutators();
+    f()
+}
+
 /// Fork under stop-the-world, leaving the child a lock state it can unwind.
 ///
 /// `fork()` gives the child one thread and every mutex the process had.  A

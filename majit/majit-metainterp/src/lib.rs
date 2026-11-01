@@ -2124,12 +2124,17 @@ pub fn guard_census_enable() {
 static GUARD_CENSUS_FORCED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+static GUARD_CENSUS_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 fn guard_census_enabled() -> bool {
     if GUARD_CENSUS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAJIT_GUARD_CENSUS").is_some())
+    env_presence_flag(&GUARD_CENSUS_FLAG, guard_census_enabled_init)
+}
+
+fn guard_census_enabled_init() -> bool {
+    std::env::var_os("MAJIT_GUARD_CENSUS").is_some()
 }
 
 /// An `IndexMap` keyed by a small integer (a green key, a trace id, a fail
@@ -2139,10 +2144,17 @@ fn guard_census_enabled() -> bool {
 pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
 pub(crate) type FxIndexSet<K> = indexmap::IndexSet<K, rustc_hash::FxBuildHasher>;
 
+#[inline]
 pub fn guard_census_record(green_key: u64, trace_id: u64, fail_index: u32) {
     if !guard_census_enabled() {
         return;
     }
+    guard_census_record_slow(green_key, trace_id, fail_index)
+}
+
+#[cold]
+#[inline(never)]
+fn guard_census_record_slow(green_key: u64, trace_id: u64, fail_index: u32) {
     let mut slot = GUARD_CENSUS.lock();
     let rows = slot.get_or_insert_with(Vec::new);
     let key = (green_key, trace_id, fail_index);

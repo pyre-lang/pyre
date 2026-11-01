@@ -1,15 +1,14 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=loop:_int_sum,loop:main
-# The `root:` arm is measured, not a relaxation: this fixture's loop aborts
-# five times with ABORT_ESCAPE and what reaches the JIT is the root trace
-# `finish_and_compile` attaches. The declining arm is the `f_locals` LoadAttr
-# fold's `standard_virtualizable_box() == Some(obj)` conjunct: the receiver
-# here is the residual result of reading `f_back`, a fresh OpRef that can
-# never equal the vable box even though its concrete pointer is the standard
-# virtualizable (measured: `g.f_locals` fires and `f.f_locals` declines for
-# `f is g`). There is no fold for `f_back` at all; adding one would let the
-# existing arm fire unchanged. Whether the conjunct is deliberate or a gap is
-# NOT settled — the tree reads both ways and the review split on it.
+# pyre-check: selfcheck-compiles=entry-bridge:bump,loop:_int_sum
+# `main`'s loop aborts with ABORT_ESCAPE on every attempt. The
+# `f.f_locals[...] = ...` store is the may-force residual `bh_store_subscr_fn`;
+# its FrameLocalsProxy write-through forces the traced frame (`force_locals`
+# clears the residual-call vable token), and `vable_after_residual_call`
+# raises `SwitchToBlackhole(ABORT_ESCAPE)`. What reaches the JIT is `bump`'s
+# entry bridge and the `_int_sum` loop. The descent that would record the
+# store instead (`try_walker_orthodox_frame_locals_setitem` ->
+# `fast_local_index`) stops at the may-force `hash_w_strict` residual inside
+# the transparent helper.
 # Self-checking regression guard for the frame-escape flush that resumes past
 # the abort. The synthetic suite discovers it as a self-checking fixture.
 # A residual (may-force) callee stores its own frame; the loop body then reads

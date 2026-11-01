@@ -172,10 +172,15 @@ use crate::resume::{
 use crate::trace_ctx::{ClearReplaceFrames, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 
+static GUARDLOG_FLAG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 #[inline]
 fn guardlog_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("MAJIT_GUARDLOG").is_some())
+    crate::env_presence_flag(&GUARDLOG_FLAG, guardlog_enabled_init)
+}
+
+fn guardlog_enabled_init() -> bool {
+    std::env::var_os("MAJIT_GUARDLOG").is_some()
 }
 
 // ── compiled-run stage probe ─────────────────────────────────────────────

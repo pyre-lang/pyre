@@ -909,19 +909,14 @@ impl VirtualState {
         match &node.info {
             VirtualStateInfo::Constant(_) => Ok(()),
             VirtualStateInfo::Virtual { fields, .. } | VirtualStateInfo::VStruct { fields, .. } => {
-                // virtualstate.py enum_forced_boxes:
-                //     box = get_box_replacement(box)
+                // virtualstate.py enum_forced_boxes: box = get_box_replacement(box)
                 //     info = getptrinfo(box)
                 //     if info is None or not info.is_virtual():
                 //         raise VirtualStatesCantMatch()
                 //     else:
                 //         assert isinstance(info, AbstractStructPtrInfo)
-                // operand-routing reader; cached once so the per-field walk below
-                // doesn't re-clone PtrInfo per iteration.
-                let info_snapshot = ctx
-                    .resolve_operand_operand_opt(box_)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b));
+                let resolved = box_.get_box_replacement(false);
+                let info_snapshot = ctx.peek_ptr_info(&resolved);
                 let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(VirtualStatesCantMatch::default());
@@ -967,13 +962,9 @@ impl VirtualState {
                 Ok(())
             }
             VirtualStateInfo::VArray { items, .. } => {
-                // virtualstate.py VArrayStateInfo.enum_forced_boxes
-                // operand-routing reader; cached once so the per-item walk
-                // below doesn't re-clone PtrInfo per iteration.
-                let info_snapshot = ctx
-                    .resolve_operand_operand_opt(box_)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b));
+                // virtualstate.py enum_forced_boxes: box = get_box_replacement(box)
+                let resolved = box_.get_box_replacement(false);
+                let info_snapshot = ctx.peek_ptr_info(&resolved);
                 let is_virtual = info_snapshot.as_ref().is_some_and(|pi| pi.is_virtual());
                 if !is_virtual {
                     return Err(VirtualStatesCantMatch::default());
@@ -1031,11 +1022,9 @@ impl VirtualState {
                 //           if fieldstate.position > self.position:
                 //               fieldstate.enum_forced_boxes(boxes, itembox, ...)
                 //
-                let runtime_fields: Vec<Vec<(u32, Operand)>> = match ctx
-                    .resolve_operand_operand_opt(box_)
-                    .as_ref()
-                    .and_then(|b| ctx.peek_ptr_info(b))
-                {
+                // virtualstate.py enum_forced_boxes: box = get_box_replacement(box)
+                let resolved = box_.get_box_replacement(false);
+                let runtime_fields: Vec<Vec<(u32, Operand)>> = match ctx.peek_ptr_info(&resolved) {
                     Some(crate::optimizeopt::info::PtrInfo::VirtualArrayStruct(vinfo)) => vinfo
                         .element_fields
                         .iter()
@@ -1102,11 +1091,11 @@ impl VirtualState {
                 //             else:
                 //                 raise VirtualStatesCantMatch
                 //     boxes[self.position_in_notvirtuals] = box
-                let resolved_box = ctx.resolve_operand_operand_opt(box_);
-                let resolved: Operand = resolved_box.clone().unwrap_or_else(|| box_.clone());
-                let forced = match resolved_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
+                // virtualstate.py enum_forced_boxes: box = get_box_replacement(box)
+                let resolved = box_.get_box_replacement(false);
+                let forced = match ctx.peek_ptr_info(&resolved) {
                     // RPython: Virtualizable refs stay virtual across iterations.
-                    Some(PtrInfo::Virtualizable(_)) => resolved,
+                    Some(PtrInfo::Virtualizable(_)) => resolved.clone(),
                     Some(ptr_info) if ptr_info.is_virtual() => {
                         if !force_boxes {
                             return Err(VirtualStatesCantMatch::default());
@@ -1125,16 +1114,11 @@ impl VirtualState {
                         // upstream owner switch.
                         let saved_pass_idx = ctx.current_pass_idx;
                         ctx.current_pass_idx = ctx.optearlyforce_idx;
-                        let forced = optimizer.force_box(
-                            resolved_box
-                                .as_ref()
-                                .expect("virtual info lives on the box"),
-                            ctx,
-                        );
+                        let forced = optimizer.force_box(&resolved, ctx);
                         ctx.current_pass_idx = saved_pass_idx;
                         forced
                     }
-                    _ => resolved,
+                    _ => resolved.clone(),
                 };
                 // boxes[self.position_in_notvirtuals] = box
                 // virtualstate.py:421 — each non-constant NotVirtual leaf
@@ -1151,7 +1135,7 @@ impl VirtualState {
                 let resolved_for_store = if forced.is_none() {
                     Operand::None
                 } else {
-                    ctx.resolve_operand_operand(&forced)
+                    resolved
                 };
                 // virtualstate.py NotVirtualStateInfo{Int,Ptr}: Box.type
                 // immutability. RPython dispatches `isinstance(self,

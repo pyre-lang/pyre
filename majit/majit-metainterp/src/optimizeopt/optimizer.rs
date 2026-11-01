@@ -32,6 +32,7 @@ pub const ENABLE_ALL_OPTS: &str = "intbounds:rewrite:virtualize:string:pure:earl
 use indexmap::{IndexMap, IndexSet};
 use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, Op, OpCode, OpRc, OpRef, Type};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
@@ -69,12 +70,16 @@ pub enum OptimizationResult {
 /// An optimization pass.
 ///
 /// optimizer.py: Optimization base class.
+/// Passes are shared objects with interior state: the chain mutates a
+/// pass's attributes while that pass may be re-entered through
+/// `self.optimizer` (`Optimizer.send_extra_operation`).
 pub trait Optimization {
     /// Process an operation. Called for each operation in the trace.
     fn propagate_forward(
-        &mut self,
+        &self,
         op: &Op,
-        _op_rc: &majit_ir::OpRc,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult;
 
@@ -83,7 +88,7 @@ pub trait Optimization {
     /// REVERSE pass order. RPython uses this for bounds propagation
     /// (intbounds.py postprocess_GUARD_TRUE) and heap cache updates
     /// (heap.py postprocess_GETFIELD_GC_I).
-    fn propagate_postprocess(&mut self, _op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) {}
+    fn propagate_postprocess(&self, _op: &Op, _op_rc: &majit_ir::OpRc, _ctx: &mut OptContext) {}
 
     /// optimizer.py have_postprocess
     fn have_postprocess(&self) -> bool {
@@ -96,39 +101,31 @@ pub trait Optimization {
     }
 
     /// Called once before optimization starts.
-    fn setup(&mut self) {}
+    fn setup(&self) {}
 
     /// Called after all operations have been processed.
-    fn flush(&mut self, _ctx: &mut OptContext) {}
+    fn flush(&self, _opt: &mut Option<&mut Optimizer>, _ctx: &mut OptContext) {}
 
     /// Mark this pass as Phase 2 (loop body). Phase 2 should not fully
     /// virtualize New() ops because guard recovery_layout is not yet
     /// populated. Default: no-op.
-    fn set_phase2(&mut self, _phase2: bool) {}
+    fn set_phase2(&self, _phase2: bool) {}
 
     /// warmstate.py: pureop_historylength.
     /// Only OptPure consumes this; other passes ignore it.
-    fn set_pureop_historylength(&mut self, _limit: usize) {}
+    fn set_pureop_historylength(&self, _limit: usize) {}
 
     /// `metainterp_sd.virtualref_info` parity hook. `OptVirtualize` reads all
     /// three descriptors; `OptHeap.force_from_effectinfo` reads
     /// `descr_forced` for forcing calls.
-    fn set_vrefinfo(&mut self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
+    fn set_vrefinfo(&self, _vrefinfo: crate::virtualref::VirtualRefInfo) {}
 
     /// optimizer.py propagate_all_forward(trace, call_pure_results, flush).
     /// Only OptPure consumes this; other passes ignore it.
-    fn set_call_pure_results(&mut self, _results: &crate::optimizeopt::util::ArgsDict) {}
+    fn set_call_pure_results(&self, _results: &crate::optimizeopt::util::ArgsDict) {}
 
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
-
-    /// `OptPure`'s `Rc<RefCell<OptPureState>>`. The driver clones it and
-    /// drops the `passes[i]` borrow before `propagate_with_optimizer`, so
-    /// `force_box` / `_int_add` can reenter the pure pass. Other passes
-    /// return `None`.
-    fn pure_state_handle(&self) -> Option<crate::optimizeopt::pure::SharedOptPure> {
-        None
-    }
 
     /// optimizer.py:557 parity hook — drain this pass's accumulated
     /// `Counters.*` bumps into `staticdata.profiler` and reset the
@@ -140,7 +137,7 @@ pub trait Optimization {
     /// nothing for passes that have no counters of their own.
     /// `Optimizer::update_counters` calls this on every pass after
     /// each `propagate_all_forward` exit.
-    fn drain_profiler_counters(&mut self, _profiler: &crate::jitprof::JitProfiler) {}
+    fn drain_profiler_counters(&self, _profiler: &crate::jitprof::JitProfiler) {}
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.
@@ -165,7 +162,7 @@ pub trait Optimization {
 
     /// heap.py deserialize_optheap — import struct fields.
     fn import_cached_fields(
-        &mut self,
+        &self,
         _entries: &[(OpRef, majit_ir::DescrRef, OpRef)],
         _ctx: &mut OptContext,
     ) {
@@ -182,7 +179,7 @@ pub trait Optimization {
 
     /// heap.py deserialize_optheap — import array item triples.
     fn import_cached_arrayitems(
-        &mut self,
+        &self,
         _entries: &[(OpRef, i64, majit_ir::DescrRef, OpRef)],
         _ctx: &mut OptContext,
     ) {
@@ -193,14 +190,14 @@ pub trait Optimization {
     /// immediately calls `register_info`.  This hook preserves that ownership
     /// while the Rust import driver dispatches across optimizer passes.
     fn register_preamble_cached_field(
-        &mut self,
+        &self,
         _struct_box: &majit_ir::operand::Operand,
         _descr: &majit_ir::DescrRef,
     ) {
     }
 
     fn register_preamble_cached_arrayitem(
-        &mut self,
+        &self,
         _array_box: &majit_ir::operand::Operand,
         _descr: &majit_ir::DescrRef,
         _index: i64,
@@ -213,13 +210,13 @@ pub trait Optimization {
     }
 
     /// rewrite.py deserialize_optrewrite
-    fn deserialize_optrewrite(&mut self, _entries: &[(i64, OpRef)]) {}
+    fn deserialize_optrewrite(&self, _entries: &[(i64, OpRef)]) {}
 
     /// shortpreamble.py: PureOp.produce_op / LoopInvariantOp.produce_op
     /// Transfer imported PreambleOp entries from OptContext to this pass.
     /// RPython calls `opt.optimizer.optpure` directly during produce_op.
     /// In majit, the Optimization trait mediates this transfer.
-    fn install_preamble_pure_ops(&mut self, _ctx: &mut OptContext) {}
+    fn install_preamble_pure_ops(&self, _ctx: &mut OptContext) {}
 
     /// RPython unroll.py: exported_infos also carries widened IntBound knowledge.
     fn export_arg_int_bounds(
@@ -346,7 +343,7 @@ pub struct Optimizer {
     pub supports_efficient_uint_mul_high: bool,
     /// optimizer.py Optimizer.jitdriver_sd
     pub jitdriver_sd: usize,
-    passes: Vec<Box<dyn Optimization>>,
+    passes: Vec<Rc<dyn Optimization>>,
     pub pureop_historylength: usize,
     /// Final num_inputs after optimization (may increase if virtualizable
     /// adds virtual input args).
@@ -623,7 +620,7 @@ impl Optimizer {
         struct_box: &majit_ir::operand::Operand,
         descr: &majit_ir::DescrRef,
     ) {
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.register_preamble_cached_field(struct_box, descr);
         }
     }
@@ -634,7 +631,7 @@ impl Optimizer {
         descr: &majit_ir::DescrRef,
         index: i64,
     ) {
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.register_preamble_cached_arrayitem(array_box, descr, index);
         }
     }
@@ -1517,12 +1514,12 @@ impl Optimizer {
         ctx: &mut OptContext,
     ) {
         if !result_struct.is_empty() {
-            for pass in &mut self.passes {
+            for pass in &self.passes {
                 pass.import_cached_fields(result_struct, ctx);
             }
         }
         if !result_array.is_empty() {
-            for pass in &mut self.passes {
+            for pass in &self.passes {
                 pass.import_cached_arrayitems(result_array, ctx);
             }
         }
@@ -1530,7 +1527,7 @@ impl Optimizer {
 
     /// bridgeopt.py:184-185 optimizer.optrewrite.deserialize_optrewrite(result_loopinvariant)
     pub fn import_loopinvariant_knowledge(&mut self, result_loopinvariant: &[(i64, OpRef)]) {
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.deserialize_optrewrite(result_loopinvariant);
         }
     }
@@ -2109,7 +2106,7 @@ impl Optimizer {
         self.opt_guards_shared_emitted = 0;
         // Drain per-pass `Counters.*` accumulators (e.g.
         // VectorizingOptimizer's OPT_VECTORIZE_TRY / OPT_VECTORIZED).
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.drain_profiler_counters(profiler);
         }
     }
@@ -2119,14 +2116,13 @@ impl Optimizer {
     pub fn flush(&mut self, ctx: &mut OptContext) -> Result<(), crate::optimize::InvalidLoop> {
         for pass_idx in 0..self.passes.len() {
             // heap.flush() resolves the "next_optimization" emit_extra
-            // target through `ctx.current_pass_idx`. Set it to the
-            // currently-flushing pass so any ops force_all_lazy_sets
-            // emits land at `(pass_idx + 1, op)` and skip the flushing
-            // pass on the subsequent drain — RPython parity with
-            // `self.next_optimization`.
+            // target through `ctx.current_pass_idx`. Heap walks remaining
+            // passes immediately (`send_extra_operation_after`); other
+            // passes still queue. Set it so those extras start after this
+            // pass — RPython parity with `self.next_optimization`.
             ctx.current_pass_idx = pass_idx;
-            let pass = &mut self.passes[pass_idx];
-            pass.flush(ctx);
+            let pass = Rc::clone(&self.passes[pass_idx]);
+            pass.flush(&mut Some(&mut *self), ctx);
             // RPython Optimization.emit_extra() routes newly forced ops to
             // optimizer.send_extra_operation(op, self.next_optimization).
             // During flush we must preserve that contract: each pass's flush
@@ -2163,18 +2159,23 @@ impl Optimizer {
         self.propagate_from_pass(0, op_rc, ctx)
     }
 
-    /// RPython optimizer.py: emit_extra(op, emit=False) parity.
-    /// Route an operation through passes starting AFTER `after_pass_idx`,
-    /// matching RPython's `send_extra_operation(op, self.next_optimization)`.
-    pub fn send_extra_operation_after(
+    /// `Optimization.emit_extra(op, emit=False)`:
+    /// `send_extra_operation(op, self.next_optimization)`. Walks the passes after
+    /// `after_pass_idx` on this `OpRc`; past the last pass the walk ends in
+    /// `Optimizer.emit`. Restores `current_pass_idx`.
+    pub(super) fn send_extra_operation_after(
         &mut self,
         after_pass_idx: usize,
-        op: &Op,
+        op: &OpRc,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
-        let op_rc = OpRc::new(op.clone());
-        ctx.register_extra_producer(&op_rc);
-        self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx)
+        ctx.assign_extra_pos(op);
+        ctx.register_extra_producer(op);
+        let saved = ctx.current_pass_idx;
+        let end_pass = self.extra_operation_end_pass();
+        let result = self.propagate_from_pass_range(after_pass_idx + 1, end_pass, op, ctx);
+        ctx.current_pass_idx = saved;
+        result
     }
 
     /// `Optimization.emit_extra` / `send_extra_operation(op, next_optimization)`.
@@ -2637,14 +2638,15 @@ impl Optimizer {
     }
 
     /// Add an optimization pass to the chain.
-    pub fn add_pass(&mut self, mut pass: Box<dyn Optimization>) {
+    pub fn add_pass(&mut self, pass: Box<dyn Optimization>) {
+        let pass: Rc<dyn Optimization> = Rc::from(pass);
         pass.set_pureop_historylength(self.pureop_historylength);
         self.passes.push(pass);
     }
 
     pub fn set_pureop_historylength(&mut self, limit: usize) {
         self.pureop_historylength = limit;
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.set_pureop_historylength(limit);
         }
     }
@@ -2654,14 +2656,14 @@ impl Optimizer {
     /// `metainterp_sd.virtualref_info`) to every pass that consumes it
     /// (`OptVirtualize` and `OptHeap`). Other passes' `set_vrefinfo` is a no-op.
     pub fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.set_vrefinfo(vrefinfo.clone());
         }
     }
 
     /// Mark all passes as Phase 2 (loop body).
     pub fn set_phase2(&mut self, phase2: bool) {
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.set_phase2(phase2);
         }
     }
@@ -3157,7 +3159,7 @@ impl Optimizer {
         }
 
         // Setup all passes
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.setup();
         }
 
@@ -3190,7 +3192,7 @@ impl Optimizer {
 
         // optimizer.py: pass call_pure_results to OptPure so it can
         // constant-fold repeated pure calls across loop iterations.
-        for pass in &mut self.passes {
+        for pass in &self.passes {
             pass.set_call_pure_results(&self.call_pure_results);
         }
 
@@ -3354,7 +3356,7 @@ impl Optimizer {
         // are first collected in ctx.imported_short_pure_ops, then transferred
         // to the OptPure pass here (matching RPython's produce_op timing).
         if !ctx.imported_short_pure_ops.is_empty() {
-            for pass in &mut self.passes {
+            for pass in &self.passes {
                 pass.install_preamble_pure_ops(&mut ctx);
             }
         }
@@ -5036,10 +5038,11 @@ impl Optimizer {
     /// (`emit_extra` / `_force_elements`): the allocation and its field stores
     /// propagate immediately and are not parked here.
     ///
-    /// Other `emit_extra` producers (heap lazy sets, rewrite, virtualize,
-    /// string ops that are not on the force path, pure's postponed op) still
-    /// park on `extra_pending` / `extra_operations_after`. Propagate that one
-    /// parked definition here, ahead of the operation that reads it.
+    /// Other `emit_extra` producers (rewrite, virtualize, string ops that
+    /// are not on the force path, pure's postponed op) still park on
+    /// `extra_pending` / `extra_operations_after`. Heap lazy sets walk the
+    /// remaining passes immediately (`send_extra_operation_after`). Propagate
+    /// that one parked definition here, ahead of the operation that reads it.
     /// Everything else keeps its queued order.
     pub(super) fn flush_queued_producer(
         &mut self,
@@ -5208,65 +5211,12 @@ impl Optimizer {
 
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
-            // `earlyforce` / `string` / `pure` call `force_box`, which needs
-            // `&mut Optimizer` (`optforce.optimizer`, `AbstractVirtualPtrInfo.force_box`)
-            // while this loop would still be borrowing `passes[i]`. Snapshot
-            // the name, then dispatch those three without holding the vec slot:
-            // ZST stack copies, or a cloned `SharedOptPure`. Every other pass
-            // keeps the vec borrow. The borrow of `passes[i]` ends before the
-            // match arms reborrow `self`.
-            enum Dispatch {
-                Early,
-                String,
-                Pure(crate::optimizeopt::pure::SharedOptPure),
-                Other,
-            }
-            let pass_name = self.passes[pass_idx].name();
-            let dispatch = if pass_name == "earlyforce" {
-                Dispatch::Early
-            } else if pass_name == "string" {
-                Dispatch::String
-            } else if pass_name == "pure" {
-                Dispatch::Pure(
-                    self.passes[pass_idx]
-                        .pure_state_handle()
-                        .expect("pure pass exposes SharedOptPure"),
-                )
-            } else {
-                Dispatch::Other
-            };
-            let result = {
-                // Post-`replace_op_with` walk: an opcode-changing `Emit` minted
-                // the producer later passes must see. Every arm, including the
-                // three that reenter through `propagate_with_optimizer`, walks
-                // that box.
-                let walked = minted.as_ref().unwrap_or(op_rc);
-                match dispatch {
-                    Dispatch::Early => crate::optimizeopt::earlyforce::propagate_with_optimizer(
-                        self,
-                        &current_op,
-                        walked,
-                        ctx,
-                    ),
-                    Dispatch::String => crate::optimizeopt::vstring::propagate_with_optimizer(
-                        self,
-                        &current_op,
-                        walked,
-                        ctx,
-                    ),
-                    Dispatch::Pure(state) => crate::optimizeopt::pure::propagate_with_optimizer(
-                        &state,
-                        self,
-                        &current_op,
-                        walked,
-                        ctx,
-                    ),
-                    Dispatch::Other => {
-                        let pass = &mut self.passes[pass_idx];
-                        pass.propagate_forward(&current_op, walked, ctx)
-                    }
-                }
-            };
+            // optimizer.py Optimizer.send_extra_operation calls
+            // opt.propagate_forward(op); the pass reaches the chain through
+            // self.optimizer.
+            let pass = Rc::clone(&self.passes[pass_idx]);
+            let walked = minted.as_ref().unwrap_or(op_rc);
+            let result = pass.propagate_forward(&current_op, walked, &mut Some(&mut *self), ctx);
             // A leaf site deep in the pass may have recorded a deferred
             // `InvalidLoop` (e.g. `get_const_info_mut_box`) while still
             // returning a benign result. Abort before acting on that result.
@@ -5362,7 +5312,8 @@ impl Optimizer {
                     // RPython's send_extra_operation does not unwind these —
                     // they belong to the original chain.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(
+                        let pass = Rc::clone(&self.passes[pp_idx]);
+                        pass.propagate_postprocess(
                             &current_op,
                             minted.as_ref().unwrap_or(op_rc),
                             ctx,
@@ -5384,7 +5335,8 @@ impl Optimizer {
                     // `opt_results` collected before it still run, in reverse.
                     // Same loop as the Restart arm above.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(
+                        let pass = Rc::clone(&self.passes[pp_idx]);
+                        pass.propagate_postprocess(
                             &current_op,
                             minted.as_ref().unwrap_or(op_rc),
                             ctx,
@@ -5426,7 +5378,8 @@ impl Optimizer {
         };
         // Postprocess in reverse order after emission.
         for &pp_idx in postprocess_passes.iter().rev() {
-            self.passes[pp_idx].propagate_postprocess(&current_op, &emitted_rc, ctx);
+            let pass = Rc::clone(&self.passes[pp_idx]);
+            pass.propagate_postprocess(&current_op, &emitted_rc, ctx);
         }
         // The FINISH reaches its emit down this path — `optimize_FINISH`
         // returns PassOn — so this is the drain that postprocess_FINISH
@@ -6551,9 +6504,10 @@ mod tests {
 
     impl Optimization for AddZeroElimination {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
@@ -6577,7 +6531,7 @@ mod tests {
     }
 
     struct AddVirtualInputsOnce {
-        added: bool,
+        added: Cell<bool>,
     }
 
     struct RemoveAsConstant {
@@ -6587,14 +6541,15 @@ mod tests {
 
     impl Optimization for AddVirtualInputsOnce {
         fn propagate_forward(
-            &mut self,
+            &self,
             _op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if !self.added {
+            if !self.added.get() {
                 ctx.num_inputs += 2;
-                self.added = true;
+                self.added.set(true);
             }
             OptimizationResult::PassOn
         }
@@ -6606,9 +6561,10 @@ mod tests {
 
     impl Optimization for RemoveAsConstant {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos().get() == self.target {
@@ -6630,15 +6586,16 @@ mod tests {
 
     impl Optimization for FlushCounter {
         fn propagate_forward(
-            &mut self,
+            &self,
             _op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             _ctx: &mut OptContext,
         ) -> OptimizationResult {
             OptimizationResult::PassOn
         }
 
-        fn flush(&mut self, _ctx: &mut OptContext) {
+        fn flush(&self, _opt: &mut Option<&mut Optimizer>, _ctx: &mut OptContext) {
             self.hits.set(self.hits.get() + 1);
         }
 
@@ -6655,9 +6612,10 @@ mod tests {
 
     impl Optimization for RemoveAsTypedConstant {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.pos().get() == self.target {
@@ -6778,19 +6736,20 @@ mod tests {
     }
 
     struct QueueForceLikeExtraOps {
-        queued: bool,
+        queued: Cell<bool>,
         field_descr: majit_ir::DescrRef,
     }
 
     impl Optimization for QueueForceLikeExtraOps {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if !self.queued && op.opcode == OpCode::IntAdd {
-                self.queued = true;
+            if !self.queued.get() && op.opcode == OpCode::IntAdd {
+                self.queued.set(true);
 
                 // The IntAdd args are the only objects at those positions.
                 ctx.seed_boxes_canonical(&[op.arg(0), op.arg(1)]);
@@ -6810,18 +6769,19 @@ mod tests {
     }
 
     struct QueueRestartCandidate {
-        queued: bool,
+        queued: Cell<bool>,
     }
 
     impl Optimization for QueueRestartCandidate {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if !self.queued && op.opcode == OpCode::IntMul {
-                self.queued = true;
+            if !self.queued.get() && op.opcode == OpCode::IntMul {
+                self.queued.set(true);
                 ctx.emit_extra(
                     ctx.current_pass_idx,
                     Op::new(OpCode::IntAdd, &[op.arg(0), op.arg(1)]),
@@ -6841,9 +6801,10 @@ mod tests {
 
     impl Optimization for CountRestartedIntSub {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             _ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntSub {
@@ -6861,9 +6822,10 @@ mod tests {
 
     impl Optimization for RestartIntAddAsSub {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             _ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
@@ -6883,9 +6845,10 @@ mod tests {
 
     impl Optimization for QueueExtraThenInvalidate {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
@@ -6953,7 +6916,9 @@ mod tests {
         let hits = Rc::new(Cell::new(0));
         let mut opt = Optimizer::new();
         opt.trace_inputargs = OpRef::inputarg_refs(&[majit_ir::Type::Int; 8]);
-        opt.add_pass(Box::new(QueueRestartCandidate { queued: false }));
+        opt.add_pass(Box::new(QueueRestartCandidate {
+            queued: Cell::new(false),
+        }));
         opt.add_pass(Box::new(RestartIntAddAsSub));
         opt.add_pass(Box::new(CountRestartedIntSub { hits: hits.clone() }));
 
@@ -7363,7 +7328,9 @@ mod tests {
     #[test]
     fn test_remaps_all_op_positions_when_virtual_inputs_are_added() {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
+        opt.add_pass(Box::new(AddVirtualInputsOnce {
+            added: Cell::new(false),
+        }));
 
         let mut ops = vec![
             Op::new(OpCode::GetfieldRawI, &[rooted_resop_operand(Type::Int, 0)]),
@@ -7401,7 +7368,9 @@ mod tests {
     #[test]
     fn test_remaps_removed_constants_away_from_compacted_live_ops() {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
+        opt.add_pass(Box::new(AddVirtualInputsOnce {
+            added: Cell::new(false),
+        }));
         opt.add_pass(Box::new(RemoveAsConstant {
             target: OpRef::int_op(5),
             value: 123,
@@ -7621,7 +7590,7 @@ mod tests {
     fn test_extra_ops_do_not_flow_into_unroll_buffer() {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(QueueForceLikeExtraOps {
-            queued: false,
+            queued: Cell::new(false),
             field_descr: std::sync::Arc::new(TestDescr(1)),
         }));
         opt.add_pass(Box::new(OptHeap::new()));
@@ -7659,19 +7628,20 @@ mod tests {
     }
 
     struct QueueTwoForceLikePairs {
-        queued: bool,
+        queued: Cell<bool>,
         field_descr: majit_ir::DescrRef,
     }
 
     impl Optimization for QueueTwoForceLikePairs {
         fn propagate_forward(
-            &mut self,
+            &self,
             op: &Op,
             _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
             ctx: &mut OptContext,
         ) -> OptimizationResult {
-            if !self.queued && op.opcode == OpCode::IntAdd {
-                self.queued = true;
+            if !self.queued.get() && op.opcode == OpCode::IntAdd {
+                self.queued.set(true);
 
                 ctx.seed_boxes_canonical(&[op.arg(0), op.arg(1)]);
                 let alloc_a = ctx.emit_extra(ctx.current_pass_idx, Op::new(OpCode::New, &[]));
@@ -7700,7 +7670,7 @@ mod tests {
     fn test_force_like_extra_ops_preserve_new_before_matching_setfield() {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(QueueTwoForceLikePairs {
-            queued: false,
+            queued: Cell::new(false),
             field_descr: std::sync::Arc::new(TestDescr(7)),
         }));
         opt.add_pass(Box::new(OptHeap::new()));
@@ -7744,9 +7714,11 @@ mod tests {
     #[test]
     fn test_remap_keeps_force_like_new_positions_out_of_constant_map() {
         let mut opt = Optimizer::new();
-        opt.add_pass(Box::new(AddVirtualInputsOnce { added: false }));
+        opt.add_pass(Box::new(AddVirtualInputsOnce {
+            added: Cell::new(false),
+        }));
         opt.add_pass(Box::new(QueueForceLikeExtraOps {
-            queued: false,
+            queued: Cell::new(false),
             field_descr: std::sync::Arc::new(TestDescr(9)),
         }));
         opt.add_pass(Box::new(RemoveAsConstant {

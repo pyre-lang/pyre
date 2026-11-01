@@ -1,3 +1,4 @@
+use indexmap::{IndexMap, IndexSet};
 /// Vectorization optimization pass.
 ///
 /// Translated from rpython/jit/metainterp/optimizeopt/vector.py.
@@ -13,7 +14,7 @@
 ///   uses a trait-object chain rather than inheritance. The standalone
 ///   `optimize_vector()` function provides the RPython-shaped entry point.
 ///
-use indexmap::{IndexMap, IndexSet};
+use std::cell::RefCell;
 
 use majit_ir::operand::Operand;
 use majit_ir::{Op, OpCode, OpRc, OpRef};
@@ -1098,7 +1099,7 @@ pub fn user_loop_bail_fast_path(loop_: &VectorLoop) -> bool {
 ///
 /// The RPython-shaped methods (`run_optimization`, `unroll_loop_iterations`,
 /// etc.) are provided alongside the `Optimization` trait impl.
-pub struct VectorizingOptimizer {
+pub struct VectorizingOptimizerState {
     /// vector.py:215: self.packset = None
     packset: Option<PackSet>,
     /// vector.py:216: self.unroll_count = 0
@@ -1137,10 +1138,46 @@ pub struct VectorizingOptimizer {
     pub(crate) opt_vectorized_emitted: usize,
 }
 
+pub struct VectorizingOptimizer {
+    state: RefCell<VectorizingOptimizerState>,
+}
+
 impl VectorizingOptimizer {
+    pub fn new() -> Self {
+        Self {
+            state: RefCell::new(VectorizingOptimizerState::new()),
+        }
+    }
+
+    pub fn new_with_params(cost_threshold: i32, vec_size: usize) -> Self {
+        Self {
+            state: RefCell::new(VectorizingOptimizerState::new_with_params(
+                cost_threshold,
+                vec_size,
+            )),
+        }
+    }
+
+    pub fn get_unroll_count(smallest_type_bytes: usize, simd_reg_bytes: usize) -> usize {
+        VectorizingOptimizerState::get_unroll_count(smallest_type_bytes, simd_reg_bytes)
+    }
+
+    pub fn run_optimization(
+        &self,
+        loop_: &mut VectorLoop,
+        info: &mut crate::optimizeopt::version::LoopVersionInfo,
+        user_code: bool,
+    ) -> Result<(Vec<Op>, indexmap::IndexMap<OpRef, i64>), VectorizeError> {
+        self.state
+            .borrow_mut()
+            .run_optimization(loop_, info, user_code)
+    }
+}
+
+impl VectorizingOptimizerState {
     /// vector.py: __init__ — default constructor for sub-pass use.
     pub fn new() -> Self {
-        VectorizingOptimizer {
+        VectorizingOptimizerState {
             packset: None,
             unroll_count: 0,
             smallest_type_bytes: 0,
@@ -2287,7 +2324,7 @@ impl VectorLoop {
 
                 // vector.py:319-320: rename guard fail args
                 if copied_op.opcode.is_guard() {
-                    VectorizingOptimizer::copy_guard_descr(&renamer, &mut copied_op);
+                    VectorizingOptimizerState::copy_guard_descr(&renamer, &mut copied_op);
                 }
 
                 // The copied op becomes the canonical producer box for its
@@ -2461,11 +2498,12 @@ impl Default for VectorizingOptimizer {
     }
 }
 
-impl Optimization for VectorizingOptimizer {
+impl VectorizingOptimizerState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         _op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         match op.opcode {
@@ -2560,10 +2598,6 @@ impl Optimization for VectorizingOptimizer {
         self.orig_label_args = None;
     }
 
-    fn name(&self) -> &'static str {
-        "vectorize_simd"
-    }
-
     fn drain_profiler_counters(&mut self, profiler: &crate::jitprof::JitProfiler) {
         profiler.count(
             crate::pyjitpl::counters::OPT_VECTORIZE_TRY,
@@ -2575,6 +2609,32 @@ impl Optimization for VectorizingOptimizer {
         );
         self.opt_vectorize_try_emitted = 0;
         self.opt_vectorized_emitted = 0;
+    }
+}
+
+impl Optimization for VectorizingOptimizer {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
+    }
+
+    fn setup(&self) {
+        self.state.borrow_mut().setup();
+    }
+
+    fn name(&self) -> &'static str {
+        "vectorize_simd"
+    }
+
+    fn drain_profiler_counters(&self, profiler: &crate::jitprof::JitProfiler) {
+        self.state.borrow_mut().drain_profiler_counters(profiler);
     }
 }
 
@@ -2672,7 +2732,9 @@ mod tests {
         let vloop = VectorLoop::new(label, vec![guard], jump);
         let opt = VectorizingOptimizer::new();
 
-        opt.mark_guard(&vloop.operations[0], &vloop);
+        opt.state
+            .borrow_mut()
+            .mark_guard(&vloop.operations[0], &vloop);
 
         let descr = vloop.operations[0]
             .getdescr()
@@ -2698,7 +2760,9 @@ mod tests {
         let vloop = VectorLoop::new(label, vec![guard], jump);
         let opt = VectorizingOptimizer::new();
 
-        opt.mark_guard(&vloop.operations[0], &vloop);
+        opt.state
+            .borrow_mut()
+            .mark_guard(&vloop.operations[0], &vloop);
 
         let descr = vloop.operations[0]
             .getdescr()
@@ -4003,16 +4067,19 @@ mod tests {
     #[test]
     fn drain_profiler_counters_folds_opt_vectorize_try_and_opt_vectorized_into_profiler() {
         use crate::pyjitpl::counters;
-        let mut vopt = VectorizingOptimizer::new();
-        vopt.opt_vectorize_try_emitted = 4;
-        vopt.opt_vectorized_emitted = 1;
+        let vopt = VectorizingOptimizer::new();
+        {
+            let mut st = vopt.state.borrow_mut();
+            st.opt_vectorize_try_emitted = 4;
+            st.opt_vectorized_emitted = 1;
+        }
         let prof = crate::jitprof::JitProfiler::default();
-        Optimization::drain_profiler_counters(&mut vopt, &prof);
+        Optimization::drain_profiler_counters(&vopt, &prof);
         assert_eq!(prof.get_counter(counters::OPT_VECTORIZE_TRY), Some(4));
         assert_eq!(prof.get_counter(counters::OPT_VECTORIZED), Some(1));
-        assert_eq!(vopt.opt_vectorize_try_emitted, 0);
-        assert_eq!(vopt.opt_vectorized_emitted, 0);
-        Optimization::drain_profiler_counters(&mut vopt, &prof);
+        assert_eq!(vopt.state.borrow_mut().opt_vectorize_try_emitted, 0);
+        assert_eq!(vopt.state.borrow_mut().opt_vectorized_emitted, 0);
+        Optimization::drain_profiler_counters(&vopt, &prof);
         assert_eq!(prof.get_counter(counters::OPT_VECTORIZE_TRY), Some(4));
         assert_eq!(prof.get_counter(counters::OPT_VECTORIZED), Some(1));
     }

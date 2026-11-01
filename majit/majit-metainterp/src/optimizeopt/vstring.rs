@@ -392,6 +392,7 @@ fn force_child_for_string_with(
 /// optimization pass. All per-string state lives on `PtrInfo::Str`
 /// (length, mode, virtual variant, lgtop). STRLEN/UNICODELEN caching is
 /// wired through `OptPure` via `pure_from_args1`.
+#[derive(Clone, Copy)]
 pub struct OptString;
 
 impl OptString {
@@ -1687,19 +1688,6 @@ impl Default for OptString {
     }
 }
 
-/// `vstring.py` `OptString.propagate_forward` with `self.optimizer`.
-/// `OptString` is a ZST: the boxed pass stays unborrowed and reentry from
-/// `_int_add`'s `send_extra_operation` is another stack copy.
-pub(crate) fn propagate_with_optimizer(
-    optimizer: &mut Optimizer,
-    op: &Op,
-    op_rc: &majit_ir::OpRc,
-    ctx: &mut OptContext,
-) -> OptimizationResult {
-    let mut pass = OptString;
-    pass.propagate_inner(&mut Some(optimizer), op, op_rc, ctx)
-}
-
 impl OptString {
     fn propagate_inner(
         &mut self,
@@ -1778,12 +1766,14 @@ impl OptString {
 
 impl Optimization for OptString {
     fn propagate_forward(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.propagate_inner(&mut None, op, op_rc, ctx)
+        let mut pass = *self;
+        pass.propagate_inner(opt, op, op_rc, ctx)
     }
 
     fn name(&self) -> &'static str {
@@ -1914,7 +1904,7 @@ mod tests {
                 rc.setarg(i, resolved);
             }
             ctx.bind_input_resops(std::slice::from_ref(rc));
-            match pass.propagate_forward(rc, rc, &mut ctx) {
+            match pass.propagate_forward(rc, rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -1933,7 +1923,7 @@ mod tests {
             }
         }
 
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         // Drain extra_operations_after (from emit_extra during force_box)
         // into new_operations so the test can see all emitted ops.
         while let Some((_pass_idx, extra_op)) = ctx.extra_operations_after.pop_front() {
@@ -2813,7 +2803,7 @@ mod tests {
         // Process NEWSTR → creates virtual Plain
         let left_op_rc = OpRc::new(left_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&left_op_rc));
-        let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut ctx);
+        let _ = pass.propagate_forward(&left_op, &left_op_rc, &mut None, &mut ctx);
         assert!(pass.is_virtual(&ctx.get_box_replacement_operand(left), &ctx));
     }
 

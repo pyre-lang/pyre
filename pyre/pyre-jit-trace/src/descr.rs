@@ -9362,16 +9362,14 @@ pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
 /// lowering of PUSH_EXC_INFO / POP_EXCEPT to GETFIELD_GC_R / SETFIELD_GC.
 ///
-/// `field_type = Ref` so the optimizer tracks the value as a GC
-/// reference (virtual-defer + correct resume), but the `flag` is
-/// deliberately NON-pointer so `is_pointer_field()` is false and the GC
-/// rewrite emits NO write barrier (`rewrite.rs handle_write_barrier_setfield`
-/// gates the barrier on `is_pointer_field() && val_is_ref`).  That is
-/// correct here: the EC is a non-GC `Rc`-owned struct whose
-/// `sys_exc_value` slot is forwarded directly as a GC root every
-/// collection (`eval::walk_pyframe_roots`), so the generational
-/// remembered-set barrier is unnecessary.  A single cached Arc gives the
-/// PUSH and POP ops the same `descr_identity`, so the heap optimizer
+/// `field_type = Ref` and `flag = FLAG_POINTER` (`descr.py get_type_flag`
+/// for a GC `Ptr`) so a traced GETFIELD yields a Ref box that the gcmap
+/// keeps live across a collecting call.  The parent SizeDescr is
+/// `is_gc_managed = false`, so `rewrite.rs handle_write_barrier_setfield`
+/// emits no `COND_CALL_GC_WB`: the EC is a non-GC `Rc`-owned struct whose
+/// `sys_exc_value` slot is forwarded as a GC root every collection
+/// (`eval::walk_pyframe_roots`).  A single cached Arc gives the PUSH and
+/// POP ops the same `descr_identity`, so the heap optimizer
 /// dead-store-eliminates a balanced save/restore (and the stored
 /// exception, if it never otherwise escapes, stays virtual and DCEs).
 pub fn ec_sys_exc_value_descr() -> DescrRef {
@@ -9460,11 +9458,12 @@ pub fn ec_accounted_activation_descr() -> DescrRef {
 /// The `ExecutionContext` field group.  `type_id 0 + vtable 0` →
 /// `SimpleSizeDescr::is_object() == false`, so the optimizer builds a
 /// StructPtrInfo for the (non-GC) EC pointer.  The object slots are Ref-typed
-/// (ref value tracking) but Unsigned-flagged (`is_pointer_field()` is false →
-/// no write barrier), which is correct because each is forwarded directly as
-/// a GC root every collection (`eval::walk_pyframe_roots` for the running
-/// context, `module::thread`'s per-context walk for the rest), so the
-/// generational remembered-set barrier is unnecessary.
+/// and Pointer-flagged (`descr.py get_type_flag` for a GC `Ptr`) so a traced
+/// GETFIELD yields a Ref box.  `handle_write_barrier_setfield` emits no
+/// `COND_CALL_GC_WB` because the parent SizeDescr is `is_gc_managed = false`
+/// (the EC has no GC header); each slot is forwarded as a GC root every
+/// collection (`eval::walk_pyframe_roots` for the running context,
+/// `module::thread`'s per-context walk for the rest).
 ///
 /// The two activation-accounting slots are Int-typed instead.  That walk
 /// visits the context's object slots by name and never reaches them, which is
@@ -9492,7 +9491,8 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         field_type: Type::Ref,
         is_immutable: false,
         is_quasi_immutable: false,
-        flag: ArrayFlag::Unsigned,
+        // descr.py get_type_flag: a GC `Ptr` field is `FLAG_POINTER`.
+        flag: ArrayFlag::Pointer,
         virtualizable: false,
         // `ExecutionContext` is not a `PyObject` layout; it carries no class
         // word. Its offsets are `EC_*` and share no origin with

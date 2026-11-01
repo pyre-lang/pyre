@@ -6,6 +6,7 @@
 /// Instead of emitting the allocation, fields are tracked in the optimizer.
 /// If a virtual escapes (e.g., passed to a call or stored in a non-virtual),
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use majit_ir::operand::Operand;
@@ -243,7 +244,7 @@ impl VirtualizableTracker {
 }
 
 /// The virtualize optimization pass.
-pub struct OptVirtualize {
+pub struct OptVirtualizeState {
     /// Standard-virtualizable identity marker; carries no field-value cache.
     vable: Option<VirtualizableTracker>,
     /// optimizer.py REMOVED + virtualize.py optimize_GUARD_NO_EXCEPTION:
@@ -262,9 +263,32 @@ pub struct OptVirtualize {
     vrefinfo: crate::virtualref::VirtualRefInfo,
 }
 
+pub struct OptVirtualize {
+    state: RefCell<OptVirtualizeState>,
+}
+
 impl OptVirtualize {
     pub fn new() -> Self {
-        OptVirtualize {
+        Self {
+            state: RefCell::new(OptVirtualizeState::new()),
+        }
+    }
+
+    pub(crate) fn with_virtualizable(config: VirtualizableConfig) -> Self {
+        Self {
+            state: RefCell::new(OptVirtualizeState::with_virtualizable(config)),
+        }
+    }
+
+    pub fn with_vrefinfo(self, vrefinfo: crate::virtualref::VirtualRefInfo) -> Self {
+        self.state.borrow_mut().vrefinfo = vrefinfo;
+        self
+    }
+}
+
+impl OptVirtualizeState {
+    pub fn new() -> Self {
+        OptVirtualizeState {
             vable: None,
             last_emitted_was_removed: false,
             last_guard_not_forced_2: None,
@@ -275,7 +299,7 @@ impl OptVirtualize {
 
     /// Create with virtualizable config for frame field tracking.
     pub(crate) fn with_virtualizable(config: VirtualizableConfig) -> Self {
-        OptVirtualize {
+        OptVirtualizeState {
             vable: Some(VirtualizableTracker::new(config)),
             last_emitted_was_removed: false,
             last_guard_not_forced_2: None,
@@ -1757,14 +1781,6 @@ impl OptVirtualize {
     ///    normally. Just clear the vref.virtual_token.
     /// 2. Forced case: `objbox` is the real virtual object — the vref was
     ///    already forced during tracing, so store it into vref.forced.
-    ///
-    /// majit note: RPython routes the emitted SETFIELD_GCs back through
-    /// `send_extra_operation`, which re-enters the virtualize pass and
-    /// lets `optimize_setfield_gc` absorb the writes into the vref's
-    /// virtual fields if it is still virtual. majit's `emit_extra` skips
-    /// the current (virtualize) pass, so the absorption is done in-place
-    /// here on the VirtualStruct half and the setfield_gc emit path is
-    /// taken only when the vref has already escaped.
     fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let vref_box = ctx.resolve_operand_operand(&op.arg(0));
         let obj_box = ctx.resolve_operand_operand(&op.arg(1));
@@ -1775,51 +1791,18 @@ impl OptVirtualize {
         // tolerates a non-const terminal, so the null check is read-only.
         let obj_is_null = ctx.is_const_null(&obj_box);
 
-        // If vref is still virtual, update the virtual struct fields directly
-        // (majit in-place absorption: `emit_extra` skips the current pass, so
-        // there is no `send_extra_operation` re-entry to absorb the writes).
-        // virtualize.py:150-153: set 'forced' to point to the real object
-        // (skipped when objbox is CONST_NULL).
-        let did_forced_write = ctx
-            .with_ptr_info_mut(&vref_box, |info| {
-                if !info.is_virtual() {
-                    return false;
-                }
-                if let PtrInfo::Virtual(vinfo) = info {
-                    if !obj_is_null {
-                        set_field(&mut vinfo.fields, VREF_FORCED_FIELD_INDEX, obj_box.clone());
-                    }
-                    return true;
-                }
-                false
-            })
-            .unwrap_or(false);
-        if did_forced_write {
-            // virtualize.py:155-158: set 'virtual_token' to CONST_NULL.
-            let null_op = Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
-            ctx.with_ptr_info_mut(&vref_box, |info| {
-                if let PtrInfo::Virtual(vinfo) = info {
-                    set_field(
-                        &mut vinfo.fields,
-                        VREF_VIRTUAL_TOKEN_FIELD_INDEX,
-                        null_op.clone(),
-                    );
-                }
-            });
-            return OptimizationResult::Remove;
-        }
-
-        // vref is not virtual (was forced/escaped): emit SETFIELD_GC ops.
-
-        // virtualize.py:150-153: set 'forced' to the real object via
-        // `vrefinfo.descr_forced` (the cached `cpu.fielddescrof(...)`
-        // Arc from `virtualref.py:42`).
+        // `optimize_VIRTUAL_REF_FINISH`: set 'forced' to the real object via
+        // `vrefinfo.descr_forced` (the cached `fielddescrof` from
+        // `VirtualRefInfo.__init__`). `optimizer.send_extra_operation`
+        // (opt=None) re-dispatches from `first_optimization` so
+        // `optimize_SETFIELD_GC` absorbs the write while the vref is
+        // still virtual.
         if !obj_is_null {
             let arg_vref = vref_box.clone();
             let arg_obj = obj_box.clone();
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_obj.clone()]);
             set_forced.setdescr(self.vrefinfo.descr_forced.clone());
-            ctx.emit_extra(ctx.current_pass_idx, set_forced);
+            ctx.send_extra_operation(set_forced);
         }
 
         // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
@@ -1828,7 +1811,7 @@ impl OptVirtualize {
         let arg_null = Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
         set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
-        ctx.emit_extra(ctx.current_pass_idx, set_token);
+        ctx.send_extra_operation(set_token);
 
         OptimizationResult::Remove
     }
@@ -1928,11 +1911,12 @@ impl Default for OptVirtualize {
     }
 }
 
-impl Optimization for OptVirtualize {
+impl OptVirtualizeState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         if let Some(ref mut vt) = self.vable {
@@ -2292,12 +2276,44 @@ impl Optimization for OptVirtualize {
         }
     }
 
+    fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        self.vrefinfo = vrefinfo;
+    }
+}
+
+impl Optimization for OptVirtualize {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
+    }
+
+    fn setup(&self) {
+        self.state.borrow_mut().setup();
+    }
+
+    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+        self.state.borrow().have_postprocess_op(opcode)
+    }
+
+    fn propagate_postprocess(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
+        self.state
+            .borrow_mut()
+            .propagate_postprocess(op, op_rc, ctx);
+    }
+
     fn name(&self) -> &'static str {
         "virtualize"
     }
 
-    fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
-        self.vrefinfo = vrefinfo;
+    fn set_vrefinfo(&self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        self.state.borrow_mut().set_vrefinfo(vrefinfo);
     }
 }
 
@@ -4322,7 +4338,7 @@ mod tests {
                 rc.setarg(i, canonical);
             }
             ctx.bind_input_resops(std::slice::from_ref(rc));
-            match pass.propagate_forward(rc, rc, ctx) {
+            match pass.propagate_forward(rc, rc, &mut None, ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -4450,7 +4466,7 @@ mod tests {
                 rc.setarg(i, resolved);
             }
             ctx.bind_input_resops(std::slice::from_ref(rc));
-            match pass.propagate_forward(rc, rc, &mut ctx) {
+            match pass.propagate_forward(rc, rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -4467,7 +4483,7 @@ mod tests {
             }
         }
 
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         ctx.new_operations
             .into_iter()
             .map(|rc| (*rc).clone())
@@ -4614,7 +4630,7 @@ mod tests {
         // RPython parity: virtualize.py's default for calls is emit(op)
         // which forwards to the next pass without forcing. Forcing happens
         // in _emit_operation (Optimizer level). OptVirtualize returns PassOn.
-        let result = pass.propagate_forward(&call, &OpRc::new(call.clone()), &mut ctx);
+        let result = pass.propagate_forward(&call, &OpRc::new(call.clone()), &mut None, &mut ctx);
         assert!(
             matches!(result, OptimizationResult::PassOn),
             "call should PassOn (forcing happens at Optimizer::emit_operation level)"
@@ -4650,7 +4666,7 @@ mod tests {
         get.setdescr(test_vable_field_descr(8, Type::Int, 1));
         get.pos().set(OpRef::int_op(10));
 
-        let result = pass.propagate_forward(&get, &OpRc::new(get.clone()), &mut ctx);
+        let result = pass.propagate_forward(&get, &OpRc::new(get.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4675,7 +4691,7 @@ mod tests {
         let mut set = Op::new(OpCode::SetfieldRaw, &[vable, value]);
         set.setdescr(test_vable_field_descr(8, Type::Int, 1));
 
-        let result = pass.propagate_forward(&set, &OpRc::new(set.clone()), &mut ctx);
+        let result = pass.propagate_forward(&set, &OpRc::new(set.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4698,8 +4714,11 @@ mod tests {
             identity_input_index: Some(0),
         });
         pass.setup();
-        if let Some(ref mut vt) = pass.vable {
-            vt.ensure_setup(&mut ctx);
+        {
+            let mut st = pass.state.borrow_mut();
+            if let Some(ref mut vt) = st.vable {
+                vt.ensure_setup(&mut ctx);
+            }
         }
         let identity = ctx
             .get_box_replacement_operand_opt(OpRef::input_arg_ref(0))
@@ -4736,7 +4755,8 @@ mod tests {
 
         let mut get_item = Op::new(OpCode::GetarrayitemRawI, &[array_ptr, index]);
         get_item.setdescr(array_descr(24));
-        let result = pass.propagate_forward(&get_item, &OpRc::new(get_item.clone()), &mut ctx);
+        let result =
+            pass.propagate_forward(&get_item, &OpRc::new(get_item.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -4768,7 +4788,8 @@ mod tests {
 
         let mut set_item = Op::new(OpCode::SetarrayitemRaw, &[array_ptr, index, stored]);
         set_item.setdescr(array_descr(24));
-        let result = pass.propagate_forward(&set_item, &OpRc::new(set_item.clone()), &mut ctx);
+        let result =
+            pass.propagate_forward(&set_item, &OpRc::new(set_item.clone()), &mut None, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
     }
 
@@ -5631,7 +5652,7 @@ mod tests {
         let new_op_rc = OpRc::new(new_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
         assert!(matches!(
-            pass.propagate_forward(&new_op, &new_op_rc, &mut ctx),
+            pass.propagate_forward(&new_op, &new_op_rc, &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
 
@@ -5645,7 +5666,7 @@ mod tests {
         set_int.pos().set(OpRef::int_op(1));
         resolve_op_args(&mut set_int, &mut ctx);
         assert!(matches!(
-            pass.propagate_forward(&set_int, &OpRc::new(set_int.clone()), &mut ctx),
+            pass.propagate_forward(&set_int, &OpRc::new(set_int.clone()), &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
 
@@ -5660,7 +5681,7 @@ mod tests {
         resolve_op_args(&mut set_ref, &mut ctx);
         assert!(
             matches!(
-                pass.propagate_forward(&set_ref, &OpRc::new(set_ref.clone()), &mut ctx),
+                pass.propagate_forward(&set_ref, &OpRc::new(set_ref.clone()), &mut None, &mut ctx),
                 OptimizationResult::PassOn
             ),
             "unlisted Ref SETFIELD must not occupy the Int allocation slot"
@@ -5721,7 +5742,7 @@ mod tests {
         let new_op_rc = OpRc::new(new_op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&new_op_rc));
         assert!(matches!(
-            pass.propagate_forward(&new_op, &new_op_rc, &mut ctx),
+            pass.propagate_forward(&new_op, &new_op_rc, &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
 
@@ -5735,7 +5756,7 @@ mod tests {
         set_op.pos().set(OpRef::int_op(1));
         resolve_op_args(&mut set_op, &mut ctx);
         assert!(matches!(
-            pass.propagate_forward(&set_op, &OpRc::new(set_op.clone()), &mut ctx),
+            pass.propagate_forward(&set_op, &OpRc::new(set_op.clone()), &mut None, &mut ctx),
             OptimizationResult::Remove
         ));
 
@@ -7087,7 +7108,8 @@ mod tests {
         // virtual_ref_finish(vref, real_obj)   <- real_obj is non-null
         //
         // When the vref is still virtual and finish has a non-null obj,
-        // the forced field is updated in the virtual struct.
+        // `send_extra_operation` re-dispatches the SETFIELD_GCs so
+        // `optimize_SETFIELD_GC` absorbs them into the virtual struct.
         // No ops should be emitted for the VirtualRefFinish itself.
         let mut ops = vec![
             Op::new(
@@ -7325,7 +7347,7 @@ mod tests {
                 rc.setarg(i, resolved);
             }
             ctx.bind_input_resops(std::slice::from_ref(rc));
-            match pass.propagate_forward(rc, rc, &mut ctx) {
+            match pass.propagate_forward(rc, rc, &mut None, &mut ctx) {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
@@ -7342,7 +7364,7 @@ mod tests {
             }
         }
 
-        pass.flush(&mut ctx);
+        pass.flush(&mut None, &mut ctx);
         ctx.new_operations
             .into_iter()
             .map(|rc| (*rc).clone())

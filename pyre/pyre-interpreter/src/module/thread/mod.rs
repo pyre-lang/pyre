@@ -678,9 +678,16 @@ pub(crate) fn current_frames() -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let mut entries = Vec::new();
-    majit_gc::gc_sync::request_stw(|_| {
-        let contexts = EXECUTION_CONTEXTS.lock();
-        for (&ident, &ec) in contexts.iter() {
+    majit_gc::gc_sync::stop_the_world(|| {
+        // The force can allocate and collect, and the collection's
+        // `walk_thread_roots` takes the same lock; the other mutators are
+        // parked, so the copied registry cannot change while it is walked.
+        let contexts: Vec<(i64, usize)> = EXECUTION_CONTEXTS
+            .lock()
+            .iter()
+            .map(|(&ident, &ec)| (ident, ec))
+            .collect();
+        for (ident, ec) in contexts {
             let frame =
                 unsafe { (*(ec as *const crate::PyExecutionContext)).gettopframe_nohidden() };
             if !frame.is_null() {
@@ -727,7 +734,7 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let mut entries = Vec::new();
-    majit_gc::gc_sync::request_stw(|_| {
+    majit_gc::gc_sync::stop_the_world(|| {
         let contexts = EXECUTION_CONTEXTS.lock();
         for (&ident, &ec) in contexts.iter() {
             // `sys_exc_info`, not the flat `sys_exc_value`: a thread inside a

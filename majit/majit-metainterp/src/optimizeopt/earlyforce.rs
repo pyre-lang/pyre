@@ -13,6 +13,7 @@ use majit_ir::{Op, OpCode};
 use crate::optimizeopt::info::PtrInfoExt;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
+#[derive(Clone, Copy)]
 pub struct OptEarlyForce;
 
 /// earlyforce.py: is_raw_free(op, opnum).
@@ -37,11 +38,11 @@ impl OptEarlyForce {
     }
 
     /// earlyforce.py `propagate_forward`: `self.optimizer.force_box(arg, self)`.
-    /// The driver calls `propagate_with_optimizer` so `force_box_impl` reaches
-    /// the owning optimizer (`optforce.optimizer`) and `emit_extra` runs
-    /// immediately. This pass already popped `potential_extra_ops`, so it
-    /// calls `force_box_impl` rather than `Optimizer::force_box` (which would
-    /// pop again). Direct unit tests pass no optimizer and keep the queue.
+    /// `force_box_impl` reaches the owning optimizer (`optforce.optimizer`)
+    /// and `emit_extra` runs immediately. This pass already popped
+    /// `potential_extra_ops`, so it calls `force_box_impl` rather than
+    /// `Optimizer::force_box` (which would pop again). Direct unit tests
+    /// pass no optimizer and keep the queue.
     fn propagate_inner(
         &mut self,
         optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
@@ -126,28 +127,18 @@ impl Default for OptEarlyForce {
     }
 }
 
-/// `earlyforce.py` `propagate_forward` with `self.optimizer`. `OptEarlyForce`
-/// is a ZST: the boxed pass stays unborrowed and reentry is another stack copy.
-pub(crate) fn propagate_with_optimizer(
-    optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
-    op: &Op,
-    op_rc: &majit_ir::OpRc,
-    ctx: &mut OptContext,
-) -> OptimizationResult {
-    let mut pass = OptEarlyForce;
-    pass.propagate_inner(&mut Some(optimizer), op, op_rc, ctx)
-}
-
 impl Optimization for OptEarlyForce {
     /// earlyforce.py: propagate_forward.
     /// Force all virtual args of non-exempt operations, then emit.
     fn propagate_forward(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.propagate_inner(&mut None, op, op_rc, ctx)
+        let mut pass = *self;
+        pass.propagate_inner(opt, op, op_rc, ctx)
     }
 
     fn name(&self) -> &'static str {

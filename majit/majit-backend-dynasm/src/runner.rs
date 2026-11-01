@@ -1357,6 +1357,14 @@ fn dynasm_id_or_identityhash(addr: usize) -> usize {
     if !majit_gc::collector_installed() {
         return !addr;
     }
+    // minimark.py `id_or_identityhash`: an address outside the nursery is
+    // its own identity. The published window exists only for the singleton
+    // collector, so a per-thread box never takes this arm.
+    if let Some((start, end, _)) = majit_gc::published_nursery_window()
+        && (addr < start || addr >= end)
+    {
+        return addr;
+    }
     // `Trace::refresh_from_gc` calls this from a root walk. `gc_op` already
     // holds the collector; a second one panics in debug
     // (`reentrant &mut gc_op`).

@@ -4237,7 +4237,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ctx.trace_ctx.finish_recorded_virtual_ref(false, false);
         return Err(err);
     }
-    flush_pending_residual_locals_adopt(ctx);
     // `execute_frame`'s `finally: ec.leave(...)`.  A `finally` runs on every
     // exit, and compiled code has no such construct, so the leave is recorded
     // at the earliest point the call is known to have returned: after
@@ -4968,9 +4967,6 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // (`GuardSnapshotVableUntyped`). The self-recursive fold uses the same
     // slot for `record_ec_leave_frame_chain`.
     let snapshot = walker_capture_snapshot_for_last_guard_scoped(ctx, pc, scope);
-    if snapshot.is_ok() {
-        flush_pending_residual_locals_adopt(ctx);
-    }
     if leave_callee_ec {
         leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
     } else if portal_vref.is_some() {
@@ -11640,7 +11636,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 transparent_helper_jitcode_index: None,
                 transparent_helper_effects_at_entry: None,
                 transparent_helper_journal_at_entry: None,
-                pending_residual_locals_adopt: None,
                 ..ctx.fbw_mode.clone()
             },
             session: ctx.session,
@@ -17639,7 +17634,6 @@ fn descend_generatorentry<Sym: WalkSym>(
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', ca_result)?;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    flush_pending_residual_locals_adopt(ctx);
     // `direct_assembler_call` keeps the assembler target alive between
     // `GUARD_NOT_FORCED` and `handle_possible_exception`.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[iter_op]);
@@ -20182,7 +20176,6 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(majit_ir::OpCode::GuardNotForced, &[], 0);
         walker_capture_snapshot_for_last_guard(ctx, pc)?;
-        flush_pending_residual_locals_adopt(ctx);
     }
     // `pyjitpl.py handle_possible_exception`: a standing last_exc_value
     // always `finishframe_exception`s.  The EI `can_raise` flag only
@@ -21647,7 +21640,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
                 .fbw_mode
                 .inline_caller_py_pc
                 .or_else(|| (ctx.vstack_cur_pypc != 0).then_some(ctx.vstack_cur_pypc)),
-            pending_residual_locals_adopt: None,
             ..ctx.fbw_mode.clone()
         },
         session: ctx.session,

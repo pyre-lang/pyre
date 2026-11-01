@@ -420,17 +420,6 @@ pub fn fbw_debug_abort_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
 }
 
-/// Whether a may-force residual's own fastlocals writes are adopted into the
-/// walk (`flush_pending_residual_locals_adopt`).  On unless
-/// `PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS` is set; the switch exists so the two
-/// sides can be measured on one binary, since the shape that loses the write
-/// takes thousands of iterations to reach and cannot be reproduced by reading
-/// `f_locals` (that read forces, and the force publishes the stale box).
-pub fn fbw_import_residual_locals_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS").is_none())
-}
-
 /// Clear any stashed Finish payload before a walk begins.  Also clears the
 /// concrete-return cell so a stale value from a prior aborted walk cannot leak
 /// into this one.

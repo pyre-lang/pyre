@@ -862,7 +862,7 @@ impl FixedSignedList {
     /// `alloc_fast_nursery_collecting_typed_roots`; this wrapper stays
     /// in the same function so the call site is a bump and a branch.
     #[inline(always)]
-    pub fn alloc_with_roots(len: usize, gc_ptrs: bool, live: &mut [GcRef]) -> Self {
+    pub fn alloc_with_roots(len: usize, gc_ptrs: bool, live: &mut [GcRef]) -> (Self, bool) {
         // I/F: `GcArray` of `u64` / FLOATSTORAGE (`word_type_id`).
         // R: register-width slots (`fixed_list_refs_type_id`). Both kinds
         // use `items_offset::<i64>()` / `size_of::<i64>()`, matching the
@@ -874,7 +874,7 @@ impl FixedSignedList {
             unsafe {
                 *(host as *mut usize) = len;
             }
-            return Self { ptr: host };
+            return (Self { ptr: host }, false);
         }
         let type_id = if gc_ptrs {
             fixed_list_refs_type_id()
@@ -899,10 +899,10 @@ impl FixedSignedList {
         // GcPtr arm) so a collection that reaches the array traces nulls,
         // not leftover nursery words. `fill_from_code` overwrites every
         // slot; the barrier runs after those stores (`read_list_from`).
-        // `needs` is the old-gen birth flag; the barrier is delayed so a
+        // `needs` is the allocator's old-gen birth answer; the caller
+        // runs the barrier after its stores only when it is set, so a
         // minor cannot scan zeros, re-arm `TRACK_YOUNG_PTRS`, and miss
-        // young pointers stored afterwards (`remember_young_pointer`).
-        let _ = needs;
+        // pointers stored afterwards (`remember_young_pointer`).
         unsafe {
             *(fresh.0 as *mut usize) = len;
             if gc_ptrs && len > 0 {
@@ -913,9 +913,12 @@ impl FixedSignedList {
                 );
             }
         }
-        Self {
-            ptr: fresh.0 as *mut u8,
-        }
+        (
+            Self {
+                ptr: fresh.0 as *mut u8,
+            },
+            needs,
+        )
     }
 
     /// `framework.py` `push_roots`: a nursery `GcArray` pointer.
@@ -979,7 +982,7 @@ mod tests {
 
     #[test]
     fn zero_length_fixed_signed_list_has_empty_slice() {
-        let list = super::FixedSignedList::alloc_with_roots(0, false, &mut []);
+        let (list, _) = super::FixedSignedList::alloc_with_roots(0, false, &mut []);
         assert!(list.is_empty());
         assert_eq!(&list[..], &[] as &[i64]);
     }
@@ -994,7 +997,7 @@ mod tests {
 
     #[test]
     fn fixed_signed_list_length_lives_in_the_header() {
-        let mut list = super::FixedSignedList::alloc_with_roots(3, false, &mut []);
+        let (mut list, _) = super::FixedSignedList::alloc_with_roots(3, false, &mut []);
         list.fill_from_code(&[1, 2, 3], &[0, 1, 2], 0);
         assert_eq!(&list[..], &[1, 2, 3]);
         let copy = list;
@@ -1007,7 +1010,7 @@ mod tests {
         // `gct_zero_gc_pointers_inside` / `ll_newlist`: GCREF slots are
         // null until `fill_from_code`. Host `alloc_zeroed` already is;
         // the GC bump writes only the tid (`malloc_fast`).
-        let list = super::FixedSignedList::alloc_with_roots(4, true, &mut []);
+        let (list, _) = super::FixedSignedList::alloc_with_roots(4, true, &mut []);
         assert_eq!(&list[..], &[0, 0, 0, 0]);
     }
 

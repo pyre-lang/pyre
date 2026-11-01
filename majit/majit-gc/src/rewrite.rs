@@ -2348,6 +2348,16 @@ impl GcRewriterImpl {
         if !val_is_ref || st.is_null_constant(&val) {
             return;
         }
+        // Not a GC object: no header for the barrier to test; its GCREF
+        // slots are roots forwarded every minor (`walk_thread_roots`);
+        // upstream has no such struct (`rewrite.py handle_write_barrier_setfield`).
+        if let Some(d) = op.getdescr()
+            && let Some(fd) = d.as_field_descr()
+            && let Some(parent) = fd.get_parent_descr()
+            && parent.as_size_descr().is_some_and(|sd| !sd.is_gc_managed())
+        {
+            return;
+        }
         self.gen_write_barrier(obj, st);
     }
 

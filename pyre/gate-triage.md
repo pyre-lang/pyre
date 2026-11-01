@@ -210,14 +210,13 @@ Polarity below follows this file's rule, with one correction it needed: an
 **OFF**. Three diagnostics (`PYRE_DESCR_SPELLING_GATE`, `PYRE_GC_DIAG`,
 `PYRE_MC_DIAG`) read as ON under the unqualified rule and are OFF in fact.
 
-### §6a — Live default-ON (4): the removal targets
+### §6a — Live default-ON (3): the removal targets
 
 | gate | what is ON by default | retire when |
 |---|---|---|
 | PYRE_JD1_NO_ENTER | entering the compiled jd1 loop directly rather than leaving the drain to the interpreter caller.  ON as a gate, but it decides nothing until `PYRE_JD1=1` arms jd1 (§6a2) | with `PYRE_JD1` |
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
-| PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a residual wrote to the frame, whether or not it forced, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the walk reads a local through a channel a residual cannot leave stale; until then this is the one-binary control that keeps the defect demonstrable, and the parity fixture's two arms (a forcing call, and an inlined callee whose store forces nothing) are only separable with it |
 
 ### §6a2 — Default-OFF experiments (3)
 

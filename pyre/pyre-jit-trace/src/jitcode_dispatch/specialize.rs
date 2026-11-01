@@ -13753,7 +13753,6 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             );
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            flush_pending_residual_locals_adopt(ctx);
             // `VirtualRefFinish(vref, virtual)` immediately before the call is
             // the optimizer proof that `forced_op == virtual_op`.  Preserve
             // the orthodox force in IR while letting the source walker follow
@@ -13948,7 +13947,6 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     ctx.live_after_jit_pc = op.next_pc;
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    flush_pending_residual_locals_adopt(ctx);
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     Ok(Some(DispatchOutcome::Continue))

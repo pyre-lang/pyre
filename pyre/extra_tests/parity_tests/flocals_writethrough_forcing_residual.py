@@ -6,14 +6,13 @@
 # against the frame the tracer is stepping a copy of, so it is the tracer's
 # handling of that call -- not the proxy -- that decides whether the write
 # survives.
-# pyre-check: regresses-under: PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS=1 -- without the adopt the walk keeps the box the local held before the call, and both traced iterations lose the write
 
 """A callee's write through the caller's ``f_locals`` survives tracing.
 
 ``setter`` forces the caller and writes its fast-local array while the tracer
-holds a boxed copy. ``adopt_residual_locals_writes`` must read the slot back for
-both the concretely called and later inlined recordings. The bound reaches both;
-the ``regresses-under`` arm proves the shape remains live.
+holds a boxed copy. The force clears the residual-call vable token, so
+``vable_after_residual_call`` aborts the trace with ABORT_ESCAPE and the
+interpreter keeps the write.
 
 ``callee_sorted`` is the inlined shape: its local ``x`` is folded, and
 ``sorted``'s key writes that local through ``FrameLocalsProxy``. The forcing

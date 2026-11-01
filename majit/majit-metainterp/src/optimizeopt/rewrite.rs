@@ -6,6 +6,7 @@ use majit_ir::operand::Operand;
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Const, Op, OpCode, OpRc, OpRef, Value};
+use std::cell::RefCell;
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
@@ -132,7 +133,7 @@ enum Nullness {
 /// - Pointer equality on same OpRef
 /// - Cast and convert round-trip elimination
 /// - Guard-no-exception removal after removed calls
-pub struct OptRewrite {
+pub struct OptRewriteState {
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
@@ -143,6 +144,18 @@ pub struct OptRewrite {
     /// rewrite.py `CallLoopinvariantOptimizationResult` — the key its
     /// `_callback` records once the rewritten call has been emitted.
     pending_loopinvariant_key: Option<i64>,
+}
+
+pub struct OptRewrite {
+    state: RefCell<OptRewriteState>,
+}
+
+impl OptRewrite {
+    pub fn new() -> Self {
+        Self {
+            state: RefCell::new(OptRewriteState::new()),
+        }
+    }
 }
 
 /// The loop `rewrite.py` runs over an `intdiv` result: send each operation
@@ -157,9 +170,9 @@ fn send_extra_operations(ctx: &mut OptContext, operations: Vec<majit_ir::OpRc>) 
     Operand::from_bound_op(&newop.expect("intdiv returns at least two operations"))
 }
 
-impl OptRewrite {
+impl OptRewriteState {
     pub fn new() -> Self {
-        OptRewrite {
+        OptRewriteState {
             loop_invariant_results: indexmap::IndexMap::new(),
             loop_invariant_producer: indexmap::IndexMap::new(),
             pending_loopinvariant_key: None,
@@ -1164,7 +1177,7 @@ impl OptRewrite {
             let arg_mask = Operand::const_(Const::Int(val - 1));
             let mut and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos().set(op.pos().get());
-            ctx.emit_extra(ctx.current_pass_idx, and_op);
+            ctx.send_extra_operation(and_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1223,7 +1236,7 @@ impl OptRewrite {
                     let arg_shift = shiftvar.clone();
                     let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                     rshift_op.pos().set(op.pos().get());
-                    ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+                    ctx.send_extra_operation(rshift_op);
                     ctx.last_op_removed = true;
                     return Some(OptimizationResult::Remove);
                 }
@@ -1235,7 +1248,7 @@ impl OptRewrite {
         if val == -1 && b1.known_gt_const(i64::MIN) {
             let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
             neg_op.pos().set(op.pos().get());
-            ctx.emit_extra(ctx.current_pass_idx, neg_op);
+            ctx.send_extra_operation(neg_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1257,7 +1270,7 @@ impl OptRewrite {
             let arg_shift = Operand::const_(Const::Int(shift));
             let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos().set(op.pos().get());
-            ctx.emit_extra(ctx.current_pass_idx, rshift_op);
+            ctx.send_extra_operation(rshift_op);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1435,10 +1448,8 @@ impl OptRewrite {
         }
 
         // rewrite.py:646-670: element-by-element copy
-        // RPython routes synthesized ops through send_extra_operation()
-        // so they pass through downstream optimization passes.
-        // We use ctx.emit_extra(current_pass_idx, op) for the same effect.
-        let pass_idx = ctx.current_pass_idx;
+        // `optimizer.send_extra_operation` (opt=None) re-dispatches
+        // GETARRAYITEM / SETARRAYITEM from `first_optimization`.
         while index_current != index_stop {
             let index = index_current;
             index_current += index_delta;
@@ -1466,7 +1477,7 @@ impl OptRewrite {
                 let mut getop = Op::new(opcode, &[arg_source.clone(), arg_idx.clone()]);
                 getop.setdescr(arraydescr.clone());
                 let getop = OpRc::new(getop);
-                ctx.emit_extra_rc(pass_idx, getop.clone());
+                ctx.send_extra_operation_rc(getop.clone());
                 Some(Operand::from_bound_op(&getop))
             };
 
@@ -1492,7 +1503,7 @@ impl OptRewrite {
                     &[arg_dest.clone(), arg_idx.clone(), arg_val.clone()],
                 );
                 setop.setdescr(arraydescr.clone());
-                ctx.emit_extra(pass_idx, setop);
+                ctx.send_extra_operation(setop);
             }
         }
         true
@@ -1721,11 +1732,12 @@ impl OptRewrite {
     }
 }
 
-impl Optimization for OptRewrite {
+impl OptRewriteState {
     fn propagate_forward(
         &mut self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // Track last_op_removed for GuardNoException optimization.
@@ -2402,10 +2414,6 @@ impl Optimization for OptRewrite {
         self.pending_loopinvariant_key = None;
     }
 
-    fn name(&self) -> &'static str {
-        "rewrite"
-    }
-
     fn have_postprocess(&self) -> bool {
         true
     }
@@ -2494,6 +2502,56 @@ impl Optimization for OptRewrite {
             self.loop_invariant_results
                 .insert(func_ptr, LoopInvariantEntry::Direct(result));
         }
+    }
+}
+
+impl Optimization for OptRewrite {
+    fn propagate_forward(
+        &self,
+        op: &Op,
+        op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
+        self.state
+            .borrow_mut()
+            .propagate_forward(op, op_rc, opt, ctx)
+    }
+
+    fn setup(&self) {
+        self.state.borrow_mut().setup();
+    }
+
+    fn name(&self) -> &'static str {
+        "rewrite"
+    }
+
+    fn have_postprocess(&self) -> bool {
+        self.state.borrow().have_postprocess()
+    }
+
+    fn propagate_postprocess(&self, op: &Op, op_rc: &OpRc, ctx: &mut OptContext) {
+        self.state
+            .borrow_mut()
+            .propagate_postprocess(op, op_rc, ctx);
+    }
+
+    fn produce_potential_short_preamble_ops(
+        &self,
+        sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
+        ctx: &mut OptContext,
+    ) {
+        self.state
+            .borrow()
+            .produce_potential_short_preamble_ops(sb, ctx);
+    }
+
+    fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
+        self.state.borrow().serialize_optrewrite()
+    }
+
+    fn deserialize_optrewrite(&self, entries: &[(i64, OpRef)]) {
+        self.state.borrow_mut().deserialize_optrewrite(entries);
     }
 }
 
@@ -2657,7 +2715,7 @@ mod tests {
         let result = loop {
             let mut result = OptimizationResult::PassOn;
             for pass in passes.iter_mut() {
-                result = pass.propagate_forward(&op, &op_rc, &mut ctx);
+                result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
                 if !matches!(result, OptimizationResult::PassOn) {
                     break;
                 }
@@ -2731,7 +2789,7 @@ mod tests {
         resolve_op_args_in_ctx(&mut op, &mut ctx);
         let op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let result = pass.propagate_forward(&op, &op_rc, &mut ctx);
+        let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
         (result, ctx)
     }
 
@@ -2793,7 +2851,7 @@ mod tests {
             ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
             let mut result = OptimizationResult::PassOn;
             for pass in passes.iter_mut() {
-                result = pass.propagate_forward(&resolved, &__pf_rc, &mut ctx);
+                result = pass.propagate_forward(&resolved, &__pf_rc, &mut None, &mut ctx);
                 if !matches!(result, OptimizationResult::PassOn) {
                     break;
                 }
@@ -3006,7 +3064,7 @@ mod tests {
         let op_rc = OpRc::new(call.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
         let mut pass = OptRewrite::new();
-        let result = pass.propagate_forward(&call, &op_rc, &mut ctx);
+        let result = pass.propagate_forward(&call, &op_rc, &mut None, &mut ctx);
         (result, ctx)
     }
 
@@ -3282,7 +3340,7 @@ mod tests {
         let guard_rc = OpRc::new(guard.clone());
         let mut pass = OptRewrite::new();
 
-        let result = pass.propagate_forward(&guard, &guard_rc, &mut ctx);
+        let result = pass.propagate_forward(&guard, &guard_rc, &mut None, &mut ctx);
         assert_remove(&result);
     }
 
@@ -3302,7 +3360,7 @@ mod tests {
         let guard_rc = OpRc::new(guard.clone());
         let mut pass = OptRewrite::new();
 
-        let result = pass.propagate_forward(&guard, &guard_rc, &mut ctx);
+        let result = pass.propagate_forward(&guard, &guard_rc, &mut None, &mut ctx);
         assert_remove(&result);
     }
 
@@ -3364,7 +3422,7 @@ mod tests {
             // stand in for inputs and are emitted directly.
             if op.opcode != OpCode::SameAsI {
                 for pass in passes.iter_mut() {
-                    result = pass.propagate_forward(&**op, op, &mut ctx);
+                    result = pass.propagate_forward(&**op, op, &mut None, &mut ctx);
                     if !matches!(result, OptimizationResult::PassOn) {
                         break;
                     }
@@ -3430,7 +3488,7 @@ mod tests {
                 // production loop's SameAs absorption (optimizer.py:864-867).
                 if op.opcode != OpCode::SameAsI {
                     for pass in passes.iter_mut() {
-                        result = pass.propagate_forward(&**op, op, &mut ctx);
+                        result = pass.propagate_forward(&**op, op, &mut None, &mut ctx);
                         if !matches!(result, OptimizationResult::PassOn) {
                             break;
                         }
@@ -3623,7 +3681,7 @@ mod tests {
         // Process op1 first (pass it through) on the producer the next
         // op's arg already wraps.
         ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
-        let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut ctx);
+        let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit_rc(ops[1].clone());
 
@@ -3633,7 +3691,7 @@ mod tests {
             ops[2].setarg(i, resolved);
         }
         ctx.bind_input_resops(std::slice::from_ref(&ops[2]));
-        let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut ctx);
+        let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut None, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
         assert_eq!(
             ctx.get_replacement_opref(OpRef::float_op(2)),
@@ -3933,13 +3991,13 @@ mod tests {
             ops[2].setarg(i, resolved);
         }
         ctx.bind_input_resops(std::slice::from_ref(&ops[2]));
-        let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut ctx);
+        let result2 = pass.propagate_forward(&ops[2], &ops[2], &mut None, &mut ctx);
         assert!(matches!(result2, OptimizationResult::Remove));
 
         // Process GuardNoException -> should also be removed
         let __pf_rc = OpRc::new((*ops[3]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result3 = pass.propagate_forward(&ops[3], &__pf_rc, &mut ctx);
+        let result3 = pass.propagate_forward(&ops[3], &__pf_rc, &mut None, &mut ctx);
         assert!(matches!(result3, OptimizationResult::Remove));
     }
 
@@ -3957,14 +4015,14 @@ mod tests {
         let mut pass = OptRewrite::new();
         // Process CallN -> PassOn (not handled by OptRewrite)
         ctx.bind_input_resops(std::slice::from_ref(&ops[1]));
-        let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut ctx);
+        let result1 = pass.propagate_forward(&ops[1], &ops[1], &mut None, &mut ctx);
         assert!(matches!(result1, OptimizationResult::PassOn));
         ctx.emit_rc(ops[1].clone());
 
         // Process GuardNoException -> should NOT be removed
         let __pf_rc = OpRc::new((*ops[2]).clone());
         ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut ctx);
+        let result2 = pass.propagate_forward(&ops[2], &__pf_rc, &mut None, &mut ctx);
         assert!(matches!(result2, OptimizationResult::PassOn));
     }
 
