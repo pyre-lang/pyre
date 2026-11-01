@@ -1179,6 +1179,23 @@ where
     ll_dict_lookup_orig(d, hash, key) >= 0
 }
 
+/// `d.keyhash` / `fnkeyhash` (`rordereddict.py`). Residual `getfunctionptr`:
+/// `RandomState::build_hasher` is not a translation subject.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn ll_dict_hash_of<K, V, S, Q>(d: &RDict<K, V, S>, key: &Q) -> u64
+where
+    K: Hash + Eq + Copy + EntryDummy + GcRefOffsets,
+    V: Copy + EntryDummy + GcRefOffsets,
+    S: BuildHasher,
+    (K, V): GcEntriesType,
+    Q: Hash + ?Sized,
+{
+    let mut state = d.hash_builder.build_hasher();
+    key.hash(&mut state);
+    state.finish()
+}
+
 /// `ll_dict_resize.oopspec = 'odict.resize(d)'`. Residual when not looked
 /// inside; the body is [`RDict::resize_inner`].
 #[inline(never)]
@@ -1441,14 +1458,10 @@ where
     S: BuildHasher,
     (K, V): GcEntriesType,
 {
-    /// `d.keyhash` / `fnkeyhash` (rordereddict.py). The hasher is a
-    /// residual: RandomState::build_hasher is not a translation subject.
+    /// `d.keyhash` / `fnkeyhash` (rordereddict.py). Body is [`ll_dict_hash_of`].
     #[inline]
-    #[majit_macros::dont_look_inside]
     fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
-        let mut state = self.hash_builder.build_hasher();
-        key.hash(&mut state);
-        state.finish()
+        ll_dict_hash_of(self, key)
     }
 
     /// `ll_dict_lookup(d, key, hash, FLAG_LOOKUP)` (rordereddict.py).

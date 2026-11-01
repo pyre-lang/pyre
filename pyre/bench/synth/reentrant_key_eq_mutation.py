@@ -1,7 +1,6 @@
-# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
-# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
-# rather than any generated code, and reads whatever the host's process
-# spawn cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`: the mutating probes below run once each, so a pypy
+# ratio would compare two interpreters' startup rather than generated code.
+# The jitstats baselines gate the warmup loop.
 class Key:
     def __init__(self, value, owner):
         self.value = value
@@ -54,6 +53,17 @@ def run_dict(operation):
         container.pop(probe, None)
     return len(container)
 
+
+# Trace getitem and setitem of a colliding user key.  owner[1] is already
+# True so `__eq__` does not insert the mutation marker; the one-shot probes
+# below still mutate once.
+owner = [None, True]
+container = {Key(i, owner): 1 for i in range(8)}
+owner[0] = container
+probe = Key(1000, owner)
+for _ in range(2000):
+    container.get(probe)
+    container[probe] = 1
 
 for operation in ("add", "contains", "discard"):
     print("set", operation, run_set(operation))

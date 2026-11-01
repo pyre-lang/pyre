@@ -3117,16 +3117,26 @@ unsafe fn scan_clear_generation(obj: PyObjectRef) -> usize {
     }
 }
 
+/// FLAG_LOOKUP miss (`ll_dict_lookup`): no live slot.
+pub const SCAN_DICT_KEY_MISS: isize = -1;
+
 /// Find `key` in the object storage by scanning same-hash entries one at a
 /// time.  The table borrow ends before equality can call user code; if that
 /// callback changes the candidate entry, restart from the beginning like
 /// `ll_dict_lookup`'s paranoia restart (`rordereddict.py`).  Services
 /// both regular object-strategy dicts and object-strategy module dicts via
 /// [`scan_object_entries`]/[`scan_clear_generation`].
-unsafe fn scan_dict_key_reentrant(
+///
+/// One `Signed`: a slot, or [`SCAN_DICT_KEY_MISS`].  A raising `keyeq` parks
+/// the exception (`eq_error_pending`) and returns the miss without consuming
+/// the flag.  `dont_look_inside`: residual `getfunctionptr` of the non-virtual
+/// half of `ll_dict_lookup`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn scan_dict_key_reentrant(
     mut obj: PyObjectRef,
-    mut key: ObjectKey,
-) -> Result<(Option<usize>, ObjectKey, PyObjectRef), DictKeyError> {
+    hash: i64,
+    mut key: PyObjectRef,
+) -> isize {
     'restart: loop {
         // Pin the container for the whole attempt so a comparison that moves a
         // nursery dict does not strand the raw `obj` the scan re-derefs after
@@ -3151,7 +3161,7 @@ unsafe fn scan_dict_key_reentrant(
                 // (`rordereddict.py:1373`).  A deleted entry leaves a
                 // tombstone, so the walk skips it rather than ending there.
                 if i >= dict_entries_slot_count(entries) {
-                    return Ok((None, key, obj));
+                    return SCAN_DICT_KEY_MISS;
                 }
                 let Some(stored_obj) = dict_entries_key_obj_at(entries, i) else {
                     i += 1;
@@ -3160,19 +3170,21 @@ unsafe fn scan_dict_key_reentrant(
                 (dict_entries_key_hash_at(entries, i), stored_obj)
             };
 
-            if stored_hash == key.hash {
+            if stored_hash == hash {
                 let _roots = crate::gc_roots::push_roots();
                 let stored_slot = crate::gc_roots::shadow_stack_len();
                 let stored_obj = crate::gc_roots::pin_root(stored_obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                key.obj = crate::gc_roots::pin_root(key.obj);
+                key = crate::gc_roots::pin_root(key);
 
-                let equal = dict_keys_equal(stored_obj, key.obj);
+                let equal = dict_keys_equal(stored_obj, key);
                 obj = crate::gc_roots::shadow_stack_get(obj_slot);
                 let stored_obj = crate::gc_roots::shadow_stack_get(stored_slot);
-                key.obj = crate::gc_roots::shadow_stack_get(key_slot);
-                if take_dict_key_error() {
-                    return Err(DictKeyError);
+                key = crate::gc_roots::shadow_stack_get(key_slot);
+                // Error beats restart: a pending `keyeq` raise is an
+                // `OperationError`, not a returned value (`ll_dict_lookup`).
+                if crate::dict_eq_hook::eq_error_pending() {
+                    return SCAN_DICT_KEY_MISS;
                 }
                 // Validate the paranoia condition before acting on the result:
                 // `ll_dict_lookup` restarts even when the comparison answered
@@ -3194,7 +3206,7 @@ unsafe fn scan_dict_key_reentrant(
                     continue 'restart;
                 }
                 if equal {
-                    return Ok((Some(i), key, obj));
+                    return i as isize;
                 }
             }
             i += 1;
@@ -3237,12 +3249,18 @@ pub unsafe fn w_dict_lookup_object_strategy_checked(
     }) {
         return result;
     }
-    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-    Ok(found.map(|i| {
+    let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    let obj = _dict_guard.root(0);
+    if index < 0 {
+        Ok(None)
+    } else {
         let dict = &*(obj as *const W_DictObject);
         let entries = &*(dict.dstorage as *const ObjectDictStorage);
-        dict_entries_value_at(entries, i)
-    }))
+        Ok(Some(dict_entries_value_at(entries, index as usize)))
+    }
 }
 
 /// Internal helper: `ModuleDictStrategy::getitem` body for pyre's
@@ -3589,24 +3607,23 @@ pub unsafe fn w_dict_setdefault_checked(
             // `Ok(None)` only arises on a broken probe (which surfaces as the
             // outer `None`); fall through to the scan defensively.
         }
-        // `value` is a native local held across the scan; a mid-scan GC in a
-        // probing `__eq__` could move it before the insert/return below, so pin
-        // and reload it alongside the container the scan returns.
-        let _value_root = crate::gc_roots::push_roots();
-        let value_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(value);
-        let (found, object_key, obj) = scan_dict_key_reentrant(obj, object_key)?;
-        let value = crate::gc_roots::shadow_stack_get(value_slot);
-        if let Some(i) = found {
+        let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        let obj = _dict_guard.root(0);
+        let key_obj = _dict_guard.root(1);
+        let value = _dict_guard.root(2);
+        if index >= 0 {
             let dict = &*(obj as *const W_DictObject);
             let entries = &*(dict.dstorage as *const ObjectDictStorage);
-            return Ok(*entries.get_slot(i).unwrap().1);
+            return Ok(*entries.get_slot(index as usize).unwrap().1);
         }
         crate::dict_eq_hook::begin_callback_free_probe();
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
         dict_write_barrier(obj);
-        dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
+        dict_entries_insert_hashed(entries, object_key.hash, key_obj, value);
         let _ = crate::dict_eq_hook::end_callback_free_probe();
         w_dict_bump_keys_version(obj);
         return Ok(value);
@@ -3735,11 +3752,15 @@ pub unsafe fn w_dict_pop_checked(
             }) {
                 return result;
             }
-            let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-            if let Some(i) = found {
+            let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+            if take_dict_key_error() {
+                return Err(DictKeyError);
+            }
+            let obj = _dict_guard.root(0);
+            if index >= 0 {
                 let dict = &mut *(obj as *mut W_DictObject);
                 let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-                let removed = entries.remove_slot(i).unwrap().1;
+                let removed = entries.remove_slot(index as usize).unwrap().1;
                 w_dict_bump_keys_version(obj);
                 return Ok(Some(removed));
             }
@@ -3857,8 +3878,7 @@ pub unsafe fn w_dict_object_setitem_callback_free(
 /// Reentrant half of `ll_dict_setitem`: [`scan_dict_key_reentrant`] then the
 /// overwrite or the callback-free placement insert. Same status word as
 /// [`w_dict_object_setitem_callback_free`], except `1` is not returned — the
-/// scan already decided equality. The fat `(slot, ObjectKey)` pair never
-/// leaves this residual.
+/// scan already decided equality. The scan result is one `Signed`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`, and `hash` must be the digest
@@ -3870,30 +3890,29 @@ pub unsafe fn w_dict_object_setitem_reentrant(
     hash: i64,
     value: *mut PyObject,
 ) -> i64 {
-    let object_key = object_key_hashed(key, hash);
-    let _value_root = crate::gc_roots::push_roots();
-    let value_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(value);
-    let (found, object_key, obj) = match scan_dict_key_reentrant(obj, object_key) {
-        Ok(found) => found,
-        Err(_) => return -1,
-    };
-    let value = crate::gc_roots::shadow_stack_get(value_slot);
+    // Clean slate for the bucket probe (`object_key_hashed`).
+    crate::dict_eq_hook::take_eq_error();
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, key, value]);
+    let index = scan_dict_key_reentrant(obj, hash, key);
+    if take_dict_key_error() {
+        return -1;
+    }
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let key = crate::gc_roots::shadow_stack_get(obj_slot + 1);
+    let value = crate::gc_roots::shadow_stack_get(obj_slot + 2);
     dict_write_barrier(obj);
-    match found {
-        Some(i) => {
-            let dict = &mut *(obj as *mut W_DictObject);
-            let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-            *entries.get_slot_mut(i).unwrap().1 = value;
-        }
-        None => {
-            crate::dict_eq_hook::begin_callback_free_probe();
-            let dict = &mut *(obj as *mut W_DictObject);
-            let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-            dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value);
-            let _ = crate::dict_eq_hook::end_callback_free_probe();
-            dict.keys_version = dict.keys_version.wrapping_add(1);
-        }
+    if index >= 0 {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
+        *entries.get_slot_mut(index as usize).unwrap().1 = value;
+    } else {
+        crate::dict_eq_hook::begin_callback_free_probe();
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
+        dict_entries_insert_hashed(entries, hash, key, value);
+        let _ = crate::dict_eq_hook::end_callback_free_probe();
+        dict.keys_version = dict.keys_version.wrapping_add(1);
     }
     0
 }
@@ -4622,16 +4641,21 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
             return result;
         }
         // A probing `__eq__`/`__hash__` escaped the callback-free ladder; pin
-        // `value` across the reentrant scan (a mid-scan GC could move it before
-        // the identity check), then remove in place on the module storage.
-        let _value_root = crate::gc_roots::push_roots();
-        let value_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(value);
-        let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-        let value = crate::gc_roots::shadow_stack_get(value_slot);
-        let Some(index) = found else {
+        // `obj` and `value` across the reentrant scan (a mid-scan GC could move
+        // them before the identity check), then remove in place on the module
+        // storage.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
+        let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let value = crate::gc_roots::shadow_stack_get(obj_slot + 1);
+        if index < 0 {
             return Ok(false);
-        };
+        }
+        let index = index as usize;
         let entries = w_module_dict_object_storage_mut(obj);
         if entries
             .get_slot(index)
@@ -4671,17 +4695,20 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
     }) {
         return result;
     }
-    // `value` is a native local held across the scan; a mid-scan GC in a
-    // probing `__eq__` could move it before the identity check below, so pin
-    // and reload it alongside the container the scan returns.
-    let _value_root = crate::gc_roots::push_roots();
-    let value_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(value);
-    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-    let value = crate::gc_roots::shadow_stack_get(value_slot);
-    let Some(index) = found else {
+    // `obj` and `value` are native locals held across the scan; a mid-scan GC
+    // in a probing `__eq__` could move them before the identity check below.
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::pin_roots(&[obj, value]);
+    let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let value = crate::gc_roots::shadow_stack_get(obj_slot + 1);
+    if index < 0 {
         return Ok(false);
-    };
+    }
+    let index = index as usize;
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
     if entries
@@ -4785,10 +4812,15 @@ pub unsafe fn w_dict_move_to_end_checked(
         // reentrant scan (which services the module `object_storage`) locates
         // the entry outside the table borrow, then the reorder runs in place —
         // the object-strategy tail below, but on the module storage.
-        let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-        let Some(index) = found else {
+        let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        let obj = _dict_guard.root(0);
+        if index < 0 {
             return Ok(false);
-        };
+        }
+        let index = index as usize;
         let entries = w_module_dict_object_storage_mut(obj);
         if entries.move_slot_to_end(index, last) {
             w_dict_bump_keys_version(obj);
@@ -4859,12 +4891,17 @@ pub unsafe fn w_dict_move_to_end_checked(
     }) {
         return result;
     }
-    // A probing `__eq__` may have run and moved the container; the reentrant
-    // scan re-pins it and returns the current index (no `value` to carry).
-    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-    let Some(index) = found else {
+    // A probing `__eq__` may have run and moved the container; reload it from
+    // the guard that outlives the scan.
+    let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    let obj = _dict_guard.root(0);
+    if index < 0 {
         return Ok(false);
-    };
+    }
+    let index = index as usize;
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
     if entries.move_slot_to_end(index, last) {
@@ -4917,11 +4954,15 @@ pub unsafe fn w_dict_delitem_object_strategy_checked(
     }) {
         return result;
     }
-    let (found, _, obj) = scan_dict_key_reentrant(obj, object_key)?;
-    if let Some(i) = found {
+    let index = scan_dict_key_reentrant(obj, object_key.hash, object_key.obj);
+    if take_dict_key_error() {
+        return Err(DictKeyError);
+    }
+    let obj = _dict_guard.root(0);
+    if index >= 0 {
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);
-        entries.remove_slot(i);
+        entries.remove_slot(index as usize);
         dict.keys_version = dict.keys_version.wrapping_add(1);
         return Ok(true);
     }
@@ -8840,6 +8881,63 @@ mod tests {
             assert!(w_dict_lookup(dict, k2).is_none());
             // The error flag was consumed by the store, not left dangling.
             assert!(!crate::dict_eq_hook::take_eq_error());
+        }
+    }
+
+    /// Collision-hash two keys into one bucket (`constant_collision_hash`).
+    /// Store `k1`; a scan for `k1` returns a live slot, a scan for `k2`
+    /// returns [`SCAN_DICT_KEY_MISS`], and neither parks a dict-key error.
+    #[test]
+    fn test_scan_dict_key_reentrant_hit_and_miss() {
+        use crate::longobject::w_long_new;
+        use majit_rlib::rbigint::RBigInt as BigInt;
+        install_test_hash_hook();
+        unsafe {
+            crate::dict_eq_hook::register_hash_w_hook(constant_collision_hash);
+            let dict = w_dict_new();
+            let huge = BigInt::from(i64::MAX) * BigInt::from(2);
+            let k1 = w_long_new(huge.clone());
+            let k2 = w_long_new(huge + BigInt::from(1));
+            w_dict_store(dict, k1, w_int_new(1));
+            assert_eq!(w_dict_strategy_name(dict), "ObjectDictStrategy");
+
+            let hit = scan_dict_key_reentrant(dict, 42, k1);
+            assert!(hit >= 0, "stored key must occupy a live slot, got {hit}");
+            assert!(!take_dict_key_error());
+
+            let miss = scan_dict_key_reentrant(dict, 42, k2);
+            assert_eq!(miss, SCAN_DICT_KEY_MISS);
+            assert!(!take_dict_key_error());
+        }
+    }
+
+    /// A raising `keyeq` during the scan parks the flag (`eq_error_pending`)
+    /// and returns the miss without consuming it (`ll_dict_lookup`).  A
+    /// second take is empty; the dict is unchanged; `__eq__` runs once.
+    #[test]
+    fn test_scan_dict_key_reentrant_eq_error_leaves_flag() {
+        use crate::longobject::w_long_new;
+        use majit_rlib::rbigint::RBigInt as BigInt;
+        install_test_hash_hook();
+        unsafe {
+            crate::dict_eq_hook::register_hash_w_hook(constant_collision_hash);
+            let dict = w_dict_new();
+            let huge = BigInt::from(i64::MAX) * BigInt::from(2);
+            let k1 = w_long_new(huge.clone());
+            let k2 = w_long_new(huge + BigInt::from(1));
+            w_dict_store(dict, k1, w_int_new(1));
+
+            RAISING_EQ_CALLS.store(0, Ordering::Relaxed);
+            crate::dict_eq_hook::register_eq_w_hook(raising_eq);
+            let miss = scan_dict_key_reentrant(dict, 42, k2);
+            crate::dict_eq_hook::clear_eq_w_hook();
+
+            assert_eq!(miss, SCAN_DICT_KEY_MISS);
+            assert!(take_dict_key_error());
+            assert!(!take_dict_key_error());
+            assert_eq!(RAISING_EQ_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(w_int_get_value(w_dict_lookup(dict, k1).unwrap()), 1);
+            assert!(w_dict_lookup(dict, k2).is_none());
         }
     }
 

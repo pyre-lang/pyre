@@ -4943,6 +4943,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dict_entries_probe_hashed",
         dict_entries_probe_hashed_word,
     );
+    // FLAG_LOOKUP miss is `-1` (`ll_dict_lookup`); a raising `keyeq` parks
+    // the exception and returns that miss (`getfunctionptr` of the scan).
+    upa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::scan_dict_key_reentrant",
+        "pyre_object::scan_dict_key_reentrant",
+        pyre_object::dictmultiobject::scan_dict_key_reentrant,
+    );
     pa4!(
         &mut entries,
         "pyre_object::dictmultiobject::dict_entries_insert_hashed",
@@ -6063,6 +6071,12 @@ where
         entries,
         "pyre_object::rordereddict::ll_dict_contains_trampoline",
         pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K>,
+        &kvsk,
+    );
+    p2_inst!(
+        entries,
+        "pyre_object::rordereddict::ll_dict_hash_of",
+        pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K>,
         &kvsk,
     );
 }
