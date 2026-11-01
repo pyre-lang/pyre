@@ -3093,13 +3093,14 @@ pub(crate) fn s_uint() -> SomeValue {
 }
 
 /// Sole positional field of a value `tyref_transparent_inner_value_type`
-/// already represents as `ValueType::Int` or `ValueType::Unsigned`.
+/// already represents as an integer or as `ValueType::Str`.
 ///
 /// The front spells that field `__pos_0` (`positional_field_name`).
-/// RPython has no newtype, so the word is the integer and the read is
-/// not an attribute. `SomeBool` walks the integer MRO and must not match.
+/// RPython has no newtype, so the word is the integer or the STR and
+/// the read is not an attribute. `SomeBool` walks the integer MRO and
+/// `SomeChar` walks the string MRO; neither is that word.
 pub(crate) fn erased_integer_positional_field(s: &SomeValue, attr: &str) -> bool {
-    attr == "__pos_0" && matches!(s, SomeValue::Integer(_))
+    attr == "__pos_0" && matches!(s, SomeValue::Integer(_) | SomeValue::String(_))
 }
 
 /// RPython `SomeString()` (`model.py` `SomeString.__init__` default

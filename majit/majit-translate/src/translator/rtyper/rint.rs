@@ -2494,6 +2494,426 @@ mod tests {
         );
     }
 
+    /// A `#[repr(transparent)]` newtype over a STR pointer is that STR.
+    ///
+    /// `StrPtrKey(*mut Utf8Str)` is the shape of `BytesKey` / `StrKey`
+    /// without their names, so the erasure is the field's lltype
+    /// (`ValueType::Str`), not a class-root table. Construction, the
+    /// positional field, and an `&self` receiver are `SomeString`.
+    /// `ObjPtrKey(*mut Obj)` stays a constructor. `__pos_0` on a string
+    /// shell is `same_as` of that word; `SomeChar` is not.
+    #[test]
+    fn erased_str_ptr_newtype_annotates_somestring_on_construct_field_and_receiver() {
+        use crate::annotator::model::{SomeString, s_str0, union};
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, Link,
+        };
+        use crate::model::{CallTarget, OpKind, ValueType};
+        use crate::translator::rtyper::call_registry::CallRegistry;
+        use crate::translator::rtyper::flowspace_adapter::{
+            derive_subject_inputcells, function_graph_to_flowspace,
+        };
+
+        fn span() -> serde_json::Value {
+            serde_json::json!({"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 1, "col": 8}
+            }})
+        }
+        fn meta(path: &[&str]) -> serde_json::Value {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        }
+        fn local(i: u64, ty: &serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty})
+        }
+        fn place(kind: serde_json::Value, ty: &serde_json::Value) -> serde_json::Value {
+            serde_json::json!({"kind": kind, "ty": ty})
+        }
+        fn transparent(
+            def_id: u64,
+            path: &[&str],
+            field_ty: &serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(path),
+                "kind": {"Struct": [{"name": null, "ty": field_ty, "attr_info": null}]},
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [{"field_offsets": [0]}],
+                        "repr": {"transparent": true}
+                    }
+                }]
+            })
+        }
+        fn struct_ty(def_id: u64, path: &[&str], fields: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(path),
+                "kind": {"Struct": fields}
+            })
+        }
+        fn fun(
+            def_id: u64,
+            name: &str,
+            inputs: Vec<serde_json::Value>,
+            output: serde_json::Value,
+            body: serde_json::Value,
+        ) -> serde_json::Value {
+            let mut locals = vec![local(0, &output)];
+            for (i, ty) in inputs.iter().enumerate() {
+                locals.push(local((i + 1) as u64, ty));
+            }
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": meta(&["fixture", name]),
+                "signature": {"is_unsafe": false, "inputs": inputs, "output": output},
+                "body": {"Unstructured": {
+                    "span": span(),
+                    "locals": {"arg_count": locals.len() - 1, "locals": locals},
+                    "body": [body]
+                }}
+            })
+        }
+        fn assign_return(rhs: serde_json::Value, ret_ty: &serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "statements": [{
+                    "span": span(),
+                    "kind": {"Assign": [
+                        place(serde_json::json!({"Local": 0}), ret_ty),
+                        rhs
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span(), "kind": "Return"}
+            })
+        }
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let key_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let obj_adt = serde_json::json!({
+            "Adt": {"id": 2, "builtin": null, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let obj_key_adt = serde_json::json!({
+            "Adt": {"id": 3, "builtin": null, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let vec_adt = serde_json::json!({
+            "Adt": {"id": 4, "builtin": null, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        });
+        let utf8_ptr = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+        let key_ty = serde_json::json!({"Value": [0, key_adt]});
+        let key_ref = serde_json::json!({"Ref": ["Erased", key_adt, "Shared"]});
+        let obj_ptr = serde_json::json!({"RawPtr": [obj_adt, "Mut"]});
+        let obj_key_ty = serde_json::json!({"Value": [1, obj_key_adt]});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+
+        let utf8 = struct_ty(
+            0,
+            &["pyre_object", "unicodeobject", "Utf8Str"],
+            serde_json::json!([
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": usize_ty, "attr_info": null}
+            ]),
+        );
+        let key = transparent(1, &["fixture", "StrPtrKey"], &utf8_ptr);
+        // A `usize` field is raw storage, so `*mut Obj` would be an
+        // address integer and the wrapper would erase to that integer.
+        // `Vec` is a GC container (`adt_path_is_gc_container`); the
+        // pointer stays a class and the wrapper must not become `Str`.
+        let vec_decl = struct_ty(
+            4,
+            &["alloc", "vec", "Vec"],
+            serde_json::json!([
+                {"name": "ptr", "ty": usize_ty, "attr_info": null}
+            ]),
+        );
+        let obj = struct_ty(
+            2,
+            &["fixture", "Obj"],
+            serde_json::json!([
+                {"name": "items", "ty": vec_adt, "attr_info": null}
+            ]),
+        );
+        let obj_key = transparent(3, &["fixture", "ObjPtrKey"], &obj_ptr);
+
+        let wrap = fun(
+            0,
+            "wrap_str_ptr",
+            vec![utf8_ptr.clone()],
+            key_ty.clone(),
+            assign_return(
+                serde_json::json!({"Aggregate": [
+                    {"Adt": [1, null]},
+                    [{"Move": place(serde_json::json!({"Local": 1}), &utf8_ptr)}]
+                ]}),
+                &key_ty,
+            ),
+        );
+        let field_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 1}), &key_ty),
+                {"Field": [null, 0]}
+            ]}),
+            &utf8_ptr,
+        );
+        let read = fun(
+            1,
+            "read_str_ptr",
+            vec![key_ty.clone()],
+            utf8_ptr.clone(),
+            assign_return(
+                serde_json::json!({"Use": [{"Copy": field_place}, "No"]}),
+                &utf8_ptr,
+            ),
+        );
+        let recv = fun(
+            2,
+            "recv_str_ptr",
+            vec![key_ref.clone()],
+            key_ref.clone(),
+            assign_return(
+                serde_json::json!({"Use": [
+                    {"Copy": place(serde_json::json!({"Local": 1}), &key_ref)},
+                    "No"
+                ]}),
+                &key_ref,
+            ),
+        );
+        let wrap_obj = fun(
+            3,
+            "wrap_obj_ptr",
+            vec![obj_ptr.clone()],
+            obj_key_ty.clone(),
+            assign_return(
+                serde_json::json!({"Aggregate": [
+                    {"Adt": [3, null]},
+                    [{"Move": place(serde_json::json!({"Local": 1}), &obj_ptr)}]
+                ]}),
+                &obj_key_ty,
+            ),
+        );
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [utf8, key, obj, obj_key, vec_decl],
+                "fun_decls": [wrap, read, recv, wrap_obj],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("str-pointer newtype fixture parses");
+
+        fn input_ty(graph: &crate::model::FunctionGraph) -> ValueType {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find_map(|op| match &op.kind {
+                    OpKind::Input { ty, .. } => Some(ty.clone()),
+                    _ => None,
+                })
+                .expect("input")
+        }
+        fn has_ctor(graph: &crate::model::FunctionGraph) -> bool {
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { .. },
+                            ..
+                        }
+                    )
+                })
+            })
+        }
+        fn has_field_read(graph: &crate::model::FunctionGraph) -> bool {
+            graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            })
+        }
+        fn returns_input(graph: &crate::model::FunctionGraph) -> bool {
+            let input = &graph.block(graph.startblock).inputargs[0];
+            graph.blocks.iter().any(|block| {
+                block.exits.iter().any(|link| {
+                    link.target == graph.returnblock
+                        && link.args.first().and_then(|arg| arg.as_variable()) == Some(input)
+                })
+            })
+        }
+        fn assert_somestring(got: &SomeValue, site: &str) {
+            let SomeValue::String(s) = got else {
+                panic!("{site} is not SomeString: {got:?}");
+            };
+            assert_eq!(
+                s.inner.base.knowntype,
+                crate::annotator::model::KnownType::Str
+            );
+            assert!(!s.inner.can_be_none, "{site} STR word is not nullable");
+            assert!(
+                !s.inner.no_nul,
+                "{site} comes from ValueType::Str, not s_str0"
+            );
+            union(got, &s_str0())
+                .unwrap_or_else(|err| panic!("{site} must union with s_str0: {err}"));
+        }
+        fn annotated_return(graph: &crate::model::FunctionGraph) -> (SomeValue, SomeValue) {
+            let ann = RPythonAnnotator::new(None, None, None, false);
+            let registry = CallRegistry::new(ann.bookkeeper.clone());
+            let lifted = function_graph_to_flowspace(graph, &registry)
+                .unwrap_or_else(|err| panic!("lift {}: {err}", graph.name));
+            crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+            let cells = derive_subject_inputcells(graph, Some(&ann.bookkeeper))
+                .unwrap_or_else(|err| panic!("seed {}: {err}", graph.name));
+            assert_eq!(cells.len(), 1, "{}", graph.name);
+            let inputcells: Vec<Option<SomeValue>> = cells.iter().cloned().map(Some).collect();
+            let ret = ann
+                .build_graph_types(&lifted.graph, &inputcells, true)
+                .unwrap_or_else(|err| panic!("annotate {}: {err}", graph.name))
+                .unwrap_or_else(|| panic!("annotate {} returned no value", graph.name));
+            (cells[0].clone(), ret)
+        }
+
+        let wrap_g = crate::front::mir::lower_function(&llbc, "wrap_str_ptr").expect("lower wrap");
+        assert!(
+            !has_ctor(&wrap_g) && returns_input(&wrap_g),
+            "StrPtrKey(p) is the STR pointer; graph={}",
+            wrap_g.dump()
+        );
+        assert!(matches!(input_ty(&wrap_g), ValueType::Str));
+        let (wrap_in, wrap_out) = annotated_return(&wrap_g);
+        assert_somestring(&wrap_in, "wrap input");
+        assert_somestring(&wrap_out, "wrap result");
+
+        let read_g = crate::front::mir::lower_function(&llbc, "read_str_ptr").expect("lower read");
+        assert!(
+            !has_field_read(&read_g)
+                && returns_input(&read_g)
+                && matches!(input_ty(&read_g), ValueType::Str),
+            "StrPtrKey.0 is the STR; graph={}",
+            read_g.dump()
+        );
+        let (read_in, read_out) = annotated_return(&read_g);
+        assert_somestring(&read_in, "field receiver");
+        assert_somestring(&read_out, "field read");
+
+        let recv_g = crate::front::mir::lower_function(&llbc, "recv_str_ptr").expect("lower recv");
+        assert!(
+            matches!(input_ty(&recv_g), ValueType::Str) && returns_input(&recv_g),
+            "&StrPtrKey receiver is the STR word; graph={}",
+            recv_g.dump()
+        );
+        let (recv_in, recv_out) = annotated_return(&recv_g);
+        assert_somestring(&recv_in, "method receiver");
+        assert_somestring(&recv_out, "method result");
+
+        let obj_g = crate::front::mir::lower_function(&llbc, "wrap_obj_ptr").expect("lower obj");
+        let constructs_obj_key = obj_g.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } => name.contains("ObjPtrKey"),
+                OpKind::New { owner } => owner.contains("ObjPtrKey"),
+                _ => false,
+            })
+        });
+        assert!(
+            constructs_obj_key
+                && !returns_input(&obj_g)
+                && !matches!(input_ty(&obj_g), ValueType::Str),
+            "ObjPtrKey stays a class; graph={}",
+            obj_g.dump()
+        );
+
+        assert!(!crate::annotator::model::erased_integer_positional_field(
+            &SomeValue::Char(SomeChar::default()),
+            "__pos_0",
+        ));
+        assert!(crate::annotator::model::erased_integer_positional_field(
+            &SomeValue::String(SomeString::new(false, true)),
+            "__pos_0",
+        ));
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let word = Variable::named("str_word");
+        let startblock = Block::shared(vec![Hlvalue::Variable(word.clone())]);
+        let graph = FunctionGraph::new("erased_str_pos0", startblock.clone());
+        let out = Variable::named("out");
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getattr",
+            vec![
+                Hlvalue::Variable(word),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__pos_0"))),
+            ],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph.into_ref();
+        let annotated = ann
+            .build_graph_types(&graph, &[Some(s_str0())], true)
+            .expect("string __pos_0 must annotate");
+        assert_somestring_flags(&annotated);
+
+        fn assert_somestring_flags(got: &Option<SomeValue>) {
+            let Some(SomeValue::String(s)) = got else {
+                panic!("__pos_0 on SomeString must stay SomeString, got {got:?}");
+            };
+            assert!(s.inner.no_nul);
+            assert!(!s.inner.can_be_none);
+            assert_eq!(
+                s.inner.base.knowntype,
+                crate::annotator::model::KnownType::Str
+            );
+        }
+        rtyper
+            .specialize_more_blocks()
+            .expect("string __pos_0 must rtype");
+        let names: Vec<String> = startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().all(|op| op != "getattr" && op != "getfield")
+                && names.iter().any(|op| op == "same_as"),
+            "STR positional field lowers to same_as, ops={names:?}"
+        );
+    }
+
     /// `SomeBool` walks Integer before Object. The identity is the integer
     /// shell only; a bool has no `__pos_0`.
     #[test]

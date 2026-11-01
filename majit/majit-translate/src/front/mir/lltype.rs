@@ -6273,16 +6273,33 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             } else {
                 return None;
             };
-            // A transparent GC handle wrapping `*mut registered` keeps
-            // the wrapper class (`transparent_deref_target_class` above,
-            // or `Ref(None)` plus the Input class_root). Peeling the
-            // inner pointer would intern the handle as the payload.
-            // STR-family dict-key wrappers (`celldict::StrKey` /
-            // `dictmultiobject::BytesKey`) are the inner STR pointer
-            // (`AbstractTypedStrategy.setitem` unwrap).
-            // `project_struct_field_type` already maps them to `s_str0()`
-            // (`is_str_family_class_root`); peel so construction is that
-            // SomeString, not `objectmodel.instantiate` + setattr `__pos_0`.
+            // The field's low-level value. A STR pointer (`*mut Utf8Str`,
+            // `*mut BytesBlock` — Charon erases the alias) is already
+            // `ValueType::Str`: `tyref_raw_ptr_pointee_is_string_value`
+            // runs before the GC-pointer arm of `tyref_to_value_type_with`.
+            // `registered_gc_ptr_class_root_with` answers for every raw
+            // pointer onto an ADT, which kept the wrapper as `SomeInstance`
+            // while `project_struct_field_type` and the str-family input
+            // seed record `SomeString`. The word is the STR (`ll_strhash`
+            // / `ll_streq`). Construction and `.0` are then the identity.
+            // A `*mut` object pointer (`IdentityKey`, `PyError`) types as
+            // `Ref`, so the GC-handle arm below still keeps the wrapper.
+            let inner = tyref_to_value_type_with(
+                &field.ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
+            if matches!(inner, ValueType::Str) {
+                return Some(inner);
+            }
+            // A STR-pointer field already returned above: the value is
+            // `ValueType::Str` from the field lltype, whatever the
+            // wrapper is named. A registered GC pointer that reaches
+            // this arm is a different word (`IdentityKey`, `PyError`).
+            // Peeling it would intern the handle as the payload, so the
+            // wrapper stays.
             if registered_gc_ptr_class_root_with(
                 &field.ty,
                 llbc,
@@ -6292,20 +6309,9 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             )
             .is_some()
             {
-                // Same predicate `project_struct_field_type` uses. Do
-                // not run `class_identity_spelling`: that crate-peel
-                // turns `other::StrKey` into the family leaf `StrKey`.
-                if !is_str_family_class_root(&decl.item_meta.name_path()) {
-                    return None;
-                }
+                return None;
             }
-            Some(tyref_to_value_type_with(
-                &field.ty,
-                llbc,
-                tombstoned,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            ))
+            Some(inner)
         }
         _ => None,
     }
