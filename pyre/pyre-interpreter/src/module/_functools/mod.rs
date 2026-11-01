@@ -6,9 +6,12 @@
 //! `W_KeyWrapper` below carries the `keyobject` payload shape but is not what
 //! `cmp_to_key` hands out — its `__call__` is generated positional-only, while
 //! `keyobject` takes `obj` by keyword and reports `(obj)` to `inspect`.
-//! `partial` follows PyPy's `lib_pypy/_functools.py`: its public state is
-//! exposed through read-only properties backed by private slots. Placeholder
-//! argument merging follows the Python 3.14 `functools.py` implementation.
+//! `partial` follows the pure-Python `functools.partial` of
+//! `lib-python/3/functools.py`, which PyPy runs (PyPy has no `_functools`):
+//! its public state is exposed through read-only properties backed by private
+//! slots. Placeholder argument merging follows the Python 3.14 `functools.py`
+//! implementation. Its `__call__` is interp-level so the call snapshots the
+//! state first.
 
 use pyre_object::*;
 
@@ -232,6 +235,244 @@ fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     })
 }
 
+fn partial_call(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if args.is_empty() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "descriptor '__call__' of 'functools.partial' object needs an argument",
+        ));
+    }
+    partial_call_impl(args[0], &args[1..], &[], &[])
+}
+
+fn partial_call_args(
+    w_self: PyObjectRef,
+    args: &pyre_interpreter::argument::Arguments,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    partial_call_impl(
+        w_self,
+        &args.arguments_w,
+        args.keyword_names_w.as_deref().unwrap_or(&[]),
+        args.keywords_w.as_deref().unwrap_or(&[]),
+    )
+}
+
+/// `partial_vectorcall`.
+///
+/// [3.15-spec] `partial_vectorcall` reads `fn`, `args` and `kw` before it merges
+/// the call's keywords, so a key whose `__hash__` re-enters `__setstate__`
+/// cannot redirect the call.  PyPy has no `_functools` and calls the
+/// app-level `functools.partial`, whose `**keywords` frame setup hashes
+/// first.  Evidence: `test_functools.TestPartial.test_call_safety_against_reentrant_mutation`.
+fn partial_call_impl(
+    w_self: PyObjectRef,
+    args_w: &[PyObjectRef],
+    keyword_names_w: &[PyObjectRef],
+    keywords_w: &[PyObjectRef],
+) -> pyre_interpreter::PyResult {
+    debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::publish_roots(&[w_self]);
+    let args_base = pyre_object::gc_roots::publish_roots(args_w);
+    let names_base = pyre_object::gc_roots::publish_roots(keyword_names_w);
+    let values_base = pyre_object::gc_roots::publish_roots(keywords_w);
+    pyre_object::gc_roots::normalize_roots(
+        self_slot,
+        1 + args_w.len() + keyword_names_w.len() + keywords_w.len(),
+    );
+    let nargs = args_w.len();
+    let n_call_kw = keyword_names_w.len();
+
+    let pin_new = |obj: PyObjectRef| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        slot
+    };
+    let copy_range = |base: usize, n: usize| {
+        let mut out = vec![pyre_object::PY_NULL; n];
+        pyre_object::gc_roots::shadow_stack_copy_range(base, &mut out);
+        out
+    };
+
+    let func_slot = pin_new(pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "_func",
+    )?);
+    let pto_args_slot = pin_new(pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "_args",
+    )?);
+    let pto_kw_slot = pin_new(pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "_keywords",
+    )?);
+    let phcount_slot = pin_new(pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "_phcount",
+    )?);
+    let merger_slot = pin_new(pyre_interpreter::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        "_merger",
+    )?);
+    let pto_args = pyre_object::gc_roots::shadow_stack_get(pto_args_slot);
+    let pto_kw = pyre_object::gc_roots::shadow_stack_get(pto_kw_slot);
+    let phcount_obj = pyre_object::gc_roots::shadow_stack_get(phcount_slot);
+    if unsafe {
+        !pyre_object::is_tuple(pto_args)
+            || !pyre_object::is_dict(pto_kw)
+            || !pyre_object::is_int(phcount_obj)
+    } {
+        return Err(pyre_interpreter::PyError::type_error(
+            "invalid partial state",
+        ));
+    }
+    let pto_args_len = unsafe { pyre_object::w_tuple_len(pto_args) };
+    let phcount = pyre_interpreter::baseobjspace::int_w(phcount_obj)?;
+    if phcount < 0 || (phcount as u64) > (pto_args_len as u64) {
+        return Err(pyre_interpreter::PyError::type_error(
+            "invalid partial state",
+        ));
+    }
+    if (nargs as i64) < phcount {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "missing positional arguments in 'partial' call; expected at least {phcount}, got {nargs}"
+        )));
+    }
+    let phcount = phcount as usize;
+
+    let pto_items = pyre_interpreter::baseobjspace::fixedview(
+        pyre_object::gc_roots::shadow_stack_get(pto_args_slot),
+        -1,
+    )?;
+    let pto_n = pto_items.len();
+    let pto_items_base = pyre_object::gc_roots::pin_roots(&pto_items);
+    let mut concat = vec![pyre_object::PY_NULL; pto_n + nargs];
+    pyre_object::gc_roots::shadow_stack_copy_range(pto_items_base, &mut concat[..pto_n]);
+    if nargs > 0 {
+        pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut concat[pto_n..]);
+    }
+    let concat_n = concat.len();
+    let concat_base = pyre_object::gc_roots::pin_roots(&concat);
+    let concat_live = copy_range(concat_base, concat_n);
+    let positional = if phcount == 0 {
+        concat_live
+    } else {
+        let concat_tuple_slot = pin_new(pyre_object::w_tuple_new(concat_live));
+        let merged = pyre_interpreter::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(merger_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(concat_tuple_slot)],
+        )?;
+        let merged_slot = pin_new(merged);
+        let merged_items = pyre_interpreter::baseobjspace::fixedview(
+            pyre_object::gc_roots::shadow_stack_get(merged_slot),
+            -1,
+        )?;
+        let merged_n = merged_items.len();
+        let merged_items_base = pyre_object::gc_roots::pin_roots(&merged_items);
+        let rest_n = nargs - phcount;
+        let mut positional = vec![pyre_object::PY_NULL; merged_n + rest_n];
+        pyre_object::gc_roots::shadow_stack_copy_range(
+            merged_items_base,
+            &mut positional[..merged_n],
+        );
+        if rest_n > 0 {
+            pyre_object::gc_roots::shadow_stack_copy_range(
+                args_base + phcount,
+                &mut positional[merged_n..],
+            );
+        }
+        positional
+    };
+    let pos_base = pyre_object::gc_roots::pin_roots(&positional);
+    let pos_n = positional.len();
+
+    let pto_nkw =
+        unsafe { pyre_object::w_dict_len(pyre_object::gc_roots::shadow_stack_get(pto_kw_slot)) };
+    let (kw_names, kw_values) = if pto_nkw == 0 {
+        (
+            copy_range(names_base, n_call_kw),
+            copy_range(values_base, n_call_kw),
+        )
+    } else {
+        let merged_slot = pin_new(unsafe {
+            pyre_object::w_dict_copy(pyre_object::gc_roots::shadow_stack_get(pto_kw_slot))
+        });
+        for i in 0..n_call_kw {
+            pyre_interpreter::baseobjspace::setitem(
+                pyre_object::gc_roots::shadow_stack_get(merged_slot),
+                pyre_object::gc_roots::shadow_stack_get(names_base + i),
+                pyre_object::gc_roots::shadow_stack_get(values_base + i),
+            )?;
+        }
+        let items = unsafe {
+            pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(merged_slot))
+        };
+        let mut names = Vec::with_capacity(items.len());
+        let mut values = Vec::with_capacity(items.len());
+        for (k, v) in items {
+            names.push(k);
+            values.push(v);
+        }
+        (names, values)
+    };
+    let kw_n = kw_names.len();
+    let kw_names_base = pyre_object::gc_roots::pin_roots(&kw_names);
+    let kw_values_base = pyre_object::gc_roots::pin_roots(&kw_values);
+    let pos_now = copy_range(pos_base, pos_n);
+    if kw_n == 0 {
+        pyre_interpreter::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+            &pos_now,
+        )
+    } else {
+        let names_now = copy_range(kw_names_base, kw_n);
+        let values_now = copy_range(kw_values_base, kw_n);
+        pyre_interpreter::call::call_args(
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+            &pyre_interpreter::argument::Arguments::with_kw(&pos_now, &names_now, &values_now),
+        )
+    }
+}
+
+/// True when `object` is an instance of a `partial` class this module minted:
+/// some class in `type(object)`'s MRO carries this `__call__` builtin in its
+/// own type dict.  The class object itself is not stored; `_functools` can be
+/// initialised more than once and each run produces a new class.
+fn is_partial_instance(object: PyObjectRef) -> bool {
+    let Some(w_type) = pyre_interpreter::typedef::r#type(object) else {
+        return false;
+    };
+    let mro_ptr = unsafe { pyre_object::typeobject::w_type_get_mro(w_type.as_ptr()) };
+    if mro_ptr.is_null() {
+        return false;
+    }
+    for &cls in unsafe { (*mro_ptr).as_slice() } {
+        let Some(descr) = pyre_interpreter::type_dict_lookup(cls, "__call__") else {
+            continue;
+        };
+        if unsafe { !pyre_interpreter::is_function(descr) } {
+            continue;
+        }
+        let code = unsafe { pyre_interpreter::function::getcode(descr) };
+        if code.is_null() || unsafe { !pyre_interpreter::is_builtin_code(code) } {
+            continue;
+        }
+        let func = unsafe { pyre_interpreter::builtin_code_get(code) };
+        if pyre_interpreter::gateway::builtin_code_fn_eq(
+            func,
+            partial_call as pyre_interpreter::BuiltinCodeFn,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+static PARTIAL_CALL_OWNER: pyre_interpreter::gateway::MethodOwner =
+    pyre_interpreter::gateway::MethodOwner {
+        type_name: "functools.partial",
+        is_instance: Some(is_partial_instance),
+    };
+
 pyre_interpreter::py_module! {
     "_functools",
     inline_app: {
@@ -393,27 +634,6 @@ class partial:
             raise TypeError("a partial object's dictionary may not be deleted")
         object.__delattr__(self, name)
 
-    def __call__(self, /, *args, **keywords):
-        # `partial_vectorcall` / `partial_call` snapshot `fn`, `args`, and
-        # `kw` before merging or calling, so a reentrant `__setstate__`
-        # cannot replace them mid-call.
-        func = self.func
-        pto_args = self.args
-        pto_keywords = self.keywords
-        phcount = self._phcount
-        merger = self._merger
-        if phcount:
-            try:
-                pto_args = merger(pto_args + args)
-                args = args[phcount:]
-            except IndexError:
-                raise TypeError(
-                    "missing positional arguments in 'partial' call; "
-                    f"expected at least {phcount}, got {len(args)}"
-                )
-        keywords = {**pto_keywords, **keywords}
-        return func(*pto_args, *args, **keywords)
-
     def __get__(self, obj, objtype=None):
         if obj is None:
             return self
@@ -498,6 +718,43 @@ cmp_to_key = staticmethod(cmp_to_key)
             function = pyre_interpreter::gateway::function_set_null_positional_defaults(function, 1);
             pyre_interpreter::__pyre_store!(ns, "reduce", function);
         }
+        let Some(partial_cls) = (unsafe { pyre_object::w_dict_getitem_str(ns, "partial") }) else {
+            return Err(pyre_interpreter::PyError::type_error(
+                "_functools.partial is missing",
+            ));
+        };
+        let roots = pyre_object::gc_roots::push_roots();
+        let partial_slot = roots.base();
+        let _ = roots.pin_root(partial_cls);
+        let wrapper = pyre_interpreter::gateway::make_method_descriptor_passthrough1_with_doc(
+            "__call__",
+            partial_call,
+            partial_call_args,
+            "Call self as a function.",
+        );
+        let wrapper_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(wrapper);
+        let code = unsafe { pyre_interpreter::function::getcode(roots.get(wrapper_slot)) };
+        unsafe {
+            pyre_interpreter::gateway::builtin_code_set_owner(code, &PARTIAL_CALL_OWNER);
+        }
+        let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_str_new("partial.__call__"));
+        unsafe {
+            pyre_interpreter::function::function_set_qualname(
+                roots.get(wrapper_slot),
+                roots.get(qualname_slot),
+            );
+            pyre_interpreter::function::function_set_objclass(
+                roots.get(wrapper_slot),
+                roots.get(partial_slot),
+            );
+        }
+        pyre_interpreter::baseobjspace::setattr_str(
+            roots.get(partial_slot),
+            "__call__",
+            roots.get(wrapper_slot),
+        )?;
     },
 }
 

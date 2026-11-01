@@ -122,11 +122,49 @@ fn rlim_as_w(v: libc::rlim_t) -> pyre_object::PyObjectRef {
     }
 }
 
-/// Convert each limit with `uint_w` so a negative is ValueError
-/// (`test_resource.ResourceTest.test_fsize_negative`) and a value wider
-/// than `rlim_t` is OverflowError. `RLIM_INFINITY` fits `rlim_t`.
+/// [3.15-spec] `resource.c py2rlim` ↔ `lib_pypy/_resource_build.py
+/// my_setrlimit` (`& RLIM_INFINITY` mask, PyPy). `PyNumber_Index`, then
+/// a negative value whose two's-complement `rlim_t` equals
+/// `RLIM_INFINITY` warns and becomes infinity; any other negative is
+/// ValueError `"Cannot convert negative int"`; a non-negative value
+/// wider than `rlim_t` is OverflowError.
 fn rlim_w(obj: pyre_object::PyObjectRef) -> Result<libc::rlim_t, pyre_interpreter::PyError> {
-    let v = pyre_interpreter::baseobjspace::uint_w(obj)?;
+    let mut w = pyre_interpreter::baseobjspace::space_index(obj)?;
+    let as_i64 = unsafe {
+        if pyre_object::pyobject::is_int(w) {
+            Some(pyre_object::intobject::w_int_get_value(w))
+        } else if pyre_object::pyobject::is_long(w) {
+            let big = pyre_object::w_long_get_value(w);
+            if pyre_object::longobject::jit_bigint_to_i64_fits(big) != 0 {
+                Some(pyre_object::longobject::jit_bigint_to_i64_value(big))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    let negative = match as_i64 {
+        Some(v) => v < 0,
+        None => unsafe {
+            pyre_object::pyobject::is_long(w) && pyre_object::w_long_get_value(w).get_sign() < 0
+        },
+    };
+    if negative {
+        if let Some(v) = as_i64 {
+            if (v as u64) as libc::rlim_t == libc::RLIM_INFINITY {
+                // `warn_deprecation` runs Python; `w` is not used after it.
+                pyre_interpreter::warn::warn_deprecation(
+                    "Use RLIM_INFINITY instead of negative limit value.",
+                )?;
+                return Ok(libc::RLIM_INFINITY);
+            }
+        }
+        return Err(pyre_interpreter::PyError::value_error(
+            "Cannot convert negative int",
+        ));
+    }
+    let v = pyre_object::with_roots!(w => pyre_interpreter::baseobjspace::uint_w(w))?;
     libc::rlim_t::try_from(v).map_err(|_| {
         pyre_interpreter::PyError::overflow_error("Python int too large to convert to C rlim_t")
     })

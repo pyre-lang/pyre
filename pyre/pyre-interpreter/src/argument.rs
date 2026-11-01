@@ -273,11 +273,12 @@ pub fn check_not_duplicate_kwargs(
 ///         i += 1
 /// ```
 ///
-/// `_do_combine_starstarargs_wrapped` — when `is_dict` is true (an exact
+/// `_do_combine_starstarargs_wrapped` — when `values_w` is `Some` (an exact
 /// `dict`, or a `dict` subclass whose `__iter__` is still `dict.__iter__`),
-/// the value is read through `dict_getitem` on the original `w_key`.
-/// The seen-set still records `text_w` (`key in seen`). The other arm is
-/// `space.getitem`, so a mapping's `__getitem__` override runs.
+/// the value for key `i` is `values_w[i]` from the caller's one walk of the
+/// entries. The seen-set still records `text_w` (`key in seen`). When
+/// `values_w` is `None`, the value is `space.getitem`, so a mapping's
+/// `__getitem__` override runs.
 ///
 /// `keyword_names_w` / `keywords_w` are the caller's two output lists
 /// (`[None] * len(keys_w)` in `_combine_starstarargs_wrapped`), passed as
@@ -288,7 +289,7 @@ pub fn do_combine_starstarargs_wrapped(
     keyword_names_w: usize,
     keywords_w: usize,
     existingkeywords_w: Option<&[PyObjectRef]>,
-    is_dict: bool,
+    values_w: Option<&[PyObjectRef]>,
     w_function: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     // argument.py `seen = {}` — Python dict with None values.  Map
@@ -297,8 +298,8 @@ pub fn do_combine_starstarargs_wrapped(
     // present-but-unread per `seen[key] = None` at line 446).
     let mut seen: std::collections::HashMap<rustpython_wtf8::Wtf8Buf, ()> =
         std::collections::HashMap::new();
-    // The per-key value lookup below runs `__getitem__` (or the dict
-    // descriptor, which hashes the key), so every turn is a collection point.
+    // The per-key value lookup below runs `__getitem__` when `values_w` is
+    // None, so every turn is a collection point.
     // `gctransform/framework.py push_roots` stores every live GCREF before
     // that call; `pop_roots` / `expand_pop_roots` writes each one back.
     // `argument.py _do_combine_starstarargs_wrapped` writes
@@ -309,11 +310,14 @@ pub fn do_combine_starstarargs_wrapped(
     let _roots = pyre_object::gc_roots::push_roots();
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
     let n = keys_w.len();
+    let values_slice = values_w.unwrap_or(&[]);
+    debug_assert!(values_w.is_none() || values_slice.len() == n);
     let root_base = pyre_object::gc_roots::publish_roots(&[w_starstararg, w_function]);
     let existing_base =
         pyre_object::gc_roots::publish_roots(existingkeywords_w.unwrap_or_default());
     let keys_base = pyre_object::gc_roots::publish_roots(keys_w);
-    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + n);
+    let values_base = pyre_object::gc_roots::publish_roots(values_slice);
+    pyre_object::gc_roots::normalize_roots(root_base, 2 + existing_len + n + values_slice.len());
     let w_starstararg = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let w_function = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     let mut existing_now = vec![pyre_object::PY_NULL; existing_len];
@@ -350,10 +354,10 @@ pub fn do_combine_starstarargs_wrapped(
         let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
         // argument.py — `keyword_names_w[i] = w_key`.
         pyre_object::gc_roots::shadow_stack_set(keyword_names_w + i, w_key);
-        // argument.py — `dict_getitem` / `space.getitem`. A str subclass is
-        // probed as `w_key`; the WTF-8 `seen` key is the wrong probe.
-        let w_value = if is_dict {
-            crate::type_methods::dict_getitem(w_starstararg(), w_key)?
+        // argument.py — `space.getitem` when `values_w` is None. A str subclass
+        // is probed as `w_key`; the WTF-8 `seen` key is the wrong probe.
+        let w_value = if values_w.is_some() {
+            pyre_object::gc_roots::shadow_stack_get(values_base + i)
         } else {
             crate::baseobjspace::getitem(w_starstararg(), w_key)?
         };
@@ -587,8 +591,30 @@ pub fn combine_starstarargs_wrapped(
             }
         }
     };
+    let mut dict_values_w: Vec<PyObjectRef> = Vec::new();
     let keys_w: Vec<PyObjectRef> = if is_dict {
-        crate::baseobjspace::unpackiterable(w_starstararg(), -1)?
+        // [3.15-spec] An exact dict, or a dict subclass that keeps `dict.__iter__`,
+        // hands over its entries in one walk and no key is hashed again;
+        // `_combine_starstarargs_wrapped` (`argument.py`) unpacks the keys and reads
+        // each value back through `dict_getitem`, which runs a str subclass's
+        // `__hash__` at the call site.  `_PyStack_UnpackDict` walks the entries.
+        // Evidence: `test_functools.TestPartial.test_call_safety_against_reentrant_mutation`.
+        // Neither `_combine_starstarargs_wrapped` nor `_do_combine_starstarargs_wrapped`
+        // carries a `@jit.*` hint.
+        let dict = crate::type_methods::resolve_dict_backing(w_starstararg());
+        let dict = pyre_object::gc_roots::pin_root(if dict.is_null() {
+            w_starstararg()
+        } else {
+            dict
+        });
+        let items = unsafe { pyre_object::w_dict_items(dict) };
+        let mut keys_w = Vec::with_capacity(items.len());
+        dict_values_w.reserve(items.len());
+        for (k, v) in items {
+            keys_w.push(k);
+            dict_values_w.push(v);
+        }
+        keys_w
     } else {
         // argument.py:131-138 — the `try` covers the whole
         // `space.call_method(w_starstararg, "keys")`, so an
@@ -645,7 +671,7 @@ pub fn combine_starstarargs_wrapped(
         keyword_names_w,
         keywords_w,
         existing,
-        is_dict,
+        if is_dict { Some(&dict_values_w) } else { None },
         w_function(),
     )?;
     // argument.py:145-150 — merge into the running output buffers.

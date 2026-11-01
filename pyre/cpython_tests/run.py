@@ -767,7 +767,7 @@ _RESOURCE_MODULE_DRIVER = (
 # libregrtest over the whole suite (measured: 491 modules on CPython 3.14,
 # 492 here), so script mode can only ever time out on it.
 #
-# Two 3.15 tests fail as __main__ on CPython 3.15.0 too and pass when imported
+# Four 3.15 tests fail as __main__ on CPython 3.15.0 too and pass when imported
 # as `test.<name>` (measured): test_complex's `test_constructor` re-emits a
 # caught warning with `__main__`'s globals, and `warnings.warn_explicit` then
 # asks the frozen-only loader of `importlib._bootstrap_external` for its
@@ -775,15 +775,19 @@ _RESOURCE_MODULE_DRIVER = (
 # `test_import_filter_syntax_warnings_by_module` fails its
 # `import test_pkg.test_mod` with "'test_pkg' is not a package" when the
 # file's own directory is on `sys.path`, where `test/test_pkg.py` shadows the
-# zip's package.
+# zip's package. test_extcall's and test_unpack_ex's doctests expect
+# `test.test_extcall.f()`-style qualified names in their tracebacks, which name
+# `__main__` when the file runs as a script.
 DOTTED_IDENTITY_MODULES = {
     "test.test_complex",
     "test.test_descr",
     "test.test_enum",
+    "test.test_extcall",
     "test.test_regrtest",
     "test.test_runpy",
     "test.test_thread",
     "test.test_threading",
+    "test.test_unpack_ex",
     "test.test_zipimport_support",
 }
 

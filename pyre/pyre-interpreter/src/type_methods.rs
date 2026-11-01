@@ -6525,38 +6525,6 @@ fn dict_lookup_checked(
     }
 }
 
-/// `descroperation.py dict_getitem` — the `dict.__getitem__` descriptor
-/// `_do_combine_starstarargs_wrapped` call. Reads the backing
-/// mapping so a subclass `__getitem__` is skipped. A miss is
-/// `raise_key_error` (`KeyError(w_key)`).
-///
-/// The lookup hashes `w_key` and can collect; both operands are rooted
-/// across it.
-pub(crate) fn dict_getitem(
-    w_dict: PyObjectRef,
-    w_key: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_dict, w_key]);
-    let backing = resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(base));
-    let found = if backing.is_null() {
-        None
-    } else {
-        let backing_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(backing);
-        dict_lookup_checked(
-            pyre_object::gc_roots::shadow_stack_get(backing_slot),
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-        )?
-    };
-    match found {
-        Some(v) => Ok(v),
-        None => Err(crate::PyError::key_error_with_key(
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-        )),
-    }
-}
-
 pub(crate) fn dict_store_checked(
     mut dict: PyObjectRef,
     mut key: PyObjectRef,
