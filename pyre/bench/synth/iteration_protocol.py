@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=36
-N = 900000
+# pyre-check: max-pypy-ratio=16
+N = 3600000
 
 
 class CountDown:

@@ -4120,6 +4120,18 @@ fn register_shared_pyobject_w_class_in(
     for name in names {
         let key = LLType::Struct(path_hash(name));
         let parent = gc.get_size_descr(key.clone(), size, 0, false);
+        // `descr.py get_size_descr` assigns
+        // `heaptracker.all_fielddescrs(STRUCT)` onto the SizeDescr it
+        // mints; `typeptr` (`ob_type`) is skipped, which leaves `w_class`
+        // alone at index 0, as the leaf's `index_in_parent` says.
+        if parent
+            .as_size_descr()
+            .is_some_and(|sd| sd.all_fielddescrs().is_empty())
+        {
+            let listed = majit_ir::descr::SimpleSizeDescr::new(u32::MAX, size, 0)
+                .with_all_fielddescrs(vec![fd.clone() as Arc<dyn FieldDescr>]);
+            gc.register_keyed_size(key.clone(), Arc::new(listed));
+        }
         if fd.get_parent_descr().is_none() {
             fd.set_parent_descr(&parent);
         }

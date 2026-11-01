@@ -248,7 +248,10 @@ impl SomePtr {
         let example = self.ll_ptrtype._example();
         match example._lookup_adtmeth(attr) {
             Err(lltype::AttributeError) => match example.getattr(attr) {
-                Ok(v) => Ok(ll_to_annotation(v)),
+                Ok(v) => {
+                    let s = ll_to_annotation(v);
+                    Ok(gc_class_root_ptr_as_instance(&s).unwrap_or(s))
+                }
                 // A raw-pointer `p.is_null()` whose receiver keeps its
                 // `SomePtr` tag (e.g. the `*mut u8` opaque GCREF from
                 // `try_gc_alloc_stable_raw`, `TO: Opaque(GCREF)`) reaches
@@ -340,6 +343,40 @@ impl SomePtr {
         }
         Ok(SomeValue::Impossible)
     }
+}
+
+/// A field read off a raw struct whose value points at a GC struct that is
+/// a class root (`Terminator.w_cls: *mut PyObject` in the raw `MapNode`)
+/// reads as that class's nullable instance. It is the annotation
+/// `project_struct_field_type` gives the same field type on a GC owner, so
+/// the value meets the owner-side reads of that class at a merge.
+fn gc_class_root_ptr_as_instance(s: &SomeValue) -> Option<SomeValue> {
+    let SomeValue::Ptr(p) = s else {
+        return None;
+    };
+    let lltype::PtrTarget::Struct(st) = &p.ll_ptrtype.TO else {
+        return None;
+    };
+    if st._gckind != lltype::GcKind::Gc {
+        return None;
+    }
+    let bk = bookkeeper::getbookkeeper()?;
+    let registered = bk
+        .struct_fields
+        .borrow()
+        .as_ref()
+        .is_some_and(|reg| reg.fields.contains_key(st._name.as_str()));
+    if !registered {
+        return None;
+    }
+    let classdef = bk.getuniqueclassdef_for_struct_root(&st._name).ok()?;
+    Some(SomeValue::Instance(
+        crate::annotator::model::SomeInstance::new(
+            Some(classdef),
+            true,
+            std::collections::BTreeMap::new(),
+        ),
+    ))
 }
 
 /// Named scalar fields of `rust_vec_lltype`'s `Struct(raw) "RustVec"`
@@ -1228,5 +1265,60 @@ mod tests {
                 ._container_example(),
         ));
         let _ = ll_to_annotation(value);
+    }
+
+    /// A raw struct field pointing at a registered GC class root reads as
+    /// that class's nullable instance; a GC struct with no registry rows
+    /// stays `SomePtr`.
+    #[test]
+    fn raw_struct_field_to_gc_class_root_reads_as_instance() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use std::rc::Rc;
+        let bk = Rc::new(Bookkeeper::new());
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "PyObject".to_string(),
+            vec![("w_class".to_string(), "*mut PyObject".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let _pos = bk.at_position(None);
+
+        let gc_ptr = |name: &str| {
+            lltype::LowLevelType::Ptr(Box::new(lltype::Ptr {
+                TO: lltype::PtrTarget::Struct(lltype::Struct::gc(
+                    name,
+                    vec![("w_class".into(), lltype::LowLevelType::Signed)],
+                )),
+            }))
+        };
+        let terminator = SomePtr::new(lltype::Ptr {
+            TO: lltype::PtrTarget::Struct(lltype::Struct::new(
+                "Terminator",
+                vec![
+                    ("w_cls".into(), gc_ptr("PyObject")),
+                    ("other".into(), gc_ptr("Unregistered")),
+                ],
+            )),
+        });
+        let attr = |name: &str| {
+            crate::annotator::bookkeeper::immutablevalue(&ConstValue::byte_str(name)).unwrap()
+        };
+
+        let SomeValue::Instance(w_cls) = terminator.getattr(&attr("w_cls")).unwrap() else {
+            panic!("w_cls must read as an instance");
+        };
+        assert!(w_cls.can_be_none);
+        let root = bk.getuniqueclassdef_for_struct_root("PyObject").unwrap();
+        assert!(
+            w_cls
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &root))
+        );
+
+        assert!(matches!(
+            terminator.getattr(&attr("other")).unwrap(),
+            SomeValue::Ptr(_)
+        ));
     }
 }

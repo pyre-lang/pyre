@@ -1081,8 +1081,11 @@ impl W_ListObject {
 
 /// Recompute the emulated `list_resize` `allocated` after a resize left its
 /// band; the residual target of `W_ListObject::sync_allocated`'s
-/// `jit.conditional_call`.
-#[majit_macros::dont_look_inside]
+/// `jit.conditional_call`. It only stores an integer field, so it is declared
+/// EF_CANNOT_RAISE: a raising effect would put a `guard_no_exception` after the
+/// `cond_call`, and that guard forces the pending `length` setfield of the
+/// append in progress (`pyjitpl.py do_conditional_call`, `check_can_raise`).
+#[majit_macros::dont_look_inside_cannot_raise]
 pub unsafe fn w_list_resync_allocated(obj: PyObjectRef, old_size: i64, new_size: i64) {
     let list = &mut *(obj as *mut W_ListObject);
     list.allocated = list.resized_allocation(old_size as usize, new_size as usize) as isize;
