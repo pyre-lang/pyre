@@ -14,8 +14,9 @@
 //! (`RawMalloc` / `RawStore` / `RawFree`). `history.py` `getkind` banks
 //! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
 //! Two borrows of one place share that address. A raw pointer of that
-//! place uses the same address. A raw pointer with no referent is not
-//! lowered. A raw pointer taken while its local is still clean reloads
+//! place uses the same address. A raw pointer of another primitive
+//! place (`&raw mut other`) is a second address. A raw pointer with no
+//! referent is not lowered. A raw pointer taken while its local is still clean reloads
 //! a later store of the address, including through a callee that
 //! returns that load and through a field that holds the pointer. A
 //! borrow of a field or a constant index names that path
@@ -32,9 +33,10 @@
 //! (`attach_aliasing_raw_arguments`). A pointer packed into a tuple,
 //! struct, or array stays on the caller's place
 //! (`local_hides_spill_alias`), so that call stays unlowered. An
-//! address-sized integer whose place this walk cannot name stays
-//! unlowered (`spill_address_source`): `pair.0`, a parameter, and a
-//! call result. An integer literal still lowers. `[q; N]` keeps `q`'s
+//! address-sized integer that is a call result, arithmetic, or
+//! `pair.0` stays unlowered (`spill_address_source`). A parameter that
+//! is a plain integer stays the caller's value (`hash_known`). An
+//! integer literal still lowers. `[q; N]` keeps `q`'s
 //! referent on each element (`repeat_slots`). A union folds that
 //! referent onto the local (`rvalue_referent`); its fields overlap, so
 //! they are not split (`aggregate_slots`). A store through an index
@@ -136,6 +138,15 @@ fn call_leaf(target: &CallTarget) -> Option<&str> {
         CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
         CallTarget::Method { name, .. } => Some(name.as_str()),
         _ => None,
+    }
+}
+
+/// Residual generic calls name `leaf__inst_<types>`
+/// (`residual_generic_fun_segments` / `template_callable_leaf`).
+fn callable_leaf_stem(leaf: &str) -> &str {
+    match leaf.split_once("__inst_") {
+        Some((stem, rest)) if !stem.is_empty() && !rest.is_empty() => stem,
+        _ => leaf,
     }
 }
 
@@ -739,9 +750,87 @@ enum Pass {
     Direct { ret_local: u64 },
     /// Copy the word, then pass `&mut` of the original, then return the copy.
     CopyThenMutBorrow,
+    /// rustc `&mut word` coerced to `*mut T`: `_r = &mut word; _p = &raw mut (*_r)`.
+    MutBorrowThenRawPtr,
 }
 
 fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass) -> FunctionGraph {
+    lower_probe_with(word_name, word_ty, sink_param, pass, false)
+}
+
+fn lower_probe_with(
+    word_name: &str,
+    word_ty: &Value,
+    sink_param: &Value,
+    pass: Pass,
+    dont_look_inside: bool,
+) -> FunctionGraph {
+    lower_probe_cfg(
+        word_name,
+        word_ty,
+        sink_param,
+        pass,
+        dont_look_inside,
+        None,
+        &[],
+    )
+}
+
+fn type_var_q() -> Value {
+    json!({"TypeVar": {"Bound": [0, 0]}})
+}
+
+fn pair_struct_ty() -> Value {
+    json!({"Adt": {
+        "id": 0,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }})
+}
+
+fn pair_struct_decl() -> Value {
+    named_decl(
+        0,
+        &["probe", "Pair"],
+        json!({"Struct": [
+            field_decl("a", &i64_ty()),
+            field_decl("b", &i64_ty()),
+        ]}),
+    )
+}
+
+fn lower_generic_q_probe(
+    word_name: &str,
+    word_ty: &Value,
+    pass: Pass,
+    dont_look_inside: bool,
+    q_arg: &Value,
+    type_decls: &[Value],
+) -> FunctionGraph {
+    let kind = match &pass {
+        Pass::Borrow { kind, .. } => *kind,
+        Pass::CopyThenMutBorrow | Pass::MutBorrowThenRawPtr => "Mut",
+        Pass::Direct { .. } => "Shared",
+    };
+    lower_probe_cfg(
+        word_name,
+        word_ty,
+        &borrow_ty(&type_var_q(), kind),
+        pass,
+        dont_look_inside,
+        Some(q_arg),
+        type_decls,
+    )
+}
+
+fn lower_probe_cfg(
+    word_name: &str,
+    word_ty: &Value,
+    sink_param: &Value,
+    pass: Pass,
+    dont_look_inside: bool,
+    generic_q: Option<&Value>,
+    type_decls: &[Value],
+) -> FunctionGraph {
     let span = json!({"data": {"file_id": 0,
         "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
     let meta = |path: &[&str]| {
@@ -751,7 +840,12 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
             "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
         })
     };
-    let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let generics = match generic_q {
+        Some(q) => {
+            json!({"regions": [], "types": [q], "const_generics": [], "trait_refs": []})
+        }
+        None => json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []}),
+    };
     let ret = i64_ty();
     // Narrower than a pointer. An address-sized integer parameter beside
     // the spill stays unlowered (`spill_address_source`).
@@ -814,6 +908,30 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                 3,
             )
         }
+        Pass::MutBorrowThenRawPtr => {
+            let borrowed = borrow_ty(word_ty, "Mut");
+            let raw = raw_ptr(word_ty, "Mut");
+            locals.push(local(3, None, &borrowed));
+            locals.push(local(4, None, &raw));
+            locals.push(local(5, None, &ret));
+            let word = place(2, word_ty);
+            let borrow = place(3, &borrowed);
+            let raw_place = place(4, &raw);
+            let deref = json!({"kind": {"Projection": [borrow.clone(), "Deref"]}, "ty": word_ty});
+            (
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow, {"Ref": {
+                        "place": word, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [raw_place.clone(), {"RawPtr": {
+                        "place": deref, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw_place})],
+                place(5, &ret),
+                2,
+            )
+        }
     };
     let ret_place_ty = if ret_local == 1 {
         flag.clone()
@@ -846,15 +964,38 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
         ]}}),
     );
     let params = vec![flag.clone(), sink_param.clone()];
-    let sink = fun(
+    let mut sink = fun(
         1,
         &["probe", "sink_pair"],
         params.clone(),
         idle_body(&ret, &params),
     );
+    if generic_q.is_some() {
+        sink["generics"] = json!({
+            "regions": [],
+            "types": [{"index": 0, "name": "Q"}],
+            "const_generics": [],
+            "trait_clauses": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "trait_type_constraints": []
+        });
+    }
+    let mut global_decls = Vec::new();
+    if dont_look_inside {
+        // `_jit_look_inside_<leaf>` bool false is `dont_look_inside`
+        // (`harvest_hints_from_llbcs` / `fun_decl_is_dont_look_inside`).
+        global_decls.push(json!({
+            "def_id": 0,
+            "item_meta": meta(&["probe", "_jit_look_inside_sink_pair"]),
+            "global_kind": "NamedConst",
+            "ty": {"Scalar": "Bool"},
+            "value": [{"Bool": false}, {"Scalar": "Bool"}]
+        }));
+    }
     let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
-        "crate_name": "probe", "type_decls": [], "fun_decls": [caller, sink],
-        "global_decls": [], "trait_decls": [], "trait_impls": []
+        "crate_name": "probe", "type_decls": type_decls, "fun_decls": [caller, sink],
+        "global_decls": global_decls, "trait_decls": [], "trait_impls": []
     }});
     let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
     lower_function(&llbc, "write_hash").unwrap_or_else(|err| panic!("lower write_hash: {err}"))
@@ -891,7 +1032,7 @@ fn sink_call(graph: &FunctionGraph) -> &OpKind {
         let OpKind::Call { target, .. } = &op.kind else {
             continue;
         };
-        if call_leaf(target) == Some("sink_pair") {
+        if call_leaf(target).is_some_and(|leaf| callable_leaf_stem(leaf) == "sink_pair") {
             assert!(found.is_none(), "two sink_pair calls\n{}", op_lines(graph));
             found = Some(&op.kind);
         }
@@ -1079,6 +1220,141 @@ fn mut_borrow_of_i64_passed_to_raw_pointer_reloads_the_word() {
     assert_address_spill(&graph, true, true);
 }
 
+/// rustc `&mut keyhash` into `hash_out: *mut i64` is `_r = &mut keyhash;
+/// _p = &raw mut (*_r)`. The call operand is already a raw pointer whose
+/// value is the aliased word; that pointer still has to be spilled.
+#[test]
+fn rustc_mut_borrow_coerced_to_raw_pointer_spills_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::MutBorrowThenRawPtr,
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+/// `w_dict_object_setitem_callback_free(obj, key, keyhash, hash_known,
+/// value, &mut keyhash)` after rustc's `&mut` → `*mut i64` coercion.
+/// `obj` / `value` are raw ADT pointers, `keyhash` is the spilled word,
+/// and `hash_known` is another address-sized integer. None of those is
+/// the spill address.
+#[test]
+fn coerced_raw_pointer_beside_object_and_hash_word_spills() {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let obj_ty = adt_ty(0, vec![]);
+    let obj_ptr = raw_ptr(&obj_ty, "Mut");
+    let borrowed = borrow_ty(&word, "Mut");
+    let hash_out_ty = raw_ptr(&word, "Mut");
+    let obj = place(1, &obj_ptr);
+    let hash = place(2, &word);
+    let hash_known = place(3, &word);
+    let value = place(4, &obj_ptr);
+    let keyhash = place(5, &word);
+    let borrow = place(6, &borrowed);
+    let raw = place(7, &hash_out_ty);
+    let dest = place(8, &ret);
+    let deref = json!({"kind": {"Projection": [borrow.clone(), "Deref"]}, "ty": word});
+    let caller = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "write_hash"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [obj_ptr.clone(), word.clone(), word.clone(), obj_ptr.clone()],
+            "output": ret.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 4, "locals": vec![
+                local(0, None, &ret),
+                local(1, Some("obj"), &obj_ptr),
+                local(2, Some("hash"), &word),
+                local(3, Some("hash_known"), &word),
+                local(4, Some("value"), &obj_ptr),
+                local(5, Some("keyhash"), &word),
+                local(6, None, &borrowed),
+                local(7, None, &hash_out_ty),
+                local(8, None, &ret),
+            ]},
+            "body": [
+                {"statements": [
+                    {"span": span, "kind": {"Assign": [
+                        keyhash.clone(),
+                        {"Use": [{"Copy": hash.clone()}, "Yes"]}
+                    ]}},
+                    {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": keyhash.clone(), "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                    {"span": span, "kind": {"Assign": [raw.clone(), {"RawPtr": {
+                        "place": deref, "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                ], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                        "args": [
+                            {"Copy": obj},
+                            {"Copy": keyhash},
+                            {"Copy": hash_known},
+                            {"Copy": value},
+                            {"Move": raw}
+                        ],
+                        "dest": dest.clone()},
+                    "target": 1, "on_unwind": 2
+                }}}},
+                {"statements": [{"span": span, "kind": {"Assign": [
+                    place(0, &ret),
+                    {"Use": [{"Copy": dest}, "Yes"]}
+                ]}}], "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }}
+    });
+    let params = vec![
+        obj_ptr.clone(),
+        word.clone(),
+        word.clone(),
+        obj_ptr,
+        hash_out_ty,
+    ];
+    let sink = json!({
+        "def_id": 1,
+        "item_meta": meta(&["probe", "sink_pair"]),
+        "signature": {"is_unsafe": false, "inputs": params.clone(), "output": ret.clone()},
+        "body": idle_body(&ret, &params)
+    });
+    let decls = json!([{
+        "def_id": 0,
+        "item_meta": meta(&["probe", "Obj"]),
+        "kind": {"Struct": [field_decl("pad", &word)]},
+        "src": "Normal"
+    }]);
+    let graph = probe_graph(decls, json!([caller, sink]), "write_hash");
+    let call = sink_call(&graph);
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spill address\n{}", op_lines(&graph));
+    assert_eq!(call_arg(call, 4), &ptrs[0], "hash_out is the spill");
+    assert_ne!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "keyhash stays the word\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(
+        call_arg(call, 2),
+        &ptrs[0],
+        "hash_known stays the word\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(
+        call_arg(call, 0),
+        &ptrs[0],
+        "obj stays the object pointer\n{}",
+        op_lines(&graph)
+    );
+}
+
 #[test]
 fn pre_call_copy_keeps_the_word_the_borrow_reloads() {
     let word = i64_ty();
@@ -1171,6 +1447,247 @@ fn raw_scalar_address_spill_leaves_other_arguments_as_the_word() {
             op_lines(&graph)
         );
     }
+}
+
+#[test]
+fn residual_shared_borrow_of_i64_spills_the_address() {
+    let word = i64_ty();
+    let graph = lower_probe_with(
+        "keyhash",
+        &word,
+        &borrow_ty(&word, "Shared"),
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 2,
+        },
+        true,
+    );
+    assert_address_spill(&graph, false, false);
+}
+
+#[test]
+fn looked_inside_shared_borrow_of_i64_stays_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &borrow_ty(&word, "Shared"),
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 2,
+        },
+    );
+    assert_no_raw_address(&graph, "looked-inside &i64");
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), input_var(&graph, "flag"));
+    assert_eq!(
+        call_arg(call, 1),
+        input_var(&graph, "keyhash"),
+        "looked-inside &i64 stays the word\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn residual_mut_borrow_of_i64_spills_and_copies_out() {
+    let word = i64_ty();
+    let graph = lower_probe_with(
+        "keyhash",
+        &word,
+        &borrow_ty(&word, "Mut"),
+        Pass::Borrow {
+            kind: "Mut",
+            ret_local: 2,
+        },
+        true,
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn residual_generic_q_of_i64_spills_the_address() {
+    let word = i64_ty();
+    let graph = lower_generic_q_probe(
+        "keyhash",
+        &word,
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 2,
+        },
+        true,
+        &word,
+        &[],
+    );
+    assert_address_spill(&graph, false, false);
+}
+
+#[test]
+fn residual_generic_q_of_struct_does_not_spill() {
+    let pair = pair_struct_ty();
+    let decl = pair_struct_decl();
+    let graph = lower_generic_q_probe(
+        "pair",
+        &pair,
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 1,
+        },
+        true,
+        &pair,
+        std::slice::from_ref(&decl),
+    );
+    assert_no_raw_address(&graph, "generic dont_look_inside &Q with Q a struct");
+}
+
+#[test]
+fn looked_inside_generic_q_of_i64_stays_the_word() {
+    let word = i64_ty();
+    let graph = lower_generic_q_probe(
+        "keyhash",
+        &word,
+        Pass::Borrow {
+            kind: "Shared",
+            ret_local: 2,
+        },
+        false,
+        &word,
+        &[],
+    );
+    assert_no_raw_address(&graph, "looked-inside generic &Q with Q = i64");
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), input_var(&graph, "flag"));
+    assert_eq!(
+        call_arg(call, 1),
+        input_var(&graph, "keyhash"),
+        "looked-inside generic &Q stays the word\n{}",
+        op_lines(&graph)
+    );
+}
+
+/// `dont_look_inside` `sink_pair(&SomeStruct, &i64)`: the `&i64` is a
+/// residual `&prim` spill. rustc reborrows `&obj` as `&(*obj)`, so the
+/// `&SomeStruct` argument names a place; that pointee cannot be the
+/// spill through its declared type.
+fn lower_residual_struct_and_i64_refs() -> FunctionGraph {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let obj_ty = pair_struct_ty();
+    let obj_ref = borrow_ty(&obj_ty, "Shared");
+    let word_ref = borrow_ty(&word, "Shared");
+    let locals = vec![
+        local(0, None, &ret),
+        local(1, Some("obj"), &obj_ref),
+        local(2, Some("keyhash"), &word),
+        local(3, None, &obj_ref),
+        local(4, None, &word_ref),
+        local(5, None, &ret),
+    ];
+    let obj_deref = json!({"kind": {"Projection": [place(1, &obj_ref), "Deref"]}, "ty": obj_ty});
+    let obj_borrow = place(3, &obj_ref);
+    let word_place = place(2, &word);
+    let word_borrow = place(4, &word_ref);
+    let statements = vec![
+        json!({"span": span, "kind": {"Assign": [obj_borrow.clone(), {"Ref": {
+            "place": obj_deref, "kind": "Shared", "ptr_metadata": null
+        }}]}}),
+        json!({"span": span, "kind": {"Assign": [word_borrow.clone(), {"Ref": {
+            "place": word_place, "kind": "Shared", "ptr_metadata": null
+        }}]}}),
+    ];
+    let call_args = vec![json!({"Move": obj_borrow}), json!({"Move": word_borrow})];
+    let dest = place(5, &ret);
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        vec![obj_ref.clone(), word.clone()],
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": 2, "locals": locals}, "body": [
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args, "dest": dest},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let params = vec![obj_ref, word_ref];
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        params.clone(),
+        idle_body(&ret, &params),
+    );
+    let some_struct = named_decl(
+        0,
+        &["probe", "SomeStruct"],
+        json!({"Struct": [
+            field_decl("a", &i64_ty()),
+            field_decl("p", &raw_ptr(&i64_ty(), "Const")),
+        ]}),
+    );
+    let file = json!({"charon_version": "0.1.201", "has_errors": false, "translated": {
+        "crate_name": "probe",
+        "type_decls": [some_struct],
+        "fun_decls": [caller, sink],
+        "global_decls": [{
+            "def_id": 0,
+            "item_meta": meta(&["probe", "_jit_look_inside_sink_pair"]),
+            "global_kind": "NamedConst",
+            "ty": {"Scalar": "Bool"},
+            "value": [{"Bool": false}, {"Scalar": "Bool"}]
+        }],
+        "trait_decls": [],
+        "trait_impls": []
+    }});
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "write_hash").unwrap_or_else(|err| panic!("lower write_hash: {err}"))
+}
+
+#[test]
+fn residual_struct_ref_beside_i64_ref_passes_the_struct_through() {
+    let graph = lower_residual_struct_and_i64_refs();
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "only the &i64 is spilled\n{}",
+        op_lines(&graph)
+    );
+    let call = sink_call(&graph);
+    assert_eq!(
+        call_arg(call, 0),
+        input_var(&graph, "obj"),
+        "&SomeStruct passes through\n{}",
+        op_lines(&graph)
+    );
+    assert_eq!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "&i64 is the spill address\n{}",
+        op_lines(&graph)
+    );
+    match &raw_ops(&graph, |kind| matches!(kind, OpKind::RawStore { .. }))[0].kind {
+        OpKind::RawStore { value, base, .. }
+            if base == &ptrs[0] && value == input_var(&graph, "keyhash") => {}
+        other => panic!("the store writes keyhash, got {other:?}"),
+    }
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
 
 enum BorrowAlias {
@@ -1919,18 +2436,30 @@ fn raw_pointer_to_the_spilled_place_uses_that_address() {
 }
 
 #[test]
-fn raw_pointer_to_another_place_stays_put() {
-    let graph = lower_raw_alias(RawAlias::OtherPlace).unwrap_or_else(|err| {
-        panic!("a raw pointer of another place must still free the spill: {err}")
-    });
+fn raw_pointer_to_another_place_gets_its_own_address() {
+    let graph = lower_raw_alias(RawAlias::OtherPlace)
+        .unwrap_or_else(|err| panic!("a raw pointer of another primitive place must spill: {err}"));
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert_eq!(
+        ptrs.len(),
+        2,
+        "each primitive place gets an address\n{}",
+        op_lines(&graph)
+    );
     let call = sink_call(&graph);
     assert_eq!(call_arg(call, 0), &ptrs[0]);
-    assert_ne!(call_arg(call, 1), &ptrs[0]);
-    assert!(
-        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+    assert_eq!(call_arg(call, 1), &ptrs[1]);
+    assert_ne!(
+        call_arg(call, 0),
+        call_arg(call, 1),
+        "the two places do not share an address\n{}",
+        op_lines(&graph)
+    );
+    let frees = raw_ops(&graph, |kind| matches!(kind, OpKind::RawFree { .. }));
+    assert_eq!(
+        frees.len(),
+        2,
+        "each spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
@@ -2593,7 +3122,8 @@ enum TracedInt {
     FieldOther,
     /// `pair.0` is the literal `0usize`.
     FieldConst,
-    /// The second parameter is an incoming `usize`.
+    /// The second parameter is an incoming `usize`. It cannot name this
+    /// function's by-value local, so it stays the caller's value.
     Param,
     /// `q = usize_source(); f(&mut word, q)`.
     CallResult,
@@ -3086,8 +3616,8 @@ fn field_usize_constant_still_frees() {
 }
 
 #[test]
-fn usize_parameter_beside_the_spill_is_not_lowered() {
-    assert_traced_escapes(TracedInt::Param);
+fn usize_parameter_beside_the_spill_still_frees() {
+    assert_traced_frees(TracedInt::Param);
 }
 
 #[test]

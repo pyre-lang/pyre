@@ -92,6 +92,39 @@ fn merge_point_between(payload: &crate::PyJitCode, op_pc: usize, marker: usize) 
         .any(|op| op.opname == "jit_merge_point")
 }
 
+/// Exact `pcdep_by_jit_pc` row emptiness — not the predecessor scan.
+///
+/// `pcdep_for_jitcode_pc` is a largest-offset-≤ lookup, so an absent
+/// later `-live-` would inherit the previous opcode's map.
+/// `get_live_vars_info` walks BACK onto the marker itself; the producer
+/// ships a row at every assembled `-live-` so an exact hit is that
+/// marker's own map.
+#[cfg(test)]
+pub(crate) fn exact_pcdep_row_is_empty_in(
+    table: &[(usize, Vec<(u8, u16, u16)>)],
+    jit_pc: usize,
+) -> bool {
+    match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+        Ok(i) => table[i].1.is_empty(),
+        Err(_) => true,
+    }
+}
+
+/// Exact-hit vs predecessor-scan rule used by [`PyJitCode::pcdep_for_snapshot_entry`].
+#[cfg(test)]
+pub(crate) fn pcdep_for_snapshot_entry_in(
+    table: &[(usize, Vec<(u8, u16, u16)>)],
+    jit_pc: usize,
+    is_live_marker: bool,
+    predecessor: &[(u8, u16, u16)],
+) -> Vec<(u8, u16, u16)> {
+    match table.binary_search_by_key(&jit_pc, |&(off, _)| off) {
+        Ok(i) => table[i].1.clone(),
+        Err(_) if is_live_marker => Vec::new(),
+        Err(_) => predecessor.to_vec(),
+    }
+}
+
 /// Resume coordinate for a plain (non-after-residual) guard.
 ///
 /// `op_pc` is the capture coordinate. Branch guards pass the jump's own
@@ -2714,9 +2747,24 @@ pub(crate) fn compute_nested_inline_caller_frame<Sym: WalkSym>(
         Some(m) => m as i32,
         None => majit_ir::resumedata::NO_JITCODE_PC,
     };
+    // A loop-header `-live-` can name colors the sub-walk never wrote
+    // (`OpRef::NONE`). Recover them from this frame's slot shadow so
+    // `collect_callee_active_boxes` does not abort. Skip the pending call
+    // result: `get_list_of_active_boxes` (`pyjitpl.py`) clears that color
+    // while the call is in flight. Snapshot-local only: do not write the
+    // recovered colours into the live banks (`generate_guard(resumepc=orgpc)`
+    // later reads those banks at the jump's own `-live-`).
+    let skip_result = result_register.and_then(|(bank, color)| (bank == 'r').then_some(color));
+    let recovered_regs_r = recover_callee_none_ref_colors(
+        ctx,
+        &pjc,
+        jitcode_index as i32,
+        caller_liveness_word,
+        skip_result,
+    );
     let boxes = collect_callee_active_boxes(
         ctx.registers_i,
-        ctx.registers_r,
+        recovered_regs_r.as_slice(),
         ctx.registers_f,
         jitcode_index,
         call_jit_pc,
@@ -3051,9 +3099,18 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
+        let result_register = super::residual_call::parent_call_result_color(&pjc, call_jit_pc);
+        let skip_result = result_register.and_then(|(bank, color)| (bank == 'r').then_some(color));
+        let recovered_regs_r = recover_callee_none_ref_colors(
+            ctx,
+            &pjc,
+            jitcode_index as i32,
+            resume_marker_jit_pc as i32,
+            skip_result,
+        );
         collect_callee_active_boxes(
             ctx.registers_i,
-            ctx.registers_r,
+            recovered_regs_r.as_slice(),
             ctx.registers_f,
             jitcode_index,
             call_jit_pc,
@@ -4092,6 +4149,86 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             ),
     }
     Ok(())
+}
+
+/// Fill `OpRef::NONE` holes from the callee slot shadow.
+///
+/// Returns a snapshot-local copy of `registers_r`. Does not write the
+/// recovered colours into the live banks: a later branch guard's
+/// `collect_outer_active_boxes` reads those banks at the jump's own
+/// `-live-` (`generate_guard(resumepc=orgpc)`).
+fn recover_callee_none_ref_colors<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pjc: &crate::PyJitCode,
+    jitcode_index: i32,
+    carried_jitcode_pc: i32,
+    skip_color: Option<usize>,
+) -> Vec<OpRef> {
+    let mut recovered = ctx.registers_r.to_vec();
+    if carried_jitcode_pc == majit_ir::resumedata::NO_JITCODE_PC
+        || !recovered.iter().any(|value| value.is_none())
+    {
+        return recovered;
+    }
+    let maps =
+        crate::state::bridge_semantic_maps_from_jitcode_pc(jitcode_index, carried_jitcode_pc);
+    let nlocals = if pjc.code_ptr.is_null() {
+        0
+    } else {
+        let code = unsafe { &*pjc.code_ptr };
+        crate::state::callee_layout_for_call_assembler(code).0
+    };
+    let shadow_opref = ctx
+        .frame_state
+        .borrow()
+        .callee_shadow
+        .as_ref()
+        .map(|shadow| shadow.opref.clone())
+        .unwrap_or_default();
+    fill_none_refs_from_callee_slots(
+        &mut recovered,
+        nlocals,
+        maps.stack_depth_at_pc,
+        &maps.pcdep_entries,
+        &shadow_opref,
+        skip_color,
+    );
+    recovered
+}
+
+/// Fill liveness-active Ref colors the sub-walk left as `OpRef::NONE`.
+///
+/// RPython reads `MIFrame.registers_r` directly (`get_list_of_active_boxes`).
+/// pyre's inlined callee keeps locals in `CalleeLocalsShadow` (slot-indexed);
+/// map each hole through `pcdep` onto that per-frame store and write the
+/// existing recorded box into the color. Does not emit IR: the boxes
+/// already sit on the trace.
+pub(crate) fn fill_none_refs_from_callee_slots(
+    registers_r: &mut [OpRef],
+    nlocals: usize,
+    stack_depth: usize,
+    pcdep: &[(u8, u16, u16)],
+    shadow_opref: &std::collections::HashMap<i64, OpRef>,
+    skip_color: Option<usize>,
+) -> usize {
+    let mut filled = 0;
+    for (color, value) in registers_r.iter_mut().enumerate() {
+        if skip_color == Some(color) || !value.is_none() {
+            continue;
+        }
+        let Some(slot) =
+            crate::state::semantic_ref_slot_for_reg_color(nlocals, stack_depth, pcdep, color)
+        else {
+            continue;
+        };
+        if let Some(&slot_value) = shadow_opref.get(&(slot as i64))
+            && !slot_value.is_none()
+        {
+            *value = slot_value;
+            filled += 1;
+        }
+    }
+    filled
 }
 
 /// Seed only the not-yet-defined result color carried by pyre's dense

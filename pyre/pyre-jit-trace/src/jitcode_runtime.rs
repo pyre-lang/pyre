@@ -5383,6 +5383,68 @@ mod tests {
         );
     }
 
+    fn dict_strategy_method_offset(method: &str) -> usize {
+        let want = format!("method_{method}");
+        for i in 0..descr_count() {
+            let BhDescr::Field {
+                name,
+                owner,
+                offset: off,
+                ..
+            } = load_descr_uncached(i)
+            else {
+                continue;
+            };
+            if name == want
+                && owner.contains("DictStrategy")
+                && (owner == "{vtable}" || owner.ends_with("::{vtable}"))
+            {
+                return off;
+            }
+        }
+        panic!("method_{method} FieldDescr on DictStrategy {{vtable}}");
+    }
+
+    #[test]
+    fn ict_map_keys_rustc_vtable_slot_for_every_dict_strategy_getitem() {
+        let offset = dict_strategy_method_offset("getitem");
+        let mut missing = Vec::new();
+        for entry in pyre_interpreter::dyn_impl_vtables() {
+            if entry.trait_leaf != "DictStrategy" {
+                continue;
+            }
+            let slot = unsafe { *((entry.vtable as *const u8).add(offset) as *const usize) };
+            let ict = indirectcalltarget_index_for_address(slot);
+            let bc = crate::state::bytecode_for_address(slot);
+            if slot == 0 || ict.is_none() || bc.is_none() {
+                missing.push(entry.impl_key);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "DictStrategy::getitem rustc vtable slots must resolve through bytecode_for_address: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn bytecode_for_address_hits_class_dict_methods_getitem_symbolic_fnaddr() {
+        // Slot::getitem residual-calls the inherent `ClassDictMethods::getitem`
+        // graph. That graph has no rustc vtable slot; the Const funcbox is
+        // `symbolic_fnaddr_for_path`. `bytecode_for_address` must still
+        // resolve it so `do_residual_or_indirect_call` `perform_call`s.
+        let path = "objspace::std::classdict::ClassDictMethods::getitem";
+        let index = compute_pathed_jitcode_index(path)
+            .expect("ClassDictMethods::getitem must have a compiled jitcode");
+        let jitcode = get_jitcode_by_index(index).expect("index resolves");
+        let addr = crate::runtime_fnaddr_patch::runtime_fnaddr(jitcode.fnaddr) as usize;
+        assert_ne!(addr, 0);
+        let hit = crate::state::bytecode_for_address(addr).expect(
+            "symbolic fnaddr of ClassDictMethods::getitem must map through bytecode_for_address",
+        );
+        assert_eq!(hit.index(), index);
+        assert_eq!(hit.name, "getitem");
+    }
+
     #[test]
     fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
         // Verify the portal accessor returns the build-time JitCode for the

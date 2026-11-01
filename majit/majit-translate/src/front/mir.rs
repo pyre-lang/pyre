@@ -81,7 +81,10 @@
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`. `new_array_clear` is produced later by
 //!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
-//!     repeat stays the `__array_repeat(fill, count)` call here.
+//!     repeat stays the `__array_repeat(fill, count)` call here. The
+//!     result type is the dest's `Array<T;N>` so
+//!     `fixed_repeat_identity` can redirect without a later
+//!     `ArrayRead` / `ArrayWrite` of the same SSA.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -144,6 +147,17 @@ use serde_json::Value;
 /// operation until that rewrite.  Non-null keeps it distinct from the null
 /// reference representation on every backend.
 const JITDRIVER_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+
+/// Locals some forward-reached `Call` terminator writes whole, plus the
+/// unique Regular call's argument operands so [`Lowering::place_address_source`]
+/// can follow a pointer-identity cast (`is_ptr_identity_cast`).
+struct CallDestLocals {
+    dests: bit_set::BitSet,
+    /// Unique whole-local Regular call writing this dest, with its
+    /// argument operands. Empty when two calls write the same local, or
+    /// the writer is not Regular.
+    unique: Vec<Option<(RegularCall, Vec<Operand>)>>,
+}
 
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
@@ -524,9 +538,14 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
     let dedup_key = semantic_function_dedup_key;
+    // A callee whose Unstructured body lives in another loaded artefact
+    // is a regular call (`fun_decl_has_body_in_loaded_crate`). The
+    // per-artefact state is rebuilt each time, so note every artefact's
+    // local bodies into it before that artefact lowers.
     for llbc in llbcs {
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
+            llbcs,
             static_addrs,
             jitdriver_receiver_roots,
             module_filter,
@@ -1666,6 +1685,7 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
     build_semantic_program_from_llbc_with_static_addrs_filtered(
         llbc,
+        &[],
         static_addrs,
         &jitdriver_receiver_roots,
         None,
@@ -1954,6 +1974,15 @@ impl CrateLoweringState {
         }
     }
 
+    /// Record body-carrying FunDecls from another loaded crate so an
+    /// Opaque import is a regular call
+    /// (`StructFieldRegistry::foreign_callables`).
+    pub(crate) fn note_loaded_crate_bodies(&mut self, llbc: &Llbc) {
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut self.struct_fields);
+        }
+    }
+
     /// Union `other`'s harvested rows into this crate's registry. Later
     /// crates see earlier ones so an Opaque projection can name a field
     /// the defining crate registered. `or_insert` keeps the first row.
@@ -2228,6 +2257,7 @@ impl<'l> CrateLowering<'l> {
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            &self.state.tombstoned_leaves,
             &fn_path,
         )
     }
@@ -2435,6 +2465,7 @@ impl<'l> CrateLowering<'l> {
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
             &self.state.raw_alloc_flavor_structs,
+            &self.state.tombstoned_leaves,
             &policy_fn_path,
         );
         let segments = spec_segments(llbc, fd, &header.name);
@@ -2669,6 +2700,7 @@ impl CrateLoweringState {
 
 fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     llbc: &Llbc,
+    loaded_llbcs: &[&Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
@@ -2677,7 +2709,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let skips = LoweringSkips::default();
     let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
-    let state = CrateLoweringState::new(
+    let mut state = CrateLoweringState::new(
         llbc,
         cross_tombstoned_leaves,
         std::collections::HashMap::new(),
@@ -2687,6 +2719,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         module_filter,
         function_filter,
     );
+    for loaded in loaded_llbcs {
+        state.note_loaded_crate_bodies(loaded);
+    }
     let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
         .lower_all(module_filter, function_filter);
     let program = state.finish(functions);
@@ -2831,6 +2866,34 @@ fn note_body_crate_root_into(
     fields.note_foreign_body_callable(root, &stripped);
 }
 
+/// True when this FunDecl has an Unstructured body here, or another
+/// loaded crate recorded one on [`StructFieldRegistry::foreign_callables`].
+/// Every local crate is extracted into the merged program
+/// ([`build_semantic_program_from_llbcs`]), so a local Opaque FunDecl
+/// is an import of a graph that exists (`is_crate_alias_root`). A
+/// harvested foreign callable is the same (`foreign_callables`).
+fn fun_decl_has_body_in_loaded_crate(
+    fd: &FunDecl,
+    fields: Option<&crate::front::semantic::StructFieldRegistry>,
+) -> bool {
+    if fd.has_unstructured_body() {
+        return true;
+    }
+    let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
+        return false;
+    };
+    if crate::local_crates::is_crate_alias_root(root) {
+        return true;
+    }
+    let stripped = strip_crate_prefix(&fd.item_meta.name_path());
+    fields.is_some_and(|fields| {
+        fields
+            .foreign_callables
+            .iter()
+            .any(|(crate_root, path)| crate_root == root && path == &stripped)
+    })
+}
+
 fn decl_fn_path(module_path: &str, name: &str) -> String {
     if module_path.is_empty() {
         name.to_string()
@@ -2882,6 +2945,7 @@ impl SemanticFunctionHeader {
         error_carrier: crate::ErrorCarrierSpec<'_>,
         gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
         raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+        tombstoned_leaves: &std::collections::HashSet<String>,
         policy_fn_path: &str,
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
@@ -2985,6 +3049,7 @@ impl SemanticFunctionHeader {
             &signature.output,
             llbc,
             error_carrier,
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
@@ -5501,6 +5566,10 @@ pub struct LowerContext<'a> {
     /// through `OnceLock`, so the stored tables stay `Sync`; lowering
     /// rebuilds a registry from these rows for `field_name_at`.
     struct_fields: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Body-carrying FunDecls harvested onto
+    /// [`StructFieldRegistry::foreign_callables`]. Stored as a `Vec` so
+    /// this context stays `Sync` for `OnceLock`.
+    foreign_callables: Vec<(String, String)>,
     dont_look_inside: std::collections::HashSet<String>,
     /// Leaves [`harden_duplicate_leaf_metadata`] emptied for this LLBC.
     /// Single-function entry points paint with this set, the same one the
@@ -5542,15 +5611,22 @@ impl<'a> LowerContext<'a> {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(dependency_raw_alloc_flavor_structs.iter().cloned());
-        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
+        let (_, _, mut struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
             llbc,
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
         );
+        // Same harvest `CrateLoweringState::new` runs, so a stand-alone
+        // lowering sees this artefact's bodies before
+        // `refuse_borrowed_transparent_scalar_residual`.
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut struct_fields);
+        }
         Self {
             llbc,
             struct_field_attrs,
+            foreign_callables: struct_fields.foreign_callables,
             struct_fields: struct_fields.fields.into(),
             dont_look_inside: dont_look_inside_set_of(llbc),
             tombstoned_leaves: tombstoned_leaves_of(llbc),
@@ -5565,7 +5641,21 @@ impl<'a> LowerContext<'a> {
     /// `CallControl` so `fielddescrof` can `getattr` the names the
     /// lowering emitted (`descr.py get_field_descr`).
     pub fn struct_field_registry(&self) -> crate::front::semantic::StructFieldRegistry {
-        struct_field_registry_from_rows(&self.struct_fields)
+        struct_field_registry_from_rows(&self.struct_fields, &self.foreign_callables)
+    }
+
+    /// Record body-carrying FunDecls from another loaded crate so an
+    /// Opaque import is a regular call
+    /// (`StructFieldRegistry::foreign_callables`).
+    pub fn note_loaded_crate_bodies(&mut self, llbc: &Llbc) {
+        let mut fields = crate::front::semantic::StructFieldRegistry {
+            foreign_callables: std::mem::take(&mut self.foreign_callables),
+            ..Default::default()
+        };
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut fields);
+        }
+        self.foreign_callables = fields.foreign_callables;
     }
 }
 
@@ -5574,9 +5664,11 @@ impl<'a> LowerContext<'a> {
 /// harvest; `__pos_N` remains the missing-row fallback.
 fn struct_field_registry_from_rows(
     rows: &std::collections::HashMap<String, Vec<(String, String)>>,
+    foreign_callables: &[(String, String)],
 ) -> crate::front::semantic::StructFieldRegistry {
     crate::front::semantic::StructFieldRegistry {
         fields: crate::front::semantic::FieldRows::from(rows.clone()),
+        foreign_callables: foreign_callables.to_vec(),
         ..Default::default()
     }
 }
@@ -5615,7 +5707,8 @@ fn lower_fun_decl_with_static_addrs_and_root_stack(
     root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
     let llbc = context.llbc;
-    let struct_fields = struct_field_registry_from_rows(&context.struct_fields);
+    let struct_fields =
+        struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
@@ -5845,6 +5938,7 @@ fn splice_recorded_fat_dyn_returns(
 #[path = "shadow_stack_erase.rs"]
 mod shadow_stack_erase;
 pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::erase_named as shadow_stack_erase_named;
 pub use shadow_stack_erase::{
     discover_depth_neutral_fns, discover_stack_fn_effects, discover_stack_leaves_above_fns,
     discover_stack_param_slots_fns, discover_stack_returns_index_fns, discover_stack_sensitive_fns,
@@ -6146,6 +6240,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             output,
             llbc,
             static_addrs.error_carrier,
+            tombstoned_leaves,
             gc_struct_ids,
             raw_alloc_flavor_structs,
         );
@@ -6335,22 +6430,33 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if !lo.result_exc_call_results.is_empty() {
             let carrier = static_addrs.error_carrier;
-            let foreign_sites =
-                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
-            let mut conversions = Vec::with_capacity(foreign_sites.len());
-            for site in &foreign_sites {
-                conversions.push(
-                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
-                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
-                    )?,
-                );
+            // `FromResidual::from_residual` of a foreign error becomes
+            // `Err(From::from(e))` raised as the carrier only when this
+            // graph *is* `Result<T, PyError>` (`result_exc_callee`).
+            // `argument.py _match_signature` raises `ArgErr` or
+            // `OperationError`; pyre returns `MatchOutcome` (not `Result`)
+            // and `parse_into_scope` catches `ArgErr`. A `from_residual` of
+            // `MatchSignatureError` is that function's own error arm, not a
+            // conversion into `PyError`.
+            if result_exc_callee {
+                let foreign_sites =
+                    crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+                let mut conversions = Vec::with_capacity(foreign_sites.len());
+                for site in &foreign_sites {
+                    conversions.push(
+                        from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty)
+                            .map_err(|err| {
+                                LowerError::Unsupported(format!("{}: {err}", lo.graph.name))
+                            })?,
+                    );
+                }
+                crate::front::result_exc::apply_foreign_from_residuals(
+                    &mut lo.graph,
+                    &foreign_sites,
+                    &conversions,
+                )
+                .map_err(LowerError::Unsupported)?;
             }
-            crate::front::result_exc::apply_foreign_from_residuals(
-                &mut lo.graph,
-                &foreign_sites,
-                &conversions,
-            )
-            .map_err(LowerError::Unsupported)?;
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,

@@ -3250,6 +3250,75 @@ assert raised
     );
 }
 
+/// `parse_into_fresh_frame` copies `_match_signature`'s scope into the
+/// frame locals array after `parse_into_scope` has allocated
+/// (`space.newdict(kwargs=True)`). That array is a nursery GcArray
+/// (`createframe_obj` `NurseryGc`); a one-byte nursery either moves it
+/// during the dict alloc or spills it old while the dict is still young.
+/// The copy must reload the array and remember it (`framework.py`
+/// `transform_generic_set`).
+#[test]
+fn kwargs_dict_survives_collection_inside_parse_into_scope() {
+    const CHILD: &str = "PYRE_PARSE_INTO_SCOPE_KWARGS_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kwargs_dict_survives_collection_inside_parse_into_scope",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated parse_into_scope kwargs regression");
+        assert!(
+            output.status.success(),
+            "kwargs dict was lost across parse_into_scope:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+def f(**k):
+    j = 0
+    while j < 8:
+        _ = [0] * 4
+        j = j + 1
+    return k["x"]
+
+def g(a, **k):
+    return a + k["b"]
+
+i = 0
+while i < 400:
+    assert f(x=i) == i
+    d = {"x": i, "y": 1}
+    assert f(**d) == i
+    assert g(i, b=1) == i + 1
+    i = i + 1
+
+def h(**k):
+    return k
+
+saved = h(x=7, y=8)
+j = 0
+while j < 20:
+    _ = [0] * 8
+    j = j + 1
+assert saved["x"] == 7
+assert saved["y"] == 8
+"#,
+        "parse_into_scope_kwargs.py",
+        "parse_into_scope kwargs dict",
+        "a **kwargs dict created in parse_into_scope must survive the copy into frame locals",
+    );
+}
+
 /// `setup_context` reads `frame.last_instr`. A compiled caller keeps that
 /// coordinate in the virtualizable until the consumer forces it, so
 /// `warnings.warn(..., stacklevel=2)` reports the call in the loop.
@@ -3315,7 +3384,6 @@ assert got.count(14) == 40, got
         "a compiled frame repr did not report the call lines",
     );
 }
-
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector
@@ -3673,5 +3741,71 @@ assert add(1, 2) == 3
         "intern_and_declaration_roots.py",
         "intern identity and declaration interior",
         "intern or declaration root did not survive collection",
+    );
+}
+
+/// `call_args_and_c_profile_args` pins `arguments_w` / `keywords_w` across
+/// `c_call_trace` / `c_return_trace`, then `refresh_arguments_from_roots`
+/// copies them back before `freeze_gc_arrays`. `keyword_names_w` is the
+/// third list `argument.py Arguments.__init__` keeps in GC storage; a
+/// profile callback that collects must not leave those name objects as
+/// stale native Vec words (`MAJIT_GC_NURSERY_POISON`).
+#[test]
+fn profiled_builtin_keyword_names_reload_after_hooks() {
+    const CHILD: &str = "PYRE_PROFILE_KW_NAMES_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "profiled_builtin_keyword_names_reload_after_hooks",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated profiled-keyword-name GC-root regression");
+        assert!(
+            output.status.success(),
+            "profiled builtin read a moved keyword name:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+import gc
+import io
+import sys
+
+def profiler(frame, event, arg):
+    gc.collect()
+    n = 0
+    junk = []
+    while n < 40:
+        junk.append(object())
+        n = n + 1
+
+sys.setprofile(profiler)
+try:
+    i = 0
+    while i < 40:
+        buf = io.StringIO()
+        print("a", "b", file=buf, **{"".join(["se", "p"]): ","})
+        assert buf.getvalue() == "a,b\n", buf.getvalue()
+        got = sorted([3, 1, 2], **{"".join(["re", "verse"]): True})
+        assert got == [3, 2, 1], got
+        got = sorted([3, 1, 2], reverse=True)
+        assert got == [3, 2, 1], got
+        i = i + 1
+finally:
+    sys.setprofile(None)
+"#,
+        "profiled_builtin_keyword_names.py",
+        "profiled builtin keyword names",
+        "refresh_arguments_from_roots must copy keyword_names_w after the profile hooks",
     );
 }

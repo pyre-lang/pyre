@@ -8216,12 +8216,11 @@ fn unpack_merge_point_jit(
     let hot = {
         let (driver, _) = driver_pair();
         let jd_no = pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX;
+        let (_save_point, root_base, _items_slot) = pyre_jit_trace::unpack_state::jd1_root_base();
         let reds = confirm_reds_if_installed(
             driver,
             jd_no,
-            pyre_jit_trace::unpack_state::jd1_live_values_at(
-                pyre_jit_trace::unpack_state::jd1_root_base(),
-            ),
+            pyre_jit_trace::unpack_state::jd1_live_values_at(root_base),
         );
         driver
             .meta_interp_mut()
@@ -8741,6 +8740,13 @@ fn run_compiled_generatorentry(
             if dbg {
                 eprintln!("[jd2] run_compiled finish exc={is_exception_exit}");
             }
+            // `ll_generatorentry_portal_runner_shim` clears the residual
+            // cells on `Ok` so a later `GUARD_NO_EXCEPTION` is not failed
+            // by a stale raise. This Rust door is `send_ex` → `space.next`
+            // (`pyopcode.py FOR_ITER`); `jit_next` answers exhaustion with
+            // a null return and no published exception. Drain both arms so
+            // that residual's `GUARD_NO_EXCEPTION` sees empty cells.
+            crate::call_jit::clear_residual_call_exception();
             if is_exception_exit {
                 let word = values.first().copied().unwrap_or(0);
                 if let Some(err) = portal_error_from_exc_ref(word) {
@@ -8862,12 +8868,14 @@ fn run_compiled_generatorentry(
                 if dbg {
                     eprintln!("[jd2] run_compiled exc");
                 }
+                crate::call_jit::clear_residual_call_exception();
                 return Some(Err(err));
             }
             crate::call_jit::BlackholeResult::BailToInterpreter => {
                 if dbg {
                     eprintln!("[jd2] run_compiled bail");
                 }
+                crate::call_jit::clear_residual_call_exception();
                 return None;
             }
             // `blackhole.py` `DoneWithThisFrame*`: box via `take_pyresult`.
@@ -8876,6 +8884,7 @@ fn run_compiled_generatorentry(
             | crate::call_jit::BlackholeResult::DoneWithThisFrameVoid
             | crate::call_jit::BlackholeResult::DoneWithThisFrameInt(_)
             | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_)) => {
+                crate::call_jit::clear_residual_call_exception();
                 return done.take_pyresult();
             }
         }
@@ -8922,10 +8931,11 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
-    // Portal pins are the two slots under this hook. Capture them before
-    // ResidualExceptionScope::park can pin a standing exception on top;
-    // otherwise jd1_root_base's `len - 2` names those parked roots.
-    let portal_root_base = pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64;
+    // Portal pins three objects (w_iterator, items, greenkey) under this hook.
+    // Capture them before ResidualExceptionScope::park can pin a standing
+    // exception on top; otherwise jd1_root_base's `len - 3` names those
+    // parked roots.
+    let (save_point, portal_root_base, items_slot) = pyre_jit_trace::unpack_state::jd1_root_base();
     // The walk below executes each residual concretely, so the raise that ends
     // the unpack is recorded into the residual-call exception cells. Those are
     // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
@@ -8997,7 +9007,7 @@ fn drive_unpack_iterable_trace(
     let (driver, _) = driver_pair();
     let meta = driver.meta_interp_mut();
 
-    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    // Extracted merge-point reds: save_point, root_base, items_slot.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
@@ -9111,6 +9121,12 @@ fn drive_unpack_iterable_trace(
                 // takes the value from result slot 0, not from `jf_guard_exc`.
                 if is_exception_exit {
                     pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
+                    // The drain consumed the loop-exit `StopIteration` (or
+                    // parked a real error). Leave the residual cells empty
+                    // so a later `GUARD_NO_EXCEPTION` / blackhole resume
+                    // does not reread it (`pyjitpl.py execute_raised`
+                    // dies with the MetaInterp; pyre's TLS cell does not).
+                    crate::call_jit::clear_residual_call_exception();
                 }
                 break;
             }
@@ -9196,35 +9212,34 @@ fn drive_unpack_iterable_trace(
     }
 
     // Seed every bank the extracted `jit_merge_point` names.  Green is
-    // the type object; reds are root_base / items_slot / RootScope cell.
+    // the type object; reds are save_point, root_base, items_slot.
     let green_args = [(
         majit_metainterp::JitArgKind::Ref,
         greenkey_raw as usize as i64,
     )];
-    let root_base = portal_root_base;
     let red_args = [
         (
             majit_metainterp::JitArgKind::Int,
             majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
-            root_base,
+            save_point,
         ),
         (
             majit_metainterp::JitArgKind::Int,
             majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-            root_base + 1,
+            portal_root_base,
         ),
         (
-            majit_metainterp::JitArgKind::Ref,
-            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
-            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
+            items_slot,
         ),
     ];
 
     let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
         greenkey: pyre_object::PY_NULL,
-        root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
-        items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
-        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+        save_point: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        root_base: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+        items_slot: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Int),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -10677,8 +10692,8 @@ fn generatorentry_portal_runner(
 ///
 /// `bhimpl_jit_merge_point` raises `ContinueRunningNormally(*args)` as the
 /// six banks; `handle_jitexception` walks `portalfunc_ARGS` and calls
-/// `portal_ptr(*args)`. The extracted portal's reds are `root_base`,
-/// `items_slot`, and the `RootScope` cell — not `w_iterator`/`items`.
+/// `portal_ptr(*args)`. The extracted portal's reds are save_point,
+/// root_base, and items_slot — not `w_iterator`/`items`.
 /// Reload those pinned objects the portal function still takes.
 fn unpackiterable_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
@@ -10693,8 +10708,9 @@ fn unpackiterable_portal_runner(
         return Ok((BhReturnType::Void, 0));
     };
     let greenkey = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let root_base = args.red_int.first().copied().unwrap_or(0) as usize;
-    let items_slot = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    // red_int[0] is save_point; the portal re-enters and push_roots again.
+    let root_base = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    let items_slot = args.red_int.get(2).copied().unwrap_or(0) as usize;
     let w_iterator = pyre_object::gc_roots::shadow_stack_get(root_base);
     let items = pyre_object::gc_roots::shadow_stack_get(items_slot);
     assert!(
@@ -12523,6 +12539,20 @@ pub(crate) fn resume_in_blackhole(
         );
     }
 
+    // `compile.py resume_in_blackhole` / `blackhole.py
+    // _prepare_resume_from_failure` take the exception off this fail
+    // descr (`cpu.grab_exc_value`). Pyre's residual helpers also write
+    // `BH_LAST_EXC_VALUE` / `_store_exception`, and a nested `list(gen)`
+    // that already caught `StopIteration` can leave those cells set.
+    // A non-exception guard (`GuardFalse` on a red local) has
+    // `guard_exc == 0`; a leftover cell would be read as this resume's
+    // pending raise and escape the generator body (`generator.py`
+    // `_leak_stopiteration`). Drain it here, the same discard
+    // `ResidualExceptionScope` does at the end of a tracing drive.
+    if guard_exc == 0 {
+        crate::call_jit::clear_residual_call_exception();
+    }
+
     // resume.py blackhole_from_resumedata is the single blackhole
     // resume mechanism: every descr that carries resume storage
     // (`ResumeGuardDescr.get_resumestorage` returns self) decodes through
@@ -13746,17 +13776,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 }
             }
         }
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][func-entry] run compiled frame=0x{:x} locals=0x{:x} key={} arg0={:?} depth={} raw_finish_known={}",
-                frame_root.frame() as *mut PyFrame as usize,
-                frame_root.frame().locals_cells_stack_w as usize,
-                green_key,
-                debug_first_arg_int(frame_root.frame()),
-                call_depth(),
-                driver.has_raw_int_finish()
-            );
-        }
+        // `interp_jit.py` / `warmstate.py bound_reached` have no per-iteration
+        // print on the compiled entry. `MAJIT_LOG=1` would otherwise write
+        // one line per remaining iteration and starve `logger.py log_loop`.
         let env = PyreEnv;
         // Same concrete boundary as `execute_assembler`: a function-entry
         // compiled trace reads its arg locals as heap `W_IntObject`
@@ -13785,22 +13807,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // `_build_stack_check_slowpath`), not in this slot.
         if let Err(exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
             return Some(Err(exc));
-        }
-        if majit_metainterp::majit_log_enabled() {
-            let kind = match &outcome {
-                DetailedDriverRunOutcome::Finished { .. } => "finished",
-                DetailedDriverRunOutcome::Jump { .. } => "jump",
-                DetailedDriverRunOutcome::Abort { .. } => "abort",
-                DetailedDriverRunOutcome::GuardFailure { .. } => "guard-failure",
-            };
-            eprintln!(
-                "[jit][func-entry] compiled outcome frame=0x{:x} locals=0x{:x} key={} arg0={:?} kind={}",
-                frame_root.frame() as *mut PyFrame as usize,
-                frame_root.frame().locals_cells_stack_w as usize,
-                green_key,
-                debug_first_arg_int(frame_root.frame()),
-                kind
-            );
         }
 
         // compile.py handle_fail parity.

@@ -9031,6 +9031,200 @@ fn ptr_write_of_scalar_is_a_raw_store() {
     );
 }
 
+/// `(&mut rooted as *mut i64).cast()` beside `&mut flag` coerced to
+/// `*mut bool`. The cast dest is a call destination; following
+/// `is_ptr_identity_cast` names `rooted`, which does not alias the
+/// spilled bool, so the call lowers.
+#[test]
+fn raw_scalar_ptr_cast_beside_mut_bool_spill_lowers() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let span = serde_json::json!({"data": {"file_id": 0,
+        "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|seg| {
+                if *seg == "<Impl>" {
+                    serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                } else {
+                    serde_json::json!({"Ident": [seg, 0]})
+                }
+            }).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let ret = i64_ty.clone();
+    let rooted_ptr = serde_json::json!({"RawPtr": [i64_ty.clone(), "Mut"]});
+    let cast_ptr = serde_json::json!({"RawPtr": [u64_ty.clone(), "Mut"]});
+    let bool_ptr = serde_json::json!({"RawPtr": [bool_ty.clone(), "Mut"]});
+    let rooted_borrow = serde_json::json!({"Ref": ["Erased", i64_ty.clone(), "Mut"]});
+    let bool_borrow = serde_json::json!({"Ref": ["Erased", bool_ty.clone(), "Mut"]});
+    let place =
+        |id: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| serde_json::json!({"index": index, "name": name, "span": span, "ty": ty});
+    let rooted = place(1, &i64_ty);
+    let flag = place(2, &bool_ty);
+    let rooted_ref = place(3, &rooted_borrow);
+    let rooted_raw = place(4, &rooted_ptr);
+    let cast_dest = place(5, &cast_ptr);
+    let flag_ref = place(6, &bool_borrow);
+    let flag_raw = place(7, &bool_ptr);
+    let sink_dest = place(8, &ret);
+    let rooted_deref = serde_json::json!({
+        "kind": {"Projection": [rooted_ref.clone(), "Deref"]}, "ty": i64_ty
+    });
+    let flag_deref = serde_json::json!({
+        "kind": {"Projection": [flag_ref.clone(), "Deref"]}, "ty": bool_ty
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "cast_beside_bool"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [i64_ty.clone(), bool_ty.clone()],
+            "output": ret.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                local(0, None, &ret),
+                local(1, Some("rooted"), &i64_ty),
+                local(2, Some("flag"), &bool_ty),
+                local(3, None, &rooted_borrow),
+                local(4, None, &rooted_ptr),
+                local(5, None, &cast_ptr),
+                local(6, None, &bool_borrow),
+                local(7, None, &bool_ptr),
+                local(8, None, &ret),
+            ]},
+            "body": [
+                {"statements": [
+                    {"span": span, "kind": {"Assign": [rooted_ref, {"Ref": {
+                        "place": rooted, "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                    {"span": span, "kind": {"Assign": [rooted_raw.clone(), {"RawPtr": {
+                        "place": rooted_deref, "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                ], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                        "args": [{"Move": rooted_raw}],
+                        "dest": cast_dest.clone()},
+                    "target": 1, "on_unwind": 3
+                }}}},
+                {"statements": [
+                    {"span": span, "kind": {"Assign": [flag_ref, {"Ref": {
+                        "place": flag, "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                    {"span": span, "kind": {"Assign": [flag_raw.clone(), {"RawPtr": {
+                        "place": flag_deref, "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                    "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                        "args": [{"Move": cast_dest}, {"Move": flag_raw}],
+                        "dest": sink_dest.clone()},
+                    "target": 2, "on_unwind": 3
+                }}}},
+                {"statements": [{"span": span, "kind": {"Assign": [
+                    place(0, &ret),
+                    {"Use": [{"Copy": sink_dest}, "Yes"]}
+                ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }}
+    });
+    let cast_fn = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["core", "ptr", "mut_ptr", "<Impl>", "cast"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [rooted_ptr.clone()],
+            "output": cast_ptr.clone()
+        },
+        "body": "Opaque"
+    });
+    let sink_params = vec![cast_ptr, bool_ptr];
+    let sink = serde_json::json!({
+        "def_id": 2,
+        "item_meta": meta(&["probe", "sink_pair"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": sink_params.clone(),
+            "output": ret.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": [
+                local(0, None, &ret),
+                local(1, None, &sink_params[0]),
+                local(2, None, &sink_params[1]),
+            ]},
+            "body": [{"statements": [], "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}}]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [caller, cast_fn, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+        .expect("probe fixture parses");
+    let graph = super::lower_function(&llbc, "cast_beside_bool")
+        .unwrap_or_else(|err| panic!("lower cast_beside_bool: {err}"));
+    let ops = graph_ops(&graph);
+    let mallocs: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::RawMalloc { .. }))
+        .collect();
+    assert_eq!(
+        mallocs.len(),
+        1,
+        "one raw spill for &mut bool\n{:?}",
+        ops.iter().map(|op| &op.kind).collect::<Vec<_>>()
+    );
+    let ptr = mallocs[0].result.as_ref().expect("RawMalloc result");
+    let sink_call = ops
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::Call { target, args, .. }
+                if matches!(
+                    target,
+                    CallTarget::FunctionPath { segments, .. }
+                        if segments.last().map(String::as_str) == Some("sink_pair")
+                ) =>
+            {
+                Some(args)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing sink_pair"));
+    let call_arg = |index: usize| {
+        sink_call
+            .get(index)
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("call arg {index} is not a variable"))
+    };
+    assert_eq!(call_arg(1), ptr, "bool out-parameter is the spill");
+    assert_ne!(
+        call_arg(0),
+        ptr,
+        "the .cast() argument stays off the bool spill"
+    );
+}
+
 #[test]
 fn ptr_write_lookalike_stays_residual() {
     let ptr_ty = serde_json::json!({
@@ -10887,6 +11081,346 @@ pub(in crate::front::mir) fn i64_field() -> serde_json::Value {
     }])
 }
 
+/// A published copy's marker is Path-form `PhantomData` when the dest
+/// crate has no matching TypeDecl. That field is a ZST, so the wrapper
+/// peels to the sized scalar, including through a borrow.
+#[test]
+fn path_form_phantomdata_marker_lets_wrapper_peel() {
+    let type_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [{"Ident": ["fixture", 0]}, {"Ident": ["DepthWord", 0]}],
+            "span": {"data": {
+                "file_id": 0,
+                "beg": {"line": 1, "col": 0},
+                "end": {"line": 4, "col": 1}
+            }},
+            "source_text": "struct Anchor { depth: usize, _not_send: PhantomData<*const ()> }",
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Struct": [
+            {
+                "name": "depth",
+                "ty": {"Value": [7, {"Scalar": {"Integer": {"Unsigned": "Usize"}}}]},
+                "attr_info": null
+            },
+            {
+                "name": "_not_send",
+                "ty": {"Adt": {
+                    "id": {"Path": "core::marker::PhantomData"},
+                    "generics": {
+                        "regions": [],
+                        "types": [{
+                            "RawPtr": [
+                                {"Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}},
+                                "Shared"
+                            ]
+                        }],
+                        "const_generics": [],
+                        "trait_refs": []
+                    },
+                    "builtin": null
+                }},
+                "attr_info": null
+            }
+        ]},
+        "layout": [{
+            "key": "aarch64-apple-darwin",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0, 8]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [null, type_decl],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let td = llbc.type_by_id(1).expect("wrapper decl");
+    let super::TypeDeclKind::Struct(fields) = &td.kind else {
+        panic!("wrapper is a struct");
+    };
+    assert!(
+        super::field_is_zst(&fields[1].ty, &llbc),
+        "Path-form PhantomData field is a ZST"
+    );
+    let ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [8, {"Adt": {"id": 1, "generics": {"types": []}}}]
+    }))
+    .expect("wrapper TyRef parses");
+    let borrowed = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [8, {
+            "Ref": ["r", {
+                "Adt": {"id": 1, "generics": {"types": []}}
+            }, "Shared"]
+        }]
+    }))
+    .expect("borrowed wrapper TyRef parses");
+    assert_eq!(
+        super::tyref_to_value_type(&ty, &llbc),
+        crate::model::ValueType::Unsigned
+    );
+    assert_eq!(
+        super::tyref_to_value_type(&borrowed, &llbc),
+        crate::model::ValueType::Unsigned
+    );
+    let discovered = super::discover_transparent_scalar_kinds(&llbc);
+    assert!(
+        discovered.iter().any(|(path, kind)| {
+            path.ends_with("DepthWord")
+                && matches!(kind, majit_charon_reader::TransparentScalarKind::Unsigned)
+        }),
+        "discover registers the unique scalar-word field: {discovered:?}"
+    );
+}
+
+/// Only a local `repr(transparent)` Struct feeds the linked kind.
+#[test]
+fn discover_skips_foreign_transparent_usize_struct() {
+    let type_decl = |is_local: bool| {
+        serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [{"Ident": ["fixture", 0]}, {"Ident": ["DepthWord", 0]}],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 4, "col": 1}
+                }},
+                "source_text": "struct DepthWord { depth: usize }",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": is_local
+            },
+            "kind": {"Struct": [
+                {
+                    "name": "depth",
+                    "ty": {"Value": [7, {"Scalar": {"Integer": {"Unsigned": "Usize"}}}]},
+                    "attr_info": null
+                }
+            ]},
+            "layout": [{
+                "key": "aarch64-apple-darwin",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "Rust", "transparent": true}
+                }
+            }]
+        })
+    };
+    let file = |is_local: bool| {
+        serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl(is_local)],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        })
+    };
+    let is_depth_word = |path: &str, kind: &majit_charon_reader::TransparentScalarKind| {
+        path.ends_with("DepthWord")
+            && matches!(kind, majit_charon_reader::TransparentScalarKind::Unsigned)
+    };
+    let foreign =
+        Llbc::from_slice(file(false).to_string().as_bytes()).expect("foreign fixture Llbc parses");
+    let foreign_discovered = super::discover_transparent_scalar_kinds(&foreign);
+    assert!(
+        foreign_discovered
+            .iter()
+            .all(|(path, kind)| !is_depth_word(path, kind)),
+        "foreign transparent struct is not discovered: {foreign_discovered:?}"
+    );
+    let local =
+        Llbc::from_slice(file(true).to_string().as_bytes()).expect("local fixture Llbc parses");
+    let local_discovered = super::discover_transparent_scalar_kinds(&local);
+    assert!(
+        local_discovered
+            .iter()
+            .any(|(path, kind)| is_depth_word(path, kind)),
+        "local transparent struct is discovered: {local_discovered:?}"
+    );
+}
+
+/// `apply_published_structs` copies the defining crate's PhantomData
+/// field onto an Opaque importer that has no PhantomData TypeDecl, so
+/// the marker stays a Path id. The copy still peels to the sized field.
+#[test]
+fn published_transparent_copy_peels_when_marker_is_path_phantomdata() {
+    let layout = serde_json::json!([{
+        "key": "aarch64-apple-darwin",
+        "value": {
+            "size": 8,
+            "align": 8,
+            "variant_layouts": [{"field_offsets": [0, 8]}],
+            "repr": {"repr_algo": "Rust", "transparent": true}
+        }
+    }]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 4, "col": 1}
+    }});
+    let defining = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                {
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Builtin": [{"Tuple": 0}, 0]}],
+                        "span": span,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false},
+                        "is_local": false
+                    },
+                    "kind": {"Struct": []},
+                    "src": {"Builtin": "Tuple"}
+                },
+                {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["DepthWord", 0]}],
+                        "span": span,
+                        "source_text": "struct Anchor { depth: usize, _not_send: PhantomData<*const ()> }",
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [
+                        {
+                            "name": "depth",
+                            "ty": {"Value": [7, {"Scalar": {"Integer": {"Unsigned": "Usize"}}}]},
+                            "attr_info": null
+                        },
+                        {
+                            "name": "_not_send",
+                            "ty": {"Adt": {
+                                "id": 2,
+                                "generics": {
+                                    "regions": [],
+                                    "types": [{
+                                        "RawPtr": [
+                                            {"Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}},
+                                            "Shared"
+                                        ]
+                                    }],
+                                    "const_generics": [],
+                                    "trait_refs": []
+                                },
+                                "builtin": null
+                            }},
+                            "attr_info": null
+                        }
+                    ]},
+                    "layout": layout
+                },
+                {
+                    "def_id": 2,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["core", 0]},
+                            {"Ident": ["marker", 0]},
+                            {"Ident": ["PhantomData", 0]}
+                        ],
+                        "span": span,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": false
+                    },
+                    "kind": {"Struct": []},
+                    "layout": [{
+                        "key": "aarch64-apple-darwin",
+                        "value": {
+                            "size": 0,
+                            "align": 1,
+                            "variant_layouts": [{"field_offsets": []}],
+                            "repr": {"repr_algo": "Rust", "transparent": false}
+                        }
+                    }]
+                }
+            ],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let importing = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "importer",
+            "type_decls": [null, {
+                "def_id": 1,
+                "item_meta": {
+                    "name": [{"Ident": ["fixture", 0]}, {"Ident": ["DepthWord", 0]}],
+                    "span": span,
+                    "source_text": "struct Anchor { depth: usize, _not_send: PhantomData<*const ()> }",
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": false
+                },
+                "kind": "Opaque",
+                "layout": layout
+            }],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let defining = Llbc::from_slice(defining.to_string().as_bytes()).expect("defining parses");
+    let mut importing =
+        Llbc::from_slice(importing.to_string().as_bytes()).expect("importing parses");
+    let rows = super::harvest_published_structs(&defining);
+    super::apply_published_structs(&mut importing, &rows);
+    let td = importing.type_by_id(1).expect("published wrapper");
+    assert!(td.published_struct_copy);
+    let super::TypeDeclKind::Struct(fields) = &td.kind else {
+        panic!("published wrapper is a struct");
+    };
+    assert!(
+        super::field_is_zst(&fields[1].ty, &importing),
+        "published Path-form PhantomData is a ZST, ty={:?}",
+        fields[1].ty
+    );
+    let ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+        "Value": [8, {"Adt": {"id": 1, "generics": {"types": []}}}]
+    }))
+    .expect("wrapper TyRef parses");
+    assert_eq!(
+        super::tyref_to_value_type(&ty, &importing),
+        crate::model::ValueType::Unsigned
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &ty,
+            &importing,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .is_none(),
+        "a transparent scalar wrapper is the word, not inlined field leaves"
+    );
+}
+
 /// `fn f<T>(x: &T)` stays generic on the declaration. The call
 /// instantiates `T` with a `repr(transparent)` scalar wrapper, so the
 /// residual must be refused; the same callee with a non-transparent
@@ -11014,9 +11548,13 @@ fn generic_residual_borrow_of_transparent_scalar_is_refused() {
             }
         })
     };
+    // A residual generic lives in a crate this artefact did not load,
+    // so `is_crate_alias_root` / `foreign_callables` stay false
+    // (`fun_decl_has_body_in_loaded_crate`). The same path under
+    // `fixture` would be the current crate's alias and skip the refuse.
     let callee = serde_json::json!({
         "def_id": 2,
-        "item_meta": item_meta(&["fixture", "f"], false),
+        "item_meta": item_meta(&["foreign", "f"], false),
         "signature": {
             "is_unsafe": false,
             "inputs": [borrowed(type_var)],
@@ -19324,7 +19862,7 @@ fn mem_drop_of_root_scope_lowers_to_one_close() {
     let calls = corpus_call_paths("mem_drop_root_scope");
     let closes = calls
         .iter()
-        .filter(|path| path.split("::").any(|seg| seg == "root_scope_close"))
+        .filter(|path| path.split("::").any(|seg| seg == "root_scope_close_word"))
         .count();
     assert_eq!(closes, 1, "{calls:?}");
     assert!(

@@ -11,12 +11,18 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use crate::runtime_ops::{CallableKind, classify_callable};
 use crate::{
     PyError, PyResult, builtin_code_get, function_get_closure, function_get_globals_obj,
-    function_get_name, function_get_name_obj, function_get_qualname, function_get_qualname_obj,
+    function_get_name_obj, function_get_qualname, function_get_qualname_obj,
 };
 
 /// `function.py:131/214/231 new_frame.run(self.name, self.qualname)`.
 /// Generator creation must capture the function's writable metadata rather
 /// than lazily rereading the immutable code object's names.
+///
+/// Residual: `into_generator_named` walks `capture_coroutine_origin`
+/// (`vec::into_iter::IntoIter::map` is not a registered graph) and
+/// `Option::map` closures. Generator construction is off the CALL_KW
+/// hot path (`PyCode.funcrun` only takes this arm for `CO_GENERATOR`).
+#[majit_macros::dont_look_inside]
 pub(crate) fn frame_into_generator_for_function(
     frame: crate::pyframe::FrameBox,
     function: PyObjectRef,
@@ -433,7 +439,10 @@ pub fn enter_runtime_thread() {
 
 /// Get the current eval function (JIT-aware if registered, plain otherwise).
 /// Respects the force-plain-eval mode.
-#[inline]
+/// Residual so the return stays an `EvalFn` pointer. Looking inside
+/// transmutes a `usize` address and the annotator sees `Integer`, which
+/// is not callable (`eval_current_frame_raw`).
+#[majit_macros::dont_look_inside]
 pub fn get_eval_fn() -> EvalFn {
     // The thread-local read stays in `is_force_plain_eval`. Inlined here it
     // is a call whose target is the `FORCE_PLAIN_EVAL` static, a symbolic
@@ -474,6 +483,9 @@ pub fn current_eval_fn_addr() -> usize {
 /// `eval_with_jit` and the rewritten portal stub are in the closure. The
 /// result/exception split stays on the pending-error channel used by the
 /// other bare-`PyObjectRef` call boundaries.
+/// Residual: `SomePtr.call` of `EvalFn` returns the payload pointer, and
+/// matching `PyResult` then reads `__discriminant` on `GcStruct object`.
+#[majit_macros::dont_look_inside]
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     clear_call_error();
     match get_eval_fn()(frame, None) {
@@ -987,7 +999,16 @@ pub fn fill_user_function_args(
     let header_base = roots.publish(&[callable, defaults]);
     let args_base = roots.publish(args);
     let base = roots.publish(&filled_args);
-    roots.normalize(header_base, 2 + args.len() + filled_args.len());
+    let extra_len = usize::from(nkwonly > 0);
+    let extra = if nkwonly > 0 {
+        // `__kwdefaults__` is published with the rest of the live set so
+        // one `normalize` forwards the whole run, including this slot.
+        let kwdefaults = unsafe { crate::function_get_kwdefaults(roots.get(header_base)) };
+        roots.publish(&[kwdefaults])
+    } else {
+        0
+    };
+    roots.normalize(header_base, 2 + nargs + total_params + extra_len);
 
     // Fill positional defaults for slots [n_pos_copied..nparams).
     if n_pos_copied < nparams && !roots.get(header_base + 1).is_null() {
@@ -1016,24 +1037,30 @@ pub fn fill_user_function_args(
         }
     }
 
-    // Fill keyword-only defaults from kwdefaults dict.
-    if nkwonly > 0 {
-        let kwdefaults = unsafe { crate::function_get_kwdefaults(roots.get(header_base)) };
-        let kwdefaults_base = roots.publish(&[kwdefaults]);
-        roots.normalize(kwdefaults_base, 1);
-        if !roots.get(kwdefaults_base).is_null()
-            && unsafe { pyre_object::is_dict(roots.get(kwdefaults_base)) }
-        {
+    // [3.15-spec] `PyDict_GetItemRef(func->func_kwdefaults, varname, &def)`
+    // (Python/ceval.c `initialize_locals`, read at v3.15.0 and v3.15.2) ↔ pypy3
+    // `space.finditem_str`.  Storage-level
+    // `getitem_str` on `resolve_dict_backing(w_kw_defs)`: a dict subclass
+    // `__getitem__` / `__missing__` is never dispatched, while an error
+    // from a colliding key's `__eq__` propagates.
+    if nkwonly > 0 && !roots.get(extra).is_null() {
+        let backing = crate::type_methods::resolve_dict_backing(roots.get(extra));
+        roots.set(extra, backing);
+        if !roots.get(extra).is_null() {
             for ki in 0..nkwonly {
                 let slot = nparams + ki;
-                if roots.get(base + slot).is_null() {
-                    let param_name = &code_ref.varnames[slot];
-                    let key_slot = roots.pin_roots(&[pyre_object::w_str_new_managed(param_name)]);
-                    if let Some(val) = unsafe {
-                        pyre_object::w_dict_lookup(roots.get(kwdefaults_base), roots.get(key_slot))
-                    } {
-                        roots.set(base + slot, val);
-                    }
+                if !roots.get(base + slot).is_null() {
+                    continue;
+                }
+                if let Some(val) = unsafe {
+                    pyre_object::dictmultiobject::w_dict_getitem_str_checked(
+                        roots.get(extra),
+                        code_ref.varnames[slot].as_str(),
+                    )
+                }
+                .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
+                {
+                    roots.set(base + slot, val);
                 }
             }
         }
@@ -1109,9 +1136,15 @@ pub fn fill_user_function_args(
 /// `fname` is the function's `__qualname__`, which may carry a lone surrogate,
 /// and the message becomes the TypeError's `args[0]` -- so the whole line is
 /// assembled as WTF-8 rather than through a `String`.
+/// Residual: `String::push_str` is not a registered graph (`call_args`
+/// looks inside `fill_user_function_args`).
+#[majit_macros::dont_look_inside]
 fn format_missing_err(fname: &Wtf8, missing: &[&str], positional: bool) -> Wtf8Buf {
     let mut arguments_str = String::new();
-    for (i, arg) in missing.iter().enumerate() {
+    // `range(len)` not `enumerate`: `slice::iter::Iter::enumerate` is
+    // not a registered graph (`fill_user_function_args` → `call_args`).
+    for i in 0..missing.len() {
+        let arg = missing[i];
         if i == 0 {
             // no separator
         } else if i == missing.len() - 1 {
@@ -1910,10 +1943,450 @@ fn call_function_ex_impl(
     )
 }
 
-/// [`call_kw_in_ctx`] reached from a frame — the `pyopcode.py:1402
-/// CALL_FUNCTION_KW` shape, whose else-branch is the frameless
-/// `space.call_args(w_function, args)`.  The caller frame is already rooted
-/// the way [`call_callable`] describes.
+/// A Python `Function` / `BuiltinFunction` whose code is `PyCode`, not
+/// `BuiltinCode`. `descroperation.py call_args` sends this to
+/// `Function.call_args` → `PyCode.funcrun`. Builtins stay on the flattening
+/// path (`gateway.py BuiltinCode.funcrun`).
+pub(crate) fn is_user_pycode_function(callable: PyObjectRef) -> bool {
+    if callable.is_null() {
+        return false;
+    }
+    let is_user = unsafe {
+        pyre_object::pyobject::py_type_check(callable, &crate::FUNCTION_TYPE)
+            || pyre_object::pyobject::py_type_check(callable, &crate::BUILTIN_FUNCTION_TYPE)
+    };
+    if !is_user {
+        return false;
+    }
+    let code = unsafe { crate::getcode(callable) };
+    !code.is_null() && unsafe { !crate::gateway::is_builtin_code(code) }
+}
+
+/// 3.14 `CALL_KW` packing: names tuple + value tail → `Arguments`.
+///
+/// `pyopcode.py CALL_FUNCTION_KW` builds `keyword_names_w` / `keywords_w`
+/// from the names tuple and the value tail, then `argument_factory`.
+/// `_jit_few_keywords` is `keywords is None or jit.isconstant(len(keywords))`
+/// (`argument.py` `__init__`). A non-null `self_or_null` prepends as arg0
+/// (the 3.14 `LOAD_METHOD` receiver slot) and sets `methodcall`
+/// (`callmethod.py` `CALL_METHOD_KW`: `methodcall=w_self is not None`).
+#[majit_macros::unroll_safe]
+fn arguments_from_call_kw(
+    self_or_null: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwarg_names: PyObjectRef,
+    w_function: PyObjectRef,
+) -> Result<crate::argument::Arguments, crate::PyError> {
+    let nargs = positional.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    // Packing reads the names tuple and can collect; keep the callable live.
+    let _ = pyre_object::gc_roots::pin_root(w_function);
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_or_null);
+    let kw_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwarg_names);
+    let pos_base = pyre_object::gc_roots::pin_roots(positional);
+
+    let kwnames = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+    let nkw = if !kwnames.is_null() && unsafe { pyre_object::is_tuple(kwnames) } {
+        unsafe { pyre_object::w_tuple_len(kwnames) }
+    } else {
+        0
+    };
+    if nkw > nargs {
+        return Err(crate::PyError::type_error(
+            "keyword argument count exceeds supplied arguments",
+        ));
+    }
+    let n_pos = nargs - nkw;
+    let has_receiver = {
+        let receiver = pyre_object::gc_roots::shadow_stack_get(first_slot);
+        !receiver.is_null() && receiver != PY_NULL
+    };
+
+    // One `pin_roots` of the collected names. A `pin_root` per name is
+    // a pin-in-a-loop: erase sees a different depth at the loop merge
+    // (`depth-disagrees-at-merge`). The names tuple is already pinned
+    // (`kw_slot`); `w_tuple_getitem` of a string-names tuple is a
+    // pointer read of that rooted array.
+    let mut names = Vec::with_capacity(nkw);
+    for i in 0..nkw {
+        let kwnames = pyre_object::gc_roots::shadow_stack_get(kw_slot);
+        let name = match unsafe { pyre_object::w_tuple_getitem(kwnames, i as i64) } {
+            Some(name) => name,
+            None => {
+                return Err(crate::PyError::type_error(
+                    "keyword name tuple is shorter than the keyword tail",
+                ));
+            }
+        };
+        names.push(name);
+    }
+    let names_base = pyre_object::gc_roots::pin_roots(&names);
+
+    let mut arguments_w = Vec::with_capacity(n_pos + usize::from(has_receiver));
+    if has_receiver {
+        arguments_w.push(pyre_object::gc_roots::shadow_stack_get(first_slot));
+    }
+    for i in 0..n_pos {
+        arguments_w.push(pyre_object::gc_roots::shadow_stack_get(pos_base + i));
+    }
+    let mut keyword_names_w = Vec::with_capacity(nkw);
+    let mut keywords_w = Vec::with_capacity(nkw);
+    for i in 0..nkw {
+        keyword_names_w.push(pyre_object::gc_roots::shadow_stack_get(names_base + i));
+        // `pos_base + (n_pos + i)` is SliceBase + one runtime local.
+        // `pos_base + n_pos + i` is SliceOffset + runtime, which erase
+        // does not model.
+        let pos_idx = n_pos + i;
+        keywords_w.push(pyre_object::gc_roots::shadow_stack_get(pos_base + pos_idx));
+    }
+    // CALL_KW has no `*` / `**` to expand (`pyopcode.py CALL_FUNCTION_KW`
+    // already packed names and values), so the constructor is a struct
+    // literal. `Arguments::new` looks inside `_combine_wrapped`, which the
+    // annotator types even when both stars are None.
+    let (keyword_names_w, keywords_w, jit_few_keywords) = if nkw == 0 {
+        (None, None, true)
+    } else {
+        (
+            Some(keyword_names_w),
+            Some(keywords_w),
+            majit_rlib::jit::isconstant(&nkw),
+        )
+    };
+    Ok(crate::argument::Arguments::from_owned_vecs(
+        arguments_w,
+        keyword_names_w,
+        keywords_w,
+        jit_few_keywords,
+        has_receiver,
+    ))
+}
+
+/// Pin the incoming `Arguments` Vecs and read the flags `funcrun_obj`
+/// needs. Residual so the look-inside caller does not getattr the Vec
+/// fields (`arguments_keyword_count` is the same split for `call_args`).
+#[majit_macros::dont_look_inside]
+fn pin_funcrun_argument_vecs(
+    args: &crate::argument::Arguments,
+) -> (usize, usize, usize, usize, usize, bool, bool, bool) {
+    let nargs = args.arguments_w.len();
+    let names_is_some = args.keyword_names_w.is_some();
+    let nkw = crate::argument::arguments_keyword_count(args);
+    let args_base = pyre_object::gc_roots::pin_roots(&args.arguments_w);
+    let names_base =
+        pyre_object::gc_roots::pin_roots(args.keyword_names_w.as_deref().unwrap_or(&[]));
+    let values_base = pyre_object::gc_roots::pin_roots(args.keywords_w.as_deref().unwrap_or(&[]));
+    (
+        nargs,
+        nkw,
+        args_base,
+        names_base,
+        values_base,
+        args.jit_few_keywords,
+        args.methodcall,
+        names_is_some,
+    )
+}
+
+/// Rebuild `Arguments` from the shadow-stack pins taken before `createframe`.
+/// The copy loops live here so `funcrun` / `funcrun_obj` stay loop-free
+/// (`look_inside_graph` residualizes a loopy graph; `funcrun` is not
+/// `unroll_safe`).
+#[inline(never)]
+fn arguments_from_funcrun_pins(
+    args_base: usize,
+    nargs: usize,
+    names_base: usize,
+    nkw: usize,
+    values_base: usize,
+    jit_few_keywords: bool,
+    methodcall: bool,
+    names_is_some: bool,
+) -> crate::argument::Arguments {
+    let arguments_w = copy_shadow_slice(args_base, nargs);
+    let keyword_names_w = if names_is_some {
+        Some(copy_shadow_slice(names_base, nkw))
+    } else {
+        None
+    };
+    let keywords_w = if names_is_some {
+        Some(copy_shadow_slice(values_base, nkw))
+    } else {
+        None
+    };
+    crate::argument::Arguments::from_owned_vecs(
+        arguments_w,
+        keyword_names_w,
+        keywords_w,
+        jit_few_keywords,
+        methodcall,
+    )
+}
+
+/// Pin each item of a tuple already rooted at `tuple_slot`.
+/// Re-reads the tuple from the slot each iteration because `w_tuple_getitem`
+/// can collect. The loop lives here so `funcrun` stays loop-free.
+#[inline(never)]
+fn pin_tuple_items_from_slot(tuple_slot: usize, n: usize) -> usize {
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..n {
+        let tuple = pyre_object::gc_roots::shadow_stack_get(tuple_slot);
+        let item = unsafe { pyre_object::w_tuple_getitem(tuple, i as i64) }.unwrap_or(PY_NULL);
+        let _ = pyre_object::gc_roots::pin_root(item);
+    }
+    base
+}
+
+#[inline(never)]
+fn copy_shadow_slice(base: usize, n: usize) -> Vec<PyObjectRef> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(pyre_object::gc_roots::shadow_stack_get(base + i));
+    }
+    out
+}
+
+/// `pycode.py PyCode.funcrun` writes `parse_into_scope` into
+/// `fresh_frame.locals_cells_stack_w`. `_match_signature` takes a list;
+/// passing the virtualizable array type-unions that list with a vable
+/// slice and gives every `_match_signature` caller
+/// `ForcesVirtualOrVirtualizable` extraeffect (`get_attr_elidable` among
+/// them). Parse into a plain list, then copy under the same
+/// `access_directly` / `fresh_virtualizable` hints. The copy loop lives
+/// here so `funcrun` stays loop-free (`look_inside_graph` residualizes a
+/// loopy graph; `funcrun` is not `unroll_safe`).
+#[majit_macros::unroll_safe]
+fn parse_into_fresh_frame(
+    args: &crate::argument::Arguments,
+    w_firstarg: PyObjectRef,
+    frame: &mut PyFrame,
+    fnname: &Wtf8,
+    signature: &crate::gateway::Signature,
+    defaults_w: &[PyObjectRef],
+    w_kw_defs: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = crate::argument::pin_root_gcarray(args.arguments_w_gc);
+    let _ = crate::argument::pin_root_gcarray(args.keyword_names_w_gc);
+    let _ = crate::argument::pin_root_gcarray(args.keywords_w_gc);
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_firstarg);
+    let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_kw_defs);
+    let ndef = defaults_w.len();
+    let defaults_base = pyre_object::gc_roots::pin_roots(defaults_w);
+    let scopelen = signature.scope_length();
+    let mut scope_w: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; scopelen];
+    let defaults_w: Vec<PyObjectRef> = (0..ndef)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(defaults_base + i))
+        .collect();
+    // `funcrun_obj` owns this frame as a `FrameBox`
+    // (`try_gc_alloc_young_nonmoving_raw`); the body is immobile.
+    // `locals_cells_stack_w` is a nursery GcArray (`createframe_obj`
+    // `NurseryGc` / `try_gc_alloc`) and moves. `parse_into_scope`
+    // allocates (`_match_signature` `space.newdict(kwargs=True)`).
+    // Pin the array as a livevar and reload it after that call
+    // (`framework.py` `push_roots` / `pop_roots`). The getfield that
+    // names it sits on `hint(frame, access_directly=True,
+    // fresh_virtualizable=True)` so `jtransform.py
+    // is_virtualizable_getset` does not put it in `vable_array_vars`.
+    let frame_ptr = frame as *mut PyFrame;
+    let frame_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(frame_ptr as PyObjectRef);
+    let locals_slot = {
+        let frame =
+            unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame) };
+        let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
+            majit_metainterp::jit::hint_access_directly(frame),
+        );
+        let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(fresh_frame.locals_cells_stack_w as PyObjectRef);
+        locals_slot
+    };
+    args.parse_into_scope(
+        pyre_object::gc_roots::shadow_stack_get(first_slot),
+        &mut scope_w,
+        fnname,
+        signature,
+        &defaults_w,
+        pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
+    )?;
+    let scope_base = pyre_object::gc_roots::pin_roots(&scope_w);
+    {
+        let locals = unsafe {
+            &mut *(pyre_object::gc_roots::shadow_stack_get(locals_slot)
+                as *mut pyre_object::FixedObjectArray)
+        };
+        let n = scopelen.min(locals.len());
+        let mut i = 0usize;
+        while i < n {
+            locals.set_ref(i, pyre_object::gc_roots::shadow_stack_get(scope_base + i));
+            i += 1;
+        }
+        // `framework.py transform_generic_set` write-barriers every GC store
+        // into a GC array. The loop itself cannot collect; one remember of
+        // the array that received the stores covers the batch
+        // (`incminimark.py write_barrier` / `remember_frame_locals_array`).
+        crate::pyframe::remember_frame_locals_array(locals as *mut pyre_object::FixedObjectArray);
+    }
+    let frame =
+        unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(frame_slot) as *mut PyFrame) };
+    let fresh_frame = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(frame),
+    );
+    fresh_frame.init_cells();
+    Ok(())
+}
+
+/// `pycode.py PyCode.funcrun` — `createframe` then
+/// `jit.hint(frame, access_directly=True, fresh_virtualizable=True)` then
+/// `Arguments.parse_into_scope` into `fresh_frame.locals_cells_stack_w`,
+/// then `init_cells` and `frame.run`. The copies pin `Arguments` across
+/// `createframe` (`ShadowStackFrameworkGCTransformer`). A getfield on a
+/// `fresh_virtualizable` is not a virtualizable access (`jtransform.py`
+/// `is_virtualizable_getset`), so the array may be passed.
+pub(crate) fn funcrun(func: PyObjectRef, args: &crate::argument::Arguments) -> PyResult {
+    funcrun_obj(func, PY_NULL, args)
+}
+
+/// `pycode.py PyCode.funcrun_obj` — `parse_into_scope(w_obj, ...)`.
+pub(crate) fn funcrun_obj(
+    func: PyObjectRef,
+    w_firstarg: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func);
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_firstarg);
+    let (
+        nargs,
+        nkw,
+        args_base,
+        names_base,
+        values_base,
+        jit_few_keywords,
+        methodcall,
+        names_is_some,
+    ) = pin_funcrun_argument_vecs(args);
+
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let code = unsafe { crate::getcode(func_now) };
+    if code.is_null() {
+        return Err(crate::PyError::type_error(
+            "funcrun requires a Python function",
+        ));
+    }
+    let code_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(code);
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let globals = unsafe { function_get_globals_obj(func_now) };
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(globals);
+
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let defs_obj = unsafe { crate::function_get_defaults(func_now) };
+    let defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(defs_obj);
+    let func_now = pyre_object::gc_roots::shadow_stack_get(func_slot);
+    let kw_defs_obj = unsafe { crate::function_get_kwdefaults(func_now) };
+    let kw_defs_obj = if kw_defs_obj.is_null() || unsafe { pyre_object::is_none(kw_defs_obj) } {
+        PY_NULL
+    } else {
+        kw_defs_obj
+    };
+    let kw_defs_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kw_defs_obj);
+
+    let defs_obj = pyre_object::gc_roots::shadow_stack_get(defs_slot);
+    let ndef = if defs_obj.is_null()
+        || unsafe { pyre_object::is_none(defs_obj) }
+        || unsafe { !pyre_object::is_tuple(defs_obj) }
+    {
+        0
+    } else {
+        unsafe { pyre_object::w_tuple_len(defs_obj) }
+    };
+    let defaults_base = pin_tuple_items_from_slot(defs_slot, ndef);
+
+    let execution_context = getexecutioncontext();
+    let mut frame = crate::pyframe::createframe_obj(
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
+        pyre_object::gc_roots::shadow_stack_get(globals_slot),
+        execution_context,
+        Some(pyre_object::gc_roots::shadow_stack_get(func_slot)),
+    )?;
+    let sig_ptr =
+        unsafe { crate::w_code_signature(pyre_object::gc_roots::shadow_stack_get(code_slot)) };
+    debug_assert!(!sig_ptr.is_null(), "PyCode._signature");
+    let signature = unsafe { &*sig_ptr };
+
+    let parsed = arguments_from_funcrun_pins(
+        args_base,
+        nargs,
+        names_base,
+        nkw,
+        values_base,
+        jit_few_keywords,
+        methodcall,
+        names_is_some,
+    );
+    let defaults_w = copy_shadow_slice(defaults_base, ndef);
+    // `pycode.py PyCode.funcrun` / `funcrun_obj` pass `func.qualname` into
+    // `parse_into_scope`, so a binding TypeError is `C.m()` /
+    // `outer.<locals>.inner()` rather than the bare `co_name`.
+    let fnname =
+        unsafe { crate::function_get_qualname(pyre_object::gc_roots::shadow_stack_get(func_slot)) };
+    // `pycode.py PyCode.funcrun` — `fresh_frame = jit.hint(frame,
+    // access_directly=True, fresh_virtualizable=True)` then
+    // `args.parse_into_scope(..., fresh_frame.locals_cells_stack_w, ...)`.
+    // `_match_signature` never sees the virtualizable array: parse into a
+    // list, then copy under those hints (`parse_into_fresh_frame`).
+    parse_into_fresh_frame(
+        &parsed,
+        pyre_object::gc_roots::shadow_stack_get(first_slot),
+        &mut *frame,
+        &fnname,
+        signature,
+        &defaults_w,
+        pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
+    )?;
+    let code_ptr = unsafe {
+        crate::w_code_get_ptr(pyre_object::gc_roots::shadow_stack_get(code_slot))
+            as *const crate::CodeObject
+    };
+    if !code_ptr.is_null()
+        && crate::pyframe::code_flags_make_generator(unsafe { (*code_ptr).flags })
+    {
+        return frame_into_generator_for_function(
+            frame,
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+        );
+    }
+    frame.fix_array_ptrs();
+    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+    // `pycode.py PyCode.funcrun` ends in `frame.run()`. The registered eval
+    // hook is a stored function pointer (`get_eval_fn`); the adapter lowers
+    // that IndirectCall to `simple_call` of the pointer, matching
+    // `PtrRepr.rtype_simple_call`.
+    let result = eval_current_frame_raw(&mut frame);
+    if result.is_null() {
+        match take_call_error() {
+            Some(err) => Err(err),
+            None => Err(crate::PyError::value_error("call failed")),
+        }
+    } else {
+        Ok(result)
+    }
+}
+
+/// [`call_kw_in_ctx`] reached from a frame — `pyopcode.py CALL_FUNCTION_KW`.
+/// Packs the 3.14 names-tuple layout into `Arguments`, then
+/// `call_args_and_c_profile` for a profiled builtin or `space.call_args`.
+/// The opcode handler (`eval::call_kw`) is `@jit.unroll_safe`; this helper
+/// has no loop of its own (`arguments_from_call_kw` owns the packing loops).
 pub fn call_kw(
     frame: &mut PyFrame,
     callable: PyObjectRef,
@@ -1921,16 +2394,34 @@ pub fn call_kw(
     positional: &[PyObjectRef],
     kwarg_names: PyObjectRef,
 ) -> PyResult {
-    let profile_frame = frame as *mut PyFrame;
-    let execution_context = getexecutioncontext();
-    call_kw_in_ctx_impl(
-        execution_context,
-        callable,
+    let _roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(callable);
+    let mut args = arguments_from_call_kw(
         self_or_null,
         positional,
         kwarg_names,
-        profile_frame,
-    )
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+    )?;
+    let _ = crate::argument::pin_root_gcarray(args.arguments_w_gc);
+    let _ = crate::argument::pin_root_gcarray(args.keyword_names_w_gc);
+    let _ = crate::argument::pin_root_gcarray(args.keywords_w_gc);
+    let callable = pyre_object::gc_roots::shadow_stack_get(callable_slot);
+    // `pyopcode.py CALL_FUNCTION_KW`: `function.is_builtin_code(w_function)`
+    // unwraps a `_Method` before testing its code, so `'a-b'.split(sep='-')`
+    // keeps the c_call/c_return arm.
+    if frame.get_is_being_profiled() && crate::function::is_builtin_code(callable) {
+        let w_res =
+            crate::baseobjspace::call_args_and_c_profile_args(frame, callable, &mut args, &[]);
+        if w_res == PY_NULL {
+            return Err(match take_call_error() {
+                Some(err) => err,
+                None => crate::PyError::value_error("call failed"),
+            });
+        }
+        return Ok(w_res);
+    }
+    crate::baseobjspace::call_args(callable, &args)
 }
 
 /// CALL_KW helper — resolve keyword arguments against the callable and
@@ -1947,13 +2438,22 @@ pub fn call_kw_in_ctx(
     positional: &[PyObjectRef],
     kwarg_names: PyObjectRef,
 ) -> PyResult {
-    call_kw_in_ctx_impl(
-        execution_context,
-        callable,
+    let _ = execution_context;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(callable);
+    let args = arguments_from_call_kw(
         self_or_null,
         positional,
         kwarg_names,
-        std::ptr::null_mut(),
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+    )?;
+    let _ = crate::argument::pin_root_gcarray(args.arguments_w_gc);
+    let _ = crate::argument::pin_root_gcarray(args.keyword_names_w_gc);
+    let _ = crate::argument::pin_root_gcarray(args.keywords_w_gc);
+    crate::baseobjspace::call_args(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        &args,
     )
 }
 
@@ -1962,6 +2462,7 @@ pub fn call_kw_in_ctx(
 /// `space.call_args`.  See [`c_profile_frame`] for what the frame decides.
 /// `pyopcode.py CALL_FUNCTION_KW` is `@jit.unroll_safe`.
 #[majit_macros::unroll_safe]
+
 fn call_kw_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -2107,13 +2608,8 @@ fn call_kw_in_ctx_impl(
         );
     }
 
-    // Keyword binding runs once, in `function.py Function.call_args`.
-    // A plain user function takes `pycode.py PyCode.funcrun`:
-    // `argument.py Arguments.parse_into_scope`, then the callee.
-    // Every other target keeps `resolve_kwargs`. Either binder fills
-    // the scope `call_user_function_resolved` runs, so that entry skips
-    // the defaults-fill / pack_varargs replay
-    // `call_user_function_with_args` performs for positional-only paths.
+    // Live CALL_KW packing is `arguments_from_call_kw` then `call_args`.
+    // Remaining targets in this leftover helper keep `resolve_kwargs`.
     let is_builtin = unsafe { crate::is_function(callable_unwrapped) }
         && unsafe {
             crate::is_builtin_code(crate::getcode(callable_unwrapped) as pyre_object::PyObjectRef)
@@ -2224,28 +2720,6 @@ fn call_kw_in_ctx_impl(
         (callable_unwrapped, None)
     };
     let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-    // The caller frame stays anchored across binding and the callee. A user
-    // function does not receive it: `Function.call_args` is the entry, and
-    // `call_user_function_resolved` keeps that shape. The non-user arm reads
-    // it back with `FrameAnchor::live` for `call_callable_with_mode`.
-    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
-    // `crate::is_function` is also true for a builtin function and a method
-    // descriptor. Those stay on `resolve_kwargs` (the builtin arm above
-    // already returned). `get_pycode` is the same user-code gate
-    // `call_user_function_resolved` uses.
-    let plain_user = unsafe {
-        crate::is_function(target_func)
-            && !crate::is_builtin_code(crate::getcode(target_func) as pyre_object::PyObjectRef)
-    };
-    if plain_user {
-        return call_user_function_from_call_kw(
-            execution_context,
-            target_func,
-            call_args,
-            kwarg_names,
-            methodcall,
-        );
-    }
     // `resolve_kwargs` reaches `store_collected_keyword`, whose `__hash__`
     // can collect. The kwnames tuple and the target are read again on the
     // binding-error path, and `call_callable_with_mode` still needs the
@@ -2253,6 +2727,7 @@ fn call_kw_in_ctx_impl(
     // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
     // keeping the raw pointer live across the call.
     let n_args = call_args.len();
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     let roots = pyre_object::gc_roots::push_roots();
     let func_slot = roots.publish(&[target_func, kwarg_names]);
     let args_base = roots.publish(call_args);
@@ -2292,168 +2767,6 @@ fn call_kw_in_ctx_impl(
             frame_anchor.live(),
         )
     }
-}
-
-/// `function.py Function.call_args` → `pycode.py PyCode.funcrun` →
-/// `argument.py Arguments.parse_into_scope`.
-///
-/// The receiver is already the first positional (`function.py Method.call_args`
-/// → `argument.py Arguments.prepend`). `methodcall` is the
-/// `callmethod.py CALL_METHOD_KW` flag `Arguments` stores. `w_firstarg` is
-/// null: `PyCode.funcrun` passes `None`.
-///
-/// The bound scope has the `Arguments.parse_into_scope` layout
-/// (`co_argcount + kwonly + *args + **kwargs`, defaults filled) and is what
-/// `call_user_function_resolved` copies into the new frame.
-fn call_user_function_from_call_kw(
-    execution_context: *const crate::PyExecutionContext,
-    target_func: PyObjectRef,
-    call_args: &[PyObjectRef],
-    kwarg_names: PyObjectRef,
-    methodcall: bool,
-) -> PyResult {
-    let n_args = call_args.len();
-    let roots = pyre_object::gc_roots::push_roots();
-    let func_slot = roots.publish(&[target_func, kwarg_names]);
-    let args_base = roots.publish(call_args);
-    roots.normalize(func_slot, 2 + n_args);
-
-    let nkw = {
-        let names = roots.get(func_slot + 1);
-        if unsafe { pyre_object::is_tuple(names) } {
-            unsafe { pyre_object::w_tuple_len(names) }
-        } else {
-            0
-        }
-    };
-    let n_pos = n_args.saturating_sub(nkw);
-
-    // `w_tuple_getitem` can rebox a keyword name. Pin each name with its
-    // value before the next getitem. A missing tuple item is skipped on both
-    // lists so they stay parallel. `nkw == 0` passes `keyword_names_w=None`
-    // (`Arguments` with no keywords), including an empty kwnames tuple.
-    let mut n_kept = 0usize;
-    let mut names_base = 0usize;
-    let mut values_base = 0usize;
-    if nkw > 0 {
-        names_base = pyre_object::gc_roots::shadow_stack_len();
-        let mut kept_ki = Vec::with_capacity(nkw);
-        for ki in 0..nkw {
-            if n_pos.saturating_add(ki) >= n_args {
-                continue;
-            }
-            let names_obj = roots.get(func_slot + 1);
-            let Some(name_obj) = (unsafe { pyre_object::w_tuple_getitem(names_obj, ki as i64) })
-            else {
-                continue;
-            };
-            let _ = roots.pin_root(name_obj);
-            kept_ki.push(ki);
-        }
-        n_kept = kept_ki.len();
-        values_base = pyre_object::gc_roots::shadow_stack_len();
-        for ki in kept_ki {
-            let _ = roots.pin_root(roots.get(args_base + n_pos + ki));
-        }
-    }
-
-    // `function.py fget_func_qualname` allocates when `w_qualname` is null.
-    // `PyCode.funcrun` passes `func.qualname` into `parse_into_scope`.
-    let fnname = unsafe { crate::function_get_qualname(roots.get(func_slot)) };
-
-    let mut ndef = 0usize;
-    let mut defaults_base = 0usize;
-    {
-        let defaults_obj = unsafe { crate::function_get_defaults(roots.get(func_slot)) };
-        if !defaults_obj.is_null() && unsafe { pyre_object::is_tuple(defaults_obj) } {
-            ndef = unsafe { pyre_object::w_tuple_len(defaults_obj) };
-        }
-    }
-    if ndef > 0 {
-        defaults_base = pyre_object::gc_roots::shadow_stack_len();
-        for index in 0..ndef {
-            let defaults_obj = unsafe { crate::function_get_defaults(roots.get(func_slot)) };
-            let item = unsafe { pyre_object::w_tuple_getitem(defaults_obj, index as i64) }
-                .unwrap_or(pyre_object::PY_NULL);
-            let _ = roots.pin_root(item);
-        }
-    }
-
-    // `pycode.py` `PyCode.funcrun`: `sig = self._signature`.
-    let signature = {
-        let func_now = roots.get(func_slot);
-        let w_code = unsafe { crate::getcode(func_now) };
-        let sig_ptr = unsafe { (*(w_code as *const crate::pycode::PyCode))._signature };
-        debug_assert!(!sig_ptr.is_null(), "PyCode._signature");
-        unsafe { &*sig_ptr }
-    };
-    let mut scope_w = vec![pyre_object::PY_NULL; signature.scope_length()];
-
-    // `Arguments::full` copies, then `_combine_wrapped` can safepoint.
-    // `match_signature` copies positionals into `scope_w` before its own
-    // `push_roots`, so the fields it reads are reloaded from this bracket
-    // after that safepoint and after the qualname / defaults allocations.
-    let pos = read_root_run(&roots, args_base, n_pos);
-    let names = if nkw == 0 {
-        None
-    } else {
-        Some(read_root_run(&roots, names_base, n_kept))
-    };
-    let values = if nkw == 0 {
-        None
-    } else {
-        Some(read_root_run(&roots, values_base, n_kept))
-    };
-    let mut arguments =
-        crate::argument::Arguments::full(&pos, names.as_deref(), values.as_deref(), methodcall);
-    arguments.arguments_w = read_root_run(&roots, args_base, n_pos);
-    if nkw == 0 {
-        arguments.keyword_names_w = None;
-        arguments.keywords_w = None;
-    } else {
-        arguments.keyword_names_w = Some(read_root_run(&roots, names_base, n_kept));
-        arguments.keywords_w = Some(read_root_run(&roots, values_base, n_kept));
-    }
-    let defaults_now = if ndef == 0 {
-        Vec::new()
-    } else {
-        read_root_run(&roots, defaults_base, ndef)
-    };
-    let defaults_arg = if ndef == 0 {
-        None
-    } else {
-        Some(defaults_now.as_slice())
-    };
-    let w_kw_defs = {
-        let kw = unsafe { crate::function_get_kwdefaults(roots.get(func_slot)) };
-        if kw.is_null() || unsafe { pyre_object::is_none(kw) } {
-            pyre_object::PY_NULL
-        } else {
-            kw
-        }
-    };
-    arguments.parse_into_scope(
-        pyre_object::PY_NULL,
-        &mut scope_w,
-        &fnname,
-        signature,
-        defaults_arg,
-        w_kw_defs,
-    )?;
-    let func_now = roots.get(func_slot);
-    call_user_function_resolved(execution_context, func_now, &scope_w)
-}
-
-fn read_root_run(
-    roots: &pyre_object::gc_roots::RootScope,
-    base: usize,
-    len: usize,
-) -> Vec<PyObjectRef> {
-    let mut out = Vec::with_capacity(len);
-    for index in 0..len {
-        out.push(roots.get(base + index));
-    }
-    out
 }
 
 /// `typeobject.c type_call` is the metaclass's `tp_call`; calling a class
@@ -3482,7 +3795,13 @@ pub fn parse_builtin_signature(
         let npos_user = npos.saturating_sub(skip);
         crate::builtins::clinic_arity(fname, npos_user, nkw, 0, n, 0)?;
     }
-    let mut scope_w = match arguments._parse(pyre_object::PY_NULL, sig, defaults, w_kw_defs, 0) {
+    let mut scope_w = match arguments._parse(
+        pyre_object::PY_NULL,
+        sig,
+        defaults.unwrap_or(&[]),
+        w_kw_defs,
+        0,
+    ) {
         Ok(scope) => scope,
         Err(crate::argument::MatchSignatureError::Shape(err)) => {
             let names_now: Vec<PyObjectRef> = (0..nkw)
@@ -3771,8 +4090,9 @@ fn call_passthrough_maybe_profile(
     let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
     let arguments = make_args();
     if !ec.is_null() {
+        let w_firstarg = arguments.firstarg().unwrap_or(pyre_object::PY_NULL);
         unsafe {
-            (*ec).c_call_trace(frame_anchor.live(), current_callable(), Some(&arguments))?;
+            (*ec).c_call_trace(frame_anchor.live(), current_callable(), w_firstarg)?;
         }
     }
     let arguments = make_args();
@@ -3782,12 +4102,9 @@ fn call_passthrough_maybe_profile(
             let _ = pyre_object::gc_roots::pin_root(w_res);
             if !ec.is_null() {
                 let arguments = make_args();
+                let w_firstarg = arguments.firstarg().unwrap_or(pyre_object::PY_NULL);
                 unsafe {
-                    (*ec).c_return_trace(
-                        frame_anchor.live(),
-                        current_callable(),
-                        Some(&arguments),
-                    )?;
+                    (*ec).c_return_trace(frame_anchor.live(), current_callable(), w_firstarg)?;
                 }
             }
             Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
@@ -3860,6 +4177,8 @@ pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> Py
 /// `typedef`, `builtins` and `importing`). One exact `str` is minted per
 /// name, which is `space.newtext` for those literals. A caller that still
 /// holds the mapping's own key objects uses [`call_with_kwargs_in_ctx_impl`].
+/// Residual: minting walks `w_str_from_wtf8_managed` (`is_ascii`).
+#[majit_macros::dont_look_inside]
 pub fn call_with_kwargs_in_ctx(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -3877,6 +4196,8 @@ pub fn call_with_kwargs_in_ctx(
 ///
 /// [`call_with_kwargs`] has no C-profile arm, so the delegate receives a
 /// null profile frame. The mint is the collecting call on this path.
+/// Residual: minting walks `w_str_from_wtf8_managed` (`is_ascii`).
+#[majit_macros::dont_look_inside]
 fn call_with_minted_keyword_names(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -3926,7 +4247,11 @@ fn call_with_minted_keyword_names(
 /// `methodcall` is `Arguments.methodcall`; `_match_signature` raises
 /// `ArgErrTooManyMethod` when it is set. Callers that hold an `Arguments`
 /// pass `args.methodcall`; star-arg and minted-name paths pass `false`.
-fn call_with_kwargs_in_ctx_impl(
+///
+/// Residual: the flatten arm of `call_args` would otherwise walk an
+/// unregistered `FunctionPath`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn call_with_kwargs_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
     pos_args: &[PyObjectRef],
@@ -4179,16 +4504,13 @@ fn call_with_kwargs_in_ctx_impl(
                     let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
                     if !ec.is_null() {
                         let pos_now = rooted_pos();
-                        let names_now = rooted_names();
-                        let values_now = rooted_values();
-                        let arguments =
-                            crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+                        let w_firstarg = if pos_now.is_empty() {
+                            PY_NULL
+                        } else {
+                            pos_now.as_slice()[0]
+                        };
                         unsafe {
-                            (*ec).c_call_trace(
-                                frame_anchor.live(),
-                                current_callable(),
-                                Some(&arguments),
-                            )
+                            (*ec).c_call_trace(frame_anchor.live(), current_callable(), w_firstarg)
                         }?;
                     }
                     // The trace runs application code. Reload, then bind once.
@@ -4259,15 +4581,16 @@ fn call_with_kwargs_in_ctx_impl(
                     let _ = pyre_object::gc_roots::pin_root(w_res);
                     if !ec.is_null() {
                         let pos_now = rooted_pos();
-                        let names_now = rooted_names();
-                        let values_now = rooted_values();
-                        let arguments =
-                            crate::argument::Arguments::with_kw(&pos_now, &names_now, &values_now);
+                        let w_firstarg = if pos_now.is_empty() {
+                            PY_NULL
+                        } else {
+                            pos_now.as_slice()[0]
+                        };
                         unsafe {
                             (*ec).c_return_trace(
                                 frame_anchor.live(),
                                 current_callable(),
-                                Some(&arguments),
+                                w_firstarg,
                             )
                         }?;
                     }
@@ -4988,9 +5311,10 @@ pub fn call_function_impl_result(
     // re-reads the nursery window and the foreign-mutator flag that the whole
     // set shares.  This is the `publish_roots` + `normalize_roots` shape
     // `pin_roots` documents for a set that does not sit in one slice.
+    let arg_len = args.len();
     let root_base = _roots.publish(&[callable]);
     let _ = _roots.publish(args);
-    let roots_moved = _roots.normalize_moved(root_base, 1 + args.len());
+    let roots_moved = _roots.normalize_moved(root_base, 1 + arg_len);
 
     // A JIT prologue may have published an overflow before entering this
     // residual dispatcher, so preserve that pending exception.  Do not run a
@@ -5015,16 +5339,20 @@ pub fn call_function_impl_result(
     // clears a thread-local and builds an error on the other one -- so an
     // unmoved run means the incoming slice already holds the live words, and
     // rebuilding it would allocate a list per call to copy them.
-    let rooted_args;
-    let args = if roots_moved {
-        let mut reloaded = Vec::with_capacity(args.len());
-        for i in 0..args.len() {
-            reloaded.push(_roots.get(root_base + 1 + i));
-        }
-        rooted_args = reloaded;
-        rooted_args.as_slice()
+    // `pop_roots` is a no-op when nothing moved: the incoming slice is still
+    // the root. Rebuild only after a forwarding stub.
+    let rooted_args = if roots_moved {
+        Some(
+            (0..arg_len)
+                .map(|i| _roots.get(root_base + 1 + i))
+                .collect::<Vec<_>>(),
+        )
     } else {
-        args
+        None
+    };
+    let args = match &rooted_args {
+        Some(v) => v.as_slice(),
+        None => args,
     };
 
     // Binding an override descriptor below runs `baseobjspace::get`, whose
@@ -6483,6 +6811,30 @@ mod function_call_args_tests {
                 pyre_object::w_int_get_value(pyre_object::w_tuple_getitem(result, 2).unwrap()),
                 30
             );
+        }
+    }
+
+    #[test]
+    fn fill_user_function_args_reads_dict_subclass_kwdefaults() {
+        crate::test_hooks::install_hash_hook();
+        let source = "\
+class Sub(dict):
+    pass
+def f(*, b=1):
+    return b
+f.__kwdefaults__ = Sub(b=7)
+result = f()
+";
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("dict-subclass __kwdefaults__");
+        let w_globals = frame.get_w_globals();
+        let result =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "result") }.expect("result");
+        unsafe {
+            assert_eq!(pyre_object::w_int_get_value(result), 7);
         }
     }
 }
