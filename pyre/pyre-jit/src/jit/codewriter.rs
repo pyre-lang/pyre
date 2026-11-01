@@ -10747,15 +10747,15 @@ impl CodeWriter {
                             emit_ref_return!(retval_reg, retval);
                         }
 
-                        // RPython jtransform.py: rewrite_op_direct_call (residual)
+                        // `pyopcode.py LOAD_GLOBAL` → `_load_global`. When
+                        // `load_global_value` is fully bound, record that
+                        // method as an HLOp and flatten it to
+                        // `inline_call_ir_r` (`jtransform.py
+                        // handle_regular_call`). Otherwise keep the
+                        // `bh_load_global_fn` residual.
                         Instruction::LoadGlobal { namei } => {
                             let raw_namei = namei.get(op_arg) as usize as i64;
-                            // `flowcontext.py LOAD_GLOBAL` resolves globals during
-                            // flow analysis and pushes the resolved Constant via
-                            // `pushvalue(w_value)` — there is NO
-                            // `SpaceOperation('load_global', ...)` at the graph
-                            // level. Keep that graph shape; the residual helper
-                            // below is walker/backend adaptation only.
+                            let nameindex = (raw_namei as usize) >> 1;
                             let _ = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                             // The global lands at the deeper slot; the
                             // `raw_namei & 1` NULL sentinel is pushed ON TOP
@@ -10774,67 +10774,77 @@ impl CodeWriter {
                             // the codewrite-time object skips that read, so a
                             // rebind of a class or module global never
                             // invalidates and `debugdata.w_globals` is ignored.
-                            //
-                            // The namespace operand (r0) is a NULL `ConstRef`
-                            // placeholder. The walker
-                            // (`replace_movable_load_global_namespace_with_frame_globals`)
-                            // replaces it from THIS jitcode's own namespace —
-                            // `WalkFrameState.inline_w_globals` for an inlined
-                            // callee (never the portal snapshot), the portal
-                            // snapshot's `frame_w_globals` at the merge point.
-                            // `try_walker_load_global_cell_fold` then hoists
-                            // the lookup to a GC-safe cell read
-                            // (`celldict.py ModuleDictStrategy.getitem_str`:
-                            // `version?` quasi-immutable +
-                            // `_getdictvalue_no_unwrapping_pure` elidable +
-                            // `unwrap_cell`), guarded by
-                            // `GUARD_NOT_INVALIDATED`.  A class or function
-                            // global becomes a constant call target through
-                            // that fold, not through a baked pointer.  The
-                            // `bh_load_global_fn` residual never reads the
-                            // placeholder: it re-resolves from this jitcode's
-                            // own frame (`get_w_globals`).  pycode (r1) is this
-                            // jitcode's promoted `W_Code`; frame (r2) is this
-                            // jitcode's own red (`get_builtin()`).
-                            //
-                            // Widening the residual without the cell fold
-                            // leaving a constant is what once turned five
-                            // loads on `exception_reraise_tb_depth_hot` into
-                            // five `ForceToken` / `GuardNotForced` /
-                            // `GuardNoException` calls (`guard_failures`
-                            // 1803 → 63769). The walker must seed this
-                            // frame's namespace so the fold fires.
                             let result_value: super::flow::FlowValue = {
-                                // `bh_load_global_fn` derives globals from the
-                                // live frame; the namespace operand is only a
-                                // trace-time cell-fold hint. The walker replaces
-                                // this null placeholder with this MIFrame's
-                                // `get_w_globals()` result before recording.
-                                let ns_var: super::flow::FlowValue = super::flow::Constant::new(
-                                    super::flow::ConstantValue::Signed(0),
-                                    Some(Kind::Ref),
-                                )
-                                .into();
-                                let code_const: super::flow::FlowValue =
-                                    super::flow::Constant::new(
-                                        super::flow::ConstantValue::Signed(w_code as i64),
+                                if fully_bound_callee_body(inline_call_targets::LOAD_GLOBAL_VALUE)
+                                    .is_some()
+                                {
+                                    let name = code.names.get(nameindex).expect(
+                                        "LOAD_GLOBAL co_names index is validated by the compiler",
+                                    );
+                                    let w_name = unsafe {
+                                        pyre_interpreter::pycode::w_code_getname_w_or_new(
+                                            w_code as pyre_object::PyObjectRef,
+                                            nameindex,
+                                            name.as_ref(),
+                                        )
+                                    };
+                                    let storage = unsafe { pyre_object::w_str_storage(w_name) };
+                                    let name_const = super::flow::Constant::new(
+                                        super::flow::ConstantValue::Signed(storage as i64),
                                         Some(Kind::Ref),
+                                    );
+                                    emit_graph_op_with_result(
+                                        &mut graph,
+                                        &current_block.block(),
+                                        "load_global_value",
+                                        vec![
+                                            frame_var.into(),
+                                            name_const.into(),
+                                            super::flow::Constant::signed(nameindex as i64).into(),
+                                        ],
+                                        Kind::Ref,
+                                        py_pc as i64,
                                     )
-                                    .into();
-                                let loaded = residual_call!(
-                                    load_global_fn_idx,
-                                    CallFlavor::Plain,
-                                    majit_ir::RuntimeHelperKind::LoadGlobal,
-                                    vec![super::flow::Constant::signed(raw_namei).into()],
-                                    vec![ns_var.into(), code_const, frame_var.into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                );
-                                loaded
-                                    .map(super::flow::FlowValue::from)
-                                    .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                                    .into()
+                                } else {
+                                    // The namespace operand (r0) is a NULL
+                                    // `ConstRef` placeholder. The walker
+                                    // (`replace_movable_load_global_namespace_with_frame_globals`)
+                                    // replaces it from THIS jitcode's own
+                                    // namespace. `bh_load_global_fn` never
+                                    // reads the placeholder: it re-resolves
+                                    // from this jitcode's own frame
+                                    // (`get_w_globals`). pycode (r1) is this
+                                    // jitcode's promoted `W_Code`; frame (r2)
+                                    // is this jitcode's own red
+                                    // (`get_builtin()`).
+                                    let ns_var: super::flow::FlowValue =
+                                        super::flow::Constant::new(
+                                            super::flow::ConstantValue::Signed(0),
+                                            Some(Kind::Ref),
+                                        )
+                                        .into();
+                                    let code_const: super::flow::FlowValue =
+                                        super::flow::Constant::new(
+                                            super::flow::ConstantValue::Signed(w_code as i64),
+                                            Some(Kind::Ref),
+                                        )
+                                        .into();
+                                    let loaded = residual_call!(
+                                        load_global_fn_idx,
+                                        CallFlavor::Plain,
+                                        majit_ir::RuntimeHelperKind::LoadGlobal,
+                                        vec![super::flow::Constant::signed(raw_namei).into()],
+                                        vec![ns_var.into(), code_const, frame_var.into()],
+                                        vec![],
+                                        vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
+                                        ResKind::Ref,
+                                        py_pc as i64,
+                                    );
+                                    loaded
+                                        .map(super::flow::FlowValue::from)
+                                        .unwrap_or_else(|| fresh_ref_value(&mut graph).into())
+                                }
                             };
                             current_state.stack.push(result_value.clone());
                             // `loaded_dst_reg == stack_base + current_depth`
@@ -18191,11 +18201,11 @@ mod tests {
         assert!(!pyjit.has_abort);
         assert_ne!(pyjit.metadata.portal_frame_reg, u16::MAX);
         let calls: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code)
-            .filter(|op| op.key.contains("residual_call"))
+            .filter(|op| op.key.contains("inline_call") || op.key.contains("residual_call"))
             .collect();
         assert!(
             !calls.is_empty(),
-            "a non-foldable global must stay a residual"
+            "LOAD_GLOBAL must emit inline_call_ir_r or the live-frame residual"
         );
         assert!(
             calls.iter().any(|op| {
@@ -18203,7 +18213,7 @@ mod tests {
                 (op.pc + 3..op.pc + 8)
                     .any(|i| code.get(i).copied() == Some(pyjit.metadata.portal_frame_reg as u8))
             }),
-            "the residual must name this callee's frame register"
+            "the call must name this callee's frame register"
         );
     }
 

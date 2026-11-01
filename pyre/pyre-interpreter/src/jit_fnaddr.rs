@@ -298,6 +298,51 @@ pub(crate) extern "C" fn object_dict_getitem_str_hashed_word(
     }
 }
 
+/// One-word residual ABI for `PyFrame.load_global_value`
+/// (`pyopcode.py _load_global`); `llmodel.py bh_call_r` passes the `&str`
+/// as one rstr STR word.
+#[inline(never)]
+pub(crate) extern "C" fn pyframe_load_global_value_word(
+    frame: i64,
+    name: i64,
+    nameindex: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::pyframe_load_global_value_word");
+    let frame = unsafe { &mut *(frame as usize as *mut crate::pyframe::PyFrame) };
+    let name = unsafe { str_from_rstr_word(name) };
+    match <crate::pyframe::PyFrame as crate::pyopcode::NamespaceOpcodeHandler>::load_global_value(
+        frame,
+        name,
+        nameindex as usize,
+    ) {
+        Ok(v) => v as usize as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as usize as i64,
+    }
+}
+
+/// Word-ABI residual for `finditem_str_named`;
+/// `llmodel.py bh_call_r` passes the `&str` as one rstr STR word.
+#[inline(never)]
+pub(crate) extern "C" fn finditem_str_named_word(
+    obj: i64,
+    key: i64,
+    pycode: i64,
+    nameindex: i64,
+) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::finditem_str_named_word");
+    let key = unsafe { str_from_rstr_word(key) };
+    match crate::baseobjspace::finditem_str_named(
+        obj as usize as pyre_object::PyObjectRef,
+        key,
+        pycode as usize as pyre_object::PyObjectRef,
+        nameindex as usize,
+    ) {
+        Ok(Some(v)) => v as usize as i64,
+        Ok(None) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err) as usize as i64,
+    }
+}
+
 /// `celldict.py ModuleDictStrategy._getdictvalue_no_unwrapping_pure` has
 /// an elidable native call boundary. Adapt its `&str` and Option result
 /// to `llmodel.py bh_call_r` words; keep the actual dictionary lookup in
@@ -2442,6 +2487,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::set_add_value",
         crate::opcode_ops::jit_opcode_ops_set_add_value,
     );
+    // LOAD_GLOBAL's `inline_call_ir_r` (`flatten.rs inline_call_targets`).
+    // The graph is `PyFrame.load_global_value`; this bridge is the one-word
+    // address blackhole `bh_call_r` calls. Argument order is the graph's
+    // (self, name, nameindex); the jitcode calldescr is i=[nameindex],
+    // r=[frame, name].
+    cp3!(
+        &mut entries,
+        "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
+        pyframe_load_global_value_word,
+    );
     // `try_hash_value` is a residual in every jitcode that calls it
     // (`set_add_value`'s non-int arm among them); this is its one-word bridge.
     cp1!(
@@ -3377,16 +3432,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::handle_fromlist",
         crate::importing::handle_fromlist_jit_abi,
     );
-    // `__import__` look-inside still residualises these: `finditem_str_named`
-    // has no jitcode (the `&str` + strategy dispatch is a symbolic hash),
-    // and the `dont_look_inside` miss / error arms need published addresses
-    // or the scan declines the wrapper after `sys_modules_dict`.
-    push_abi_unsound_argument_alias_pair(
+    // Nested `inline_call` of the `finditem_str_named` jitcode
+    // (`fully_bound_callee_body` / `pathed_runtime_jitcode_cached`).
+    // The graph is `baseobjspace::finditem_str_named`; this bridge is the
+    // one-word address blackhole `bh_call_r` calls. Argument order is the
+    // graph's (obj, key, pycode, nameindex). The `dont_look_inside` miss /
+    // error arms below stay ABI-unsound: their `&str` is still two words.
+    cp4!(
         &mut entries,
-        &mut abi_unsound_arguments,
         "pyre_interpreter::baseobjspace::finditem_str_named",
-        "pyre_interpreter::finditem_str_named",
-        crate::baseobjspace::finditem_str_named as *const (),
+        finditem_str_named_word,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -7279,11 +7334,12 @@ mod tests {
     use super::{
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word, dyn_impl_vtables,
-        hash_str_hooked_bytes_word, is_abi_unsound_argument_residual, is_list_write_barrier,
-        is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
-        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
-        module_dict_getdictvalue_no_unwrapping_pure_word, object_dict_getitem_str_hashed_word,
-        object_dict_getitem_str_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
+        finditem_str_named_word, hash_str_hooked_bytes_word, is_abi_unsound_argument_residual,
+        is_list_write_barrier, is_pyframe_operand_stack_accessor,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
+        jit_trace_fnaddrs, module_dict_getdictvalue_no_unwrapping_pure_word,
+        object_dict_getitem_str_hashed_word, object_dict_getitem_str_word,
+        pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
         w_dict_getitem_str_object_strategy_hashed_word, w_dict_getitem_str_shortcut_hashed_word,
@@ -8017,6 +8073,14 @@ mod tests {
             (
                 "pyre_interpreter::opcode_ops::set_add_value",
                 crate::opcode_ops::jit_opcode_ops_set_add_value as *const () as usize as i64,
+            ),
+            (
+                "pyframe::PyFrame::<impl pyre_interpreter::pyopcode::NamespaceOpcodeHandler<pyre_interpreter::pyframe::PyFrame>>::load_global_value",
+                pyframe_load_global_value_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::baseobjspace::finditem_str_named",
+                finditem_str_named_word as *const () as usize as i64,
             ),
             (
                 "pyre_interpreter::builtins::try_hash_value",
