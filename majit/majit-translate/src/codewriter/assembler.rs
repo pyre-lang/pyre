@@ -942,6 +942,63 @@ fn panic_if_gc_host_object_int_dest(
     }
 }
 
+/// `get_type_repr().convert_const` word for `goto_if_exception_mismatch/iL`.
+///
+/// Accepts the `OBJECT_VTABLE` pointer `cast_vtable_to_typeptr` returns,
+/// or an uncast per-class vtable (walk `super` the same way). A null
+/// pointer or any other `LLPtr` panics. The word is `_ptr._cast_to_int`
+/// (`_container._getid`), pooled by `emit_const_i` with no reloc.
+fn rpython_exception_vtable_word(
+    ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> i64 {
+    if !ptr.nonzero() {
+        panic!("goto_if_exception_mismatch: null exception-class vtable");
+    }
+    let typeptr = object_vtable_typeptr(ptr);
+    let bits = typeptr._cast_to_int(true).unwrap_or_else(|err| {
+        panic!("goto_if_exception_mismatch: exception-class vtable _cast_to_int failed: {err}")
+    });
+    if bits == 0 {
+        panic!("goto_if_exception_mismatch: null exception-class vtable");
+    }
+    bits
+}
+
+fn object_vtable_typeptr(
+    ptr: &crate::translator::rtyper::lltypesystem::lltype::_ptr,
+) -> crate::translator::rtyper::lltypesystem::lltype::_ptr {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rclass::{OBJECT_VTABLE, cast_vtable_to_typeptr};
+
+    let to = LowLevelType::from(ptr._TYPE.TO.clone());
+    if to == *OBJECT_VTABLE {
+        return ptr.clone();
+    }
+    if !ptr_target_has_field(&ptr._TYPE.TO, "super") {
+        panic!(
+            "goto_if_exception_mismatch: llexitcase LLPtr is not an OBJECT_VTABLE (got {:?})",
+            ptr._TYPE
+        );
+    }
+    cast_vtable_to_typeptr(ptr.clone())
+}
+
+fn ptr_target_has_field(
+    to: &crate::translator::rtyper::lltypesystem::lltype::PtrTarget,
+    field: &str,
+) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let struct_t = match to {
+        PtrTarget::Struct(struct_t) => struct_t.clone(),
+        PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(LowLevelType::Struct(struct_t)) => *struct_t,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    struct_t._names.iter().any(|name| name == field)
+}
+
 impl AssemblerEncode for Assembler {
     /// RPython: `Assembler.write_insn(insn)` — assembler.py.
     ///
@@ -4254,6 +4311,8 @@ impl AssemblerEncode for Assembler {
         match value {
             ConstValue::Int(value) => self.emit_const_i(*value, state),
             ConstValue::UInt(value) => self.emit_const_i(*value as i64, state),
+            // Builtin host class (`StopIteration`, `OverflowError`, the
+            // carrier): pytype row, `StaticAddr` reloc.
             ConstValue::HostObject(obj) => {
                 let bits = exception_class_addr(obj, callcontrol, "goto_if_exception_mismatch")
                     .unwrap_or_else(|| {
@@ -4268,6 +4327,17 @@ impl AssemblerEncode for Assembler {
                         )
                     });
                 self.emit_const_i_reloc(bits, ConstIRelocKind::StaticAddr { name: row_name }, state)
+            }
+            // RPython exception class: `get_type_repr().convert_const`
+            // (`ClassRepr.getvtable` / `cast_vtable_to_typeptr`). The
+            // pooled word is `_ptr._cast_to_int` (container `_getid`),
+            // not a pytype row and not a `StaticAddr` reloc.
+            // `bh_classof` reads word 0 and `bh_issubclass` compares it
+            // with `majit_gc::subclass_range` (`exceptiondata.ll_issubclass`,
+            // `jtransform.py` `goto_if_exception_mismatch`).
+            ConstValue::LLPtr(ptr) => {
+                let bits = rpython_exception_vtable_word(ptr);
+                self.emit_const_i(bits, state)
             }
             other => {
                 panic!("goto_if_exception_mismatch: unsupported llexitcase constant {other:?}")
@@ -14366,5 +14436,443 @@ mod tests {
         let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
         let mut asm = Assembler::new();
         let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::flowspace::model::HOST_ENV;
+    use crate::model::{
+        BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, RPythonExceptionClass,
+        exception_exitcase,
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType, malloc, nullptr};
+    use crate::translator::rtyper::normalizecalls::assign_inheritance_ids;
+    use crate::translator::rtyper::rclass::{
+        self, Flavor, getclassrepr, getinstancerepr, ll_cast_to_object, ll_isinstance,
+    };
+    use crate::translator::rtyper::rtyper::RPythonTyper;
+
+    /// `OBJECT_VTABLE` is a resolved `ForwardReference`. `malloc` accepts
+    /// only the container `Struct`.
+    fn resolved_object_vtable() -> LowLevelType {
+        match rclass::OBJECT_VTABLE.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd
+                .resolved()
+                .expect("OBJECT_VTABLE forward-reference must be resolved"),
+            other => other,
+        }
+    }
+
+    fn fresh_exception_typer() -> (Rc<RPythonAnnotator>, Rc<RPythonTyper>) {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        (ann, rtyper)
+    }
+
+    fn register_user_exception(
+        ann: &RPythonAnnotator,
+        name: &str,
+        bases: Vec<crate::flowspace::model::HostObject>,
+    ) -> (crate::flowspace::model::HostObject, Rc<RefCell<ClassDef>>) {
+        let class = crate::flowspace::model::HostObject::new_class(name, bases);
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef(&class)
+            .unwrap_or_else(|err| panic!("getuniqueclassdef({name}): {err}"));
+        (class, classdef)
+    }
+
+    /// `Link::new_mixed` leaves `llexitcase` unset. `with_llexitcase_from_exitcase`
+    /// is `get_type_repr().convert_const` (`rtyper.py` `_convert_link`).
+    fn llexitcase_of(classdef: &Rc<RefCell<ClassDef>>) -> ConstValue {
+        let exitcase =
+            ExitCase::ExceptionClass(RPythonExceptionClass::from_classdef(classdef.clone()));
+        let bare = Link::new_mixed(vec![], BlockId(0), Some(exitcase));
+        assert!(
+            bare.llexitcase.is_none(),
+            "new_mixed must not materialise an exception-class vtable"
+        );
+        bare.with_llexitcase_from_exitcase()
+            .llexitcase
+            .expect("exception-class llexitcase")
+    }
+
+    fn vtable_ptr(value: &ConstValue) -> &lltype::_ptr {
+        let ConstValue::LLPtr(ptr) = value else {
+            panic!("llexitcase must be the class vtable LLPtr, got {value:?}");
+        };
+        let to = LowLevelType::from(ptr._TYPE.TO.clone());
+        assert_eq!(
+            to,
+            *rclass::OBJECT_VTABLE,
+            "llexitcase must be cast_vtable_to_typeptr's OBJECT_VTABLE"
+        );
+        ptr
+    }
+
+    fn vtable_word(value: &ConstValue) -> i64 {
+        vtable_ptr(value)
+            ._cast_to_int(true)
+            .expect("vtable _cast_to_int")
+    }
+
+    fn subclass_range(ptr: &lltype::_ptr) -> (i64, i64) {
+        let min = match ptr.getattr("subclassrange_min").expect("subclassrange_min") {
+            lltype::LowLevelValue::Signed(value) => value,
+            other => panic!("subclassrange_min must be Signed, got {other:?}"),
+        };
+        let max = match ptr.getattr("subclassrange_max").expect("subclassrange_max") {
+            lltype::LowLevelValue::Signed(value) => value,
+            other => panic!("subclassrange_max must be Signed, got {other:?}"),
+        };
+        (min, max)
+    }
+
+    fn raised_instance(
+        rtyper: &Rc<RPythonTyper>,
+        classdef: &Rc<RefCell<ClassDef>>,
+    ) -> lltype::_ptr {
+        getinstancerepr(rtyper, Some(classdef), Flavor::Gc)
+            .expect("getinstancerepr")
+            .get_reusable_prebuilt_instance()
+            .expect("get_reusable_prebuilt_instance")
+    }
+
+    /// `ll_isinstance` reads `typeptr` on the OBJECT super (`rclass.py`).
+    fn handler_catches(inst: &lltype::_ptr, cls_vtable: &lltype::_ptr) -> bool {
+        let obj = ll_cast_to_object(inst).expect("ll_cast_to_object");
+        ll_isinstance(&obj, cls_vtable).expect("ll_isinstance")
+    }
+
+    fn assemble_mismatch(
+        values: Vec<ConstValue>,
+        callcontrol: Option<&crate::call::CallControl>,
+    ) -> crate::jitcode::JitCodeBody {
+        use crate::flatten::{FlatOp, Label, SSARepr};
+
+        let mut insns: Vec<FlatOp> = values
+            .into_iter()
+            .map(|llexitcase| FlatOp::GotoIfExceptionMismatch {
+                llexitcase,
+                target: Label(0),
+            })
+            .collect();
+        insns.push(FlatOp::Label(Label(0)));
+        let mut flat = SSARepr {
+            name: "vtable_mismatch".into(),
+            insns,
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        match callcontrol {
+            Some(cc) => asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(cc)),
+            None => asm.assemble(&mut flat, &empty_regallocs()),
+        }
+    }
+
+    fn identity_int_regallocs(
+        graph: &FunctionGraph,
+    ) -> HashMap<crate::flatten::RegKind, regalloc::RegAllocator> {
+        let mut coloring = regalloc::Coloring::default();
+        for var in graph.iter_variables() {
+            let color = coloring.len();
+            coloring.entry(var).or_insert(color);
+        }
+        let num_regs = coloring.len().max(1);
+        let mut regallocs = HashMap::new();
+        regallocs.insert(
+            crate::flatten::RegKind::Int,
+            regalloc::RegAllocator { coloring, num_regs },
+        );
+        regallocs
+    }
+
+    /// `B ⊂ A`, sibling `C ⊂ A`. Exitcase `A` catches a raised `B`;
+    /// exitcase `B` misses `C`. The pooled word is the vtable
+    /// `_cast_to_int`, and `StopIteration` stays on the pytype row.
+    #[test]
+    fn rpython_exception_class_link_catches_subclass_misses_sibling() {
+        use crate::flatten::{FlatOp, flatten_graph};
+
+        let (ann, rtyper) = fresh_exception_typer();
+        let exception = HOST_ENV
+            .lookup_builtin("Exception")
+            .expect("HOST_ENV Exception");
+        let (a_host, a_cd) = register_user_exception(&ann, "synth.A", vec![exception]);
+        let (b_host, b_cd) = register_user_exception(&ann, "synth.B", vec![a_host.clone()]);
+        let (c_host, c_cd) = register_user_exception(&ann, "synth.C", vec![a_host.clone()]);
+        assert!(b_cd.borrow().issubclass(&a_cd));
+        assert!(c_cd.borrow().issubclass(&a_cd));
+        assert!(!b_cd.borrow().issubclass(&c_cd));
+        assert!(!c_cd.borrow().issubclass(&b_cd));
+
+        // Ids before any vtable: a later assign must not renumber a
+        // vtable `fill_vtable_root` already wrote.
+        assign_inheritance_ids(&ann);
+        for classdef in [&a_cd, &b_cd, &c_cd] {
+            getclassrepr(&rtyper, Some(classdef)).expect("getclassrepr");
+        }
+
+        let a_ll = llexitcase_of(&a_cd);
+        let b_ll = llexitcase_of(&b_cd);
+        let c_ll = llexitcase_of(&c_cd);
+        let a_bits = vtable_word(&a_ll);
+        let b_bits = vtable_word(&b_ll);
+        let c_bits = vtable_word(&c_ll);
+        {
+            let a_ptr = vtable_ptr(&a_ll);
+            let b_ptr = vtable_ptr(&b_ll);
+            let c_ptr = vtable_ptr(&c_ll);
+            let (a_min, a_max) = subclass_range(a_ptr);
+            let (b_min, b_max) = subclass_range(b_ptr);
+            let (c_min, c_max) = subclass_range(c_ptr);
+            assert!(
+                a_min < b_min && b_min < a_max,
+                "A covers B ({a_min}..{a_max} vs {b_min})"
+            );
+            assert!(
+                a_min < c_min && c_min < a_max,
+                "A covers C ({a_min}..{a_max} vs {c_min})"
+            );
+            assert!(
+                !(b_min <= c_min && c_min < b_max),
+                "B misses sibling C ({b_min}..{b_max} vs {c_min})"
+            );
+            assert!(
+                !(c_min <= b_min && b_min < c_max),
+                "C misses sibling B ({c_min}..{c_max} vs {b_min})"
+            );
+
+            let b_inst = raised_instance(&rtyper, &b_cd);
+            let c_inst = raised_instance(&rtyper, &c_cd);
+            assert!(
+                handler_catches(&b_inst, a_ptr),
+                "exitcase A catches a raised B"
+            );
+            assert!(
+                !handler_catches(&c_inst, b_ptr),
+                "exitcase B does not catch sibling C"
+            );
+            assert!(handler_catches(&c_inst, a_ptr));
+            assert!(handler_catches(&b_inst, b_ptr));
+            assert!(!handler_catches(&b_inst, c_ptr));
+        }
+        assert_ne!(a_bits, 0);
+        assert_ne!(a_bits, 0x30);
+        assert_ne!(b_bits, 0x30);
+        assert_ne!(c_bits, 0x30);
+        assert_ne!(a_bits, b_bits);
+        assert_ne!(a_bits, c_bits);
+        assert_ne!(b_bits, c_bits);
+        for (bits, host) in [(a_bits, &a_host), (b_bits, &b_host), (c_bits, &c_host)] {
+            assert_ne!(bits, host.identity_id() as i64);
+        }
+
+        let mut graph = FunctionGraph::new("synth_exc_link");
+        let entry = graph.startblock;
+        let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        graph.push_op_var(entry, OpKind::live(), false);
+        let handler = graph.create_block();
+        let handler_exc_type_var = graph.alloc_value_var();
+        let handler_exc_value_var = graph.alloc_value_var();
+        graph.push_inputarg_var(handler, handler_exc_type_var);
+        graph.push_inputarg_var(handler, handler_exc_value_var.clone());
+        graph.push_op_var(handler, OpKind::live(), false);
+        graph.set_goto(handler, graph.returnblock, vec![handler_exc_value_var]);
+
+        let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
+        graph.set_goto(entry, graph.returnblock, vec![call_result_var.clone()]);
+        let normal_link =
+            Link::from_variables(&graph, vec![call_result_var], graph.returnblock, None);
+        let class_const = ConstValue::HostObject(a_host.clone());
+        let typed = Link::new_mixed(
+            vec![
+                LinkArg::from(class_const.clone()),
+                LinkArg::Value(last_exc_value_var.clone()),
+            ],
+            handler,
+            Some(ExitCase::ExceptionClass(
+                RPythonExceptionClass::from_classdef(a_cd.clone()),
+            )),
+        );
+        assert!(typed.llexitcase.is_none());
+        let typed = typed.with_llexitcase_from_exitcase().extravars(
+            Some(LinkArg::from(class_const)),
+            Some(LinkArg::Value(last_exc_value_var.clone())),
+        );
+        // `cast_vtable_to_typeptr` mints a fresh interior `_ptr` on every
+        // `convert_const`. `ConstValue::LLPtr` equality is that wrapper's
+        // `_identity`, so two conversions of A do not compare equal.
+        // The pooled word is `_cast_to_int` (container `_getid`).
+        let typed_ll = typed.llexitcase.clone().expect("typed link vtable");
+        assert_eq!(vtable_word(&typed_ll), a_bits);
+        let catchall = Link::from_variables(
+            &graph,
+            vec![last_exception_var.clone(), last_exc_value_var.clone()],
+            exc_block,
+            Some(exception_exitcase()),
+        )
+        .extravars(
+            Some(LinkArg::Value(last_exception_var)),
+            Some(LinkArg::Value(last_exc_value_var)),
+        );
+        graph.set_control_flow_metadata(
+            entry,
+            Some(ExitSwitch::LastException),
+            vec![normal_link, typed, catchall],
+        );
+        let mut regallocs = identity_int_regallocs(&graph);
+        let flat = flatten_graph(&graph, &mut regallocs);
+        assert!(
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::GotoIfExceptionMismatch { llexitcase, .. } if llexitcase == &typed_ll
+            )),
+            "typed A link must flatten to the vtable llexitcase, got {:?}",
+            flat.insns
+        );
+
+        let stop = HOST_ENV
+            .lookup_exception_class("StopIteration")
+            .expect("StopIteration");
+        let cc = cc_with_exc_rows(&[("interp_exceptions::EXC_STOP_ITERATION_TYPE", 0x30)]);
+        let body = assemble_mismatch(
+            vec![a_ll, b_ll, ConstValue::HostObject(stop.clone())],
+            Some(&cc),
+        );
+        assert!(body.constants_i.contains(&a_bits));
+        assert!(body.constants_i.contains(&b_bits));
+        assert!(body.constants_i.contains(&0x30));
+        assert!(!body.constants_i.contains(&(stop.identity_id() as i64)));
+        assert_eq!(body.reloc_consts_i.len(), 1);
+        let reloc = &body.reloc_consts_i[0];
+        assert_eq!(body.constants_i[reloc.constants_i_index], 0x30);
+        assert!(matches!(
+            &reloc.kind,
+            crate::jitcode::ConstIRelocKind::StaticAddr { name }
+                if name.contains("EXC_STOP_ITERATION_TYPE")
+        ));
+    }
+
+    /// An undotted user class is not a builtin host class unless it is
+    /// the `HOST_ENV` object. Step 2's `ArgErr` may have no dot.
+    #[test]
+    fn undotted_user_exception_class_llexitcase_is_vtable_not_pytype_row() {
+        assert!(
+            HOST_ENV.lookup_exception_class("ArgErr").is_none(),
+            "HOST_ENV must not already own ArgErr"
+        );
+        let (ann, rtyper) = fresh_exception_typer();
+        let exception = HOST_ENV
+            .lookup_builtin("Exception")
+            .expect("HOST_ENV Exception");
+        let (class, classdef) = register_user_exception(&ann, "ArgErr", vec![exception]);
+        assign_inheritance_ids(&ann);
+        getclassrepr(&rtyper, Some(&classdef)).expect("getclassrepr");
+        let ll = llexitcase_of(&classdef);
+        let bits = vtable_word(&ll);
+        assert_ne!(bits, class.identity_id() as i64);
+        assert_ne!(bits, 0x30);
+        let body = assemble_mismatch(vec![ll], None);
+        assert_eq!(body.constants_i, vec![bits]);
+        assert!(body.reloc_consts_i.is_empty());
+    }
+
+    /// `emit_llexitcase` pools `_cast_to_int` for an `OBJECT_VTABLE`
+    /// pointer and for an uncast per-class vtable (`super` walk). No
+    /// pytype row and no `StaticAddr` reloc.
+    #[test]
+    fn rpython_exception_vtable_llexitcase_emits_identity_not_pytype_row() {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, Struct};
+        use crate::translator::rtyper::rclass::cast_vtable_to_typeptr;
+
+        let vtable_ty = resolved_object_vtable();
+        let cast_ptr =
+            malloc(vtable_ty.clone(), None, MallocFlavor::Gc, true).expect("malloc OBJECT_VTABLE");
+        let cast_bits = cast_ptr._cast_to_int(true).expect("cast _cast_to_int");
+
+        let leaf = Struct::with_hints(
+            "synth_leaf_vtable",
+            vec![("super".into(), vtable_ty)],
+            vec![],
+        );
+        let leaf_ptr = malloc(
+            LowLevelType::Struct(Box::new(leaf)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc uncast vtable");
+        let leaf_bits = cast_vtable_to_typeptr(leaf_ptr.clone())
+            ._cast_to_int(true)
+            .expect("uncast _cast_to_int");
+        assert_ne!(cast_bits, 0);
+        assert_ne!(leaf_bits, 0);
+        assert_ne!(cast_bits, leaf_bits);
+        assert_ne!(cast_bits, 0x30);
+        assert_ne!(leaf_bits, 0x30);
+
+        let body = assemble_mismatch(
+            vec![
+                ConstValue::LLPtr(Box::new(cast_ptr)),
+                ConstValue::LLPtr(Box::new(leaf_ptr)),
+            ],
+            None,
+        );
+        assert_eq!(body.constants_i, vec![cast_bits, leaf_bits]);
+        assert!(body.reloc_consts_i.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "null exception-class vtable")]
+    fn rpython_exception_vtable_llexitcase_null_panics() {
+        let null = nullptr(resolved_object_vtable()).expect("nullptr OBJECT_VTABLE");
+        let _ = assemble_mismatch(vec![ConstValue::LLPtr(Box::new(null))], None);
+    }
+
+    #[test]
+    #[should_panic(expected = "llexitcase LLPtr is not an OBJECT_VTABLE")]
+    fn rpython_exception_vtable_llexitcase_non_vtable_panics() {
+        use crate::translator::rtyper::lltypesystem::lltype::{MallocFlavor, Struct};
+
+        let other = Struct::new("not_a_vtable", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr = malloc(
+            LowLevelType::Struct(Box::new(other)),
+            None,
+            MallocFlavor::Raw,
+            true,
+        )
+        .expect("malloc");
+        let _ = assemble_mismatch(vec![ConstValue::LLPtr(Box::new(ptr))], None);
+    }
+
+    #[test]
+    #[should_panic(expected = "ClassDef.repr is missing")]
+    fn exception_class_llexitcase_panics_without_classrepr() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let exception = HOST_ENV
+            .lookup_builtin("Exception")
+            .expect("HOST_ENV Exception");
+        let (_class, classdef) = register_user_exception(&ann, "synth.NoRepr", vec![exception]);
+        let _ = llexitcase_of(&classdef);
+    }
+
+    #[test]
+    #[should_panic(expected = "inheritance ids are unset")]
+    fn exception_class_llexitcase_panics_without_inheritance_ids() {
+        let (ann, rtyper) = fresh_exception_typer();
+        let exception = HOST_ENV
+            .lookup_builtin("Exception")
+            .expect("HOST_ENV Exception");
+        let (_class, classdef) = register_user_exception(&ann, "synth.NoIds", vec![exception]);
+        getclassrepr(&rtyper, Some(&classdef)).expect("getclassrepr");
+        let _ = llexitcase_of(&classdef);
     }
 }

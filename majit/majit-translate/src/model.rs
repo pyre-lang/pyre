@@ -4,10 +4,13 @@
 //! to model only the semantics needed by majit's translation/codewriter layer.
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
-use crate::flowspace::model::ConstValue;
+use crate::annotator::classdesc::ClassDef;
+use crate::flowspace::model::{ConstValue, HostObject};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlockId(pub usize);
@@ -2097,13 +2100,55 @@ pub enum ExitSwitch {
     },
 }
 
+/// An RPython exception class (`ClassDef` / `ClassDesc`), not a builtin
+/// host class and not [`ExitCase::ErrorCarrier`].
+///
+/// Equality is the `ClassDef` `Rc` identity. `RefCell<ClassDef>` is not
+/// `Eq`, and a side table of class ids would not be the class object
+/// upstream stores on `Link.exitcase`.
+#[derive(Clone)]
+pub struct RPythonExceptionClass {
+    classdef: Rc<RefCell<ClassDef>>,
+}
+
+impl RPythonExceptionClass {
+    pub fn from_classdef(classdef: Rc<RefCell<ClassDef>>) -> Self {
+        Self { classdef }
+    }
+
+    pub fn classdef(&self) -> &Rc<RefCell<ClassDef>> {
+        &self.classdef
+    }
+
+    /// The class object `exitcase_to_hlvalue` hands the annotator.
+    /// `annrpython.py` `flowin` on a canraise link requires a
+    /// `Constant` whose value is that class (`getuniqueclassdef`).
+    pub fn host_object(&self) -> HostObject {
+        self.classdef.borrow().classdesc.borrow().pyobj.clone()
+    }
+}
+
+impl PartialEq for RPythonExceptionClass {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.classdef, &other.classdef)
+    }
+}
+
+impl Eq for RPythonExceptionClass {}
+
+impl fmt::Debug for RPythonExceptionClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RPythonExceptionClass({})", self.classdef.borrow().name)
+    }
+}
+
 /// RPython `Link.exitcase`.
 ///
 /// Upstream stores the concrete switch value itself here: `False` /
 /// `True` for boolean branches, the Python `Exception` class object for
 /// catch-all exception links, or a specific exception class object for
 /// typed handlers (`flowspace/model.py`,
-/// `flowspace/flowcontext.py:127-143`).
+/// `flowspace/flowcontext.py` `guessexception`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitCase {
     Bool(bool),
@@ -2117,6 +2162,16 @@ pub enum ExitCase {
     /// resolves it to that class and the codewriter's
     /// `error_carrier_edges` rewrites it to the runtime domain.
     ErrorCarrier,
+    /// RPython exception class (`ClassDef` / `ClassDesc`). Not a builtin
+    /// host class (`ExitCase::Const` of `StopIteration` / `OverflowError`)
+    /// and not [`ExitCase::ErrorCarrier`].
+    ///
+    /// `Link::new_mixed` leaves `llexitcase` unset. After `getclassrepr`
+    /// and `assign_inheritance_ids`, `with_llexitcase_from_exitcase`
+    /// stores `get_type_repr().convert_const` — the `OBJECT_VTABLE`
+    /// pointer from `ClassRepr.getvtable` / `cast_vtable_to_typeptr`
+    /// (`rtyper.py` `_convert_link`, `rclass.py` `convert_const`).
+    ExceptionClass(RPythonExceptionClass),
 }
 
 /// RPython `flowspace/model.py` `Link`.
@@ -2194,18 +2249,24 @@ impl Link {
     }
 
     /// Structural counterpart of RPython rtyper's
-    /// `convert_link()` (`rtyper.py`): copy the flow-level
-    /// `exitcase` into the low-level `llexitcase` slot for primitive
-    /// branch values.  The `"default"` switch sentinel is not a
-    /// low-level case and stays `None`.
+    /// `_convert_link` (`rtyper.py`): copy a primitive `exitcase` into
+    /// `llexitcase`. The `"default"` switch sentinel is not a low-level
+    /// case and stays `None`. [`ExitCase::ErrorCarrier`] is not a class
+    /// constant. [`ExitCase::ExceptionClass`] becomes
+    /// `get_type_repr().convert_const` (`rclass.py`): the class
+    /// `OBJECT_VTABLE` pointer. That arm panics unless `ClassDef.repr`
+    /// is already set and inheritance ids are assigned; it does not
+    /// call `assign_inheritance_ids` (a later call would renumber a
+    /// vtable that this conversion materialises).
     pub fn with_llexitcase_from_exitcase(mut self) -> Self {
         self.llexitcase = match &self.exitcase {
             Some(ExitCase::Bool(value)) => Some(ConstValue::Bool(*value)),
             Some(ExitCase::Const(value)) if value.string_eq("default") => None,
             Some(ExitCase::Const(value)) => Some(value.clone()),
-            // A class exitcase is converted by the rtyper
-            // (`get_type_repr(...).convert_const`), not copied.
             Some(ExitCase::ErrorCarrier) => None,
+            Some(ExitCase::ExceptionClass(class)) => Some(
+                crate::translator::rtyper::rclass::exception_class_llexitcase(class.classdef()),
+            ),
             None => None,
         };
         self

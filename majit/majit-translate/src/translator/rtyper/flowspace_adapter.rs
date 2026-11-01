@@ -4881,6 +4881,12 @@ fn exitcase_to_hlvalue(
                 class,
             ))))
         }
+        // The class object, not the vtable. `flowin` on a canraise link
+        // calls `getuniqueclassdef` on this constant. No CLASSTYPE
+        // concretetype: same stamp as the carrier class constant.
+        Some(ExitCase::ExceptionClass(class)) => Some(Hlvalue::Constant(Constant::new(
+            ConstValue::HostObject(class.host_object()),
+        ))),
     })
 }
 
@@ -6939,6 +6945,32 @@ mod tests {
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> CallRegistry {
         CallRegistry::new(Rc::new(Bookkeeper::new()))
+    }
+
+    #[test]
+    fn exception_class_exitcase_maps_to_host_class_constant() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{ConstValue, HOST_ENV, Hlvalue, HostObject};
+        use crate::model::{ExitCase, RPythonExceptionClass};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let base = HOST_ENV.lookup_builtin("Exception").expect("Exception");
+        let class = HostObject::new_class("synth.ExcBase", vec![base]);
+        let classdef = ann.bookkeeper.getuniqueclassdef(&class).expect("classdef");
+        let exitcase = ExitCase::ExceptionClass(RPythonExceptionClass::from_classdef(classdef));
+        let hl = exitcase_to_hlvalue(Some(&exitcase), &empty_call_registry())
+            .expect("adapter maps the class");
+        let Some(Hlvalue::Constant(constant)) = hl else {
+            panic!("exitcase must be a class constant, got {hl:?}");
+        };
+        assert!(
+            constant.concretetype.is_none(),
+            "class constant carries no CLASSTYPE concretetype"
+        );
+        let ConstValue::HostObject(mapped) = &constant.value else {
+            panic!("expected HostObject class, got {:?}", constant.value);
+        };
+        assert_eq!(mapped, &class);
     }
 
     fn call_registry_with_struct_field(owner: &str, field: &str, ty: &str) -> CallRegistry {
