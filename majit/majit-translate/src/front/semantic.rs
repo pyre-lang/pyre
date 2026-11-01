@@ -177,12 +177,16 @@ impl SemanticFunction {
 /// The front mints [`majit_charon_reader::ullbc::positional_field_name`]
 /// when that name is missing. The flag is the origin, not the spelling:
 /// a declared field called `__pos_0` stays `is_positional == false`.
+/// `is_atomic` is the wrapper identity `tyref_atomic_arg` sees before
+/// harvest spells the field as its inner scalar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FieldRow {
     pub name: String,
     pub ty: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_positional: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_atomic: bool,
 }
 
 impl FieldRow {
@@ -191,6 +195,7 @@ impl FieldRow {
             name: name.into(),
             ty: ty.into(),
             is_positional: false,
+            is_atomic: false,
         }
     }
 
@@ -199,7 +204,13 @@ impl FieldRow {
             name: name.into(),
             ty: ty.into(),
             is_positional: true,
+            is_atomic: false,
         }
+    }
+
+    pub fn with_atomic(mut self, is_atomic: bool) -> Self {
+        self.is_atomic = is_atomic;
+        self
     }
 }
 
@@ -226,6 +237,8 @@ impl<'de> Deserialize<'de> for FieldRow {
                 ty: String,
                 #[serde(default)]
                 is_positional: bool,
+                #[serde(default)]
+                is_atomic: bool,
             },
         }
         match De::deserialize(deserializer)? {
@@ -234,10 +247,12 @@ impl<'de> Deserialize<'de> for FieldRow {
                 name,
                 ty,
                 is_positional,
+                is_atomic,
             } => Ok(Self {
                 name,
                 ty,
                 is_positional,
+                is_atomic,
             }),
         }
     }

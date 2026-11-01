@@ -3464,13 +3464,12 @@ impl<'a> Lowering<'a> {
                 }
                 // A Relaxed load is the scalar field value.
                 //
-                // An Acquire load of quasi-immutable `w_globals` is also that
-                // field value, so the codewriter still emits
-                // `record_quasiimmut_field` and the pure getfield. The
-                // executable read is Acquire (`FieldDescr::load_is_acquire`):
-                // the watcher invalidates the compiled pointer and does not
-                // order the load. SeqCst, Release, an unknown ordering, and
-                // an Acquire load of any other field stay unsupported.
+                // An Acquire load of a field declared quasi-immutable is
+                // that field's read: the codewriter emits
+                // `record_quasiimmut_field` and the getfield, and the
+                // descr's Acquire bit orders the executable read. SeqCst,
+                // Release, an unknown ordering, and an Acquire load of a
+                // field that is not quasi-immutable stay unsupported.
                 // `&self` may already alias the loaded value, NOT its
                 // address, so those cannot fall through to an ordinary
                 // `Atomic::load` call.
@@ -3492,18 +3491,12 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity leaves the field *address*;
                         // loading that word is `raw_load`, not aliasing the
                         // pointer (Unsigned) onto the Signed memo.
-                        let referent = arg_locals
-                            .first()
-                            .copied()
-                            .flatten()
-                            .and_then(|local| self.atomic_ref_place.get(&local))
-                            .map(clone_place);
-                        if let Some(referent) = referent {
-                            let value = self.resolve_place(mir_bb, referent)?;
-                            self.local_var[dest_local] = Some(LocalValue::One(value));
-                            let target_bb = self.block_id[target];
-                            let link_args = self.edge_args(mir_bb, target)?;
-                            self.graph.set_goto(bb_id, target_bb, link_args);
+                        if self.bind_dest_to_recorded_atomic_load(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            &arg_locals,
+                        )? {
                             return Ok(());
                         }
                         if let Some((item_ty, itemsize, is_item_signed)) =
@@ -3541,22 +3534,32 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Quasi-immutable `w_globals`. The field read stays so
-                    // `record_quasiimmut_field` still guards it. Execution of
-                    // the getfield and of `bh_getfield_gc_r` is the Acquire
-                    // load, not the Relaxed scalar fold above.
-                    if ordering == Some("Acquire")
-                        && self.atomic_load_receiver_is_quasi_w_globals(&args[0])
+                    // Quasi-immutable field. The field is read at the load
+                    // site through the recorded borrow (`atomic_ref_place`),
+                    // so `record_quasiimmut_field` still guards it and the
+                    // getfield executes as the Acquire load. A receiver with
+                    // no recorded borrow (a copied local, or an
+                    // `Atomic*::from_ptr` view) cannot be re-read there, so
+                    // it stays unsupported rather than reusing an earlier
+                    // read. A borrow whose place goes through a reassigned
+                    // local or a pointer read from a field also stays
+                    // unsupported.
+                    let is_acquire = ordering == Some("Acquire");
+                    let ordering_label = ordering.unwrap_or("unknown").to_string();
+                    if is_acquire
+                        && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
+                        && self.atomic_load_referent_is_stable(&arg_locals)
+                        && self.bind_dest_to_recorded_atomic_load(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            &arg_locals,
+                        )?
                     {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
                     return Err(LowerError::Unsupported(format!(
-                        "atomic load ordering {} requires address-preserving ordered lowering",
-                        ordering.unwrap_or("unknown")
+                        "atomic load ordering {ordering_label} requires address-preserving ordered lowering"
                     )));
                 }
                 // `<Atomic*>::store(&self, value, ordering)` — the write twin
@@ -8760,6 +8763,34 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(())
+    }
+
+    /// Bind `dest_local` to a fresh read of the atomic slot recorded on
+    /// the `&self` local, then close the block. The read happens at this
+    /// call site (`resolve_place`), not at the borrow that built `&self`.
+    fn bind_dest_to_recorded_atomic_load(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        arg_locals: &[Option<usize>],
+    ) -> Result<bool, LowerError> {
+        let Some(referent) = arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .and_then(|local| self.atomic_ref_place.get(&local))
+            .map(clone_place)
+        else {
+            return Ok(false);
+        };
+        let value = self.resolve_place(mir_bb, referent)?;
+        self.local_var[dest_local] = Some(LocalValue::One(value));
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place

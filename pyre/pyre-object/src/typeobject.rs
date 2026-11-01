@@ -208,7 +208,9 @@ impl Layout {
     "version_tag?",
     "w_name?",
     "flag_patma_collection?",
-    "flag_map_or_seq"
+    "flag_map_or_seq",
+    "flag_abstract?",
+    "compares_by_identity_status?"
 )]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
@@ -454,6 +456,25 @@ pub struct W_TypeObject {
     pub mutate_flag_patma_collection: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
     pub mutate_flag_patma_collection_lock:
         std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+    /// Hidden `mutate_flag_abstract` field `rclass.py
+    /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
+    /// `"flag_abstract?"`.  Written by the `__abstractmethods__` setattr hook.
+    ///
+    /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
+    /// no GC pointers, reclaimed by `type_object_destructor`.
+    pub mutate_flag_abstract: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_flag_abstract_lock: std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
+    /// Hidden `mutate_compares_by_identity_status` field `rclass.py
+    /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
+    /// `"compares_by_identity_status?"`.  Written by the `compares_by_identity`
+    /// lookup and by the type-dict mutation reset.
+    ///
+    /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
+    /// no GC pointers, reclaimed by `type_object_destructor`.
+    pub mutate_compares_by_identity_status:
+        std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmut>,
+    pub mutate_compares_by_identity_status_lock:
+        std::sync::atomic::AtomicPtr<crate::quasiimmut::QuasiImmutLock>,
     /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type join
     /// the collector's traversal. A build that keeps the global interpreter
     /// lock gives them a two-word `PyGC_Head` for it, which is what
@@ -490,6 +511,16 @@ crate::quasi_immut_words!(
     mutate_flag_patma_collection,
     mutate_flag_patma_collection_lock
 );
+crate::quasi_immut_words!(
+    W_TypeObject,
+    mutate_flag_abstract,
+    mutate_flag_abstract_lock
+);
+crate::quasi_immut_words!(
+    W_TypeObject,
+    mutate_compares_by_identity_status,
+    mutate_compares_by_identity_status_lock
+);
 
 impl W_TypeObject {
     #[inline]
@@ -518,6 +549,22 @@ impl W_TypeObject {
         crate::quasiimmut::QuasiImmutField::new(
             &self.mutate_flag_patma_collection,
             &self.mutate_flag_patma_collection_lock,
+        )
+    }
+
+    #[inline]
+    pub fn mutate_flag_abstract(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_flag_abstract,
+            &self.mutate_flag_abstract_lock,
+        )
+    }
+
+    #[inline]
+    pub fn mutate_compares_by_identity_status(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_compares_by_identity_status,
+            &self.mutate_compares_by_identity_status_lock,
         )
     }
 }
@@ -732,6 +779,10 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         mutate_flag_cpython_immutabletype_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_flag_patma_collection: crate::quasiimmut::null_mutate_word(),
         mutate_flag_patma_collection_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_flag_abstract: crate::quasiimmut::null_mutate_word(),
+        mutate_flag_abstract_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_compares_by_identity_status: crate::quasiimmut::null_mutate_word(),
+        mutate_compares_by_identity_status_lock: crate::quasiimmut::null_mutate_lock(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     };
@@ -883,6 +934,10 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         mutate_flag_cpython_immutabletype_lock: crate::quasiimmut::null_mutate_lock(),
         mutate_flag_patma_collection: crate::quasiimmut::null_mutate_word(),
         mutate_flag_patma_collection_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_flag_abstract: crate::quasiimmut::null_mutate_word(),
+        mutate_flag_abstract_lock: crate::quasiimmut::null_mutate_lock(),
+        mutate_compares_by_identity_status: crate::quasiimmut::null_mutate_word(),
+        mutate_compares_by_identity_status_lock: crate::quasiimmut::null_mutate_lock(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     }) as PyObjectRef
@@ -944,6 +999,8 @@ pub unsafe fn w_type_compares_by_identity_status(w_type: PyObjectRef) -> u8 {
 }
 
 /// Write-side companion to [`w_type_compares_by_identity_status`].
+/// The store goes through `mutate_compares_by_identity_status` so loops
+/// that read the old flag are invalidated first (`rclass.py hook_setfield`).
 ///
 /// # Safety
 /// Same as the reader; called by pyre-interpreter's lookup after
@@ -952,9 +1009,12 @@ pub unsafe fn w_type_set_compares_by_identity_status(w_type: PyObjectRef, status
     if w_type.is_null() || !is_type(w_type) {
         return;
     }
-    let t = &*(w_type as *const W_TypeObject);
-    t.compares_by_identity_status
-        .store(status, std::sync::atomic::Ordering::Release);
+    let t = w_type as *const W_TypeObject;
+    (*t).mutate_compares_by_identity_status()
+        .invalidate_then_store(|| {
+            (*t).compares_by_identity_status
+                .store(status, std::sync::atomic::Ordering::Release);
+        });
 }
 
 /// typeobject.py — `flag_map_or_seq` accessor on a `W_TypeObject`.
@@ -1150,6 +1210,8 @@ pub unsafe fn w_type_is_abstract(w_type: PyObjectRef) -> bool {
 /// side effect on per-type state, not a build-time constant, so the JIT
 /// residualises the call via the registered fnaddr rather than tracing the
 /// store the tracer cannot model.
+/// The store goes through `mutate_flag_abstract` so loops that read the old
+/// flag are invalidated first (`rclass.py hook_setfield`).
 ///
 /// # Safety
 /// `w_type` must point at a `W_TypeObject`.
@@ -1158,9 +1220,11 @@ pub unsafe fn w_type_set_abstract(w_type: PyObjectRef, abstract_: bool) {
     if w_type.is_null() || !is_type(w_type) {
         return;
     }
-    let t = &*(w_type as *const W_TypeObject);
-    t.flag_abstract
-        .store(abstract_, std::sync::atomic::Ordering::Release);
+    let t = w_type as *const W_TypeObject;
+    (*t).mutate_flag_abstract().invalidate_then_store(|| {
+        (*t).flag_abstract
+            .store(abstract_, std::sync::atomic::Ordering::Release);
+    });
 }
 
 // ── Layout accessors ─────────────────────────────────────────────────

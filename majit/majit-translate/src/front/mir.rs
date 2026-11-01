@@ -1015,7 +1015,7 @@ fn register_ref_enum_instantiation_rows(
                     registrable = false;
                     break;
                 }
-                rows.push(field_decl_row(i, f, concrete));
+                rows.push(field_row_from_decl(i, f, concrete, llbc));
             }
             if !registrable {
                 continue;
@@ -1225,7 +1225,7 @@ fn register_ordereddict_i64_entry_rows(
                 "f_hash" => hash = true,
                 _ => {}
             }
-            rows.push(field_decl_row(index, field, concrete_ty));
+            rows.push(field_row_from_decl(index, field, concrete_ty, llbc));
         }
         if !concrete || !key_is_i64 || !valid || !value || !hash {
             continue;
@@ -3153,6 +3153,18 @@ fn field_decl_row(
     }
 }
 
+/// Registry row plus the Atomic* fact `tyref_atomic_arg` sees before
+/// harvest spells the field as its inner scalar.
+fn field_row_from_decl(
+    index: usize,
+    field: &FieldDecl,
+    ty: impl Into<String>,
+    llbc: &Llbc,
+) -> crate::front::semantic::FieldRow {
+    field_decl_row(index, field, ty)
+        .with_atomic(lltype::tyref_atomic_arg(&field.ty, llbc).is_some())
+}
+
 fn field_decl_name(index: usize, field: &FieldDecl) -> String {
     field
         .name
@@ -3320,7 +3332,7 @@ fn register_type_alias_struct(
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
             );
-            field_decl_row(i, f, field_ty)
+            field_row_from_decl(i, f, field_ty, llbc)
         })
         .collect();
     struct_fields.fields.insert(name.clone(), rows.clone());
@@ -3567,7 +3579,7 @@ fn derive_program_metadata(
                                 &fname,
                                 layout,
                             );
-                        vec![field_decl_row(i, f, field_ty)]
+                        vec![field_row_from_decl(i, f, field_ty, llbc)]
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
@@ -4051,7 +4063,7 @@ fn derive_program_metadata(
                                 voffsets.insert(fname.clone(), off);
                             }
                             vattrs.push((fname.clone(), attr_ty));
-                            vrows.push(field_decl_row(i, f, row_ty));
+                            vrows.push(field_row_from_decl(i, f, row_ty, llbc));
                         }
                         struct_fields
                             .fields

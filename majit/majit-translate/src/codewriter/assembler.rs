@@ -5344,6 +5344,7 @@ fn bh_field_spec_from_parts(
     is_immutable: bool,
     is_quasi_immutable: bool,
     index_in_parent: usize,
+    load_is_acquire: bool,
 ) -> crate::jitcode::BhFieldSpec {
     crate::jitcode::BhFieldSpec {
         index,
@@ -5359,11 +5360,10 @@ fn bh_field_spec_from_parts(
         index_in_parent,
         // Built from an owner name and a field name, with no layout in reach:
         // there is nothing here to declare with, so the rebuilding side falls
-        // back to the name. Acquire is the same: no source descr to copy a
-        // stored stamp from, and the name predicate still answers for quasi
-        // `w_globals`.
+        // back to the name. Acquire is the harvest stamp for a quasi
+        // typed `Atomic*` field (`FieldRow.is_atomic`).
         is_class_word: None,
-        load_is_acquire: false,
+        load_is_acquire,
     }
 }
 
@@ -5528,6 +5528,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
                 false,
                 false,
                 0,
+                false,
             ),
         );
     }
@@ -5681,6 +5682,7 @@ fn inherited_enum_tag_spec(
         tag.is_immutable,
         tag.is_quasi_immutable,
         0,
+        tag.load_is_acquire,
     ))
 }
 
@@ -5731,6 +5733,7 @@ fn bh_result_variant_field_specs(
         offset = (offset + align - 1) & !(align - 1);
         let index = specs.len() + 1;
         let rank = cc.field_immutability(Some(owner), field_name);
+        let is_quasi = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
         specs.push(bh_field_spec_from_parts(
             index as u32,
             owner,
@@ -5740,8 +5743,9 @@ fn bh_result_variant_field_specs(
             field_type,
             field_flag,
             rank.is_some(),
-            rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
+            is_quasi,
             index,
+            is_quasi && row.is_atomic,
         ));
         offset += field_size;
     }
@@ -5818,6 +5822,9 @@ fn bh_all_field_specs_for_struct_into(
                 fl.flag,
                 fl.is_immutable(),
             );
+            let is_atomic = entries
+                .iter()
+                .any(|row| row.is_atomic && row.name == fl.name);
             specs.push(bh_field_spec_from_parts(
                 index_in_parent as u32,
                 root_owner,
@@ -5829,6 +5836,7 @@ fn bh_all_field_specs_for_struct_into(
                 is_immutable,
                 fl.is_quasi_immutable(),
                 index_in_parent,
+                fl.is_quasi_immutable() && is_atomic,
             ));
         }
         return;
@@ -5884,6 +5892,7 @@ fn bh_all_field_specs_for_struct_into(
                     field_flag,
                     rank.is_some(),
                 );
+                let is_quasi = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 specs.push(bh_field_spec_from_parts(
                     index_in_parent as u32,
                     root_owner,
@@ -5893,8 +5902,9 @@ fn bh_all_field_specs_for_struct_into(
                     field_type,
                     field_flag,
                     is_immutable,
-                    rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
+                    is_quasi,
                     index_in_parent,
+                    is_quasi && row.is_atomic,
                 ));
             }
         }
@@ -6180,6 +6190,9 @@ fn fielddescrof(
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
             is_quasi_immutable = rank.is_quasi_immutable();
+        }
+        if is_quasi_immutable && cc.field_row_is_atomic(owner, &field_key) {
+            load_is_acquire = true;
         }
         // Both fallbacks above take `offset` from a second source — the
         // `struct_layout_for` registry or the recorded scalar word — and neither

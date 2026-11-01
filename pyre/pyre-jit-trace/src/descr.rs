@@ -4682,10 +4682,9 @@ pub fn w_list_size_descr() -> DescrRef {
 /// `_version_tag` / `name`). `mutate_*_lock` is the second word
 /// `FUNCTION_DESCR_GROUP` declares for each `mutate_<name>`.
 ///
-/// The interpreter Acquire reader `w_type_get_version_tag` stays residual.
-/// The jitted heap-type path reads through `w_type_read_version_tag_field`
-/// (Relaxed), which the codewriter folds to a getfield, so
-/// `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field/rdd`.
+/// `w_type_get_version_tag`'s Acquire load lowers to this row's getfield, and
+/// the stored bit makes the executable read Acquire. The Relaxed sibling
+/// `w_type_read_version_tag_field` folds to the same getfield.
 static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
     LazyLock::new(|| {
         use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
@@ -4705,7 +4704,8 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                      is_immutable,
                      is_quasi_immutable,
                      flag,
-                     index_in_parent| {
+                     index_in_parent,
+                     load_is_acquire| {
             SimpleFieldDescrSpec {
                 index,
                 field_key: field_key.to_string(),
@@ -4719,7 +4719,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 virtualizable: false,
                 index_in_parent,
                 is_class_word: Some(false),
-                load_is_acquire: false,
+                load_is_acquire,
             }
         };
         let specs = vec![
@@ -4733,6 +4733,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 true,
                 ArrayFlag::Pointer,
                 0,
+                false,
             ),
             field(
                 u32::MAX,
@@ -4744,6 +4745,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 true,
                 ArrayFlag::Unsigned,
                 1,
+                true,
             ),
             field(
                 u32::MAX,
@@ -4755,6 +4757,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 false,
                 ArrayFlag::Pointer,
                 2,
+                false,
             ),
             field(
                 u32::MAX,
@@ -4766,6 +4769,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 false,
                 ArrayFlag::Pointer,
                 3,
+                false,
             ),
             field(
                 u32::MAX,
@@ -4777,6 +4781,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 false,
                 ArrayFlag::Pointer,
                 4,
+                false,
             ),
             field(
                 u32::MAX,
@@ -4788,6 +4793,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 false,
                 ArrayFlag::Pointer,
                 5,
+                false,
             ),
         ];
         let cache_key = majit_ir::descr::path_hash("typeobject::W_TypeObject");
@@ -11361,6 +11367,25 @@ mod tests {
                 .expect("ModuleDictStrategy.version parent lookup"),
             &module_dict_mutate_version_descr()
         ));
+    }
+
+    #[test]
+    fn w_type_version_tag_canonical_descr_loads_with_acquire() {
+        let version = field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "version_tag");
+        let mutate =
+            field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mutate_version_tag");
+        assert!(
+            version
+                .as_field_descr()
+                .expect("version_tag is a field")
+                .load_is_acquire()
+        );
+        assert!(
+            !mutate
+                .as_field_descr()
+                .expect("mutate_version_tag is a field")
+                .load_is_acquire()
+        );
     }
 
     #[test]

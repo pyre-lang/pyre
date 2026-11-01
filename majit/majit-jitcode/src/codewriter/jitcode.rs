@@ -2129,8 +2129,8 @@ pub struct BhFieldSpec {
     /// finds the same `(STRUCT, fieldname)` slot cached.
     #[serde(default)]
     pub is_class_word: Option<bool>,
-    /// Stored Acquire stamp for `Atomic*` fields. Unioned with the
-    /// `w_globals` name predicate in `BhDescr::load_is_acquire`.
+    /// Stored Acquire stamp for typed `Atomic*` fields. Unioned with
+    /// the quasi-pointer overlay in `BhDescr::load_is_acquire`.
     #[serde(default)]
     pub load_is_acquire: bool,
 }
@@ -2854,8 +2854,8 @@ pub enum BhDescr {
         parent: Option<Arc<BhSizeSpec>>,
         name: String,
         owner: String,
-        /// Stored Acquire stamp. Unioned with the `w_globals` name
-        /// predicate in [`BhDescr::load_is_acquire`].
+        /// Stored Acquire stamp. Unioned with the quasi-pointer overlay
+        /// in [`BhDescr::load_is_acquire`].
         #[serde(default)]
         load_is_acquire: bool,
     },
@@ -3332,13 +3332,12 @@ pub static EMPTY_DESCR_TABLE: &(dyn DescrTable + 'static) = &EMPTY_DESCRS;
 impl BhDescr {
     /// Acquire load of a field or raw-array word.
     ///
-    /// A Field is Acquire when the stored bit is set or the quasi
-    /// `w_globals` name predicate matches (`descr.py FieldDescr`). An
-    /// Array is Acquire only from the stored bit.
+    /// A Field is Acquire when the stored bit is set or the field is a
+    /// quasi-immutable pointer (`descr.py FieldDescr`). An Array is
+    /// Acquire only from the stored bit.
     pub fn load_is_acquire(&self) -> bool {
         match self {
             BhDescr::Field {
-                name,
                 is_quasi_immutable,
                 field_type,
                 field_flag,
@@ -3350,7 +3349,6 @@ impl BhDescr {
                         *is_quasi_immutable,
                         *field_type == majit_ir::value::Type::Ref
                             || *field_flag == majit_ir::descr::ArrayFlag::Pointer,
-                        name,
                     )
             }
             BhDescr::Array {

@@ -6120,24 +6120,18 @@ pub trait FieldDescr: Descr {
 
     /// This field's executable read is an Acquire load.
     ///
-    /// `PyCode.w_globals` is published with `AtomicPtr::store(Release)`.
-    /// The quasi-immutable watcher invalidates a compiled assumption of the
-    /// pointer; the load itself still has to acquire that publication.
-    /// A stored bit covers `Atomic*` integer fields (`W_TypeObject.version_tag`);
-    /// the name predicate stays as a union so a `w_globals` load that was
-    /// Acquire remains Acquire (`descr.py FieldDescr`).
+    /// A quasi-immutable pointer field is published by its mutator and
+    /// read with Acquire (`AtomicPtr::from_ptr` overlay of
+    /// `PyCode.w_globals`). An integer/bool `Atomic*` quasi field gets
+    /// the stored bit instead (`descr.py FieldDescr`).
     fn load_is_acquire(&self) -> bool {
         self.stored_load_is_acquire()
-            || ref_field_load_is_acquire(
-                self.is_quasi_immutable(),
-                self.is_pointer_field(),
-                self.field_name(),
-            )
+            || ref_field_load_is_acquire(self.is_quasi_immutable(), self.is_pointer_field())
     }
 
-    /// Layout-stamped Acquire bit, independent of the `w_globals` name
-    /// predicate. Default false; `SimpleFieldDescr` stores the producer
-    /// stamp (`with_load_is_acquire`).
+    /// Layout-stamped Acquire bit for typed `Atomic*` fields. Default
+    /// false; `SimpleFieldDescr` stores the producer stamp
+    /// (`with_load_is_acquire`).
     fn stored_load_is_acquire(&self) -> bool {
         false
     }
@@ -6219,20 +6213,11 @@ pub trait FieldDescr: Descr {
     }
 }
 
-/// `PyCode.w_globals`, bare or `STRUCT.w_globals`. `mutate_w_globals` does
-/// not match: the hidden mutate slot is not the published pointer.
-pub fn is_w_globals_field_name(name: &str) -> bool {
-    name == "w_globals" || name.ends_with(".w_globals")
-}
-
-/// Acquire load of the quasi-immutable `w_globals` pointer. Other quasi
-/// fields stay plain loads; their slots are not `AtomicPtr`.
-pub fn ref_field_load_is_acquire(
-    is_quasi_immutable: bool,
-    is_pointer: bool,
-    field_name: &str,
-) -> bool {
-    is_quasi_immutable && is_pointer && is_w_globals_field_name(field_name)
+/// Acquire load of a quasi-immutable pointer field. The mutator publishes
+/// the pointer and the getfield reads it with Acquire. An integer/bool
+/// `Atomic*` quasi field gets the stored bit instead.
+pub fn ref_field_load_is_acquire(is_quasi_immutable: bool, is_pointer: bool) -> bool {
+    is_quasi_immutable && is_pointer
 }
 
 /// RPython: descr.py FLAG_* constants for array element type classification.
@@ -6778,8 +6763,8 @@ pub struct SimpleFieldDescr {
     /// descr.py FieldDescr.index — slot position within the
     /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
-    /// Stored Acquire stamp for `Atomic*` fields. Unioned with the
-    /// `w_globals` name predicate in `FieldDescr::load_is_acquire`.
+    /// Stored Acquire stamp for typed `Atomic*` fields. Unioned with
+    /// the quasi-pointer overlay in `FieldDescr::load_is_acquire`.
     load_is_acquire: bool,
     /// descr.py FieldDescr.parent_descr — backreference to the SizeDescr
     /// of the containing struct/object. Required by
@@ -7040,7 +7025,7 @@ impl SimpleFieldDescr {
     }
 
     /// Stamp an Acquire load on this descr (`Atomic*` integer fields and
-    /// raw word loads). Unioned with the `w_globals` name predicate.
+    /// raw word loads). Unioned with the quasi-pointer overlay.
     pub fn with_load_is_acquire(mut self, load_is_acquire: bool) -> Self {
         self.load_is_acquire = load_is_acquire;
         self
@@ -7663,7 +7648,7 @@ pub struct SimpleFieldDescrSpec {
     /// pre-applied guess, so a producer that only guessed does not outrank one
     /// that knows.
     pub is_class_word: Option<bool>,
-    /// Stored Acquire stamp. Unioned with the `w_globals` name predicate in
+    /// Stored Acquire stamp. Unioned with the quasi-pointer overlay in
     /// `FieldDescr::load_is_acquire`. `descr.py` `get_field_descr` keeps one
     /// descr object per `(STRUCT, fieldname)`; the bit is part of that mint.
     pub load_is_acquire: bool,
@@ -9471,12 +9456,12 @@ mod acquire_load_tests {
     }
 
     #[test]
-    fn only_quasi_w_globals_loads_with_acquire() {
+    fn quasi_pointer_or_stored_atomic_loads_with_acquire() {
         assert!(pointer_field(true, "PyCode.w_globals", "w_globals").load_is_acquire());
         assert!(pointer_field(true, "w_globals", "w_globals").load_is_acquire());
         assert!(!pointer_field(false, "PyCode.w_globals", "w_globals").load_is_acquire());
-        assert!(!pointer_field(true, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
-        assert!(!pointer_field(true, "w_func_globals", "w_func_globals").load_is_acquire());
+        assert!(!pointer_field(false, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
+        assert!(pointer_field(true, "w_func_globals", "w_func_globals").load_is_acquire());
         let version = SimpleFieldDescr::new_with_name(
             1,
             8,
@@ -9505,7 +9490,7 @@ mod acquire_load_tests {
         )
         .with_load_is_acquire(true);
         assert!(version.load_is_acquire());
-        assert!(!pointer_field(true, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
+        assert!(!pointer_field(false, "mutate_w_globals", "mutate_w_globals").load_is_acquire());
     }
 }
 

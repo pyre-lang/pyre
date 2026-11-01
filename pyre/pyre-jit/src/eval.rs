@@ -630,6 +630,9 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     unsafe { (*t).mutate_w_name().reclaim() };
     unsafe { (*t).mutate_flag_cpython_immutabletype().reclaim() };
     unsafe { (*t).mutate_flag_patma_collection().reclaim() };
+    // `flag_abstract?` and `compares_by_identity_status?` are the same shape.
+    unsafe { (*t).mutate_flag_abstract().reclaim() };
+    unsafe { (*t).mutate_compares_by_identity_status().reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` / `w_fdel?` instances on sweep.

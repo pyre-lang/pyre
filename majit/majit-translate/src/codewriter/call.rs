@@ -5125,6 +5125,17 @@ impl CallControl {
         self.struct_fields.fields.get(owner).map(Vec::as_slice)
     }
 
+    /// Harvested `FieldRow.is_atomic`: the field's declared type was a
+    /// `core::sync::atomic::Atomic*` wrapper before the layout peeler
+    /// spelled it as the inner scalar.
+    pub fn field_row_is_atomic(&self, owner: &str, field_key: &str) -> bool {
+        let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
+        self.struct_field_entries(owner).is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row.is_atomic && (row.name == field_key || row.name == leaf))
+        })
+    }
+
     /// `cpu.arraydescrof(ARRAY)` for callers that do not already hold the
     /// codewriter-side `array_index` — resolves it via
     /// [`DescrIndexRegistry::array_index`] keyed on
@@ -5827,6 +5838,8 @@ impl CallControl {
         // descr.py: index = heaptracker.get_fielddescr_index_in(
         // STRUCT, fieldname).
         let index_in_parent = field_pos_in(self, owner_root, field_name);
+        let load_is_acquire =
+            is_quasi_immutable && self.field_row_is_atomic(owner_root, field_name);
         let descr = majit_ir::descr::gc_cache().lock().get_field_descr(
             struct_key,
             field_name,
@@ -5842,7 +5855,7 @@ impl CallControl {
             // Always a claim: `field_pos_in` walks the owner's layout and
             // panics rather than hand back an unnumbered field.
             Some(index_in_parent),
-            false,
+            load_is_acquire,
         );
         // Same arguments this `get_field_descr` miss just used, kept so
         // the runtime's own cache can take the same miss branch
@@ -6133,6 +6146,8 @@ impl CallControl {
                     // an interior access and the direct field access agree
                     // (`descr.py`, one numberer per STRUCT).
                     let index_in_parent = field_pos_in(self, &elem_name, field_name);
+                    let load_is_acquire =
+                        is_quasi_immutable && self.field_row_is_atomic(&elem_name, field_name);
                     let mut gc = majit_ir::descr::gc_cache().lock();
                     let mint = gc.get_field_descr(
                         struct_key,
@@ -6149,7 +6164,7 @@ impl CallControl {
                         // Always a claim: `field_pos_in` walks the owner's layout and
                         // panics rather than hand back an unnumbered field.
                         Some(index_in_parent),
-                        false,
+                        load_is_acquire,
                     );
                     found = Some(mint as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
                 }
@@ -14054,7 +14069,7 @@ fn all_interiorfielddescrs(
                         // Always a claim: the index is this field's position in
                         // `entries`, straight off `.iter().enumerate()`.
                         Some(index_in_parent),
-                        false,
+                        *is_quasi_immutable && cc.field_row_is_atomic(struct_name, name),
                     )
                 }
             };
@@ -14192,7 +14207,7 @@ fn all_interiorfielddescrs(
                     // Always a claim: the index is this field's position in
                     // `entries`, straight off `.iter().enumerate()`.
                     Some(index_in_parent),
-                    false,
+                    *is_quasi_immutable && cc.field_row_is_atomic(struct_name, name),
                 )
             }
         };

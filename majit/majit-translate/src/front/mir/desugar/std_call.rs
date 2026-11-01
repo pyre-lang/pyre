@@ -2022,19 +2022,23 @@ impl<'a> Lowering<'a> {
         self.is_atomic_method(reg, "load")
     }
 
-    /// The receiver variable is a `FieldRead`, or a fresh block input
-    /// copied from one, of quasi-immutable `w_globals`.
+    /// The receiver variable is a `FieldRead`, or a `FrameState.copy` of
+    /// one, of a field the owner declares quasi-immutable.
     ///
-    /// `w_code_get_w_globals` computes `&raw (*code).w_globals` in one
-    /// block and calls `AtomicPtr::load` in the successor. `FrameState.copy`
-    /// gives that successor a fresh Variable, so the load's receiver is not
-    /// the `FieldRead` result. [`Self::input_copied_from`] is that copy.
+    /// [`Self::is_atomic_load`] already established the receiver is an
+    /// `Atomic*`. Typed wrappers (`version_tag: AtomicU64`) and the
+    /// `AtomicPtr::from_ptr` overlay (`w_globals`) both produce a
+    /// `FieldRead` of the published slot. `w_code_get_w_globals` computes
+    /// `&raw (*code).w_globals` in one block and calls `AtomicPtr::load`
+    /// in the successor. `FrameState.copy` gives that successor a fresh
+    /// Variable, so the load's receiver is not the `FieldRead` result.
+    /// [`Self::input_copied_from`] is that copy.
     ///
     /// The marker is the table harvested once for this artefact
     /// (`self.immutable_fields`). A missing owner, a missing marker, a
-    /// field other than `w_globals`, a merge phi, or a rank that is not
-    /// quasi fails closed and the load keeps the unsupported-ordering error.
-    pub(in crate::front::mir) fn atomic_load_receiver_is_quasi_w_globals(
+    /// merge phi, or a rank that is not quasi fails closed and the load
+    /// keeps the unsupported-ordering error.
+    pub(in crate::front::mir) fn atomic_load_receiver_is_quasi_immutable_field(
         &self,
         recv: &Variable,
     ) -> bool {
@@ -2068,14 +2072,59 @@ impl<'a> Lowering<'a> {
         let Some(owner) = owner else {
             return false;
         };
-        if !majit_ir::descr::is_w_globals_field_name(&name) {
-            return false;
-        }
         self.immutable_fields.get(&owner).is_some_and(|fields| {
             fields
                 .iter()
                 .any(|(field_name, rank)| field_name == &name && rank.is_quasi_immutable())
         })
+    }
+
+    /// The Acquire load re-reads the borrowed place at the load site. That
+    /// equals the Rust reference only when every pointer the place goes
+    /// through is fixed between the borrow and the load: single-assigned
+    /// locals, field offsets, statics.
+    ///
+    /// `InstanceRepr.getfield` reads from the already evaluated instance.
+    pub(in crate::front::mir) fn atomic_load_referent_is_stable(
+        &self,
+        arg_locals: &[Option<usize>],
+    ) -> bool {
+        let Some(local) = arg_locals.first().copied().flatten() else {
+            return false;
+        };
+        if self.multi_assigned_locals.contains(&local) {
+            return false;
+        }
+        let Some(place) = self.atomic_ref_place.get(&local) else {
+            return false;
+        };
+        self.recorded_place_is_stable(place)
+    }
+
+    fn recorded_place_is_stable(&self, place: &Place) -> bool {
+        match &place.kind {
+            PlaceKind::Global { .. } => true,
+            PlaceKind::Local(l) => !self.multi_assigned_locals.contains(&(*l as usize)),
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if v.as_object().is_some_and(|obj| obj.contains_key("Field")) =>
+            {
+                self.recorded_place_is_stable(inner)
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Atom(name)) if name == "Deref" => {
+                let PlaceKind::Local(l) = &inner.kind else {
+                    return false;
+                };
+                let l = *l as usize;
+                if self.multi_assigned_locals.contains(&l) {
+                    return false;
+                }
+                match self.atomic_ref_place.get(&l) {
+                    Some(recorded) => self.recorded_place_is_stable(recorded),
+                    None => true,
+                }
+            }
+            PlaceKind::Projection(..) | PlaceKind::Unknown => false,
+        }
     }
 
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
