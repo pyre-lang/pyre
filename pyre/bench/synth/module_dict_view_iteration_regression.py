@@ -50,6 +50,16 @@ def peak_rss_mb():
     return value / scale
 
 
+def warm_jit_metadata():
+    # Initialize process-wide compiler metadata before measuring view growth.
+    # A separate function keeps selfcheck-compiles=main meaningful: main must
+    # still compile during the measured walk, within the unchanged RSS budget.
+    total = 0
+    for i in range(6000):
+        total += i
+    return total
+
+
 def main():
     module = types.ModuleType("module_dict_view_probe")
     for i in range(NAMES):
@@ -67,6 +77,7 @@ def main():
     if [key for key in namespace] != [k for k, _ in materialised]:
         failures.append("key iteration disagrees with items()")
 
+    warm_jit_metadata()
     before = peak_rss_mb()
     seen = 0
     for _ in range(ROUNDS):

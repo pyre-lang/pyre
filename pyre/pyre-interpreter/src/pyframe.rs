@@ -6872,7 +6872,7 @@ impl PyFrame {
     ///
     /// An unstarted generator (`last_instr == -1` with a `RETURN_GENERATOR`
     /// prefix) rests on the instruction after that opcode — the `POP_TOP` —
-    /// matching CPython's `instr_ptr` after `TARGET(RETURN_GENERATOR)`.
+    /// matching `instr_ptr` after `TARGET(RETURN_GENERATOR)`.
     /// Regular frames have no such prefix and still start at 0.
     #[inline]
     pub fn next_instr(&self) -> usize {

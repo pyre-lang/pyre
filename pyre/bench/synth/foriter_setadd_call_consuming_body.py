@@ -4,9 +4,11 @@
 # `guard_failures` sits on a minor-collection boundary: one guard keeps
 # failing before its bridge compiles, and the `counter.py`
 # `invoke_after_minor_collection` decay lands inside its trace_eagerness ticks
-# at a point the nursery traffic picks. Against the 4553 baseline, ubuntu CI
-# reads 4572 on wasm with six loops and 25 bridges, while dynasm and cranelift
-# stay within 15 of it. The band covers that 4553-4572 range.
+# at a point the nursery traffic picks. Dynasm and cranelift both read 3995
+# once cranelift packs loop ref-root homes by longevity
+# (`FrameManager.get_new_loc`) instead of reserving the union of every Ref
+# the trace produced. Wasm stays a few counts off that (frozen 16-slot
+# granules); the band covers that remainder and host-to-host nursery drift.
 # A set comprehension whose element call consumes the very heap it is draining,
 # so a body execution replayed or dropped by the tracer changes the heap, not
 # just the result.

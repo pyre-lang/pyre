@@ -17927,20 +17927,16 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             Ok(if value.is_null() { w_none() } else { value })
         }
         pyre_object::MEMBER_TRACEBACK_FRAME => {
+            // typedef.py `tb_frame = interp_attrproperty_w('frame', cls=PyTraceback)`:
+            // the slot itself.  `mark_as_escaped` belongs to
+            // `executioncontext.py leave`, `error.py OperationError.get_traceback`,
+            // `interp_exceptions.py descr_gettraceback`, and `sys/vm.py getframe`.
             let frame = unsafe { crate::pytraceback::w_pytraceback_get_frame(obj) };
-            if frame.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            // Mark escaped so the JIT keeps the frame materialised for the
-            // exposed reference (pyframe.py `mark_as_escaped`), the way
-            // `sys/vm.py _getframe` does for the frame it hands out.  This
-            // store has no counterpart on the upstream `tb_frame`, whose
-            // complete caller set is `executioncontext.py leave`, `error.py
-            // OperationError.get_traceback`, `interp_exceptions.py
-            // descr_gettraceback` and `sys/vm.py _getframe` — a deviation, not
-            // a port.
-            unsafe { (*frame).mark_as_escaped() };
-            Ok(frame as pyre_object::PyObjectRef)
+            Ok(if frame.is_null() {
+                pyre_object::w_none()
+            } else {
+                frame as pyre_object::PyObjectRef
+            })
         }
         // `descr_get_tb_lasti` — the slot already holds the byte offset
         // `tb_lasti` means, so `traceback._get_code_position` recovers the

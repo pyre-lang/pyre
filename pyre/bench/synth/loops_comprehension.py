@@ -1,5 +1,11 @@
 # pyre-check: max-pypy-ratio=16
 # Readings 5.0x-8.1x (macos dynasm 5.0x failed floor 7.5 against 30, run 37242176195). Floor 4x.
+# pyre-check: jitstats-band=guard_failures=6
+# dynasm guard_failures reads 2326 on one macOS arm64 binary at every
+# PYPY_GC_NURSERY from 2M to 32M (256K reads 2330) and every PYTHONHASHSEED,
+# and 2332 on macOS CI (runs 40499777746 and 40570473141) at the same 7 loops /
+# 12 bridges; the CI LLBC matches the local one except for the checkout path.
+# upstream/main reads 2485 locally against its recorded 2486.
 # Merged synth parity smoke suite: independent feature-level hot loops, each
 # kept verbatim from its former standalone file with module-level names prefixed
 # by the source name. Bug-repro / resume / kept-stack tests are NOT merged (they

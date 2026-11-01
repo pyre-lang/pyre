@@ -283,10 +283,10 @@ fn match_metainterp_finish_descr(
 use majit_backend::deadframe::FrameHeapOwner;
 use majit_backend::jitframe::{
     BASEITEMOFS, HostHeapGc, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
-    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, JitframeDescrFacts,
+    JF_GCMAP_OFS, JF_GUARD_EXC_OFS, JF_SAVEDATA_OFS, JitFrame, JitFrameInfo, JitframeDescrFacts,
     check_jitframe_descr, jitframe_facts_at_cpu_init, jitframe_is_gc_object,
     jitframe_write_barrier, malloc_entry_jitframe, malloc_jitframe_no_collect,
-    publish_standalone_jitframe_facts,
+    publish_standalone_jitframe_facts, realloc_frame,
 };
 use majit_backend::llmodel::{
     done_ref_slot0, park_or_free_done_entry_frame, prepare_done_raw_entry_frame,
@@ -4324,8 +4324,43 @@ extern "C" fn gc_alloc_lowlevel_string_shim(
 ///   spills; this helper only needs to copy those words verbatim.
 /// - Must run on the JIT thread that owns the `CRANELIFT_ACTIVE_GC`
 ///   thread-local.
+/// - When `jf_frame_info` is set (`prepare_done_raw_entry_frame` /
+///   `JitFrame::init`), it must stay writable for
+///   `jitframeinfo_update_depth`.
 #[inline(never)]
 pub unsafe extern "C" fn cranelift_realloc_frame(old_jf: *mut i64, new_depth: usize) -> *mut i64 {
+    let old = old_jf as *mut JitFrame;
+    // llmodel.py `realloc_frame`: if size > frame.jf_frame_info.jfi_frame_depth
+    // then `update_frame_depth` and `JITFRAME.allocate(frame.jf_frame_info)`.
+    // wasm_realloc_frame already does this; without it every later
+    // `execute_token` still mallocs the old depth and reallocs again.
+    let fi = unsafe { (*old).jf_frame_info as *mut JitFrameInfo };
+    if !fi.is_null() {
+        let base_ofs = (JF_FRAME_ITEM0_OFS as usize + GcHeader::SIZE) as isize;
+        let new_jf = unsafe {
+            realloc_frame(
+                old,
+                new_depth as isize,
+                base_ofs,
+                |size_bytes| {
+                    let payload = (size_bytes as usize).saturating_sub(GcHeader::SIZE);
+                    with_gc_ll_descr(|gc| malloc_jitframe_no_collect(gc, payload))
+                },
+                |new_frame| write_barrier_if_managed(GcRef(new_frame as usize)),
+            )
+        };
+        write_barrier_if_managed(GcRef(old as usize));
+        if majit_ir::debug::have_debug_prints() {
+            majit_ir::debug::log_one(
+                "jit-backend",
+                &format!(
+                    "cranelift realloc-frame old={old_jf:p} new={new_jf:p} new_depth={new_depth}"
+                ),
+            );
+        }
+        return new_jf as *mut i64;
+    }
+
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8;
     let new_total = header_words + new_depth;
     let new_bytes = new_total * 8;
@@ -5545,8 +5580,10 @@ fn resolve_call_assembler_target(
     // A target reached via do_recursive_call(assembler_call=True) at an
     // inline-frame loop header (opimpl_jit_merge_point pyjitpl.py) is a
     // loop greenkey, not a function-entry trace: it exits via guard-deopt and
-    // exposes no FINISH descr. RPython/x86 never require a target-local finish
-    // exit — _call_assembler_check_descr (x86/assembler.py) compares the
+    // exposes no portal-return FINISH. A segmented loop's only FINISH is
+    // `exit_frame_with_exception_descr_ref` (`_create_segmented_trace_and_blackhole`).
+    // RPython/x86 never require a target-local finish exit —
+    // `_call_assembler_check_descr` (x86/assembler.py) compares the
     // returned jf_descr against the CPU-global done_with_this_frame descr, and
     // the helper path handles the deopt result. When the target DOES expose a
     // finish exit (function-entry traces), keep validating its result type.
@@ -8233,8 +8270,8 @@ fn overlay_rd_locs_on_dense(frame: &[i64], rd_locs: &[u16], dense_len: usize) ->
 /// `GuardNotForced2`'s force spill, and `spill_ref_roots` inside
 /// `emit_collecting_gc_call` plus the malloc / call_assembler / call_release_gil
 /// slow paths. Guard exits, FINISH and the closing-JUMP publish leave the
-/// function and are not listed. A demoted home is stored at
-/// `ref_root_base_ofs` or `nonref_home_base_ofs`, both past
+/// function and are not listed. A demoted home is stored in the scanned
+/// tail at `ref_root_base_ofs` (same region as ref-roots), past
 /// `max_output_slots`, so it does not end residency of slots `[0, arity)`.
 fn op_writes_jitframe_output_slot(op: &Op) -> bool {
     matches!(
@@ -12150,17 +12187,20 @@ impl CraneliftBackend {
         let mut loop_phi_keep_by_label = compute_loop_phi_keep(ops, &label_indices);
         // Two home regions carry a demoted arg:
         //
-        //  * GC ref (non-inputarg) → its ref-root slot in `[max_output_slots ..
-        //    max_output_slots + ref_root_slots.len())`, forwarded in place by the
-        //    collector.  A ref INPUTARG keeps its SSA param: the slot is
-        //    entry-synced and spill/reloaded, and keeping the param avoids a
-        //    once-seeded carried slot going stale when an enclosing loop re-enters
-        //    with a different input value.
+        //  * GC ref (non-inputarg) → a packed ref-root slot in
+        //    `[max_output_slots .. max_output_slots + reserved_tail)`, forwarded
+        //    in place by the collector. `reserved_tail` is the span of
+        //    concurrent homes (`FrameManager.get_new_loc`), not the union of
+        //    every Ref the trace ever produced. A ref INPUTARG keeps its SSA
+        //    param: the slot is entry-synced and spill/reloaded, and keeping the
+        //    param avoids a once-seeded carried slot going stale when an
+        //    enclosing loop re-enters with a different input value.
         //
-        //  * non-ref i64 → a dedicated home in the region AFTER the ref roots
-        //    (`nonref_home_base_ofs`), disjoint from the dense `[0,
-        //    max_output_slots)` scratch that guard failargs and before-call spills
-        //    overwrite by index.  That disjoint home is why non-refs (incl.
+        //  * non-ref i64 → a home in the same scanned tail as the ref roots
+        //    (`nonref_home_base_ofs` == `ref_root_base_ofs`), disjoint from the
+        //    dense `[0, max_output_slots)` scratch that guard failargs and
+        //    before-call spills overwrite by index.  That disjoint home is why
+        //    non-refs (incl.
         //    inputargs) are safe to demote: the ref-inputarg staleness argument
         //    does not apply because the home is re-seeded on every LABEL entry
         //    edge (preamble fall-through and loader re-entry). Floats and SIMD
@@ -12250,19 +12290,61 @@ impl CraneliftBackend {
             bridge_var_slots = var_slots;
             demoted
         } else {
-            demoted_home_index_map(&loop_phi_keep_by_label, ops, &ref_root_slots, None, 0)
+            let demoted =
+                demoted_home_index_map(&loop_phi_keep_by_label, ops, &ref_root_slots, None, 0);
+            let mut home_vars: IndexSet<u32> =
+                ref_root_slots.iter().map(|&(var_idx, _)| var_idx).collect();
+            home_vars.extend(demoted.keys().copied());
+            if home_vars.is_empty() {
+                demoted
+            } else {
+                let intervals = compute_bridge_home_intervals(inputargs, ops, &home_vars);
+                let ref_vars: IndexSet<u32> =
+                    ref_root_slots.iter().map(|&(var_idx, _)| var_idx).collect();
+                let demoted_vars: IndexSet<u32> = demoted.keys().copied().collect();
+                let empty_bind = IndexMap::new();
+                let (var_slots, _) = assign_bridge_homes_linear_scan(
+                    &intervals,
+                    &empty_bind,
+                    &ref_vars,
+                    &demoted_vars,
+                    0,
+                );
+                for (var_idx, slot) in ref_root_slots.iter_mut() {
+                    if let Some(&home) = var_slots.get(var_idx) {
+                        *slot = home;
+                    }
+                }
+                let mut packed = IndexMap::new();
+                for raw in demoted.keys().copied() {
+                    if let Some(&home) = var_slots.get(&raw) {
+                        packed.insert(raw, home);
+                    }
+                }
+                packed
+            }
         };
-        let num_nonref_homes: usize = loop_phi_keep_by_label
-            .iter()
-            .map(|(&li, keep)| nonref_demoted_positions(li, keep, ops, &ref_root_slots).len())
-            .sum();
-        // Bridges fold ref-roots and demoted homes into the same slot
-        // space as the bind set (`FrameManager.get_new_loc`). Loops keep
-        // a tail past the dense value area.
+        // Bridges fold ref-roots and demoted homes into the bind set
+        // (`FrameManager.get_new_loc`). Loops keep a tail past the dense
+        // value area, scanned the same way: one home per box
+        // (`RegisterManager.loc`), reused when longevity says the previous
+        // occupant is dead. Union length would count every Ref the trace
+        // ever produced; `jfi_frame_depth` is the span of concurrent homes.
         let reserved_tail = if absolute_homes {
             0
         } else {
-            ref_root_slots.len() + num_nonref_homes
+            let ref_span = ref_root_slots
+                .iter()
+                .map(|(_, slot)| *slot + 1)
+                .max()
+                .unwrap_or(0);
+            let demoted_span = demoted_home_index
+                .values()
+                .copied()
+                .max()
+                .map(|s| s + 1)
+                .unwrap_or(0);
+            ref_span.max(demoted_span)
         };
         let fail_arg_homes = FailArgHomes {
             ref_root_slots: &ref_root_slots,
@@ -12828,25 +12910,24 @@ impl CraneliftBackend {
                     (label_idx, positions)
                 })
                 .collect();
-        // Demoted non-ref (i64) args. Loops: home in the region AFTER the
-        // ref-root slots, disjoint from the dense scratch. Bridges: lowest
+        // Demoted non-ref (i64) args. Loops: home in the same scanned tail as
+        // the ref-roots, disjoint from the dense scratch. Bridges: lowest
         // free slot (`_find_frame_location`), must not alias a bind home.
         // Re-seeded on every LABEL entry edge. Not a GC root.
-        let nonref_home_base_ofs = ref_root_base_ofs + (ref_root_slots.len() as i32) * 8;
-        let mut next_nonref_home = 0usize;
+        // Packed into the same tail as ref-roots (`assign_bridge_homes_linear_scan`).
+        let nonref_home_base_ofs = ref_root_base_ofs;
         let demoted_nonref_positions_by_label: IndexMap<usize, Vec<(usize, u32, i32)>> = {
             let mut m: IndexMap<usize, Vec<(usize, u32, i32)>> = IndexMap::new();
             for (&label_idx, keep) in &loop_phi_keep_by_label {
                 let mut positions = Vec::new();
                 for (i, raw) in nonref_demoted_positions(label_idx, keep, ops, &ref_root_slots) {
+                    let slot = *demoted_home_index.get(&raw).expect("demoted home");
                     let offset = if absolute_homes {
-                        let slot = *demoted_home_index.get(&raw).expect("demoted home");
                         JF_FRAME_ITEM0_OFS + (slot as i32) * 8
                     } else {
-                        nonref_home_base_ofs + (next_nonref_home as i32) * 8
+                        nonref_home_base_ofs + (slot as i32) * 8
                     };
                     positions.push((i, raw, offset));
-                    next_nonref_home += 1;
                 }
                 if !positions.is_empty() {
                     m.insert(label_idx, positions);
@@ -12854,7 +12935,6 @@ impl CraneliftBackend {
             }
             m
         };
-        debug_assert_eq!(next_nonref_home, num_nonref_homes);
         // This map is intentionally local to `do_compile` and grows only when
         // code emission reaches a LABEL whose fall-through path has seeded the
         // root slot. Guard emission receives it explicitly; nested compilation
@@ -13126,8 +13206,8 @@ impl CraneliftBackend {
         // A guard gcmap names a ref-root slot only when `rd_locs` redirects
         // that fail arg onto a home that already holds the value: a demoted
         // ref seeded at its LABEL, or a stale root spilled before the guard.
-        // That home's frame index is `max_output_slots + root_slot` (a demoted
-        // non-ref home sits past the ref roots). Every other ref fail arg
+        // That home's frame index is `max_output_slots + root_slot` (demoted
+        // non-ref homes share that scanned tail). Every other ref fail arg
         // stays at its dense index, below `max_output_slots` and so below
         // `ref_root_base_ofs`. At this entry neither home exists — demotion
         // requires a LABEL, and `stale_ref_vars` has no insertion yet — so an
@@ -20216,8 +20296,19 @@ impl CraneliftBackend {
                 })
                 .collect();
             eprintln!(
-                "[jit][compile-loop] trace_id={} header_pc={} entry={:p} body={:p} fail_descrs={:?}",
-                trace_id, header_pc, code_ptr, body_ptr, fail_descr_preview
+                "[jit][compile-loop] trace_id={} header_pc={} entry={:p} body={:p} \
+                 max_output_slots={} reserved_tail={} ref_roots={} demoted_unique={} \
+                 guaranteed_frame_depth={} fail_descrs={:?}",
+                trace_id,
+                header_pc,
+                code_ptr,
+                body_ptr,
+                max_output_slots,
+                reserved_tail,
+                ref_root_slots.len(),
+                demoted_home_index.len(),
+                guaranteed_frame_depth,
+                fail_descr_preview
             );
         }
 
@@ -20839,6 +20930,9 @@ fn demoted_home_index_map(
     let mut next = 0usize;
     for (&label_idx, keep) in loop_phi_keep_by_label {
         for (_i, raw) in nonref_demoted_positions(label_idx, keep, ops, ref_root_slots) {
+            if map.contains_key(&raw) {
+                continue;
+            }
             let idx = if let Some(occ) = occupied.as_mut() {
                 let slot = find_frame_location(occ, start);
                 occ.insert(slot);
@@ -20859,7 +20953,7 @@ fn resolve_fail_locs_and_stamp(
     ops: &[Op],
     fail_descrs: &[DescrRef],
     max_output_slots: usize,
-    num_ref_roots: usize,
+    _num_ref_roots: usize,
     preserve_descrs: bool,
 ) {
     for info in guard_infos.iter_mut() {
@@ -20869,7 +20963,7 @@ fn resolve_fail_locs_and_stamp(
                 continue;
             }
             if *loc & FAIL_LOC_DEMOTED != 0 {
-                *loc = max_output_slots + num_ref_roots + (*loc & FAIL_LOC_PAYLOAD);
+                *loc = max_output_slots + (*loc & FAIL_LOC_PAYLOAD);
             } else if *loc & FAIL_LOC_REF_ROOT != 0 {
                 *loc = max_output_slots + (*loc & FAIL_LOC_PAYLOAD);
             }
@@ -24333,6 +24427,50 @@ mod tests {
         );
     }
 
+    /// `llmodel.py realloc_frame` widens `jf_frame_info` before allocating, so
+    /// a later `execute_token` mallocs the grown depth instead of reallocing
+    /// on every closing-jump.
+    #[test]
+    fn realloc_frame_widens_frame_info_like_llmodel() {
+        let depth = 8usize;
+        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+        let payload_bytes = (header_words + depth) * 8;
+        let base_ofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 64,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let _backend = backend_with_gc(gc);
+
+        let info = JitFrameInfo::default();
+        info.update_frame_depth(base_ofs, depth as i64);
+        assert_eq!(info.depth() as usize, depth);
+
+        let type_id = cranelift_jitframe_type_id().expect("JITFRAME type id must be registered");
+        let old = with_cranelift_gc_required(|gc| {
+            gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
+        });
+        assert_ne!(old.0, 0, "old frame allocation failed");
+        unsafe {
+            JitFrame::init(old.0 as *mut JitFrame, &info, depth);
+        }
+
+        let new_jf = unsafe { cranelift_realloc_frame(old.0 as *mut i64, depth * 2) };
+        assert!(!new_jf.is_null(), "realloc returned no frame");
+        assert!(
+            info.depth() as usize >= depth * 2,
+            "llmodel.py realloc_frame must publish the new depth on jf_frame_info"
+        );
+        unsafe {
+            let new = new_jf as *mut JitFrame;
+            assert_eq!((*new).jf_frame_info as *const JitFrameInfo, &info);
+            assert_eq!(JitFrame::frame_length(new) as usize, depth * 2);
+        }
+    }
+
     #[derive(Default)]
     struct TrackingGcState {
         collecting_allocs: usize,
@@ -26208,6 +26346,107 @@ mod tests {
             backend.get_value_direct(&frame, slot),
             7,
             "the compared operand is readable at the slot the stamp names"
+        );
+        let raw = backend.execute_token_ints_raw(&token, &[0]);
+        assert_eq!(
+            raw.guard_value_operand,
+            Some(7),
+            "host token run reads the same slot `make_a_counter_per_value` stamped"
+        );
+    }
+
+    thread_local! {
+        static CA_BRIDGE_OPERAND: Cell<Option<(i64, bool)>> = const { Cell::new(None) };
+    }
+
+    fn capture_ca_bridge_operand(
+        _frame: *mut majit_backend::jitframe::JitFrame,
+        _descr: usize,
+        operand: i64,
+        present: bool,
+    ) -> Option<i64> {
+        CA_BRIDGE_OPERAND.with(|c| c.set(Some((operand, present))));
+        None
+    }
+
+    /// `handle_fail_resume_guard` / `llmodel.py get_value_direct`: the
+    /// CALL_ASSEMBLER helper must hand `make_a_counter_per_value`'s operand
+    /// to the bridge callback, including when it is not a fail argument.
+    #[test]
+    fn call_assembler_guard_failure_passes_guard_value_operand_to_bridge_fn() {
+        register_call_assembler_bridge(capture_ca_bridge_operand);
+        CA_BRIDGE_OPERAND.with(|c| c.set(None));
+
+        let mut backend = CraneliftBackend::new();
+
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let wide = Op::new(OpCode::GuardTrue, &[rb(OpRef::int_op(4))]);
+        wide.pos().set(OpRef::NONE);
+        wide.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
+        let guard = Op::new(
+            OpCode::GuardValue,
+            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+        );
+        guard.pos().set(OpRef::NONE);
+        guard.set_fail_arg_types(vec![Type::Int]);
+        guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
+            OpRc::new(wide),
+            OpRc::new(guard),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
+        ];
+
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 7i64);
+        constants.insert(101, 100i64);
+        constants.insert(102, 999i64);
+        constants.insert(103, 5i64);
+        constants.insert(104, 1i64);
+        backend.set_constants(constants);
+
+        let token = Arc::new(JitCellToken::new(0xc0df));
+        token
+            .compiled_loop_token_expect()
+            .set_loop_token_wref(Arc::downgrade(&token));
+        backend
+            .compile_loop(&inputargs, &ops, token.as_ref())
+            .unwrap();
+
+        let frame = backend.execute_token(token.as_ref(), &[Value::Int(0)]);
+        let descr_arc = backend.get_latest_descr_arc(&frame);
+        let fd = descr_arc
+            .as_fail_descr()
+            .expect("guard exit carries a FailDescr");
+        assert!(
+            majit_backend::guard_value_counter_slot(fd).is_some(),
+            "the GUARD_VALUE stamped a counter slot"
+        );
+
+        let cell = majit_ir::FailDescrCell::wrap(descr_arc.clone());
+        let frame_ptr = frame
+            .as_jitframe()
+            .expect("cranelift deadframe is a jitframe")
+            .jf_gcref()
+            .0 as i64;
+        let _ = call_assembler_guard_failure_inner(
+            std::ptr::null(),
+            token.identity_key(),
+            majit_ir::FailDescrCell::thin_ptr(&cell) as i64,
+            frame_ptr,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            CA_BRIDGE_OPERAND.with(|c| c.get()),
+            Some((7, true)),
+            "the compared operand must reach bridge_fn"
         );
     }
 
@@ -35736,6 +35975,57 @@ mod tests {
         let (locs, span) = pack_fail_locs(&[i0, i1], false, 0, &bridge_homes, &empty_occ);
         assert_eq!(locs, vec![2, 0]);
         assert_eq!(span, 1);
+    }
+
+    #[test]
+    fn demoted_home_index_map_one_slot_per_box_across_labels() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let ops: Vec<Op> = vec![
+            mk_op(OpCode::Label, &[i0, i1], 0),
+            mk_op(OpCode::Label, &[i0, i1], 1),
+        ]
+        .into_iter()
+        .map(|o| o.as_ref().clone())
+        .collect();
+        let mut keep = IndexMap::new();
+        keep.insert(0, vec![false, false]);
+        keep.insert(1, vec![false, false]);
+        let map = demoted_home_index_map(&keep, &ops, &[], None, 0);
+        assert_eq!(map.len(), 2, "two boxes share one home each across LABELs");
+        assert_eq!(map.get(&i0.raw()), Some(&0));
+        assert_eq!(map.get(&i1.raw()), Some(&1));
+    }
+
+    #[test]
+    fn loop_ref_root_tail_reuses_nonoverlapping_homes() {
+        // Two nursery mallocs whose last uses do not overlap: FrameManager
+        // reuses the tail slot (`assign_bridge_homes_linear_scan`). Union
+        // length would still be 2.
+        let inputargs = vec![InputArg::new_ref_rc(0)];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 1),
+            mk_op(OpCode::PtrEq, &[OpRef::ref_op(1), OpRef::ref_op(1)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 3),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
+        ];
+        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let mut home_vars = IndexSet::new();
+        home_vars.insert(1);
+        home_vars.insert(3);
+        let intervals = compute_bridge_home_intervals(&inputargs, &ops, &home_vars);
+        let mut refs = IndexSet::new();
+        refs.insert(1);
+        refs.insert(3);
+        let demoted = IndexSet::new();
+        let empty_bind = IndexMap::new();
+        let (slots, _) =
+            assign_bridge_homes_linear_scan(&intervals, &empty_bind, &refs, &demoted, 0);
+        let span = slots.values().copied().max().map(|s| s + 1).unwrap_or(0);
+        assert_eq!(slots.len(), 2);
+        assert_eq!(span, 1, "second malloc reuses the first's dead tail slot");
+        assert_eq!(slots.get(&1), Some(&0));
+        assert_eq!(slots.get(&3), Some(&0));
     }
 
     #[test]
