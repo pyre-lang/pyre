@@ -654,7 +654,11 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
     };
     let expected = match (bank, concrete) {
         (GuardValueBank::Int, ConcreteValue::Int(v)) => ctx.trace_ctx.const_int(v),
-        (GuardValueBank::Ref, ConcreteValue::Ref(ptr)) if !ptr.is_null() => {
+        // `GcRef::NULL` is a real concrete null (`executor.py
+        // constant_from_op` mints `ConstPtr` for any value, NULL included).
+        // `GcRef::NO_CONCRETE` (`usize::MAX - 1`) is the unknown sentinel
+        // and is not this arm.
+        (GuardValueBank::Ref, ConcreteValue::Ref(ptr)) => {
             ctx.trace_ctx.const_ref(ptr as usize as i64)
         }
         (GuardValueBank::Float, ConcreteValue::Float(f)) => {
@@ -665,12 +669,11 @@ pub(crate) fn guard_value_record<Sym: WalkSym>(
             // leaves the register Null (`unop_cast_record` / `is_method`).
             // `implement_guard_value` (`pyjitpl.py`) still needs the live
             // pointer, so recover those bits the same way as
-            // `_establish_nullity`.
+            // `_establish_nullity`. `bits == 0` is `GcRef::NULL`.
             match ctx.trace_ctx.box_value(value) {
                 Some(majit_ir::Value::Ref(r)) => {
                     let bits = r.as_usize();
                     if r != majit_ir::GcRef::NO_CONCRETE
-                        && bits != 0
                         && bits % std::mem::align_of::<usize>() == 0
                     {
                         ctx.trace_ctx.const_ref(bits as i64)
