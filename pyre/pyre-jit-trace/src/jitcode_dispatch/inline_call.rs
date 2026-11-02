@@ -18113,7 +18113,7 @@ fn residualize_generator_resume_foriter<Sym: WalkSym>(
 /// (yield or `return`) and a `do_recursive_call` assembler result feed this
 /// dest write after the same `frame_finished_execution` check.
 #[allow(clippy::too_many_arguments)]
-fn bind_generator_resume_foriter_item<Sym: WalkSym>(
+pub(crate) fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     dst: usize,
@@ -18124,6 +18124,7 @@ fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     iter_op: OpRef,
     caller_parent: InlineParentFrame,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let root_pc = caller_parent.resume_pc.unwrap_or(op.next_pc);
     let finished = record_send_ex_finished_frame_guard(
         ctx,
         op.pc,
@@ -18134,10 +18135,12 @@ fn bind_generator_resume_foriter_item<Sym: WalkSym>(
         caller_parent,
     )?;
     if finished {
-        let null_item = OpRef::const_ptr(majit_ir::GcRef::NULL);
-        write_ref_reg(ctx, op.pc, dst, null_item, ConcreteValue::Null)?;
-        ctx.frame_state.borrow_mut().vstack_last_ref = null_item;
-        return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        // `_send_ex` after `_invoke_execute_frame`: a finished frame runs
+        // `self.frame_is_finished()` then StopIteration. `jit_next` collapses
+        // that to a null FOR_ITER dest. Walk the send_ex tail so
+        // `bh_send_ex_tail` is the dest (and executes the teardown on this
+        // iteration) instead of baking ConstPtr NULL.
+        return walk_send_ex_finished_tail(ctx, op, dst, item, iter_op, root_pc);
     }
     // The finished-frame guard records ops and captures resume data; both
     // can minor-collect. `_send_ex` / `PyFrame.FOR_ITER` keep the yielded
@@ -18147,6 +18150,62 @@ fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     // shadow from that box; `fbw_foriter_inflight_capture` stores the
     // pointer verbatim, so it must receive the forwarded one.
     publish_generator_resume_foriter_item(ctx, op, dst, item, body_coord)
+}
+
+/// `_send_ex` tail after a finished frame: walk `bh_send_ex_tail` so the
+/// compiled FOR_ITER dest is the residual result, and the tracing iteration
+/// runs `frame_is_finished` through the executor.
+fn walk_send_ex_finished_tail<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    item: OpRef,
+    iter_op: OpRef,
+    root_pc: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let snapshot_sym = ctx.fbw_mode.snapshot_sym;
+    let Some(sym) = (unsafe { snapshot_sym.as_ref() }) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    let Some((jitcode_index, resume_pc)) = send_ex_continuation_level() else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
+    let middle = majit_metainterp::ReconstructRecipe {
+        code_ptr: std::ptr::null(),
+        jitcode_index,
+        jitcode_pc: resume_pc as i32,
+        nlocals: 0,
+        valuestackdepth: 0,
+        registers_i: Vec::new(),
+        registers_r: vec![item, iter_op],
+        registers_f: Vec::new(),
+        concrete_r: Vec::new(),
+        registers_r_color: Vec::new(),
+        frame: OpRef::NONE,
+        nargs: 0,
+        len_tail: true,
+        ctor_tail: false,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
+    };
+    let answer = match crate::trace::walk_len_operator_tail(
+        ctx.trace_ctx,
+        ctx.session,
+        sym,
+        root_pc,
+        &middle,
+        &[],
+        item,
+    ) {
+        Some(Ok(answer)) => answer,
+        Some(Err(_)) | None => return Err(DispatchError::callee_inline_unsupported(op.pc)),
+    };
+    let concrete = walker_concrete_ref_object(ctx, answer)
+        .map(ConcreteValue::Ref)
+        .unwrap_or(ConcreteValue::Null);
+    write_ref_reg(ctx, op.pc, dst, answer, concrete)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = answer;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Write the yielded FOR_ITER item from the live box, after any recording

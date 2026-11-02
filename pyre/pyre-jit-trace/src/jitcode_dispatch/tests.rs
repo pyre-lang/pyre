@@ -790,6 +790,77 @@ fn generator_resume_foriter_item_is_reread_from_the_live_box_after_the_finished_
     );
 }
 
+#[test]
+fn generator_resume_finished_arm_does_not_bind_const_null() {
+    // `_send_ex` on a finished frame walks `bh_send_ex_tail` so the FOR_ITER
+    // dest is the residual result. A WalkContext with no snapshot_sym cannot
+    // start that drain; the arm must refuse rather than bake ConstPtr NULL.
+    use pyre_interpreter::compile_exec;
+
+    fbw_foriter_inflight_clear();
+    let code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+    frame.set_frame_finished_execution(true);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::PyFrame;
+
+    let mut tc = fresh_trace_ctx();
+    let item = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(item, Value::Ref(majit_ir::GcRef(0x9C_0000_2000)));
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    let iter_op = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let caller_parent = send_ex_continuation_parent_frame(iter_op).expect("tail installs");
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: 0,
+        next_pc: 1,
+    };
+    let mut regs_r = [item];
+    let mut concrete_r = [ConcreteValue::Ref(
+        0x9C_0000_2000 as pyre_object::PyObjectRef,
+    )];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let frame_root = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
+            let err = bind_generator_resume_foriter_item(
+                wc,
+                &op,
+                0,
+                item,
+                InflightForiterBody::Py(1),
+                frame_box,
+                frame_root,
+                iter_op,
+                caller_parent,
+            )
+            .expect_err("finished arm without a snapshot_sym must refuse");
+            assert!(
+                matches!(
+                    err,
+                    DispatchError::LoopBearingCalleeInlineUnsupported { pc: 0, .. }
+                ),
+                "finished arm must not bake ConstPtr NULL, got {err:?}",
+            );
+            assert_eq!(
+                wc.registers_r.get(0),
+                Some(item),
+                "FOR_ITER dest must stay the body result when the tail walk declines",
+            );
+        },
+    );
+    std::hint::black_box(&frame);
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
