@@ -9,7 +9,7 @@
 //! Separated from space.rs to avoid bloating the hot-path compilation
 //! unit. Method functions are registered into TypeDef at startup.
 
-use majit_rlib::rbigint::RBigInt as BigInt;
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntGcRoot};
 use num_traits::ToPrimitive;
 use pyre_object::*;
 // `classify`/`case`/`identifier` back the `str` predicate and `casefold`
@@ -4071,22 +4071,22 @@ fn format_with_spec(mut val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate:
                 }
                 return format_finite_float(f, spec);
             }
-            let owned;
-            let big = if pyre_object::is_bool(val) {
-                owned = BigInt::from(pyre_object::w_bool_get_value(val) as i64);
-                &owned
+            // The handle stays live across `RBigInt.format` (`_format` allocates),
+            // so it is owner-rooted the way `int_floordiv` does and read back
+            // through `&*owned`; `w_long_get_value` aliases `W_LongObject.num`,
+            // so the alias moves into the same root.
+            let owned = if pyre_object::is_bool(val) {
+                RBigIntGcRoot::new(BigInt::from(pyre_object::w_bool_get_value(val) as i64))
             } else if pyre_object::is_int(val) {
-                owned = BigInt::from(pyre_object::w_int_get_value(val));
-                &owned
+                RBigIntGcRoot::new(BigInt::from(pyre_object::w_int_get_value(val)))
             } else {
-                // newformat.py's `w_num.asbigint()` borrows `W_LongObject.num`.
-                pyre_object::w_long_get_value(val)
+                RBigIntGcRoot::new(pyre_object::w_long_get_value(val).translated_alias())
             };
             if spec.ends_with("c") && parsed.is_ok() {
-                return format_char(big, spec);
+                return format_char(&*owned, spec);
             }
             parsed.map_err(|e| format_spec_err(e, spec, &type_name, true))?;
-            return format_rbigint(big, spec, &type_name);
+            return format_rbigint(&*owned, spec, &type_name);
         }
         if pyre_object::is_float(val) {
             let v = pyre_object::floatobject::w_float_get_value(val);
