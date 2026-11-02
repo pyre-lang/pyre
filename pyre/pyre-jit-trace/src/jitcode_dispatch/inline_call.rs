@@ -2665,40 +2665,40 @@ fn summarize_descent_blockers(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
 ) -> DescentBlockerSummary {
-    let mut cycle_hits = 0;
-    summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], &mut cycle_hits)
+    let mut cycle_low = usize::MAX;
+    summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], &mut cycle_low)
 }
 
 /// [`summarize_descent_blockers`] for a callee, memoized on the callee's body
 /// when the answer belongs to that body.
 ///
-/// A callee is scanned with no entry facts, so what it computes is the same
-/// fact-free summary [`descent_blocker_summary`] holds — except under a cycle,
-/// where a body already on the stack answers "executes an effect, names no
-/// blocker" for the occurrence that opened the cycle rather than for the body.
-/// A subtree that took that arm nowhere did not read the stack at all and its
-/// answer is a property of the body alone.  Without the memo a callee shared by
-/// several paths is re-walked once per path, and the walk is transitive, so the
-/// scan a single gateway pays grows with the shape of the graph beneath it.
+/// A cycle that closes on this body or on a body pushed after it is answered
+/// inside this subtree, so the result does not read the stack below this body
+/// and equals the summary [`descent_blocker_summary`] computes for the body
+/// from an empty stack; only a cycle that closes on a body further down
+/// (index < depth) makes the answer path-dependent, and then it is not stored.
 fn summarize_descent_blockers_cached(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
-    cycle_hits: &mut u64,
+    cycle_low: &mut usize,
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
+        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_low);
     }
     let Some(jitcode) = crate::jitcode_runtime::get_jitcode_ref_by_index(jitcode_index) else {
-        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
+        return summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_low);
     };
     if let Some(cached) = jitcode.descent_blocker_summary_if_computed() {
         return cached;
     }
-    let cycles_before = *cycle_hits;
-    let summary = summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_hits);
-    if *cycle_hits == cycles_before {
+    let depth = seen.len(); // this body is pushed at index `depth`
+    let outer_low = core::mem::replace(cycle_low, usize::MAX);
+    let summary = summarize_descent_blockers_with_entry_inner(jitcode_index, seen, &[], cycle_low);
+    let inner_low = *cycle_low;
+    if inner_low >= depth {
         jitcode.descent_blocker_summary(|| summary);
     }
+    *cycle_low = outer_low.min(inner_low);
     summary
 }
 
@@ -2711,15 +2711,15 @@ fn summarize_descent_blockers_with_entry(
     seen: &mut Vec<usize>,
     entry_array_lengths: &[(usize, usize)],
 ) -> DescentBlockerSummary {
-    // This memoization fence belongs to this analysis stack, not to the
+    // `cycle_low` belongs to this analysis stack, not to the
     // executing thread. Every recursive callee shares it; an independent
     // analysis (including a reentrant one) must not change its value.
-    let mut cycle_hits = 0;
+    let mut cycle_low = usize::MAX;
     summarize_descent_blockers_with_entry_inner(
         jitcode_index,
         seen,
         entry_array_lengths,
-        &mut cycle_hits,
+        &mut cycle_low,
     )
 }
 
@@ -2727,10 +2727,14 @@ fn summarize_descent_blockers_with_entry_inner(
     jitcode_index: usize,
     seen: &mut Vec<usize>,
     entry_array_lengths: &[(usize, usize)],
-    cycle_hits: &mut u64,
+    cycle_low: &mut usize,
 ) -> DescentBlockerSummary {
     if seen.contains(&jitcode_index) {
-        *cycle_hits += 1;
+        let pos = seen
+            .iter()
+            .position(|&idx| idx == jitcode_index)
+            .expect("seen.contains");
+        *cycle_low = (*cycle_low).min(pos);
         return DescentBlockerSummary {
             may_execute_effect: true,
             ..DescentBlockerSummary::default()
@@ -2765,12 +2769,12 @@ fn summarize_descent_blockers_with_entry_inner(
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))?;
             match entry_lens {
-                [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_hits)),
+                [] => Some(summarize_descent_blockers_cached(callee, seen, cycle_low)),
                 // Nested identity-trampoline facts stay on this `seen` path.
                 // The entry-length OnceLock starts an empty `seen`, so an
                 // A → B → A trampoline would reenter A's in-progress slot.
                 other => Some(summarize_descent_blockers_with_entry_inner(
-                    callee, seen, other, cycle_hits,
+                    callee, seen, other, cycle_low,
                 )),
             }
         },

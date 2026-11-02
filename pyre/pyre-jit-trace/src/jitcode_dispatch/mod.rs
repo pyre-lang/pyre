@@ -8469,19 +8469,21 @@ fn collect_outer_active_boxes_into<Sym: WalkSym>(
     } else {
         Some(unsafe { &*sym.jitcode() })
     };
-    let entry_pcdep_entries: &[(u8, u16, u16)] = match (jc, entry_twin, entry_jitcode_pc >= 0) {
+    // Plain entries use `pcdep_for_snapshot_entry` so a `-live-` that is
+    // absent from the first-offset table does not inherit the previous
+    // opcode's map (`jitcode.py get_live_vars_info`).
+    let entry_pcdep_owned: Vec<(u8, u16, u16)> = match (jc, entry_twin, entry_jitcode_pc >= 0) {
         (Some(jc), OuterActiveBoxesEntryTwin::Plain, true) => jc
             .payload
-            .pcdep_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
+            .pcdep_for_snapshot_entry(entry_jitcode_pc as usize, crate::state::op_live()),
         (Some(jc), OuterActiveBoxesEntryTwin::Trivia, true) => jc
             .payload
             .pcdep_trivia_for_jitcode_pc(entry_jitcode_pc as usize)
-            .unwrap_or(&[]),
-        // Defensive default for a genuinely absent entry coordinate
-        // (marker miss); 0-fire across the corpus.
-        _ => &[],
+            .map(ToOwned::to_owned)
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
+    let entry_pcdep_entries: &[(u8, u16, u16)] = &entry_pcdep_owned;
     let (carried_pcdep_entries, carried_stack_only) = match jc {
         None => (&[] as &[(u8, u16, u16)], 0usize),
         Some(jc) => {

@@ -7,7 +7,17 @@
 #
 # parity-env: MAJIT_STRICT=1
 
+import unittest
 from itertools import combinations, combinations_with_replacement, groupby, product
+
+
+class Case(unittest.TestCase):
+    # TestCase.assertEqual(self, first, second, msg=None): a positional
+    # CALL 2 after an inlined listcomp (LOAD_FAST_AND_CLEAR + SWAP 2)
+    # must still bind `second`. A module-level helper with the same
+    # default would bind a short stack as (first, second) and hide it.
+    def check(self, first, second):
+        self.assertEqual(first, second)
 
 
 def fact(n):
@@ -46,6 +56,17 @@ def main():
             return 0 if r else 1
         return fact(n + r - 1) / fact(r) / fact(n - 1)
 
+    case = Case()
+    # Sibling heat: compile assertEqual + listcomp the way
+    # TestBasicOps.test_combinations does before
+    # test_combinations_with_replacement.
+    for n in range(7):
+        values = [5 * x - 12 for x in range(n)]
+        for r in range(n + 2):
+            result = list(combinations(values, r))
+            for c in result:
+                case.check(list(c), [e for e in values if e in c])
+
     cwr = combinations_with_replacement
     for n in range(7):
         values = [5 * x - 12 for x in range(n)]
@@ -65,7 +86,7 @@ def main():
                 assert len(noruns) == len(set(noruns))
                 assert list(c) == sorted(c)
                 assert all(e in values for e in c)
-                assert noruns == [e for e in values if e in c]
+                case.check(noruns, [e for e in values if e in c])
             assert result == list(cwr1(values, r))
             assert result == list(cwr2(values, r))
 
