@@ -110,26 +110,15 @@ fn method_arity(
     }
 }
 
-/// The `TypeError` `PyLong_AsVoidPtr` raises for something that is not an
-/// integer at all, checked before the conversion so that whatever an
-/// `__index__` of its own raises still comes through unchanged.
-fn require_int(obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    if !unsafe { pyre_object::pyobject::is_int_or_long(obj) }
-        && unsafe { pyre_interpreter::baseobjspace::lookup(obj, "__index__") }.is_none()
-    {
-        return Err(pyre_interpreter::PyError::type_error(
-            "an integer is required",
-        ));
-    }
-    Ok(())
-}
-
-/// A handle argument (`_Py_PARSE_UINTPTR`): the value modulo the pointer
-/// width, so a handle may be written as the negative it is or as the unsigned
-/// value it prints as.
+/// `lib_pypy/_overlapped.py _int2handle` at the native boundary.
+/// [3.15-spec] PyPy's CFFI cast masks integers and accepts coercion.
+/// At v3.15.0, `Modules/overlapped.c pointer_converter` and
+/// `uint_ptr_t_converter` use `Objects/longobject.c PyLong_AsVoidPtr`:
+/// actual integers only, signed negative or unsigned positive pointer range.
+/// This governs every HANDLE, socket, completion key and OVERLAPPED pointer
+/// slot in `Modules/clinic/overlapped.c.h`, including `Overlapped`'s event.
 fn handle_w(obj: PyObjectRef) -> Result<host_overlapped::Handle, pyre_interpreter::PyError> {
-    require_int(obj)?;
-    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as isize as host_overlapped::Handle)
+    Ok(isize_w(obj)? as host_overlapped::Handle)
 }
 
 /// The integer a pointer-sized value comes back as (`PyLong_FromVoidPtr`):
@@ -145,13 +134,32 @@ fn w_uintptr(value: usize) -> PyObjectRef {
 }
 
 fn isize_w(obj: PyObjectRef) -> Result<isize, pyre_interpreter::PyError> {
-    require_int(obj)?;
-    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as isize)
+    if !unsafe { pyre_object::pyobject::is_int_or_long(obj) } {
+        return Err(pyre_interpreter::PyError::type_error(
+            "an integer is required",
+        ));
+    }
+    let too_large = || pyre_interpreter::PyError::overflow_error("int too big to convert");
+    // Select signedness before unwrapping, as PyLong_AsVoidPtr does. A
+    // successful unsigned conversion must not first allocate a discarded
+    // signed overflow exception and move the caller's remaining arguments.
+    let positive_long = unsafe {
+        pyre_object::pyobject::is_long(obj)
+            && pyre_object::longobject::w_long_get_value(obj).get_sign() >= 0
+    };
+    if positive_long {
+        let value = pyre_interpreter::baseobjspace::uint_w(obj).map_err(|_| too_large())?;
+        usize::try_from(value)
+            .map(|v| v as isize)
+            .map_err(|_| too_large())
+    } else {
+        let value = pyre_interpreter::baseobjspace::int_w(obj).map_err(|_| too_large())?;
+        isize::try_from(value).map_err(|_| too_large())
+    }
 }
 
 fn usize_w(obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
-    require_int(obj)?;
-    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as usize)
+    Ok(isize_w(obj)? as usize)
 }
 
 fn u32_w(obj: PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
