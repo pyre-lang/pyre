@@ -56,6 +56,10 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     // current activation/thread, independently of the frame object.
     let frame_ctx = pyre_interpreter::call::getexecutioncontext();
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    let _root = pyre_object::gc_roots::push_roots();
+    if !saved_ctx.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(saved_ctx as pyre_object::PyObjectRef);
+    }
     if !frame_ctx.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
     }

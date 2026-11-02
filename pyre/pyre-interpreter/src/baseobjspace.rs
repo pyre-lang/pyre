@@ -24796,8 +24796,8 @@ fn async_generator_init_hooks(async_gen: PyObjectRef) -> PyResult {
             w_async_generator_set_finalizer(async_gen, PY_NULL);
             return Ok(w_none());
         }
-        w_async_generator_set_finalizer(async_gen, (*ec).w_asyncgen_finalizer_fn);
-        let firstiter = (*ec).w_asyncgen_firstiter_fn;
+        w_async_generator_set_finalizer(async_gen, (*ec).w_asyncgen_finalizer_fn());
+        let firstiter = (*ec).w_asyncgen_firstiter_fn();
         if !firstiter.is_null() {
             let _roots = pyre_object::gc_roots::push_roots();
             let base = pyre_object::gc_roots::pin_roots(&[async_gen, firstiter]);

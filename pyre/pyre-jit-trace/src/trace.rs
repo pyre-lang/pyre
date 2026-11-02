@@ -991,7 +991,7 @@ fn try_commit_midbody_abort_inner(
     // error arm, so the saved word is a GC root (forwarded in place).
     // `ObjectSlotRoot::new` that does not register (no GC hook) leaves
     // behaviour unchanged.
-    let mut sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
+    let mut sys_exc_value_pre = unsafe { (*ec).sys_exc_value() };
     let _sys_exc_value_pre_root = ObjectSlotRoot::new(&mut sys_exc_value_pre);
     // Everything between the preflight above and here — the callee frame
     // allocation, the local writes, the Int/Float boxing — can allocate and
@@ -1069,7 +1069,7 @@ fn try_commit_midbody_abort_inner(
             // caller frame. Restore the caller's pre-CALL handled-exception
             // state first; PUSH_EXC_INFO/POP_EXCEPT will manage it from the
             // selected handler onward.
-            unsafe { (*ec).sys_exc_value = sys_exc_value_pre };
+            unsafe { (*ec).set_sys_exc_info(sys_exc_value_pre) };
             // No licence check here any more: the preflight above refuses a
             // licence-less site outright, so a raise reaching this point always
             // has somewhere to go.  That is what makes this arm infallible —
@@ -2009,7 +2009,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let entry_topframeref_slot = (!root_ec.is_null()).then(|| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(
-            unsafe { (*root_ec).topframeref } as pyre_object::PyObjectRef
+            unsafe { (*root_ec).topframeref() } as pyre_object::PyObjectRef
         );
         slot
     });
@@ -2539,9 +2539,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
             if let Some(slot) = entry_topframeref_slot {
                 unsafe {
-                    (*(root_ec as *mut pyre_interpreter::PyExecutionContext)).topframeref =
-                        pyre_object::gc_roots::shadow_stack_get(slot)
-                            as *mut pyre_interpreter::PyFrame;
+                    (*(root_ec as *mut pyre_interpreter::PyExecutionContext))
+                        .set_topframeref(pyre_object::gc_roots::shadow_stack_get(slot)
+                            as *mut pyre_interpreter::PyFrame);
                 }
             }
         }
@@ -3847,7 +3847,7 @@ fn cash_multi_frame_blackhole(
     // inside the drive would leave the restore below writing back a pre-move
     // pointer.
     let saved_root =
-        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
+        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref() } as usize));
     // The live frame is rooted for the same window and for a stronger reason:
     // a compiled trace allocates an inlined callee's `PyFrame` with its own
     // `NewWithVtable`, which the GC rewriter lowers to a nursery allocation,
@@ -3868,7 +3868,7 @@ fn cash_multi_frame_blackhole(
             return;
         }
         unsafe {
-            (*ec).topframeref = frame_ptr as *mut pyre_interpreter::PyFrame;
+            (*ec).set_topframeref(frame_ptr as *mut pyre_interpreter::PyFrame);
         }
     };
     // `pyopcode.py RETURN_VALUE` / `pyopcode.py
@@ -3918,7 +3918,7 @@ fn cash_multi_frame_blackhole(
             // `executioncontext.py leave`: `self.topframeref = frame.f_backref`
             // before the caller's residuals run.
             unsafe {
-                (*ec).topframeref = (*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref;
+                (*ec).set_topframeref((*(frame_ptr as *mut pyre_interpreter::PyFrame)).f_backref);
             }
             level_recursion.borrow_mut().pop();
         }
@@ -3984,7 +3984,7 @@ fn cash_multi_frame_blackhole(
     let root_addr = majit_gc::shadow_stack::get(live_root).0;
     majit_gc::shadow_stack::pop_to(saved_root);
     unsafe {
-        (*ec).topframeref = saved_topframeref;
+        (*ec).set_topframeref(saved_topframeref);
     }
     // Frame 0's blackhole level ran against `per_frame[0]`, the LIVE frame,
     // because `convert_and_run_from_pyjitpl` overrides each level's

@@ -1,7 +1,6 @@
 //! pyre — A Rust meta-tracing JIT Python interpreter.
 
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::OnceLock;
 
 use lexopt::Arg::*;
@@ -12,7 +11,10 @@ use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::shutdown::finalize_runtime;
-use pyre_interpreter::{CompileOpts, Mode, PyDisplay, PyErrorKind, PyExecutionContext};
+use pyre_interpreter::{
+    CompileOpts, ExecutionContextRef, Mode, PyDisplay, PyErrorKind, PyExecutionContext,
+    alloc_execution_context,
+};
 use pyre_jit::eval::eval_with_jit;
 
 pub mod memory_ceiling;
@@ -689,7 +691,7 @@ fn read_stdin_source_catching_sandbox() -> std::io::Result<String> {
         Err(payload) => match payload.downcast::<majit_rlib::rsandbox::SandboxError>() {
             Ok(err) => {
                 let execution_context = setup_exec_context();
-                let ec_ptr = Rc::as_ptr(&execution_context);
+                let ec_ptr = execution_context.as_ptr();
                 let (canonical, _main_module) =
                     pyre_interpreter::app_main::prepare_main_module(&execution_context);
                 let pyerr = pyre_interpreter::error::get_converted_unexpected_exception(
@@ -1519,13 +1521,13 @@ fn maybe_print_cell_census() {
 /// the `LAST_EXEC_CTX` TLS slot so
 /// `space.getexecutioncontext()` (sys.settrace/getframe) resolves from the
 /// first user statement, and install SIGINT handling (app_main.py:926).
-fn setup_exec_context() -> Rc<PyExecutionContext> {
+fn setup_exec_context() -> ExecutionContextRef {
     // Register __build_class__ callback (PyPy: setup_builtin_modules)
     register_build_class();
-    let execution_context = Rc::new(PyExecutionContext::default());
-    set_last_exec_ctx(Rc::as_ptr(&execution_context));
+    let execution_context = alloc_execution_context();
+    set_last_exec_ctx(execution_context.as_ptr());
     unsafe {
-        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        let ec_ptr = execution_context.as_mut_ptr();
         (*ec_ptr).install_user_del_action();
         pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
@@ -1620,7 +1622,7 @@ fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
 /// the `-m` entry point. `vm.run_module` analog.
 fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession> {
     let execution_context = setup_exec_context();
-    let ec_ptr = Rc::as_ptr(&execution_context);
+    let ec_ptr = execution_context.as_ptr();
 
     // `_run_module_as_main` reads `sys.modules["__main__"].__dict__` and runs
     // the module's code in it, so a `__main__` module backed by a fresh dict
@@ -1905,7 +1907,7 @@ fn end_after_startup_failure(
 /// `SystemExit` -- because the point of asking for the prompt is to look at
 /// what went wrong.
 pub(crate) struct MainSession {
-    pub(crate) execution_context: Rc<PyExecutionContext>,
+    pub(crate) execution_context: ExecutionContextRef,
     pub(crate) canonical: pyre_object::PyObjectRef,
     pub(crate) main_module: pyre_object::PyObjectRef,
 }
@@ -1914,12 +1916,12 @@ pub(crate) struct MainSession {
 /// it is done with it.
 fn finish_or_inspect(
     inspect: bool,
-    execution_context: Rc<PyExecutionContext>,
+    execution_context: ExecutionContextRef,
     canonical: pyre_object::PyObjectRef,
     main_module: pyre_object::PyObjectRef,
 ) -> Option<MainSession> {
     if !inspect {
-        finish_main(canonical, Rc::as_ptr(&execution_context));
+        finish_main(canonical, execution_context.as_ptr());
         return None;
     }
     Some(MainSession {
@@ -1969,16 +1971,16 @@ fn eval_program_in_main(
     program: MainProgram<'_>,
     filename: &str,
     main_file: Option<&str>,
-    execution_context: Rc<PyExecutionContext>,
+    execution_context: ExecutionContextRef,
     canonical: pyre_object::PyObjectRef,
     main_module: pyre_object::PyObjectRef,
     no_site: bool,
     run_code: bool,
 ) -> Option<MainSession> {
-    let ec_ptr = Rc::as_ptr(&execution_context);
+    let ec_ptr = execution_context.as_ptr();
     let sourceless = matches!(program, MainProgram::Bytecode(_));
     // The frame below takes the context by value; the prompt needs it too.
-    let session_context = Rc::clone(&execution_context);
+    let session_context = execution_context;
 
     pyre_interpreter::app_main::seed_main_module_attrs(canonical, main_module, main_file);
     let script_file = if filename == "<stdin>" {
@@ -2203,7 +2205,7 @@ fn run_script_path(
     run_code: bool,
 ) -> Option<MainSession> {
     let execution_context = setup_exec_context();
-    let ec_ptr = Rc::as_ptr(&execution_context);
+    let ec_ptr = execution_context.as_ptr();
     let (canonical, main_module) =
         pyre_interpreter::app_main::prepare_main_module(&execution_context);
 
@@ -2311,7 +2313,7 @@ fn run_source(
     let main_file = absolute_script_path(filename);
     let filename = main_file.as_deref().unwrap_or(filename);
     let execution_context = setup_exec_context();
-    let ec_ptr = Rc::as_ptr(&execution_context);
+    let ec_ptr = execution_context.as_ptr();
     let (canonical, main_module) =
         pyre_interpreter::app_main::prepare_main_module(&execution_context);
 

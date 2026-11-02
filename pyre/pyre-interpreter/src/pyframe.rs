@@ -5,19 +5,11 @@
 //! local variables, and instruction pointer. The JIT virtualizes
 //! these fields so they live in registers instead of memory.
 
-use std::rc::Rc;
-
+use crate::ExecutionContextRef;
 use crate::PyExecutionContext;
 use crate::{CodeFlags, CodeObject};
 use pyre_object::FixedObjectArray;
 use pyre_object::*;
-
-// Ensure *const PyExecutionContext and Rc<PyExecutionContext> have the same
-// size so that PyFrame field offsets are preserved after the switch.
-const _: () = assert!(
-    std::mem::size_of::<*const PyExecutionContext>()
-        == std::mem::size_of::<Rc<PyExecutionContext>>()
-);
 
 /// Borrow a frame's `locals_cells_stack_w` array.
 ///
@@ -4639,20 +4631,14 @@ impl PyFrame {
     /// `createframe` (PyPy `baseobjspace.py`) so every heap-allocated
     /// `PyFrame` flows through the canonical entry point.
     pub fn new(code: CodeObject) -> FrameBox {
-        let execution_context = Rc::new(PyExecutionContext::default());
-        let ctx_ptr = Rc::as_ptr(&execution_context);
-        let frame = Self::new_with_context(code, execution_context)
-            .expect("PyFrame::new: test entry code must not carry freevars");
-        // `threadlocals.py:enter_thread` — the ExecutionContext slot belongs to
-        // the OS-thread locals and is installed once at thread entry, not
-        // re-stamped per frame.  The other entry points do this themselves
-        // (`pyrex/src/lib.rs`, `pyre-wasm/src/lib.rs`,
-        // `pyre-wasm-test/src/main.rs`); as the remaining entry point this one
-        // must too, or `space.getexecutioncontext()` stays null and every
-        // context reached through it — the class-body frame's builtins among
-        // them — falls back to the empty default.
+        let execution_context = crate::alloc_execution_context();
+        let ctx_ptr = execution_context.as_ptr();
+        // `threadlocals.py:enter_thread` / `pyrex` `setup_exec_context` —
+        // install the ExecutionContext before any constructor allocation so
+        // the threadlocals slot roots it across `new_with_context`.
         crate::call::set_last_exec_ctx(ctx_ptr);
-        frame
+        Self::new_with_context(code, execution_context)
+            .expect("PyFrame::new: test entry code must not carry freevars")
     }
 
     /// Module-entry adapter for `createframe` — leaks owned arguments
@@ -4668,7 +4654,7 @@ impl PyFrame {
     /// before calling `createframe`. Pyre's adapter exists because:
     /// (1) Rust has no GC, so `code`/`w_globals`/`ec` lifetimes must be
     /// leaked into raw pointers manually; (2) pyre's `ExecutionContext`
-    /// is per-frame (not per-space), so callers pass `Rc<EC>` explicitly.
+    /// is per-frame (not per-space), so callers pass `ExecutionContextRef` explicitly.
     /// Three production callers (`pyrex/lib.rs`, `pyre-wasm/lib.rs`,
     /// `pyre-wasm-test/main.rs`) plus `PyFrame::new` (test helper)
     /// invoke this; without the adapter each would duplicate the 9-line
@@ -4678,15 +4664,18 @@ impl PyFrame {
     /// closure errors surface as interpreter errors instead of panics.
     pub fn new_with_context(
         code: CodeObject,
-        execution_context: Rc<PyExecutionContext>,
+        execution_context: ExecutionContextRef,
     ) -> Result<FrameBox, crate::PyError> {
         // `fresh_module_globals` seeds `__builtins__ = space.builtin`
         // (PyPy `main.py:45 / Module.__init__` parity) into a proxy-less
         // celldict.  Just set `__name__` on top.
         let w_globals = execution_context.fresh_module_globals();
         // Root the fresh globals across the `__name__` store; the frame
-        // construction below roots them again for its own span.
+        // construction below roots them again for its own span. The EC is
+        // the same livevar: pin it in this bracket so a collection here
+        // cannot sweep it when the caller has not installed threadlocals.
         let _root = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(execution_context.as_ptr() as PyObjectRef);
         let globals_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_globals);
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -4713,7 +4702,7 @@ impl PyFrame {
     /// object does, so the namespace cannot come from the frame.
     pub fn new_with_context_and_globals(
         code: CodeObject,
-        execution_context: Rc<PyExecutionContext>,
+        execution_context: ExecutionContextRef,
         w_globals: PyObjectRef,
     ) -> Result<FrameBox, crate::PyError> {
         // Root the globals across the code/object allocations and the frame
@@ -4721,9 +4710,10 @@ impl PyFrame {
         // on its first use, or stores a later distinct dictionary on the
         // frame's debug data, and both locations root it once they return.
         let _root = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(execution_context.as_ptr() as PyObjectRef);
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
         let w_code = pyre_object::gc_roots::pin_root(crate::box_code_object(code));
-        let ctx_ptr = Rc::into_raw(execution_context);
+        let ctx_ptr = execution_context.as_ptr();
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
 
@@ -4734,13 +4724,14 @@ impl PyFrame {
     /// silently discard the wrapper-owned parts of marshal's result.
     pub fn new_with_context_and_globals_obj(
         w_code: PyObjectRef,
-        execution_context: Rc<PyExecutionContext>,
+        execution_context: ExecutionContextRef,
         w_globals: PyObjectRef,
     ) -> Result<FrameBox, crate::PyError> {
         let _roots = pyre_object::gc_roots::push_roots();
-        let root_base = _roots.publish(&[w_code, w_globals]);
-        _roots.normalize(root_base, 2);
-        let ctx_ptr = Rc::into_raw(execution_context);
+        let root_base =
+            _roots.publish(&[w_code, w_globals, execution_context.as_ptr() as PyObjectRef]);
+        _roots.normalize(root_base, 3);
+        let ctx_ptr = execution_context.as_ptr();
         crate::createframe_obj(
             _roots.get(root_base) as *const (),
             _roots.get(root_base + 1),
@@ -7112,6 +7103,7 @@ pub fn createframe_obj(
     let _ = _roots.pin_root(code as PyObjectRef);
     let _ = _roots.pin_root(w_globals);
     let _ = _roots.pin_root(outer_func.unwrap_or(PY_NULL));
+    let _ = _roots.pin_root(execution_context as PyObjectRef);
     let frame_stores_global = unsafe {
         crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1))
     };
@@ -7137,7 +7129,7 @@ pub fn createframe_obj(
         // pyframe.py `__init__` assigns `self.builtin` only under
         // `honor__builtins__`.
         w_builtin: if crate::baseobjspace::HONOR_BUILTINS {
-            _roots.get(root_base + 3)
+            _roots.get(root_base + 4)
         } else {
             PY_NULL
         },

@@ -3,6 +3,8 @@ use pyre_object::quasiimmut::{
     QuasiImmut, QuasiImmutField, QuasiImmutLock, null_mutate_lock, null_mutate_word,
 };
 use std::cell::{Cell, RefCell};
+use std::ops::Deref;
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -731,9 +733,9 @@ impl Drop for ProfilefuncWatchers {
 #[majit_macros::jit_immutable_fields("w_tracefunc?", "profilefunc?")]
 #[derive(Clone)]
 pub struct ExecutionContext {
-    pub space: PyObjectRef,
-    pub topframeref: *mut PyFrame,
-    pub w_tracefunc: PyObjectRef,
+    space: PyObjectRef,
+    topframeref: *mut PyFrame,
+    w_tracefunc: PyObjectRef,
     /// Hidden `mutate_w_tracefunc` (`quasiimmut.py get_mutate_field_name` of
     /// pyre `w_tracefunc`; `executioncontext.py _immutable_fields_ =
     /// ['w_tracefunc?']`). [`Clone`] yields an empty field so a copied EC
@@ -741,7 +743,7 @@ pub struct ExecutionContext {
     /// `repr(C)`, so this offset is the mutate word.
     mutate_w_tracefunc: WTracefuncWatchers,
     pub is_tracing: i32,
-    pub compiler: PyObjectRef,
+    compiler: PyObjectRef,
     /// pypy/interpreter/executioncontext.py:320 — function pointer to
     /// the low-level profiling trampoline (e.g. `app_profile_call`).
     /// `None` means profiling is disabled.  The user callable lives in
@@ -752,9 +754,9 @@ pub struct ExecutionContext {
     /// ['profilefunc?']`). The wrapper is `repr(C)`, so this offset is
     /// the mutate word.
     mutate_profilefunc: ProfilefuncWatchers,
-    pub w_profilefuncarg: PyObjectRef,
+    w_profilefuncarg: PyObjectRef,
     pub thread_disappeared: bool,
-    pub w_async_exception_type: PyObjectRef,
+    w_async_exception_type: PyObjectRef,
     /// `threadlocals.py ExecutionContext._signals_enabled` — only the
     /// execution context owned by `OSThreadLocals._mainthreadident` may run
     /// app-level signal handlers.  A fork from another thread promotes that
@@ -766,7 +768,7 @@ pub struct ExecutionContext {
     pub profile_all_generation: usize,
     /// `os_local.py:ExecutionContext._thread_local_objs`: weak references to
     /// `_thread._local` objects which own a dictionary for this EC.
-    pub thread_local_refs: Vec<PyObjectRef>,
+    thread_local_refs: Vec<PyObjectRef>,
     /// Cached access to process-owned `space.actionflag`.  Every EC points to
     /// the same flag, matching `baseobjspace.py:450`.
     pub actionflag: SpaceActionFlag,
@@ -800,8 +802,8 @@ pub struct ExecutionContext {
     /// (replaces the former `eval::CURRENT_EXCEPTION` thread-local), so
     /// the JIT can read/write it as a GETFIELD_GC/SETFIELD_GC slot on the
     /// per-thread EC pointer and the optimizer can dead-store-eliminate a
-    /// balanced save/restore.  GC-rooted via `walk_pyframe_roots`.
-    pub sys_exc_value: PyObjectRef,
+    /// balanced save/restore. Traced by [`executioncontext_custom_trace`].
+    sys_exc_value: PyObjectRef,
     /// `warmspot.py rewrite_can_enter_jits` leaves compiled-loop exits outside
     /// the portal's jitcode and propagates them out of band.  This is pyre's
     /// execution-context-owned carrier for that pending exit.
@@ -813,28 +815,28 @@ pub struct ExecutionContext {
     /// `executioncontext.py:55` — linked-list head for running generators and
     /// coroutines.  Each node owns the suspended exception state of its
     /// caller through `GeneratorOrCoroutine.previous_gen_or_coroutine`.
-    pub current_gen_or_coroutine: PyObjectRef,
+    current_gen_or_coroutine: PyObjectRef,
     /// `executioncontext.py:53-54` — PEP 525 hooks, owned by the execution
     /// context (thread-specific), never by a process-global side table.
-    pub w_asyncgen_firstiter_fn: PyObjectRef,
-    pub w_asyncgen_finalizer_fn: PyObjectRef,
+    w_asyncgen_firstiter_fn: PyObjectRef,
+    w_asyncgen_finalizer_fn: PyObjectRef,
     /// `executioncontext.py:52` — the current PEP 567 Context object for this
     /// execution context, reached from `lib_pypy/_contextvars.py` through
     /// `__pypy__.get_contextvar_context()` and swapped temporarily inside
     /// `Context.run`.  Execution-context-owned, not a process global or an
     /// independent Rust TLS side table.
-    pub contextvar_context: PyObjectRef,
+    contextvar_context: PyObjectRef,
     /// `objspace.py` `ec._py_repr` — the identity dict of objects currently
     /// being `repr()`'d (`__pypy__.objects_in_repr()`), lazily created.
     /// Recursive `__repr__` (e.g. `OrderedDict`) consults it to emit `...`
     /// instead of recursing.  Execution-context-owned like `contextvar_context`.
-    pub py_repr: PyObjectRef,
+    py_repr: PyObjectRef,
     /// Mid-repr object set for `Py_ReprEnter` / the display cycle guard.
     /// Upstream keeps this on the execution context (`objspace.py
     /// get_objects_in_repr` / `cpyext Py_ReprEnter`), not a thread-local.
-    pub repr_active: RefCell<Vec<PyObjectRef>>,
+    repr_active: RefCell<Vec<PyObjectRef>>,
     /// Placeholders currently being resolved (`_PyThreadStateImpl.lazy_imports`).
-    pub lazy_imports_resolving: RefCell<Vec<PyObjectRef>>,
+    lazy_imports_resolving: RefCell<Vec<PyObjectRef>>,
     /// Number of user Python frames currently executing bytecode on this
     /// context.  Bumped once at every `eval_loop` / `eval_loop_jit` entry and
     /// dropped when that activation returns, so the module-level frame, an
@@ -857,8 +859,8 @@ pub struct ExecutionContext {
     /// different, simultaneously-live frame, so its address cannot collide
     /// with the one recorded.
     ///
-    /// Never dereferenced and never a GC root: `eval.rs`'s `visit_ec_slots`
-    /// forwards the context's reference slots one named field at a time, and
+    /// Never dereferenced and never a GC root: [`executioncontext_custom_trace`]
+    /// walks the context's reference slots one named field at a time, and
     /// this one is an identity token that may name a frame already freed, so
     /// forwarding it would be wrong rather than merely unnecessary.
     pub accounted_activation: usize,
@@ -871,8 +873,8 @@ pub struct ExecutionContext {
     pub genentry_note_armed: bool,
     pub genentry_note_finished: bool,
     pub genentry_note_is_err: bool,
-    pub genentry_note_gen: PyObjectRef,
-    pub genentry_note_word: PyObjectRef,
+    genentry_note_gen: PyObjectRef,
+    genentry_note_word: PyObjectRef,
     /// This thread's `SHADOW_STACK` cell, resolved once.
     ///
     /// `shadowstack.py` `gc_enter_roots_frame` resolves the root stack once
@@ -885,6 +887,133 @@ pub struct ExecutionContext {
 }
 
 pub type PyExecutionContext = ExecutionContext;
+
+/// Runtime-assigned GC type id. Stamped at the absolute tail of
+/// `pyre-jit::eval::build_gc` so no hardcoded / `#[pyre_class(type_id = N)]`
+/// id moves (`AllVirtuals` uses the same tail rule). portal-interpret
+/// registered after FrameDebugData (id 100, because RaiseCause occupied 99);
+/// that placement shifts `W_Range` and every later explicit id.
+/// `pypy/interpreter/executioncontext.py` `ExecutionContext`.
+pub static EXECUTION_CONTEXT_GC_TYPE_ID: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
+
+/// One-word GC handle to [`ExecutionContext`]. Copy; liveness is the
+/// per-thread registry (`module::thread::EXECUTION_CONTEXTS` and
+/// `LAST_EXEC_CTX`), not a refcount.
+///
+/// `pypy/interpreter/executioncontext.py` `ExecutionContext` is a translated
+/// GC instance; `pypy/module/thread/threadlocals.py` `OSThreadLocals` holds
+/// the per-thread `ec`.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct ExecutionContextRef(NonNull<ExecutionContext>);
+
+impl ExecutionContextRef {
+    #[inline]
+    pub fn as_ptr(self) -> *const ExecutionContext {
+        self.0.as_ptr()
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(self) -> *mut ExecutionContext {
+        self.0.as_ptr()
+    }
+
+    /// Rebuild a handle from a live payload pointer.
+    ///
+    /// # Safety
+    /// `ptr` is a live [`ExecutionContext`] allocated by
+    /// [`alloc_execution_context`] / [`malloc_typed_stable`].
+    #[inline]
+    pub unsafe fn from_ptr(ptr: *mut ExecutionContext) -> Self {
+        debug_assert!(!ptr.is_null());
+        Self(unsafe { NonNull::new_unchecked(ptr) })
+    }
+}
+
+impl Deref for ExecutionContextRef {
+    type Target = ExecutionContext;
+    fn deref(&self) -> &ExecutionContext {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl pyre_object::lltype::GcType for ExecutionContext {
+    fn type_id() -> u32 {
+        EXECUTION_CONTEXT_GC_TYPE_ID.get()
+    }
+    const SIZE: usize = std::mem::size_of::<ExecutionContext>();
+}
+
+/// Allocate a non-moving GC [`ExecutionContext`].
+pub fn alloc_execution_context() -> ExecutionContextRef {
+    alloc_execution_context_value(ExecutionContext::new())
+}
+
+fn alloc_execution_context_value(value: ExecutionContext) -> ExecutionContextRef {
+    let ptr = pyre_object::lltype::malloc_typed_stable(value);
+    debug_assert!(!ptr.is_null());
+    ExecutionContextRef(unsafe { NonNull::new_unchecked(ptr) })
+}
+
+unsafe fn visit_ec_obj(f: &mut dyn FnMut(*mut majit_ir::GcRef), slot: *mut PyObjectRef) {
+    f(slot as *mut majit_ir::GcRef);
+}
+
+/// Visit every GC reference the execution context owns.
+pub unsafe fn executioncontext_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe {
+        let ec = obj_addr as *mut ExecutionContext;
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).space));
+        f(std::ptr::addr_of_mut!((*ec).topframeref) as *mut majit_ir::GcRef);
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_tracefunc));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).compiler));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_profilefuncarg));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_async_exception_type));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).sys_exc_value));
+        crate::eval::walk_raw_exception_roots((*ec).sys_exc_value, &mut |gcref| {
+            f(gcref as *mut majit_ir::GcRef);
+        });
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).current_gen_or_coroutine));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).contextvar_context));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_asyncgen_firstiter_fn));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).w_asyncgen_finalizer_fn));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).builtins_module));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).builtin));
+        for wref in &mut (*ec).thread_local_refs {
+            visit_ec_obj(f, wref as *mut PyObjectRef);
+        }
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).genentry_note_gen));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).genentry_note_word));
+        visit_ec_obj(f, std::ptr::addr_of_mut!((*ec).py_repr));
+        for entry in (*ec).repr_active.get_mut().iter_mut() {
+            visit_ec_obj(f, entry as *mut PyObjectRef);
+        }
+        for entry in (*ec).lazy_imports_resolving.get_mut().iter_mut() {
+            visit_ec_obj(f, entry as *mut PyObjectRef);
+        }
+        if let Some(pending) = (*ec).pending_loop_exit.as_mut() {
+            match pending {
+                PendingLoopExit::Done(Ok(value)) => visit_ec_obj(f, value as *mut PyObjectRef),
+                PendingLoopExit::Done(Err(err)) | PendingLoopExit::ExitFrameWithException(err) => {
+                    err.walk_gc_refs(&mut |gcref| {
+                        f(gcref as *mut majit_ir::GcRef);
+                    });
+                }
+                PendingLoopExit::ContinueRunningNormally => {}
+            }
+        }
+    }
+}
+
+/// Drop glue for the Rust containers the payload owns (`Vec`, `RefCell`,
+/// quasi-immut watchers).
+pub unsafe fn executioncontext_destructor(obj_addr: usize) {
+    unsafe { std::ptr::drop_in_place(obj_addr as *mut ExecutionContext) };
+}
 
 /// Byte offset of `sys_exc_value` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
@@ -967,9 +1096,9 @@ pub const EC_PY_RECURSION_DEPTH_OFFSET: usize =
 pub const EC_ACCOUNTED_ACTIVATION_OFFSET: usize =
     std::mem::offset_of!(ExecutionContext, accounted_activation);
 
-/// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr
-/// describing the (non-GC) EC struct.  The EC is never JIT-allocated;
-/// this size only backs the field-tracking SizeDescr.
+/// Size of `ExecutionContext`, for the JIT's StructPtrInfo SizeDescr.
+/// The EC is never JIT-allocated; this size only backs the field-tracking
+/// SizeDescr.
 pub const EC_SIZE: usize = std::mem::size_of::<ExecutionContext>();
 
 impl Default for ExecutionContext {
@@ -979,6 +1108,234 @@ impl Default for ExecutionContext {
 }
 
 impl ExecutionContext {
+    #[inline]
+    pub fn space(&self) -> PyObjectRef {
+        self.space
+    }
+
+    #[inline]
+    pub fn set_space(&mut self, space: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.space = space;
+    }
+
+    #[inline]
+    pub fn topframeref(&self) -> *mut PyFrame {
+        self.topframeref
+    }
+
+    #[inline]
+    pub fn set_topframeref(&mut self, frame: *mut PyFrame) {
+        // The write barrier goes through the hook cell so the native scan
+        // judges this store able to collect. Hand the frame back out of the
+        // anchor, as [`Self::gettopframe`] does around `force_frame`.
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.topframeref = anchor.live();
+    }
+
+    #[inline]
+    pub fn w_tracefunc(&self) -> PyObjectRef {
+        self.w_tracefunc
+    }
+
+    #[inline]
+    pub fn compiler(&self) -> PyObjectRef {
+        self.compiler
+    }
+
+    #[inline]
+    pub fn set_compiler(&mut self, compiler: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.compiler = compiler;
+    }
+
+    #[inline]
+    pub fn w_profilefuncarg(&self) -> PyObjectRef {
+        self.w_profilefuncarg
+    }
+
+    #[inline]
+    pub fn w_async_exception_type(&self) -> PyObjectRef {
+        self.w_async_exception_type
+    }
+
+    #[inline]
+    pub fn set_w_async_exception_type(&mut self, w_type: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.w_async_exception_type = w_type;
+    }
+
+    #[inline]
+    pub fn sys_exc_value(&self) -> PyObjectRef {
+        self.sys_exc_value
+    }
+
+    #[inline]
+    pub fn current_gen_or_coroutine(&self) -> PyObjectRef {
+        self.current_gen_or_coroutine
+    }
+
+    #[inline]
+    pub fn contextvar_context(&self) -> PyObjectRef {
+        self.contextvar_context
+    }
+
+    #[inline]
+    pub fn set_contextvar_context(&mut self, context: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.contextvar_context = context;
+    }
+
+    #[inline]
+    pub fn w_asyncgen_firstiter_fn(&self) -> PyObjectRef {
+        self.w_asyncgen_firstiter_fn
+    }
+
+    #[inline]
+    pub fn set_w_asyncgen_firstiter_fn(&mut self, value: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.w_asyncgen_firstiter_fn = value;
+    }
+
+    #[inline]
+    pub fn w_asyncgen_finalizer_fn(&self) -> PyObjectRef {
+        self.w_asyncgen_finalizer_fn
+    }
+
+    #[inline]
+    pub fn set_w_asyncgen_finalizer_fn(&mut self, value: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.w_asyncgen_finalizer_fn = value;
+    }
+
+    #[inline]
+    pub fn py_repr(&self) -> PyObjectRef {
+        self.py_repr
+    }
+
+    #[inline]
+    pub fn set_py_repr(&mut self, value: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.py_repr = value;
+    }
+
+    #[inline]
+    pub fn genentry_note_gen(&self) -> PyObjectRef {
+        self.genentry_note_gen
+    }
+
+    #[inline]
+    pub fn set_genentry_note_gen(&mut self, value: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.genentry_note_gen = value;
+    }
+
+    #[inline]
+    pub fn genentry_note_word(&self) -> PyObjectRef {
+        self.genentry_note_word
+    }
+
+    #[inline]
+    pub fn set_genentry_note_word(&mut self, value: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.genentry_note_word = value;
+    }
+
+    pub fn thread_local_refs(&self) -> &[PyObjectRef] {
+        &self.thread_local_refs
+    }
+
+    /// Reads only; pushes and pops go through `lazy_imports_push` / `lazy_imports_pop`, which take the write barrier.
+    pub fn lazy_imports_resolving(&self) -> &RefCell<Vec<PyObjectRef>> {
+        &self.lazy_imports_resolving
+    }
+
+    pub fn push_thread_local_ref(&mut self, wref: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.thread_local_refs.push(wref);
+    }
+
+    pub fn take_thread_local_refs(&mut self) -> Vec<PyObjectRef> {
+        std::mem::take(&mut self.thread_local_refs)
+    }
+
+    pub fn repr_active_enter(&self, obj: PyObjectRef) -> bool {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        let mut active = self.repr_active.borrow_mut();
+        if active.contains(&obj) {
+            false
+        } else {
+            active.push(obj);
+            true
+        }
+    }
+
+    pub fn repr_active_leave(&self, obj: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        let mut active = self.repr_active.borrow_mut();
+        if let Some(pos) = active.iter().rposition(|&entry| entry == obj) {
+            active.remove(pos);
+        }
+    }
+
+    pub fn repr_active_leave_at(&self, index: usize) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        let mut active = self.repr_active.borrow_mut();
+        if index < active.len() {
+            active.remove(index);
+        }
+    }
+
+    pub fn repr_active_len(&self) -> usize {
+        self.repr_active.borrow().len()
+    }
+
+    pub fn lazy_imports_push(&self, op: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        self.lazy_imports_resolving.borrow_mut().push(op);
+    }
+
+    pub fn lazy_imports_pop(&self, op: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
+        let mut stack = self.lazy_imports_resolving.borrow_mut();
+        if let Some(i) = stack.iter().rposition(|&p| std::ptr::eq(p, op)) {
+            stack.remove(i);
+        }
+    }
+
     #[inline]
     pub fn new() -> Self {
         let builtins_module = crate::builtins::new_builtin_module_dict();
@@ -1034,7 +1391,7 @@ impl ExecutionContext {
     /// Interpreter-wide objects (the object space, action flag, finalizer
     /// action, and builtins module) remain shared, while frame, exception,
     /// tracing, profiling, and generator state starts fresh for each OS thread.
-    pub fn clone_for_thread(&self) -> Self {
+    pub fn clone_for_thread(&self) -> ExecutionContextRef {
         let mut ec = self.clone();
         ec.topframeref = std::ptr::null_mut();
         // The activation accounting is per-context and the worker runs none of
@@ -1049,7 +1406,8 @@ impl ExecutionContext {
         ec.root_stack_slot.set(0);
         ec.w_tracefunc = pyre_object::PY_NULL;
         ec.is_tracing = 0;
-        ec.store_profilefunc(None, pyre_object::PY_NULL);
+        ec.profilefunc = None;
+        ec.w_profilefuncarg = pyre_object::PY_NULL;
         ec.thread_disappeared = false;
         ec.w_async_exception_type = pyre_object::PY_NULL;
         ec.genentry_note_armed = false;
@@ -1078,51 +1436,13 @@ impl ExecutionContext {
         ec.py_repr = pyre_object::PY_NULL;
         ec.repr_active = RefCell::new(Vec::new());
         ec.lazy_imports_resolving = RefCell::new(Vec::new());
-        ec
-    }
-
-    /// Expose the two builtin-owner slots to the translated shadow-stack root
-    /// walker.  PyPy reaches both through the process-owned object space;
-    /// pyre stores movable GC refs directly on the EC and must forward those
-    /// fields in place.
-    pub(crate) fn walk_builtin_roots(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-        visitor(unsafe {
-            &mut *(&mut self.builtins_module as *mut PyObjectRef as *mut majit_ir::GcRef)
-        });
-        visitor(unsafe { &mut *(&mut self.builtin as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        for wref in &mut self.thread_local_refs {
-            visitor(unsafe { &mut *(wref as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        }
-        visitor(unsafe {
-            &mut *(&mut self.contextvar_context as *mut PyObjectRef as *mut majit_ir::GcRef)
-        });
-        visitor(unsafe {
-            &mut *(&mut self.genentry_note_gen as *mut PyObjectRef as *mut majit_ir::GcRef)
-        });
-        visitor(unsafe {
-            &mut *(&mut self.genentry_note_word as *mut PyObjectRef as *mut majit_ir::GcRef)
-        });
-        visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        for entry in self.repr_active.get_mut().iter_mut() {
-            visitor(unsafe { &mut *(entry as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        }
-        for entry in self.lazy_imports_resolving.get_mut().iter_mut() {
-            visitor(unsafe { &mut *(entry as *mut PyObjectRef as *mut majit_ir::GcRef) });
-        }
-        if let Some(pending) = self.pending_loop_exit.as_mut() {
-            match pending {
-                PendingLoopExit::Done(Ok(value)) => {
-                    visitor(unsafe { &mut *(value as *mut PyObjectRef as *mut majit_ir::GcRef) })
-                }
-                PendingLoopExit::Done(Err(err)) | PendingLoopExit::ExitFrameWithException(err) => {
-                    err.walk_gc_refs(visitor)
-                }
-                PendingLoopExit::ContinueRunningNormally => {}
-            }
-        }
+        alloc_execution_context_value(ec)
     }
 
     pub fn set_pending_loop_exit(&mut self, exit: PendingLoopExit) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         self.pending_loop_exit = Some(exit);
     }
 
@@ -1131,8 +1451,8 @@ impl ExecutionContext {
     }
 
     pub fn __init__(&mut self, space: PyObjectRef) {
-        self.space = space;
-        self.compiler = pyre_object::w_none();
+        self.set_space(space);
+        self.set_compiler(pyre_object::w_none());
     }
 
     pub fn install_user_del_action(&mut self) {
@@ -1273,7 +1593,7 @@ impl ExecutionContext {
         // `virtual_ref(frame)` is the frame pointer itself
         // (`_jit_vref.py lowleveltype = OBJECTPTR`, no allocation); the
         // JIT rewrites it to a `JitVirtualRef` when it virtualizes the frame.
-        self.topframeref = frame;
+        self.set_topframeref(frame);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1337,7 +1657,8 @@ impl ExecutionContext {
         unsafe {
             // `self.topframeref = frame.f_backref` (no parens — move the raw
             // caller vref back, do not force it).
-            self.topframeref = (*frame).f_backref;
+            self.set_topframeref((*frame).f_backref);
+            let frame = anchor.live();
             if (*frame).escaped() || got_exception {
                 // Both forces below can materialize frames, so they can
                 // collect, and the traced exit value is a local of this
@@ -1768,10 +2089,16 @@ impl ExecutionContext {
     }
 
     pub fn set_sys_exc_info(&mut self, operror: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         self.sys_exc_value = operror;
     }
 
     pub fn clear_sys_exc_info(&mut self) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         self.sys_exc_value = pyre_object::PY_NULL;
     }
 
@@ -1782,6 +2109,9 @@ impl ExecutionContext {
         let current_exc = self.sys_exc_value;
         let saved_exc =
             unsafe { pyre_object::generator::w_generator_get_saved_exc_value(generator) };
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         self.sys_exc_value = saved_exc;
         unsafe {
             pyre_object::generator::w_generator_set_saved_exc_value(generator, current_exc);
@@ -1799,6 +2129,9 @@ impl ExecutionContext {
         debug_assert_eq!(self.current_gen_or_coroutine, generator);
         let caller_exc =
             unsafe { pyre_object::generator::w_generator_get_saved_exc_value(generator) };
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         self.current_gen_or_coroutine =
             unsafe { pyre_object::generator::w_generator_get_previous(generator) };
         unsafe {
@@ -1811,6 +2144,9 @@ impl ExecutionContext {
     #[majit_macros::dont_look_inside]
     pub fn settrace(&mut self, w_func: PyObjectRef) {
         if w_func.is_null() || w_func == pyre_object::w_none() {
+            pyre_object::gc_hook::try_gc_write_barrier(
+                self as *const Self as pyre_object::gc_hook::GCREF,
+            );
             pyre_object::quasi_immut_store!(self.mutate_w_tracefunc.field() =>
                 self.w_tracefunc = pyre_object::PY_NULL;
             );
@@ -1825,6 +2161,9 @@ impl ExecutionContext {
         let _ = pyre_object::gc_roots::pin_root(w_func);
         self.force_all_frames(false);
         let w_func = pyre_object::gc_roots::shadow_stack_get(func_slot);
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         pyre_object::quasi_immut_store!(self.mutate_w_tracefunc.field() =>
             self.w_tracefunc = w_func;
         );
@@ -1847,6 +2186,9 @@ impl ExecutionContext {
     }
 
     fn store_profilefunc(&mut self, func: Option<ProfileFunc>, w_arg: PyObjectRef) {
+        pyre_object::gc_hook::try_gc_write_barrier(
+            self as *const Self as pyre_object::gc_hook::GCREF,
+        );
         pyre_object::quasi_immut_store!(self.mutate_profilefunc.field() =>
             self.profilefunc = func;
             self.w_profilefuncarg = w_arg;

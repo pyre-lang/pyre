@@ -13475,7 +13475,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     let frame = if inline_level {
         inline_ptr as *mut pyre_interpreter::PyFrame
     } else {
-        if unsafe { (*ec).topframeref } as usize != vable_ptr {
+        if unsafe { (*ec).topframeref() } as usize != vable_ptr {
             return Ok(None);
         }
         let frame = unsafe { (*ec).gettopframe_nohidden() };
@@ -13968,7 +13968,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     let mut concrete_gen = if ec_live.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe { (*ec_live).current_gen_or_coroutine }
+        unsafe { (*ec_live).current_gen_or_coroutine() }
     };
     let slot_is_exception =
         !concrete_exc.is_null() && unsafe { pyre_object::is_exception(concrete_exc) };
@@ -13992,7 +13992,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     concrete_gen = if ec_live.is_null() {
         std::ptr::null_mut()
     } else {
-        unsafe { (*ec_live).current_gen_or_coroutine }
+        unsafe { (*ec_live).current_gen_or_coroutine() }
     };
 
     let (concrete_class, kind, concrete_tb, concrete_tb_frame, concrete_layout) =

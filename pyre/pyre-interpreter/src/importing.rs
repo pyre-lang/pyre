@@ -9190,22 +9190,15 @@ mod tests {
         crate::typedef::init_typeobjects();
         {
             // source_exec_stores_file_from_the_path_buffer
-            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let ec = crate::alloc_execution_context();
+            crate::call::set_last_exec_ctx(ec.as_ptr());
             let code = crate::compile::compile_source("x = 1\n", crate::compile::Mode::Exec)
                 .expect("compile");
             let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
-            let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
+            let w_globals = ec.fresh_module_globals();
             let path = rustpython_wtf8::Wtf8Buf::from("/tmp/m.py");
-            exec_code_module(
-                w_code,
-                w_globals,
-                std::rc::Rc::as_ptr(&ec),
-                Some(&path),
-                None,
-                false,
-            )
-            .expect("exec");
+            exec_code_module(w_code, w_globals, ec.as_ptr(), Some(&path), None, false)
+                .expect("exec");
             let file = unsafe { pyre_object::w_dict_getitem_str(w_globals, "__file__") }
                 .expect("__file__");
             unsafe {
@@ -9217,22 +9210,15 @@ mod tests {
         }
         {
             // frozen_startup_body_runs_on_the_plain_dispatch
-            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let ec = crate::alloc_execution_context();
+            crate::call::set_last_exec_ctx(ec.as_ptr());
             let code = crate::compile::compile_source("y = 2\n", crate::compile::Mode::Exec)
                 .expect("compile");
             let w_code = crate::pycode::w_code_new(Box::into_raw(Box::new(code)) as *const ());
-            let w_globals = unsafe { &*std::rc::Rc::as_ptr(&ec) }.fresh_module_globals();
+            let w_globals = ec.fresh_module_globals();
             let path = rustpython_wtf8::Wtf8Buf::from("<frozen importlib._bootstrap>");
-            exec_code_module(
-                w_code,
-                w_globals,
-                std::rc::Rc::as_ptr(&ec),
-                Some(&path),
-                None,
-                true,
-            )
-            .expect("plain exec");
+            exec_code_module(w_code, w_globals, ec.as_ptr(), Some(&path), None, true)
+                .expect("plain exec");
             let bound = unsafe { pyre_object::w_dict_getitem_str(w_globals, "y") }.expect("y");
             assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(bound) }, 2);
         }
@@ -9285,8 +9271,8 @@ mod tests {
         crate::typedef::init_typeobjects();
         {
             // appleveldef_install_binds_through_the_plain_dispatch
-            let ec = std::rc::Rc::new(crate::PyExecutionContext::default());
-            crate::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&ec));
+            let ec = crate::alloc_execution_context();
+            crate::call::set_last_exec_ctx(ec.as_ptr());
             let ns = pyre_object::dictmultiobject::w_dict_new();
             appleveldef_install(
                 ns,

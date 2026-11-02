@@ -534,7 +534,7 @@ impl CheckSignalAction {
             return;
         }
         let ec = crate::call::getexecutioncontext();
-        if !ec.is_null() && !unsafe { (*ec).w_async_exception_type }.is_null() {
+        if !ec.is_null() && !unsafe { (*ec).w_async_exception_type() }.is_null() {
             signalstate::rearm_ticker();
             return;
         }
@@ -850,7 +850,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
     let action_addr = *CHECK_SIGNAL_ACTION.get_or_init(|| {
         // moduledef.py:64-66 — construct and register the one signal action
         // owned by the process object space.
-        let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space));
+        let action: &'static mut CheckSignalAction = Box::leak(CheckSignalAction::new(ec.space()));
         action.register_periodic_action(ec.actionflag.shared_mut(), false);
         // CheckSignalAction.startup — register after a GIL switch so a
         // signal seen on a worker rearms the main ticker promptly.

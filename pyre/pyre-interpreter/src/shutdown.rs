@@ -540,7 +540,7 @@ pub fn finalize_runtime(
     if !ec_ptr.is_null() {
         unsafe {
             let ec = &mut *(ec_ptr as *mut crate::executioncontext::PyExecutionContext);
-            ec.topframeref = std::ptr::null_mut();
+            ec.set_topframeref(std::ptr::null_mut());
         }
     }
     let shutdown_modules = crate::importing::release_sys_modules_for_shutdown();

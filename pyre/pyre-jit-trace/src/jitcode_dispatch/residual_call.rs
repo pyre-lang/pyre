@@ -3932,7 +3932,7 @@ impl ResidualFrameChainGuard {
         if ec.is_null() {
             return None;
         }
-        let saved_topframeref = unsafe { (*ec).topframeref };
+        let saved_topframeref = unsafe { (*ec).topframeref() };
         // `executioncontext.py` `enter` never re-links a frame already on the
         // chain: `interp_jit.py` puts `jit_merge_point` on `PyFrame.dispatch`,
         // below `execute_frame`'s enter, so a residual runs inside that
@@ -3962,7 +3962,7 @@ impl ResidualFrameChainGuard {
 
             unsafe {
                 (*frame).f_backref = saved_topframeref;
-                (*ec).topframeref = published as *mut pyre_interpreter::PyFrame;
+                (*ec).set_topframeref(published as *mut pyre_interpreter::PyFrame);
             }
         }
         // The walk's inline frame is the escape target
@@ -4035,7 +4035,7 @@ impl Drop for ResidualFrameChainGuard {
                 // (no parens).  The value `enter` displaced was written to
                 // `f_backref`, so a collection during the residual forwarded
                 // it in place.
-                (*self.ec).topframeref = (*self.frame()).f_backref;
+                (*self.ec).set_topframeref((*self.frame()).f_backref);
             }
             let frame = self.frame();
             // Keep the nursery frame rooted until `topframeref` is restored;

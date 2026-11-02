@@ -496,15 +496,20 @@ mod tests {
             let _roots = gc_roots::push_roots();
             // __reduce__ resolves the live builtin through the execution
             // context, just as W_ReverseSeqIterObject.descr_reduce does.
-            let context = Box::new(crate::PyExecutionContext::new());
+            let context = crate::alloc_execution_context();
             struct RestoreContext(*const crate::PyExecutionContext);
             impl Drop for RestoreContext {
                 fn drop(&mut self) {
                     crate::call::set_last_exec_ctx(self.0);
                 }
             }
-            let _context = RestoreContext(crate::call::getexecutioncontext());
-            crate::call::set_last_exec_ctx(&*context);
+            let saved_ctx = crate::call::take_last_exec_ctx();
+            let _saved_root = gc_roots::push_roots();
+            if !saved_ctx.is_null() {
+                let _ = gc_roots::pin_root(saved_ctx as PyObjectRef);
+            }
+            let _context = RestoreContext(saved_ctx);
+            crate::call::set_last_exec_ctx(context.as_ptr());
             let iter_slot = gc_roots::shadow_stack_len();
             let _ = gc_roots::pin_root(w_list_reverse_iter_new(w_list_new_range(1, 1, 3), 2));
             let invoke = |name: &str, args: &[PyObjectRef]| {

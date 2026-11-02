@@ -617,8 +617,8 @@ pub fn genentry_resume_note_reset() {
         (*ec).genentry_note_armed = false;
         (*ec).genentry_note_finished = false;
         (*ec).genentry_note_is_err = false;
-        (*ec).genentry_note_gen = pyre_object::PY_NULL;
-        (*ec).genentry_note_word = pyre_object::PY_NULL;
+        (*ec).set_genentry_note_gen(pyre_object::PY_NULL);
+        (*ec).set_genentry_note_word(pyre_object::PY_NULL);
     }
 }
 
@@ -648,8 +648,8 @@ pub fn genentry_resume_note_finish(w_gen: PyObjectRef, is_err: bool, word: u64) 
         if !(*ec).genentry_note_armed {
             return;
         }
-        (*ec).genentry_note_gen = w_gen;
-        (*ec).genentry_note_word = word as PyObjectRef;
+        (*ec).set_genentry_note_gen(w_gen);
+        (*ec).set_genentry_note_word(word as PyObjectRef);
         (*ec).genentry_note_is_err = is_err;
         (*ec).genentry_note_finished = true;
     }
@@ -666,10 +666,10 @@ pub fn genentry_body_result_for(w_gen: PyObjectRef) -> Option<Result<PyObjectRef
         if !(*ec).genentry_note_finished {
             return None;
         }
-        if (*ec).genentry_note_gen != w_gen {
+        if (*ec).genentry_note_gen() != w_gen {
             return None;
         }
-        let word = (*ec).genentry_note_word;
+        let word = (*ec).genentry_note_word();
         let is_err = (*ec).genentry_note_is_err;
         genentry_resume_note_reset();
         if is_err {
@@ -710,14 +710,49 @@ pub fn unpack_portal_runner(
     }
 }
 
+/// Owns the on-demand ExecutionContext created when the threadlocals slot is
+/// empty. Lives until the thread exits or until [`ensure_executioncontext`]
+/// installs a new fallback. A store into `LAST_EXEC_CTX` never drops this
+/// guard, so a save -> install other -> restore sequence still has a Drop that
+/// unregisters the restored pointer (`threadlocals.py
+/// AutoFreeECWrapper.__del__`). Drop is the thread-exit counterpart of
+/// `leave_thread`: it clears that slot only while `LAST_EXEC_CTX` still holds
+/// this pointer, so `EXECUTION_CONTEXTS` cannot keep a pointer into a dropped
+/// execution context.
+struct FallbackEcGuard {
+    ec: crate::ExecutionContextRef,
+}
+
+impl Drop for FallbackEcGuard {
+    fn drop(&mut self) {
+        let ptr = self.ec.as_ptr();
+        // `set_last_exec_ctx` uses `.with` and panics if `LAST_EXEC_CTX` has
+        // already been destroyed; `ForcePlainEvalGuard` uses `try_with` for
+        // the same TLS-destructor window.
+        match LAST_EXEC_CTX.try_with(|c| c.get() == ptr) {
+            Ok(true) => set_last_exec_ctx(std::ptr::null()),
+            Ok(false) => {}
+            Err(_) => crate::module::thread::unregister_execution_context(),
+        }
+    }
+}
+
 thread_local! {
     static FORCE_PLAIN_EVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// Last known valid execution context — for call_user_function_with_args.
     static LAST_EXEC_CTX: std::cell::Cell<*const crate::PyExecutionContext> =
         const { std::cell::Cell::new(std::ptr::null()) };
+    /// On-demand EC from [`ensure_executioncontext`]. The guard lives until
+    /// the thread exits or until [`ensure_executioncontext`] replaces the
+    /// slot; a store into `LAST_EXEC_CTX` never drops it.
+    static FALLBACK_EC: std::cell::RefCell<Option<FallbackEcGuard>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Set the last known execution context (called at eval loop entry).
+///
+/// Never drops `FALLBACK_EC`: that guard stays until the thread exits
+/// or until [`ensure_executioncontext`] replaces the slot.
 pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
     LAST_EXEC_CTX.with(|c| {
         let previous = c.replace(ctx);
@@ -769,7 +804,7 @@ pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
 /// creating one on demand.  Pyre stores the active context in a TLS
 /// slot seeded at process boot by pyrex (`pyrex/src/lib.rs`'s
 /// `setup_exec_context`, which calls
-/// `set_last_exec_ctx(Rc::as_ptr(&execution_context))`) and
+/// `set_last_exec_ctx(execution_context.as_ptr())`) and
 /// re-stamped on every `eval_frame_plain` entry. The slot stays
 /// pointing at that thread's EC for the lifetime of its activation, so
 /// `sys.gettrace`/`settrace`/`getprofile`/`setprofile` and other
@@ -782,50 +817,33 @@ pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
     take_last_exec_ctx()
 }
 
-/// Owns the on-demand ExecutionContext created when the threadlocals slot is
-/// empty.  Drop is the thread-exit counterpart of `leave_thread`: it clears
-/// that slot before the allocation is freed, so `EXECUTION_CONTEXTS` cannot
-/// keep a pointer into a dropped `Rc`.
-struct FallbackEcGuard {
-    ec: std::rc::Rc<crate::PyExecutionContext>,
-}
-
-impl Drop for FallbackEcGuard {
-    fn drop(&mut self) {
-        let ptr = std::rc::Rc::as_ptr(&self.ec);
-        // `set_last_exec_ctx` uses `.with` and panics if `LAST_EXEC_CTX` has
-        // already been destroyed; `ForcePlainEvalGuard` uses `try_with` for
-        // the same TLS-destructor window.
-        match LAST_EXEC_CTX.try_with(|c| c.get() == ptr) {
-            Ok(true) => set_last_exec_ctx(std::ptr::null()),
-            Ok(false) => {}
-            Err(_) => crate::module::thread::unregister_execution_context(),
-        }
-    }
-}
-
 /// `baseobjspace.py getexecutioncontext` untranslated path: if the
 /// threadlocals slot is empty, `enter_thread` / `createexecutioncontext`
 /// installs one. Used by `repr_enter` so a missing EC is not treated
 /// as "already in repr" and is not a silent first-enter without a set.
-/// `dont_look_inside`: the fallback `RefCell` lives in a function-local
-/// thread-local, and that `.with` has no extractable graph.
+/// `dont_look_inside`: the fallback `RefCell` lives in a thread-local,
+/// and that `.with` has no extractable graph.
 #[majit_macros::dont_look_inside]
 pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
     let existing = take_last_exec_ctx();
     if !existing.is_null() {
         return existing;
     }
-    thread_local! {
-        static FALLBACK_EC: std::cell::RefCell<Option<FallbackEcGuard>> =
-            const { std::cell::RefCell::new(None) };
-    }
     FALLBACK_EC.with(|slot| {
         let mut guard = slot.borrow_mut();
-        let fallback = guard.get_or_insert_with(|| FallbackEcGuard {
-            ec: std::rc::Rc::new(crate::PyExecutionContext::default()),
-        });
-        let ptr = std::rc::Rc::as_ptr(&fallback.ec);
+        // The slot is empty. A leftover cache pointer is no longer this
+        // thread's registered context (`LAST_EXEC_CTX` / `EXECUTION_CONTEXTS`).
+        if let Some(cached) = guard.as_ref() {
+            if cached.ec.as_ptr() == take_last_exec_ctx() {
+                return cached.ec.as_ptr();
+            }
+            let _ = guard.take();
+        }
+        let fallback = FallbackEcGuard {
+            ec: crate::alloc_execution_context(),
+        };
+        let ptr = fallback.ec.as_ptr();
+        *guard = Some(fallback);
         set_last_exec_ctx(ptr);
         ptr
     })

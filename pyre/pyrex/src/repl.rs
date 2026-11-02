@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::rc::Rc;
 
 use rustpython_compiler::{
     CompileError, Mode, ParseError,
@@ -8,7 +7,9 @@ use rustpython_compiler::{
 
 use pyre_interpreter::call::register_build_class;
 use pyre_interpreter::importing;
-use pyre_interpreter::{CompileOpts, PyDisplay, PyError, PyExecutionContext};
+use pyre_interpreter::{
+    CompileOpts, PyDisplay, PyError, PyExecutionContext, alloc_execution_context,
+};
 use pyre_jit::eval::eval_with_jit;
 
 use crate::repl_readline::{Readline, ReadlineResult};
@@ -82,14 +83,14 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
             (session.execution_context, canonical, main_module)
         }
         None => {
-            let execution_context = Rc::new(PyExecutionContext::default());
+            let execution_context = alloc_execution_context();
             register_build_class();
             // `app_main.py run_command_line` — install SIGINT →
             // default_int_handler so Ctrl-C at the REPL raises
             // KeyboardInterrupt rather than killing the process, and register
             // the periodic signal-check action.
             unsafe {
-                let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+                let ec_ptr = execution_context.as_mut_ptr();
                 pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
                 (*ec_ptr).install_user_del_action();
                 pyre_interpreter::module::signal::interp_signal::install_signal_handling(
@@ -124,7 +125,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
 
             // pylifecycle.c init_importlib before site — see run_source.
             if let Err(e) =
-                importing::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context))
+                importing::init_importlib_bootstrap(canonical, execution_context.as_ptr())
             {
                 eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
             }
@@ -133,9 +134,9 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                 canonical,
                 None,
                 false,
-                Rc::as_ptr(&execution_context),
+                execution_context.as_ptr(),
             );
-            crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
+            crate::import_site(no_site, canonical, execution_context.as_ptr());
             (execution_context, canonical, main_module)
         }
     };
@@ -159,7 +160,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     configure_sys_for_repl(sys_module);
 
     let runtime = ReplRuntime {
-        ctx_ptr: Rc::into_raw(Rc::clone(&execution_context)),
+        ctx_ptr: execution_context.as_ptr(),
         w_globals: canonical,
         sys_module,
     };
@@ -306,7 +307,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     // callbacks, the module teardown and the stream flush all belong here.
     // `exit()` at the prompt takes it too -- the status it asked for is
     // delivered by the exit below, after the callbacks have run.
-    crate::finish_main(canonical, Rc::as_ptr(&execution_context));
+    crate::finish_main(canonical, execution_context.as_ptr());
 
     // `Py_RunMain` consults `unhandled_keyboard_interrupt` after the prompt
     // and after `Py_FinalizeEx`, and overwrites any `exitcode` the prompt

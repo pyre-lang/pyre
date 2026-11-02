@@ -901,13 +901,13 @@ fn run_python_impl(source: &str) -> String {
     ERR_BUF.with(|buf| buf.borrow_mut().clear());
     EXIT_CODE.with(|c| c.set(0));
 
-    let execution_context = std::rc::Rc::new(PyExecutionContext::default());
+    let execution_context = pyre_interpreter::alloc_execution_context();
     // Seed the TLS execution-context slot (pyrex real_main does the same at
     // boot). `getexecutioncontext().gettopframe()` must be live so a residual
     // `bh_call_fn_impl` from a blackhole resume — e.g. a `print(...)` after a
     // JIT-compiled loop — can resolve its parent frame instead of tripping the
     // fail-fast topframe assert.
-    pyre_interpreter::call::set_last_exec_ctx(std::rc::Rc::as_ptr(&execution_context));
+    pyre_interpreter::call::set_last_exec_ctx(execution_context.as_ptr());
     // objspace.py `space.user_del_action`: the queue every registered
     // finalizer's trigger fires into (`finalizer_queue_trigger` reads
     // `ec.user_del_action`).  Without it the pointer stays null and the trigger
@@ -916,7 +916,7 @@ fn run_python_impl(source: &str) -> String {
     // `gc.collect()`.  `pyrex::setup_exec_context` installs it at boot; this
     // entry point is the other launcher and needs the same step.
     unsafe {
-        let ec_ptr = std::rc::Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+        let ec_ptr = execution_context.as_mut_ptr();
         (*ec_ptr).install_user_del_action();
         // The same step for the other periodic action: without it the ticker
         // cell is unregistered and `CheckSignalAction` never runs, so a

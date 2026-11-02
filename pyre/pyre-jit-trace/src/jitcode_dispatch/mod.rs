@@ -14826,7 +14826,7 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
-    !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
+    !ec.is_null() && unsafe { !(*ec).w_tracefunc().is_null() || (*ec).profilefunc.is_some() }
 }
 
 /// Which portal reds were taken from `snapshot_sym` and must be written back.
@@ -15252,7 +15252,7 @@ pub(super) fn walker_call_trace_hook_reads<Sym: WalkSym>(
         return Ok(());
     }
     debug_assert!(
-        unsafe { (*ec).w_tracefunc.is_null() && (*ec).profilefunc.is_none() },
+        unsafe { (*ec).w_tracefunc().is_null() && (*ec).profilefunc.is_none() },
         "walker_call_trace_hook_reads: every caller declines on ec_hook_installed() first",
     );
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {

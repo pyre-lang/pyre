@@ -69,7 +69,7 @@ static GIL_RELEASE_ACTION: OnceLock<usize> = OnceLock::new();
 /// the runtime lifetime.
 pub fn initialize(ec: &mut ExecutionContext) {
     GIL_RELEASE_ACTION.get_or_init(|| {
-        let action: &'static mut GilReleaseAction = Box::leak(GilReleaseAction::new(ec.space));
+        let action: &'static mut GilReleaseAction = Box::leak(GilReleaseAction::new(ec.space()));
         action.register_periodic_action(ec.actionflag.shared_mut(), true);
         action as *mut GilReleaseAction as usize
     });

@@ -29,7 +29,7 @@ fn get_contextvar_context(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     if ec.is_null() {
         return Ok(pyre_object::w_none());
     }
-    let context = unsafe { (*ec).contextvar_context };
+    let context = unsafe { (*ec).contextvar_context() };
     if context.is_null() {
         Ok(pyre_object::w_none())
     } else {
@@ -51,7 +51,7 @@ fn set_contextvar_context(args: &[pyre_object::PyObjectRef]) -> crate::PyResult 
             "no current execution context",
         ));
     }
-    unsafe { (*ec).contextvar_context = context };
+    unsafe { (*ec).set_contextvar_context(context) };
     Ok(pyre_object::w_none())
 }
 
@@ -268,7 +268,7 @@ fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             "no current execution context",
         ));
     }
-    let cached = unsafe { (*ec).py_repr };
+    let cached = unsafe { (*ec).py_repr() };
     if !cached.is_null() {
         return Ok(cached);
     }
@@ -280,8 +280,8 @@ fn objects_in_repr(_: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         })?;
     let inst = crate::call::call_function_impl_result(ty, &[])?;
     // Stored immediately (no intervening allocation); thereafter forwarded by
-    // `ExecutionContext::walk_builtin_roots`.
-    unsafe { (*ec).py_repr = inst };
+    // `executioncontext_custom_trace`.
+    unsafe { (*ec).set_py_repr(inst) };
     Ok(inst)
 }
 
