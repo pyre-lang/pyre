@@ -7700,7 +7700,7 @@ impl<'a> Lowering<'a> {
         // instead.  A named struct's constructor is the
         // malloc marker; [`scalar_replace_named_struct_aggregates`]
         // replaces it with per-field SSA after boxing fusion.
-        let target = if owner_path.is_empty() {
+        let mut target = if owner_path.is_empty() {
             CallTarget::synthetic_transparent_ctor(ctor_name.clone())
         } else if adt_is_struct {
             // Resolved to a `TypeDeclKind::Struct`, so the value is
@@ -7734,7 +7734,7 @@ impl<'a> Lowering<'a> {
         // carrier. `typed_ref_field_narrow_root` of the declared
         // payload would recast onto that payload class.
         let handle_store_root = self.transparent_handle_field_store_root(dest_ty);
-        let fields = (0..n_operands)
+        let fields: Vec<AggregateField> = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows
                     .get(i)
@@ -7771,6 +7771,15 @@ impl<'a> Lowering<'a> {
                 }
             })
             .collect();
+        // `lltype.py` `Struct._names_without_voids` drops a Void field;
+        // stamp that drop on a Result `Ok` ctor so `result_exc` does not
+        // re-parse the owner spelling.
+        if ctor_name == "Ok"
+            && crate::front::result_exc::result_ctor_kind(&target) == Some(false)
+            && fields.first().is_some_and(|field| field.void)
+        {
+            target = target.with_payload_void();
+        }
         Ok(AggregateShape::Ctor(AggregateCtor {
             target,
             result_owner,
@@ -7979,6 +7988,12 @@ impl<'a> Lowering<'a> {
                 let inst_args = inst_adt
                     .map(|h| render_adt_type_args(h, self.llbc, 0))
                     .unwrap_or_default();
+                // Instantiated field type (`collect_by_value_struct_leaves`
+                // `substitute_spill_typevars`): `_names_without_voids` sees
+                // a user ZST via `tyref_is_void_zst`, not the type-var `T`.
+                let owner_node = dest_ty
+                    .and_then(|ty| tyref_node(ty, self.llbc))
+                    .and_then(|n| strip_ty_wrappers(n, self.llbc));
                 let field_rows: Vec<(String, String, Option<TyRef>)> = v
                     .fields
                     .iter()
@@ -7995,12 +8010,15 @@ impl<'a> Lowering<'a> {
                                 &self.raw_alloc_flavor_structs,
                             )
                         };
+                        let declared_ty = owner_node
+                            .and_then(|owner| substitute_spill_typevars(&f.ty, owner, self.llbc))
+                            .unwrap_or_else(|| clone_tyref(&f.ty));
                         (
                             f.name.clone().unwrap_or_else(|| {
                                 majit_charon_reader::ullbc::positional_field_name(i)
                             }),
                             field_ty,
-                            Some(clone_tyref(&f.ty)),
+                            Some(declared_ty),
                         )
                     })
                     .collect();

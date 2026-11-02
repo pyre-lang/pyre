@@ -1860,14 +1860,16 @@ fn leftover_ok_or_else(graph: &majit_translate::model::FunctionGraph) -> usize {
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .filter(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "ok_or_else"
-            )
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if name == "ok_or_else" => true,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("ok_or_else") => true,
+            _ => false,
         })
         .count()
 }
@@ -1926,4 +1928,214 @@ fn simplequeue_get_ok_or_else_is_lowered() {
 fn create_new_dict_ok_or_else_is_lowered() {
     let graph = lower_function(interp(), "create_new_dict").expect("create_new_dict lowers");
     assert_no_ok_or_else(&graph, "create_new_dict");
+}
+
+fn producer_op<'a>(
+    graph: &'a majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<&'a majit_translate::model::SpaceOperation> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|op| op.result.as_ref() == Some(var))
+}
+
+fn value_type_is_payload(ty: &majit_translate::model::ValueType) -> bool {
+    use majit_translate::model::ValueType;
+    match ty {
+        ValueType::Str | ValueType::StringBuilder => true,
+        ValueType::Ref(Some(s)) => {
+            s.contains("PyObject") || s.contains("string::String") || s.contains("&str")
+        }
+        _ => false,
+    }
+}
+
+/// A merged continue whose one predecessor is a payload (PyObject / Str)
+/// and another is unit `ConstNone` is the census `X ∪ Void` shape
+/// (`annrpython.py` `follow_link`; `rnone.py` `NoneRepr` is only None).
+fn payload_phi_joined_with_constnone(graph: &majit_translate::model::FunctionGraph) -> Vec<String> {
+    use majit_translate::model::{LinkArg, OpKind};
+    let mut hits = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        let mut preds = Vec::new();
+        for src in &graph.blocks {
+            for link in &src.exits {
+                if link.target.0 == bi {
+                    preds.push(link);
+                }
+            }
+        }
+        if preds.len() < 2 {
+            continue;
+        }
+        for slot in 0..block.inputargs.len() {
+            let mut saw_constnone = false;
+            let mut saw_payload = false;
+            for link in &preds {
+                let Some(arg) = link.args.get(slot) else {
+                    continue;
+                };
+                let LinkArg::Value(v) = arg else {
+                    continue;
+                };
+                let Some(op) = producer_op(graph, v) else {
+                    continue;
+                };
+                match &op.kind {
+                    OpKind::ConstNone => saw_constnone = true,
+                    OpKind::Call { result_ty, .. } | OpKind::IndirectCall { result_ty, .. }
+                        if value_type_is_payload(result_ty) =>
+                    {
+                        saw_payload = true;
+                    }
+                    OpKind::FieldRead { ty, .. } if value_type_is_payload(ty) => {
+                        saw_payload = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_constnone && saw_payload {
+                hits.push(format!("bb{bi} slot{slot}"));
+            }
+        }
+    }
+    hits
+}
+
+fn assert_no_payload_constnone_phi(graph: &majit_translate::model::FunctionGraph, name: &str) {
+    let hits = payload_phi_joined_with_constnone(graph);
+    assert!(
+        hits.is_empty(),
+        "{name} merged a payload with ConstNone: {hits:?}"
+    );
+}
+
+/// `Some(f) => f(..)` fn-pointer `Result<PyObjectRef, PyError>` merged with
+/// the named `unpackiterable_portal` call. The hook is `Call(__dyn_call)`.
+#[test]
+fn unpack_portal_runner_dyn_call_return_carries_payload() {
+    let graph =
+        lower_function(interp(), "unpack_portal_runner").expect("unpack_portal_runner lowers");
+    assert_no_payload_constnone_phi(&graph, "unpack_portal_runner");
+    let rb = graph.returnblock.0;
+    assert!(
+        !graph.blocks[rb].inputargs.is_empty(),
+        "unpack_portal_runner returnblock is void"
+    );
+}
+
+/// Tail-return `opt.ok_or_else(err_fn)` as FunctionPath
+/// `core::option::<Impl>::ok_or_else`.
+#[test]
+fn simplequeue_get_ok_or_else_return_carries_payload() {
+    let graph =
+        lower_function(optional_module(), "simplequeue_get").expect("simplequeue_get lowers");
+    assert_no_ok_or_else(&graph, "simplequeue_get");
+    assert_no_payload_constnone_phi(&graph, "simplequeue_get");
+}
+
+#[test]
+fn get_attr_ok_or_else_return_carries_payload() {
+    let graph = lower_function(optional_module(), "get_attr").expect("get_attr lowers");
+    assert_no_ok_or_else(&graph, "get_attr");
+    assert_no_payload_constnone_phi(&graph, "get_attr");
+}
+
+/// `args.get(1).copied().ok_or_else(...)?` in `struct::iter_unpack`: Regular
+/// FunctionPath `core::option::<Impl>::ok_or_else` consumed by `?`. The
+/// try-site rewrite fuses it (`exceptiontransform.py` `transform_completely`);
+/// a leftover `from_residual` getattr / `ControlFlow` Break is the
+/// annotate-skip that dual-recording the combinator used to leave.
+#[test]
+fn iter_unpack_ok_or_else_try_is_lowered() {
+    let graph = lower_function(
+        interp(),
+        "pyre_interpreter::module::struct::<Impl>::iter_unpack",
+    )
+    .expect("iter_unpack lowers");
+    assert_no_ok_or_else(&graph, "iter_unpack");
+    assert_no_from_residual_break(&graph, "iter_unpack");
+    assert_no_payload_constnone_phi(&graph, "iter_unpack");
+}
+
+fn leftover_from_residual_break(graph: &majit_translate::model::FunctionGraph) -> Vec<String> {
+    let mut reachable = vec![false; graph.blocks.len()];
+    let mut stack = vec![graph.startblock.0];
+    while let Some(block) = stack.pop() {
+        if block >= reachable.len() || reachable[block] {
+            continue;
+        }
+        reachable[block] = true;
+        for link in &graph.blocks[block].exits {
+            stack.push(link.target.0);
+        }
+    }
+    let mut hits = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "from_residual" => {
+                    hits.push(format!("bb{bi} Call Method from_residual"));
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("from_residual") => {
+                    hits.push(format!("bb{bi} Call FunctionPath from_residual"));
+                }
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            name, owner_path, ..
+                        },
+                    ..
+                } if name == "Break"
+                    && owner_path.iter().any(|seg| seg.contains("ControlFlow")) =>
+                {
+                    hits.push(format!("bb{bi} ControlFlow Break ctor"));
+                }
+                OpKind::FieldRead { field, .. } if field.name == "from_residual" => {
+                    hits.push(format!("bb{bi} getattr from_residual"));
+                }
+                _ => {}
+            }
+        }
+    }
+    hits
+}
+
+fn assert_no_from_residual_break(graph: &majit_translate::model::FunctionGraph, name: &str) {
+    let hits = leftover_from_residual_break(graph);
+    assert!(
+        hits.is_empty(),
+        "{name} left from_residual / ControlFlow Break: {hits:?}"
+    );
+}
+
+/// `str_utf8_w(x)?` `Result<&str>` joined with an `Option<&str>` Some arm.
+#[test]
+fn reconfigure_encoding_join_carries_str() {
+    let graph = lower_function(interp(), "reconfigure").expect("reconfigure lowers");
+    assert_no_payload_constnone_phi(&graph, "reconfigure");
+    let has_str_utf8 = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty: majit_translate::model::ValueType::Str,
+                    ..
+                } if segments.last().map(String::as_str) == Some("str_utf8_w")
+            )
+        })
+    });
+    assert!(has_str_utf8, "reconfigure lost reminted str_utf8_w");
 }

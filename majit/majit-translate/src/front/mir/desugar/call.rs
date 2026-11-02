@@ -7604,13 +7604,8 @@ impl<'a> Lowering<'a> {
         // combinator, and lowering only the downstream `?` would leave that
         // unregistered residual (while lowering only the Option select would
         // materialise the Result shell RPython never has).
-        let captured_option_ok_or_else_try = if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok_or_else"
-            && args.len() == 2
+        let captured_option_ok_or_else_try = if let OpKind::Call { target, args, .. } = &op_kind
+            && call_is_option_ok_or_else(target, args.len(), callee_name_path.as_deref())
             && let Some(site) = self.recognize_option_ok_or_else_try_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
@@ -7624,15 +7619,14 @@ impl<'a> Lowering<'a> {
         };
         // `Option::ok_or_else` is a combinator (`DiscCombinator::OptionOkOrElse`),
         // not a transformed `Result<T, PyError>` callee.  Capturing it as a
-        // scoped call remints the residual Method as a payload and leaves the
-        // foreign `ok_or_else` in the graph.
+        // scoped call remints the residual Method / FunctionPath as a payload
+        // and leaves the foreign `ok_or_else` in the graph. Regular Fun
+        // `core::option::<Impl>::ok_or_else` is the same combinator as the
+        // Method form.
         let option_ok_or_else_method = matches!(
             &op_kind,
-            OpKind::Call {
-                target: CallTarget::Method { name, .. },
-                args,
-                ..
-            } if name == "ok_or_else" && args.len() == 2
+            OpKind::Call { target, args, .. }
+                if call_is_option_ok_or_else(target, args.len(), callee_name_path.as_deref())
         ) && first_arg_ty.as_ref().is_some_and(|ty| {
             crate::front::result_exc::tyref_is_option(ty, self.llbc)
                 || self.peel_to_option_or_result(ty).is_some_and(|peeled| {
@@ -7656,8 +7650,28 @@ impl<'a> Lowering<'a> {
                 ..
             }
         );
+        // Dynamic residue (`fnptr_indirect` off) is `Call(__dyn_call)` with
+        // no `callee_name_path`. Unknown-family `IndirectCall` is the same
+        // Result-of-carrier dest as a named Fun: `remint_call_as_payload`
+        // (`annrpython.py` `follow_link` binds the value the source returns).
+        let dyn_call_residue = matches!(
+            &op_kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__dyn_call"]
+        );
+        let unknown_family_indirect = matches!(
+            &op_kind,
+            OpKind::IndirectCall {
+                family_key: None,
+                ..
+            }
+        );
         if (matches!(&op_kind, OpKind::Call { .. }) && callee_name_path.is_some()
-            || indirect_family_call)
+            || indirect_family_call
+            || dyn_call_residue
+            || unknown_family_indirect)
             && !captured_option_ok_or_else_try
             && !option_ok_or_else_method
             && crate::front::result_exc::tyref_is_result_of_carrier(
@@ -8485,18 +8499,37 @@ impl<'a> Lowering<'a> {
         // `unwrap_or_else`/`or_else`/`is_some_and` are extracted core
         // bodies (`CHARON_CORE_INCLUDE`); this records the remaining
         // Option/Result methods whose semantics are the same shape.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && let Some(kind) = DiscCombinator::from_method(
+        let combinator = match &op_kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                args,
+                ..
+            } => DiscCombinator::from_method(
                 name,
                 args.len(),
                 callee_name_path.as_deref(),
                 first_arg_ty.as_ref(),
                 self.llbc,
             )
+            .map(|kind| (kind, args.as_slice())),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } => segments.last().and_then(|leaf| {
+                let path = segments.join("::");
+                DiscCombinator::from_method(
+                    leaf,
+                    args.len(),
+                    Some(path.as_str()),
+                    first_arg_ty.as_ref(),
+                    self.llbc,
+                )
+                .map(|kind| (kind, args.as_slice()))
+            }),
+            _ => None,
+        };
+        if let Some((kind, args)) = combinator
             && let Some(site) = self.recognize_disc_combinator_site(
                 kind,
                 args,

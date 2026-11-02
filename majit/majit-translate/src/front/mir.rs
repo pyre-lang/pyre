@@ -6337,6 +6337,39 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             );
         }
+        // `Option::ok_or_else(...)?` is recorded twice: the combined
+        // try-site (`recognize_option_ok_or_else_try_site`) and
+        // `DiscCombinator::OptionOkOrElse` (`from_method` on Method and
+        // Regular FunctionPath `core::option::<Impl>::ok_or_else`). Fuse
+        // the `?` first — that rewrite keys on the residual call as
+        // producer (`rewire_one_option_ok_or_else_try_site`). A
+        // tail-return / `and_then` consumer declines
+        // (`forwards_to_returnblock`) and leaves the call for the
+        // combinator below, which rebuilds `Ok(payload)` with `__pos_0`
+        // so `classify_slot_value` does not mint unit `ConstNone`
+        // (`annrpython.py` `follow_link`; `rnone.py` `NoneRepr`;
+        // `exceptiontransform.py` `transform_completely`).
+        let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
+            0
+        } else {
+            crate::front::result_exc::rewire_option_ok_or_else_try_sites(
+                &mut lo.graph,
+                &lo.option_ok_or_else_try_sites,
+                result_exc_callee,
+            )
+        };
+        let (option_ok_or_else_sites, disc_combinator_sites): (Vec<_>, Vec<_>) =
+            disc_combinator_sites
+                .into_iter()
+                .partition(|site| site.kind == DiscCombinator::OptionOkOrElse);
+        let option_ok_or_else_disc = !option_ok_or_else_sites.is_empty();
+        if !option_ok_or_else_sites.is_empty() {
+            rewire_disc_combinator_sites(
+                &mut lo.graph,
+                &option_ok_or_else_sites,
+                static_addrs.error_carrier,
+            );
+        }
         // Carrier `unwrap_or` / `expect` / `unwrap` fuse onto the call's
         // `LastException` join (`try/except OperationError`, or the implicit
         // `AssertionError` panic for `core` `Result::expect`) before
@@ -6426,16 +6459,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &mut lo.graph,
             &remaining_map_err,
         ) + toint_map_err_fused;
-
-        let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
-            0
-        } else {
-            crate::front::result_exc::rewire_option_ok_or_else_try_sites(
-                &mut lo.graph,
-                &lo.option_ok_or_else_try_sites,
-                result_exc_callee,
-            )
-        };
 
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
@@ -6708,9 +6731,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // The Never callee is `RaiseImplicit` (`TermKind::Abort`);
         // `remove_assertion_errors` then prunes that arm. Carrier
         // `Result<T, PyError>` unwrap/expect stay on `result_exc`.
-        let option_ok_or_else_disc = disc_combinator_sites
-            .iter()
-            .any(|site| site.kind == DiscCombinator::OptionOkOrElse);
         if !disc_combinator_sites.is_empty() {
             rewire_disc_combinator_sites(
                 &mut lo.graph,

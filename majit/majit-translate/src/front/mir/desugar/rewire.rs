@@ -88,6 +88,37 @@ pub(in crate::front::mir) fn is_core_option_method(path: &str, leaf: &str) -> bo
     )
 }
 
+/// Leaf of a Method or a Regular FunctionPath. Combinator matching keys on
+/// that leaf (`ok_or_else`) plus [`is_core_option_method`] for the path.
+pub(in crate::front::mir) fn call_target_leaf(target: &CallTarget) -> Option<&str> {
+    match target {
+        CallTarget::Method { name, .. } => Some(name.as_str()),
+        CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+        _ => None,
+    }
+}
+
+/// `Option::ok_or_else` as `CallTarget::Method` or as Regular Fun
+/// `core::option::<Impl>::ok_or_else` (`CallTarget::FunctionPath`).
+pub(in crate::front::mir) fn call_is_option_ok_or_else(
+    target: &CallTarget,
+    nargs: usize,
+    callee_name_path: Option<&str>,
+) -> bool {
+    if nargs != 2 {
+        return false;
+    }
+    match target {
+        CallTarget::Method { name, .. } if name == "ok_or_else" => true,
+        CallTarget::FunctionPath { segments, .. } => {
+            let path = segments.join("::");
+            is_core_option_method(&path, "ok_or_else")
+                || callee_name_path.is_some_and(|p| is_core_option_method(p, "ok_or_else"))
+        }
+        _ => false,
+    }
+}
+
 pub(in crate::front::mir) fn is_core_result_method(path: &str, leaf: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
@@ -634,11 +665,8 @@ pub(in crate::front::mir) fn locate_combinator_call(
             || (!site.call_args.is_empty()
                 && matches!(
                     &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::Method { name: m, .. },
-                        args,
-                        ..
-                    } if m == method && *args == site.call_args
+                    OpKind::Call { target, args, .. }
+                        if call_target_leaf(target) == Some(method) && *args == site.call_args
                 ))
     };
     let a = graph
@@ -676,14 +704,12 @@ pub(in crate::front::mir) fn locate_combinator_call(
         ));
     };
     let args = match &graph.blocks[a].operations[ci].kind {
-        OpKind::Call {
-            target: CallTarget::Method { name: m, .. },
-            args,
-            ..
-        } if m == method => args.iter().map(|arg| arg.clone().into_variable()).collect(),
+        OpKind::Call { target, args, .. } if call_target_leaf(target) == Some(method) => {
+            args.iter().map(|arg| arg.clone().into_variable()).collect()
+        }
         other => {
             return Err(format!(
-                "{name}: {method} producer is not a method call: {other:?}"
+                "{name}: {method} producer is not a method or FunctionPath call: {other:?}"
             ));
         }
     };

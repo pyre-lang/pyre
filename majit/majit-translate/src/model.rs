@@ -311,6 +311,12 @@ pub enum CallTarget {
         /// ctors, positional aggregates, and hand-built targets.
         #[serde(default)]
         variant_tag: Option<i64>,
+        /// The payload field was Void (`lltype.py` `Struct._names_without_voids`)
+        /// and was omitted from the FieldWrite chain. Stamped on a Result
+        /// `Ok` ctor by `aggregate_shape` so `result_exc` does not re-parse
+        /// the owner spelling.
+        #[serde(default)]
+        payload_void: bool,
     },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
@@ -487,6 +493,7 @@ impl CallTarget {
             owner_path: Vec::new(),
             is_struct: false,
             variant_tag: None,
+            payload_void: false,
         }
     }
 
@@ -503,6 +510,7 @@ impl CallTarget {
             owner_path,
             is_struct: false,
             variant_tag: None,
+            payload_void: false,
         }
     }
 
@@ -522,6 +530,7 @@ impl CallTarget {
             owner_path,
             is_struct: false,
             variant_tag: Some(variant_tag),
+            payload_void: false,
         }
     }
 
@@ -542,7 +551,17 @@ impl CallTarget {
             owner_path,
             is_struct: true,
             variant_tag: None,
+            payload_void: false,
         }
+    }
+
+    /// Stamp that this ctor's payload field was Void
+    /// (`lltype.py` `Struct._names_without_voids`).
+    pub fn with_payload_void(mut self) -> Self {
+        if let CallTarget::SyntheticTransparentCtor { payload_void, .. } = &mut self {
+            *payload_void = true;
+        }
+        self
     }
 
     pub fn receiver_root(&self) -> Option<&str> {
