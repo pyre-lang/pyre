@@ -4,7 +4,7 @@
 # A try/except INSIDE a hot loop whose body raises through a may-force
 # residual call (`//`, `%`, `int("z")`) on some iterations and is CAUGHT,
 # with the loop CONTINUING afterwards.  The raising op is int-specialized
-# (`GuardFalse(int_eq(divisor, 0))` + bare `IntFloorDiv`); when the divisor
+# (`GuardFalse(int_eq(divisor, 0))`); when the divisor
 # is 0 the precondition guard deopts, the blackhole re-executes the op, it
 # raises, and the in-frame `catch_exception` consumes the exception (v=7).
 # The blackhole then reaches the loop merge point and ContinueRunningNormally

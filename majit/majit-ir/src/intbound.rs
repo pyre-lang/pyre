@@ -731,53 +731,6 @@ impl IntBound {
         IntBound::bounded(lower, upper)
     }
 
-    /// Bound for the truncating `int_floordiv` primitive.
-    ///
-    /// [`Self::py_div_bound`] is the floor form and belongs to `int_py_div`;
-    /// this one rounds toward zero, so the two disagree for a negative
-    /// quotient.
-    pub fn trunc_div_bound(&self, other: &IntBound) -> IntBound {
-        if other.contains(0) || other.lower < 0 && 0 < other.upper {
-            return IntBound::unbounded();
-        }
-        // `i64::MIN / -1` overflows, so leave the corners unevaluated there.
-        if other.contains(-1) && (self.lower == i64::MIN || self.upper == i64::MIN) {
-            return IntBound::unbounded();
-        }
-        let a = self.upper / other.upper;
-        let b = self.upper / other.lower;
-        let c = self.lower / other.upper;
-        let d = self.lower / other.lower;
-        IntBound::bounded(a.min(b).min(c).min(d), a.max(b).max(c).max(d))
-    }
-
-    /// Bound for the truncating `int_mod` primitive.
-    ///
-    /// The remainder is smaller in magnitude than the divisor and carries the
-    /// *dividend's* sign, where [`Self::mod_bound`] — the `int_py_mod` form —
-    /// carries the divisor's.
-    pub fn trunc_mod_bound(&self, other: &IntBound) -> IntBound {
-        let (Some(lo_abs), Some(hi_abs)) = (other.lower.checked_abs(), other.upper.checked_abs())
-        else {
-            return IntBound::unbounded();
-        };
-        let magnitude = lo_abs.max(hi_abs);
-        if magnitude == 0 {
-            return IntBound::unbounded();
-        }
-        let lower = if self.known_nonnegative() {
-            0
-        } else {
-            -(magnitude - 1)
-        };
-        let upper = if self.known_le_const(0) {
-            0
-        } else {
-            magnitude - 1
-        };
-        IntBound::bounded(lower, upper)
-    }
-
     /// Bound after left shift.
     pub fn lshift_bound(&self, other: &IntBound) -> IntBound {
         let (mut tvalue, mut tmask) = (0u64, u64::MAX); // TNUM_UNKNOWN

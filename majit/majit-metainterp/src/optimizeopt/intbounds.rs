@@ -517,23 +517,6 @@ impl OptIntBoundsState {
         self.intersect_bound(res_box, &b, ctx);
     }
 
-    fn postprocess_int_floordiv(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
-        let b0 = self.getintbound_arg(&op.arg(0), ctx);
-        let b1 = self.getintbound_arg(&op.arg(1), ctx);
-        let b = b0.trunc_div_bound(&b1);
-        self.intersect_bound(res_box, &b, ctx);
-    }
-
-    fn postprocess_int_mod(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
-        let b0 = self.getintbound_arg(&op.arg(0), ctx);
-        let b1 = self.getintbound_arg(&op.arg(1), ctx);
-        // `IntMod` truncates, so `mod_bound`'s `0 <= x % pos < pos` does not
-        // hold for a negative dividend; that one belongs to the `int_py_mod`
-        // call, which `postprocess_call` still attaches it to.
-        let b = b0.trunc_mod_bound(&b1);
-        self.intersect_bound(res_box, &b, ctx);
-    }
-
     fn postprocess_int_neg(&mut self, op: &Op, res_box: &Operand, ctx: &mut OptContext) {
         let b = self.getintbound_arg(&op.arg(0), ctx);
         let result = b.neg_bound();
@@ -1649,8 +1632,6 @@ impl OptIntBoundsState {
                 | OpCode::IntLshift
                 | OpCode::IntRshift
                 | OpCode::UintRshift
-                | OpCode::IntFloorDiv
-                | OpCode::IntMod
                 | OpCode::IntNeg
                 | OpCode::IntInvert
                 | OpCode::IntForceGeZero
@@ -1709,8 +1690,6 @@ impl OptIntBoundsState {
             OpCode::IntLshift => self.postprocess_int_lshift(op, &res_box, ctx),
             OpCode::IntRshift => self.postprocess_int_rshift(op, &res_box, ctx),
             OpCode::UintRshift => self.postprocess_uint_rshift(op, &res_box, ctx),
-            OpCode::IntFloorDiv => self.postprocess_int_floordiv(op, &res_box, ctx),
-            OpCode::IntMod => self.postprocess_int_mod(op, &res_box, ctx),
             OpCode::IntNeg => self.postprocess_int_neg(op, &res_box, ctx),
             OpCode::IntInvert => self.postprocess_int_invert(op, &res_box, ctx),
             OpCode::IntForceGeZero => self.postprocess_int_force_ge_zero(op, &res_box, ctx),

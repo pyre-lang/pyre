@@ -7953,10 +7953,6 @@ fn build_function(
             OpCode::IntAdd => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Add),
             OpCode::IntSub => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Sub),
             OpCode::IntMul => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Mul),
-            OpCode::IntFloorDiv => {
-                emit_binop(&mut sink, constants, value_types, op, BinOp::I64DivS)
-            }
-            OpCode::IntMod => emit_binop(&mut sink, constants, value_types, op, BinOp::I64RemS),
             OpCode::IntAnd => emit_binop(&mut sink, constants, value_types, op, BinOp::I64And),
             OpCode::IntOr => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Or),
             OpCode::IntXor => emit_binop(&mut sink, constants, value_types, op, BinOp::I64Xor),
@@ -13045,8 +13041,6 @@ enum BinOp {
     I64Add,
     I64Sub,
     I64Mul,
-    I64DivS,
-    I64RemS,
     I64And,
     I64Or,
     I64Xor,
@@ -13065,12 +13059,6 @@ fn apply_binop(sink: &mut PeepSink<'_, '_>, op: BinOp) {
         }
         BinOp::I64Mul => {
             sink.i64_mul();
-        }
-        BinOp::I64DivS => {
-            sink.i64_div_s();
-        }
-        BinOp::I64RemS => {
-            sink.i64_rem_s();
         }
         BinOp::I64And => {
             sink.i64_and();

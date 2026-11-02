@@ -851,9 +851,6 @@ impl<'a> RegAlloc<'a> {
             OpCode::IntForceGeZero if op.num_args() != 0 => {
                 self.consider_int_force_ge_zero(dst, &args[0], i, asm);
             }
-            OpCode::IntFloorDiv | OpCode::IntMod if op.num_args() >= 2 => {
-                self._consider_binop(dst, &args[0], &args[1], i, asm);
-            }
             OpCode::UintMulHigh if op.num_args() >= 2 => {
                 self.consider_uint_mul_high(dst, &args[0], &args[1], i, asm);
             }

@@ -5834,20 +5834,6 @@ pub fn eval_binop_i(opcode: OpCode, lhs: i64, rhs: i64) -> i64 {
         OpCode::IntAdd | OpCode::IntAddOvf => lhs.wrapping_add(rhs),
         OpCode::IntSub | OpCode::IntSubOvf => lhs.wrapping_sub(rhs),
         OpCode::IntMul | OpCode::IntMulOvf => lhs.wrapping_mul(rhs),
-        OpCode::IntFloorDiv => {
-            if rhs == 0 {
-                0
-            } else {
-                lhs.wrapping_div(rhs)
-            }
-        }
-        OpCode::IntMod => {
-            if rhs == 0 {
-                0
-            } else {
-                lhs.wrapping_rem(rhs)
-            }
-        }
         OpCode::IntAnd => lhs & rhs,
         OpCode::IntSignext => crate::support::int_signext(lhs, rhs),
         OpCode::IntOr => lhs | rhs,

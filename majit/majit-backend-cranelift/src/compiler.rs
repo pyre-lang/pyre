@@ -14440,16 +14440,6 @@ impl CraneliftBackend {
                     let r = builder.ins().imul(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
-                OpCode::IntFloorDiv => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
-                    let r = builder.ins().sdiv(a, b);
-                    builder.def_var(var(&opref_var_map, vi), r);
-                }
-                OpCode::IntMod => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
-                    let r = builder.ins().srem(a, b);
-                    builder.def_var(var(&opref_var_map, vi), r);
-                }
 
                 // ── Overflow arithmetic ──
                 // Compute the result normally, then detect signed overflow
@@ -29394,32 +29384,6 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[Value::Int(6), Value::Int(7)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
-    }
-
-    #[test]
-    fn test_int_floor_div() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-                OpRef::NONE.raw(),
-            ),
-            mk_op(
-                OpCode::IntFloorDiv,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-                2,
-            ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-        ];
-
-        let token = JitCellToken::new(3);
-        backend.compile_loop(&inputargs, &ops, &token).unwrap();
-
-        let frame = backend.execute_token(&token, &[Value::Int(42), Value::Int(6)]);
-        assert_eq!(backend.get_int_value(&frame, 0), 7);
     }
 
     #[test]

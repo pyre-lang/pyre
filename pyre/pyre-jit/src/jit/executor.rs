@@ -106,9 +106,8 @@ pub fn bhimpl_int_mod(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     }
 }
 
-/// `support.py _ll_2_int_floordiv` — the truncating primitive the
-/// `IntFloorDiv` opcode is, as distinct from the floor helper above that the
-/// `int_py_div` call reaches.
+/// `support.py _ll_2_int_floordiv` — the truncating primitive, as distinct from
+/// the floor helper above that the `int_py_div` call reaches.
 pub fn _ll_2_int_floordiv(a: ConcreteValue, b: ConcreteValue) -> ConcreteValue {
     match (a.getint(), b.getint()) {
         (Some(x), Some(y)) if y != 0 => ConcreteValue::Int(x.wrapping_div(y)),
@@ -358,24 +357,6 @@ pub fn execute_opcode(opcode: majit_ir::OpCode, args: &[ConcreteValue]) -> (Conc
             } else {
                 (ConcreteValue::Null, false)
             }
-        }
-        // The truncating primitives, not the floor helpers the `int_py_div` /
-        // `int_py_mod` calls reach.
-        OpCode::IntFloorDiv => {
-            let v = if args.len() >= 2 {
-                _ll_2_int_floordiv(args[0], args[1])
-            } else {
-                ConcreteValue::Null
-            };
-            (v, false)
-        }
-        OpCode::IntMod => {
-            let v = if args.len() >= 2 {
-                _ll_2_int_mod(args[0], args[1])
-            } else {
-                ConcreteValue::Null
-            };
-            (v, false)
         }
         OpCode::IntAnd => {
             let v = if args.len() >= 2 {

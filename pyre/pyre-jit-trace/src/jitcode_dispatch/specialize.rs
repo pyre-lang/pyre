@@ -11522,11 +11522,7 @@ fn walker_emit_range_length<Sym: WalkSym>(
         return Ok(None);
     };
     // `//` through the same `ll_int_py_div` pure call the `BINARY_OP` integer
-    // fold emits.  `OpCode::IntFloorDiv` would be the direct spelling, but the
-    // dynasm backend carries a regalloc arm for it and no assembler arm on
-    // either architecture, so it lowers to nothing and the destination keeps
-    // an operand: this quotient came back as its own dividend for a positive
-    // step and as the divisor for a negative one.  Both operands are
+    // fold emits.  Both operands are
     // non-negative here (`positive_step` is guarded above and `diff` follows
     // the ordering guard), where floor and truncation agree, so the two
     // spellings compute the same value.

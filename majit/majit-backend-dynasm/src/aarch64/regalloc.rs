@@ -606,9 +606,6 @@ impl<'a> RegAlloc<'a> {
             OpCode::IntForceGeZero if op.num_args() != 0 => {
                 self.prepare_op_int_force_ge_zero(dst, &args[0], i, asm);
             }
-            OpCode::IntFloorDiv | OpCode::IntMod if op.num_args() >= 2 => {
-                self.prepare_op_int_mul(dst, &args[0], &args[1], i, asm);
-            }
             OpCode::UintMulHigh if op.num_args() >= 2 => {
                 self.prepare_op_int_mul(dst, &args[0], &args[1], i, asm);
             }
