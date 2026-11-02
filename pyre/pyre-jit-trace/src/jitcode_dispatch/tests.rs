@@ -664,6 +664,60 @@ fn send_ex_continuation_pending_slot_holds_the_portal_result() {
     assert_eq!(parent.boxes[1], generator);
 }
 
+#[test]
+fn send_ex_frame_nonnull_guard_records_unless_the_box_is_a_constant() {
+    // `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) is
+    // `getfield_gc_r` of `inst_frame` then `guard_nonnull`. A ConstPtr
+    // subject is already decided (`pyjitpl.py` `generate_guard`).
+    let mut tc = fresh_trace_ctx();
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    with_hint_walk_context(
+        &mut tc,
+        &mut [frame_box],
+        &mut [ConcreteValue::Ref(
+            0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+        )],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            record_send_ex_frame_nonnull_guard(wc, 0, frame_box)
+                .expect("a live frame box records GuardNonnull");
+        },
+    );
+    let last = tc.ops().last().expect("recorded op");
+    assert_eq!(last.opcode, majit_ir::OpCode::GuardNonnull);
+    assert_eq!(last.num_args(), 1);
+    assert_eq!((&*last.getarglist())[0].to_opref(), frame_box);
+
+    let mut tc = fresh_trace_ctx();
+    let frame_box = OpRef::const_ptr(majit_ir::GcRef(0xdead_beef));
+    let ops_before = tc.num_ops();
+    with_hint_walk_context(
+        &mut tc,
+        &mut [frame_box],
+        &mut [ConcreteValue::Ref(
+            0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
+        )],
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            record_send_ex_frame_nonnull_guard(wc, 0, frame_box)
+                .expect("a known nonnull constant skips the guard");
+        },
+    );
+    assert_eq!(tc.num_ops(), ops_before);
+    assert!(
+        !tc.ops()
+            .iter()
+            .any(|op| op.opcode == majit_ir::OpCode::GuardNonnull),
+        "a ConstPtr frame is already decided; generate_guard skips it",
+    );
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,

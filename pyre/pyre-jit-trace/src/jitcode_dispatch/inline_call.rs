@@ -17889,6 +17889,24 @@ mod send_ex_continuation_tests {
     }
 }
 
+/// `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) reads
+/// `frame = self.frame` and handles `frame is None` first. Record
+/// `GuardNonnull` on the GETFIELD box, with a FOR_ITER resume snapshot,
+/// before any read through that box. `generate_guard` (`pyjitpl.py`)
+/// skips a Const subject: a known nonnull constant is already decided.
+pub(crate) fn record_send_ex_frame_nonnull_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_box: OpRef,
+) -> Result<(), DispatchError> {
+    if frame_box.is_constant() {
+        return Ok(());
+    }
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardNonnull, &[frame_box], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)
+}
+
 /// `_send_ex` after `_invoke_execute_frame`: `frame.frame_finished_execution`
 /// is `PyFrame.flags` masked with `FLAG_FRAME_FINISHED`. Guard failure
 /// resumes at the send_ex tail so `bh_send_ex_tail` returns the same
@@ -18223,6 +18241,13 @@ fn walk_generator_resume<Sym: WalkSym>(
         frame_box,
         majit_ir::Value::Ref(majit_ir::GcRef(gen_frame as usize)),
     );
+    // `_send_ex` (`generator.py` `GeneratorOrCoroutine._send_ex`) reads
+    // `frame = self.frame` and handles `frame is None` first. The pypy3
+    // trace is `getfield_gc_r(p, descr=<...inst_frame>)` then
+    // `guard_nonnull`. Capture while `inline_subwalk` is still the
+    // caller's so the snapshot is the FOR_ITER frame, matching the
+    // iterator GuardClass / pycode GuardValue snapshots above.
+    record_send_ex_frame_nonnull_guard(ctx, op.pc, frame_box)?;
     let last_instr_box = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         frame_box,
