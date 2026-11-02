@@ -623,7 +623,8 @@ pub(super) fn send_extra_operation_from(
     if ctx.in_final_emission {
         ctx.emit_rc(op.clone());
     } else if let Some(opt) = optimizer.as_deref_mut() {
-        if let Err(crate::optimize::InvalidLoop(reason)) = opt.send_extra_operation(op, ctx) {
+        if let Err(crate::optimize::InvalidLoop(reason)) = opt.send_extra_operation_in_pass(op, ctx)
+        {
             ctx.signal_invalid_loop(reason);
         }
     } else {
@@ -2176,6 +2177,24 @@ impl Optimizer {
         ctx.register_extra_producer(op_rc);
         let saved = ctx.current_pass_idx;
         let result = self.propagate_from_pass(0, op_rc, ctx);
+        ctx.current_pass_idx = saved;
+        result
+    }
+
+    /// `self.optimizer.send_extra_operation(op)` called from inside an
+    /// optimization; the chain ends at the `Optimizer`, so a trailing
+    /// streaming `OptUnroll` is not entered (same bound as
+    /// `send_extra_operation_after`).
+    pub(super) fn send_extra_operation_in_pass(
+        &mut self,
+        op_rc: &OpRc,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        ctx.assign_extra_pos(op_rc);
+        ctx.register_extra_producer(op_rc);
+        let saved = ctx.current_pass_idx;
+        let end_pass = self.extra_operation_end_pass();
+        let result = self.propagate_from_pass_range(0, end_pass, op_rc, ctx);
         ctx.current_pass_idx = saved;
         result
     }

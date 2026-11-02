@@ -3438,12 +3438,6 @@ impl OptContext {
         OpRef::op_typed(pos, value.get_type())
     }
 
-    /// info.py emit during force_box: routes through emit_extra
-    /// normally, or direct emit when in_final_emission is true.
-    pub fn emit_for_force(&mut self, op: Op) -> OpRef {
-        self.emit_for_force_with(&mut None, op)
-    }
-
     /// `emit_for_force` with the owning `Optimizer`, so a force-time STRLEN
     /// or string store follows `Optimization.emit_extra` immediately
     /// (`send_extra_operation_after`). Past the last pass the walk ends in
@@ -3458,11 +3452,6 @@ impl OptContext {
         op: Op,
     ) -> OpRef {
         self.emit_for_force_rc_with(optimizer, majit_ir::OpRc::new(op))
-    }
-
-    /// `emit_for_force` when the caller keeps the op as its box.
-    pub fn emit_for_force_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
-        self.emit_for_force_rc_with(&mut None, op)
     }
 
     /// `emit_for_force_rc` with the owning `Optimizer`. See `emit_for_force_with`.
@@ -3521,18 +3510,11 @@ impl OptContext {
         }
     }
 
-    /// vstring.py getstrlen / 171-175 / 251-253 / 281-295
-    /// Per-subclass getstrlen() dispatch — returns a cached lgtop box if
-    /// available, or computes/emits the length and caches in StrPtrInfo.lgtop.
-    /// Always returns a box, never an i64 summary.
-    ///
-    /// Delegates to `getstrlen_for(opref, opref, mode)`.
-    pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> Operand {
-        self.getstrlen_opref_with(&mut None, opref, mode)
-    }
-
-    /// `getstrlen_opref` with the owning `Optimizer` (`vstring.py`
-    /// `optstring.emit_extra` for the STRLEN, via `emit_for_force_rc_with`).
+    /// vstring.py `getstrlen` / `StrPtrInfo.getstrlen` — per-subclass dispatch
+    /// returns a cached lgtop box if available, or computes/emits the length
+    /// and caches in StrPtrInfo.lgtop. Always returns a box, never an i64
+    /// summary. With the owning `Optimizer` (`optstring.emit_extra` for the
+    /// STRLEN, via `emit_for_force_rc_with`).
     pub(crate) fn getstrlen_opref_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
@@ -3549,11 +3531,6 @@ impl OptContext {
     /// emission uses `op_opref`.  Cached lgtop is stored on `info_opref`'s
     /// PtrInfo.
     ///
-    /// When both are the same, use `getstrlen_opref(opref, mode)` instead.
-    pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> Operand {
-        self.getstrlen_for_with(&mut None, info_opref, op_opref, mode)
-    }
-
     /// `getstrlen_for` with the owning `Optimizer`. Entry index stays
     /// `current_pass_idx + 1` (`emit_for_force`); it is not retargeted at
     /// `optstring`.
@@ -3621,17 +3598,12 @@ impl OptContext {
         };
         let arg1 = self.materialize_operand_at(op_resolved);
         let lengthop = majit_ir::OpRc::new(majit_ir::Op::new(strlen_opcode, &[arg1]));
-        // vstring.py StrPtrInfo.getstrlen: `optstring.emit_extra(lengthop)`.
-        // Optimization.emit_extra → send_extra_operation down the rest of
-        // the chain; during force (`in_final_emission`) that lands in
-        // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
-        // `emit_for_force_rc` is that routing. `emit_extra_rc` queues the
-        // STRLEN after the NEWSTR/COPYSTRCONTENT that consume it.
-        self.emit_for_force_rc_with(optimizer, lengthop.clone());
         let result = Operand::from_bound_op(&lengthop);
-        // vstring.py: lengthop.set_forwarded(self.getlenbound(mode)). The
-        // lenbound is lazily installed on the StrPtrInfo, a PtrInfo-internal
-        // mutation.
+        // vstring.py StrPtrInfo.getstrlen: `lengthop.set_forwarded(self.getlenbound(mode))`
+        // then `self.lgtop = lengthop` before `string_optimizer.emit_extra(lengthop)`.
+        // Bound and lgtop are attached before the emit so remaining passes and a
+        // nested length query on the same string see them. The lenbound is lazily
+        // installed on the StrPtrInfo, a PtrInfo-internal mutation.
         let lenbound = self
             .get_box_replacement_operand_opt(info_opref)
             .as_ref()
@@ -3639,10 +3611,16 @@ impl OptContext {
         if let Some(bound) = lenbound {
             self.setintbound(&result, &bound);
         }
-        // vstring.py:117: self.lgtop = lengthop
+        // vstring.py StrPtrInfo.getstrlen: `self.lgtop = lengthop`
         if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
             self.set_str_lgtop(&b, result.clone());
         }
+        // vstring.py StrPtrInfo.getstrlen: `string_optimizer.emit_extra(lengthop)`.
+        // Optimization.emit_extra → send_extra_operation down the rest of
+        // the chain; during force (`in_final_emission`) that lands in
+        // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
+        // `emit_for_force_rc` is that routing.
+        self.emit_for_force_rc_with(optimizer, lengthop.clone());
         result
     }
 
@@ -10387,7 +10365,7 @@ mod getstrlen_force_tests {
                 avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
             }),
         );
-        let _ = ctx.getstrlen_opref(arg, 0);
+        let _ = ctx.getstrlen_opref_with(&mut None, arg, 0);
         assert!(
             ctx.extra_operations_after.is_empty(),
             "force-time getstrlen must emit STRLEN immediately"

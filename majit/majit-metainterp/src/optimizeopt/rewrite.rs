@@ -2238,15 +2238,16 @@ impl OptRewrite {
                     // RPython: LoopInvariantOp.produce_op stores PreambleOp
                     // in loop_invariant_results during import. Transfer from
                     // ctx.imported_loop_invariant_results on first access.
+                    let already_cached = self
+                        .loop_invariant_results
+                        .borrow()
+                        .iter()
+                        .any(|(k, _)| *k == func_val);
                     if let Some(&(_, source)) = ctx
                         .imported_loop_invariant_results
                         .iter()
                         .find(|(k, _)| *k == func_val)
-                        && !self
-                            .loop_invariant_results
-                            .borrow()
-                            .iter()
-                            .any(|(k, _)| *k == func_val)
+                        && !already_cached
                     {
                         // RPython shortpreamble.py:158-159. Dual-slot case:
                         // `produce_loop_invariant` installs
@@ -2276,9 +2277,8 @@ impl OptRewrite {
                     }
                     // rewrite.py:453-458: isinstance(resvalue, PreambleOp)
                     // → force_op_from_preamble → replace in dict
-                    if let Some(entry) =
-                        self.loop_invariant_results.borrow().get(&func_val).cloned()
-                    {
+                    let cached = self.loop_invariant_results.borrow().get(&func_val).cloned();
+                    if let Some(entry) = cached {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
                                 // unroll.py: force_op_from_preamble(preamble_op)
@@ -2862,6 +2862,45 @@ mod tests {
 
     fn assert_forward(ctx: &OptContext, from: OpRef, to: OpRef) {
         assert_eq!(ctx.get_replacement_opref(from), to);
+    }
+
+    /// Imported `Preamble` cache hit: `force_op_from_preamble` then replace
+    /// the dict entry with the forced `Direct` result (`rewrite.py`
+    /// `optimize_CALL_LOOPINVARIANT`).
+    #[test]
+    fn test_call_loopinvariant_preamble_hit_forces_and_caches() {
+        let func_val = 0xCAFE_i64;
+        let source = OpRef::int_op(1);
+        let mut ctx = OptContext::new(4);
+        // `force_op_from_preamble_op` requires a short-preamble producer.
+        ctx.initialize_imported_short_preamble_builder(&[], &[], &[]);
+        let source_op = ctx.materialize_operand_at(source);
+        let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
+        replay.pos().set(ctx.get_replacement_opref(source));
+        let pass = OptRewrite::new();
+        pass.loop_invariant_results.borrow_mut().insert(
+            func_val,
+            LoopInvariantEntry::Preamble(PreambleOp {
+                op: source_op,
+                invented_name: false,
+                preamble_op: OpRc::new(replay),
+                same_as_source: None,
+            }),
+        );
+
+        let func = Operand::const_from_value(Value::Int(func_val));
+        let mut op = Op::new(OpCode::CallLoopinvariantI, &[func]);
+        op.pos().set(OpRef::int_op(2));
+        resolve_op_args_in_ctx(&mut op, &mut ctx);
+        let op_rc = OpRc::new(op.clone());
+        ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+        let result = pass.propagate_forward(&op, &op_rc, &mut None, &mut ctx);
+        assert!(matches!(result, OptimizationResult::Remove));
+        let cached = pass.loop_invariant_results.borrow().get(&func_val).cloned();
+        match cached {
+            Some(LoopInvariantEntry::Direct(_)) => {}
+            other => panic!("expected Direct after Preamble hit, got {other:?}"),
+        }
     }
 
     /// Run the rewrite pass on a sequence of ops and return the optimized ops.
