@@ -1877,7 +1877,7 @@ pub fn live_bridge_ref_addr(
 ///     vrefinfo.continue_tracing(vrefbox.getref_base(),
 ///                               virtualbox.getref_base())
 /// ```
-pub(crate) fn reconnect_virtualrefs(
+pub fn reconnect_virtualrefs(
     ctx: &mut crate::TraceCtx,
     virtualref_boxes: Vec<(OpRef, usize)>,
     cache: &BridgeVirtualCache<'_>,

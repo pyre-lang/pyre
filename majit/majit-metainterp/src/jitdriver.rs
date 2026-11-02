@@ -172,6 +172,17 @@ fn consume_vable_identity_addr(boxes: &crate::VrefVableBoxes) -> Option<usize> {
     }
 }
 
+/// Consume-decoded box address: a `Value::Ref` pointer, an `Int` word,
+/// otherwise 0. `pyjitpl.py rebuild_state_after_failure` reads
+/// `getref_base()` off each virtualref box.
+fn value_to_usize(value: &majit_ir::Value) -> usize {
+    match value {
+        majit_ir::Value::Ref(r) => r.as_usize(),
+        majit_ir::Value::Int(n) => *n as usize,
+        _ => 0,
+    }
+}
+
 /// `MAJIT_BH_ENTRY_EXC`: report a `BH_LAST_EXC_VALUE` that survived into a
 /// blackhole drive the caller did not describe as raising.
 ///
@@ -11296,10 +11307,11 @@ impl<S: JitState> JitDriver<S> {
         //   * `ResumeDataResult.virtualref_values` (vref pair stream) is
         //     restored into `TraceCtx.virtualref_boxes` and each pair fires
         //     `vrefinfo.continue_tracing(vref, virtual)`
-        //     (`virtualref.py`) inside
-        //     `pyre-jit-trace::state::setup_bridge_sym` — matches the
-        //     `consume_virtualref_info` half of `consume_vref_and_vable`
-        //     (resume.py).
+        //     (`virtualref.py`) in `start_bridge_tracing` after
+        //     `rebuild_from_resumedata` and before `setup_bridge_sym` —
+        //     `MetaInterp.rebuild_state_after_failure` order
+        //     (`consume_virtualref_info` half of `consume_vref_and_vable`,
+        //     resume.py).
         //   * `ResumeDataResult.virtualizable_boxes` (vable scalar +
         //     array stream) is restored into `sym` via
         //     `seed_virtualizable_boxes`, populating
@@ -11736,6 +11748,33 @@ impl<S: JitState> JitDriver<S> {
                 if let Some(addr) = consume_vable_identity_addr(&boxes) {
                     ctx.set_virtualizable_heap_ptr(addr as *const u8);
                 }
+                // pyjitpl.py `MetaInterp.rebuild_state_after_failure`:
+                // `self.virtualref_boxes = virtualref_boxes` then
+                // `vrefinfo.continue_tracing(vref, virtual)` per pair,
+                // before the virtualizable fill (`setup_bridge_sym`).
+                let virtualref_boxes: Vec<(OpRef, usize)> = boxes
+                    .virtualref_boxes
+                    .iter()
+                    .map(|&(op, val)| (op, value_to_usize(&val)))
+                    .collect();
+                crate::resume_box_reader::reconnect_virtualrefs(ctx, virtualref_boxes, &reader);
+                // pyjitpl.py `MetaInterp.rebuild_state_after_failure`.
+                // Assembler (virtualizable.py case 4) into tracing (case 2):
+                // `virtualizable = unwrap_virtualizable_box(virtualizable_boxes[-1])`
+                // then `reset_token_gcref`. `consume_vable_identity_addr` is
+                // that last box; `standard_virtualizable_ptr` is not seeded
+                // until `setup_bridge_sym`.
+                if let Some(info) = &vable_info
+                    && info.has_vable_token()
+                {
+                    if let Some(ptr) = consume_vable_identity_addr(&boxes) {
+                        unsafe {
+                            if info.is_token_nonnull_gcref(ptr as *const u8) {
+                                info.reset_token_gcref(ptr as *mut u8);
+                            }
+                        }
+                    }
+                }
                 S::setup_bridge_sym(
                     sym,
                     ctx,
@@ -11746,25 +11785,6 @@ impl<S: JitState> JitDriver<S> {
                     &mut reader,
                     &boxes,
                 );
-                // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail.
-                // Assembler (virtualizable.py case 4) into tracing (case 2):
-                // `virtualizable = unwrap_virtualizable_box(virtualizable_boxes[-1])`
-                // then `reset_token_gcref`. `standard_virtualizable_ptr` is
-                // that last box; fall back to the consume-stream identity.
-                if let Some(info) = &vable_info
-                    && info.has_vable_token()
-                {
-                    let ptr = ctx
-                        .standard_virtualizable_ptr()
-                        .or_else(|| consume_vable_identity_addr(&boxes));
-                    if let Some(ptr) = ptr {
-                        unsafe {
-                            if info.is_token_nonnull_gcref(ptr as *const u8) {
-                                info.reset_token_gcref(ptr as *mut u8);
-                            }
-                        }
-                    }
-                }
                 if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
                     ctx.synchronize_virtualizable_after_guard_failure();
                 }
@@ -16756,6 +16776,140 @@ mod tests {
             1,
             "call_jit skips a second rebuild_from_resumedata when frames are already seated"
         );
+    }
+
+    #[test]
+    fn bridge_reconnects_vrefs_and_resets_token_before_setup_bridge_sym() {
+        // `rebuild_state_after_failure` reconnects vrefs then resets the
+        // vable token, then fills the virtualizable (`setup_bridge_sym`).
+        // Token reset is not asserted: this scaffolding has no vable_info.
+        use majit_ir::resumedata::RebuiltFrame;
+        use majit_jitcode::insns::BC_LIVE;
+        use majit_jitcode::jitcode::JitCodeBody;
+
+        struct BridgeVrefOrderState;
+        impl JitState for BridgeVrefOrderState {
+            type Meta = ();
+            type Sym = ();
+            type Env = ();
+            fn build_meta(&self, _: usize, _: &()) {}
+            fn extract_live(&mut self, _: &()) -> Vec<i64> {
+                vec![0]
+            }
+            fn create_sym(_: &(), _: usize) {}
+            fn is_compatible(&self, _: &()) -> bool {
+                true
+            }
+            fn restore(&mut self, _: &(), _: &[i64]) {}
+            fn collect_jump_args(_: &()) -> Vec<OpRef> {
+                vec![]
+            }
+            fn validate_close(_: &(), _: &()) -> bool {
+                true
+            }
+            fn rebuild_from_resumedata(
+                _: &mut (),
+                fail_arg_types: &[Type],
+                storage: Option<&Arc<crate::resume::ResumeStorage>>,
+            ) -> Option<crate::ResumeDataResult> {
+                assert!(fail_arg_types.is_empty());
+                Some(crate::ResumeDataResult {
+                    frames: vec![RebuiltFrame {
+                        jitcode_index: 0,
+                        pc: 0,
+                        values: vec![],
+                    }],
+                    virtualizable_boxes: vec![],
+                    virtualref_values: vec![],
+                    storage: storage.cloned(),
+                    num_failargs: 0,
+                    fail_arg_types: vec![],
+                })
+            }
+            fn consume_vref_and_vable_boxes(
+                _: &mut (),
+                _: &mut crate::TraceCtx,
+                _: &crate::ResumeDataResult,
+                _: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                _: &[i64],
+                _: &[Type],
+                _: &mut crate::BridgeVirtualCache<'_>,
+            ) -> crate::VrefVableBoxes {
+                let mut boxes = crate::VrefVableBoxes::default();
+                boxes.virtualref_boxes = vec![
+                    (OpRef::NONE, Value::Ref(GcRef(0))),
+                    (OpRef::NONE, Value::Ref(GcRef(0))),
+                ];
+                boxes
+            }
+            fn setup_bridge_sym(
+                _: &mut (),
+                ctx: &mut crate::TraceCtx,
+                _: &crate::ResumeDataResult,
+                _: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+                _: &[i64],
+                _: &[Type],
+                _: &mut crate::BridgeVirtualCache<'_>,
+                _: &crate::VrefVableBoxes,
+            ) {
+                assert_eq!(
+                    ctx.virtualref_boxes_len(),
+                    2,
+                    "reconnect_virtualrefs must run before setup_bridge_sym"
+                );
+            }
+        }
+
+        let mut driver = JitDriver::<BridgeVrefOrderState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.register_descriptor(JitDriverStaticData::new(vec![], vec![("value", Type::Int)]));
+
+        let jc = crate::jitcode::JitCode::new("bridge-vref-order");
+        let mut startpoints = indexmap::IndexSet::new();
+        startpoints.insert(0);
+        jc.set_body(JitCodeBody {
+            code: vec![BC_LIVE, 0, 0, 0],
+            startpoints: Some(startpoints),
+            ..JitCodeBody::default()
+        });
+        let jitcode = std::sync::Arc::new(jc);
+        {
+            let sd = std::sync::Arc::get_mut(&mut driver.meta.staticdata)
+                .expect("staticdata uniquely owned before tracing");
+            sd.op_live = i32::from(BC_LIVE);
+            sd.jitcodes.push(jitcode.clone());
+        }
+        driver.install_extracted_portal_jitcode(jitcode);
+
+        let green_key = gk(407);
+        let key = green_key.clone();
+        assert!(matches!(
+            driver.meta.force_start_tracing(
+                green_key.get_uhash(),
+                (0, 0),
+                Some((&key.values, &key.types)),
+                None,
+                &[Value::Int(0)]
+            ),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().unwrap();
+            let guard = ctx.record_guard(OpCode::GuardTrue, &[OpRef::input_arg_int(0)], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(guard, &[]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)]);
+        let failure = driver
+            .meta
+            .run_compiled_detailed(green_key.get_uhash(), &[0])
+            .expect("guard should fail");
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
+        let descr = failure.descr_arc.clone().unwrap();
+        drop(failure);
+
+        let mut state = BridgeVrefOrderState;
+        assert!(driver.start_bridge_tracing(&descr, &mut state, &(), &fail_values, 0, false, &[]));
     }
 
     // ── Multi-entry point lifecycle tests ──
