@@ -2417,6 +2417,10 @@ pub struct GeneratorResumeSubwalk {
     /// resumed from again after this yield.  Durable, so every walk-time write
     /// to it is journalled (`fbw_arm_durable_frame_undo`).
     pub frame: usize,
+    /// Shadow-stack slot of `frame`. Recording GETFIELD / GETARRAYITEM /
+    /// guards / snapshots can minor-collect; re-read through this root
+    /// rather than the copied pointer.
+    pub frame_root: usize,
     /// The generator body's `w_code`. `walk_generator_resume` passes this
     /// as the resume walk frame's `WalkFrameStateData.inline_w_code`
     /// (`MIFrame.setup(jitcode)`); merge points read that per-frame field.
