@@ -7260,28 +7260,24 @@ impl<S: JitState> JitDriver<S> {
         )
         .expect("plain handle_fail is ResumeGuardDescr");
         let fd: &dyn majit_ir::FailDescr = rgd;
-        let fail_index = fd.fail_index();
-        let trace_id = fd.trace_id();
+        let descr_id = fd as *const dyn majit_ir::FailDescr as *const () as usize;
         let guard_value_operand = self.meta.resolve_guard_value_operand(fd, &deadframe);
         let descr_owning_key = majit_backend::descr_owning_green_key(fd);
         self.meta
             .record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
         // must_compile tick for bridge threshold counting.
         if crate::majit_log_enabled() {
-            let descr_addr = fd as *const dyn majit_ir::FailDescr as *const () as usize;
             eprintln!(
-                "[jit] handle_fail: fail_index={} trace_id={} descr_addr={:#x} values={}",
-                fail_index,
-                trace_id,
-                descr_addr,
+                "[jit] handle_fail: descr=0x{:x} values={}",
+                descr_id,
                 fd.fail_arg_types().len()
             );
         }
         if failvals_enabled() {
             let raw_values = self.meta.raw_exit_slots_from_deadframe(&deadframe, fd);
             eprintln!(
-                "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
-                fail_index,
+                "@@@FAILVALS descr=0x{:x} resume_pc={} raw_values={:?}",
+                descr_id,
                 crate::compile::guard_resume_pc(fd)
                     .map(|p| p as i64)
                     .unwrap_or(-1),
@@ -7291,9 +7287,8 @@ impl<S: JitState> JitDriver<S> {
         if crate::callee_rca_enabled() {
             let raw_values = self.meta.raw_exit_slots_from_deadframe(&deadframe, fd);
             eprintln!(
-                "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
-                fail_index,
-                trace_id,
+                "[callee-rca][guard-fail] descr=0x{:x} raw_values={:?} exit_types={:?}",
+                descr_id,
                 raw_values,
                 fd.fail_arg_types(),
             );
@@ -7346,8 +7341,6 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 target_pc,
                 green_key,
-                trace_id,
-                fail_index,
             ) {
                 return Some(resume);
             }
@@ -7394,11 +7387,16 @@ impl<S: JitState> JitDriver<S> {
         // MetaInterp on this path).
         self.restore_trace_vable_ptr(None);
         if portal_rca {
+            let descr_id = result
+                .descr_arc
+                .as_ref()
+                .map(majit_ir::descr_identity)
+                .unwrap_or(0);
             eprintln!(
                 "[portal-rca][compiled-exit] green_key={green_key} \
-                 dispatch_key={selected_dispatch_key} is_finish={} fail_index={} \
+                 dispatch_key={selected_dispatch_key} is_finish={} descr=0x{:x} \
                  typed_values={:?}",
-                result.is_finish, result.fail_index, result.typed_values
+                result.is_finish, descr_id, result.typed_values
             );
         }
 
@@ -7524,8 +7522,7 @@ impl<S: JitState> JitDriver<S> {
         let fd: &dyn majit_ir::FailDescr = descr_arc
             .as_fail_descr()
             .expect("a guard exit carries a FailDescr");
-        let fail_index = fd.fail_index();
-        let trace_id = fd.trace_id();
+        let descr_id = fd as *const dyn majit_ir::FailDescr as *const () as usize;
         let guard_value_operand = result.guard_value_operand;
         // `compile.py handle_fail` `resumedescr.rd_loop_token`.
         let descr_owning_key = result.rd_loop_token;
@@ -7562,12 +7559,9 @@ impl<S: JitState> JitDriver<S> {
 
         // must_compile tick for bridge threshold counting.
         if crate::majit_log_enabled() {
-            let descr_addr = fd as *const dyn majit_ir::FailDescr as *const () as usize;
             eprintln!(
-                "[jit] handle_fail: fail_index={} trace_id={} descr_addr={:#x} values={}",
-                fail_index,
-                trace_id,
-                descr_addr,
+                "[jit] handle_fail: descr=0x{:x} values={}",
+                descr_id,
                 fd.fail_arg_types().len()
             );
         }
@@ -7576,8 +7570,8 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.raw_exit_slots_from_deadframe(frame, fd)
             });
             eprintln!(
-                "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
-                fail_index,
+                "@@@FAILVALS descr=0x{:x} resume_pc={} raw_values={:?}",
+                descr_id,
                 crate::compile::guard_resume_pc(fd)
                     .map(|p| p as i64)
                     .unwrap_or(-1),
@@ -7589,9 +7583,8 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.raw_exit_slots_from_deadframe(frame, fd)
             });
             eprintln!(
-                "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
-                fail_index,
-                trace_id,
+                "[callee-rca][guard-fail] descr=0x{:x} raw_values={:?} exit_types={:?}",
+                descr_id,
                 raw_values,
                 fd.fail_arg_types(),
             );
@@ -7658,8 +7651,6 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 target_pc,
                 green_key,
-                trace_id,
-                fail_index,
             ) {
                 return Some(resume);
             }
@@ -7691,8 +7682,6 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         target_pc: usize,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
     ) -> Option<PortalResume> {
         fd.start_compiling();
         struct DoneCompiling<'a>(&'a dyn majit_ir::FailDescr);
@@ -7741,10 +7730,9 @@ impl<S: JitState> JitDriver<S> {
         if let Some(resume) = bridge_pc {
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
+                    "[bridge] guard-resume bridge key={} descr=0x{:x} resume_pc={}",
                     green_key,
-                    trace_id,
-                    fail_index,
+                    fd as *const dyn majit_ir::FailDescr as *const () as usize,
                     resume.resume_pc().unwrap_or(usize::MAX),
                 );
             }
@@ -9680,8 +9668,6 @@ impl<S: JitState> JitDriver<S> {
 
         let is_finish = result.is_finish;
         let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
         // Carried past the finish arm below, which is the one that has none.
         let descr_arc = result.descr_arc.take();
         let guard_value_operand = result.guard_value_operand;
@@ -9756,10 +9742,9 @@ impl<S: JitState> JitDriver<S> {
         if guardlog_enabled() {
             let preview: Vec<i64> = raw_values.iter().take(6).copied().collect();
             eprintln!(
-                "@@@GUARD key={} trace={} fail={} bridge={} nvals={} vals={:?}",
+                "@@@GUARD key={} descr=0x{:x} bridge={} nvals={} vals={:?}",
                 owning_key,
-                trace_id,
-                fail_index,
+                majit_ir::descr_identity(&descr_arc),
                 should_bridge,
                 raw_values.len(),
                 preview
@@ -9774,8 +9759,6 @@ impl<S: JitState> JitDriver<S> {
         // `*args`) and must not outlive the door.
         self.restore_trace_vable_ptr(saved_vable_ptr);
         DetailedDriverRunOutcome::GuardFailure {
-            fail_index,
-            trace_id,
             descr_arc,
             should_bridge,
             owning_key,
@@ -11148,8 +11131,7 @@ impl<S: JitState> JitDriver<S> {
         // deadframe)` threads the descr (`resumedescr`) as the
         // canonical bridge-source identity.  The descr Arc returned by
         // `cpu.get_latest_descr` (`history.py:125`) plays the same role
-        // — `descr_owning_jct(arc).green_key`, `arc.trace_id()` and
-        // `arc.fail_index_per_trace()` are the line-by-line readers.
+        // — `descr_owning_jct(arc).green_key` is the line-by-line reader.
         // Pyre threads `Arc<dyn Descr>` and obtains the `FailDescr`
         // facet via `as_fail_descr()` (sub-trait of `Descr`).
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,

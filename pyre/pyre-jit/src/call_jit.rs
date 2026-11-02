@@ -2260,9 +2260,9 @@ fn jit_blackhole_resume_from_guard(
     let guard_exc = unsafe { (*deadframe).jf_guard_exc as i64 };
 
     // compile.py `resume_in_blackhole(descr, deadframe)`:
-    // recover the failed descr from `descr_addr` (history.py:125
-    // `cpu.get_latest_descr` is the C-ABI carrier) and derive
-    // (trace_id, fail_index) from descr identity.  The recovery is
+    // recover the failed descr from `descr_addr` (`history.py
+    // AbstractFailDescr` / `llmodel.py get_latest_descr` is the C-ABI
+    // carrier).  The recovery is
     // infallible for live JIT code — `Backend::fail_descr_arc_from_addr`
     // panics if the raw value is not a live `FailDescrCell` pointer,
     // matching RPython's `cpu.get_latest_descr(deadframe)`
@@ -2274,8 +2274,7 @@ fn jit_blackhole_resume_from_guard(
     let descr_fd = descr_arc
         .as_fail_descr()
         .expect("fail_descr_arc_from_addr returned non-FailDescr");
-    let trace_id = descr_fd.trace_id();
-    let fail_index = descr_fd.fail_index_per_trace();
+    let descr_id = descr_fd as *const dyn majit_ir::FailDescr as *const () as usize;
     let n_fail_args = descr_fd.fail_arg_types().len();
     // `resume_in_blackhole` reads fail args off the deadframe
     // (`cpu.grab_exc_value` / `get_latest_descr` path in `llmodel.py`).
@@ -2304,8 +2303,8 @@ fn jit_blackhole_resume_from_guard(
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[blackhole-resume] trace={} fail_idx={} nvals={}",
-            trace_id, fail_index, n_fail_args,
+            "[blackhole-resume] descr=0x{:x} nvals={}",
+            descr_id, n_fail_args,
         );
     }
 
@@ -2387,8 +2386,8 @@ fn jit_blackhole_resume_from_guard(
     }
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[blackhole-resume] no rd_numb for trace={} fail={} (force_fn fallback)",
-            trace_id, fail_index,
+            "[blackhole-resume] no rd_numb for descr=0x{:x} (force_fn fallback)",
+            descr_id,
         );
     }
     None
@@ -4129,10 +4128,7 @@ pub fn trace_and_compile_from_bridge(
     let Some(green_key) = bridge_compile_preflight(descr_arc) else {
         return BridgeResolution::ResumeBlackhole;
     };
-    let (trace_id, fail_index) = descr_arc
-        .as_fail_descr()
-        .map(|fd| (fd.trace_id(), fd.fail_index_per_trace()))
-        .unwrap_or((0, 0));
+    let descr_id = majit_ir::descr_identity(descr_arc);
     // compile.py `_trace_and_compile_from_bridge`: `jitdriver_sd` is the
     // failing loop's `rd_loop_token.outermost_jitdriver_sd`.
     let jd_index = failing_loop_jitdriver_index(descr_arc);
@@ -4237,8 +4233,8 @@ pub fn trace_and_compile_from_bridge(
     // Bridge tracing sees the full frame layout — no truncation.
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][bridge-trace] start key={} trace={} fail={} resume_pc={}",
-            green_key, trace_id, fail_index, resume_pc
+            "[jit][bridge-trace] start key={} descr=0x{:x} resume_pc={}",
+            green_key, descr_id, resume_pc
         );
     }
 
@@ -4272,8 +4268,8 @@ pub fn trace_and_compile_from_bridge(
     if !started {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] start_bridge_tracing failed key={} trace={} fail={}",
-                green_key, trace_id, fail_index
+                "[jit][bridge-trace] start_bridge_tracing failed key={} descr=0x{:x}",
+                green_key, descr_id
             );
         }
         return BridgeResolution::ResumeBlackhole;
@@ -4513,8 +4509,8 @@ pub fn trace_and_compile_from_bridge(
         // ticks again.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] uncaught pending exc → blackhole key={} trace={} fail={} resume_pc={}",
-                green_key, trace_id, fail_index, resume_pc
+                "[jit][bridge-trace] uncaught pending exc → blackhole key={} descr=0x{:x} resume_pc={}",
+                green_key, descr_id, resume_pc
             );
         }
         let (driver, _) = crate::eval::driver_pair();
@@ -4834,8 +4830,8 @@ pub fn trace_and_compile_from_bridge(
     if tracing_active {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][bridge-trace] abort: no-bridge key={} trace={} fail={} resume_pc={}",
-                green_key, trace_id, fail_index, resume_pc
+                "[jit][bridge-trace] abort: no-bridge key={} descr=0x{:x} resume_pc={}",
+                green_key, descr_id, resume_pc
             );
         }
         let (driver, _) = crate::eval::driver_pair();
@@ -5687,10 +5683,8 @@ fn jit_ca_handle_guard_failure(
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][ca-bridge] must_compile fired: key={} trace={} fail={}",
-            source_green_key,
-            descr_fd.trace_id(),
-            descr_fd.fail_index_per_trace(),
+            "[jit][ca-bridge] must_compile fired: key={} descr=0x{:x}",
+            source_green_key, descr_fd as *const dyn majit_ir::FailDescr as *const () as usize,
         );
     }
 
@@ -5748,14 +5742,13 @@ fn jit_ca_handle_guard_failure(
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit][ca-bridge] compiled={} key={} trace={} fail={}",
+            "[jit][ca-bridge] compiled={} key={} descr=0x{:x}",
             matches!(
                 resolution,
                 BridgeResolution::CompiledContinue | BridgeResolution::CompiledContinueLive(_)
             ),
             source_green_key,
-            descr_fd.trace_id(),
-            descr_fd.fail_index_per_trace(),
+            descr_fd as *const dyn majit_ir::FailDescr as *const () as usize,
         );
     }
 

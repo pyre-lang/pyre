@@ -10752,11 +10752,6 @@ impl<M: Clone> MetaInterp<M> {
                     return CompileOutcome::Cancelled;
                 }
             };
-            let fail_descr = descr_arc
-                .as_fail_descr()
-                .expect("bridge source op.descr must implement FailDescr");
-            let trace_id = fail_descr.trace_id();
-            let fail_index = fail_descr.fail_index_per_trace();
             // The `@@@GUARD` line in `record_guard_failure_event` names the
             // coordinate a failure arrived at; this names the coordinate a
             // bridge attached to. Only both together answer the question
@@ -10766,12 +10761,14 @@ impl<M: Clone> MetaInterp<M> {
             // failure after this line for the same coordinate is a bridge
             // that did not take.
             if guardlog_enabled() {
-                eprintln!("@@@BRIDGE tid={trace_id} fail={fail_index}");
+                eprintln!(
+                    "@@@BRIDGE descr=0x{:x}",
+                    majit_ir::descr_identity(&descr_arc)
+                );
             }
             let success = self.compile_bridge(
                 origin_key,
                 green_key,
-                fail_index,
                 &descr_arc,
                 bridge_ops,
                 &bridge_inputargs,
@@ -11736,7 +11733,6 @@ impl<M: Clone> MetaInterp<M> {
              at start_retrace_from_guard) must match the trace-context key \
              compile_retrace passes down"
         );
-        let fail_index = fail_descr.fail_index_per_trace();
         let bridge_trace_id = self.alloc_trace_id();
 
         let compiled_constants_typed =
@@ -11829,8 +11825,9 @@ impl<M: Clone> MetaInterp<M> {
                 self.stats.retraces_compiled += 1;
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] attached retrace to guard at key={green_key}, guard={fail_index}, \
+                        "[jit] attached retrace to guard at key={green_key}, descr=0x{:x}, \
                          num_inputs={}",
+                        majit_ir::descr_identity(&bridge.source_descr),
                         inputargs.len()
                     );
                 }
@@ -11864,7 +11861,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.next_global_opref = self.next_global_opref.max(new_high_water);
                 self.remember_compiled_graph_write();
                 drop(_combined_live);
-                self.staticdata.log_bridge_compile(fail_index);
+                self.staticdata.log_bridge_compile();
                 self.stats.bridges_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
                     hook(
@@ -13390,7 +13387,7 @@ impl<M: Clone> MetaInterp<M> {
     /// Run compiled code and return detailed guard failure information.
     ///
     /// Unlike `run_compiled`, this returns the full `CompileResult` including
-    /// the fail_index, which allows the interpreter to handle different guard
+    /// the failing descr, which allows the interpreter to handle different guard
     /// failures differently.
     pub fn run_compiled_detailed(
         &mut self,
@@ -13414,8 +13411,6 @@ impl<M: Clone> MetaInterp<M> {
         let descr: &dyn majit_ir::FailDescr = descr_arc
             .as_fail_descr()
             .expect("get_latest_descr_arc returned a non-FailDescr Descr");
-        let fail_index = descr.fail_index();
-        let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         // Borrowed, not copied — see the sibling
@@ -13432,8 +13427,6 @@ impl<M: Clone> MetaInterp<M> {
             Self::finish_compiled_run_io();
             return Some(CompileResult {
                 typed_values: ExitValues::from_vec(vec![Value::Ref(GcRef(exc as usize))]),
-                fail_index,
-                trace_id,
                 descr_arc: Some(descr_arc),
                 is_finish: true,
                 is_exit_frame_with_exception: true,
@@ -13486,8 +13479,6 @@ impl<M: Clone> MetaInterp<M> {
 
         Some(CompileResult {
             typed_values,
-            fail_index,
-            trace_id,
             descr_arc: (!is_finish).then_some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
@@ -13735,8 +13726,6 @@ impl<M: Clone> MetaInterp<M> {
         // pays no reference count for it. The guard arm below takes the
         // shared hold, since that is the arm whose result outlives the frame.
         let descr: &dyn majit_ir::FailDescr = self.backend.get_latest_descr(&frame);
-        let fail_index = descr.fail_index();
-        let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         // Borrowed, not copied. `warmstate.py execute_assembler` reads
@@ -13762,8 +13751,7 @@ impl<M: Clone> MetaInterp<M> {
                 let repeat_types: &[Type] = repeat_fail.fail_arg_types();
                 let decoded = Self::decode_exit_slots(&self.backend, &frame, repeat_types);
                 std::hint::black_box((
-                    repeat_fail.fail_index(),
-                    repeat_fail.trace_id(),
+                    repeat_fail as *const dyn majit_ir::FailDescr as *const () as usize,
                     repeat_fail.is_finish(),
                     repeat_fail.is_exit_frame_with_exception(),
                     &decoded,
@@ -13795,8 +13783,6 @@ impl<M: Clone> MetaInterp<M> {
             Self::finish_compiled_run_io();
             return CompileResult {
                 typed_values: ExitValues::from_vec(vec![Value::Ref(GcRef(exc as usize))]),
-                fail_index,
-                trace_id,
                 descr_arc: Some(descr_arc),
                 is_finish: true,
                 is_exit_frame_with_exception: true,
@@ -13824,8 +13810,6 @@ impl<M: Clone> MetaInterp<M> {
             // (`handle_fail` / blackhole) never see this arm.
             return CompileResult {
                 typed_values,
-                fail_index,
-                trace_id,
                 descr_arc: None,
                 is_finish,
                 is_exit_frame_with_exception,
@@ -13905,8 +13889,6 @@ impl<M: Clone> MetaInterp<M> {
 
         CompileResult {
             typed_values,
-            fail_index,
-            trace_id,
             descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
@@ -14762,12 +14744,9 @@ impl<M: Clone> MetaInterp<M> {
     /// in handle_fail (compile.py).
     ///
     /// Identity is derived directly from `descr_arc`: the owning JCT's
-    /// `green_key` mirrors `compile.py:725 resumedescr.rd_loop_token.
-    /// loop_token_wref()`, `trace_id` mirrors `assembler.py:227
-    /// self.faildescr.trace_id`, and `fail_index_per_trace` mirrors
-    /// `self.faildescr.index = i`.  The `fallback_green_key` only fires
-    /// when the stamped owning green key is unset; see
-    /// [`Self::owning_key_for_descr`].
+    /// `green_key` mirrors `resumedescr.rd_loop_token.loop_token_wref()`.
+    /// The `fallback_green_key` only fires when the stamped owning green
+    /// key is unset; see [`Self::owning_key_for_descr`].
     ///
     /// Returns (should_compile, owning_green_key).
     ///
@@ -14861,8 +14840,6 @@ impl<M: Clone> MetaInterp<M> {
         let descr_fd = descr_arc
             .as_fail_descr()
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
-        let trace_id = descr_fd.trace_id();
-        let fail_index = descr_fd.fail_index_per_trace();
         if descr_addr == 0 {
             crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
@@ -14932,8 +14909,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         if fired && crate::majit_log_enabled() {
             eprintln!(
-                "[jit] must_compile FIRED: key={} trace={} guard={}",
-                owning_key, trace_id, fail_index
+                "[jit] must_compile FIRED: key={} descr=0x{:x}",
+                owning_key, descr_addr
             );
         }
         (fired, owning_key)
@@ -14982,11 +14959,9 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(4);
         }
         if fired && crate::majit_log_enabled() {
-            let trace_id = rgd.trace_id.load(Ordering::Relaxed);
-            let fail_index = rgd.fail_index_per_trace.load(Ordering::Relaxed);
             eprintln!(
-                "[jit] must_compile FIRED: key={} trace={} guard={}",
-                owning_key, trace_id, fail_index
+                "[jit] must_compile FIRED: key={} descr=0x{:x}",
+                owning_key, descr_addr
             );
         }
         (fired, owning_key)
@@ -15617,7 +15592,6 @@ impl<M: Clone> MetaInterp<M> {
     /// that eventually jumps back to the loop or exits.
     ///
     /// `green_key` identifies the loop containing the guard.
-    /// `fail_index` identifies which guard to bridge from.
     /// `fail_descr` is the FailDescr from the guard that failed.
     /// `bridge_ops` are the recorded bridge trace operations.
     /// `bridge_inputargs` are the input arguments for the bridge.
@@ -15651,7 +15625,6 @@ impl<M: Clone> MetaInterp<M> {
         // five jit-stats counters are byte-identical across the corpus with
         // and without this parameter.  It is a parity correction, not a lever.
         jump_target_key: u64,
-        fail_index: u32,
         fail_descr_arc: &majit_ir::DescrRef,
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
@@ -15676,6 +15649,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_descr: &dyn majit_ir::FailDescr = fail_descr_arc
             .as_fail_descr()
             .expect("compile_bridge: the bridge origin descr is a FailDescr");
+        let descr_id = majit_ir::descr_identity(fail_descr_arc);
         let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
 
         // `pyjitpl.py:2921-2923`:
@@ -15710,8 +15684,8 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compile_bridge: rd_loop_token weakref dead → \
-                         compile.giveup() (pyjitpl.py:2923), key={} fail_index={}",
-                        green_key, fail_index,
+                         compile.giveup() (pyjitpl.py:2923), key={} descr=0x{:x}",
+                        green_key, descr_id,
                     );
                 }
                 self.jitlog_trace_aborted();
@@ -16083,8 +16057,8 @@ impl<M: Clone> MetaInterp<M> {
                 self.jitlog_trace_aborted();
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} fail_index={}",
-                        inv.0, green_key, fail_index
+                        "[jit] compile_bridge: InvalidLoop(\"{}\") at key={} descr=0x{:x}",
+                        inv.0, green_key, descr_id
                     );
                 }
                 return false;
@@ -16177,9 +16151,9 @@ impl<M: Clone> MetaInterp<M> {
             // correct CLT for newly compiled bridge-internal guards.
             if crate::majit_log_enabled() {
                 eprintln!(
-                    "[jit] calling backend.compile_bridge: key={} guard={} ops={}",
+                    "[jit] calling backend.compile_bridge: key={} descr=0x{:x} ops={}",
                     green_key,
-                    fail_index,
+                    descr_id,
                     optimized_ops.len()
                 );
             }
@@ -16236,8 +16210,8 @@ impl<M: Clone> MetaInterp<M> {
                     );
                     if is_invalid_loop && crate::majit_log_enabled() {
                         eprintln!(
-                            "[jit] bridge compile_bridge InvalidLoop key={} guard={}",
-                            green_key, fail_index
+                            "[jit] bridge compile_bridge InvalidLoop key={} descr=0x{:x}",
+                            green_key, descr_id
                         );
                     }
                     Err(majit_backend::BackendError::CompilationFailed(
@@ -16258,8 +16232,8 @@ impl<M: Clone> MetaInterp<M> {
                 self.last_compiled_artifact_token = Some(source_jct.clone());
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] compiled bridge at key={}, guard={}",
-                        green_key, fail_index
+                        "[jit] compiled bridge at key={}, descr=0x{:x}",
+                        green_key, descr_id
                     );
                 }
                 // compile.py store_hash for bridge guards.
@@ -16302,7 +16276,7 @@ impl<M: Clone> MetaInterp<M> {
                 let new_high_water = compute_next_global_opref(bridge_inputargs, &optimized_ops);
                 self.next_global_opref = self.next_global_opref.max(new_high_water);
                 self.remember_compiled_graph_write();
-                self.staticdata.log_bridge_compile(fail_index);
+                self.staticdata.log_bridge_compile();
                 self.stats.bridges_compiled += 1;
                 // `cpu.tracker.total_compiled_bridges` is bumped inside
                 // `Backend::compile_bridge` via `clt.compiling_a_bridge()`
@@ -16611,15 +16585,11 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr: &majit_ir::DescrRef,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
         fail_values: &[i64],
     ) -> Option<(Vec<i64>, Vec<i64>)> {
         self.handle_async_forcing_with_allocator(
             descr,
             green_key,
-            trace_id,
-            fail_index,
             fail_values.into(),
             &crate::resume::NullAllocator,
         )
@@ -16633,17 +16603,14 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         descr: &majit_ir::DescrRef,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
         fail_values: FailArgSource<'_>,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) -> Option<(Vec<i64>, Vec<i64>)> {
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit][handle_async_forcing] key={} trace={} fail={} nvals={}",
+                "[jit][handle_async_forcing] key={} descr=0x{:x} nvals={}",
                 green_key,
-                trace_id,
-                fail_index,
+                majit_ir::descr_identity(descr),
                 fail_values.len()
             );
         }
@@ -16762,8 +16729,6 @@ impl<M: Clone> MetaInterp<M> {
                 .expect("forced virtualizable must have a fail descriptor");
             let green_key = majit_backend::descr_owning_green_key(descr)
                 .expect("forced virtualizable must belong to a compiled loop");
-            let trace_id = descr.trace_id();
-            let fail_index = descr.fail_index();
             // compile.py `force_from_resumedata(..., deadframe)`: TAGBOX
             // reads `cpu.get_*_value` off the live jitframe. `llmodel.py
             // force` returns that same frame still executing: COND_CALL
@@ -16801,8 +16766,6 @@ impl<M: Clone> MetaInterp<M> {
             let cache = self.handle_async_forcing_with_allocator(
                 &descr_arc,
                 green_key,
-                trace_id,
-                fail_index,
                 fail_values,
                 allocator,
             );
@@ -21007,13 +20970,10 @@ pub enum DetailedDriverRunOutcome {
     /// process via handle_fail(). No state restoration is done here —
     /// the caller decides whether to bridge or blackhole.
     GuardFailure {
-        fail_index: u32,
-        trace_id: u64,
-        /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
-        /// runtime descr Arc returned by `Backend::get_latest_descr_arc`,
-        /// preferring the metainterp `AbstractFailDescr` reached
-        /// through `meta_descr`.  Consumers call `descr_arc.as_fail_descr()`
-        /// to access `rd_loop_token_clt` / `fail_index_per_trace`.
+        /// `cpu.get_latest_descr(deadframe)` (`history.py AbstractFailDescr` /
+        /// `llmodel.py get_latest_descr`) — the runtime descr Arc returned
+        /// by `Backend::get_latest_descr_arc`. Consumers call
+        /// `descr_arc.as_fail_descr()`.
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         /// compile.py: must_compile() result.
         should_bridge: bool,
@@ -22050,9 +22010,9 @@ impl MetaInterpStaticData {
     }
 
     /// Log a bridge compilation. No-op without a logger.
-    pub fn log_bridge_compile(&self, guard_index: u32) {
+    pub fn log_bridge_compile(&self) {
         if let Some(log) = self.jitlog.lock().as_mut() {
-            log.log_bridge_compile(guard_index);
+            log.log_bridge_compile();
         }
     }
 
@@ -31762,8 +31722,6 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(29);
-        let trace_id = 31;
-        let fail_index = 7;
 
         let mut writer = crate::resumecode::Writer::new(4);
         writer.append_int(0); // items_resume_section (patched below)
@@ -31788,7 +31746,7 @@ mod tests {
         )]));
 
         let (ptrs, ints) = meta
-            .handle_async_forcing(&descr, green_key.get_uhash(), trace_id, fail_index, &[])
+            .handle_async_forcing(&descr, green_key.get_uhash(), &[])
             .expect("descr rd_virtuals should be forced");
         assert_eq!(ptrs, vec![0]);
         assert_eq!(ints, vec![0]);
@@ -31828,8 +31786,6 @@ mod tests {
         );
 
         let fail_descr = descr.as_fail_descr().expect("resume guard");
-        let trace_id = fail_descr.trace_id();
-        let fail_index = fail_descr.fail_index_per_trace();
         let old_token = meta
             .get_procedure_token(green_key.get_uhash())
             .expect("live token");
@@ -31861,8 +31817,6 @@ mod tests {
             .handle_async_forcing_with_allocator(
                 &descr,
                 green_key.get_uhash(),
-                trace_id,
-                fail_index,
                 (&[42i64] as &[i64]).into(),
                 &crate::resume::NullAllocator,
             )
@@ -35459,8 +35413,6 @@ mod loop_side_table_tests {
         assert_eq!(jd1, 1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(91);
-        let trace_id = 31;
-        let fail_index = 7;
 
         let mut writer = crate::resumecode::Writer::new(4);
         writer.append_int(0); // items_resume_section (patched below)
@@ -35493,8 +35445,6 @@ mod loop_side_table_tests {
             .handle_async_forcing_with_allocator(
                 &descr,
                 green_key.get_uhash(),
-                trace_id,
-                fail_index,
                 (&[] as &[i64]).into(),
                 &crate::resume::NullAllocator,
             )

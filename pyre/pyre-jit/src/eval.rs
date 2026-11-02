@@ -8709,7 +8709,6 @@ fn run_compiled_generatorentry(
                 (
                     r.is_finish,
                     r.is_exit_frame_with_exception,
-                    r.fail_index,
                     r.descr_arc
                         .as_ref()
                         .and_then(majit_metainterp::resume::get_resumestorage)
@@ -8724,7 +8723,6 @@ fn run_compiled_generatorentry(
         let Some((
             is_finish,
             is_exception_exit,
-            fail_index,
             has_storage,
             mut values,
             guard_exc,
@@ -8761,7 +8759,11 @@ fn run_compiled_generatorentry(
         }
         if !has_storage {
             if dbg {
-                eprintln!("[jd2] run_compiled no resume fail_index={fail_index}");
+                let descr_id = descr_arc
+                    .as_ref()
+                    .map(majit_ir::descr_identity)
+                    .unwrap_or(0);
+                eprintln!("[jd2] run_compiled no resume descr=0x{descr_id:x}");
             }
             return None;
         }
@@ -12119,8 +12121,6 @@ fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
 fn handle_fail(
     frame: &mut PyFrame,
     green_key: u64,
-    _trace_id: u64,
-    _fail_index: u32,
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     _owning_key: u64,
@@ -12330,8 +12330,6 @@ enum HandleFailDispatch {
 fn dispatch_handle_fail(
     frame_root: &mut FrameRoot,
     green_key: u64,
-    trace_id: u64,
-    fail_index: u32,
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     owning_key: u64,
@@ -12356,8 +12354,6 @@ fn dispatch_handle_fail(
     match handle_fail(
         frame_root.frame(),
         green_key,
-        trace_id,
-        fail_index,
         descr_arc,
         should_bridge,
         owning_key,
@@ -12553,9 +12549,8 @@ pub(crate) fn resume_in_blackhole(
         );
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[bh-rd-numb] trace={} fail_idx={} result={}",
-                fd.trace_id(),
-                fd.fail_index_per_trace(),
+                "[bh-rd-numb] descr=0x{:x} result={}",
+                fd as *const dyn majit_ir::FailDescr as *const () as usize,
                 blackhole_result_tag(&result),
             );
         }
@@ -12858,8 +12853,6 @@ fn execute_assembler(
         // warmstate.py:416-422 general: handle_fail
         // compile.py:701-717 → bridge or blackhole
         DetailedDriverRunOutcome::GuardFailure {
-            fail_index,
-            trace_id,
             ref descr_arc,
             should_bridge,
             owning_key,
@@ -12871,8 +12864,6 @@ fn execute_assembler(
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,
-                trace_id,
-                fail_index,
                 descr_arc,
                 should_bridge,
                 owning_key,
@@ -13457,8 +13448,6 @@ fn bound_reached(
         }
         // compile.py handle_fail: bridge/blackhole decision.
         if let DetailedDriverRunOutcome::GuardFailure {
-            fail_index,
-            trace_id,
             ref descr_arc,
             should_bridge,
             owning_key,
@@ -13471,8 +13460,6 @@ fn bound_reached(
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,
-                trace_id,
-                fail_index,
                 descr_arc,
                 should_bridge,
                 owning_key,
@@ -13796,8 +13783,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
 
         // compile.py handle_fail parity.
         if let DetailedDriverRunOutcome::GuardFailure {
-            fail_index,
-            trace_id,
             ref descr_arc,
             should_bridge,
             owning_key,
@@ -13810,8 +13795,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             match dispatch_handle_fail(
                 &mut frame_root,
                 green_key,
-                trace_id,
-                fail_index,
                 descr_arc,
                 should_bridge,
                 owning_key,
@@ -15211,11 +15194,11 @@ pub(crate) fn decode_and_restore_guard_failure(
     raw_values: &[i64],
     descr: &dyn majit_ir::FailDescr,
 ) -> Option<DecodedGuardFailure> {
+    let descr_id = descr as *const dyn majit_ir::FailDescr as *const () as usize;
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
-            "[jit] guard-fail trace_id={} fail_idx={} rd_numb={}",
-            descr.trace_id(),
-            descr.fail_index_per_trace(),
+            "[jit] guard-fail descr=0x{:x} rd_numb={}",
+            descr_id,
             descr.rd_numb().map_or(0, <[_]>::len),
         );
     }
@@ -15225,8 +15208,8 @@ pub(crate) fn decode_and_restore_guard_failure(
             .map(|i| format!("{:#x}", raw_values[i] as usize))
             .collect();
         eprintln!(
-            "[jit] guard-fail: fail_idx={} types={:?} raw_len={} raw=[{}]",
-            descr.fail_index_per_trace(),
+            "[jit] guard-fail: descr=0x{:x} types={:?} raw_len={} raw=[{}]",
+            descr_id,
             descr.fail_arg_types(),
             nraw,
             slots.join(", ")
@@ -15292,8 +15275,8 @@ pub(crate) fn decode_and_restore_guard_failure(
             .expect("rebuild_guard_fail_state: descr rd_numb missing");
         assert!(
             !rd_numb.is_empty(),
-            "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
-            descr.fail_index_per_trace()
+            "rebuild_guard_fail_state: storage.rd_numb is empty (descr=0x{:x})",
+            descr as *const dyn majit_ir::FailDescr as *const () as usize
         );
         // GuardFailureSync mode writes the captured vable boxes back onto
         // the physical frame — `build_resumed_frames` picks that mode for a
