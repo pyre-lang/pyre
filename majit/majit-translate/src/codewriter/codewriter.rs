@@ -367,16 +367,23 @@ impl CodeWriter {
 
     /// Run the dual-gate type resolver against the program-wide
     /// `CallRegistry` and commit every resolved kind to the graph's backing
-    /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map so
-    /// post-jtransform operands can be rebound to typed variables. A Skip runs
-    /// the legacy annotator and resolver, commits their kinds, and returns
-    /// `None`. `path` identifies either outcome in diagnostics.
+    /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map
+    /// plus hops `specialize_block` rewrote to a Constant, so publication can
+    /// replace the surviving FunctionGraph op. A Skip runs the legacy
+    /// annotator and resolver, commits their kinds, and returns `None`.
+    /// `path` identifies either outcome in diagnostics.
     pub fn dual_gate_publish_concretetypes(
         &mut self,
         graph: &FunctionGraph,
         callcontrol: &mut CallControl,
         path: &crate::parse::CallPath,
-    ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
+    ) -> Option<(
+        crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
+        std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Constant,
+        >,
+    )> {
         let diag_label = path.display_name();
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
@@ -417,6 +424,7 @@ impl CodeWriter {
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match {
                 real_value_to_var,
                 real_constants,
+                const_results,
             }) => {
                 // The accept arm, recorded so this gate's rows sum to a
                 // denominator.  "N graphs Skipped" is not a finding on its
@@ -461,7 +469,7 @@ impl CodeWriter {
                 // jtransform's own retypes stand after it.
                 crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
                 crate::codewriter::type_state::apply_from_flowspace_constants(&real_constants);
-                Some(real_value_to_var)
+                Some((real_value_to_var, const_results))
             }
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
                 // A Skip is a decline: the real rtyper refused this graph
@@ -676,7 +684,7 @@ impl CodeWriter {
         // kind to each backing `Variable.concretetype` cell in both
         // arms, so downstream consumers read kinds via
         // `FunctionGraph::concretetype_of(&v)` directly.
-        let real_value_to_var = crate::codewriter::transform_profile::time_phase(
+        let published = crate::codewriter::transform_profile::time_phase(
             "step0_dual_gate_publish_concretetypes",
             || self.dual_gate_publish_concretetypes(graph, callcontrol, path),
         );
@@ -688,7 +696,7 @@ impl CodeWriter {
         // it as the unknown family (`indirect_call` with `graphs=None`).
         // Match may have cut the GraphStore graph (`transform_dead_code`);
         // the drain clone was taken before publish, so re-read after accept.
-        let mut graph_owned = if real_value_to_var.is_some() {
+        let mut graph_owned = if published.is_some() {
             callcontrol
                 .function_graphs()
                 .get(path)
@@ -697,6 +705,17 @@ impl CodeWriter {
         } else {
             graph.clone()
         };
+        // `rtyper.py specialize_block` rewrote hops to Constants on the
+        // PyGraph (`translate_hl_to_ll` `same_as(Constant, op.result)`).
+        // Copy that rewrite onto this clone so jtransform sees a `Const*`
+        // the way `jtransform.py` reads the rtyper's one graph.
+        if let Some((_, const_results)) = published.as_ref() {
+            crate::translator::rtyper::cutover::apply_rtyper_const_results(
+                &mut graph_owned,
+                const_results,
+            );
+        }
+        let real_value_to_var = published.map(|(value_to_var, _)| value_to_var);
         // The error carrier's `raise e` / `except OperationError as e`
         // edges, annotated as such, move to the runtime exception value
         // before jtransform reads them. Hierarchies are minted when the
