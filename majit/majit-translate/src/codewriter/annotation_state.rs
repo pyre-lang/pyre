@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str0};
 use crate::model::ValueType;
+use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
 
 /// Classdef-less `Ref` shells are not counted in a thread-local.
 /// A `SomeInstance` carries its `classdef` only when the caller has a
@@ -233,7 +234,15 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         SomeValue::Instance(inst) => {
             ValueType::Ref(inst.classdef.as_ref().map(|cd| cd.borrow().name.clone()))
         }
-        SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
+        // `history.getkind` / `codewriter/support.py` (via `getkind`): a
+        // `Ptr` whose `TO` is `FuncType` (`FuncType._gckind == 'raw'`) is
+        // `'int'`. GC pointees stay `Ref`. Raw non-function pointees stay
+        // `Ref` here; that kind is a separate decision.
+        SomeValue::Ptr(p) => match &p.ll_ptrtype.TO {
+            PtrTarget::Func(_) => ValueType::Int,
+            _ => ValueType::Ref(None),
+        },
+        SomeValue::PBC(_) => ValueType::Ref(None),
         // Keep the `StringBuilder` shell distinct across the roundtrip so
         // the rtyper picks `StringBuilderRepr` rather than the generic
         // `Ref` fallback (which would erase the builder method surface).
@@ -339,6 +348,12 @@ mod tests {
             .expect("SingleFloat projects to an annotation shell");
         assert!(matches!(shell, SomeValue::SingleFloat(_)));
         assert_eq!(somevalue_to_valuetype(&shell), ValueType::SingleFloat);
+    }
+
+    #[test]
+    fn function_pointer_someptr_projects_as_int() {
+        let s = crate::annotator::bookkeeper::raw_fn_ptr_somevalue();
+        assert_eq!(somevalue_to_valuetype(&s), ValueType::Int);
     }
 
     #[test]
