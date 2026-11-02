@@ -718,6 +718,78 @@ fn send_ex_frame_nonnull_guard_records_unless_the_box_is_a_constant() {
     );
 }
 
+#[test]
+fn generator_resume_foriter_item_is_reread_from_the_live_box_after_the_finished_frame_guard() {
+    // The finished-frame guard records ops and captures resume data; both
+    // can minor-collect. A copy of the yielded pointer taken before that
+    // window is the pre-move address; `fbw_foriter_inflight_capture` stores
+    // the supplied pointer verbatim. Re-read from the live box after the
+    // recording (`getref_base`), the way `write_ref_reg` already refreshes
+    // its shadow.
+    //
+    // A minor collection cannot be forced inside `record_bytes` from this
+    // harness (`TraceCtx::for_test_types` records into a host buffer,
+    // `attach_live_byte_recorder` is a no-op under `cfg(test)`). Simulate
+    // the collector's writeback on the live box between the guard and the
+    // publish.
+    const OLD: usize = 0x9C_0000_1000;
+    const NEW: usize = 0x9C_0000_1080;
+    fbw_foriter_inflight_clear();
+    let mut tc = fresh_trace_ctx();
+    let item = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(item, Value::Ref(majit_ir::GcRef(OLD)));
+    let frame_box = dummy_ptr_eq_box(&mut tc);
+    let iter_op = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let caller_parent = send_ex_continuation_parent_frame(iter_op).expect("tail installs");
+    let op = DecodedOp {
+        key: "fixture/r",
+        opname: "fixture",
+        argcodes: "r",
+        pc: 0,
+        next_pc: 1,
+    };
+    let mut regs_r = [item];
+    let mut concrete_r = [ConcreteValue::Ref(OLD as pyre_object::PyObjectRef)];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut [],
+        &mut [],
+        &mut [],
+        &[],
+        |wc| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let frame_root = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
+            record_send_ex_finished_frame_guard(
+                wc,
+                op.pc,
+                frame_box,
+                frame_root,
+                iter_op,
+                item,
+                caller_parent,
+            )
+            .expect("finished-frame guard records");
+            wc.trace_ctx
+                .set_opref_concrete(item, Value::Ref(majit_ir::GcRef(NEW)));
+            publish_generator_resume_foriter_item(wc, &op, 0, item, InflightForiterBody::Py(1))
+                .expect("publish after the collection window");
+            assert_eq!(
+                fbw_foriter_inflight_take(0, 0, 0),
+                Some((NEW as pyre_object::PyObjectRef, 1)),
+                "in-flight capture must store the forwarded pointer, not the pre-move copy",
+            );
+        },
+    );
+    assert_eq!(
+        concrete_r[0],
+        ConcreteValue::Ref(NEW as pyre_object::PyObjectRef),
+        "FOR_ITER dest shadow must be the live box after the window",
+    );
+}
+
 fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,

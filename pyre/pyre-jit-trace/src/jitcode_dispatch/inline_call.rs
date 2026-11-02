@@ -17912,7 +17912,7 @@ pub(crate) fn record_send_ex_frame_nonnull_guard<Sym: WalkSym>(
 /// resumes at the send_ex tail so `bh_send_ex_tail` returns the same
 /// null-or-item `jit_next` would. `item` is the portal result occupying the
 /// tail's pending slot (`boxes[0]`), including a CALL_ASSEMBLER dest.
-fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
+pub(crate) fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     frame_box: OpRef,
@@ -17984,6 +17984,24 @@ fn record_send_ex_finished_frame_guard<Sym: WalkSym>(
     Ok(finished)
 }
 
+/// Cut a generator-resume walk so FOR_ITER residualizes. Effects already
+/// executed on the live frame cannot be undone; those abort.
+fn residualize_generator_resume_foriter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    gen_frame: usize,
+    executed_effects_before: usize,
+    pre_emit_pos: majit_metainterp::recorder::TracePosition,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    fbw_durable_frame_rollback_one(gen_frame);
+    if fbw_executed_effect_count() != executed_effects_before {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    }
+    ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+    ctx.trace_ctx.heap_cache_mut().reset();
+    Ok(None)
+}
+
 /// FOR_ITER dest after a generator-resume sub-walk returns.
 ///
 /// `_send_ex` returns the yielded item while the frame is still running;
@@ -17996,7 +18014,6 @@ fn bind_generator_resume_foriter_item<Sym: WalkSym>(
     op: &DecodedOp,
     dst: usize,
     item: OpRef,
-    concrete_item: pyre_object::PyObjectRef,
     body_coord: InflightForiterBody,
     frame_box: OpRef,
     frame_root: usize,
@@ -18018,6 +18035,30 @@ fn bind_generator_resume_foriter_item<Sym: WalkSym>(
         ctx.frame_state.borrow_mut().vstack_last_ref = null_item;
         return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
     }
+    // The finished-frame guard records ops and captures resume data; both
+    // can minor-collect. `_send_ex` / `PyFrame.FOR_ITER` keep the yielded
+    // object as a GC-managed reference (`pushvalue`). Re-read it from the
+    // live box (`getref_base`) before publishing: a copy taken before the
+    // recording is the pre-move address. `write_ref_reg` refreshes its own
+    // shadow from that box; `fbw_foriter_inflight_capture` stores the
+    // pointer verbatim, so it must receive the forwarded one.
+    publish_generator_resume_foriter_item(ctx, op, dst, item, body_coord)
+}
+
+/// Write the yielded FOR_ITER item from the live box, after any recording
+/// that can minor-collect. SubReturn and CALL_ASSEMBLER both bind through
+/// [`bind_generator_resume_foriter_item`] once the box is known resolvable;
+/// SubReturn residualizes before that recording when it is not.
+pub(crate) fn publish_generator_resume_foriter_item<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    item: OpRef,
+    body_coord: InflightForiterBody,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    };
     write_ref_reg(ctx, op.pc, dst, item, ConcreteValue::Ref(concrete_item))?;
     fbw_foriter_inflight_capture(
         InflightForiterOwner::current(ctx.session),
@@ -18497,19 +18538,8 @@ fn walk_generator_resume<Sym: WalkSym>(
     ) {
         drop(inline_concrete.take());
     }
-    let (item, concrete_item) = match walk_result {
-        DispatchOutcome::SubReturn { result: Some(item) } => {
-            let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
-                fbw_durable_frame_rollback_one(gen_frame as usize);
-                if fbw_executed_effect_count() != executed_effects_before {
-                    return Err(DispatchError::callee_inline_unsupported(op.pc));
-                }
-                ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-                ctx.trace_ctx.heap_cache_mut().reset();
-                return Ok(None);
-            };
-            (item, concrete_item)
-        }
+    let (item, residualize_if_unstamped) = match walk_result {
+        DispatchOutcome::SubReturn { result: Some(item) } => (item, true),
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
             // `do_recursive_call(..., assembler_call=True)`: reds are
             // `[frame, ec]` (`PyPyJitDriver.reds`). The CALL_ASSEMBLER
@@ -18547,27 +18577,39 @@ fn walk_generator_resume<Sym: WalkSym>(
             let Some(item) = ctx.registers_r.get(dst) else {
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             };
-            let Some(concrete_item) = walker_concrete_ref_object(ctx, item) else {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            };
-            (item, concrete_item)
+            (item, false)
         }
         _ => {
-            fbw_durable_frame_rollback_one(gen_frame as usize);
-            if fbw_executed_effect_count() != executed_effects_before {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
+            return residualize_generator_resume_foriter(
+                ctx,
+                op.pc,
+                gen_frame as usize,
+                executed_effects_before,
+                pre_emit_pos,
+            );
         }
     };
+    // Availability only — do not keep the pointer. The finished-frame
+    // guard records ops and captures resume data; both can minor-collect,
+    // so the live box is re-read after that recording. SubReturn residualizes
+    // FOR_ITER when the box is unstamped; CALL_ASSEMBLER still errors.
+    if walker_concrete_ref_object(ctx, item).is_none() {
+        if residualize_if_unstamped {
+            return residualize_generator_resume_foriter(
+                ctx,
+                op.pc,
+                gen_frame as usize,
+                executed_effects_before,
+                pre_emit_pos,
+            );
+        }
+        return Err(DispatchError::callee_inline_unsupported(op.pc));
+    }
     bind_generator_resume_foriter_item(
         ctx,
         op,
         dst,
         item,
-        concrete_item,
         body_coord,
         frame_box,
         frame_root,
