@@ -9219,6 +9219,90 @@ fn walker_pin_ec_w_tracefunc_records_quasiimmut_from_mutate_descr() {
 }
 
 #[test]
+fn walker_call_trace_hook_reads_guards_null_hooks() {
+    // `executioncontext.py ExecutionContext.call_trace`:
+    // `self.gettrace() is not None or self.profilefunc is not None`,
+    // with `gettrace = jit.promote(self.w_tracefunc)`.
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let ec = Box::into_raw(Box::new(pyre_interpreter::ExecutionContext::new()));
+    let _tls = LastExecCtxGuard::install(ec);
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [crate::state::ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [crate::state::ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    let w_tracefunc = crate::descr::ec_w_tracefunc_descr();
+    let profilefunc = crate::descr::ec_profilefunc_descr();
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let mut snapshot_sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
+            // `new_uninit` plants `null_jitcode()` (index -1 skeleton). Capture
+            // treats a non-null pointer as a full-body walk and aborts
+            // (`GuardResumeCoordinateUnavailable`). The EC box is all
+            // `walker_ensure_execution_context` needs; the arm path then uses
+            // `with_hint_walk_context`'s `-live-` coordinate.
+            snapshot_sym.jitcode = std::ptr::null();
+            let ec_box = wc.trace_ctx.const_ref(ec as i64);
+            snapshot_sym.set_execution_context(ec_box);
+            wc.fbw_mode.snapshot_sym = &snapshot_sym;
+            walker_call_trace_hook_reads(wc, 0).expect("null hooks record call_trace reads");
+            let n = wc.trace_ctx.num_ops();
+            walker_call_trace_hook_reads(wc, 0).expect("cached");
+            assert_eq!(
+                wc.trace_ctx.num_ops(),
+                n,
+                "a second call_trace read in the same trace is a heapcache hit"
+            );
+            std::hint::black_box(&mut snapshot_sym);
+        },
+    );
+    let mut saw_tracefunc_getfield = false;
+    let mut saw_tracefunc_isnull = false;
+    let mut saw_profilefunc_getfield = false;
+    let mut saw_profilefunc_false = false;
+    for op in tc.ops() {
+        if op.opcode == majit_ir::OpCode::GetfieldGcR
+            && op
+                .getdescr()
+                .is_some_and(|d| std::sync::Arc::ptr_eq(&d, &w_tracefunc))
+        {
+            saw_tracefunc_getfield = true;
+        }
+        if saw_tracefunc_getfield && op.opcode == majit_ir::OpCode::GuardIsnull {
+            saw_tracefunc_isnull = true;
+        }
+        if op.opcode == majit_ir::OpCode::GetfieldGcI
+            && op
+                .getdescr()
+                .is_some_and(|d| std::sync::Arc::ptr_eq(&d, &profilefunc))
+        {
+            saw_profilefunc_getfield = true;
+        }
+        if saw_profilefunc_getfield && op.opcode == majit_ir::OpCode::GuardFalse {
+            saw_profilefunc_false = true;
+        }
+    }
+    assert!(
+        saw_tracefunc_getfield && saw_tracefunc_isnull,
+        "gettrace() promote(None) is GetfieldGcR + GuardIsnull"
+    );
+    assert!(
+        saw_profilefunc_getfield && saw_profilefunc_false,
+        "profilefunc is not None is GetfieldGcI + GuardFalse"
+    );
+}
+
+#[test]
 fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
     // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
     pyre_interpreter::test_hooks::install_hash_hook();
@@ -9236,6 +9320,52 @@ fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
         },
         "ExecutionContext.profilefunc?",
     );
+}
+
+/// Save and restore `LAST_EXEC_CTX` so a dummy ExecutionContext cannot leak
+/// into a sibling test on the same thread.
+struct LastExecCtxGuard {
+    saved: *const pyre_interpreter::PyExecutionContext,
+}
+
+impl LastExecCtxGuard {
+    fn install(ec: *const pyre_interpreter::PyExecutionContext) -> Self {
+        let saved = pyre_interpreter::call::take_last_exec_ctx();
+        pyre_interpreter::call::set_last_exec_ctx(ec);
+        Self { saved }
+    }
+}
+
+impl Drop for LastExecCtxGuard {
+    fn drop(&mut self) {
+        pyre_interpreter::call::set_last_exec_ctx(self.saved);
+    }
+}
+
+fn portal_ops_have_no_ec_qmut_or_gni(ops: &[majit_ir::OpRc]) {
+    let w_tracefunc = crate::descr::ec_w_tracefunc_descr();
+    let profilefunc = crate::descr::ec_profilefunc_descr();
+    for op in ops {
+        if op.opcode == majit_ir::OpCode::QuasiimmutField {
+            let is_ec = op.getdescr().is_some_and(|d| {
+                let field = d
+                    .as_quasi_immut_descr()
+                    .map(|qd| qd.fielddescr().clone())
+                    .unwrap_or_else(|| d.clone());
+                std::sync::Arc::ptr_eq(&field, &w_tracefunc)
+                    || std::sync::Arc::ptr_eq(&field, &profilefunc)
+            });
+            assert!(
+                !is_ec,
+                "portal records no QuasiimmutField on ExecutionContext"
+            );
+        }
+        assert_ne!(
+            op.opcode,
+            majit_ir::OpCode::GuardNotInvalidated,
+            "portal records no GUARD_NOT_INVALIDATED from a w_tracefunc/profilefunc pin"
+        );
+    }
 }
 
 /// Process-global `HOST_HOOKS` is one slot; save and restore it so this
@@ -25593,7 +25723,8 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
 /// `pyjitpl.py` `opimpl_jit_merge_point` snapshots `history.any_operation()`
 /// before `debug_merge_point` records `DEBUG_MERGE_POINT`. An empty history
 /// visiting an already-compiled green stays inert even though that record
-/// (and the portal debugdata/tracefunc/profilefunc guards) runs first.
+/// runs first. The portal merge records nothing of `w_tracefunc` /
+/// `profilefunc`.
 #[test]
 fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
     let jmp_byte = *insns_opname_to_byte()
@@ -25666,6 +25797,7 @@ fn jit_merge_point_empty_history_stays_inert_when_compiled_targets_exist() {
         wc.trace_ctx.num_ops() > 0,
         "debug_merge_point still records DEBUG_MERGE_POINT on the inert path"
     );
+    portal_ops_have_no_ec_qmut_or_gni(wc.trace_ctx.ops());
 }
 
 /// True-portal instruction starts emit `get_is_being_profiled`'s diamond
