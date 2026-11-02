@@ -1849,9 +1849,11 @@ unsafe fn instantiate_raised_class(mut w_type: PyObjectRef) -> Result<PyObjectRe
     Ok(result)
 }
 
-/// GC type id appended after [`crate::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID`]
-/// in `pyre-jit::eval::build_gc`. Older hardcoded ids never shift.
-pub const RAISE_CAUSE_GC_TYPE_ID: u32 = 99;
+/// Runtime-assigned GC type id. Stamped at the absolute tail of
+/// `pyre-jit::eval::build_gc` so no hardcoded / `#[pyre_class(type_id = N)]`
+/// id moves (`AllVirtuals` uses the same tail rule).
+pub static RAISE_CAUSE_GC_TYPE_ID: pyre_object::lltype::TypeIdCell =
+    pyre_object::lltype::TypeIdCell::auto();
 
 /// The `from` cause of a `raise X from Y`, after the class call, together with
 /// the wording owed if it turns out not to name an exception.
@@ -1909,7 +1911,7 @@ impl std::ops::Deref for RaiseCauseRef {
 
 impl pyre_object::lltype::GcType for RaiseCause {
     fn type_id() -> u32 {
-        RAISE_CAUSE_GC_TYPE_ID
+        RAISE_CAUSE_GC_TYPE_ID.get()
     }
     const SIZE: usize = std::mem::size_of::<RaiseCause>();
 }

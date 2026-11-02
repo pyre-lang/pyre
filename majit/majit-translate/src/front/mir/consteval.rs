@@ -1818,7 +1818,6 @@ pub(crate) fn discover_raw_struct_paths(
             gc_struct_ids,
             immutable_fields,
             &mut stack,
-            None,
         ) {
             paths.push(decl.item_meta.name_path());
         }
@@ -4169,19 +4168,6 @@ pub(in crate::front::mir) fn align_up(offset: u64, align: u64) -> Option<u64> {
     } else {
         offset.checked_add(align - rem)
     }
-}
-
-pub(in crate::front::mir) fn tyexpr_body<'a>(
-    llbc: &'a Llbc,
-    ty: &'a serde_json::Value,
-) -> Option<&'a serde_json::Value> {
-    if let Some(arr) = ty.get("Value").and_then(serde_json::Value::as_array) {
-        return arr.get(1);
-    }
-    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return llbc.dedup_body(id);
-    }
-    Some(ty)
 }
 
 pub(in crate::front::mir) fn primitive_size_align(

@@ -150,23 +150,35 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// FunDecl output still names a binder: a root `TypeVar`, a
-    /// `*mut T` / `&T` whose pointee is a `TypeVar`, or an `Option`
-    /// whose payload peels to one. `FUNC.RESULT` then comes from the
-    /// destination place (`rtyper.py` `setconcretetype`).
+    /// FunDecl output still names a binder: a `TypeVar` anywhere in the
+    /// type (`spill_argument_carries_typevar`), a root `TraitType`, a
+    /// `*mut T` / `&T` whose pointee is one, or an `Option` whose payload
+    /// peels to one. `FUNC.RESULT` then comes from the destination place
+    /// (`rtyper.py` `setconcretetype`).
+    /// `Index::index` declares `&I::Output`; the dest place of
+    /// `s[..k]` is `&str` (`unaryop.py` `SomeString.getslice`).
+    /// `Vec::<T, A>::clone` declares `Vec<T, A>`; the dest place of
+    /// `strides.clone()` is `Vec<i64>` (`rrustvec.rs` `RustVecRepr`).
     pub(in crate::front::mir) fn tyref_output_is_unsubstituted(&self, ty: &TyRef) -> bool {
-        if tyref_is_type_var(ty, self.llbc) {
+        if let Some(node) = tyref_node(ty, self.llbc)
+            && spill_argument_carries_typevar(node, self.llbc, &mut Vec::new(), 0)
+        {
+            return true;
+        }
+        let binder =
+            |ty: &TyRef| tyref_is_type_var(ty, self.llbc) || tyref_is_trait_type(ty, self.llbc);
+        if binder(ty) {
             return true;
         }
         if self
             .tyref_peel_ref_to_pointee(ty)
-            .is_some_and(|p| tyref_is_type_var(&p, self.llbc))
+            .is_some_and(|p| binder(&p))
         {
             return true;
         }
         crate::front::result_exc::tyref_option_payload(ty, self.llbc).is_some_and(|p| {
             let p = self.tyref_peel_ref_to_pointee(&p).unwrap_or(p);
-            tyref_is_type_var(&p, self.llbc)
+            binder(&p)
         })
     }
 
@@ -229,10 +241,11 @@ impl<'a> Lowering<'a> {
             .get(0)?,
             self.llbc,
         )?;
-        // A Vec header is the Int address (`RustVecRepr`), including
-        // `Option<&Vec<T>>`. The Option<&T> peel below would otherwise
-        // name the Vec ADT as a GC instance class.
-        if tyref_is_rust_vec_header(&TyRef::Other(payload.clone()), self.llbc) {
+        // A one-word Vec header is the Int address (`RustVecRepr`),
+        // including `Option<&Vec<T>>`. The Option<&T> peel below would
+        // otherwise name the Vec ADT as a GC instance class. `Vec<u8>`
+        // is the list model and keeps the later payload walk.
+        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_some() {
             return None;
         }
         if let Some(root) =
@@ -386,10 +399,9 @@ impl<'a> Lowering<'a> {
         let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
-        // Vec header Int niche: `None` is `option_niche_int_null`, not a
-        // GC `Vec<…>` instance. Decided before the Option<&T> string /
-        // name-prefix arms.
-        if tyref_is_rust_vec_header(&TyRef::Other(payload.clone()), self.llbc) {
+        // One-word Vec header Int niche: `None` is `option_niche_int_null`,
+        // not a GC `Vec<…>` instance. `Vec<u8>` is the list model.
+        if tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_some() {
             return None;
         }
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
@@ -2208,6 +2220,21 @@ impl<'a> Lowering<'a> {
                 .is_some_and(|payload| tyref_is_raw_c_void_ptr(&payload, self.llbc))
         {
             return emit_voidp_nullptr(&mut self.graph, bb_id);
+        }
+        // `Option<GCREF>` / `GCREF` is `llmemory.GCREF` (`llmemory.py`
+        // `GCREF`). None is `cast_int_to_ptr(GCREF, 0)` (`rgc.py`
+        // `NULL_GCREF` = `lltype.nullptr(llmemory.GCREF.TO)` /
+        // `ann_cast_int_to_ptr` → `SomePtr(GCREF)`). The Some arm is
+        // 1-arg `cast_int_to_ptr` (`SomePtr(GCREF)`).
+        if tyref_is_gcref_spelling(option_ty, self.llbc)
+            || crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+                .is_some_and(|payload| tyref_is_gcref_spelling(&payload, self.llbc))
+        {
+            return emit_typed_nullptr(
+                &mut self.graph,
+                bb_id,
+                (*crate::translator::rtyper::lltypesystem::lltype::GCREF).clone(),
+            );
         }
         // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
         // `rtype_is_None` compares against a null of the operand's own

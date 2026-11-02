@@ -8894,7 +8894,7 @@ impl<'a> Transformer<'a> {
             }
         }
         if let OpKind::FieldRead { base, .. } = &op.kind
-            && crate::codewriter::heaptracker::is_typeptr_field(field)
+            && crate::codewriter::heaptracker::is_typeptr_getset(field, self.callcontrol.as_deref())
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -9453,7 +9453,7 @@ impl<'a> Transformer<'a> {
         // `_getusercls` each malloc their own STRUCT
         // (`alloc_exact_object_instance` / `alloc_user_object_instance`).
         if matches!(&op.kind, OpKind::FieldWrite { .. })
-            && crate::codewriter::heaptracker::is_typeptr_field(field)
+            && crate::codewriter::heaptracker::is_typeptr_getset(field, self.callcontrol.as_deref())
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
@@ -9595,21 +9595,15 @@ impl<'a> Transformer<'a> {
             typed_ty.clone()
         };
         if &rewrite_ty != ty {
-            // `jtransform.py rewrite_op_setfield` takes `getkind` from
-            // the field lltype (`RESULT = v_value.concretetype`); the
-            // stored value already has that kind. A Ref/Str field whose
-            // SSA value is Int/Unsigned is a producer lowering bug —
-            // `history.py` `getkind`, rtyper `lowleveltype`.
+            // A Ref/Str field whose stored SSA is Int/Unsigned, and is
+            // not flavor-raw int-banked, keeps the FieldWrite
+            // (`jtransform.py rewrite_op_setfield` takes getkind from
+            // the field lltype).
             if matches!(ty, ValueType::Ref(_) | ValueType::Str)
                 && matches!(rewrite_ty, ValueType::Int | ValueType::Unsigned)
                 && !self.flavor_raw_ref_is_int_banked(ty)
             {
-                panic!(
-                    "rewrite_op_setfield kind mismatch in {graph_name}: \
-                     field {field:?} is {ty:?} but value {value:?} is {rewrite_ty:?}; \
-                     getkind comes from the field lltype \
-                     (`jtransform.py` rewrite_op_setfield, `history.py` getkind)"
-                );
+                return RewriteResult::Keep;
             }
             let base_var = match &op.kind {
                 OpKind::FieldWrite { base, .. } => base.clone(),

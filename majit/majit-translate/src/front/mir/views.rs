@@ -2655,16 +2655,11 @@ impl<'a> Lowering<'a> {
             .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc));
         let name_segs: Vec<String> = path_segments_respecting_angles(&name);
         let vec_view = rust_vec_slice_view(&name);
-        // One-word-item rust-vec header deref / as_slice, including a
-        // byte item (`Vec<u8>`, no helper kind). The slice is the
-        // `(p, l)` pair; the Vec header ptr/len are the view. Decided
-        // before the u8-window dest arm so `Vec<u8>::deref` does not
-        // take the pair-return length-slot residual.
+        // One-word-item rust-vec header deref / as_slice. `pair_of_vec` is
+        // `(ll_vec_items, ll_vec_length)` (`rlist.py` `ll_getitem_fast`).
+        // A byte item (`Vec<u8>`) has no helper kind and is the list model.
         let vec_header_view = args.len() == 1
-            && arg_tys.first().and_then(Option::as_ref).is_some_and(|ty| {
-                tyref_is_rust_vec_header(ty, self.llbc)
-                    && (vec_kind.is_some() || tyref_rust_vec_item_is_u8(ty, self.llbc))
-            })
+            && vec_kind.is_some()
             && (vec_view.is_some() || is_deref_call(reg, self.llbc));
         let arg_is_range_full = arg_tys
             .get(1)
@@ -2764,7 +2759,7 @@ impl<'a> Lowering<'a> {
             } else if vec_header_view {
                 let (ptr, len) = self.pair_of_vec(
                     mir_bb,
-                    vec_kind.unwrap_or(majit_ir::rvec::VecItemKind::Int),
+                    vec_kind.expect("vec_header_view is one-word item kind"),
                     args[0].clone(),
                 );
                 let ptr = self.ensure_window_ccharp(mir_bb, ptr);
@@ -2806,12 +2801,10 @@ impl<'a> Lowering<'a> {
                 // residual `vec::Vec::<impl Deref<Vec<…>>>::deref` (and
                 // `deref_mut` / `as_slice` / `as_mut_slice`) are one view of
                 // the same list. `pair_of_vec` is `(ll_vec_items, ll_vec_length)`
-                // (`rlist.py` `ll_getitem_fast` / `ll_items` / `ll_length`).
-                // A one-word item and a byte item (`Vec<u8>`, no helper kind)
-                // both split the header.
+                // (`rlist.py` `ll_getitem_fast` reads that list; nothing is copied).
                 _ if vec_header_view => self.pair_of_vec(
                     mir_bb,
-                    vec_kind.unwrap_or(majit_ir::rvec::VecItemKind::Int),
+                    vec_kind.expect("vec_header_view is one-word item kind"),
                     args[0].clone(),
                 ),
                 (_, Some(kind)) if vec_index && args.len() == 2 => {
@@ -3148,9 +3141,14 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
-                    let data = self.slice_as_ptr_word(mir_bb, &dest_ty, args[0].clone(), false);
-                    self.stamp_pair_window_as_ptr_ccharp(&dest_ty, &data);
-                    data
+                    let first_ty = arg_tys.first().and_then(Option::as_ref);
+                    if is_as_view_noop(self.llbc, &reg, first_ty, &dest_ty) {
+                        args[0].clone()
+                    } else {
+                        let data = self.slice_as_ptr_word(mir_bb, &dest_ty, args[0].clone(), false);
+                        self.stamp_pair_window_as_ptr_ccharp(&dest_ty, &data);
+                        data
+                    }
                 }
                 "core::slice::index::<Impl>::index"
                 | "core::slice::index::<Impl>::index_mut"
@@ -4812,21 +4810,12 @@ pub(in crate::front::mir) fn tyref_is_rust_vec_header(ty: &TyRef, llbc: &Llbc) -
 /// behind a borrow, or behind a raw pointer, all of which the translator
 /// represents as the address of the raw `{ptr, len, cap}` header
 /// (`RustVecRepr`).  `None` for every other type.
-///
-/// A pointer item is classified by `history.py` `getkind` of that item
-/// (`GCREF` / a GC pointee is `Ref`; `*mut u8` / `rffi.CCHARP` is `Int`).
 pub(in crate::front::mir) fn tyref_rust_vec_item_kind(
     ty: &TyRef,
     llbc: &Llbc,
 ) -> Option<majit_ir::rvec::VecItemKind> {
-    let node = tyref_rust_vec_adt_node(ty, llbc)?;
-    let item = node
-        .get("Adt")?
-        .get("generics")?
-        .get("types")?
-        .as_array()?
-        .first()?;
-    rust_vec_item_kind_of_item_node(item, llbc)
+    let ast = tyref_one_word_vec_ast(ty, llbc)?;
+    majit_ir::rvec::rust_vec_item_kind_for_spelling(&ast, crate::layout::target_word_size())
 }
 
 /// Item `TyRef` of an `alloc::vec::Vec<T>` (`rrustvec.rs` item `lowleveltype`).
@@ -4857,37 +4846,6 @@ pub(in crate::front::mir) fn tyref_rust_vec_item_is_u8(ty: &TyRef, llbc: &Llbc) 
         .and_then(|item| json_ty_scalar_element_spelling(item, llbc))
         .as_deref()
         == Some("u8")
-}
-
-/// Layout spelling of a Vec item from `history.py` `getkind` of that item
-/// TyRef (`rrustvec.rs` `vec_item_kind_of`). A missing item or a kind with
-/// no register bank is a producer error.
-pub(in crate::front::mir) fn rust_vec_item_getkind_layout_spelling(
-    ty: &TyRef,
-    llbc: &Llbc,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-) -> &'static str {
-    let item_ty = tyref_rust_vec_item_ty(ty, llbc)
-        .unwrap_or_else(|| panic!("Vec field has no item TyRef (`rrustvec.rs` item lowleveltype)"));
-    match tyref_to_value_type_with(
-        &item_ty,
-        llbc,
-        no_tombstoned_leaves(),
-        gc_struct_ids,
-        &std::collections::HashSet::<String>::new(),
-    ) {
-        ValueType::Int
-        | ValueType::Unsigned
-        | ValueType::Bool
-        | ValueType::SingleFloat
-        | ValueType::Int128
-        | ValueType::UInt128 => "usize",
-        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => "GCREF",
-        ValueType::Float => "f64",
-        ValueType::Void | ValueType::State | ValueType::Unknown => {
-            panic!("Vec field item getkind has no register bank (`rrustvec.rs` vec_item_kind_of)")
-        }
-    }
 }
 
 /// Register kind of a one-word `Vec` / slice item type node.
@@ -5862,8 +5820,11 @@ pub(in crate::front::mir) fn callee_leaf_name(reg: &RegularCall, llbc: &Llbc) ->
 ///
 /// W1: receiver is a STR (`tyref_is_string_family` / `tyref_is_w1_str`)
 /// or a transparent newtype over a W1 STR source pointer; dest is a
-/// shared `&[u8]` / `&str`. The dest binds to the receiver's STR word
-/// (the newtype's single field is that word).
+/// shared `&[u8]` / `&str` (`as_bytes`). A W1 view dest whose dest is a
+/// raw `*const u8` / `*mut u8` is the same no-op: `as_bytes().as_ptr()`
+/// stays the STR word (`ll_stritem_nonneg`). `str::as_ptr` of a STR
+/// receiver to that raw pointer is `rffi.get_raw_address_of_string`
+/// (`CCHARP`), a different class.
 /// W2: receiver is a list and dest is a list view (`as_slice`). Already
 /// lowered by [`Lowering::is_container_slice_identity`]; kept here so
 /// `as_ptr` (list → CCHARP) is not a no-op.
@@ -5883,6 +5844,9 @@ pub(in crate::front::mir) fn is_as_view_noop(
         return false;
     };
     if tyref_is_w1_str_receiver(first, llbc) && tyref_is_w1_str_view_dest(dest_ty, llbc) {
+        return true;
+    }
+    if tyref_is_w1_str_view_dest(first, llbc) && tyref_is_raw_u8_ptr(dest_ty, llbc) {
         return true;
     }
     tyref_is_u8_list(first, llbc)
@@ -6056,6 +6020,29 @@ pub(in crate::front::mir) fn body_owner_view_locals(
                         }
                         changed = true;
                     }
+                }
+                // `as_ptr` dest is `*const u8`, not a window. A W1
+                // `as_bytes().as_ptr()` is still the STR
+                // (`is_as_view_noop`); mark it so `p.add(i)` sees the
+                // header after `merge_string_byte_view_state` skips a
+                // not-yet-lowered successor.
+                if is_body_local(dest)
+                    && tyref_is_raw_u8_ptr(&call.dest.ty, llbc)
+                    && !str_view[dest]
+                    && let CallFunc::Regular(reg) = &call.func
+                    && is_as_view_noop(
+                        llbc,
+                        reg,
+                        call.args.first().and_then(operand_tyref),
+                        &call.dest.ty,
+                    )
+                    && call
+                        .args
+                        .first()
+                        .is_some_and(|op| operand_is_w1_str_or_marked(op, &str_view, llbc))
+                {
+                    str_view[dest] = true;
+                    changed = true;
                 }
             }
             for st in &bb.statements {
@@ -7223,6 +7210,7 @@ fn path_segments_respecting_angles(path: &str) -> Vec<String> {
 /// `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice`: the slice view
 /// of a `Vec` header. Both Charon impl spellings (`<Impl>` and `Vec`)
 /// and the crate-stripped residual path (`vec::Vec::…`).
+#[cfg(test)]
 pub(in crate::front::mir) fn rust_vec_slice_view_leaf(segments: &[String]) -> Option<&str> {
     match rust_vec_std_leaf(segments)? {
         leaf @ ("deref" | "deref_mut" | "as_slice" | "as_mut_slice") => Some(leaf),

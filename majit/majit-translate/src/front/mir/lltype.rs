@@ -2116,54 +2116,28 @@ pub(in crate::front::mir) fn one_word_pointer_bank_pointee<'l>(
 
 /// Declared gckind of the struct or enum `ty` names, after one pointer peel.
 ///
-/// `None` when `ty` is not a struct or enum. [`declared_gckind`] of that
-/// ADT is the only answer: `GcType` / field-0 parent is `Some(true)`,
-/// every other identity is `Some(false)`. A harvested
-/// `_alloc_flavor_ = "raw"` owner has no `GcType` impl, so it is already
-/// Raw.
+/// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
+/// the raw-address classifier rejects (exception carrier, a GC-pointer field)
+/// stays a GC base: the pointer bank already kept it as `Ref`. Only an owner
+/// [`declared_raw_adt_node`] accepts is Raw.
 pub(in crate::front::mir) fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> Option<bool> {
-    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     let pointee = one_level_pointer_pointee(node, llbc)
         .and_then(|pointee| strip_ty_indirections(pointee, llbc))
         .unwrap_or(node);
-    Some(node_declared_gckind(pointee, llbc, gc_struct_ids)? == GcKind::Gc)
-}
-
-/// Stamp for a field op's `owner_declared_gc`. [`container_declared_gc`]
-/// is still [`declared_gckind`] only. A `GcType` owner records `Some(true)`.
-/// A raw overlay ADT or a flavor-raw class (`rclass.py getgcflavor`)
-/// records `Some(false)` so `field_owner_is_gc` emits `getfield_raw`.
-/// An instance-valued owner without `GcType` (payload-enum struct, GC
-/// handle) stays `None`: `field_owner_is_gc` defaults to gc, matching
-/// the Ref paint. This is not a second kind classifier.
-pub(in crate::front::mir) fn field_owner_declared_gc(
-    ty: &TyRef,
-    llbc: &Llbc,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-) -> Option<bool> {
-    match container_declared_gc(ty, llbc, gc_struct_ids) {
-        Some(true) => Some(true),
-        Some(false) => {
-            let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
-            let pointee = one_level_pointer_pointee(node, llbc)
-                .and_then(|p| strip_ty_indirections(p, llbc))
-                .unwrap_or(node);
-            if declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
-                || tyref_is_raw_alloc_flavor_adt(ty, llbc)
-                || tyref_is_raw_alloc_flavor_adt(&TyRef::Other(pointee.clone()), llbc)
-            {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        None => None,
+    declared_adt_struct_id(pointee, llbc)?;
+    // The same raw-storage test as the dest overlay: a GC pointer field
+    // in `_immutable_fields_` is a pure raw word (`rewrite_op_getfield`
+    // refuses only a non-pure `getfield_raw_r`).
+    if declared_raw_adt_node(pointee, llbc, gc_struct_ids, immutable_fields).is_some() {
+        return Some(false);
     }
+    Some(true)
 }
 
 /// [`declared_gckind`] of a non-builtin struct or enum node.
@@ -2302,77 +2276,63 @@ pub(in crate::front::mir) fn tyref_is_declared_raw_overlay(
 ) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_indirections(n, llbc))
-        .is_some_and(|n| declared_raw_adt_node(n, llbc, gc_struct_ids).is_some())
+        .is_some_and(|n| {
+            declared_raw_adt_node(n, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+        })
+}
+
+/// The node names the published exception carrier ADT.
+pub(in crate::front::mir) fn exception_carrier_node(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let carrier = llbc.exception_carrier();
+    if carrier.is_empty() {
+        return false;
+    }
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(def_id)
+        .is_some_and(|td| td.item_meta.name_path() == carrier)
 }
 
 /// A non-builtin struct/enum node whose declared kind is Raw.
 ///
 /// Strings, builtins, scalars, `str` / slice / `dyn`, and zero-sized pointees
-/// are `None` so the classifier that already owns them still runs.
-/// [`declared_gckind`] of the ADT is the only remaining answer.
+/// are `None` so the classifier that already owns them still runs. A pointee
+/// present in `gc_struct_ids` is Gc.
 pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
     node: &'a serde_json::Value,
     llbc: &'a Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> Option<&'a serde_json::Value> {
     let node = strip_ty_indirections(node, llbc)?;
     if node_is_string_value(node, llbc) {
         return None;
     }
-    let ty = TyRef::Other(node.clone());
-    // Builtin arms answer before the declared-ADT arm, the same order
-    // as `tyref_is_raw_value` / `field_ty_is_raw_word`. A fixture
-    // `Option<String>` has no `Builtin` src, so `declared_adt_struct_id`
-    // is Some and would otherwise answer Raw from [`declared_gckind`]
-    // before those lowerings (`borrowed_pointee_is_raw_enum`).
-    // Option niche: a payload that is not a raw word is a tagged instance.
-    if let Some(payload) = crate::front::result_exc::tyref_option_payload(&ty, llbc)
-        && !field_ty_is_raw_word(
-            &payload,
-            llbc,
-            gc_struct_ids,
-            no_immutable_fields(),
-            &mut Vec::new(),
-        )
-    {
+    let sid = declared_adt_struct_id(node, llbc)?;
+    // The exception carrier is the object `raise` stores. RPython's
+    // exception instance is a GC pointer (`getkind` ref, `flatten.py`
+    // `make_return`), not a raw address.
+    if exception_carrier_node(node, llbc) {
         return None;
     }
-    if let Some(def_id) = adt_node_def_id(node) {
-        // String inline header / collections / PyObject.
-        if adt_path_is_gc_container(llbc, def_id) {
-            return None;
-        }
-    }
-    // Vec header: by-value `{ptr, len, cap}` is a raw word, not a
-    // declared-raw overlay ADT.
-    if tyref_is_rust_vec_header(&ty, llbc) {
+    let name = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
+        .unwrap_or_default();
+    if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
-    // A payload enum of raw words (`RawOptPair`, `Option<(u32, u64)>`)
-    // is the C overlay: `&mut` is one address (`borrowed_pointee_is_raw_enum`).
-    // `dest_overlay_ptr_lltype` still refuses a GC-pointer payload via
-    // `adt_def_is_raw_storage`. `Option<String>` already returned above.
-    // A one-field wrapper over a payload-carrying enum is that tagged
-    // instance (`DynLike` over `HeldUnion`), not a C raw overlay.
-    if tyref_unique_payload_enum_wrapper(&ty, llbc) {
+    if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
         return None;
     }
-    // A multi-field owner that stores a payload enum (`Fmt.code`) is
-    // that class instance. Overlay skip, not a kind answer:
-    // [`tyref_is_raw_struct_value`] still reads [`declared_gckind`].
-    if tyref_struct_holds_payload_enum(&ty, llbc) {
-        return None;
-    }
-    // A `repr(transparent)` GC handle (`PyError` → `PyErrorObject`)
-    // intern's as the target class, not a C raw overlay.
-    if tyref_transparent_gc_handle(&ty, llbc, gc_struct_ids) {
-        return None;
-    }
-    declared_adt_struct_id(node, llbc)?;
-    if tyref_is_zero_sized(&ty, llbc) {
-        return None;
-    }
-    if !node_declared_raw(node, llbc, gc_struct_ids) {
+    // A raw struct's fields are addresses and scalars. A GC pointer field
+    // would be `getfield_raw_r`; `rewrite_op_getfield` raises only for a
+    // non-pure `getfield_raw_r`, so an `_immutable_fields_` GC field is
+    // still raw storage (`MapNodeTerminatorView.w_cls`).
+    let def_id = adt_node_def_id(node)?;
+    let mut stack = Vec::new();
+    if !adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
         return None;
     }
     Some(node)
@@ -2380,18 +2340,12 @@ pub(in crate::front::mir) fn declared_raw_adt_node<'a>(
 
 /// The ADT's fields are raw words: scalars, nested raw structs, or one
 /// address pointing at those. A `Vec` / `String` / other GC field is not.
-///
-/// `generics` is `None` for the TypeDecl template (TypeVar fields stay
-/// TypeVars). `Some` substitutes those fields from the owner's type
-/// arguments (`tyref_instantiate_adt_field_ty`) so `Cell<usize>` is
-/// classified as its specialization, whose field is `usize`.
 pub(in crate::front::mir) fn adt_def_is_raw_storage(
     def_id: u64,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     stack: &mut Vec<u64>,
-    generics: Option<&serde_json::Value>,
 ) -> bool {
     if stack.contains(&def_id) {
         // A pointer cycle. By-value nesting cannot repeat a def without a
@@ -2420,29 +2374,15 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     ) {
         return false;
     }
-    // A closure env is the callable (`tyref_keeps_callable_identity`),
-    // even when it has no fields or only captures another callable.
-    // Classifying it raw makes `call_once` `self` an Int and a captured
-    // callable field `getfield_raw_r` (`jtransform.py`
-    // `rewrite_op_getfield`).
-    if type_decl_is_closure_env(td) {
-        return false;
-    }
     let carrier = llbc.exception_carrier();
     if !carrier.is_empty() && td.item_meta.name_path() == carrier {
         return false;
     }
     stack.push(def_id);
     let ok = match &td.kind {
-        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => adt_fields_are_raw_storage(
-            td,
-            fields,
-            llbc,
-            gc_struct_ids,
-            immutable_fields,
-            stack,
-            generics,
-        ),
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            adt_fields_are_raw_storage(td, fields, llbc, gc_struct_ids, immutable_fields, stack)
+        }
         TypeDeclKind::Enum(variants) => variants.iter().all(|variant| {
             adt_fields_are_raw_storage(
                 td,
@@ -2451,24 +2391,13 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
                 gc_struct_ids,
                 immutable_fields,
                 stack,
-                generics,
             )
         }),
         TypeDeclKind::Alias(body) => type_node_peel_aliases(body, llbc)
             .and_then(adt_node_def_id)
             .is_some_and(|id| {
-                adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, stack, generics)
+                adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, stack)
             }),
-        // A foreign `Opaque` decl has no field list. The linked scalar
-        // kind is that missing layout (`link_transparent_scalar_types`):
-        // peel and field-layout spelling consult this the same way a
-        // defining-crate `Struct` does (`rtyper.py` `getrepr` →
-        // `lowleveltype`). A multi-field all-raw struct is the same
-        // fact without a one-field peel (`is_raw_struct_path`).
-        TypeDeclKind::Opaque => {
-            let path = td.item_meta.name_path();
-            llbc.transparent_scalar_kind(&path).is_some() || llbc.is_raw_struct_path(&path)
-        }
         _ => false,
     };
     stack.pop();
@@ -2477,7 +2406,7 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
 
 /// Fields of `owner` are raw words, or a GC pointer listed in
 /// `_immutable_fields_` (`rewrite_op_getfield`: only a non-pure
-/// `getfield_raw_r` is refused). `generics` is `None` for the template.
+/// `getfield_raw_r` is refused).
 pub(in crate::front::mir) fn adt_fields_are_raw_storage(
     owner: &TypeDecl,
     fields: &[FieldDecl],
@@ -2485,50 +2414,12 @@ pub(in crate::front::mir) fn adt_fields_are_raw_storage(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     stack: &mut Vec<u64>,
-    generics: Option<&serde_json::Value>,
 ) -> bool {
     fields.iter().enumerate().all(|(i, field)| {
-        let field_ty = match generics {
-            Some(generics) => {
-                let owner_ty = TyRef::Other(serde_json::json!({
-                    "Adt": {
-                        "id": owner.def_id,
-                        "generics": generics,
-                    }
-                }));
-                tyref_instantiate_adt_field_ty(&owner_ty, &field.ty, llbc)
-            }
-            None => field.ty.clone(),
-        };
-        if field_ty_is_raw_word(&field_ty, llbc, gc_struct_ids, immutable_fields, stack) {
+        if field_ty_is_raw_word(&field.ty, llbc, gc_struct_ids, immutable_fields, stack) {
             return true;
         }
-        // Nested by-value ADT on an instantiated owner: the template
-        // walk above saw TypeVar fields. Carry the substituted
-        // generics so `UnsafeCell<usize>` is classified as `usize`.
-        if generics.is_some()
-            && let Some(node) =
-                tyref_node(&field_ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))
-            && one_level_pointer_pointee(node, llbc).is_none()
-            && let Some(nested_id) = adt_node_def_id(node)
-            && !adt_path_is_gc_container(llbc, nested_id)
-            && tyref_payload_enum_class_root_with(&field_ty, llbc, no_tombstoned_leaves()).is_none()
-        {
-            let nested_generics = adt_node_nonempty_generics(node, llbc);
-            if nested_generics.is_some()
-                && adt_def_is_raw_storage(
-                    nested_id,
-                    llbc,
-                    gc_struct_ids,
-                    immutable_fields,
-                    stack,
-                    nested_generics,
-                )
-            {
-                return true;
-            }
-        }
-        field_ty_is_gc_pointer(&field_ty, llbc, gc_struct_ids)
+        field_ty_is_gc_pointer(&field.ty, llbc, gc_struct_ids)
             && field_declared_immutable(owner, &field_decl_name(i, field), immutable_fields)
     })
 }
@@ -2544,11 +2435,6 @@ pub(in crate::front::mir) fn tyref_is_raw_value(
     if one_level_pointer_pointee(node, llbc).is_some() {
         return false;
     }
-    // Builtin arms (Vec header, String inline header, Option niche,
-    // scalar enum, RootScope) run first. A fixture `String` /
-    // `Option<String>` has no `Builtin` src, so `declared_adt_struct_id`
-    // is Some and would otherwise answer from [`declared_gckind`]
-    // before those lowerings.
     field_ty_is_raw_word(
         ty,
         llbc,
@@ -2769,58 +2655,14 @@ pub(in crate::front::mir) fn field_ty_is_raw_word(
     if node.get("Scalar").is_some() {
         return true;
     }
-    // A ZST occupies no GC storage. The empty tuple is unit
-    // (`is_unit_type`) even when Charon left no TypeDecl for it
-    // (`id: 0` null slot), so `tyref_is_zero_sized` cannot see a layout.
-    if is_unit_type(ty, llbc) || tyref_is_zero_sized(ty, llbc) {
-        return true;
-    }
-    if let Some(def_id) = adt_node_def_id(node)
-        && adt_path_is_phantom_data(llbc, def_id)
-    {
-        return true;
-    }
     if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
         return pointee_is_raw_word(pointee, llbc, gc_struct_ids);
     }
-    // A by-value `Vec<T>` is the raw `{ptr, len, cap}` header
-    // (`tyref_is_rust_vec_header` / `RustVecRepr`, kind int).
-    if tyref_is_rust_vec_header(ty, llbc) {
-        return true;
-    }
     if let Some(def_id) = adt_node_def_id(node) {
-        // RootScope: the linked scalar kind is that missing layout
-        // (`link_transparent_scalar_types` / `transparent_scalar_kind`).
-        if let Some(td) = llbc.type_by_id(def_id)
-            && llbc
-                .transparent_scalar_kind(&td.item_meta.name_path())
-                .is_some()
-        {
-            return true;
-        }
         if adt_path_is_gc_container(llbc, def_id) {
             return false;
         }
-        // Option of a raw word is a scalar-payload enum: the payload
-        // is that word (`tyref_option_payload`). A payload enum of a
-        // GC instance stays a tagged instance.
-        if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
-            && field_ty_is_raw_word(&payload, llbc, gc_struct_ids, immutable_fields, stack)
-        {
-            return true;
-        }
-        // A payload-carrying enum is a tagged instance (`getkind` ref).
-        // A field of that type is not a raw word: classifying the owner
-        // raw makes the read `getfield_raw_r` (`jtransform.py`
-        // `rewrite_op_getfield`). A fieldless enum stays the discriminant
-        // integer. `&mut RawEnum` still uses [`declared_gckind`]
-        // on the enum itself (`borrowed_pointee_is_raw_enum`).
-        if tyref_payload_enum_class_root_with(ty, llbc, no_tombstoned_leaves()).is_some()
-            || tyref_struct_holds_payload_enum(ty, llbc)
-        {
-            return false;
-        }
-        return node_declared_raw(node, llbc, gc_struct_ids);
+        return adt_def_is_raw_storage(def_id, llbc, gc_struct_ids, immutable_fields, stack);
     }
     false
 }
@@ -2945,8 +2787,9 @@ pub(in crate::front::mir) fn adt_path_is_gc_container(llbc: &Llbc, def_id: u64) 
 /// the annotator sees a raw-flavored `Ptr` (`SomePtr`), never `SomeInteger`.
 /// `history.py` `getkind` of that `Ptr` is `'int'` at dual-gate, from the
 /// harvested `_alloc_flavor_` set (`valuetype_to_concrete_for_legacy`).
-/// FieldRead of that pointer is [`raw_value_getkind`] of the named Ref.
-/// FieldWrite lltype is `'int'` (`tyref_aggregate_field_value_type`).
+/// FieldRead of a `Ref(None)` raw value is Int (`adt_field_read_value_type`
+/// / `tyref_is_raw_value`). FieldWrite lltype is `'int'`
+/// (`tyref_aggregate_field_value_type`).
 pub(in crate::front::mir) fn tyref_is_raw_alloc_flavor_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc) else {
         return false;
@@ -3029,7 +2872,9 @@ pub(in crate::front::mir) fn ty_is_raw_address(
         // Non-borrow one-word pointer to a storage-raw ADT (`Box` /
         // `NonNull` / `Arc` of a C struct). A `Ref` of a raw struct
         // stays `Ref` (`RootScope::get`).
-        if !is_borrow && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some() {
+        if !is_borrow
+            && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+        {
             return true;
         }
         // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
@@ -3081,7 +2926,7 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
     };
     matches!(td.kind, TypeDeclKind::Enum(_))
         && !type_decl_is_fieldless_enum(td, llbc)
-        && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+        && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
         // Address overlay guard, not a kind answer: a declared-Raw
         // payload enum whose fields are raw words is one address
         // (`&mut RawOptPair`). A declared-Raw enum that still holds a
@@ -3092,7 +2937,6 @@ pub(in crate::front::mir) fn borrowed_pointee_is_raw_enum(
             gc_struct_ids,
             no_immutable_fields(),
             &mut Vec::new(),
-            None,
         )
 }
 
@@ -3110,7 +2954,8 @@ pub(in crate::front::mir) fn raw_address_owner_root(
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     let pointee = one_word_pointer_pointee(node, llbc)?;
     let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
-    let pointee = if declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+    let pointee = if declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields())
+        .is_some()
         || flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs)
     {
         pointee
@@ -3169,28 +3014,6 @@ pub(in crate::front::mir) fn flavor_raw_pointer_class_root(
     ))
 }
 
-/// Intern key of a harvested `_alloc_flavor_ = raw` ADT, including a
-/// closure capture whose borrow Charon stripped to the pointee.
-fn flavor_raw_adt_class_root(
-    ty: &TyRef,
-    llbc: &Llbc,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Option<String> {
-    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
-    let def_id = adt_node_def_id(node)?;
-    let td = llbc.type_by_id(def_id)?;
-    let path = td.item_meta.name_path();
-    if flavor_raw_adt_node(node, llbc, raw_alloc_flavor_structs)
-        || llbc.is_raw_alloc_flavor_path(&path)
-    {
-        Some(crate::front::llbc_hints::alloc_flavor_class_intern_key(
-            &path,
-        ))
-    } else {
-        None
-    }
-}
-
 /// Whether a wrapper-stripped node is a `RawPtr` to a Raw struct or enum.
 pub(in crate::front::mir) fn raw_ptr_node_is_declared_raw(
     node: &serde_json::Value,
@@ -3205,7 +3028,7 @@ pub(in crate::front::mir) fn raw_ptr_node_is_declared_raw(
     else {
         return false;
     };
-    declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+    declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
 }
 
 pub(in crate::front::mir) fn tyref_to_value_type_with(
@@ -3313,11 +3136,9 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if tyref_is_borrowed_fn_ptr(ty, llbc) {
         return ValueType::Int;
     }
-    // A `Vec<T>` is the address of its raw `{ptr, len, cap}` header
-    // (`RustVecRepr`, kind `int`), for every item type T, not a GC
-    // reference. Item kind selects the `ll_vec_*` helper; the header
-    // word itself is always `int` (`history.py` `getkind`).
-    if tyref_is_rust_vec_header(ty, llbc) {
+    // A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
+    // header (`RustVecRepr`, kind `int`), not a GC reference.
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
         return ValueType::Int;
     }
     // A Rust-heap `String` is a `{cap, ptr, len}` header, not rstr `STR`
@@ -3718,33 +3539,6 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
     if let Some(raw) = raw_field_address_value_type(place_ty, field_ty, owner_declared_gc, llbc) {
         return raw;
     }
-    // Raw-flavored `Ptr` (`*const CodeObject`): annotator `SomePtr`
-    // (`flavor_raw_pointer_class_root` / `rclass.py getgcflavor`). Front
-    // FieldWrite ty stays `Ref(Some(root))`; `rewrite_op_setfield` banks
-    // Int when CallControl holds the flavor (`history.getkind`).
-    if let Some(root) = flavor_raw_pointer_class_root(place_ty, llbc, raw_alloc_flavor_structs)
-        .or_else(|| flavor_raw_pointer_class_root(field_ty, llbc, raw_alloc_flavor_structs))
-    {
-        return ValueType::Ref(Some(root));
-    }
-    // Charon may store `&CodeObject` as the pointee ADT once it strips
-    // the borrow; the capture is still that class pointer.
-    if owner_is_closure_env
-        && let Some(root) = flavor_raw_adt_class_root(place_ty, llbc, raw_alloc_flavor_structs)
-            .or_else(|| flavor_raw_adt_class_root(field_ty, llbc, raw_alloc_flavor_structs))
-    {
-        return ValueType::Ref(Some(root));
-    }
-    // A rust-heap `String` is the same header address `Vec<u8>` stores;
-    // the capture may be by-value String or `&String` (`getarraysubstruct`).
-    if owner_is_closure_env
-        && (tyref_is_rust_heap_string(place_ty, llbc)
-            || tyref_is_rust_heap_string(field_ty, llbc)
-            || tyref_is_rust_vec_header(place_ty, llbc)
-            || tyref_is_rust_vec_header(field_ty, llbc))
-    {
-        return ValueType::Int;
-    }
     let declared = if container_is_enum {
         tyref_enum_payload_value_type(
             place_ty,
@@ -3763,27 +3557,28 @@ pub(in crate::front::mir) fn adt_field_read_value_type(
         )
     };
     match declared {
-        resolved @ ValueType::Ref(_) => {
+        ValueType::Ref(None) => {
             if owner_is_closure_env
-                && let Some(peeled) = tyref_closure_capture_primitive_value(field_ty, llbc)
-                    .or_else(|| tyref_closure_capture_primitive_value(place_ty, llbc))
+                && let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
+                    .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
             {
                 return peeled;
             }
             // A by-value raw struct such as `Position` is not a GC
             // pointer. `getkind` of that word is int, so the load is
             // `getfield_raw_i`. A mutable `getfield_raw_r` is refused.
-            match raw_value_getkind(resolved, &[place_ty, field_ty], llbc, gc_struct_ids) {
-                ValueType::Int => ValueType::Int,
-                ValueType::Ref(None) => tyref_to_value_type_with(
-                    field_ty,
-                    llbc,
-                    tombstoned,
-                    gc_struct_ids,
-                    raw_alloc_flavor_structs,
-                ),
-                other => other,
+            if tyref_is_raw_value(place_ty, llbc, gc_struct_ids)
+                || tyref_is_raw_value(field_ty, llbc, gc_struct_ids)
+            {
+                return ValueType::Int;
             }
+            tyref_to_value_type_with(
+                field_ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
         }
         resolved => resolved,
     }
@@ -3917,16 +3712,11 @@ pub(in crate::front::mir) fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bo
 }
 
 /// A closure-env capture of `&P` or `&mut P` for a primitive `P` is `P`.
-/// `lltype.py` `Ptr.__new__` refuses `Ptr(Signed)`, so both kinds of
-/// borrow alias the referent (`history.py` `getkind`). Shared-only
-/// peel stays on [`tyref_shared_borrow_primitive_pointee`] for enum
-/// payloads and ordinary struct fields, where `&mut P` is a stored
-/// pointer `__deref_write` consumes.
-pub(in crate::front::mir) fn tyref_closure_capture_primitive_value(
+pub(in crate::front::mir) fn tyref_shared_borrow_primitive_value(
     ty: &TyRef,
     llbc: &Llbc,
 ) -> Option<ValueType> {
-    let pointee = tyref_ref_primitive_pointee(ty, llbc, true)?;
+    let pointee = tyref_shared_borrow_primitive_pointee(ty, llbc)?;
     Some(tyref_to_value_type(&TyRef::Other(pointee), llbc))
 }
 
@@ -3977,7 +3767,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     // the `Value` / `Deduplicated` wrappers. [`tyref_to_value_type_with`]
     // follows those itself; stripping here keeps the node the peel above
     // already resolved.
-    let resolved = match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
+    match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
         Some(node) => tyref_to_value_type_with(
             &TyRef::Other(node.clone()),
             llbc,
@@ -3986,12 +3776,7 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
             raw_alloc_flavor_structs,
         ),
         None => ValueType::Ref(None),
-    };
-    // Same getkind as FieldRead: a by-value raw struct paints `Ref(None)`
-    // at the annotator (`tyref_is_raw_struct_value`) and `'int'` at the
-    // JIT (`tyref_is_raw_value` / `Position`, `scoped_alloc_buffer`).
-    // Unit `()` stays Void (`tyref_result_ok_is_unit`).
-    raw_value_getkind(resolved, &[ty], llbc, gc_struct_ids)
+    }
 }
 
 /// `ty` resolves to an enum, whose variant payloads
@@ -5077,26 +4862,18 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     ) {
         return Some(token);
     }
-    let painted = tyref_to_value_type_with(
+    // Looked-inside by-value ADT results stay `"ref"` (`tyref_to_value_type_with`).
+    // `raw_value_getkind` would paint a declared-Raw struct as Int and stamp
+    // FUNC.RESULT `i` while the residual ctor still returns CFG `r`
+    // (`object_key_for` / `synthetic-transparent-ctor`). Main matches the
+    // painter here and leaves ordinary looked-inside FUNC.RESULT unstamped.
+    let token = match tyref_to_value_type_with(
         kind_src,
         llbc,
         no_tombstoned_leaves(),
         gc_struct_ids,
         raw_alloc_flavor_structs,
-    );
-    // Same gate as RegularCall `result_ty`: a by-value raw struct token
-    // is Int. A pointer return and a payload-enum return stay the
-    // painter so FUNC.RESULT matches the CFG return kind.
-    let token = match if tyref_call_signature_raw_value(
-        kind_src,
-        llbc,
-        no_tombstoned_leaves(),
-        gc_struct_ids,
     ) {
-        raw_value_getkind(painted, &[kind_src], llbc, gc_struct_ids)
-    } else {
-        painted
-    } {
         ValueType::Bool => "bool",
         ValueType::Int => {
             // A storage-raw pointer is `ValueType::Int` (`ty_is_raw_address`)
@@ -5527,14 +5304,14 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
             raw_alloc_flavor_structs,
         );
     }
-    // Matching [`tyref_to_value_type`]: a `Vec<T>` is the address of its
-    // raw `{ptr, len, cap}` header (`RustVecRepr`, kind `int`) for every
-    // item type. Layout and the register bank keep that Int. FORCE does not
+    // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
+    // address of its raw `{ptr, len, cap}` header (`RustVecRepr`, kind
+    // `int`). Layout and the register bank keep that Int. FORCE does not
     // seed the field (`register_struct_fields` skips a Vec layout row) so
     // `project_struct_rows` installs `SomeRustVec` from the `*mut Vec<…>`
     // annotation spelling. An Integer FORCE made `len` of the field
     // `'int' has no length`.
-    if tyref_is_rust_vec_header(ty, llbc) {
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
         return ValueType::Int;
     }
     // Matching [`tyref_to_value_type`]: a Rust-heap `String` is decided
@@ -5739,19 +5516,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
         return ValueType::Unknown;
     }
     if type_decl_is_closure_env(owner)
-        && let Some(peeled) = tyref_closure_capture_primitive_value(ty, llbc)
+        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
     {
         return peeled;
-    }
-    if type_decl_is_closure_env(owner) {
-        if let Some(root) = flavor_raw_pointer_class_root(ty, llbc, raw_alloc_flavor_structs)
-            .or_else(|| flavor_raw_adt_class_root(ty, llbc, raw_alloc_flavor_structs))
-        {
-            return ValueType::Ref(Some(root));
-        }
-        if tyref_is_rust_heap_string(ty, llbc) || tyref_is_rust_vec_header(ty, llbc) {
-            return ValueType::Int;
-        }
     }
     tyref_to_attr_value_type_with(
         ty,
@@ -6189,10 +5956,29 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     if tyref_one_word_handle_payload_field(ty, llbc, tombstoned).is_some() {
         return None;
     }
-    // A transparent scalar already has its inner repr (`rtyper.py
-    // bindingrepr`). It is not an inlined Struct for all_fielddescrs:
-    // recursing would read a field from the scalar word itself.
-    if tyref_transparent_inner_value_type(
+    // A `#[repr(transparent)]` one-word wrapper (scalar or GC pointer)
+    // is not an inlined Struct: `heaptracker.all_fielddescrs` keeps the
+    // wrapper's own field, and recursing would emit a positional inner
+    // name for a word whose interior descr is the outer field. A
+    // transparent wrapper whose instantiated payload is itself a
+    // by-value struct is walked on that STRUCT;
+    // `collect_by_value_struct_leaves` peels the wrapper via
+    // `tyref_transparent_nonzst_field`.
+    if tyref_transparent_nonzst_field(ty, llbc).is_some() {
+        let inner_struct = tyref_transparent_instantiated_inner_ty(ty, llbc).is_some_and(|inner| {
+            tyref_by_value_struct_decl(
+                &inner,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+            .is_some()
+        });
+        if !inner_struct {
+            return None;
+        }
+    } else if tyref_transparent_inner_value_type(
         ty,
         llbc,
         tombstoned,
@@ -6682,11 +6468,6 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    // Matching [`tyref_to_value_type`]: a Vec header is the Int address,
-    // including `&Vec<T>` / `*mut Vec<T>`.
-    if tyref_is_rust_vec_header(ty, llbc) {
-        return None;
-    }
     // Matching [`tyref_to_value_type`]: `&Option<P>` is the Option word.
     if let Some(option_ty) = tyref_shared_borrow_option_pointee(ty, llbc)
         && option_nonzero_word_kind(&option_ty, llbc).is_none()
@@ -6802,10 +6583,6 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     tombstoned: &std::collections::HashSet<String>,
     generics: Option<&serde_json::Value>,
 ) -> Option<String> {
-    // Vec header Int: no SomeList / ADT class root, including `&Vec<T>`.
-    if tyref_is_rust_vec_header(ty, llbc) {
-        return None;
-    }
     let spelling = tyref_to_ast_string(ty, llbc);
     if majit_ir::descr::is_list_container_spelling(&spelling) {
         return Some(spelling);
@@ -7472,10 +7249,8 @@ pub(in crate::front::mir) fn tyref_transparent_instantiated_inner_ty(
     Some(tyref_instantiate_adt_field_ty(ty, &field.ty, llbc))
 }
 
-/// [`adt_def_is_raw_storage`] on the instantiated type: a Struct / Union
-/// / Enum uses the owner's generic arguments to substitute each field
-/// (`tyref_instantiate_adt_field_ty`). `None` generics (a non-generic
-/// owner, or empty type arguments) is the TypeDecl template.
+/// [`adt_def_is_raw_storage`] of the TypeDecl template.
+#[cfg(test)]
 pub(in crate::front::mir) fn tyref_adt_is_raw_storage(
     ty: &TyRef,
     llbc: &Llbc,
@@ -7488,14 +7263,7 @@ pub(in crate::front::mir) fn tyref_adt_is_raw_storage(
     let Some(id) = adt_node_def_id(node) else {
         return false;
     };
-    adt_def_is_raw_storage(
-        id,
-        llbc,
-        gc_struct_ids,
-        immutable_fields,
-        &mut Vec::new(),
-        adt_node_nonempty_generics(node, llbc),
-    )
+    adt_def_is_raw_storage(id, llbc, gc_struct_ids, immutable_fields, &mut Vec::new())
 }
 
 pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
@@ -7514,62 +7282,67 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
     // parameter is declared `r`. `strip_ty_wrappers` leaves `RawPtr` alone,
     // so a raw pointer to the wrapper keeps pointer semantics.
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
-    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
-    // The linked kind is the missing layout field: a foreign `Opaque`
-    // decl keeps `repr.transparent: false`, `apply_published_structs`
-    // copies fields without `repr`, and a defining-crate `Struct` whose
-    // layout omitted the flag (the `bitflags!` `CodeFlags` word) is the
-    // same gap. Reading a copied field would retype the word; the kind
-    // stays the scalar table.
-    if let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) {
+    let id = adt_node_def_id(node)?;
+    let decl = llbc.type_by_id(id)?;
+    // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
+    // crate is outside the extraction set, so the layout does not record the
+    // wrapper. The linked kind is that missing field.
+    // `apply_published_structs` turns that import into a `Struct` and does
+    // not copy `repr`, so the same false flag remains. Reading the copied
+    // field would retype the word; the kind stays the scalar table.
+    if (matches!(&decl.kind, TypeDeclKind::Opaque) || decl.published_struct_copy)
+        && let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path())
+    {
         return Some(transparent_scalar_value_type(kind));
     }
     if !decl.is_repr_transparent() {
         return None;
     }
-    // A class instance keeps its lowleveltype (`rtyper.py` `getrepr` →
-    // `lowleveltype`; `getkind`). [`tyref_adt_is_raw_storage`] is that
-    // classification on the instantiated type: peeling a non-raw owner
-    // to its inner word stamps FUNC.RESULT `i` while the CFG constructs
-    // the instance (`r`). A generic wrapper's template fields are
-    // TypeVars; the specialization's field is the substituted word.
-    if !tyref_adt_is_raw_storage(ty, llbc, gc_struct_ids, no_immutable_fields()) {
-        return None;
-    }
-    let inner = tyref_transparent_instantiated_inner_ty(ty, llbc)?;
-    // A transparent GC handle wrapping `*mut registered` keeps
-    // the wrapper class (`transparent_deref_target_class` above,
-    // or `Ref(None)` plus the Input class_root). Peeling the
-    // inner pointer would intern the handle as the payload.
-    // STR-family dict-key wrappers (`celldict::StrKey` /
-    // `dictmultiobject::BytesKey`) are the inner STR pointer
-    // (`AbstractTypedStrategy.setitem` unwrap).
-    // `project_struct_field_type` already maps them to `s_str0()`
-    // (`is_str_family_class_root`); peel so construction is that
-    // SomeString, not `objectmodel.instantiate` + setattr `__pos_0`.
-    if registered_gc_ptr_class_root_with(
-        &inner,
-        llbc,
-        tombstoned,
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    )
-    .is_some()
-    {
-        // Same predicate `project_struct_field_type` uses. Do
-        // not run `class_identity_spelling`: that crate-peel
-        // turns `other::StrKey` into the family leaf `StrKey`.
-        if !is_str_family_class_root(&decl.item_meta.name_path()) {
-            return None;
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) if !decl.published_struct_copy => {
+            let field = if let Some((index, _)) = transparent_nonzst_field(decl, llbc) {
+                fields.get(index)?
+            } else if let [only] = fields.as_slice() {
+                only
+            } else {
+                return None;
+            };
+            // A transparent GC handle wrapping `*mut registered` keeps
+            // the wrapper class (`transparent_deref_target_class` above,
+            // or `Ref(None)` plus the Input class_root). Peeling the
+            // inner pointer would intern the handle as the payload.
+            // STR-family dict-key wrappers (`celldict::StrKey` /
+            // `dictmultiobject::BytesKey`) are the inner STR pointer
+            // (`AbstractTypedStrategy.setitem` unwrap).
+            // `project_struct_field_type` already maps them to `s_str0()`
+            // (`is_str_family_class_root`); peel so construction is that
+            // SomeString, not `objectmodel.instantiate` + setattr `__pos_0`.
+            if registered_gc_ptr_class_root_with(
+                &field.ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+            .is_some()
+            {
+                // Same predicate `project_struct_field_type` uses. Do
+                // not run `class_identity_spelling`: that crate-peel
+                // turns `other::StrKey` into the family leaf `StrKey`.
+                if !is_str_family_class_root(&decl.item_meta.name_path()) {
+                    return None;
+                }
+            }
+            Some(tyref_to_value_type_with(
+                &field.ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ))
         }
+        _ => None,
     }
-    Some(tyref_to_value_type_with(
-        &inner,
-        llbc,
-        tombstoned,
-        gc_struct_ids,
-        raw_alloc_flavor_structs,
-    ))
 }
 
 pub(in crate::front::mir) fn transparent_scalar_value_type(
@@ -7769,14 +7542,6 @@ pub(crate) fn type_decl_ref_generics<'a>(
         .and_then(|decl| decl.item_meta.instantiation())
         .and_then(|inst| instantiation_generic_args(inst, llbc))
         .or(own)
-}
-
-fn adt_node_nonempty_generics<'a>(
-    node: &'a serde_json::Value,
-    llbc: &'a Llbc,
-) -> Option<&'a serde_json::Value> {
-    let adt = node.get("Adt").and_then(serde_json::Value::as_object)?;
-    type_decl_ref_generics(adt, llbc).filter(|g| generic_args_are_nonempty(g))
 }
 
 pub(in crate::front::mir) fn generic_args_are_nonempty(generics: &serde_json::Value) -> bool {
@@ -8386,6 +8151,24 @@ pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llb
     }
 }
 
+/// Stamp a raw `*mut` / `*const c_void` cell `VOIDP` (`rffi.py` `VOIDP`).
+/// `lltype.py` `ann_cast_int_to_ptr` of that word is `SomePtr(VOIDP)`;
+/// a residual Call dest must carry the same lltype so it unions with
+/// `cast_int_to_ptr(VOIDP, addr)` (`held as *mut c_void`).
+pub(in crate::front::mir) fn stamp_as_voidp(var: &Variable) {
+    var.set_concretetype(Some(
+        (*crate::translator::rtyper::lltypesystem::rffi::VOIDP).clone(),
+    ));
+}
+
+/// Stamp a raw `c_void` pointer cell `VOIDP`. The producing op must be
+/// Int-banked (`history.py` `getkind` of a raw `Ptr`).
+pub(in crate::front::mir) fn stamp_raw_c_void_voidp(var: &Variable, ty: &TyRef, llbc: &Llbc) {
+    if tyref_is_raw_c_void_ptr(ty, llbc) {
+        stamp_as_voidp(var);
+    }
+}
+
 /// Stamp a function-pointer dest `Ptr(FuncType)` (`lltype.FuncType` /
 /// `getfunctionptr`). The walker rebuilds `SomePtr` from this
 /// `concretetype` (`var_concretetype_is_ccharp` parallel). Prefer the
@@ -8805,7 +8588,7 @@ pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
         return None;
     }
     let inputs = value_type_inputs(llbc);
-    let adt = declared_raw_adt_node(pointee, llbc, &inputs.gc_struct_ids)?;
+    let adt = declared_raw_adt_node(pointee, llbc, &inputs.gc_struct_ids, no_immutable_fields())?;
     let id = adt_node_def_id(adt)?;
     let decl = llbc.type_by_id(id)?;
     if !matches!(decl.kind, TypeDeclKind::Struct(_)) || decl.layout.is_none() {
@@ -8838,12 +8621,6 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
         return None;
     }
     let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
-    // Vec header owns every Vec spelling — by value, `&`/`&mut`, raw
-    // pointer, or inside this niche Option. Decided before the
-    // Option<&T> heap-string / list arms so `Option<&Vec<T>>` is Int.
-    if tyref_is_rust_vec_header(&payload, llbc) {
-        return Some(ValueType::Int);
-    }
     if tyref_is_rust_heap_string(&payload, llbc) {
         return Some(ValueType::Ref(tyref_class_root_with(
             &payload, llbc, tombstoned,
@@ -8859,10 +8636,11 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
     // is not this niche (`tyref_is_niche_option` keeps the tag).
     // `&mut [T]` / `*mut [u8]` is that same list (`tyref_is_u8_list`);
     // shared `&[u8]` is a window (`tyref_is_u8_window`) and stays out.
-    // A Vec header already returned Int above (`tyref_is_rust_vec_header`);
-    // `Vec<` spelling is not a second classifier.
     let rendered = tyref_to_ast_string(&payload, llbc);
-    if tyref_is_u8_list(&payload, llbc) || rendered.starts_with("VecDeque<") {
+    if tyref_is_u8_list(&payload, llbc)
+        || rendered.starts_with("Vec<")
+        || rendered.starts_with("VecDeque<")
+    {
         return Some(ValueType::Ref(Some(rendered)));
     }
     if let Some(node) = tyref_node(&payload, llbc)
@@ -10628,21 +10406,6 @@ pub(in crate::front::mir) fn gc_ref_pointer(
     })
 }
 
-pub(in crate::front::mir) fn pointer_target_json(
-    obj: &serde_json::Map<String, serde_json::Value>,
-) -> Option<&serde_json::Value> {
-    if let Some(target) = obj
-        .get("RawPtr")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|arr| arr.first())
-    {
-        return Some(target);
-    }
-    obj.get("Ref")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|arr| arr.get(1))
-}
-
 pub(in crate::front::mir) fn tyref_mut_ref_pointee(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let reference = node.as_object()?.get("Ref")?.as_array()?;
@@ -10676,6 +10439,15 @@ pub(in crate::front::mir) fn tyref_gc_mut_ref_cell_root(
 
 pub(in crate::front::mir) fn tyref_is_type_var(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc).is_some_and(|node| node.get("TypeVar").is_some())
+}
+
+/// A trait associated-type projection (`Index::Output`). The decl-level
+/// type is a binder; `rtyper.py` `setconcretetype` takes `FUNC.RESULT`
+/// from the destination place.
+pub(in crate::front::mir) fn tyref_is_trait_type(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| node.get("TraitType").is_some())
 }
 
 /// `dont_look_inside` is keyed by `strip_crate_prefix(name_path())`.
@@ -11603,28 +11375,13 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
             .map(|arg| tyref_to_ast_string(&arg, llbc))
             .unwrap_or_else(|| "*mut PyObject".to_string());
     }
-    // A stored `*mut Vec<T>` / `&Vec<T>` is one pointer-sized word
-    // (`rrustvec.rs rust_vec_lltype`). A by-value `Vec<T>` field is the
-    // inline three-word `{cap, ptr, len}` (`lltype._note_inlined_into`);
-    // its *value* is the interior address (`direct_fieldptr`).
-    match tyref_rust_vec_layout(ty, llbc) {
-        Some(RustVecLayout::HeaderPtr) => return "isize".to_string(),
-        Some(RustVecLayout::ByValue) => {
-            return format!(
-                "Vec<{}>",
-                rust_vec_item_getkind_layout_spelling(ty, llbc, gc_struct_ids)
-            );
-        }
-        None => {
-            // Inlined raw STRUCT: fall through to the type path below.
-        }
+    // A `Vec` of one-word items is the header address (`RustVecRepr`,
+    // kind `int`): one pointer-sized word, not the 24-byte inline Vec.
+    // Spelling the Vec ADT here registers a `FLAG_STRUCT` row whose
+    // size disagrees with the Int publish.
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return "isize".to_string();
     }
-    // An inlined raw STRUCT (`QuasiImmutField`) is `lltype.Struct`.
-    // `heaptracker.py all_fielddescrs` recurses into it. `history.getkind`
-    // `'int'` of a Ptr *to* that STRUCT is the JIT kind only
-    // (`get_type_flag` of a raw pointer spelling). Keep the type path so
-    // `is_known_struct` is true and the parent index census numbers the
-    // inner leaves.
     // `Option<E>` over a densely numbered fieldless E uses E's scalar tag
     // plus one reserved value for `None`.  Preserve that physical width in
     // the containing struct's descriptor instead of treating it as a Ref.
@@ -11643,23 +11400,12 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
     if !decl.is_repr_transparent() {
         return tyref_to_ast_string(ty, llbc);
     }
-    // A class instance keeps its lowleveltype (`rtyper.py` `getrepr` →
-    // `lowleveltype`; `getkind`). [`tyref_adt_is_raw_storage`] is that
-    // classification on the instantiated type: the instance is not its
-    // inner word. A generic wrapper's template fields are TypeVars; the
-    // specialization's field is the substituted word.
-    if !tyref_adt_is_raw_storage(ty, llbc, gc_struct_ids, no_immutable_fields()) {
-        return tyref_to_ast_string(ty, llbc);
-    }
-    if let Some(inner) = tyref_transparent_instantiated_inner_ty(ty, llbc)
+    if let TypeDeclKind::Struct(fields) = &decl.kind
+        && !decl.published_struct_copy
+        && let Some((index, _)) = transparent_nonzst_field(decl, llbc)
+        && let Some(field) = fields.get(index)
         && !matches!(
-            tyref_to_value_type_with(
-                &inner,
-                llbc,
-                no_tombstoned_leaves(),
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            ),
+            tyref_to_value_type(&field.ty, llbc),
             ValueType::Ref(_)
                 | ValueType::Str
                 | ValueType::StringBuilder
@@ -11668,7 +11414,7 @@ pub(in crate::front::mir) fn tyref_to_field_layout_string(
                 | ValueType::Unknown
         )
     {
-        return tyref_to_field_layout_string(&inner, llbc, gc_struct_ids, raw_alloc_flavor_structs);
+        return tyref_to_ast_string(&field.ty, llbc);
     }
     let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path()) else {
         return tyref_to_ast_string(ty, llbc);
@@ -11937,13 +11683,14 @@ pub(in crate::front::mir) fn tyref_is_container_type(ty: &TyRef, llbc: &Llbc) ->
     if tyref_is_copy_scalar_or_thin_ptr(ty, llbc) {
         return false;
     }
-    // A by-value `Vec<T>` is the inline `{ptr, len, cap}` header, and a
-    // by-value rust-heap `String` is that same header around `Vec<u8>`
+    // A by-value one-word `Vec<T>` is the inline `{ptr, len, cap}` header,
+    // and a by-value rust-heap `String` is that same header around `Vec<u8>`
     // (`alloc::string::String { vec: Vec<u8> }`). Indexing either is
-    // `getarraysubstruct`. `tyref_is_rust_vec_header` / `tyref_is_rust_heap_string`
+    // `getarraysubstruct`. `tyref_rust_vec_item_kind` / `tyref_is_rust_heap_string`
     // also match a header address (`&Vec<T>`, `*mut Vec<T>`, `&String`);
     // those are one word and already returned above as thin pointers.
-    if tyref_is_rust_vec_header(ty, llbc) || tyref_is_rust_heap_string(ty, llbc) {
+    // `Vec<u8>` is the list model (`rlist.py`), not this container.
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() || tyref_is_rust_heap_string(ty, llbc) {
         return true;
     }
     if tyref_is_inline_fat_ptr(ty, llbc) || tyref_transparent_inner_is_inline_fat_ptr(ty, llbc) {
@@ -13077,6 +12824,7 @@ pub(in crate::front::mir) fn tyref_tuple_arity(ty: &TyRef, llbc: &Llbc) -> usize
 /// otherwise name `Tuple<usize,…>` while this field stays `Ref` and a
 /// stored `usize` local fails `rewrite_op_setfield`. Same peel as
 /// [`tuple_element_field_value_type`] / [`tyref_enum_payload_value_type`].
+#[cfg(test)]
 pub(in crate::front::mir) fn tyref_aggregate_field_value_type(
     ty: &TyRef,
     llbc: &Llbc,

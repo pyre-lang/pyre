@@ -3769,25 +3769,23 @@ pub(in crate::front::mir) fn rust_vec_header_ptr_spelling(
 /// declared field. A stored `*mut Vec<T>` / `&Vec<T>` of one-word items is a
 /// canonical header-pointer spelling `project_rust_vec` accepts. An integer
 /// item keeps its own spelling (`usize` / `u64` versus `isize` / `i64`) so
-/// that projector can set `SomeInteger.unsigned`. A by-value `Vec<T>` field
-/// is the inline three-word substruct (`lltype._note_inlined_into`).
-/// [`tyref_to_field_layout_string`] writes `isize`, which annotates as
-/// `SomeInteger` and then `len` of the field raises `'int' has no length`.
+/// that projector can set `SomeInteger.unsigned`. [`tyref_to_field_layout_string`]
+/// writes `isize`, which annotates as `SomeInteger` and then `len` of the
+/// field raises `'int' has no length`.
 fn annotation_struct_field_type(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
-    match tyref_rust_vec_layout(ty, llbc) {
-        Some(RustVecLayout::HeaderPtr) => {
-            rust_vec_header_ptr_spelling(ty, llbc).unwrap_or_else(|| {
-                tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
-            })
+    match tyref_rust_vec_item_kind(ty, llbc) {
+        Some(majit_ir::rvec::VecItemKind::Int) => {
+            let item =
+                tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
+            format!("*mut Vec<{item}>")
         }
-        Some(RustVecLayout::ByValue) => {
-            tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
-        }
+        Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
+        Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => {
             let layout =
                 tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
@@ -4039,14 +4037,7 @@ fn note_raw_word_owner(
     immutable_fields: &ImmutableFieldsTable,
 ) {
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(
-        td.def_id,
-        llbc,
-        gc_struct_ids,
-        immutable_fields,
-        &mut stack,
-        None,
-    ) {
+    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
         return;
     }
     let name = td.item_meta.name_path();

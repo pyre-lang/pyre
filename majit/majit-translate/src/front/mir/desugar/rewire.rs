@@ -314,23 +314,6 @@ pub(crate) enum AggregateShape {
     Ctor(AggregateCtor),
 }
 
-/// Unsuffixed `core::ops::range::{leaf}` aggregate. Accepts both the
-/// historical `["core","ops","range"]` + `Range<T>` split and the class
-/// identity split `["core"]` + `ops::range::Range<T>`.
-pub(in crate::front::mir) fn is_core_ops_range_adt_ctor(
-    owner_path: &[String],
-    ctor_name: &str,
-    leaf: &str,
-) -> bool {
-    let joined = if owner_path.is_empty() {
-        ctor_name.to_string()
-    } else {
-        format!("{}::{ctor_name}", owner_path.join("::"))
-    };
-    let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
-    base == format!("core::ops::range::{leaf}")
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateCtor {
     pub(in crate::front::mir) target: CallTarget,

@@ -22,7 +22,7 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     init_jit_hooks();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    importing::init_sys_path(&cwd, cwd.as_os_str());
+    importing::init_sys_path(&cwd, Some(cwd.as_os_str()));
     importing::add_sys_path_0();
     importing::set_sys_argv(&[std::ffi::OsString::from(name)]);
 
@@ -38,7 +38,8 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
         .map_err(|e| format!("frame setup error: {}", e.message_text()))?;
 
     let canonical = frame.get_w_globals();
-    let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);
+    let main_module =
+        pyre_object::w_module_new_aliasing_dict(pyre_object::w_str_new("__main__"), canonical);
     importing::set_sys_module("__main__", main_module);
 
     eval_with_jit(&mut frame, None)

@@ -289,7 +289,12 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         let base = self.interior_header_base(bb_id, &alias)?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
-        let owner_declared_gc = field_owner_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
+        let owner_declared_gc = container_declared_gc(
+            &inner.ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        );
         let item_ty = adt_field_read_value_type(
             place_ty,
             field_ty,
@@ -578,19 +583,100 @@ impl<'a> Lowering<'a> {
     /// takes the STR; recover it from `cast_ptr_to_int_src`. Walk until the
     /// GcRef header: one hop can stop on an intermediate address word, and
     /// `strgetitem` of that word assembles as `/ii>i`.
+    ///
+    /// A `__cast_instance_intrinsic` of a `FieldRead` / `Input` whose type
+    /// is `Str` is the same header (`cast_pointer` is identity). Prefer
+    /// that FieldRead so `strgetitem` names the getfield STR.
     pub(in crate::front::mir) fn string_repr_of_byte_view_ptr(&self, ptr: &Variable) -> Variable {
         let mut cur = ptr.clone();
         let mut seen = std::collections::HashSet::new();
         loop {
-            if self.var_is_gc_string_repr(&cur) {
+            if !seen.insert(cur.id()) || seen.len() > 16 {
                 return cur;
             }
-            if !seen.insert(cur.id()) || seen.len() > 16 {
+            if let Some(inner) = self.str_field_under_instance_cast(&cur) {
+                cur = inner;
+                continue;
+            }
+            if self.var_is_gc_string_repr(&cur) {
                 return cur;
             }
             match self.address_cast_pointer(&cur) {
                 Some(orig) if orig.id() != cur.id() => cur = orig,
                 _ => return cur,
+            }
+        }
+    }
+
+    /// Operand of a `__cast_instance_intrinsic` whose producer is a STR
+    /// FieldRead or `Input { ty: Str }`. A dest-is-str restore of a GCREF
+    /// is not this case: that operand is not a Str-typed header.
+    ///
+    /// `FrameState.copy` mints a fresh Variable for extra-live (`input_copied_from`).
+    /// `resolve_to_producer_op` returns none on a phi, so walk that rename
+    /// the way [`Self::var_is_str_input`] does.
+    fn str_field_under_instance_cast(&self, var: &Variable) -> Option<Variable> {
+        let mut id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if let Some(src) = self.str_field_under_instance_cast_at(id) {
+                return Some(src);
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return None;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return None,
+            }
+        }
+    }
+
+    fn str_field_under_instance_cast_at(&self, id: u64) -> Option<Variable> {
+        let op = self.graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref().is_some_and(|r| r.id() == id))
+        })?;
+        if crate::model::cast_instance_root(&op.kind).is_none() {
+            return None;
+        }
+        let OpKind::Call { args, .. } = &op.kind else {
+            return None;
+        };
+        let src = args.first().and_then(crate::model::LinkArg::as_variable)?;
+        self.producer_is_str_header(src).then(|| src.clone())
+    }
+
+    fn producer_is_str_header(&self, var: &Variable) -> bool {
+        let mut id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let found = self.graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    op.result.as_ref().is_some_and(|r| r.id() == id)
+                        && matches!(
+                            &op.kind,
+                            OpKind::FieldRead {
+                                ty: ValueType::Str,
+                                ..
+                            } | OpKind::Input {
+                                ty: ValueType::Str,
+                                ..
+                            }
+                        )
+                })
+            });
+            if found {
+                return true;
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return false;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return false,
             }
         }
     }
@@ -1182,10 +1268,11 @@ impl<'a> Lowering<'a> {
                             Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
-                                    .with_owner_declared_gc(field_owner_declared_gc(
+                                    .with_owner_declared_gc(container_declared_gc(
                                         &field_base_ty,
                                         self.llbc,
                                         self.gc_struct_ids,
+                                        self.immutable_fields,
                                     ))
                                     .with_base_is_deref(base_is_deref)
                                     .with_host_index(host_index)
@@ -1244,10 +1331,11 @@ impl<'a> Lowering<'a> {
                             // `PyObject ∪ PyErrorObject`.
                             value =
                                 self.recast_error_carrier_field_store(bb_id, &field_base_ty, value);
-                            let owner_declared_gc = field_owner_declared_gc(
+                            let owner_declared_gc = container_declared_gc(
                                 &field_base_ty,
                                 self.llbc,
                                 self.gc_struct_ids,
+                                self.immutable_fields,
                             );
                             let field_dest_ty =
                                 tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
@@ -1696,10 +1784,11 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(ty, self.llbc).is_some() {
             return None;
         }
-        // A `Vec<T>` header is `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs
-        // rust_vec_lltype`), kind `int`. The pointee TypeDecl is not a GC
-        // type, so the store is the header address, not a `SomeList`.
-        if tyref_is_rust_vec_header(ty, self.llbc) {
+        // A one-word `Vec<T>` header is `Ptr(Struct(raw) "RustVec")`
+        // (`rrustvec.rs rust_vec_lltype`), kind `int`. The pointee TypeDecl
+        // is not a GC type, so the store is the header address, not a
+        // `SomeList`. `Vec<u8>` is the list model.
+        if tyref_rust_vec_item_kind(ty, self.llbc).is_some() {
             return None;
         }
         let node = strip_ty_indirections(tyref_node(ty, self.llbc)?, self.llbc)?;
@@ -2340,13 +2429,18 @@ impl<'a> Lowering<'a> {
                         return Ok((Some(op), res));
                     }
                     // `get().0 as *mut T` of an erased `OwnerRootGuard` is the
-                    // loaded word (`owner_root_guard.rs`). A dest-class
-                    // narrow here would hide that FieldRead from the return;
-                    // `deref_mut` retargets the word to the pointee class.
+                    // loaded GCREF word (`owner_root_guard.rs`). Recast onto
+                    // the registered dest (`rgc.cast_gcref_to_instance` /
+                    // `cast_base_ptr_to_instance`). Aliasing would leave
+                    // SomePtr(GCREF) on a `PyFrame` return. `deref_mut`
+                    // retargets a `frame_ptr` call, which is not a guard word.
                     if matches!(dst_kind, ValueType::Ref(_))
                         && let Some(word) = self.guard_root_word(&arg)
                     {
-                        return Ok((None, word));
+                        let bb_id = self.emit_bb(mir_bb);
+                        let recast =
+                            self.recast_gcref_word_to_registered_dest(bb_id, dest_ty, word);
+                        return Ok((None, recast));
                     }
 
                     // An integer cast to a narrower unsigned type keeps only
@@ -3081,9 +3175,10 @@ impl<'a> Lowering<'a> {
                     return Ok((Some(op), res));
                 }
                 // `get().0 as *mut T` of an erased `OwnerRootGuard` is the
-                // loaded word (`owner_root_guard.rs`). Charon emits this
-                // as `Rvalue::Cast`, not `UnaryOp::Cast`; a dest-class
-                // narrow would hide that FieldRead from the return.
+                // loaded GCREF word (`owner_root_guard.rs`). Charon emits
+                // this as `Rvalue::Cast`, not `UnaryOp::Cast`. Recast onto
+                // the registered dest (`rgc.cast_gcref_to_instance` /
+                // `cast_base_ptr_to_instance`).
                 let dest_is_ref = matches!(
                     tyref_to_value_type_with(
                         &ty,
@@ -3095,7 +3190,9 @@ impl<'a> Lowering<'a> {
                     ValueType::Ref(_)
                 );
                 if dest_is_ref && let Some(word) = self.guard_root_word(&v) {
-                    return Ok((None, word));
+                    let bb_id = self.emit_bb(mir_bb);
+                    let recast = self.recast_gcref_word_to_registered_dest(bb_id, dest_ty, word);
+                    return Ok((None, recast));
                 }
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
@@ -3476,16 +3573,6 @@ impl<'a> Lowering<'a> {
                                 let var = self.resolve_operand(mir_bb, op)?;
                                 let (ptr, len) =
                                     self.owner_to_window(mir_bb, var, src_ty.as_ref())?;
-                                arg_vars.push(ptr);
-                                pair_lens.push(Some(len));
-                                continue;
-                            }
-                            // Origin dest of a `Vec<u8>` slice view has a
-                            // length slot whose stored ty misses
-                            // `tyref_pair_field_kind` (`u8` has no helper
-                            // kind). `pair_operand` still names both words;
-                            // `resolve_operand` would read the pair as one.
-                            if let Some((ptr, len, _)) = self.pair_operand(mir_bb, &op)? {
                                 arg_vars.push(ptr);
                                 pair_lens.push(Some(len));
                                 continue;
@@ -3995,8 +4082,12 @@ impl<'a> Lowering<'a> {
                         res,
                     ));
                 }
-                let disc_owner_gc =
-                    field_owner_declared_gc(&place.ty, self.llbc, self.gc_struct_ids);
+                let disc_owner_gc = container_declared_gc(
+                    &place.ty,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    self.immutable_fields,
+                );
                 let recast_tagged_sum =
                     crate::front::result_exc::tyref_is_option(&place.ty, self.llbc);
                 let mut base = self.resolve_place(mir_bb, place)?;
@@ -4474,8 +4565,12 @@ impl<'a> Lowering<'a> {
                 if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
                     && v.as_object().and_then(|m| m.get("Field")).is_some()
                 {
-                    let owner_gc =
-                        field_owner_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
+                    let owner_gc = container_declared_gc(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        self.immutable_fields,
+                    );
                     if let Some(raw) =
                         raw_field_address_value_type(&place.ty, &place.ty, owner_gc, self.llbc)
                     {
@@ -4536,10 +4631,11 @@ impl<'a> Lowering<'a> {
         if tyref_fieldless_enum_pointee(dest_ty, self.llbc).is_some() {
             return None;
         }
-        // A by-value `Vec<T>` dest is the three-word header, not an
-        // instance classdef. Narrowing it would paint `SomeInstance`
-        // onto a later `getitem` that must stay a list.
-        if tyref_is_rust_vec_header(dest_ty, self.llbc) {
+        // A one-word by-value `Vec<T>` dest is the three-word header, not
+        // an instance classdef. Narrowing it would paint `SomeInstance`
+        // onto a later `getitem` that must stay a list. `Vec<u8>` is that
+        // list model and keeps the classdef walk off this skip.
+        if tyref_rust_vec_item_kind(dest_ty, self.llbc).is_some() {
             return None;
         }
         if let Some(root) =
@@ -4620,7 +4716,12 @@ impl<'a> Lowering<'a> {
         }
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
-        let node = declared_raw_adt_node(pointee, self.llbc, self.gc_struct_ids)?;
+        let node = declared_raw_adt_node(
+            pointee,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        )?;
         let id = adt_node_def_id(node)?;
         // Refusal guard, not a kind classifier: a declared-Raw struct
         // that still holds a mutable GC pointer is not a raw `SomePtr`
@@ -4632,7 +4733,6 @@ impl<'a> Lowering<'a> {
             self.gc_struct_ids,
             self.immutable_fields,
             &mut Vec::new(),
-            None,
         ) {
             return None;
         }
@@ -4742,7 +4842,12 @@ impl<'a> Lowering<'a> {
             tyref_node(&payload, self.llbc).and_then(|n| type_node_peel_aliases(n, self.llbc))?;
         let pointee = one_level_pointer_pointee(payload_node, self.llbc)?;
         let pointee = strip_ty_indirections(pointee, self.llbc).unwrap_or(pointee);
-        let adt = declared_raw_adt_node(pointee, self.llbc, self.gc_struct_ids)?;
+        let adt = declared_raw_adt_node(
+            pointee,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        )?;
         let id = adt_node_def_id(adt)?;
         let decl = self.llbc.type_by_id(id)?;
         if type_decl_is_fieldless_enum(decl, self.llbc) {
@@ -6872,8 +6977,12 @@ impl<'a> Lowering<'a> {
                         return Ok(res);
                     }
                     let field_pure = immutable_static_id.is_some();
-                    let owner_declared_gc =
-                        field_owner_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
+                    let owner_declared_gc = container_declared_gc(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        self.immutable_fields,
+                    );
                     let scalar_word =
                         self.llbc_scalar_field_word(&inner.ty, host_index, &field_ty, &place_ty);
                     // Captured before `resolve_projection_base` moves `inner`. A
@@ -8403,7 +8512,12 @@ impl<'a> Lowering<'a> {
                 })
                 .and_then(|id| self.llbc.type_by_id(id))
                 .is_some_and(type_decl_is_closure_env);
-        let owner_declared_gc = field_owner_declared_gc(dest_ty, self.llbc, self.gc_struct_ids);
+        let owner_declared_gc = container_declared_gc(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        );
         let fields: Vec<AggregateField> = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows

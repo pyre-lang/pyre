@@ -367,8 +367,11 @@ impl ProvidedCrate {
             if Rc::ptr_eq(&owner, self) {
                 continue;
             }
-            let req =
-                crate::front::clause_spec::remap_spec_request(req, &self.llbc, &owner.llbc, fn_id);
+            let Some(req) =
+                crate::front::clause_spec::remap_spec_request(req, &self.llbc, &owner.llbc, fn_id)
+            else {
+                continue;
+            };
             if let Some(spec) = owner.declare_spec(tables, req) {
                 tables.declarations.push(spec);
             }

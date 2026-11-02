@@ -842,8 +842,10 @@ pub use pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID;
 // Appended tail registrations for PyFrame-owned auxiliary objects. These live
 // with their Rust layouts in pyre-interpreter and are re-exported here beside
 // PYFRAME_GC_TYPE_ID for the runtime registration census.
-pub use pyre_interpreter::eval::RAISE_CAUSE_GC_TYPE_ID;
 pub use pyre_interpreter::pyframe::FRAME_DEBUG_DATA_GC_TYPE_ID;
+// Stamped at the absolute tail of `build_gc`; the cell is not a compile-time
+// const.
+pub use pyre_interpreter::eval::RAISE_CAUSE_GC_TYPE_ID;
 // Stamped at the absolute tail of `build_gc`; the cell is not a compile-time
 // const. `pypy/interpreter/executioncontext.py` `ExecutionContext`.
 pub use pyre_interpreter::executioncontext::EXECUTION_CONTEXT_GC_TYPE_ID;

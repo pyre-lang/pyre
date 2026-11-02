@@ -235,26 +235,15 @@ impl<'a> Lowering<'a> {
                 self.gc_struct_ids,
                 &self.raw_alloc_flavor_structs,
             );
-            // By-value raw struct (`Parsed`): same getkind as FieldRead.
-            // Portal red `ec` (`*const PyExecutionContext`) is a pointer
-            // word (`interp_jit.py` `reds = ['frame', 'ec']`). A payload
-            // enum (`Option<i64>`) keeps the CFG return Ref.
-            let resolved = if tyref_call_signature_raw_value(
-                dest_class_ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-            ) {
-                raw_value_getkind(painted, &[dest_class_ty], self.llbc, self.gc_struct_ids)
-            } else {
-                painted
-            };
+            // Residual FUNC.RESULT is `dont_look_inside_return_token`
+            // (`call.py getcalldescr`); RegularCall dest is the same
+            // `tyref_to_value_type_with` painter as main.
             // Transparent raw wrapper (`RootScope` → usize): the peel
             // paints Unsigned and [`tyref_call_signature_raw_value`]
             // misses the wrapper (`strip_ty_indirections`). `history.py`
             // `getkind` of that word is `'int'`. FUNC.RESULT still
             // spells `u64`.
-            match resolved {
+            match painted {
                 ValueType::Unsigned
                     if tyref_transparent_inner_value_type(
                         dest_class_ty,
@@ -3703,10 +3692,10 @@ impl<'a> Lowering<'a> {
                     // `ann_direct_arrayitems` is still deferred.
                     //
                     // `get().0 as *mut T` of an erased `OwnerRootGuard` is
-                    // the loaded word (`owner_root_guard.rs`). rustc may
-                    // emit that as `<ptr>::cast` after an int-to-ptr; a
-                    // dest-class narrow would hide the FieldRead from
-                    // `frame_ptr`'s return. `deref_mut` casts a
+                    // the loaded GCREF word (`owner_root_guard.rs`). rustc
+                    // may emit that as `<ptr>::cast` after an int-to-ptr.
+                    // Recast onto the registered dest
+                    // (`rgc.cast_gcref_to_instance`). `deref_mut` casts a
                     // `frame_ptr` call, which is not a guard word.
                     let dest_is_ref = matches!(
                         tyref_to_value_type_with(
@@ -3722,7 +3711,9 @@ impl<'a> Lowering<'a> {
                         tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
                     });
                     if let Some(word) = self.guard_root_word(&args[0]) {
-                        self.alias_dest_to_arg0_inherit(dest_local, word, &arg_locals);
+                        let recast =
+                            self.recast_gcref_word_to_registered_dest(bb_id, &call.dest.ty, word);
+                        self.local_var[dest_local] = Some(LocalValue::One(recast));
                     } else if let Some((base, offset)) =
                         self.taken_array_field_address(bb_id, &args[0], Some(&call.dest.ty))?
                         && let Some(root) =
@@ -5509,22 +5500,12 @@ impl<'a> Lowering<'a> {
                 // below.
                 //
                 // `Vec<PyObjectRef>::as_slice` is [`Self::try_lower_object_vec_whole_list_view`].
-                // Any other `Vec<T>` is the raw header address; its slice is
-                // not that word (`history.py` `getkind` of the header is
-                // `int`, of `&[u8]` is `ref`).
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    let rust_vec_header = first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_is_rust_vec_header(ty, self.llbc));
-                    if !rust_vec_header
-                        || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
-                    {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
-                    }
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
                 }
                 // `<[T]>::as_ptr` — the slice's data pointer is the receiver
                 // value in the erased array-pointer model.  Alias the result to
@@ -5567,13 +5548,24 @@ impl<'a> Lowering<'a> {
                     };
                     // A W1 string view is still `Ptr(STR)` (`rstr.py
                     // ll_stritem_nonneg`), not a materialized CCHARP window.
-                    let data = if first_arg_is_string_byte_view {
+                    // `is_as_view_noop`: receiver and dest share a repr
+                    // class (10-26). `slice_as_ptr_word` only when they
+                    // differ. Mark dest so `p.add(i)` sees the STR even
+                    // when `merge_string_byte_view_state` skipped the
+                    // successor (`*const u8` is not a pre-pass window).
+                    let view_noop =
+                        is_as_view_noop(self.llbc, &reg, first_arg_ty.as_ref(), &call.dest.ty);
+                    let data = if view_noop {
                         data
                     } else {
                         self.slice_as_ptr_word(mir_bb, &call.dest.ty, data, true)
                     };
-                    self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
-                    self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
+                    if view_noop {
+                        self.alias_dest_to_arg0(dest_local, data, true);
+                    } else {
+                        self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
+                        self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5674,7 +5666,12 @@ impl<'a> Lowering<'a> {
                                     .unwrap_or_else(|| ty.clone())
                             });
                             let owner_declared_gc = cell_ty.as_ref().and_then(|ty| {
-                                field_owner_declared_gc(ty, self.llbc, self.gc_struct_ids)
+                                container_declared_gc(
+                                    ty,
+                                    self.llbc,
+                                    self.gc_struct_ids,
+                                    self.immutable_fields,
+                                )
                             });
                             OpKind::FieldWrite {
                                 base: args[0].clone(),
@@ -8253,6 +8250,7 @@ impl<'a> Lowering<'a> {
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
         if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
             stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+            stamp_raw_c_void_voidp(&result_var, &call.dest.ty, self.llbc);
             stamp_fn_ptr(
                 &result_var,
                 &call.dest.ty,
@@ -9822,6 +9820,7 @@ impl<'a> Lowering<'a> {
         spec.borrow_mut()
             .enqueue(crate::front::clause_spec::SpecRequest {
                 fn_id: fd.def_id,
+                fn_path: fd.item_meta.name_path(),
                 leaf,
                 trait_refs,
                 types,
@@ -10384,7 +10383,6 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     self.immutable_fields,
                     &mut raw_stack,
-                    None,
                 ) {
                     let owner = td
                         .item_meta

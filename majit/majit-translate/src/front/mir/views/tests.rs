@@ -4,10 +4,9 @@ use majit_charon_reader::{Llbc, ullbc::TyRef};
 
 use crate::front::mir::tests::{
     call_leafs, fixture_item_meta, graph_ops, ident_path, llbc_with_trait_impls,
-    std_extern_call_fixture_with_types, std_extern_call_fixture_with_types_dest, window_call_leafs,
-    window_empty_generics, window_graph_ops, window_llbc, window_local, window_meta,
-    window_opaque_fun, window_place, window_shared_slice, window_span,
-    window_unwind_and_return_blocks, window_usize,
+    std_extern_call_fixture_with_types, window_call_leafs, window_empty_generics, window_graph_ops,
+    window_llbc, window_local, window_meta, window_opaque_fun, window_place, window_shared_slice,
+    window_span, window_unwind_and_return_blocks, window_usize,
 };
 
 /// `k = w_bytes_data(key); entries.get(k)` keeps `k` as one `Ptr(STR)`
@@ -397,75 +396,6 @@ fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
                 _ => false,
             }),
             "Vec::{leaf} items word is cast_int_to_ptr(CCHARP); ops={ops:?}"
-        );
-    }
-}
-
-#[test]
-fn byte_item_vec_deref_splits_the_header_with_word_helpers() {
-    let generics = |types: Vec<serde_json::Value>| {
-        serde_json::json!({
-            "regions": [], "types": types, "const_generics": [], "trait_refs": []
-        })
-    };
-    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
-    let vec_ty = serde_json::json!({
-        "Adt": {"id": 0, "generics": generics(vec![u8_ty.clone()])}
-    });
-    let u8_slice = serde_json::json!({
-        "Ref": ["'_", {"Slice": [u8_ty, null]}, "Shared"]
-    });
-    let vec_decl = {
-        let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
-            .iter()
-            .map(|s| serde_json::json!({"Ident": [s, 0]}))
-            .collect();
-        serde_json::json!({
-            "def_id": 0,
-            "item_meta": {
-                "name": name,
-                "span": {"data": {
-                    "file_id": 0,
-                    "beg": {"line": 1, "col": 0},
-                    "end": {"line": 1, "col": 1}
-                }},
-                "source_text": null,
-                "attr_info": {
-                    "attributes": [], "inline": null, "rename": null, "public": true
-                },
-                "is_local": false
-            },
-            "kind": {"Struct": []}
-        })
-    };
-    for (caller, callee) in [
-        ("vec_u8_deref", &["vec", "Vec", "deref"] as &[&str]),
-        ("vec_u8_as_slice", &["alloc", "vec", "<Impl>", "as_slice"]),
-    ] {
-        let llbc = std_extern_call_fixture_with_types_dest(
-            caller,
-            callee,
-            &[vec_ty.clone()],
-            u8_slice.clone(),
-            vec![vec_decl.clone()],
-            true,
-        );
-        let graph = super::lower_function(&llbc, caller).expect("lower Vec<u8> slice view");
-        let ops = graph_ops(&graph);
-        let leafs = call_leafs(&ops);
-        assert!(
-            leafs.iter().any(|leaf| leaf == "ll_vec_items_i"),
-            "{caller} must call ll_vec_items_i; leafs={leafs:?} ops={ops:?}"
-        );
-        assert!(
-            leafs.iter().any(|leaf| leaf == "ll_vec_length_i"),
-            "{caller} must call ll_vec_length_i; leafs={leafs:?} ops={ops:?}"
-        );
-        assert!(
-            !leafs
-                .iter()
-                .any(|leaf| leaf == "deref" || leaf == "as_slice"),
-            "{caller} must not stay residual; leafs={leafs:?}"
         );
     }
 }

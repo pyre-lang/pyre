@@ -1313,32 +1313,33 @@ fn wrap_result_exc_call(
 ) -> Option<proc_macro2::TokenStream> {
     match return_kind {
         HelperCallKind::Void => Some(quote! {
-            ::majit_ir::helper_fnaddr::residual_result_void(#inner)
-        }),
-        HelperCallKind::Float => {
-            let _ = payload_ty;
-            Some(quote! {
-                ::majit_ir::helper_fnaddr::residual_result_f64(#inner)
-            })
-        }
-        HelperCallKind::Int | HelperCallKind::Ref => {
-            if vec_one_word_item(payload_ty).is_some() {
-                let converted = helper_return_to_i64(quote! { __majit_ok }, payload_ty)?;
-                Some(quote! {
-                    match #inner {
-                        ::core::result::Result::Ok(__majit_ok) => #converted,
-                        ::core::result::Result::Err(__majit_err) => {
-                            ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
-                            0
-                        }
-                    }
-                })
-            } else {
-                let _ = helper_return_to_i64(quote! { __probe }, payload_ty)?;
-                Some(quote! {
-                    ::majit_ir::helper_fnaddr::residual_result_i64(#inner)
-                })
+            match #inner {
+                ::core::result::Result::Ok(_) => {}
+                ::core::result::Result::Err(__majit_err) => {
+                    ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                }
             }
+        }),
+        HelperCallKind::Float => Some(quote! {
+            match #inner {
+                ::core::result::Result::Ok(__majit_ok) => __majit_ok,
+                ::core::result::Result::Err(__majit_err) => {
+                    ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                    0.0
+                }
+            }
+        }),
+        HelperCallKind::Int | HelperCallKind::Ref => {
+            let converted = helper_return_to_i64(quote! { __majit_ok }, payload_ty)?;
+            Some(quote! {
+                match #inner {
+                    ::core::result::Result::Ok(__majit_ok) => #converted,
+                    ::core::result::Result::Err(__majit_err) => {
+                        ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                        0
+                    }
+                }
+            })
         }
         HelperCallKind::Unsupported => None,
     }

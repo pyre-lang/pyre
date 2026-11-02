@@ -1,16 +1,13 @@
 use super::{
     DecodedConst, bitflags_trait_empty_const, decode_literal, is_class_pytype_assoc_const,
-    primitive_float_const, scalar_to_const_value, static_key_segments, tyref_to_value_type,
+    primitive_float_const, scalar_to_const_value, static_key_segments,
 };
 
 use crate::flowspace::model::ConstValue;
 
-use crate::model::{CallTarget, OpKind, ValueType};
+use crate::model::{CallTarget, OpKind};
 
-use majit_charon_reader::{
-    Llbc,
-    ullbc::{NameSeg, TyRef},
-};
+use majit_charon_reader::{Llbc, ullbc::NameSeg};
 
 use crate::front::mir::tests::{
     const_artifact, empty_generics, empty_llbc, fixture_llbc, init_fun, item_meta_json,

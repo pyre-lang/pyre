@@ -1888,8 +1888,7 @@ enum JitAction {
 
 use crate::jit::descr::{
     BUILTIN_CODE_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID,
-    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RAISE_CAUSE_GC_TYPE_ID,
-    RANGE_ITER_GC_TYPE_ID,
+    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
     SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
     SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BASE_EXCEPTION_GC_TYPE_ID,
     W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
@@ -3794,14 +3793,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         ],
     ));
     debug_assert_eq!(frame_debug_data_tid, FRAME_DEBUG_DATA_GC_TYPE_ID);
-    // RaiseCause is a plain GC object (`GcType`). Both fields are GC
-    // references; `Option<PyError>` is two words, so the custom trace
-    // visits `w_cause` and the PyError word inside `invalid`.
-    let raise_cause_tid = gc.register_type(TypeInfo::with_custom_trace(
-        std::mem::size_of::<pyre_interpreter::eval::RaiseCause>(),
-        pyre_interpreter::eval::raise_cause_trace,
-    ));
-    debug_assert_eq!(raise_cause_tid, RAISE_CAUSE_GC_TYPE_ID);
     // setobject.py W_SetIterObject — AUTO-ID typed payload. Its live `w_set`
     // edge is traced, preserving a source owned solely by an iterator. Keep
     // this at the absolute tail of the type-id chain: inserting it before the
@@ -5453,6 +5444,15 @@ fn build_gc() -> Box<MiniMarkGC> {
         .without_app_level_typedef(),
     );
     pyre_object::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
+    // RaiseCause is a plain GC object (`GcType`). Both fields are GC
+    // references; `Option<PyError>` is two words, so the custom trace
+    // visits `w_cause` and the PyError word inside `invalid`. Absolute tail
+    // so no hardcoded / `#[pyre_class(type_id = N)]` id moves.
+    let raise_cause_tid = gc.register_type(TypeInfo::with_custom_trace(
+        std::mem::size_of::<pyre_interpreter::eval::RaiseCause>(),
+        pyre_interpreter::eval::raise_cause_trace,
+    ));
+    pyre_interpreter::eval::RAISE_CAUSE_GC_TYPE_ID.set(raise_cause_tid);
     // ExecutionContext is a plain GC object (`GcType`), not a PyObject
     // subclass. Custom trace visits every GC slot it owns; the destructor
     // runs drop glue for Vec/RefCell/quasi-immut watchers. Absolute tail

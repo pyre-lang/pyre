@@ -4263,6 +4263,7 @@ impl<'a> Lowering<'a> {
     ) -> bool {
         if is_as_view_noop(self.llbc, reg, first_arg_ty, dest_ty)
             && first_arg_ty.is_some_and(|ty| tyref_is_w1_str_receiver(ty, self.llbc))
+            && tyref_is_w1_str_view_dest(dest_ty, self.llbc)
         {
             return true;
         }

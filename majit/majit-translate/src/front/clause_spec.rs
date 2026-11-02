@@ -319,14 +319,17 @@ pub(crate) fn substituted_unstructured(
 /// body in one type universe; Charon numbers TypeDecl / TraitImpl ids per
 /// artefact, so a call in another crate's LLBC has to name the same
 /// types by `name_path` before substitution walks the owning body.
+/// `None` when a caller id has no owner mapping: the substitution lives
+/// in the owner's type universe, and a TYPE that universe cannot name
+/// has no graph there.
 pub(crate) fn remap_spec_request(
     req: SpecRequest,
     from: &Llbc,
     to: &Llbc,
     fn_id: u64,
-) -> SpecRequest {
+) -> Option<SpecRequest> {
     let maps = IdMaps::build(from, to);
-    SpecRequest {
+    Some(SpecRequest {
         fn_id,
         fn_path: req.fn_path,
         leaf: req.leaf,
@@ -334,18 +337,18 @@ pub(crate) fn remap_spec_request(
             .trait_refs
             .into_iter()
             .map(|v| remap_value(v, from, &maps, Space::TraitRef))
-            .collect(),
+            .collect::<Option<Vec<_>>>()?,
         types: req
             .types
             .into_iter()
             .map(|v| remap_value(v, from, &maps, Space::Ty))
-            .collect(),
+            .collect::<Option<Vec<_>>>()?,
         const_generics: req
             .const_generics
             .into_iter()
             .map(|v| remap_value(v, from, &maps, Space::Const))
-            .collect(),
-    }
+            .collect::<Option<Vec<_>>>()?,
+    })
 }
 
 struct IdMaps {
@@ -415,9 +418,11 @@ impl IdMaps {
     }
 }
 
-fn remap_value(mut v: Value, from: &Llbc, maps: &IdMaps, space: Space) -> Value {
-    remap_value_at(&mut v, from, maps, space, None, 0);
-    v
+fn remap_value(mut v: Value, from: &Llbc, maps: &IdMaps, space: Space) -> Option<Value> {
+    if !remap_value_at(&mut v, from, maps, space, None, 0) {
+        return None;
+    }
+    Some(v)
 }
 
 fn remap_value_at(
@@ -427,9 +432,9 @@ fn remap_value_at(
     space: Space,
     key: Option<&str>,
     depth: usize,
-) {
+) -> bool {
     if depth > 64 {
-        return;
+        return true;
     }
     let expanded = v.as_object().and_then(|obj| {
         obj.get("Deduplicated")
@@ -443,45 +448,57 @@ fn remap_value_at(
             })
     });
     if let Some(mut plain) = expanded {
-        remap_value_at(&mut plain, from, maps, space, None, depth + 1);
+        if !remap_value_at(&mut plain, from, maps, space, None, depth + 1) {
+            return false;
+        }
         *v = plain;
-        return;
+        return true;
     }
     match v {
         Value::Array(items) => {
             for (i, item) in items.iter_mut().enumerate() {
-                remap_value_at(item, from, maps, space.element(key, i), None, depth + 1);
+                if !remap_value_at(item, from, maps, space.element(key, i), None, depth + 1) {
+                    return false;
+                }
             }
         }
         Value::Object(map) => {
-            if let Some(id) = map.get("Fun").and_then(Value::as_u64)
-                && let Some(&to_id) = maps.funs.get(&id)
-            {
+            if let Some(id) = map.get("Fun").and_then(Value::as_u64) {
+                let Some(&to_id) = maps.funs.get(&id) else {
+                    return false;
+                };
                 map.insert("Fun".to_string(), Value::from(to_id));
             }
             if let Some(id) = map.get("id").and_then(Value::as_u64) {
                 let mapped = match key {
-                    Some("Adt") => maps.types.get(&id).copied(),
-                    Some("TraitImpl") => maps.impls.get(&id).copied(),
+                    Some("Adt") => Some(maps.types.get(&id).copied()),
+                    Some("TraitImpl") => Some(maps.impls.get(&id).copied()),
                     Some("skip_binder") if space == Space::TraitRef => {
-                        maps.traits.get(&id).copied()
+                        Some(maps.traits.get(&id).copied())
                     }
                     _ => None,
                 };
-                if let Some(to_id) = mapped {
-                    map.insert("id".to_string(), Value::from(to_id));
+                match mapped {
+                    Some(Some(to_id)) => {
+                        map.insert("id".to_string(), Value::from(to_id));
+                    }
+                    Some(None) => return false,
+                    None => {}
                 }
             }
             let keys: Vec<String> = map.keys().cloned().collect();
             for k in keys {
                 let item_space = space.field(&k);
                 if let Some(item) = map.get_mut(&k) {
-                    remap_value_at(item, from, maps, item_space, Some(&k), depth + 1);
+                    if !remap_value_at(item, from, maps, item_space, Some(&k), depth + 1) {
+                        return false;
+                    }
                 }
             }
         }
         _ => {}
     }
+    true
 }
 
 /// Trait-impl id of a resolved trait call. `None` for a `Clause` ref.
@@ -2017,12 +2034,58 @@ mod tests {
             ],
             const_generics: vec![],
         };
-        let remapped = remap_spec_request(req, &from, &to, 3225);
+        let remapped = remap_spec_request(req, &from, &to, 3225).expect("mapped");
         assert_eq!(remapped.fn_id, 3225);
         assert_eq!(
             remapped.types[0].pointer("/Adt/id").and_then(Value::as_u64),
             Some(3)
         );
+    }
+
+    /// A caller Adt id whose `name_path` is absent from the owner is
+    /// refused. The owner's colliding id with a different name is not used.
+    #[test]
+    fn remap_spec_request_refuses_an_adt_id_the_owner_cannot_name() {
+        let decl = |def_id: u64, name: &str| {
+            json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": [{"Ident": ["c", 0]}, {"Ident": [name, 0]}],
+                    "span": {"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}},
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "kind": "Opaque",
+                "signature": {"is_unsafe": false, "inputs": [], "output": {"Scalar": {"Integer": {"Unsigned": "Usize"}}}}
+            })
+        };
+        let file = |crate_name: &str, type_id: u64, name: &str| {
+            json!({
+                "charon_version": "t",
+                "has_errors": false,
+                "translated": {
+                    "crate_name": crate_name,
+                    "type_decls": [decl(type_id, name)],
+                    "fun_decls": [],
+                    "files": []
+                }
+            })
+        };
+        let from =
+            Llbc::from_slice(file("caller", 259, "W_Kqueue").to_string().as_bytes()).expect("from");
+        let to = Llbc::from_slice(file("owner", 259, "MapRef").to_string().as_bytes()).expect("to");
+        let req = SpecRequest {
+            fn_id: 1669,
+            fn_path: "c::f".to_string(),
+            leaf: "f__spec_x".to_string(),
+            trait_refs: vec![],
+            types: vec![
+                json!({"Adt": {"id": 259, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}, "builtin": null}}),
+            ],
+            const_generics: vec![],
+        };
+        assert!(remap_spec_request(req, &from, &to, 3225).is_none());
     }
 
     /// `&T` stays distinct from `T`.

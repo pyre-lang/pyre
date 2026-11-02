@@ -4629,9 +4629,9 @@ fn trace_and_compile_from_bridge_body(
             };
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
-                    "[jit][bridge-trace] interpret-from-resume key={} trace={} fail={} \
+                    "[jit][bridge-trace] interpret-from-resume key={} descr=0x{:x} \
                      resume_pc={} walk_pc={} compiled={}",
-                    green_key, trace_id, fail_index, resume_pc, pc, compiled
+                    green_key, descr_id, resume_pc, pc, compiled
                 );
             }
             // `pyjitpl.py handle_guard_failure` never goes back to the
