@@ -2,33 +2,37 @@
 //!
 //! This slice exposes the exact lltype-facing surface that can be represented
 //! with pyre's current `lltype` port: errno flags, C array/struct helper
-//! constructors, callback pointer types, and the standard raw pointer aliases.
+//! constructors, callback pointer types, the standard raw pointer aliases,
+//! and the platform C integer `Number` types created by `setup()`.
 //! The program-level half of `rffi.py` (string and buffer helpers, `llexternal`
-//! wrappers and their callbacks, the platform integer aliases) is program code
-//! here: it lives in `majit_rlib::rffi` and `majit_rlib::lltypesystem::rffi`,
-//! which the translator reads as LLBC like the rest of the program.
+//! wrappers and their callbacks) is program code here: it lives in
+//! `majit_rlib::rffi` and `majit_rlib::lltypesystem::rffi`, which the
+//! translator reads as LLBC like the rest of the program.
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
 use indexmap::IndexMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::annotator::dictdef::DictDef;
-use crate::annotator::model::{SomeInteger, SomeValue};
+use crate::annotator::model::{KnownType, SomeInteger, SomeValue};
 use crate::flowspace::model::{
     AlwaysInline, Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc,
     GraphRef, Hlvalue, Link, SpaceOperation, Variable, c_last_exception,
 };
 use crate::flowspace::pygraph::PyGraph;
+use crate::rlib::rarithmetic;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, _ptr, _ptr_obj, Array, CastWhateverError, FixedSizeArray, FuncType, GCREF,
-    LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, SomePtr, Struct, cast_primitive,
-    functionptr_with_external_name, malloc, nullptr, typeOf, typeOf_const,
+    LowLevelType, LowLevelValue, MallocFlavor, Number, Ptr, PtrTarget, SomePtr, Struct,
+    build_number, cast_primitive, const_as_f64, functionptr_with_external_name, malloc, nullptr,
+    truncated_from_const, typeOf, typeOf_const,
 };
 use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
 use crate::translator::rtyper::lltypesystem::rstr::{
@@ -40,6 +44,9 @@ use crate::translator::rtyper::rmodel::{PtrRepr, Repr, lowlevel_type_const};
 use crate::translator::rtyper::rtyper::{
     HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype, exception_args,
     helper_pygraph_from_graph, variable_with_lltype,
+};
+use crate::translator::rtyper::tool::rfficache::{
+    PLATFORM, RffiCacheError, sizeof_c_type, sizeof_c_types,
 };
 
 pub use majit_jitcode::rffi::{
@@ -73,14 +80,600 @@ pub const UNSIGNED: LowLevelType = LowLevelType::Unsigned;
 pub const r_singlefloat: LowLevelType = LowLevelType::SingleFloat;
 pub const NULL: Option<()> = None;
 
-fn ptr_to_array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
-    LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(Array::with_hints(of, hints)),
-    }))
+/// RPython `TYPES` seed list (`rffi.py`). POSIX typedefs follow
+/// `os.name != 'nt'` on the *target* (`layout::target_os`), not the host
+/// `#[cfg]`. `wasm32-unknown-unknown` is `unknown` and keeps only builtin
+/// C types plus pointer-width typedefs the rustc probe can answer.
+pub static TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(types_for_target);
+
+fn types_for_target() -> Vec<&'static str> {
+    let mut types = vec![
+        "short",
+        "unsigned short",
+        "int",
+        "unsigned int",
+        "long",
+        "unsigned long",
+        "signed char",
+        "unsigned char",
+        "long long",
+        "unsigned long long",
+        "size_t",
+        "time_t",
+        "wchar_t",
+        "uintptr_t",
+        "intptr_t",
+        "void*",
+    ];
+    // `rffi.py`: `try: sizeof_c_type('__int128_t', ignore_errors=True);
+    // TYPES += ['__int128_t', '__uint128_t'] except CompilationError: pass`
+    // before the POSIX `os.name != 'nt'` block. The rustc probe has no
+    // `__int128_t` mapping, so a cross target skips both names.
+    if sizeof_c_type("__int128_t", true).is_ok() {
+        types.extend(["__int128_t", "__uint128_t"]);
+    }
+    let os = crate::layout::target_os();
+    if target_os_is_unix(os) {
+        types.extend([
+            "mode_t",
+            "pid_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "int_least8_t",
+            "uint_least8_t",
+            "int_least16_t",
+            "uint_least16_t",
+            "int_least32_t",
+            "uint_least32_t",
+            "int_least64_t",
+            "uint_least64_t",
+            "int_fast8_t",
+            "uint_fast8_t",
+            "int_fast16_t",
+            "uint_fast16_t",
+            "int_fast32_t",
+            "uint_fast32_t",
+            "int_fast64_t",
+            "uint_fast64_t",
+            "intmax_t",
+            "uintmax_t",
+        ]);
+    } else if os == "unknown" {
+        types.retain(|name| !matches!(*name, "time_t" | "wchar_t"));
+    }
+    types
+}
+
+fn target_os_is_unix(os: &str) -> bool {
+    !matches!(os, "windows" | "unknown" | "none" | "uefi")
+}
+
+fn types_contains(c_name: &str) -> bool {
+    TYPES.iter().any(|name| *name == c_name)
+}
+
+fn rffi_name_from_c_type(mut name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("unsigned") {
+        name = rest.trim_start();
+        format!("u{}", name.replace(' ', ""))
+    } else {
+        name.replace(' ', "")
+    }
+}
+
+/// Signedness from `populate_inttypes` (`rffi.py`): `'unsigned'` prefix,
+/// `size_t` / `uint*` / `__uint*` unsigned; `wchar_t` unsigned on Windows;
+/// everything else signed (`void*` included).
+fn rffi_inttype_signed(c_name: &str) -> bool {
+    if c_name.starts_with("unsigned") {
+        false
+    } else if c_name == "size_t" || c_name.starts_with("uint") || c_name.starts_with("__uint") {
+        false
+    } else if c_name == "wchar_t" && crate::layout::target_os() == "windows" {
+        false
+    } else {
+        true
+    }
+}
+
+fn populate_platform_inttypes() -> Result<(), RffiCacheError> {
+    let mut missing_c = Vec::new();
+    let mut missing_name = Vec::new();
+    let mut missing_signed = Vec::new();
+    {
+        let platform = PLATFORM.lock();
+        for c_name in TYPES.iter().copied() {
+            let name = rffi_name_from_c_type(c_name).to_uppercase();
+            if platform.get(&name).is_none() {
+                missing_signed.push(rffi_inttype_signed(c_name));
+                missing_c.push(c_name);
+                missing_name.push(name);
+            }
+        }
+    }
+    if missing_c.is_empty() {
+        return Ok(());
+    }
+    let sizes = sizeof_c_types(&missing_c, false)?;
+    let mut platform = PLATFORM.lock();
+    for ((name, signed), size) in missing_name
+        .iter()
+        .zip(missing_signed)
+        .zip(sizes.into_iter())
+    {
+        if platform.get(name).is_none() {
+            platform.make_type(name, signed, size)?;
+        }
+    }
+    Ok(())
+}
+
+/// RPython `populate_inttypes()` (`rffi.py`).
+pub fn populate_inttypes() -> Vec<String> {
+    if let Err(err) = populate_platform_inttypes() {
+        panic!("{}", err);
+    }
+    TYPES
+        .iter()
+        .map(|name| rffi_name_from_c_type(name))
+        .collect()
 }
 
 fn nolength_hints() -> Vec<(String, ConstValue)> {
     vec![("nolength".into(), ConstValue::Bool(true))]
+}
+
+/// One `setup()` row: `NAME`, `NAMEP`, and `r_<name>` (`rffi.py` `setup`).
+///
+/// `RffiGlobal` Deref needs `&'static LowLevelType` handles, so published
+/// types stay interned statics. `intern_static` leaks a value only the
+/// first time it is seen; repeated `setup()` calls on an unchanged
+/// platform leak nothing, and the total leak is bounded by the number of
+/// distinct published values. `rclass` is `KnownType` (Copy) and stored
+/// by value.
+#[derive(Copy, Clone)]
+struct PublishedCInt {
+    tp: &'static LowLevelType,
+    tpp: &'static LowLevelType,
+    rclass: KnownType,
+}
+
+struct Published {
+    result: Vec<LowLevelType>,
+    by_key: IndexMap<String, PublishedCInt>,
+    /// `rffi.py` `os.name == 'nt'`: `PID_T`/`SSIZE_T`/`PTRDIFF_T` at
+    /// `TYPES` construction and `MODE_T = INT` after `setup()`. Bare
+    /// `NAME` aliases; not in `TYPES`, so no `NAMEP`/`r_*`.
+    aliases: IndexMap<String, &'static LowLevelType>,
+}
+
+/// Module globals last written by `setup()` (`rffi.py` `globals()[...] =`).
+static PUBLISHED: RwLock<Option<Published>> = RwLock::new(None);
+
+/// `rffi.py` module initialization: `NUMBER_TYPES = setup()`, then the
+/// `Signed→int` override and the `r_int_real` / `INT_real` /
+/// `r_uint_real` / `UINT_real` registrations. Every public number-type
+/// export forces this once.
+static RFFI_MODULE: OnceLock<RffiModule> = OnceLock::new();
+
+struct RffiModule {
+    number_types: Vec<LowLevelType>,
+    r_int_real: KnownType,
+    int_real: LowLevelType,
+    r_uint_real: KnownType,
+    uint_real: LowLevelType,
+    /// `globals()['r_long']` from the first `setup()` (`rffi.py`), taken
+    /// before `numbertype_to_rclass[Signed] = int`. A later `setup()` may
+    /// republish `r_long` as builtin `int` when `LONG` is `Signed`.
+    #[allow(dead_code)]
+    first_r_long: KnownType,
+}
+
+/// Process-global intern table for published `LowLevelType` values.
+/// `setup` (`rffi.py`) rebinds module globals onto the platform's existing
+/// type objects; this table is the Rust analogue that keeps `&'static`
+/// identity without leaking on every `setup()`.
+static INTERNED: LazyLock<Mutex<HashMap<LowLevelType, &'static LowLevelType>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Intern `tp` as `&'static LowLevelType`. Leaks only the first time a
+/// given value is seen; later calls return the same pointer.
+fn intern_static(tp: LowLevelType) -> &'static LowLevelType {
+    let mut interned = INTERNED.lock();
+    if let Some(&existing) = interned.get(&tp) {
+        return existing;
+    }
+    let leaked: &'static LowLevelType = Box::leak(Box::new(tp.clone()));
+    interned.insert(tp, leaked);
+    leaked
+}
+
+fn insert_published(
+    by_key: &mut IndexMap<String, PublishedCInt>,
+    key: String,
+    tp: LowLevelType,
+    rclass: KnownType,
+) -> LowLevelType {
+    let tpp = CArrayPtr(tp.clone());
+    let published = PublishedCInt {
+        tp: intern_static(tp.clone()),
+        tpp: intern_static(tpp),
+        rclass,
+    };
+    by_key.insert(key, published);
+    tp
+}
+
+/// `rffi.py` `os.name == 'nt'` `TYPES` else-branch (`PID_T` / `SSIZE_T` /
+/// `PTRDIFF_T = lltype.Signed`) and later `MODE_T = INT`. Bare `NAME`
+/// aliases only: the names are not in `TYPES` and get no `NAMEP` / `r_*`.
+fn nt_fallback_type_aliases(
+    types: &[&str],
+    int_tp: LowLevelType,
+) -> IndexMap<String, LowLevelType> {
+    let mut aliases = IndexMap::new();
+    if !types.iter().any(|name| *name == "pid_t") {
+        aliases.insert("PID_T".into(), SIGNED);
+    }
+    if !types.iter().any(|name| *name == "ssize_t") {
+        aliases.insert("SSIZE_T".into(), SIGNED);
+    }
+    if !types.iter().any(|name| *name == "ptrdiff_t") {
+        aliases.insert("PTRDIFF_T".into(), SIGNED);
+    }
+    if !types.iter().any(|name| *name == "mode_t") {
+        aliases.insert("MODE_T".into(), int_tp);
+    }
+    aliases
+}
+
+/// RPython `setup()` body (`rffi.py`): for every `populate_inttypes()`
+/// name, bind `r_<name>`, `NAME`, and `NAMEP`. `os.name == 'nt'`
+/// aliases from [`nt_fallback_type_aliases`] stay out of that family.
+fn setup_body() -> Published {
+    let names = populate_inttypes();
+    let platform = PLATFORM.lock();
+    let mut result = Vec::with_capacity(names.len());
+    let mut by_key = IndexMap::with_capacity(names.len());
+    for name in names {
+        let key = name.to_uppercase();
+        let tp = match platform.get(&key) {
+            Some(nt) => nt.lltype.clone(),
+            None => panic!("rffi.setup: {key} missing from Platform.types"),
+        };
+        // `globals()['r_' + name] = platform.numbertype_to_rclass[tp]`
+        let rclass = platform
+            .numbertype_to_rclass(&tp)
+            .unwrap_or_else(|| panic!("rffi.setup: r_{name} missing from numbertype_to_rclass"));
+        result.push(insert_published(&mut by_key, key, tp, rclass));
+    }
+    drop(platform);
+    let int_tp = (*by_key
+        .get("INT")
+        .unwrap_or_else(|| panic!("rffi.setup: INT missing from published table"))
+        .tp)
+        .clone();
+    let aliases = nt_fallback_type_aliases(TYPES.as_slice(), int_tp)
+        .into_iter()
+        .map(|(key, tp)| (key, intern_static(tp)))
+        .collect();
+    Published {
+        result,
+        by_key,
+        aliases,
+    }
+}
+
+fn published_table_cint(key: &str) -> PublishedCInt {
+    let guard = PUBLISHED.read();
+    let table = guard
+        .as_ref()
+        .unwrap_or_else(|| panic!("rffi.setup: published table missing"));
+    table
+        .by_key
+        .get(key)
+        .copied()
+        .unwrap_or_else(|| panic!("rffi.setup: {key} is not in TYPES for this target"))
+}
+
+fn published_table_lltype(key: &str) -> &'static LowLevelType {
+    let guard = PUBLISHED.read();
+    let table = guard
+        .as_ref()
+        .unwrap_or_else(|| panic!("rffi.setup: published table missing"));
+    if let Some(entry) = table.by_key.get(key) {
+        return entry.tp;
+    }
+    if let Some(&tp) = table.aliases.get(key) {
+        return tp;
+    }
+    if let Some(stem) = key.strip_suffix('P')
+        && let Some(entry) = table.by_key.get(stem)
+    {
+        return entry.tpp;
+    }
+    panic!("rffi.setup: {key} is not in TYPES for this target");
+}
+
+fn published_cint(key: &str) -> PublishedCInt {
+    let _ = rffi_module();
+    published_table_cint(key)
+}
+
+fn published_lltype_ref(key: &str) -> &'static LowLevelType {
+    let _ = rffi_module();
+    published_table_lltype(key)
+}
+
+#[cfg(test)]
+fn published_lltype(key: &str) -> LowLevelType {
+    published_lltype_ref(key).clone()
+}
+
+#[cfg(test)]
+fn platform_lltype(name: &str) -> LowLevelType {
+    published_lltype(name)
+}
+
+/// `globals()[NAME]` / `globals()[NAMEP]` from `setup()` (`rffi.py`).
+/// Each read forces rffi module init, then looks the name up in the
+/// table last written by `setup()`.
+#[derive(Copy, Clone, Debug)]
+pub struct RffiGlobal(&'static str);
+
+impl Deref for RffiGlobal {
+    type Target = LowLevelType;
+
+    fn deref(&self) -> &LowLevelType {
+        published_lltype_ref(self.0)
+    }
+}
+
+/// `setup()` (`rffi.py`) without forcing `rffi_module` first.
+/// `rffi_module_init` calls this so public [`setup`] cannot recurse.
+fn setup_unforced() -> Vec<LowLevelType> {
+    let published = setup_body();
+    let result = published.result.clone();
+    *PUBLISHED.write() = Some(published);
+    result
+}
+
+/// RPython `setup()` (`rffi.py`). Recomputes and replaces the published
+/// globals table (`globals()['r_' + name]`, `NAME`, `NAMEP`).
+///
+/// Upstream module init (`NUMBER_TYPES = setup()`, then
+/// `numbertype_to_rclass[Signed] = int`, then `r_int_real` / `INT_real` /
+/// `r_uint_real` / `UINT_real`) always completes before an external
+/// caller can invoke `setup()`. Public `setup()` therefore forces
+/// `rffi_module` first; init uses [`setup_unforced`].
+pub fn setup() -> Vec<LowLevelType> {
+    let _ = rffi_module();
+    setup_unforced()
+}
+
+/// `platform.numbertype_to_rclass[tp]` after rffi module init (`rffi.py`).
+pub fn numbertype_to_rclass(tp: &LowLevelType) -> KnownType {
+    let _ = rffi_module();
+    PLATFORM
+        .lock()
+        .numbertype_to_rclass(tp)
+        .unwrap_or_else(|| panic!("rffi.setup: no rclass for {tp:?}"))
+}
+
+/// `globals()['r_' + name]` (`rffi.py` `setup`). `name` is the
+/// lower-case rffi name (`"uchar"`, `"int_least8_t"`, `"__int128_t"`).
+/// Forces rffi module init, then reads the rclass snapshot `setup()`
+/// published, not the live `platform.numbertype_to_rclass` map. Panics
+/// when that name is not in `TYPES` for this target.
+pub fn r_class(name: &str) -> KnownType {
+    published_cint(&name.to_uppercase()).rclass
+}
+
+macro_rules! rffi_r_class {
+    ($($fn:ident => $name:expr;)*) => {
+        $(
+            pub fn $fn() -> KnownType {
+                r_class($name)
+            }
+        )*
+    };
+}
+
+// Named `r_<name>` accessors `setup()` binds (`rffi.py`). `r_int`
+// shadows `rarithmetic.r_int` inside this module the way `rffi.r_int`
+// does upstream.
+rffi_r_class! {
+    r_signedchar => "signedchar";
+    r_uchar => "uchar";
+    r_short => "short";
+    r_ushort => "ushort";
+    r_int => "int";
+    r_uint => "uint";
+    r_long => "long";
+    r_ulong => "ulong";
+    r_longlong => "longlong";
+    r_ulonglong => "ulonglong";
+    r_size_t => "size_t";
+    r_time_t => "time_t";
+    r_wchar_t => "wchar_t";
+    r_uintptr_t => "uintptr_t";
+    r_intptr_t => "intptr_t";
+    r_mode_t => "mode_t";
+    r_pid_t => "pid_t";
+    r_ssize_t => "ssize_t";
+    r_ptrdiff_t => "ptrdiff_t";
+    r_int_least8_t => "int_least8_t";
+    r_uint_least8_t => "uint_least8_t";
+    r_int_least16_t => "int_least16_t";
+    r_uint_least16_t => "uint_least16_t";
+    r_int_least32_t => "int_least32_t";
+    r_uint_least32_t => "uint_least32_t";
+    r_int_least64_t => "int_least64_t";
+    r_uint_least64_t => "uint_least64_t";
+    r_int_fast8_t => "int_fast8_t";
+    r_uint_fast8_t => "uint_fast8_t";
+    r_int_fast16_t => "int_fast16_t";
+    r_uint_fast16_t => "uint_fast16_t";
+    r_int_fast32_t => "int_fast32_t";
+    r_uint_fast32_t => "uint_fast32_t";
+    r_int_fast64_t => "int_fast64_t";
+    r_uint_fast64_t => "uint_fast64_t";
+    r_intmax_t => "intmax_t";
+    r_uintmax_t => "uintmax_t";
+    // `r___int128_t` / `r___uint128_t` (`rffi.py` `setup`). Panic when
+    // `TYPES` does not contain `__int128_t` / `__uint128_t`.
+    r___int128_t => "__int128_t";
+    r___uint128_t => "__uint128_t";
+}
+
+/// `SIGN`/`BITS` of the rclass behind a rffi C integer `Number`.
+/// `LowLevelType::Number` carries `KnownType::RInt`; when `build_number`
+/// folded the C type onto a predefined singleton, the `Platform`
+/// `NumberType` record supplies the same pair (`rfficache._make_type`).
+fn rffi_c_int_sign_bits(c_name: &str, tp: &LowLevelType) -> (bool, u16) {
+    match tp {
+        LowLevelType::Number(n) => (n._type.sign, n._type.bits),
+        _ => match PLATFORM.lock().get(c_name) {
+            Some(nt) => (nt.signed, nt.bits as u16),
+            None => panic!("rffi.setup: {c_name} missing from Platform.types"),
+        },
+    }
+}
+
+fn build_int_real(name: &'static str, c_name: &str, c_tp: &LowLevelType) -> KnownType {
+    let (sign, bits) = rffi_c_int_sign_bits(c_name, c_tp);
+    rarithmetic::build_int(Some(name), sign, bits, true).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// `r_int_real` / `INT_real` (or the UINT pair) (`rffi.py`):
+/// `rarithmetic.build_int`, `lltype.build_number`, then
+/// `platform.numbertype_to_rclass[TP_real] = r_*_real`.
+fn register_number_real(number_name: &str, r_name: &'static str) -> (KnownType, LowLevelType) {
+    let published = published_table_cint(number_name);
+    let r_real = build_int_real(r_name, number_name, published.tp);
+    let tp = build_number(Some(number_name), r_real)
+        .unwrap_or_else(|e| panic!("lltype.build_number({number_name}, {r_name}): {e}"));
+    PLATFORM.lock().set_numbertype_to_rclass(tp.clone(), r_real);
+    (r_real, tp)
+}
+
+/// RPython module body after `setup` (`rffi.py`):
+/// `NUMBER_TYPES = setup()`;
+/// `platform.numbertype_to_rclass[lltype.Signed] = int`;
+/// `r_int_real` / `INT_real` then `NUMBER_TYPES.append(INT_real)`;
+/// same for `r_uint_real` / `UINT_real`.
+/// Calls [`setup_unforced`] so this cannot re-enter `rffi_module`
+/// through public [`setup`]. Reads `INT`/`UINT` from the table that
+/// write just installed, so this cannot re-enter through `RffiGlobal`.
+fn rffi_module_init() -> RffiModule {
+    let mut number_types = setup_unforced();
+    let first_r_long = published_table_cint("LONG").rclass;
+    PLATFORM
+        .lock()
+        .set_numbertype_to_rclass(LowLevelType::Signed, KnownType::Int);
+    let (r_int_real_cls, int_real) = register_number_real("INT", "r_int_real");
+    number_types.push(int_real.clone());
+    let (r_uint_real_cls, uint_real) = register_number_real("UINT", "r_uint_real");
+    number_types.push(uint_real.clone());
+    RffiModule {
+        number_types,
+        r_int_real: r_int_real_cls,
+        int_real,
+        r_uint_real: r_uint_real_cls,
+        uint_real,
+        first_r_long,
+    }
+}
+
+fn rffi_module() -> &'static RffiModule {
+    RFFI_MODULE.get_or_init(rffi_module_init)
+}
+
+/// `NUMBER_TYPES` (`rffi.py`): `setup()` result plus `INT_real` and `UINT_real`.
+pub static NUMBER_TYPES: LazyLock<Vec<LowLevelType>> =
+    LazyLock::new(|| rffi_module().number_types.clone());
+
+/// `rarithmetic.build_int("r_int_real", r_int.SIGN, r_int.BITS, True)` (`rffi.py`).
+/// `r_int` here is the rffi C-int class bound by `setup()`.
+pub static r_int_real: LazyLock<KnownType> = LazyLock::new(|| rffi_module().r_int_real);
+
+/// `lltype.build_number("INT", r_int_real)` (`rffi.py`).
+pub static INT_real: LazyLock<LowLevelType> = LazyLock::new(|| rffi_module().int_real.clone());
+
+/// `rarithmetic.build_int("r_uint_real", r_uint.SIGN, r_uint.BITS, True)` (`rffi.py`).
+/// `r_uint` here is the rffi C-unsigned-int class bound by `setup()`.
+pub static r_uint_real: LazyLock<KnownType> = LazyLock::new(|| rffi_module().r_uint_real);
+
+/// `lltype.build_number("UINT", r_uint_real)` (`rffi.py`).
+pub static UINT_real: LazyLock<LowLevelType> = LazyLock::new(|| rffi_module().uint_real.clone());
+
+/// `globals()[NAME]` / `globals()[NAMEP]` from `setup()` (`rffi.py`).
+/// The export panics when accessed if that name is not in `TYPES` for
+/// this target (POSIX-only names on Windows/wasm32; `__int128_t` when
+/// the compiler lacks it). `os.name == 'nt'` aliases (`PID_T` /
+/// `SSIZE_T` / `PTRDIFF_T` / `MODE_T`) are bare `NAME` bindings from
+/// [`nt_fallback_type_aliases`]; `NAMEP` / `r_*` still panic.
+macro_rules! rffi_c_int {
+    ($id:ident, $pid:ident) => {
+        pub static $id: RffiGlobal = RffiGlobal(stringify!($id));
+        pub static $pid: RffiGlobal = RffiGlobal(concat!(stringify!($id), "P"));
+    };
+}
+
+rffi_c_int!(SIGNEDCHAR, SIGNEDCHARP);
+rffi_c_int!(UCHAR, UCHARP);
+rffi_c_int!(SHORT, SHORTP);
+rffi_c_int!(USHORT, USHORTP);
+rffi_c_int!(INT, INTP);
+rffi_c_int!(UINT, UINTP);
+rffi_c_int!(LONG, LONGP);
+rffi_c_int!(ULONG, ULONGP);
+rffi_c_int!(LONGLONG, LONGLONGP);
+rffi_c_int!(ULONGLONG, ULONGLONGP);
+rffi_c_int!(SIZE_T, SIZE_TP);
+rffi_c_int!(TIME_T, TIME_TP);
+rffi_c_int!(WCHAR_T, WCHAR_TP);
+rffi_c_int!(UINTPTR_T, UINTPTR_TP);
+rffi_c_int!(INTPTR_T, INTPTR_TP);
+
+// Upstream `__INT128_T` / `__UINT128_T` (`rffi.py` `setup`). Panics when
+// accessed if `TYPES` does not contain `__int128_t` / `__uint128_t`.
+rffi_c_int!(__INT128_T, __INT128_TP);
+rffi_c_int!(__UINT128_T, __UINT128_TP);
+
+rffi_c_int!(INT_LEAST8_T, INT_LEAST8_TP);
+rffi_c_int!(UINT_LEAST8_T, UINT_LEAST8_TP);
+rffi_c_int!(INT_LEAST16_T, INT_LEAST16_TP);
+rffi_c_int!(UINT_LEAST16_T, UINT_LEAST16_TP);
+rffi_c_int!(INT_LEAST32_T, INT_LEAST32_TP);
+rffi_c_int!(UINT_LEAST32_T, UINT_LEAST32_TP);
+rffi_c_int!(INT_LEAST64_T, INT_LEAST64_TP);
+rffi_c_int!(UINT_LEAST64_T, UINT_LEAST64_TP);
+rffi_c_int!(INT_FAST8_T, INT_FAST8_TP);
+rffi_c_int!(UINT_FAST8_T, UINT_FAST8_TP);
+rffi_c_int!(INT_FAST16_T, INT_FAST16_TP);
+rffi_c_int!(UINT_FAST16_T, UINT_FAST16_TP);
+rffi_c_int!(INT_FAST32_T, INT_FAST32_TP);
+rffi_c_int!(UINT_FAST32_T, UINT_FAST32_TP);
+rffi_c_int!(INT_FAST64_T, INT_FAST64_TP);
+rffi_c_int!(UINT_FAST64_T, UINT_FAST64_TP);
+rffi_c_int!(INTMAX_T, INTMAX_TP);
+rffi_c_int!(UINTMAX_T, UINTMAX_TP);
+
+rffi_c_int!(SSIZE_T, SSIZE_TP);
+rffi_c_int!(MODE_T, MODE_TP);
+rffi_c_int!(PID_T, PID_TP);
+rffi_c_int!(PTRDIFF_T, PTRDIFF_TP);
+
+/// `INT_realP` (`rffi.py`).
+pub static INT_realP: LazyLock<LowLevelType> = LazyLock::new(|| CArrayPtr((*INT_real).clone()));
+/// `UINT_realP` sibling of `INT_realP`.
+pub static UINT_realP: LazyLock<LowLevelType> = LazyLock::new(|| CArrayPtr((*UINT_real).clone()));
+
+fn ptr_to_array(of: LowLevelType, hints: Vec<(String, ConstValue)>) -> LowLevelType {
+    LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Array(Array::with_hints(of, hints)),
+    }))
 }
 
 fn void_hints(render_as_const: bool) -> Vec<(String, ConstValue)> {
@@ -215,7 +808,8 @@ pub fn make(STRUCT: Struct, fields: Vec<(String, LowLevelValue)>) -> Result<_ptr
 /// Integer 0 to a `Ptr` is `nullptr` (`ctypes.c_void_p(0)`). A nonzero
 /// integer becomes the `_ptr_obj::IntCast` address carrier
 /// (`cast_int_to_ptr` / `force_cast` `c_void_p`). Primitive destinations
-/// go through `cast_primitive`.
+/// follow the numeric part of `ll2ctypes.force_cast` (ctypes wrap, not
+/// `cast_primitive` / `rint_new` range checks).
 pub fn cast_value(tgt: &LowLevelType, value: &ConstValue) -> Result<ConstValue, CastWhateverError> {
     if !(tgt.is_primitive() || matches!(tgt, LowLevelType::Ptr(_))) {
         return Err(CastWhateverError::TypeError(format!(
@@ -232,7 +826,7 @@ pub fn cast_value(tgt: &LowLevelType, value: &ConstValue) -> Result<ConstValue, 
         if let Ok(orig) = typeOf_const(&value)
             && orig.is_primitive()
         {
-            return cast_primitive(tgt, &value);
+            return force_cast_numeric(tgt, &value);
         }
         return Err(CastWhateverError::TypeError(format!(
             "casting {value:?} to {tgt:?}"
@@ -269,9 +863,121 @@ fn unwrap_force_cast_source(value: &ConstValue) -> ConstValue {
                 }
             }
         },
+        ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => {
+            r_singlefloat_or_r_longfloat_as_float(value)
+        }
+        other => other.clone(),
+    }
+}
+
+/// `ll2ctypes.force_cast`: `if isinstance(value, r_singlefloat): value = float(value)`
+/// and `elif isinstance(cvalue, r_longfloat): cvalue = cvalue.value`.
+fn r_singlefloat_or_r_longfloat_as_float(value: &ConstValue) -> ConstValue {
+    match value {
         ConstValue::SingleFloat(bits) => ConstValue::float(f32::from_bits(*bits) as f64),
         ConstValue::LongFloat(bits) => ConstValue::float(f64::from_bits(*bits)),
         other => other.clone(),
+    }
+}
+
+/// ctypes integer wrap used by `ll2ctypes.force_cast`:
+/// `cresulttype(cvalue).value` masks to `bits` and, for a signed
+/// destination, sign-extends (`c_byte(255).value == -1`).
+/// `rint_new` / `Number._cast` raise OverflowError on signed overflow,
+/// so they are not this wrap.
+fn wrap_exact_int(bits: u16, signed: bool, value: i128) -> i128 {
+    let bits_u = if bits == 0 {
+        0
+    } else if bits >= 128 {
+        value as u128
+    } else {
+        (value as u128) & ((1u128 << bits) - 1)
+    };
+    if signed && bits > 0 && bits < 128 {
+        let shift = 128 - bits;
+        ((bits_u << shift) as i128) >> shift
+    } else {
+        bits_u as i128
+    }
+}
+
+/// `lltype.Number` destinations `force_cast` wraps with ctypes
+/// (`Signed` / `Unsigned` / longlong / `LowLevelType::Number`).
+fn integer_dest_bits_signed(tgt: &LowLevelType) -> Option<(u16, bool)> {
+    match tgt {
+        LowLevelType::Signed => Some((rarithmetic::long_bit(), true)),
+        LowLevelType::Unsigned => Some((rarithmetic::long_bit(), false)),
+        LowLevelType::SignedLongLong => Some((64, true)),
+        LowLevelType::UnsignedLongLong => Some((64, false)),
+        LowLevelType::SignedLongLongLong => Some((128, true)),
+        LowLevelType::UnsignedLongLongLong => Some((128, false)),
+        LowLevelType::Number(n) => Some((n._type.bits, n._type.sign)),
+        _ => None,
+    }
+}
+
+/// `ll2ctypes.ctypes2lltype` for an integer `RESTYPE`.
+fn ctypes2lltype_integer(RESTYPE: &LowLevelType, wrapped: i128) -> ConstValue {
+    match RESTYPE {
+        LowLevelType::Signed | LowLevelType::SignedLongLong => ConstValue::Int(wrapped as i64),
+        LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => ConstValue::UInt(wrapped as u64),
+        LowLevelType::SignedLongLongLong => ConstValue::Int128(wrapped),
+        LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(wrapped as u128),
+        LowLevelType::Number(n) => ConstValue::rint(n._type, wrapped),
+        _ => ConstValue::Int(wrapped as i64),
+    }
+}
+
+/// Numeric part of `ll2ctypes.force_cast` after the pointer shortcut
+/// and the `RESTYPE == TYPE1` identity. Integer destinations wrap with
+/// ctypes (`cresulttype(cvalue).value`). Bool is `bool(cvalue)` of the
+/// original source; Float/SingleFloat/LongFloat take the source's exact
+/// value as a float (`cresulttype(cvalue).value`). Char/UniChar keep
+/// `cast_primitive`.
+fn force_cast_numeric(
+    RESTYPE: &LowLevelType,
+    value: &ConstValue,
+) -> Result<ConstValue, CastWhateverError> {
+    let value = r_singlefloat_or_r_longfloat_as_float(value);
+    if let Some((bits, signed)) = integer_dest_bits_signed(RESTYPE) {
+        let t = truncated_from_const(&value)?;
+        let wrapped = wrap_exact_int(bits, signed, t.low as i128);
+        return Ok(ctypes2lltype_integer(RESTYPE, wrapped));
+    }
+    match RESTYPE {
+        LowLevelType::Bool => force_cast_to_bool(&value),
+        LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
+            force_cast_to_float(RESTYPE, &value)
+        }
+        _ => cast_primitive(RESTYPE, &value),
+    }
+}
+
+/// `ll2ctypes.force_cast`: `RESTYPE == Bool` → `bool(cvalue)` after
+/// `lltype2ctypes` (`Char`/`UniChar` → `ord`). Float keeps `f != 0.0`
+/// (`force_cast(Bool, 0.5)` is True); integers and character codes
+/// use `truncated_from_const` then `!= 0`.
+fn force_cast_to_bool(value: &ConstValue) -> Result<ConstValue, CastWhateverError> {
+    if matches!(value, ConstValue::Float(_)) {
+        return Ok(ConstValue::Bool(const_as_f64(value)? != 0.0));
+    }
+    let t = truncated_from_const(value)?;
+    Ok(ConstValue::Bool(t.low != 0))
+}
+
+/// `ll2ctypes.force_cast`: Float/SingleFloat/LongFloat destination is
+/// `cresulttype(cvalue).value` — the source's exact value as a float.
+/// Unsigned sources stay positive (`rint_value` for `ConstValue::RInt`).
+fn force_cast_to_float(
+    RESTYPE: &LowLevelType,
+    value: &ConstValue,
+) -> Result<ConstValue, CastWhateverError> {
+    let f = const_as_f64(value)?;
+    match RESTYPE {
+        LowLevelType::Float => Ok(ConstValue::float(f)),
+        LowLevelType::SingleFloat => Ok(ConstValue::SingleFloat((f as f32).to_bits())),
+        LowLevelType::LongFloat => Ok(ConstValue::LongFloat(f.to_bits())),
+        _ => Err(CastWhateverError::TypeError("unsupported cast".into())),
     }
 }
 
@@ -283,11 +989,36 @@ fn integer_bits_for_ptr_cast(value: &ConstValue) -> Result<i64, CastWhateverErro
         ConstValue::Bool(true) => Ok(1),
         ConstValue::Int128(n) => Ok(*n as i64),
         ConstValue::UInt128(n) => Ok(*n as i64),
+        ConstValue::RInt(c, v, _) => Ok(rarithmetic::rint_value(*c, *v).as_i64()),
         ConstValue::LLPtr(p) if !p.nonzero() => Ok(0),
         _ => Err(CastWhateverError::TypeError(format!(
             "casting {value:?} to pointer"
         ))),
     }
+}
+
+/// `rffi.py sizeof` for a `lltype.Number`: `tp._type.BITS/8`.
+///
+/// Python 2 `/` on ints is floor, so a 65-bit class is 8 bytes and
+/// `getkind` banks it as `'int'` when that is `<= sizeof(Signed)`.
+/// Char and Bool return 1, SingleFloat returns 4, on dedicated arms of
+/// [`sizeof`]; they are not Numbers.
+pub fn sizeof_number(n: &Number) -> i64 {
+    (n._type.bits as i64) / 8
+}
+
+/// Forced `build_int` class wrapped as `lltype.Number`. Tests use widths
+/// (`65`, `128`) that `setup()` does not publish.
+#[cfg(test)]
+pub(crate) fn number_from_forced_int(name: &'static str, sign: bool, bits: u16) -> LowLevelType {
+    let c = match rarithmetic::build_int(Some(name), sign, bits, true) {
+        Ok(KnownType::RInt(c)) => c,
+        other => panic!("expected RInt, got {other:?}"),
+    };
+    LowLevelType::Number(Box::new(Number {
+        _name: name.into(),
+        _type: c,
+    }))
 }
 
 /// `rffi.py sizeof(tp)`: integer size when known. A `Struct` without a
@@ -320,9 +1051,8 @@ pub fn sizeof(tp: &LowLevelType) -> Result<ConstValue, TyperError> {
         }
         LowLevelType::Char | LowLevelType::Bool => Ok(ConstValue::Int(1)),
         LowLevelType::UniChar => {
-            // `rffi.py sizeof`: `r_wchar_t.BITS/8`. `setup()` maps
-            // `wchar_t` to UniChar; `ll2ctypes.py` stores UniChar as
-            // `c_uint16` when `sizeof(c_wchar) == 2` else `c_uint32`.
+            // `rffi.py sizeof`: `r_wchar_t.BITS/8`. UniChar stays the
+            // unicode code-point primitive; `WCHAR_T` is a Number.
             Ok(ConstValue::Int(llmemory::sizeof_wchar_t()))
         }
         LowLevelType::Float => Ok(ConstValue::Int(8)),
@@ -332,6 +1062,7 @@ pub fn sizeof(tp: &LowLevelType) -> Result<ConstValue, TyperError> {
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => {
             Ok(ConstValue::Int(16))
         }
+        LowLevelType::Number(n) => Ok(ConstValue::Int(sizeof_number(n))),
         _ => Err(TyperError::message(format!("sizeof({tp:?}): not a Number"))),
     }
 }
@@ -351,6 +1082,7 @@ pub fn size_and_sign(tp: &LowLevelType) -> Result<(usize, bool), TyperError> {
         }
     };
     let unsigned = match tp {
+        LowLevelType::Number(n) => !n._type.sign,
         LowLevelType::Unsigned
         | LowLevelType::UnsignedLongLong
         | LowLevelType::UnsignedLongLongLong => true,
@@ -1283,8 +2015,17 @@ impl CConstant {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Serializes tests that call `setup()` (`rffi.py`) or observe the
+    /// published table / `numbertype_to_rclass`. Poison recovery so one
+    /// panic does not wedge later tests in this module.
+    static RFFI_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) fn rffi_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        RFFI_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn ptr_array_of(value: &LowLevelType) -> &Array {
         let LowLevelType::Ptr(ptr) = value else {
@@ -1314,6 +2055,91 @@ mod tests {
             panic!("expected nullptr, got {null:?}");
         };
         assert!(!p0.nonzero());
+    }
+
+    fn number_class(tp: &LowLevelType) -> crate::annotator::model::RIntClass {
+        match tp {
+            LowLevelType::Number(n) => n._type,
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    /// `ll2ctypes.force_cast`: integer dests wrap (`c_byte(255).value == -1`),
+    /// unsigned sources stay positive as float, float→int is `int()` then wrap.
+    #[test]
+    fn cast_value_force_cast_wraps_like_ctypes() {
+        let _guard = rffi_test_guard();
+        let signedchar = (*SIGNEDCHAR).clone();
+        let short = (*SHORT).clone();
+        let uchar = (*UCHAR).clone();
+        assert_eq!(
+            cast_value(&signedchar, &ConstValue::Int(255)).unwrap(),
+            ConstValue::rint(number_class(&signedchar), -1)
+        );
+        assert_eq!(
+            cast_value(&short, &ConstValue::Int(65535)).unwrap(),
+            ConstValue::rint(number_class(&short), -1)
+        );
+        assert_eq!(
+            cast_value(&uchar, &ConstValue::Int(300)).unwrap(),
+            ConstValue::rint(number_class(&uchar), 44)
+        );
+        assert_eq!(
+            cast_value(&LowLevelType::Float, &ConstValue::UInt(u64::MAX)).unwrap(),
+            ConstValue::float(18446744073709551615.0)
+        );
+        assert_eq!(
+            cast_value(&uchar, &ConstValue::float(-1.5)).unwrap(),
+            ConstValue::rint(number_class(&uchar), 255)
+        );
+        assert_eq!(
+            cast_value(&short, &ConstValue::Bool(true)).unwrap(),
+            ConstValue::rint(number_class(&short), 1)
+        );
+    }
+
+    #[test]
+    fn cast_value_force_cast_bool_float_singlefloat_and_rint_ptr() {
+        let _guard = rffi_test_guard();
+        assert_eq!(
+            cast_value(
+                &LowLevelType::Signed,
+                &ConstValue::SingleFloat(2.5f32.to_bits()),
+            )
+            .unwrap(),
+            ConstValue::Int(2)
+        );
+        assert_eq!(
+            cast_value(&LowLevelType::Bool, &ConstValue::float(0.5)).unwrap(),
+            ConstValue::Bool(true)
+        );
+        assert_eq!(
+            cast_value(&LowLevelType::Float, &ConstValue::UInt(u64::MAX)).unwrap(),
+            ConstValue::float(18446744073709551615.0)
+        );
+        let null = cast_value(&*VOIDP, &ConstValue::rint(number_class(&*UCHAR), 0))
+            .expect("force_cast(VOIDP, r_uchar(0))");
+        let ConstValue::LLPtr(p0) = null else {
+            panic!("expected nullptr, got {null:?}");
+        };
+        assert!(!p0.nonzero());
+        // `lltype2ctypes`: Char/UniChar → `ord` before `bool(cvalue)`.
+        assert_eq!(
+            cast_value(&LowLevelType::Bool, &ConstValue::ByteStr(vec![0])).unwrap(),
+            ConstValue::Bool(false)
+        );
+        assert_eq!(
+            cast_value(&LowLevelType::Bool, &ConstValue::UniStr("\0".into())).unwrap(),
+            ConstValue::Bool(false)
+        );
+        assert_eq!(
+            cast_value(&LowLevelType::Bool, &ConstValue::UniChar(0)).unwrap(),
+            ConstValue::Bool(false)
+        );
+        assert_eq!(
+            cast_value(&LowLevelType::Bool, &ConstValue::ByteStr(vec![b'a'])).unwrap(),
+            ConstValue::Bool(true)
+        );
     }
 
     #[test]
@@ -1399,6 +2225,21 @@ mod tests {
     }
 
     #[test]
+    fn sizeof_number_floors_bits_over_eight() {
+        // `rffi.sizeof`: `tp._type.BITS/8`. Char/Bool/SingleFloat are
+        // not Numbers (1 / 1 / 4 on dedicated arms).
+        let n65 = number_from_forced_int("r_int65_rffi", true, 65);
+        assert_eq!(sizeof(&n65).unwrap(), ConstValue::Int(8));
+        match &n65 {
+            LowLevelType::Number(n) => assert_eq!(sizeof_number(n), 8),
+            other => panic!("expected Number, got {other:?}"),
+        }
+        assert_eq!(sizeof(&*UCHAR).unwrap(), ConstValue::Int(1));
+        let n128 = number_from_forced_int("r_int128_rffi", true, 128);
+        assert_eq!(sizeof(&n128).unwrap(), ConstValue::Int(16));
+    }
+
+    #[test]
     fn sizeof_struct_with_size_hint_is_int() {
         let hinted = LowLevelType::Struct(Box::new(Struct::with_hints(
             "Hinted",
@@ -1417,6 +2258,340 @@ mod tests {
 
         let ptr = llexternal("demo", vec![], LowLevelType::Void);
         assert!(_isllptr(&ptr));
+    }
+
+    #[test]
+    fn r_int_real_has_c_int_width_and_is_a_fresh_class() {
+        let _guard = rffi_test_guard();
+        let (sign, bits) = rffi_c_int_sign_bits("INT", &*INT);
+        match *r_int_real {
+            KnownType::RInt(c) => assert_eq!(c.bits, bits),
+            other => panic!("r_int_real is a forced class, got {other:?}"),
+        }
+        assert_ne!(
+            *r_int_real,
+            rarithmetic::build_int(None, sign, bits, false).unwrap()
+        );
+    }
+
+    #[test]
+    fn inttype_population_preserves_rffi_names() {
+        let _guard = rffi_test_guard();
+        let names = populate_inttypes();
+        assert!(names.contains(&"short".to_string()));
+        assert!(names.contains(&"ushort".to_string()));
+        assert!(names.contains(&"int".to_string()));
+        assert!(names.contains(&"uint".to_string()));
+        assert!(names.contains(&"void*".to_string()));
+        assert!(NUMBER_TYPES.len() >= names.len() + 2);
+        assert_ne!(*UCHAR, UNSIGNED);
+        assert_eq!(sizeof(&*UCHAR).unwrap(), ConstValue::Int(1));
+        assert_eq!(sizeof(&*USHORT).unwrap(), ConstValue::Int(2));
+        assert_eq!(sizeof(&*UINT).unwrap(), ConstValue::Int(4));
+        assert_eq!(size_and_sign(&*UCHAR).unwrap(), (1, true));
+        assert_eq!(size_and_sign(&*SHORT).unwrap(), (2, false));
+        let (_, long_bits) = rffi_c_int_sign_bits("LONG", &*LONG);
+        if long_bits == 64 {
+            assert_eq!(*ULONG, UNSIGNED);
+            assert_eq!(*LONG, SIGNED);
+        }
+        assert_ne!(*UINT_real, *UINT);
+        match &*UCHAR {
+            LowLevelType::Number(n) => {
+                assert_eq!(
+                    cast_primitive(&*UCHAR, &ConstValue::Int(-1)).unwrap(),
+                    ConstValue::rint(n._type, 255)
+                );
+            }
+            other => panic!("UCHAR is a Number, got {other:?}"),
+        }
+        let (int_sign, int_bits) = rffi_c_int_sign_bits("INT", &*INT);
+        let (uint_sign, uint_bits) = rffi_c_int_sign_bits("UINT", &*UINT);
+        match *r_int_real {
+            KnownType::RInt(c) => assert_eq!(c.bits, int_bits),
+            other => panic!("r_int_real is a forced class, got {other:?}"),
+        }
+        match *r_uint_real {
+            KnownType::RInt(c) => assert_eq!(c.bits, uint_bits),
+            other => panic!("r_uint_real is a forced class, got {other:?}"),
+        }
+        assert_ne!(
+            *r_int_real,
+            rarithmetic::build_int(None, int_sign, int_bits, false).unwrap()
+        );
+        assert_ne!(
+            *r_uint_real,
+            rarithmetic::build_int(None, uint_sign, uint_bits, false).unwrap()
+        );
+        assert_eq!(r_singlefloat, LowLevelType::SingleFloat);
+        assert_eq!(NULL, None);
+    }
+
+    fn rclass_name(kt: KnownType) -> String {
+        match kt {
+            KnownType::Int => "int".to_string(),
+            KnownType::Ruint => "r_uint".to_string(),
+            KnownType::LongLong => "r_longlong".to_string(),
+            KnownType::LongLongLong => "r_longlonglong".to_string(),
+            KnownType::ULongLong => "r_ulonglong".to_string(),
+            KnownType::ULongLongLong => "r_ulonglonglong".to_string(),
+            KnownType::RInt(c) => c.name.to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn numbertype_to_rclass_is_keyed_by_lltype() {
+        let _guard = rffi_test_guard();
+        match numbertype_to_rclass(&*UCHAR) {
+            KnownType::RInt(c) => {
+                assert!(!c.sign);
+                assert_eq!(c.bits, 8);
+                assert_eq!(c.name.to_ascii_lowercase(), "r_uchar");
+            }
+            other => panic!("UCHAR rclass: {other:?}"),
+        }
+        assert_eq!(rclass_name(r_uchar()).to_ascii_lowercase(), "r_uchar");
+        assert_eq!(r_class("uchar"), numbertype_to_rclass(&*UCHAR));
+        assert_eq!(r_class("uchar"), r_uchar());
+        assert_eq!(r_int(), numbertype_to_rclass(&*INT));
+        assert_eq!(numbertype_to_rclass(&LowLevelType::Signed), KnownType::Int);
+        match numbertype_to_rclass(&*INT_real) {
+            KnownType::RInt(c) => assert_eq!(c.name, "r_int_real"),
+            other => panic!("INT_real rclass: {other:?}"),
+        }
+        match numbertype_to_rclass(&*UINT_real) {
+            KnownType::RInt(c) => assert_eq!(c.name, "r_uint_real"),
+            other => panic!("UINT_real rclass: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn number_types_void_star_is_integer_not_voidp() {
+        let _guard = rffi_test_guard();
+        let _ = &*NUMBER_TYPES;
+        let void_star = PLATFORM
+            .lock()
+            .get("VOID*")
+            .expect("setup populates VOID*")
+            .lltype
+            .clone();
+        assert!(void_star.is_number());
+        assert_eq!(
+            sizeof(&void_star).unwrap(),
+            ConstValue::Int(crate::layout::target_word_size() as i64)
+        );
+        match &void_star {
+            LowLevelType::Number(n) => assert_eq!(n._name, "VOID*"),
+            LowLevelType::Signed => {}
+            other => panic!("VOID* is a Number, got {other:?}"),
+        }
+        assert!(NUMBER_TYPES.iter().any(|tp| *tp == void_star));
+        assert!(!NUMBER_TYPES.iter().any(|tp| *tp == *VOIDP));
+    }
+
+    #[test]
+    fn types_includes_int128_iff_sizeof_succeeds() {
+        let _guard = rffi_test_guard();
+        let sizeof_ok = sizeof_c_type("__int128_t", true).is_ok();
+        assert_eq!(TYPES.iter().any(|name| *name == "__int128_t"), sizeof_ok);
+        assert_eq!(TYPES.iter().any(|name| *name == "__uint128_t"), sizeof_ok);
+        if sizeof_ok {
+            let signed128 = platform_lltype("__INT128_T");
+            assert_eq!(signed128, LowLevelType::SignedLongLongLong);
+            assert_eq!(numbertype_to_rclass(&signed128), KnownType::LongLongLong);
+            let unsigned128 = platform_lltype("__UINT128_T");
+            assert_eq!(unsigned128, LowLevelType::UnsignedLongLongLong);
+            assert_eq!(numbertype_to_rclass(&unsigned128), KnownType::ULongLongLong);
+            assert_eq!(*__INT128_T, signed128);
+            assert_eq!(*__UINT128_T, unsigned128);
+            assert_eq!(r_class("__int128_t"), numbertype_to_rclass(&*__INT128_T));
+            assert_eq!(r___int128_t(), r_class("__int128_t"));
+        } else {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = &*__INT128_T;
+                }))
+                .is_err(),
+                "__INT128_T must panic when TYPES lacks __int128_t"
+            );
+        }
+    }
+
+    #[test]
+    fn touching_uchar_runs_full_rffi_module_init() {
+        let _guard = rffi_test_guard();
+        let _ = &*UCHAR;
+        assert_eq!(numbertype_to_rclass(&LowLevelType::Signed), KnownType::Int);
+        let long_class = rffi_module().first_r_long;
+        let (_, long_bits) = rffi_c_int_sign_bits("LONG", &*LONG);
+        if long_bits == 64 {
+            assert_ne!(
+                long_class,
+                KnownType::Int,
+                "r_class(\"long\") is the class setup() bound, not live Signed→int"
+            );
+            match long_class {
+                KnownType::Rint => {}
+                KnownType::RInt(c) => {
+                    assert!(c.sign);
+                    assert!(c.name.to_ascii_lowercase().contains("long"));
+                }
+                other => panic!("expected generated r_long class, got {other:?}"),
+            }
+        } else {
+            assert_eq!(
+                long_class,
+                r_class("int"),
+                "r_class(\"long\") shares the (signed, 32) class with r_class(\"int\")"
+            );
+        }
+    }
+
+    #[test]
+    fn r_class_reads_setup_snapshot_not_live_map() {
+        let _guard = rffi_test_guard();
+        let _ = &*UCHAR;
+        assert_eq!(numbertype_to_rclass(&LowLevelType::Signed), KnownType::Int);
+        let long_class = rffi_module().first_r_long;
+        let (_, long_bits) = rffi_c_int_sign_bits("LONG", &*LONG);
+        if long_bits == 64 {
+            assert_ne!(
+                long_class,
+                KnownType::Int,
+                "r_class(\"long\") is the class setup() bound, not live Signed→int"
+            );
+            match long_class {
+                KnownType::Rint => {}
+                KnownType::RInt(c) => {
+                    assert!(c.sign);
+                    assert!(c.name.to_ascii_lowercase().contains("long"));
+                }
+                other => panic!("expected generated r_long class, got {other:?}"),
+            }
+        } else {
+            assert_eq!(
+                long_class,
+                r_class("int"),
+                "r_class(\"long\") shares the (signed, 32) class with r_class(\"int\")"
+            );
+        }
+        let uchar_tp = (*UCHAR).clone();
+        let uchar_class = r_class("uchar");
+        PLATFORM
+            .lock()
+            .set_numbertype_to_rclass(uchar_tp.clone(), KnownType::Int);
+        assert_eq!(r_class("uchar"), uchar_class);
+        PLATFORM
+            .lock()
+            .set_numbertype_to_rclass(uchar_tp, uchar_class);
+        let long_tp = (*LONG).clone();
+        PLATFORM
+            .lock()
+            .set_numbertype_to_rclass(long_tp, long_class);
+        let first = setup();
+        let second = setup();
+        assert_eq!(first, second);
+        assert_eq!(r_class("uchar"), uchar_class);
+        assert_eq!(r_class("long"), long_class);
+        PLATFORM
+            .lock()
+            .set_numbertype_to_rclass(LowLevelType::Signed, KnownType::Int);
+    }
+
+    #[test]
+    fn setup_twice_returns_same_static_uchar_pointers() {
+        let _guard = rffi_test_guard();
+        let _ = setup();
+        let uchar: &LowLevelType = &*UCHAR;
+        let ucharp: &LowLevelType = &*UCHARP;
+        let _ = setup();
+        assert!(
+            std::ptr::eq(uchar, &*UCHAR),
+            "setup() interned UCHAR must keep the same &'static pointer"
+        );
+        assert!(
+            std::ptr::eq(ucharp, &*UCHARP),
+            "setup() interned UCHARP must keep the same &'static pointer"
+        );
+    }
+
+    #[test]
+    fn external_setup_runs_after_signed_to_int_override() {
+        let _guard = rffi_test_guard();
+        let _ = setup();
+        assert_eq!(numbertype_to_rclass(&LowLevelType::Signed), KnownType::Int);
+    }
+
+    #[test]
+    fn int_least16_tp_is_nolength_array_ptr_on_unix() {
+        let _guard = rffi_test_guard();
+        if !types_contains("int_least16_t") {
+            return;
+        }
+        let array = ptr_array_of(&INT_LEAST16_TP);
+        assert_eq!(array.OF, *INT_LEAST16_T);
+        assert_eq!(array._hints.get("nolength"), Some(&ConstValue::Bool(true)));
+        assert_eq!(*INT_LEAST16_TP, CArrayPtr((*INT_LEAST16_T).clone()));
+        assert_eq!(
+            r_class("int_least16_t"),
+            numbertype_to_rclass(&*INT_LEAST16_T)
+        );
+    }
+
+    #[test]
+    fn windows_aliases_match_rffi_nt_branch() {
+        let _guard = rffi_test_guard();
+        if crate::layout::target_os() == "windows" {
+            assert_eq!(*PID_T, LowLevelType::Signed);
+            assert_eq!(*SSIZE_T, LowLevelType::Signed);
+            assert_eq!(*PTRDIFF_T, LowLevelType::Signed);
+            assert_eq!(*MODE_T, *INT);
+        } else if types_contains("pid_t") {
+            assert_eq!(*PID_T, platform_lltype("PID_T"));
+            assert_eq!(*SSIZE_T, platform_lltype("SSIZE_T"));
+            assert_eq!(*PTRDIFF_T, platform_lltype("PTRDIFF_T"));
+            assert_eq!(*MODE_T, platform_lltype("MODE_T"));
+        }
+    }
+
+    #[test]
+    fn nt_fallback_aliases_are_bare_type_aliases() {
+        let _guard = rffi_test_guard();
+        let windows_types = [
+            "short",
+            "unsigned short",
+            "int",
+            "unsigned int",
+            "long",
+            "unsigned long",
+            "signed char",
+            "unsigned char",
+            "long long",
+            "unsigned long long",
+            "size_t",
+            "time_t",
+            "wchar_t",
+            "uintptr_t",
+            "intptr_t",
+            "void*",
+        ];
+        let int_tp = LowLevelType::Signed;
+        let aliases = nt_fallback_type_aliases(&windows_types, int_tp.clone());
+        assert_eq!(aliases.get("PID_T"), Some(&SIGNED));
+        assert_eq!(aliases.get("SSIZE_T"), Some(&SIGNED));
+        assert_eq!(aliases.get("PTRDIFF_T"), Some(&SIGNED));
+        assert_eq!(aliases.get("MODE_T"), Some(&int_tp));
+        assert!(!aliases.contains_key("PID_TP"));
+        assert!(!aliases.contains_key("SSIZE_TP"));
+        assert!(!aliases.contains_key("PTRDIFF_TP"));
+        assert!(!aliases.contains_key("MODE_TP"));
+        assert!(!aliases.contains_key("r_pid_t"));
+        assert!(!aliases.keys().any(|key| key.starts_with("r_")));
+        assert_eq!(aliases.len(), 4);
+
+        let unix_types = ["mode_t", "pid_t", "ssize_t", "ptrdiff_t"];
+        assert!(nt_fallback_type_aliases(&unix_types, int_tp).is_empty());
     }
 
     #[test]

@@ -1303,6 +1303,28 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         _ => {}
     }
 
+    if args.iter().any(|v| matches!(v, ConstValue::RInt(_, _, _)))
+        && matches!(
+            kind,
+            OpKind::Add
+                | OpKind::Sub
+                | OpKind::Mul
+                | OpKind::And
+                | OpKind::Or
+                | OpKind::Xor
+                | OpKind::LShift
+                | OpKind::RShift
+                | OpKind::FloorDiv
+                | OpKind::Mod
+                | OpKind::Div
+                | OpKind::Neg
+                | OpKind::Invert
+                | OpKind::Abs
+        )
+    {
+        return fold_rint_op(kind, args);
+    }
+
     match (kind, args) {
         // unary
         (OpKind::Bool, [v]) => v.truthy().map(ConstValue::Bool),
@@ -1610,45 +1632,16 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
 /// directly, so the dispatch follows Python's coercion rules).
 pub(crate) fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Ordering> {
     use ConstValue as C;
+    if let (Some(x), Some(y)) = (integer_numeric(a), integer_numeric(b)) {
+        return Some(x.cmp_numeric(y));
+    }
     match (a, b) {
-        (C::Int(x), C::Int(y)) => Some(x.cmp(y)),
         (C::Float(x), C::Float(y)) => f64::from_bits(*x).partial_cmp(&f64::from_bits(*y)),
         (C::ByteStr(x), C::ByteStr(y)) => Some(x.cmp(y)),
         (C::UniStr(x), C::UniStr(y)) => Some(x.cmp(y)),
-        (C::Bool(x), C::Bool(y)) => Some(x.cmp(y)),
-        // Bool ↔ Int (bool is int subclass).
-        (C::Bool(x), C::Int(y)) => Some(i64::from(*x).cmp(y)),
-        (C::Int(x), C::Bool(y)) => Some(x.cmp(&i64::from(*y))),
-        // Int ↔ Float — exact comparison via `cmp_int_float_exact` (port
-        // of `pypy/objspace/std/floatobject.py make_compare_func`
-        // / `do_compare_bigint`). Naive `*x as f64` rounds to the
-        // nearest representable f64 (mantissa is 53 bits), which would
-        // misclassify `Int(2^53 + 1) == Float(2^53)` as equal.
-        (C::Int(x), C::Float(b)) => cmp_int_float_exact(*x, f64::from_bits(*b)),
-        (C::Float(b), C::Int(x)) => {
-            cmp_int_float_exact(*x, f64::from_bits(*b)).map(std::cmp::Ordering::reverse)
-        }
-        // Bool ↔ Float (`Bool` is `0` or `1`, far below the 2^53
-        // mantissa boundary; simple cast is exact).
-        (C::Bool(x), C::Float(b)) => (i64::from(*x) as f64).partial_cmp(&f64::from_bits(*b)),
-        (C::Float(b), C::Bool(x)) => f64::from_bits(*b).partial_cmp(&(i64::from(*x) as f64)),
-        // `r_uint` compares numerically with int/bool (`base_int` is a
-        // `long` subclass) and with float via the same bigint path.
-        // `r_uint(2**64-1) != -1`.
-        (C::UInt(_), _) | (_, C::UInt(_)) => match (numeric_i128(a), numeric_i128(b)) {
-            (Some(x), Some(y)) => Some(x.cmp(&y)),
-            (Some(x), None) => match b {
-                C::Float(bits) => cmp_i128_float_exact(x, f64::from_bits(*bits)),
-                _ => None,
-            },
-            (None, Some(y)) => match a {
-                C::Float(bits) => {
-                    cmp_i128_float_exact(y, f64::from_bits(*bits)).map(std::cmp::Ordering::reverse)
-                }
-                _ => None,
-            },
-            (None, None) => None,
-        },
+        (C::Float(bits), _) => cmp_rint_float(integer_numeric(b)?, f64::from_bits(*bits))
+            .map(std::cmp::Ordering::reverse),
+        (_, C::Float(bits)) => cmp_rint_float(integer_numeric(a)?, f64::from_bits(*bits)),
         _ => None,
     }
 }
@@ -1782,6 +1775,336 @@ fn numeric_i128(v: &ConstValue) -> Option<i128> {
         ConstValue::UInt(n) => Some(*n as i128),
         ConstValue::Bool(b) => Some(i128::from(*b)),
         _ => None,
+    }
+}
+
+/// Integer-valued constants: `Int`, `UInt`, `Int128`, `UInt128`, `Bool`,
+/// `RInt`. `rint_value` interprets the stored i128 by `class.sign`.
+fn integer_numeric(v: &ConstValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::{RIntValue, rint_value};
+    match v {
+        ConstValue::Int(n) => Some(RIntValue::Signed(*n as i128)),
+        ConstValue::Int128(n) => Some(RIntValue::Signed(*n)),
+        ConstValue::UInt(n) => Some(RIntValue::Unsigned(*n as u128)),
+        ConstValue::UInt128(n) => Some(RIntValue::Unsigned(*n)),
+        ConstValue::Bool(b) => Some(RIntValue::Signed(i128::from(*b))),
+        ConstValue::RInt(c, n, _) => Some(rint_value(*c, *n)),
+        _ => None,
+    }
+}
+
+fn const_integer_type(v: &ConstValue) -> Option<crate::annotator::model::KnownType> {
+    use crate::annotator::model::KnownType;
+    match v {
+        ConstValue::Int(_) => Some(KnownType::Int),
+        ConstValue::UInt(_) => Some(KnownType::Ruint),
+        ConstValue::Int128(_) => Some(KnownType::LongLongLong),
+        ConstValue::UInt128(_) => Some(KnownType::ULongLongLong),
+        ConstValue::Bool(_) => Some(KnownType::Bool),
+        ConstValue::RInt(c, _, _) => Some(KnownType::RInt(*c)),
+        ConstValue::Float(_) => Some(KnownType::Float),
+        _ => None,
+    }
+}
+
+fn cmp_rint_float(n: crate::rlib::rarithmetic::RIntValue, f: f64) -> Option<std::cmp::Ordering> {
+    match n.as_i128() {
+        Some(i) => match i64::try_from(i) {
+            Ok(v) => cmp_int_float_exact(v, f),
+            Err(_) => cmp_i128_float_exact(i, f),
+        },
+        None => cmp_u128_float_exact(n.as_u128(), f),
+    }
+}
+
+fn cmp_u128_float_exact(n: u128, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    if f < 0.0 {
+        return Some(Ordering::Greater);
+    }
+    if f.is_infinite() {
+        return Some(Ordering::Less);
+    }
+    const MANTISSA_LIMIT: u128 = 1 << 53;
+    if n <= MANTISSA_LIMIT {
+        return (n as f64).partial_cmp(&f);
+    }
+    let fl = f.floor();
+    if fl < 0.0 {
+        return Some(Ordering::Greater);
+    }
+    let hi = 2.0f64.powi(128);
+    if fl >= hi {
+        return Some(Ordering::Less);
+    }
+    let fl_int = fl as u128;
+    if fl == f {
+        Some(n.cmp(&fl_int))
+    } else if n <= fl_int {
+        Some(Ordering::Less)
+    } else {
+        Some(Ordering::Greater)
+    }
+}
+
+fn fold_rint_op(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
+    use crate::rlib::rarithmetic::{_widen, construct_int_type};
+    match (kind, args) {
+        (OpKind::Neg, [a]) => {
+            construct_int_type(const_integer_type(a)?, rint_neg(integer_numeric(a)?)?)
+        }
+        (OpKind::Abs, [a]) => {
+            construct_int_type(const_integer_type(a)?, rint_abs(integer_numeric(a)?)?)
+        }
+        (OpKind::Invert, [a]) => {
+            construct_int_type(const_integer_type(a)?, rint_invert(integer_numeric(a)?)?)
+        }
+        (
+            OpKind::Add
+            | OpKind::Sub
+            | OpKind::Mul
+            | OpKind::And
+            | OpKind::Or
+            | OpKind::Xor
+            | OpKind::FloorDiv
+            | OpKind::Mod
+            | OpKind::Div,
+            [a, b],
+        ) => {
+            if matches!(a, ConstValue::Float(_)) || matches!(b, ConstValue::Float(_)) {
+                return fold_rint_float_op(kind, a, b);
+            }
+            let va = integer_numeric(a)?;
+            let vb = integer_numeric(b)?;
+            let result = match kind {
+                OpKind::Add => rint_add(va, vb)?,
+                OpKind::Sub => rint_add(va, rint_neg(vb)?)?,
+                OpKind::Mul => rint_mul(va, vb)?,
+                OpKind::And => rint_bitop(va, vb, |x, y| x & y),
+                OpKind::Or => rint_bitop(va, vb, |x, y| x | y),
+                OpKind::Xor => rint_bitop(va, vb, |x, y| x ^ y),
+                OpKind::FloorDiv | OpKind::Div => rint_floordiv(va, vb)?,
+                OpKind::Mod => rint_mod(va, vb)?,
+                _ => return None,
+            };
+            _widen(const_integer_type(a)?, const_integer_type(b)?, result)
+        }
+        (OpKind::LShift | OpKind::RShift, [a, b]) => fold_rint_shift(kind, a, b),
+        _ => None,
+    }
+}
+
+fn fold_rint_float_op(kind: OpKind, a: &ConstValue, b: &ConstValue) -> Option<ConstValue> {
+    let x = const_as_float(a)?;
+    let y = const_as_float(b)?;
+    match kind {
+        OpKind::Add => Some(ConstValue::float(x + y)),
+        OpKind::Sub => Some(ConstValue::float(x - y)),
+        OpKind::Mul => Some(ConstValue::float(x * y)),
+        OpKind::Div => {
+            if y == 0.0 {
+                None
+            } else {
+                Some(ConstValue::float(x / y))
+            }
+        }
+        OpKind::FloorDiv => {
+            if y == 0.0 {
+                None
+            } else {
+                Some(ConstValue::float(float_py_floor_div(x, y)))
+            }
+        }
+        OpKind::Mod => {
+            if y == 0.0 {
+                None
+            } else {
+                Some(ConstValue::float(float_py_mod(x, y)))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn const_as_float(v: &ConstValue) -> Option<f64> {
+    match v {
+        ConstValue::Float(bits) => Some(f64::from_bits(*bits)),
+        _ => integer_numeric(v).map(|n| n.as_f64()),
+    }
+}
+
+fn fold_rint_shift(kind: OpKind, a: &ConstValue, b: &ConstValue) -> Option<ConstValue> {
+    use crate::rlib::rarithmetic::{RIntValue, construct_int_type, integer_signed_and_bits};
+    let va = integer_numeric(a)?;
+    let y = integer_numeric(b)?.as_i128()?;
+    if y < 0 {
+        return None;
+    }
+    let kt = const_integer_type(a)?;
+    if va.is_zero() {
+        return construct_int_type(kt, va);
+    }
+    if y > i64::MAX as i128 {
+        return None;
+    }
+    if let Some((sign, bits)) = integer_signed_and_bits(kt)
+        && !sign
+    {
+        let x = va.as_u128();
+        let shifted = if kind == OpKind::LShift {
+            if y >= bits as i128 {
+                0
+            } else {
+                x.wrapping_shl(y as u32)
+            }
+        } else if y >= 128 {
+            0
+        } else {
+            x >> (y as u32)
+        };
+        return construct_int_type(kt, RIntValue::Unsigned(shifted));
+    }
+    let x = va.as_i128()?;
+    let shifted = if kind == OpKind::LShift {
+        if y >= 127 {
+            return None;
+        }
+        x.checked_shl(y as u32)?
+    } else if y >= 127 {
+        if x < 0 { -1 } else { 0 }
+    } else {
+        x >> (y as u32)
+    };
+    construct_int_type(kt, RIntValue::Signed(shifted))
+}
+
+fn rint_neg(v: crate::rlib::rarithmetic::RIntValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    match v {
+        Signed(n) => n.checked_neg().map(Signed),
+        Unsigned(0) => Some(Unsigned(0)),
+        Unsigned(n) => {
+            if n == 1u128 << 127 {
+                Some(Signed(i128::MIN))
+            } else {
+                i128::try_from(n).ok()?.checked_neg().map(Signed)
+            }
+        }
+    }
+}
+
+fn rint_abs(v: crate::rlib::rarithmetic::RIntValue) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    if v.is_negative() {
+        rint_neg(v)
+    } else {
+        Some(v)
+    }
+}
+
+fn rint_invert(
+    v: crate::rlib::rarithmetic::RIntValue,
+) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    match v {
+        Signed(n) => Some(Signed(!n)),
+        Unsigned(n) => i128::try_from(n)
+            .ok()?
+            .checked_neg()?
+            .checked_sub(1)
+            .map(Signed),
+    }
+}
+
+fn rint_add(
+    a: crate::rlib::rarithmetic::RIntValue,
+    b: crate::rlib::rarithmetic::RIntValue,
+) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    match (a, b) {
+        (Signed(x), Signed(y)) => x.checked_add(y).map(Signed),
+        (Unsigned(x), Unsigned(y)) => x.checked_add(y).map(Unsigned),
+        (Signed(x), Unsigned(y)) | (Unsigned(y), Signed(x)) => {
+            if x >= 0 {
+                (x as u128).checked_add(y).map(Unsigned)
+            } else {
+                let mag = x.unsigned_abs();
+                if y >= mag {
+                    Some(Unsigned(y - mag))
+                } else {
+                    i128::try_from(mag - y).ok().map(|d| Signed(-d))
+                }
+            }
+        }
+    }
+}
+
+fn rint_mul(
+    a: crate::rlib::rarithmetic::RIntValue,
+    b: crate::rlib::rarithmetic::RIntValue,
+) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    match (a, b) {
+        (Signed(x), Signed(y)) => x.checked_mul(y).map(Signed),
+        (Unsigned(x), Unsigned(y)) => x.checked_mul(y).map(Unsigned),
+        (Signed(x), Unsigned(y)) | (Unsigned(y), Signed(x)) => {
+            if x >= 0 {
+                (x as u128).checked_mul(y).map(Unsigned)
+            } else {
+                let mag = x.unsigned_abs().checked_mul(y)?;
+                i128::try_from(mag).ok()?.checked_neg().map(Signed)
+            }
+        }
+    }
+}
+
+fn rint_bitop(
+    a: crate::rlib::rarithmetic::RIntValue,
+    b: crate::rlib::rarithmetic::RIntValue,
+    op: impl Fn(u128, u128) -> u128,
+) -> crate::rlib::rarithmetic::RIntValue {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    let r = op(a.as_u128(), b.as_u128());
+    if !a.is_negative() && !b.is_negative() {
+        Unsigned(r)
+    } else {
+        Signed(r as i128)
+    }
+}
+
+fn rint_floordiv(
+    a: crate::rlib::rarithmetic::RIntValue,
+    b: crate::rlib::rarithmetic::RIntValue,
+) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    match (a, b) {
+        (Unsigned(x), Unsigned(y)) => {
+            if y == 0 {
+                None
+            } else {
+                Some(Unsigned(x / y))
+            }
+        }
+        _ => python_floor_div_i128(a.as_i128()?, b.as_i128()?).map(Signed),
+    }
+}
+
+fn rint_mod(
+    a: crate::rlib::rarithmetic::RIntValue,
+    b: crate::rlib::rarithmetic::RIntValue,
+) -> Option<crate::rlib::rarithmetic::RIntValue> {
+    use crate::rlib::rarithmetic::RIntValue::*;
+    match (a, b) {
+        (Unsigned(x), Unsigned(y)) => {
+            if y == 0 {
+                None
+            } else {
+                Some(Unsigned(x % y))
+            }
+        }
+        _ => python_mod_i128(a.as_i128()?, b.as_i128()?).map(Signed),
     }
 }
 
@@ -2034,43 +2357,19 @@ fn float_py_floor_div(x: f64, y: f64) -> f64 {
 ///   whole side-table — left as a follow-up.
 pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
     use ConstValue as C;
+    if let (Some(x), Some(y)) = (integer_numeric(a), integer_numeric(b)) {
+        return x.cmp_numeric(y).is_eq();
+    }
     match (a, b) {
-        (C::Bool(x), C::Bool(y)) => x == y,
-        (C::Bool(x), C::Int(y)) | (C::Int(y), C::Bool(x)) => i64::from(*x) == *y,
-        (C::Int(x), C::Int(y)) => x == y,
-        (C::Bool(x), C::Float(bits)) | (C::Float(bits), C::Bool(x)) => {
-            f64::from_bits(*bits) == (i64::from(*x) as f64)
-        }
-        // Int ↔ Float — route through `cmp_int_float_exact` so ints
-        // beyond the 53-bit mantissa boundary compare correctly.
-        // Naive `*x as f64` would round `Int(2^53 + 1)` to `2^53`,
-        // misclassifying it as equal to `Float(2^53)`. Mirrors upstream
-        // `pypy/objspace/std/floatobject.py do_compare_bigint`'s
-        // eq branch: a non-integer-valued f64 can never equal an int.
-        (C::Int(x), C::Float(bits)) | (C::Float(bits), C::Int(x)) => {
-            cmp_int_float_exact(*x, f64::from_bits(*bits))
-                .map(|o| o.is_eq())
-                .unwrap_or(false)
-        }
-        // `r_uint` hashes/compares numerically with int/bool
-        // (`r_uint(1) == 1 == True`) but `r_uint(2**64-1) != -1`.
-        (C::UInt(_), _) | (_, C::UInt(_)) => match (numeric_i128(a), numeric_i128(b)) {
-            (Some(x), Some(y)) => x == y,
-            (Some(x), None) => match b {
-                C::Float(bits) => cmp_i128_float_exact(x, f64::from_bits(*bits))
-                    .map(|o| o.is_eq())
-                    .unwrap_or(false),
-                _ => a == b,
-            },
-            (None, Some(y)) => match a {
-                C::Float(bits) => cmp_i128_float_exact(y, f64::from_bits(*bits))
-                    .map(|o| o.is_eq())
-                    .unwrap_or(false),
-                _ => a == b,
-            },
-            (None, None) => a == b,
-        },
-        (C::Float(a), C::Float(b)) => f64::from_bits(*a) == f64::from_bits(*b),
+        (C::Float(x), C::Float(y)) => f64::from_bits(*x) == f64::from_bits(*y),
+        (C::Float(bits), _) => integer_numeric(b)
+            .and_then(|n| cmp_rint_float(n, f64::from_bits(*bits)))
+            .map(|o| o.is_eq())
+            .unwrap_or(false),
+        (_, C::Float(bits)) => integer_numeric(a)
+            .and_then(|n| cmp_rint_float(n, f64::from_bits(*bits)))
+            .map(|o| o.is_eq())
+            .unwrap_or(false),
         // Container deep equality — Python compares
         // `tuple` / `list` element-wise via `==` per element. So
         // `(True,) == (1,)` is True even though Bool/Int are
@@ -2235,8 +2534,8 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
         // `lshift_ovf` is HLOperation default (`pure=False` per
         // `add_operator(name + '_ovf', …)` at `:337-338`) so this
         // whitelist arm is unreachable for it via the `pure()` gate.
-        (OpKind::LShift | OpKind::RShift, [lhs, ConstValue::Int(b)])
-            if is_int_like(lhs) && *b < 0 =>
+        (OpKind::LShift | OpKind::RShift, [lhs, rhs])
+            if is_int_like(lhs) && integer_numeric(rhs).is_some_and(|n| n.is_negative()) =>
         {
             Some(make_err("ValueError: negative shift count"))
         }
@@ -2263,10 +2562,7 @@ fn constfold_always_raises(kind: OpKind, args: &[&ConstValue]) -> Option<Flowing
 /// — non-numeric lhs raises `TypeError` first per upstream
 /// `operator.truediv` dispatch.
 pub(crate) fn is_foldable_numeric(v: &ConstValue) -> bool {
-    matches!(
-        v,
-        ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::Bool(_) | ConstValue::Float(_)
-    )
+    integer_numeric(v).is_some() || matches!(v, ConstValue::Float(_))
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `v` is
@@ -2274,10 +2570,7 @@ pub(crate) fn is_foldable_numeric(v: &ConstValue) -> bool {
 /// `UInt(0)`, or `Bool(false)`. Mirrors upstream Python's
 /// `0 == False == r_uint(0)` numeric equality at the divisor slot.
 fn is_zero_int_like(v: &ConstValue) -> bool {
-    matches!(
-        v,
-        ConstValue::Int(0) | ConstValue::UInt(0) | ConstValue::Bool(false)
-    )
+    integer_numeric(v).is_some_and(|n| n.is_zero())
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `v` is
@@ -2287,10 +2580,7 @@ fn is_zero_int_like(v: &ConstValue) -> bool {
 /// and `r_uint(1) // 0` participate in the same zero-divisor whitelist
 /// as `1 // 0`.
 fn is_int_like(v: &ConstValue) -> bool {
-    matches!(
-        v,
-        ConstValue::Int(_) | ConstValue::UInt(_) | ConstValue::Bool(_)
-    )
+    integer_numeric(v).is_some()
 }
 
 /// Helper for [`constfold_always_raises`]: returns `true` when `v` is
@@ -2333,8 +2623,7 @@ fn shift_type_error(lhs: &ConstValue, rhs: &ConstValue) -> bool {
 fn cross_type_ordering(a: &ConstValue, b: &ConstValue) -> bool {
     use ConstValue as C;
     let kind = |v: &ConstValue| match v {
-        C::Int(_) => Some(0),
-        C::UInt(_) => Some(0), // r_uint is a long subclass — same kind
+        C::Int(_) | C::UInt(_) | C::Int128(_) | C::UInt128(_) | C::RInt(_, _, _) => Some(0),
         C::Bool(_) => Some(0), // Python: bool is int — same kind
         C::Float(_) => Some(1),
         C::UniStr(_) => Some(2),
@@ -4639,6 +4928,38 @@ mod tests {
         );
         assert_eq!(
             fold(OpKind::Gt, vec![cu(u64::MAX), ci(-1)]),
+            Some(ConstValue::Bool(true)),
+        );
+    }
+
+    #[test]
+    fn constfold_rint_numeric_compare_and_wrap_arith() {
+        // `base_int` is a `long` subclass: comparisons are numeric, and
+        // `unsigned_int.__new__` masks with `MASK` after `_widen`.
+        // `cmp_integer` calls `pyfunc` on annotation constants (not
+        // `constfold`, which requires `Constant.foldable()`).
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let ushort = crate::rlib::rarithmetic::built_rint("r_ushort", false, 16);
+        let one = ConstValue::rint(uchar, 1);
+        let two = ConstValue::Int(2);
+        let int_one = ConstValue::Int(1);
+        let ushort_one = ConstValue::rint(ushort, 1);
+        let a200 = ConstValue::rint(uchar, 200);
+        let a100 = ConstValue::rint(uchar, 100);
+        assert_eq!(
+            pyfunc(OpKind::Eq, &[&one, &int_one]),
+            Some(ConstValue::Bool(true)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::Ne, &[&one, &ushort_one]),
+            Some(ConstValue::Bool(false)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::Add, &[&a200, &a100]),
+            Some(ConstValue::rint(uchar, 44)),
+        );
+        assert_eq!(
+            pyfunc(OpKind::Lt, &[&one, &two]),
             Some(ConstValue::Bool(true)),
         );
     }

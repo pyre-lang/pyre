@@ -80,6 +80,23 @@ fn host_target_env() -> &'static str {
     }
 }
 
+/// OS field of a rustc target triple (`arch-vendor-os[-env]`).
+///
+/// Apple triples yield `darwin` rather than cargo's `macos`
+/// (`aarch64-apple-darwin` → `"darwin"`).
+/// `rfficache::sizeof_oracle_for` only uses it to recognise
+/// the `"unknown"` OS of a target with no C toolchain
+/// (`wasm32-unknown-unknown` → `"unknown"`).
+pub fn target_os_of(triple: &str) -> &str {
+    let mut parts = triple.split('-');
+    let _arch = parts.next();
+    match (parts.next(), parts.next()) {
+        (Some(_), Some(os)) => os,
+        (Some(os), None) => os,
+        _ => "",
+    }
+}
+
 /// OS the layout model describes — cargo's `CARGO_CFG_TARGET_OS`.
 /// Host `std::env::consts::OS` when unset. Same channel as
 /// [`target_word_size`].

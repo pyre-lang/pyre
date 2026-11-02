@@ -28,9 +28,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::thread::ThreadId;
 
-use crate::annotator::model::KnownType;
+use crate::annotator::model::{KnownType, RIntClass};
 use crate::flowspace::model::{
     ConcretetypePlaceholder, ConstValue, FunctionGraph, GraphKey, GraphRef, Hlvalue,
+};
+use crate::rlib::rarithmetic::{
+    RIntValue, normalizedinttype, rint_new, rint_value, signed_int_overflow_message,
 };
 use crate::translator::rtyper::error::TyperError;
 
@@ -108,18 +111,40 @@ pub static FORWARDREF_BY_FLAVOR: LazyLock<HashMap<&'static str, &'static str>> =
         ])
     });
 
-/// RPython `_numbertypes` (`lltype.py`): Python numeric carrier type
-/// name to the corresponding low-level Number token.
+/// RPython `class Number(Primitive)` (`lltype.py`) for a `build_int` class
+/// other than the predefined `Signed` / `Unsigned` / longlong singletons:
+/// `rffi.UCHAR`, `USHORT`, `UINT`, ...
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Number {
+    pub _name: String,
+    pub _type: RIntClass,
+}
+
+impl Number {
+    /// RPython `Number.normalized` (`lltype.py`):
+    /// `return build_number(None, normalizedinttype(self._type))`.
+    pub fn normalized(&self) -> LowLevelType {
+        build_normalized_number(KnownType::RInt(self._type))
+    }
+}
+
+/// RPython `_numbertypes` (`lltype.py`): keyed by the Python integer
+/// class (`int`, `r_uint`, a `build_int` class, …). Seeded with the six
+/// predefined Number singletons; `build_number` inserts further
+/// `LowLevelType::Number` entries.
 #[allow(non_upper_case_globals)]
-pub static _numbertypes: LazyLock<HashMap<&'static str, LowLevelType>> = LazyLock::new(|| {
-    HashMap::from([
-        ("int", LowLevelType::Signed),
-        ("r_uint", LowLevelType::Unsigned),
-        ("r_longlong", LowLevelType::SignedLongLong),
-        ("r_longlonglong", LowLevelType::SignedLongLongLong),
-        ("r_ulonglong", LowLevelType::UnsignedLongLong),
-        ("r_ulonglonglong", LowLevelType::UnsignedLongLongLong),
-    ])
+pub static _numbertypes: LazyLock<Mutex<HashMap<KnownType, LowLevelType>>> = LazyLock::new(|| {
+    Mutex::new(HashMap::from([
+        (KnownType::Int, LowLevelType::Signed),
+        // `_numbertypes[r_int] = _numbertypes[int]` (`lltype.py`):
+        // `r_int` shares the Signed low-level type with builtin `int`.
+        (KnownType::Rint, LowLevelType::Signed),
+        (KnownType::Ruint, LowLevelType::Unsigned),
+        (KnownType::LongLong, LowLevelType::SignedLongLong),
+        (KnownType::LongLongLong, LowLevelType::SignedLongLongLong),
+        (KnownType::ULongLong, LowLevelType::UnsignedLongLong),
+        (KnownType::ULongLongLong, LowLevelType::UnsignedLongLongLong),
+    ]))
 });
 
 /// RPython `_to_primitive` (`lltype.py`): low-level primitive token
@@ -407,6 +432,7 @@ impl LowLevelType {
                 | LowLevelType::Char
                 | LowLevelType::UniChar
                 | LowLevelType::Address
+                | LowLevelType::Number(_)
         )
     }
 
@@ -420,7 +446,33 @@ impl LowLevelType {
                 | LowLevelType::SignedLongLongLong
                 | LowLevelType::UnsignedLongLong
                 | LowLevelType::UnsignedLongLongLong
+                | LowLevelType::Number(_)
         )
+    }
+
+    /// RPython `Number._type` (`lltype.py`): the rarithmetic class this
+    /// Number wraps. Signed / Unsigned / longlong singletons are Number
+    /// instances upstream.
+    fn number_rclass(&self) -> KnownType {
+        match self {
+            LowLevelType::Signed => KnownType::Int,
+            LowLevelType::Unsigned => KnownType::Ruint,
+            LowLevelType::SignedLongLong => KnownType::LongLong,
+            LowLevelType::UnsignedLongLong => KnownType::ULongLong,
+            LowLevelType::SignedLongLongLong => KnownType::LongLongLong,
+            LowLevelType::UnsignedLongLongLong => KnownType::ULongLongLong,
+            LowLevelType::Number(n) => KnownType::RInt(n._type),
+            other => panic!("{other:?} is not a Number"),
+        }
+    }
+
+    /// RPython `Number.normalized` (`lltype.py`):
+    /// `return build_number(None, normalizedinttype(self._type))`.
+    pub fn normalized(&self) -> LowLevelType {
+        match self {
+            LowLevelType::Number(n) => n.normalized(),
+            _ => build_normalized_number(self.number_rclass()),
+        }
     }
 
     /// RPython `LowLevelType._contains_value(value)` — used by
@@ -482,6 +534,11 @@ impl LowLevelType {
             LowLevelType::SignedLongLongLong => matches!(value, ConstValue::Int128(_)),
             // `typeOf(r_ulonglonglong)` is `UnsignedLongLongLong`.
             LowLevelType::UnsignedLongLongLong => matches!(value, ConstValue::UInt128(_)),
+            // `isCompatibleType(typeOf(value), self)`: `typeOf` of a
+            // `build_int` instance is the Number registered for that class.
+            LowLevelType::Number(n) => {
+                matches!(value, ConstValue::RInt(c, _, _) if *c == n._type)
+            }
             LowLevelType::Float => matches!(value, ConstValue::Float(_)),
             LowLevelType::SingleFloat => matches!(value, ConstValue::SingleFloat(_)),
             LowLevelType::LongFloat => matches!(value, ConstValue::LongFloat(_)),
@@ -529,6 +586,8 @@ impl LowLevelType {
             LowLevelType::Char => "Char".to_string(),
             LowLevelType::UniChar => "UniChar".to_string(),
             LowLevelType::Address => "Address".to_string(),
+            // `Primitive.__str__` / `_short_name` is `self._name`.
+            LowLevelType::Number(n) => n._name.clone(),
             LowLevelType::Struct(t) => t._short_name(),
             LowLevelType::Array(t) => t._short_name(),
             LowLevelType::FixedSizeArray(t) => t._short_name(),
@@ -574,6 +633,9 @@ pub enum LowLevelValue {
     LongFloat(u64),
     Char(char),
     UniChar(char),
+    /// Heap cell of a [`LowLevelType::Number`]: the `build_int` class
+    /// constructor applied to 0 (`Primitive._defl` is `_type()`).
+    Number(Box<Number>, i128),
     /// RPython `llmemory.Address` values — `fakeaddress(ptr)` / `NULL`.
     /// The NULL sentinel is [`_address::Null`]; richer `fakeaddress`
     /// bodies will extend [`_address`] as llmemory wrappers land.
@@ -766,6 +828,10 @@ pub enum LowLevelType {
     /// by `MultipleUnrelatedFrozenPBCRepr.lowleveltype` and `adr_eq` /
     /// `adr_ne` operations. Values are [`LowLevelValue::Address`].
     Address,
+    /// RPython `class Number(Primitive)` (`lltype.py`) for a `build_int`
+    /// class other than the predefined Signed / Unsigned / longlong
+    /// singletons (`rffi.UCHAR`, `USHORT`, `UINT`, ...).
+    Number(Box<Number>),
     Func(Box<FuncType>),
     Struct(Box<Struct>),
     Array(Box<Array>),
@@ -836,6 +902,7 @@ impl PartialEq for LowLevelType {
             | (LowLevelType::Char, LowLevelType::Char)
             | (LowLevelType::UniChar, LowLevelType::UniChar)
             | (LowLevelType::Address, LowLevelType::Address) => true,
+            (LowLevelType::Number(left), LowLevelType::Number(right)) => left == right,
             (LowLevelType::Func(left), LowLevelType::Func(right)) => left == right,
             (LowLevelType::Struct(left), LowLevelType::Struct(right)) => left == right,
             (LowLevelType::Array(left), LowLevelType::Array(right)) => left == right,
@@ -925,6 +992,10 @@ impl Hash for LowLevelType {
                 t.hash(state);
             }
             LowLevelType::Address => 21_u8.hash(state),
+            LowLevelType::Number(n) => {
+                22_u8.hash(state);
+                n.hash(state);
+            }
         }
     }
 }
@@ -976,9 +1047,12 @@ impl std::fmt::Debug for Struct {
 }
 
 /// RPython `Array`/`GcArray` (`lltype.py`).
+/// `ContainerType._install_extras` stores `_adtmeths` and `_hints` on
+/// Array the same way as Struct (`Array.__init__` forwards `**kwds`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Array {
     pub OF: ConcretetypePlaceholder,
+    pub _adtmeths: frozendict<ConstValue>,
     pub _hints: frozendict<ConstValue>,
     pub _gckind: GcKind,
 }
@@ -3642,16 +3716,21 @@ impl _ptr {
     }
 
     pub fn _lookup_adtmeth(&self, member_name: &str) -> Result<LowLevelAdtMember, AttributeError> {
+        // `_ptr._lookup_adtmeth` (`lltype.py`): any `ContainerType`,
+        // including Array, looks up `self._T._adtmeths`.
+        let ptrtype = LowLevelPointerType::Ptr(self._TYPE.clone());
         match &self._TYPE.TO {
-            PtrTarget::Struct(struct_t) => {
-                struct_t._lookup_adtmeth(member_name, &LowLevelPointerType::Ptr(self._TYPE.clone()))
-            }
-            PtrTarget::ForwardReference(forward_ref) => {
-                let Some(LowLevelType::Struct(struct_t)) = forward_ref.resolved() else {
-                    return Err(AttributeError);
-                };
-                struct_t._lookup_adtmeth(member_name, &LowLevelPointerType::Ptr(self._TYPE.clone()))
-            }
+            PtrTarget::Struct(struct_t) => struct_t._lookup_adtmeth(member_name, &ptrtype),
+            PtrTarget::Array(array_t) => array_t._lookup_adtmeth(member_name, &ptrtype),
+            PtrTarget::ForwardReference(forward_ref) => match forward_ref.resolved() {
+                Some(LowLevelType::Struct(struct_t)) => {
+                    struct_t._lookup_adtmeth(member_name, &ptrtype)
+                }
+                Some(LowLevelType::Array(array_t)) => {
+                    array_t._lookup_adtmeth(member_name, &ptrtype)
+                }
+                _ => Err(AttributeError),
+            },
             _ => Err(AttributeError),
         }
     }
@@ -3922,11 +4001,15 @@ impl _interior_ptr {
     }
 
     pub fn _lookup_adtmeth(&self, member_name: &str) -> Result<LowLevelAdtMember, AttributeError> {
-        let LowLevelValue::Struct(obj) = self._obj() else {
-            return Err(AttributeError);
-        };
-        obj.TYPE
-            ._lookup_adtmeth(member_name, &LowLevelPointerType::InteriorPtr(self._TYPE()))
+        let ptrtype = LowLevelPointerType::InteriorPtr(self._TYPE());
+        match self._obj() {
+            LowLevelValue::Struct(obj) => obj.TYPE._lookup_adtmeth(member_name, &ptrtype),
+            LowLevelValue::Array(obj) => match &obj.TYPE {
+                ArrayContainer::Array(array_t) => array_t._lookup_adtmeth(member_name, &ptrtype),
+                ArrayContainer::FixedSizeArray(_) => Err(AttributeError),
+            },
+            _ => Err(AttributeError),
+        }
     }
 
     /// RPython `_abstract_ptr._fixedlength` (`lltype.py`),
@@ -4110,6 +4193,8 @@ impl LowLevelType {
             // `NULL = fakeaddress(None)` — `_defl` returns the NULL
             // sentinel.
             LowLevelType::Address => LowLevelValue::Address(_address::Null),
+            // `Primitive._defl` is `_type()` = 0 for a Number.
+            LowLevelType::Number(n) => LowLevelValue::Number(n.clone(), 0),
             LowLevelType::Func(_) => {
                 panic!("FuncType has no standalone low-level value default")
             }
@@ -4181,6 +4266,7 @@ pub fn typeOf_value(value: &LowLevelValue) -> ConcretetypePlaceholder {
         LowLevelValue::Char(_) => LowLevelType::Char,
         LowLevelValue::UniChar(_) => LowLevelType::UniChar,
         LowLevelValue::Address(_) => LowLevelType::Address,
+        LowLevelValue::Number(n, _) => LowLevelType::Number(n.clone()),
         LowLevelValue::Struct(obj) => LowLevelType::Struct(Box::new(obj.TYPE.clone())),
         LowLevelValue::Array(obj) => match &obj.TYPE {
             ArrayContainer::Array(array_t) => LowLevelType::Array(Box::new(array_t.clone())),
@@ -4587,16 +4673,7 @@ impl Struct {
         member_name: &str,
         ll_ptrtype: &LowLevelPointerType,
     ) -> Result<LowLevelAdtMember, AttributeError> {
-        let Some(adtmember) = self._adtmeths.get(member_name) else {
-            return Err(AttributeError);
-        };
-        match adtmember {
-            ConstValue::HostObject(_) => Ok(LowLevelAdtMember::Method {
-                ll_ptrtype: ll_ptrtype.clone(),
-                func: adtmember.clone(),
-            }),
-            _ => Ok(LowLevelAdtMember::Value(adtmember.clone())),
-        }
+        lookup_adtmeth_member(&self._adtmeths, member_name, ll_ptrtype)
     }
 
     pub fn _nofield(&self, name: &str) -> String {
@@ -4604,13 +4681,32 @@ impl Struct {
     }
 }
 
+/// `_ptr._lookup_adtmeth` (`lltype.py`): `self._T._adtmeths[member_name]`,
+/// shared by Struct and Array (`ContainerType._adtmeths`).
+fn lookup_adtmeth_member(
+    adtmeths: &frozendict<ConstValue>,
+    member_name: &str,
+    ll_ptrtype: &LowLevelPointerType,
+) -> Result<LowLevelAdtMember, AttributeError> {
+    let Some(adtmember) = adtmeths.get(member_name) else {
+        return Err(AttributeError);
+    };
+    match adtmember {
+        ConstValue::HostObject(_) => Ok(LowLevelAdtMember::Method {
+            ll_ptrtype: ll_ptrtype.clone(),
+            func: adtmember.clone(),
+        }),
+        _ => Ok(LowLevelAdtMember::Value(adtmember.clone())),
+    }
+}
+
 impl Array {
     pub fn new(of: ConcretetypePlaceholder) -> Self {
-        Self::_build(of, GcKind::Raw, vec![])
+        Self::_build(of, GcKind::Raw, vec![], vec![])
     }
 
     pub fn gc(of: ConcretetypePlaceholder) -> Self {
-        Self::_build(of, GcKind::Gc, vec![])
+        Self::_build(of, GcKind::Gc, vec![], vec![])
     }
 
     /// Raw `Array(OF, hints={...})`. Upstream
@@ -4622,13 +4718,28 @@ impl Array {
     ///                hints={'nolength': True, 'immutable': True,
     ///                       'static_immutable': True})`.
     pub fn with_hints(of: ConcretetypePlaceholder, hints: Vec<(String, ConstValue)>) -> Self {
-        Self::_build(of, GcKind::Raw, hints)
+        Self::_build(of, GcKind::Raw, vec![], hints)
+    }
+
+    /// Raw `Array(OF, adtmeths={...})`. `ContainerType._install_extras`
+    /// (`lltype.py`) stores the dict on `_adtmeths`.
+    pub fn with_adtmeths(of: ConcretetypePlaceholder, adtmeths: Vec<(String, ConstValue)>) -> Self {
+        Self::_build(of, GcKind::Raw, adtmeths, vec![])
     }
 
     /// `GcArray(OF, hints={...})`. Same as [`Array::gc`] plus a
     /// `hints` dict mirrored from upstream `_install_extras`.
     pub fn gc_with_hints(of: ConcretetypePlaceholder, hints: Vec<(String, ConstValue)>) -> Self {
-        Self::_build(of, GcKind::Gc, hints)
+        Self::_build(of, GcKind::Gc, vec![], hints)
+    }
+
+    /// `GcArray(OF, adtmeths={...})`. `get_ll_dict` (`rordereddict.py`)
+    /// stamps `entrymeths` on `GcArray(DICTENTRY, adtmeths=entrymeths)`.
+    pub fn gc_with_adtmeths(
+        of: ConcretetypePlaceholder,
+        adtmeths: Vec<(String, ConstValue)>,
+    ) -> Self {
+        Self::_build(of, GcKind::Gc, adtmeths, vec![])
     }
 
     /// Unified constructor mirroring `Array.__init__` / `_install_extras`
@@ -4638,6 +4749,7 @@ impl Array {
     fn _build(
         of: ConcretetypePlaceholder,
         gckind: GcKind,
+        adtmeths: Vec<(String, ConstValue)>,
         hints: Vec<(String, ConstValue)>,
     ) -> Self {
         if of.is_container_type() && of._gckind() != GcKind::Raw {
@@ -4648,6 +4760,7 @@ impl Array {
         }
         let result = Array {
             OF: of,
+            _adtmeths: frozendict::new(adtmeths),
             _hints: frozendict::new(hints),
             _gckind: gckind,
         };
@@ -4657,6 +4770,14 @@ impl Array {
             ._note_inlined_into(&parent, false, false)
             .unwrap_or_else(|err| panic!("{err}"));
         result
+    }
+
+    pub fn _lookup_adtmeth(
+        &self,
+        member_name: &str,
+        ll_ptrtype: &LowLevelPointerType,
+    ) -> Result<LowLevelAdtMember, AttributeError> {
+        lookup_adtmeth_member(&self._adtmeths, member_name, ll_ptrtype)
     }
 
     pub fn _container_example(&self) -> _array {
@@ -5176,7 +5297,8 @@ impl LowLevelType {
             | LowLevelType::LongFloat
             | LowLevelType::Char
             | LowLevelType::UniChar
-            | LowLevelType::Address => true,
+            | LowLevelType::Address
+            | LowLevelType::Number(_) => true,
             LowLevelType::Struct(t) => t._is_atomic(),
             _ => false,
         }
@@ -5205,6 +5327,7 @@ impl LowLevelType {
             | LowLevelType::Char
             | LowLevelType::UniChar
             | LowLevelType::Address
+            | LowLevelType::Number(_)
             | LowLevelType::Ptr(_)
             | LowLevelType::InteriorPtr(_) => Ok(()),
             LowLevelType::Struct(t) => t._note_inlined_into(parent, first),
@@ -5329,7 +5452,8 @@ impl Ptr {
                         | LowLevelType::LongFloat
                         | LowLevelType::Char
                         | LowLevelType::UniChar
-                        | LowLevelType::Address => {
+                        | LowLevelType::Address
+                        | LowLevelType::Number(_) => {
                             panic!("ForwardReference target must resolve to a container type")
                         }
                     }
@@ -5494,6 +5618,10 @@ pub fn typeOf_const(value: &ConstValue) -> Result<LowLevelType, CastWhateverErro
         ConstValue::UInt(_) => Ok(LowLevelType::Unsigned),
         ConstValue::Int128(_) => Ok(LowLevelType::SignedLongLongLong),
         ConstValue::UInt128(_) => Ok(LowLevelType::UnsignedLongLongLong),
+        // `issubclass(tp, base_int): return build_number(None, tp)`.
+        ConstValue::RInt(c, _, _) => {
+            build_number(None, KnownType::RInt(*c)).map_err(CastWhateverError::type_error)
+        }
         ConstValue::Bool(_) => Ok(LowLevelType::Bool),
         ConstValue::Float(_) => Ok(LowLevelType::Float),
         ConstValue::SingleFloat(_) => Ok(LowLevelType::SingleFloat),
@@ -5538,41 +5666,66 @@ fn const_value_type_name(value: &ConstValue) -> &'static str {
 
 /// Truncated integer of unbounded magnitude, with the low 128 bits for
 /// wrapping integer destinations. `cast_primitive` converts a float to
-/// `long` first (`lltype.py`); Bool/Char/UniChar use the exact value,
-/// wrapping applies only to `Number._cast`.
-struct TruncatedInt {
-    low: u128,
+/// `long` first (`lltype.py` `cast_primitive`, Float source only);
+/// Bool/Char/UniChar use the exact value, wrapping applies only to
+/// `Number._cast`. `force_cast` integer dests (`ll2ctypes.force_cast`)
+/// take `low` for the ctypes wrap.
+pub(crate) struct TruncatedInt {
+    pub(crate) low: u128,
     is_zero: bool,
     fits_i128: bool,
+    /// Truncated integer-valued f64 when `long(value)` does not fit
+    /// i128 (`cast_primitive` Float source). `None` for integer sources.
+    float_exact: Option<f64>,
 }
 
 impl TruncatedInt {
-    fn from_i128(n: i128) -> Self {
+    fn new(low: u128, is_zero: bool, fits_i128: bool, float_exact: Option<f64>) -> Self {
         Self {
-            low: n as u128,
-            is_zero: n == 0,
-            fits_i128: true,
+            low,
+            is_zero,
+            fits_i128,
+            float_exact,
         }
     }
 
-    fn from_u128(n: u128) -> Self {
-        Self {
-            low: n,
-            is_zero: n == 0,
-            fits_i128: n <= i128::MAX as u128,
-        }
+    pub(crate) fn from_i128(n: i128) -> Self {
+        Self::new(n as u128, n == 0, true, None)
     }
 
-    fn as_i128(&self) -> Option<i128> {
+    pub(crate) fn from_u128(n: u128) -> Self {
+        Self::new(n, n == 0, n <= i128::MAX as u128, None)
+    }
+
+    pub(crate) fn as_i128(&self) -> Option<i128> {
         if self.fits_i128 {
             Some(self.low as i128)
         } else {
             None
         }
     }
+
+    /// Exact decimal of `long(value)` for `signed_int.__new__`
+    /// OverflowError (`rarithmetic.py`). A Float source is the truncated
+    /// integer-valued f64; an integer source is the value itself.
+    pub(crate) fn exact_int_display(&self) -> String {
+        if let Some(n) = self.as_i128() {
+            n.to_string()
+        } else if let Some(f) = self.float_exact {
+            format!("{:.0}", f)
+        } else {
+            self.low.to_string()
+        }
+    }
 }
 
-fn truncated_from_const(value: &ConstValue) -> Result<TruncatedInt, CastWhateverError> {
+/// `signed_int.__new__` OverflowError payload (`rarithmetic.py`).
+/// `val` is `long(value)`: the source integer, or the truncated float.
+pub(crate) fn signed_int_overflow_from_truncated(t: &TruncatedInt, bits: u16) -> String {
+    signed_int_overflow_message(t.exact_int_display(), bits)
+}
+
+pub(crate) fn truncated_from_const(value: &ConstValue) -> Result<TruncatedInt, CastWhateverError> {
     match value {
         ConstValue::Bool(true) => Ok(TruncatedInt::from_i128(1)),
         ConstValue::Bool(false) => Ok(TruncatedInt::from_i128(0)),
@@ -5580,6 +5733,12 @@ fn truncated_from_const(value: &ConstValue) -> Result<TruncatedInt, CastWhatever
         ConstValue::UInt(n) => Ok(TruncatedInt::from_u128(*n as u128)),
         ConstValue::Int128(n) => Ok(TruncatedInt::from_i128(*n)),
         ConstValue::UInt128(n) => Ok(TruncatedInt::from_u128(*n)),
+        ConstValue::RInt(c, n, _) => Ok(match rint_value(*c, *n) {
+            RIntValue::Signed(v) => TruncatedInt::from_i128(v),
+            RIntValue::Unsigned(v) => TruncatedInt::from_u128(v),
+        }),
+        // `cast_primitive`: `value = long(value)` only when `ORIG == Float`.
+        // `r_singlefloat` / `r_longfloat` have no integer conversion.
         ConstValue::Float(bits) => f64_trunc_toward_zero(f64::from_bits(*bits)),
         ConstValue::ByteStr(bytes) if bytes.len() == 1 => {
             Ok(TruncatedInt::from_i128(bytes[0] as i128))
@@ -5604,7 +5763,7 @@ fn const_as_i128(value: &ConstValue) -> Result<i128, CastWhateverError> {
 
 /// Python 2 `long(float)`: NaN is `ValueError`, infinity is `OverflowError`,
 /// a finite value truncates toward zero to an arbitrary-precision integer.
-fn f64_trunc_toward_zero(f: f64) -> Result<TruncatedInt, CastWhateverError> {
+pub(crate) fn f64_trunc_toward_zero(f: f64) -> Result<TruncatedInt, CastWhateverError> {
     if f.is_nan() {
         return Err(CastWhateverError::value_error(
             "cannot convert float NaN to integer",
@@ -5643,14 +5802,11 @@ fn f64_trunc_toward_zero(f: f64) -> Result<TruncatedInt, CastWhateverError> {
         mag <= i128::MAX as u128
     };
     let low = if sign { mag.wrapping_neg() } else { mag };
-    Ok(TruncatedInt {
-        low,
-        is_zero,
-        fits_i128,
-    })
+    let float_exact = if fits_i128 { None } else { Some(f.trunc()) };
+    Ok(TruncatedInt::new(low, is_zero, fits_i128, float_exact))
 }
 
-fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
+pub(crate) fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
     match value {
         ConstValue::Float(bits) | ConstValue::LongFloat(bits) => Ok(f64::from_bits(*bits)),
         ConstValue::SingleFloat(bits) => Ok(f32::from_bits(*bits) as f64),
@@ -5660,6 +5816,7 @@ fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
         ConstValue::UInt(n) => Ok(*n as f64),
         ConstValue::Int128(n) => Ok(*n as f64),
         ConstValue::UInt128(n) => Ok(*n as f64),
+        ConstValue::RInt(c, n, _) => Ok(rint_value(*c, *n).as_f64()),
         ConstValue::ByteStr(bytes) if bytes.len() == 1 => Ok(bytes[0] as f64),
         ConstValue::UniStr(s) => {
             let mut chars = s.chars();
@@ -5708,12 +5865,31 @@ fn number_cast_truncated(
         LowLevelType::SignedLongLongLong => {
             let Some(n) = t.as_i128() else {
                 return Err(CastWhateverError::overflow_error(
-                    "does not fit in signed 128-bit integer",
+                    signed_int_overflow_from_truncated(&t, 128),
                 ));
             };
             Ok(ConstValue::Int128(n))
         }
         LowLevelType::UnsignedLongLongLong => Ok(ConstValue::UInt128(t.low)),
+        // `TGT._cast(value)` is the `build_int` class constructor
+        // (`Number._cast` → `signed_int.__new__` / `unsigned_int.__new__`).
+        // Signed uses the original integer; wrapping `t.low as i128` first
+        // would turn `UInt128(u128::MAX)` into `-1` and pass SIGNEDCHAR.
+        LowLevelType::Number(n) => {
+            let value = if n._type.sign {
+                match t.as_i128() {
+                    Some(v) => v,
+                    None => {
+                        return Err(CastWhateverError::overflow_error(
+                            signed_int_overflow_from_truncated(&t, n._type.bits),
+                        ));
+                    }
+                }
+            } else {
+                t.low as i128
+            };
+            rint_new(n._type, value).map_err(CastWhateverError::overflow_error)
+        }
         _ => Err(CastWhateverError::type_error("unsupported cast")),
     }
 }
@@ -6711,16 +6887,33 @@ where
     )
 }
 
-pub fn build_number(_name: Option<()>, knowntype: KnownType) -> LowLevelType {
-    match knowntype {
-        KnownType::Int => LowLevelType::Signed,
-        KnownType::Ruint => LowLevelType::Unsigned,
-        KnownType::LongLong => LowLevelType::SignedLongLong,
-        KnownType::LongLongLong => LowLevelType::SignedLongLongLong,
-        KnownType::ULongLong => LowLevelType::UnsignedLongLong,
-        KnownType::ULongLongLong => LowLevelType::UnsignedLongLongLong,
-        other => panic!("lltype.build_number() does not support knowntype {other}"),
+/// `build_number(None, normalizedinttype(self._type))` (`Number.normalized`).
+fn build_normalized_number(t: KnownType) -> LowLevelType {
+    build_number(None, normalizedinttype(t)).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// RPython `lltype.build_number(name, type)` (`lltype.py`).
+pub fn build_number(name: Option<&str>, knowntype: KnownType) -> Result<LowLevelType, String> {
+    let mut map = _numbertypes.lock();
+    if let Some(ty) = map.get(&knowntype) {
+        return Ok(ty.clone());
     }
+    let Some(name) = name else {
+        return Err(format!(
+            "ValueError: No matching lowlevel type for {knowntype:?}"
+        ));
+    };
+    let KnownType::RInt(c) = knowntype else {
+        return Err(format!(
+            "ValueError: No matching lowlevel type for {knowntype:?}"
+        ));
+    };
+    let number = LowLevelType::Number(Box::new(Number {
+        _name: name.into(),
+        _type: c,
+    }));
+    map.insert(knowntype, number.clone());
+    Ok(number)
 }
 
 impl LowLevelType {
@@ -8203,6 +8396,25 @@ mod tests {
     }
 
     #[test]
+    fn array_pointer_lookup_adtmeth_reads_array_adtmeths() {
+        // `_ptr._lookup_adtmeth` (`lltype.py`) looks up ContainerType._adtmeths,
+        // including Array.
+        let ptr_t = Ptr {
+            TO: PtrTarget::Array(Array::gc_with_adtmeths(
+                LowLevelType::Signed,
+                vec![("no_direct_compare".into(), ConstValue::Bool(true))],
+            )),
+        };
+        let ptr = ptr_t._example();
+        let LowLevelAdtMember::Value(value) = ptr._lookup_adtmeth("no_direct_compare").unwrap()
+        else {
+            panic!("expected adt value");
+        };
+        assert_eq!(value, ConstValue::Bool(true));
+        assert!(ptr._lookup_adtmeth("missing").is_err());
+    }
+
+    #[test]
     fn struct_pointer_getattr_exposes_inlined_struct_field_as_pointer() {
         let inner = Struct::new("Inner", vec![("y".into(), LowLevelType::Signed)]);
         let outer = Ptr {
@@ -8708,6 +8920,37 @@ mod tests {
     }
 
     #[test]
+    fn array_adtmeths_are_kept_and_participate_in_equality() {
+        // `ContainerType._install_extras` (`lltype.py`) stores `_adtmeths`
+        // on Array; two Arrays that differ only there are unequal.
+        let adtmeths = vec![("no_direct_compare".into(), ConstValue::Bool(true))];
+        let with = Array::gc_with_adtmeths(LowLevelType::Signed, adtmeths.clone());
+        assert_eq!(
+            with._adtmeths.get("no_direct_compare"),
+            Some(&ConstValue::Bool(true))
+        );
+        let without = Array::gc(LowLevelType::Signed);
+        assert!(without._adtmeths.is_empty());
+        assert_ne!(with, without);
+        let mut hasher_with = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher_without = std::collections::hash_map::DefaultHasher::new();
+        with.hash(&mut hasher_with);
+        without.hash(&mut hasher_without);
+        assert_ne!(hasher_with.finish(), hasher_without.finish());
+        let with_again = Array::gc_with_adtmeths(LowLevelType::Signed, adtmeths);
+        assert_eq!(with, with_again);
+        let raw = Array::with_adtmeths(
+            LowLevelType::Signed,
+            vec![("no_direct_compare".into(), ConstValue::Bool(true))],
+        );
+        assert_ne!(raw, with);
+        assert_eq!(
+            raw._adtmeths.get("no_direct_compare"),
+            Some(&ConstValue::Bool(true))
+        );
+    }
+
+    #[test]
     fn array_short_name_prefixes_with_kind() {
         // lltype.py — Array/GcArray _short_name.
         assert_eq!(
@@ -8918,6 +9161,21 @@ mod tests {
         let interior =
             gc_parent_ptr._interior_ptr_type_with_index(&LowLevelType::Struct(Box::new(to_struct)));
         assert_eq!(interior._adtmeths, frozendict::new(adtmeths));
+    }
+
+    #[test]
+    fn interior_ptr_type_with_index_leaves_array_adtmeths_on_array() {
+        // `Ptr._interior_ptr_type_with_index` copies `_adtmeths` only
+        // when TO is a Struct; an Array keeps them on itself.
+        let adtmeths = vec![("no_direct_compare".into(), ConstValue::Bool(true))];
+        let to_array = Array::gc_with_adtmeths(LowLevelType::Signed, adtmeths.clone());
+        let gc_parent_ptr = Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        };
+        let interior = gc_parent_ptr
+            ._interior_ptr_type_with_index(&LowLevelType::Array(Box::new(to_array.clone())));
+        assert!(interior._adtmeths.is_empty());
+        assert_eq!(to_array._adtmeths, frozendict::new(adtmeths));
     }
 
     #[test]
@@ -9553,8 +9811,26 @@ mod tests {
             FORWARDREF_BY_FLAVOR.get("prebuilt"),
             Some(&"FuncForwardReference")
         );
-        assert_eq!(_numbertypes.get("int"), Some(&LowLevelType::Signed));
-        assert_eq!(_numbertypes.get("r_uint"), Some(&LowLevelType::Unsigned));
+        assert_eq!(
+            _numbertypes.lock().get(&KnownType::Int),
+            Some(&LowLevelType::Signed)
+        );
+        assert_eq!(
+            _numbertypes.lock().get(&KnownType::Rint),
+            Some(&LowLevelType::Signed)
+        );
+        assert_eq!(
+            build_number(None, KnownType::Rint).unwrap(),
+            LowLevelType::Signed
+        );
+        assert_eq!(
+            build_number(None, KnownType::Rint).unwrap(),
+            build_number(None, KnownType::Int).unwrap()
+        );
+        assert_eq!(
+            _numbertypes.lock().get(&KnownType::Ruint),
+            Some(&LowLevelType::Unsigned)
+        );
         assert_eq!(_to_primitive.get("Char"), Some(&"chr"));
         assert_eq!(_to_primitive.get("Signed"), Some(&"int"));
 
@@ -9734,6 +10010,21 @@ mod tests {
         assert!(
             matches!(inf, CastWhateverError::OverflowError(_)),
             "long(inf) is OverflowError, got {inf:?}"
+        );
+    }
+
+    #[test]
+    fn cast_primitive_singlefloat_to_signed_is_error() {
+        // `cast_primitive`: `long(value)` only for a Float source.
+        // `r_singlefloat` has no integer conversion.
+        let err = cast_primitive(
+            &LowLevelType::Signed,
+            &ConstValue::SingleFloat(1.5f32.to_bits()),
+        )
+        .expect_err("cast_primitive(Signed, r_singlefloat(1.5))");
+        assert!(
+            matches!(err, CastWhateverError::TypeError(_)),
+            "r_singlefloat → Signed is TypeError, got {err:?}"
         );
     }
 
@@ -9944,5 +10235,145 @@ mod tests {
             panic!("expected nullptr from IntCast(0), got {zero:?}");
         };
         assert!(!p0.nonzero());
+    }
+
+    #[test]
+    fn number_build_cast_contains_and_defl() {
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let schar = crate::rlib::rarithmetic::built_rint("r_schar", true, 8);
+        let bits24 = match crate::rlib::rarithmetic::build_int(Some("r_uint24"), false, 24, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            KnownType::RInt(c) => c,
+            other => panic!("expected RInt, got {other:?}"),
+        };
+
+        let uchar_ty = build_number(Some("UCHAR"), KnownType::RInt(uchar)).unwrap();
+        match &uchar_ty {
+            LowLevelType::Number(n) => assert_eq!(n._name, "UCHAR"),
+            other => panic!("expected Number, got {other:?}"),
+        }
+        let again = build_number(None, KnownType::RInt(uchar)).unwrap();
+        assert_eq!(uchar_ty, again);
+        assert_ne!(uchar_ty, LowLevelType::Unsigned);
+
+        let err = build_number(None, KnownType::RInt(bits24)).unwrap_err();
+        assert!(err.contains("ValueError"), "unregistered Number: {err}");
+
+        assert_eq!(
+            cast_primitive(&uchar_ty, &ConstValue::Int(-1)).unwrap(),
+            ConstValue::rint(uchar, 255)
+        );
+        assert_eq!(
+            cast_primitive(&LowLevelType::Signed, &ConstValue::rint(uchar, 200)).unwrap(),
+            ConstValue::Int(200)
+        );
+
+        let schar_ty = build_number(Some("SCHAR"), KnownType::RInt(schar)).unwrap();
+        let overflow = cast_primitive(&schar_ty, &ConstValue::Int(128)).unwrap_err();
+        assert_eq!(
+            overflow.to_string(),
+            "128 does not fit in signed 8-bit integer"
+        );
+
+        assert_eq!(uchar_ty.normalized(), LowLevelType::Unsigned);
+        assert_eq!(schar_ty.normalized(), LowLevelType::Signed);
+        assert_eq!(LowLevelType::Signed.normalized(), LowLevelType::Signed);
+        match &uchar_ty {
+            LowLevelType::Number(n) => {
+                assert_eq!(n.normalized(), LowLevelType::Unsigned);
+            }
+            other => panic!("expected Number, got {other:?}"),
+        }
+
+        assert!(uchar_ty.contains_value(&ConstValue::rint(uchar, 1)));
+        assert!(!uchar_ty.contains_value(&ConstValue::Int(1)));
+
+        match uchar_ty._defl() {
+            LowLevelValue::Number(n, 0) => assert_eq!(n._name, "UCHAR"),
+            other => panic!("expected Number(_, 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cast_primitive_signed_number_keeps_uint128_magnitude() {
+        let schar_ty = (*crate::translator::rtyper::lltypesystem::rffi::SIGNEDCHAR).clone();
+        let err = cast_primitive(&schar_ty, &ConstValue::UInt128(u128::MAX))
+            .expect_err("u128::MAX does not fit in SIGNEDCHAR");
+        assert_eq!(
+            err.to_string(),
+            format!("{u} does not fit in signed 8-bit integer", u = u128::MAX)
+        );
+        let minus_one =
+            cast_primitive(&schar_ty, &ConstValue::Int(-1)).expect("-1 fits SIGNEDCHAR");
+        match (&schar_ty, minus_one) {
+            (LowLevelType::Number(n), ConstValue::RInt(c, v, _)) => {
+                assert_eq!(c, n._type);
+                assert_eq!(v, -1);
+            }
+            other => panic!("expected RInt(-1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsigned_128_forced_number_reads_as_unsigned() {
+        let class =
+            match crate::rlib::rarithmetic::build_int(Some("r_u128_forced"), false, 128, true)
+                .unwrap_or_else(|e| panic!("{e}"))
+            {
+                KnownType::RInt(c) => c,
+                other => panic!("expected RInt, got {other:?}"),
+            };
+        let ty = build_number(Some("U128FORCED"), KnownType::RInt(class))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let held = ConstValue::rint(class, u128::MAX as i128);
+        assert_eq!(typeOf_const(&held).unwrap(), ty);
+
+        let as_float =
+            cast_primitive(&LowLevelType::Float, &held).expect("unsigned Number → Float");
+        assert_eq!(as_float, ConstValue::float(u128::MAX as f64));
+        assert_eq!(u128::MAX as f64, 3.402823669209385e38);
+
+        let as_unsigned =
+            cast_primitive(&LowLevelType::Unsigned, &held).expect("truncated_from_const unsigned");
+        assert_eq!(as_unsigned, ConstValue::UInt(u128::MAX as usize as u64));
+    }
+
+    #[test]
+    fn number_normalized_widens_uchar_to_unsigned() {
+        use crate::translator::rtyper::lltypesystem::rffi;
+        assert_eq!(rffi::UCHAR.normalized(), LowLevelType::Unsigned);
+        assert_eq!(rffi::SIGNEDCHAR.normalized(), LowLevelType::Signed);
+        assert_eq!(LowLevelType::Signed.normalized(), LowLevelType::Signed);
+    }
+
+    #[test]
+    fn cast_primitive_float_pow128_to_short_reports_full_integer() {
+        let short = (*crate::translator::rtyper::lltypesystem::rffi::SHORT).clone();
+        let bits = match &short {
+            LowLevelType::Number(n) => n._type.bits,
+            other => panic!("SHORT is a Number, got {other:?}"),
+        };
+        let t = f64_trunc_toward_zero(2.0f64.powi(128)).expect("2**128 truncates");
+        assert_eq!(
+            t.exact_int_display(),
+            "340282366920938463463374607431768211456"
+        );
+        let err = cast_primitive(&short, &ConstValue::float(2.0f64.powi(128)))
+            .expect_err("2**128 → SHORT");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "340282366920938463463374607431768211456 does not fit in signed {bits}-bit integer"
+            )
+        );
+        let neg = cast_primitive(&short, &ConstValue::float(-(2.0f64.powi(128))))
+            .expect_err("-2**128 → SHORT");
+        assert_eq!(
+            neg.to_string(),
+            format!(
+                "-340282366920938463463374607431768211456 does not fit in signed {bits}-bit integer"
+            )
+        );
     }
 }

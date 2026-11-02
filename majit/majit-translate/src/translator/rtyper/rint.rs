@@ -39,11 +39,10 @@
 //!   `rtyper.py` still needs `exceptiondata.py` parity.
 //! * `rtype_hex` / `rtype_oct` / `rtype_bin` (`rint.py`) — require
 //!   `lltypesystem/ll_str.py` (`ll_int2hex/oct/bin`).
-//! * `ll_str` / `ll_hash_int` / `ll_hash_long_long` / `ll_eq_shortint`
-//!   (`rint.py`) — land with `rdict.py` (needs
-//!   `get_ll_{eq,hash}_function`) + `annlowlevel.llstr`.
-//! * `get_ll_{eq,ge,gt,lt,le,hash,fasthash,dummyval}_function`
-//!   (`rint.py`) — require trait slots absent from pyre's `Repr`.
+//! * `ll_str` / `ll_hash_long_long` (`rint.py`) — `ll_str` still needs
+//!   `annlowlevel.llstr`; `ll_hash_long_long` is the 32-bit-target
+//!   branch of `get_ll_hash_function`.
+//! * `get_ll_{ge,gt,lt,le,dummyval}_function` (`rint.py`).
 
 #![allow(non_camel_case_types)]
 
@@ -52,7 +51,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::annotator::model::{SomeValue, unionof};
-use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+use crate::flowspace::model::{ConstValue, Constant, Hlvalue, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, LowLevelValue};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -146,6 +145,7 @@ impl IntegerRepr {
             }
             (_, LowLevelValue::Unsigned(n)) => Ok(ConstValue::UInt(n)),
             (_, LowLevelValue::Signed(n)) => Ok(ConstValue::Int(n)),
+            (_, LowLevelValue::Number(n, v)) => Ok(ConstValue::rint(n._type, v)),
             (_, other) => Err(TyperError::message(format!(
                 "IntegerRepr.rtype_neg: unexpected lowleveltype._defl {other:?}"
             ))),
@@ -179,19 +179,29 @@ impl Repr for IntegerRepr {
     ///     return None
     /// ```
     ///
-    /// `_opprefix is None` is the "shortint" branch (RPython narrow
-    /// integers like `r_singleshort` whose `==` requires explicit
-    /// `intmask` widening). Pyre's primitive lltypes (`Signed`, `Bool`,
-    /// `Unsigned`, long-long variants) all carry an `opprefix`, so the
-    /// shortint branch is never taken; returning `None` instructs the
-    /// caller (`gen_eq_function` / `rtype_contains`) to fall back to
-    /// the primitive `int_eq`/`uint_eq`/... inline op via
-    /// `eq_funcs[i] or operator.eq`.
+    /// `_opprefix is None` is the shortint branch: narrow `Number`
+    /// reprs (`rffi.UCHAR` / `SHORT` / …) whose `==` is
+    /// `intmask(n) == intmask(m)`. Word-sized and long-long reprs
+    /// carry an opprefix, so callers (`gen_eq_function` /
+    /// `rtype_contains`) fall back to the primitive `int_eq` /
+    /// `uint_eq` / … inline op via `eq_funcs[i] or operator.eq`.
     fn get_ll_eq_function(
         &self,
-        _rtyper: &super::rtyper::RPythonTyper,
+        rtyper: &super::rtyper::RPythonTyper,
     ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
-        Ok(None)
+        if self.opprefix.is_some() {
+            return Ok(None);
+        }
+        let lltype = self.lltype.clone();
+        let name = "ll_eq_shortint".to_string();
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                name.clone(),
+                vec![lltype.clone(), lltype],
+                LowLevelType::Bool,
+                move |_rtyper, args, _result| build_ll_eq_shortint_helper_graph(&name, &args[0]),
+            )
+            .map(Some)
     }
 
     /// RPython `IntegerRepr.get_ll_hash_function(self)` (`rint.py`):
@@ -255,9 +265,41 @@ impl Repr for IntegerRepr {
     /// value`) carries `llmemory` address offsets through unchanged; the
     /// concrete byte size is resolved only at code emission.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        if matches!(
+            value,
+            ConstValue::AddressOffset(_) | ConstValue::InheritanceId { .. }
+        ) {
+            return Ok(Constant::with_concretetype(
+                value.clone(),
+                self.lltype.clone(),
+            ));
+        }
+        if matches!(self.lltype, LowLevelType::Number(_)) {
+            return match value {
+                ConstValue::Int(_)
+                | ConstValue::UInt(_)
+                | ConstValue::Int128(_)
+                | ConstValue::UInt128(_)
+                | ConstValue::Bool(_)
+                | ConstValue::RInt(_, _, _) => {
+                    let converted =
+                        crate::translator::rtyper::lltypesystem::lltype::cast_primitive(
+                            &self.lltype,
+                            value,
+                        )
+                        .map_err(|e| TyperError::message(e.to_string()))?;
+                    Ok(Constant::with_concretetype(converted, self.lltype.clone()))
+                }
+                _ => Err(TyperError::message(format!("not an integer: {value:?}"))),
+            };
+        }
         let converted = match value {
             ConstValue::AddressOffset(_) => value.clone(),
             ConstValue::InheritanceId { .. } => value.clone(),
+            ConstValue::RInt(_, _, _) => {
+                crate::translator::rtyper::lltypesystem::lltype::cast_primitive(&self.lltype, value)
+                    .map_err(|e| TyperError::message(e.to_string()))?
+            }
             ConstValue::Int(n) => match self.lltype {
                 // `cast_primitive(Unsigned, int)` → `r_uint`
                 // (`lltype.Unsigned = build_number("Unsigned", r_uint)`).
@@ -567,7 +609,7 @@ pub(crate) fn build_ll_hash_int_helper_graph(
     name: &str,
     lltype: &LowLevelType,
 ) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
-    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation};
+    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Hlvalue, Link};
     use crate::translator::rtyper::rtyper::{helper_pygraph_from_graph, variable_with_lltype};
 
     let arg = variable_with_lltype("n", lltype.clone());
@@ -583,31 +625,11 @@ pub(crate) fn build_ll_hash_int_helper_graph(
     // `Signed` (already the target). Bool MUST emit `cast_bool_to_int`
     // — without it the return link would carry a `Bool`-typed Variable
     // into a `Signed`-typed return slot (`gen_hash_function` mixes the
-    // result with `int_mul`/`int_xor`).
-    let return_value = if lltype == &LowLevelType::Signed {
-        Hlvalue::Variable(arg)
-    } else {
-        let cast_op = match lltype {
-            LowLevelType::Bool => "cast_bool_to_int",
-            LowLevelType::Unsigned => "cast_uint_to_int",
-            LowLevelType::SignedLongLong => "truncate_longlong_to_int",
-            LowLevelType::UnsignedLongLong
-            | LowLevelType::SignedLongLongLong
-            | LowLevelType::UnsignedLongLongLong => "cast_primitive",
-            other => {
-                return Err(TyperError::message(format!(
-                    "ll_hash_int: no cast-to-Signed op for {other:?}"
-                )));
-            }
-        };
-        let cast_var = variable_with_lltype("hashed", LowLevelType::Signed);
-        startblock.borrow_mut().operations.push(SpaceOperation::new(
-            cast_op,
-            vec![Hlvalue::Variable(arg)],
-            Hlvalue::Variable(cast_var.clone()),
-        ));
-        Hlvalue::Variable(cast_var)
-    };
+    // result with `int_mul`/`int_xor`). Number (`rffi.UCHAR` / `SHORT`
+    // / …) uses `cast_primitive`, the op `pairtype(IntegerRepr,
+    // IntegerRepr).convert_from_to` emits for every pair outside the
+    // four dedicated casts.
+    let return_value = emit_intmask_to_signed(&startblock, "hashed", arg, lltype)?;
 
     use crate::flowspace::model::BlockRefExt;
     startblock.closeblock(vec![
@@ -624,6 +646,106 @@ pub(crate) fn build_ll_hash_int_helper_graph(
         vec!["n".to_string()],
         func,
     ))
+}
+
+/// RPython `ll_eq_shortint(n, m) = intmask(n) == intmask(m)` (`rint.py`).
+///
+/// `ll_eq_shortint.no_direct_compare = True` rides on the helper's
+/// [`crate::flowspace::model::GraphFunc`] so `rordereddict.py`
+/// `get_ll_dict` can copy it onto `ENTRIES`
+/// (`getattr(ll_eq_function, 'no_direct_compare', False)`).
+/// Two `cast_primitive`s to Signed (the `rtype_intmask` /
+/// `IntegerRepr.convert_from_to` lowering for a Number argument) plus
+/// `int_eq`.
+pub(crate) fn build_ll_eq_shortint_helper_graph(
+    name: &str,
+    lltype: &LowLevelType,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Hlvalue, Link};
+    use crate::translator::rtyper::rtyper::{helper_pygraph_from_graph, variable_with_lltype};
+
+    let n = variable_with_lltype("n", lltype.clone());
+    let m = variable_with_lltype("m", lltype.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(n.clone()),
+        Hlvalue::Variable(m.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let n_int = emit_intmask_to_signed(&startblock, "n_int", n, lltype)?;
+    let m_int = emit_intmask_to_signed(&startblock, "m_int", m, lltype)?;
+    let eq = variable_with_lltype("eq", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_eq",
+        vec![n_int, m_int],
+        Hlvalue::Variable(eq.clone()),
+    ));
+
+    use crate::flowspace::model::BlockRefExt;
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(eq)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func.no_direct_compare = true;
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["n".to_string(), "m".to_string()],
+        func,
+    ))
+}
+
+/// Op `rtype_intmask` / `IntegerRepr.convert_from_to` emits to Signed.
+/// `None` is identity (`lltype` is already Signed).
+fn intmask_cast_to_signed_op(lltype: &LowLevelType) -> Result<Option<&'static str>, TyperError> {
+    match lltype {
+        LowLevelType::Signed => Ok(None),
+        LowLevelType::Bool => Ok(Some("cast_bool_to_int")),
+        LowLevelType::Unsigned => Ok(Some("cast_uint_to_int")),
+        LowLevelType::SignedLongLong => Ok(Some("truncate_longlong_to_int")),
+        LowLevelType::UnsignedLongLong
+        | LowLevelType::SignedLongLongLong
+        | LowLevelType::UnsignedLongLongLong
+        | LowLevelType::Number(_) => Ok(Some("cast_primitive")),
+        other => Err(TyperError::message(format!(
+            "ll_hash_int: no cast-to-Signed op for {other:?}"
+        ))),
+    }
+}
+
+fn emit_intmask_to_signed(
+    startblock: &crate::flowspace::model::BlockRef,
+    dest_name: &str,
+    arg: crate::flowspace::model::Variable,
+    lltype: &LowLevelType,
+) -> Result<Hlvalue, TyperError> {
+    use crate::translator::rtyper::rtyper::variable_with_lltype;
+    match intmask_cast_to_signed_op(lltype)? {
+        None => Ok(Hlvalue::Variable(arg)),
+        Some(cast_op) => {
+            let cast_var = variable_with_lltype(dest_name, LowLevelType::Signed);
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                cast_op,
+                vec![Hlvalue::Variable(arg)],
+                Hlvalue::Variable(cast_var.clone()),
+            ));
+            Ok(Hlvalue::Variable(cast_var))
+        }
+    }
 }
 
 // ____________________________________________________________
@@ -1359,9 +1481,16 @@ mod tests {
     use crate::annotator::model::{
         KnownType, SomeChar, SomeInteger, SomeUnicodeCodePoint, SomeValue,
     };
-    use crate::flowspace::model::{SpaceOperation, Variable};
+    use crate::flowspace::model::Variable;
+    use crate::translator::rtyper::llinterp::eval_funcptr;
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        _getconcretetype, build_number, getfunctionptr,
+    };
+    use crate::translator::rtyper::lltypesystem::rffi;
     use crate::translator::rtyper::rmodel::setupstate;
-    use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
+    use crate::translator::rtyper::rtyper::{
+        HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1468,6 +1597,20 @@ mod tests {
         assert_eq!(c.value, ConstValue::UInt(7));
         let c = u.convert_const(&ConstValue::Bool(true)).unwrap();
         assert_eq!(c.value, ConstValue::UInt(1));
+    }
+
+    #[test]
+    fn getintegerrepr_uchar_has_no_opprefix_and_convert_const_masks() {
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let uchar_ty = build_number(Some("UCHAR"), KnownType::RInt(uchar)).unwrap();
+        let r = getintegerrepr(&uchar_ty);
+        let err = r.opprefix().unwrap_err();
+        assert!(
+            err.to_string().contains("size is too small"),
+            "opprefix: {err}"
+        );
+        let c = r.convert_const(&ConstValue::Int(-1)).unwrap();
+        assert_eq!(c.value, ConstValue::rint(uchar, 255));
     }
 
     #[test]
@@ -1779,6 +1922,120 @@ mod tests {
             assert_eq!(startblock.operations.len(), 1, "{}", llfn.name);
             assert_eq!(startblock.operations[0].opname, expected, "{}", llfn.name);
         }
+    }
+
+    fn eval_helper(llfn: &LowLevelFunction, args: &[LowLevelValue]) -> LowLevelValue {
+        let graph = llfn
+            .graph
+            .as_ref()
+            .expect("helper carries a graph")
+            .graph
+            .clone();
+        let fptr = getfunctionptr(&graph, _getconcretetype).expect("helper funcptr");
+        eval_funcptr(&fptr, args).expect("eval_funcptr")
+    }
+
+    fn number_llvalue(lltype: &LowLevelType, v: i128) -> LowLevelValue {
+        match lltype {
+            LowLevelType::Number(n) => LowLevelValue::Number(n.clone(), v),
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    /// `ll_hash_int(n) = intmask(n)` (`rint.py`): a Number argument
+    /// lowers through `cast_primitive` to Signed.
+    #[test]
+    fn integer_repr_get_ll_hash_function_number_intmasks_via_cast_primitive() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        for (lltype, value, expected) in [
+            ((*rffi::UCHAR).clone(), 200i128, 200i64),
+            ((*rffi::SHORT).clone(), -5i128, -5i64),
+        ] {
+            let r = getintegerrepr(&lltype);
+            let llfn = r
+                .get_ll_hash_function(&rtyper)
+                .expect("get_ll_hash_function(Number)")
+                .expect("returns Some helper");
+            let graph = llfn.graph.as_ref().expect("helper carries a graph");
+            let inner = graph.graph.borrow();
+            let startblock = inner.startblock.borrow();
+            assert_eq!(startblock.operations.len(), 1, "{}", llfn.name);
+            assert_eq!(
+                startblock.operations[0].opname, "cast_primitive",
+                "{}",
+                llfn.name
+            );
+            drop(startblock);
+            drop(inner);
+            assert_eq!(
+                eval_helper(&llfn, &[number_llvalue(&lltype, value)]),
+                LowLevelValue::Signed(expected),
+                "{}",
+                llfn.name
+            );
+        }
+    }
+
+    /// `IntegerRepr.get_ll_eq_function` (`rint.py`) returns
+    /// `ll_eq_shortint` when `_opprefix is None`; Signed keeps `None`.
+    #[test]
+    fn integer_repr_get_ll_eq_function_shortint_compares_via_intmask() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+
+        let signed = signed_repr()
+            .get_ll_eq_function(&rtyper)
+            .expect("get_ll_eq_function(Signed)");
+        assert!(signed.is_none(), "Signed opprefix is not None");
+
+        let uchar = (*rffi::UCHAR).clone();
+        let r = getintegerrepr(&uchar);
+        let llfn = r
+            .get_ll_eq_function(&rtyper)
+            .expect("get_ll_eq_function(UCHAR)")
+            .expect("returns ll_eq_shortint");
+        assert_eq!(llfn.name, "ll_eq_shortint");
+        assert_eq!(llfn.args, vec![uchar.clone(), uchar.clone()]);
+        assert_eq!(llfn.result, LowLevelType::Bool);
+        assert!(
+            llfn.graph
+                .as_ref()
+                .expect("helper carries a graph")
+                .func
+                .no_direct_compare,
+            "ll_eq_shortint.no_direct_compare = True"
+        );
+        let graph = llfn.graph.as_ref().expect("helper carries a graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            opnames,
+            vec!["cast_primitive", "cast_primitive", "int_eq"],
+            "intmask(n) == intmask(m)"
+        );
+        drop(startblock);
+        drop(inner);
+
+        assert_eq!(
+            eval_helper(
+                &llfn,
+                &[number_llvalue(&uchar, 200), number_llvalue(&uchar, 200)],
+            ),
+            LowLevelValue::Bool(true)
+        );
+        assert_eq!(
+            eval_helper(
+                &llfn,
+                &[number_llvalue(&uchar, 1), number_llvalue(&uchar, 2)],
+            ),
+            LowLevelValue::Bool(false)
+        );
     }
 
     /// `lowlevel_helper_function_with_builder` caches by

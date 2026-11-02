@@ -937,6 +937,7 @@ fn primitive_byte_size_for(ty: &LowLevelType, word: i64, signed: i64) -> Result<
         LowLevelType::SingleFloat => Ok(4),
         LowLevelType::UniChar => Ok(sizeof_wchar_t()),
         LowLevelType::Bool | LowLevelType::Char => Ok(1),
+        LowLevelType::Number(n) => Ok(super::rffi::sizeof_number(n)),
         other => Err(format!("no primitive byte size for {other:?}")),
     }
 }
@@ -1687,6 +1688,16 @@ mod tests {
     }
 
     #[test]
+    fn primitive_byte_size_number_floors_like_rffi_sizeof() {
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let n65 = rffi::number_from_forced_int("r_int65_llmemory", true, 65);
+        assert_eq!(item(n65, 1).byte_size(&NoLayout), Ok(8));
+        assert_eq!(item((*rffi::UCHAR).clone(), 1).byte_size(&NoLayout), Ok(1));
+        let n128 = rffi::number_from_forced_int("r_int128_llmemory", true, 128);
+        assert_eq!(item(n128, 1).byte_size(&NoLayout), Ok(16));
+    }
+
+    #[test]
     fn byte_size_resolves_primitives_and_sums_composites() {
         assert_eq!(item(LowLevelType::Signed, 3).byte_size(&NoLayout), Ok(24));
         assert_eq!(item(LowLevelType::Char, 4).byte_size(&NoLayout), Ok(4));
@@ -1757,6 +1768,7 @@ mod tests {
         // sizeof(ARRAY.OF) * n`.
         let array_ty = LowLevelType::Array(Box::new(Array {
             OF: LowLevelType::Signed,
+            _adtmeths: frozendict::from(Vec::new()),
             _hints: frozendict::from(Vec::new()),
             _gckind: GcKind::Gc,
         }));
@@ -1822,6 +1834,7 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, frozendict};
         LowLevelType::Array(Box::new(Array {
             OF: of,
+            _adtmeths: frozendict::from(Vec::new()),
             _hints: frozendict::from(hints),
             _gckind: GcKind::Gc,
         }))

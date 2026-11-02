@@ -833,6 +833,7 @@ fn merge_flat(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>
 fn const_value_type(value: &ConstValue) -> ValueType {
     match value {
         ConstValue::Int(_)
+        | ConstValue::RInt(_, _, _)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }

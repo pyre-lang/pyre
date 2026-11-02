@@ -2160,6 +2160,7 @@ dependencies = [
  "bincode",
  "bit-set",
  "bitflags 2.13.0",
+ "cc",
  "indexmap",
  "libc",
  "majit-charon-reader",

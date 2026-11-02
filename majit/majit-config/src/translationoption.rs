@@ -27,10 +27,13 @@
 //!    aarch64-exclusion predicate. Upstream at `:23-31` hand-maintains
 //!    the same Linux-only-and-no-aarch64 list of C compilers that
 //!    accept `__thread`.
-//! 3. **`MAINDIR` / `CACHE_DIR`** are DEFERRED. They are C-backend
-//!    concerns (`rpython/translator/c/genc.py` consumes them); no
-//!    annotator path needs them. Re-port when the C-backend port
-//!    lands.
+//! 3. **`CACHE_DIR`**: `realpath(join(MAINDIR, '_cache', MACHINE))`
+//!    with `MAINDIR` = the `majit/` directory (parent of this crate's
+//!    `CARGO_MANIFEST_DIR`). Analog of upstream `MAINDIR` /
+//!    `CACHE_DIR` (`translationoption.py`): `MAINDIR =
+//!    dirname(dirname(__file__))` is the `rpython/` package dir.
+//!    `cache_dir()` is `os.path.realpath` of that join: canonicalize the
+//!    longest existing ancestor, then append remaining components.
 //! 4. **`ArbitraryOption` payload tests** (`instrumentctl`) avoid
 //!    upstream's Python-dict storage — the Rust port's
 //!    `OptionValue::Arbitrary(Rc<dyn Any>)` preserves the dynamic-type
@@ -42,6 +45,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::config::{
@@ -78,6 +82,84 @@ pub const IS_64_BITS: bool = usize::BITS == 64;
 /// other non-aarch64 Linux arches). False on macOS, Windows, and
 /// aarch64 Linux per upstream's hand-maintained list.
 pub const SUPPORT__THREAD: bool = cfg!(target_os = "linux") && !cfg!(target_arch = "aarch64");
+
+/// `_stdlib_platform.machine()` (`translationoption.MACHINE`).
+///
+/// `platform.machine()` is `uname -m` on posix (`arm64` on Darwin
+/// aarch64, `aarch64` on Linux aarch64, `x86_64` on posix x86_64) and
+/// `PROCESSOR_ARCHITECTURE` on Windows (`AMD64` / `ARM64` / `x86`).
+/// majit-config has no `libc` dependency, so the spelling is the
+/// `(target_os, target_arch)` table for those values.
+pub const fn machine() -> &'static str {
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        "AMD64"
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
+        "ARM64"
+    } else if cfg!(all(windows, target_arch = "x86")) {
+        "x86"
+    } else if cfg!(all(windows, target_arch = "arm")) {
+        "ARM"
+    } else if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+        "arm64"
+    } else {
+        std::env::consts::ARCH
+    }
+}
+
+/// `MACHINE` (`translationoption.py`): `_stdlib_platform.machine()`.
+pub const MACHINE: &str = machine();
+
+/// `MAINDIR` (`translationoption.py`): `os.path.dirname(os.path.dirname(__file__))`,
+/// the `rpython/` package dir. Analog is the `majit/` directory, parent of
+/// this crate's `CARGO_MANIFEST_DIR`.
+pub fn maindir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("majit-config crate lives under majit/")
+        .to_path_buf()
+}
+
+/// `os.path.realpath`: canonicalize the longest existing ancestor, then
+/// append remaining components (`translationoption.CACHE_DIR`).
+pub fn realpath(path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut ancestor = path.clone();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let mut resolved = canonical;
+            for component in missing.iter().rev() {
+                resolved.push(component);
+            }
+            return resolved;
+        }
+        match ancestor.file_name() {
+            Some(name) => {
+                missing.push(name.to_os_string());
+                match ancestor.parent() {
+                    Some(parent) if parent.as_os_str() != ancestor.as_os_str() => {
+                        ancestor = parent.to_path_buf();
+                    }
+                    _ => return path,
+                }
+            }
+            None => return path,
+        }
+    }
+}
+
+/// `CACHE_DIR` (`translationoption.py`).
+///
+/// `os.path.realpath(os.path.join(MAINDIR, '_cache', MACHINE))`.
+pub fn cache_dir() -> PathBuf {
+    realpath(&maindir().join("_cache").join(MACHINE))
+}
 
 /// Upstream `:39-42 PLATFORMS = ['host', 'arm']`. Kept as a module
 /// constant so `ChoiceOption("platform", ...)` can reuse it.
@@ -1026,6 +1108,66 @@ mod tests {
     fn fresh_combined() -> Rc<Config> {
         get_combined_translation_config(None, None, None, false)
             .expect("combined translation config must build")
+    }
+
+    #[test]
+    fn cache_dir_ends_with_cache_machine_under_maindir() {
+        let expected = maindir().join("_cache").join(MACHINE);
+        let dir = cache_dir();
+        assert_eq!(dir, realpath(&expected));
+        assert!(
+            dir.ends_with(std::path::Path::new("_cache").join(MACHINE)),
+            "cache_dir() must end with _cache/{MACHINE} under maindir(), got {}",
+            dir.display()
+        );
+        let main = maindir();
+        let main_canon = main.canonicalize().unwrap_or_else(|_| main.clone());
+        assert!(
+            dir.starts_with(&main) || dir.starts_with(&main_canon),
+            "cache_dir() must sit under maindir() {}, got {}",
+            main.display(),
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn machine_uses_platform_machine_spelling() {
+        assert_eq!(MACHINE, machine());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(MACHINE, "arm64");
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        assert_eq!(MACHINE, "aarch64");
+        #[cfg(all(unix, not(target_os = "macos"), target_arch = "x86_64"))]
+        assert_eq!(MACHINE, "x86_64");
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        assert_eq!(MACHINE, "x86_64");
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        assert_eq!(MACHINE, "AMD64");
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        assert_eq!(MACHINE, "ARM64");
+        #[cfg(all(windows, target_arch = "x86"))]
+        assert_eq!(MACHINE, "x86");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn realpath_resolves_symlinked_parent_with_missing_leaf() {
+        let root = std::env::temp_dir().join(format!(
+            "majit-realpath-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let real_parent = root.join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let link_parent = root.join("link-parent");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let missing_leaf = link_parent.join("missing-leaf");
+        assert!(!missing_leaf.exists());
+        let got = realpath(&missing_leaf);
+        let expected = real_parent.canonicalize().unwrap().join("missing-leaf");
+        assert_eq!(got, expected);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

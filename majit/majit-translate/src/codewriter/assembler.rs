@@ -529,6 +529,102 @@ trait AssemblerEncode {
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
 }
 
+/// Resolve an integer-kind [`ConstValue`] to its concrete `i64`
+/// (`Assembler.emit_const` value extraction).  `llmemory` address offsets
+/// are symbolic; resolve to the concrete byte size at code emission.
+/// Struct field offsets / sizes come from the `CallControl`'s struct
+/// layouts (it implements `OffsetLayout`); the layout-free offsets
+/// resolve even without a `callcontrol`.
+pub(crate) fn resolve_const_i_value(value: &ConstValue, callcontrol: Option<&CallControl>) -> i64 {
+    match value {
+        ConstValue::Int(n) => *n,
+        ConstValue::UInt(n) => *n as i64,
+        ConstValue::Bool(b) => *b as i64,
+        ConstValue::SpecTag(tag) => *tag as i64,
+        // assembler.py::Assembler.emit_const converts raw pointers via
+        // cast_ptr_to_adr/adr2int. Null needs no runtime relocation.
+        ConstValue::LLPtr(ptr) if !ptr.nonzero() => {
+            assert_eq!(
+                ptr._TYPE._gckind(),
+                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                "integer pointer constants must be raw"
+            );
+            0
+        }
+        ConstValue::LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address::Null) => 0,
+        // Symbolic inheritance-id marker: emit the resolved id. When
+        // only the eager `value` is present it is the concrete id;
+        // `cdef_id` reserves the key for a numbering resolution.
+        ConstValue::InheritanceId { value, .. } => *value,
+        ConstValue::AddressOffset(offset) => {
+            let resolved = match callcontrol {
+                Some(cc) => offset.byte_size(cc),
+                None => offset.byte_size(&NoStructLayout),
+            };
+            resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
+        }
+        // assembler.py Assembler.emit_const, kind 'int':
+        // `value = lltype.cast_primitive(lltype.Signed, value)` for
+        // every non-symbolic integer constant, including UniChar and
+        // rffi Number (`ConstValue::RInt`) instances.
+        ConstValue::UniChar(_) | ConstValue::RInt(_, _, _) => {
+            match crate::translator::rtyper::lltypesystem::lltype::cast_primitive(
+                &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+                value,
+            ) {
+                Ok(ConstValue::Int(n)) => n,
+                other => panic!("emit_const → Signed: {other:?}"),
+            }
+        }
+        ConstValue::SingleFloat(bits) => super::longlong::singlefloat2int(f32::from_bits(*bits)),
+        ConstValue::AddressAsInt(addr) => match addr {
+            crate::translator::rtyper::lltypesystem::lltype::_address::Null => 0,
+            crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n) => *n,
+            crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_) => {
+                panic!(
+                    "AddressAsInt of a container-backed address is symbolic; \
+                     Assembler has no ConstIRelocKind for it (only FnAddr/StaticAddr)"
+                )
+            }
+        },
+        other => std::panic::panic_any(AssemblerError::message(format!(
+            "integer-kind constant not supported by emit_const_i: {other:?}"
+        ))),
+    }
+}
+
+/// Integer-kind Number / `ConstValue::RInt` as `Assembler.emit_const`
+/// (kind `'int'`): `value = lltype.cast_primitive(lltype.Signed, value)`.
+/// The lltype is the constant's own Number concretetype when present,
+/// else `build_number` of the RInt class.
+pub(crate) fn signed_int_from_number_const(
+    value: &ConstValue,
+    concretetype: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> Option<(
+    i64,
+    crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+)> {
+    use crate::annotator::model::KnownType;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, build_number};
+    match (value, concretetype) {
+        (ConstValue::RInt(class, _, _), _) => {
+            let n = resolve_const_i_value(value, None);
+            let lltype = match concretetype {
+                Some(ty) => ty.clone(),
+                None => build_number(None, KnownType::RInt(*class)).unwrap_or_else(|err| {
+                    panic!("emit_const: no Number type for RInt class: {err}")
+                }),
+            };
+            Some((n, lltype))
+        }
+        (_, Some(ty @ LowLevelType::Number(_))) => {
+            let n = resolve_const_i_value(value, None);
+            Some((n, ty.clone()))
+        }
+        _ => None,
+    }
+}
+
 impl AssemblerExt for Assembler {
     /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
     ///
@@ -4015,67 +4111,9 @@ impl AssemblerEncode for Assembler {
     }
 
     /// Resolve an integer-kind [`ConstValue`] to its concrete `i64`
-    /// (`assembler.py` value extraction).  `llmemory` address offsets
-    /// are symbolic; resolve to the concrete byte size at code emission.
-    /// Struct field offsets / sizes come from the `CallControl`'s struct
-    /// layouts (it implements `OffsetLayout`); the layout-free offsets
-    /// resolve even without a `callcontrol`.
+    /// (`Assembler.emit_const` value extraction).
     fn resolve_const_i_value(value: &ConstValue, callcontrol: Option<&CallControl>) -> i64 {
-        match value {
-            ConstValue::Int(n) => *n,
-            ConstValue::UInt(n) => *n as i64,
-            ConstValue::Bool(b) => *b as i64,
-            ConstValue::SpecTag(tag) => *tag as i64,
-            // assembler.py::Assembler.emit_const converts raw pointers via
-            // cast_ptr_to_adr/adr2int. Null needs no runtime relocation.
-            ConstValue::LLPtr(ptr) if !ptr.nonzero() => {
-                assert_eq!(
-                    ptr._TYPE._gckind(),
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
-                    "integer pointer constants must be raw"
-                );
-                0
-            }
-            ConstValue::LLAddress(
-                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
-            ) => 0,
-            // Symbolic inheritance-id marker: emit the resolved id. When
-            // only the eager `value` is present it is the concrete id;
-            // `cdef_id` reserves the key for a numbering resolution.
-            ConstValue::InheritanceId { value, .. } => *value,
-            ConstValue::AddressOffset(offset) => {
-                let resolved = match callcontrol {
-                    Some(cc) => offset.byte_size(cc),
-                    None => offset.byte_size(&NoStructLayout),
-                };
-                resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
-            }
-            ConstValue::UniChar(_) => {
-                match crate::translator::rtyper::lltypesystem::lltype::cast_primitive(
-                    &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
-                    value,
-                ) {
-                    Ok(ConstValue::Int(n)) => n,
-                    other => panic!("emit_const UniChar → Signed: {other:?}"),
-                }
-            }
-            ConstValue::SingleFloat(bits) => {
-                super::longlong::singlefloat2int(f32::from_bits(*bits))
-            }
-            ConstValue::AddressAsInt(addr) => match addr {
-                crate::translator::rtyper::lltypesystem::lltype::_address::Null => 0,
-                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n) => *n,
-                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_) => {
-                    panic!(
-                        "AddressAsInt of a container-backed address is symbolic; \
-                         Assembler has no ConstIRelocKind for it (only FnAddr/StaticAddr)"
-                    )
-                }
-            },
-            other => std::panic::panic_any(AssemblerError::message(format!(
-                "integer-kind constant not supported by emit_const_i: {other:?}"
-            ))),
-        }
+        crate::codewriter::assembler::resolve_const_i_value(value, callcontrol)
     }
 
     /// `assembler.py:99-107` short-const for an integer-kind Constant
@@ -10148,6 +10186,34 @@ mod tests {
         assert_eq!(
             Assembler::resolve_const_i_value(&ConstValue::UniChar(0xD800), None),
             0xD800
+        );
+    }
+
+    /// assembler.py Assembler.emit_const, kind 'int':
+    /// `lltype.cast_primitive(lltype.Signed, r_uchar(200)) == 200` and
+    /// `cast_primitive(Signed, r_signedchar(-3)) == -3`.
+    #[test]
+    fn resolve_const_i_rint_is_cast_primitive_signed() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi;
+
+        let rint_class = |ty: &LowLevelType| match ty {
+            LowLevelType::Number(n) => n._type,
+            other => panic!("expected Number, got {other:?}"),
+        };
+        assert_eq!(
+            Assembler::resolve_const_i_value(
+                &ConstValue::rint(rint_class(&*rffi::UCHAR), 200),
+                None
+            ),
+            200
+        );
+        assert_eq!(
+            Assembler::resolve_const_i_value(
+                &ConstValue::rint(rint_class(&*rffi::SIGNEDCHAR), -3),
+                None
+            ),
+            -3
         );
     }
 

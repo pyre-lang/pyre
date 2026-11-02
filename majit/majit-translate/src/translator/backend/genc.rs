@@ -34,6 +34,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{_getconcretetype, getfunct
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
 
+pub use crate::translator::tool::cbuild::ExternalCompilationInfo;
+
 /// Port of upstream `class CBuilder(object)` at `genc.py`.
 ///
 /// Field shape mirrors upstream's `__init__` (`:68-78`) plus the
@@ -80,7 +82,7 @@ pub struct CBuilder {
     /// `reverse_debugger` is on). The slot stays opaque because the C
     /// backend still stores heterogeneous values through Python object
     /// attributes, but the stored object is the concrete
-    /// [`ExternalCompilationInfo`] port below.
+    /// [`ExternalCompilationInfo`] (`translator.tool.cbuild`).
     pub eci: RefCell<Option<Rc<dyn Any>>>,
     /// `self.secondary_entrypoints = secondary_entrypoints` (`:78`).
     pub secondary_entrypoints: Vec<EntryPointSpec>,
@@ -535,119 +537,6 @@ impl std::fmt::Debug for CBuilder {
     }
 }
 
-/// Port of upstream `cbuild.ExternalCompilationInfo` at
-/// `rpython/translator/tool/cbuild.py`.
-///
-/// Upstream has thirteen tuple attributes in `_ATTRIBUTES`
-/// (`cbuild.py`) plus the two extra attributes
-/// `use_cpp_linker` and `platform` (`:19`). Rust stores the same data
-/// in owned vectors and an optional opaque platform key.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ExternalCompilationInfo {
-    pub pre_include_bits: Vec<String>,
-    pub includes: Vec<String>,
-    pub include_dirs: Vec<PathBuf>,
-    pub post_include_bits: Vec<String>,
-    pub libraries: Vec<String>,
-    pub library_dirs: Vec<PathBuf>,
-    pub separate_module_sources: Vec<String>,
-    pub separate_module_files: Vec<PathBuf>,
-    pub compile_extra: Vec<String>,
-    pub link_extra: Vec<String>,
-    pub frameworks: Vec<String>,
-    pub link_files: Vec<PathBuf>,
-    pub testonly_libraries: Vec<String>,
-    pub use_cpp_linker: bool,
-    pub platform: Option<String>,
-}
-
-impl ExternalCompilationInfo {
-    /// Upstream `ExternalCompilationInfo.merge(*ecis)` at
-    /// `cbuild.py`. All attributes are de-duplicated in first
-    /// occurrence order except `compile_extra` and `link_extra`, where
-    /// duplicates are explicitly preserved (`_DUPLICATES_OK`).
-    pub fn merge(&self, others: &[&ExternalCompilationInfo]) -> Result<Self, TaskError> {
-        let mut result = ExternalCompilationInfo {
-            platform: self.platform.clone(),
-            use_cpp_linker: self.use_cpp_linker,
-            ..ExternalCompilationInfo::default()
-        };
-        let mut unique_others: Vec<&ExternalCompilationInfo> = Vec::new();
-        for other in others {
-            if !unique_others.contains(other) {
-                unique_others.push(*other);
-            }
-        }
-
-        for other in &unique_others {
-            if other.platform != self.platform {
-                return Err(TaskError {
-                    message: format!(
-                        "cbuild.py:246 ExternalCompilationInfo.merge: mixing platforms {:?} and {:?}",
-                        other.platform, self.platform
-                    ),
-                });
-            }
-        }
-
-        append_unique(&mut result.pre_include_bits, &self.pre_include_bits);
-        append_unique(&mut result.includes, &self.includes);
-        append_unique(&mut result.include_dirs, &self.include_dirs);
-        append_unique(&mut result.post_include_bits, &self.post_include_bits);
-        append_unique(&mut result.libraries, &self.libraries);
-        append_unique(&mut result.library_dirs, &self.library_dirs);
-        append_unique(
-            &mut result.separate_module_sources,
-            &self.separate_module_sources,
-        );
-        append_unique(
-            &mut result.separate_module_files,
-            &self.separate_module_files,
-        );
-        result
-            .compile_extra
-            .extend(self.compile_extra.iter().cloned());
-        result.link_extra.extend(self.link_extra.iter().cloned());
-        append_unique(&mut result.frameworks, &self.frameworks);
-        append_unique(&mut result.link_files, &self.link_files);
-        append_unique(&mut result.testonly_libraries, &self.testonly_libraries);
-
-        for other in unique_others {
-            append_unique(&mut result.pre_include_bits, &other.pre_include_bits);
-            append_unique(&mut result.includes, &other.includes);
-            append_unique(&mut result.include_dirs, &other.include_dirs);
-            append_unique(&mut result.post_include_bits, &other.post_include_bits);
-            append_unique(&mut result.libraries, &other.libraries);
-            append_unique(&mut result.library_dirs, &other.library_dirs);
-            append_unique(
-                &mut result.separate_module_sources,
-                &other.separate_module_sources,
-            );
-            append_unique(
-                &mut result.separate_module_files,
-                &other.separate_module_files,
-            );
-            result
-                .compile_extra
-                .extend(other.compile_extra.iter().cloned());
-            result.link_extra.extend(other.link_extra.iter().cloned());
-            append_unique(&mut result.frameworks, &other.frameworks);
-            append_unique(&mut result.link_files, &other.link_files);
-            append_unique(&mut result.testonly_libraries, &other.testonly_libraries);
-            result.use_cpp_linker |= other.use_cpp_linker;
-        }
-        Ok(result)
-    }
-}
-
-fn append_unique<T: Clone + Eq>(dst: &mut Vec<T>, src: &[T]) {
-    for item in src {
-        if !dst.contains(item) {
-            dst.push(item.clone());
-        }
-    }
-}
-
 #[derive(Clone)]
 pub enum EntryPointPtr {
     One(Rc<dyn Any>),
@@ -929,39 +818,6 @@ mod tests {
             "sentinel path must reference PYPY_SRCROOT: {:?}",
             eci.include_dirs
         );
-    }
-
-    #[test]
-    fn external_compilation_info_merge_dedupes_except_compile_and_link_extra() {
-        let left = ExternalCompilationInfo {
-            includes: vec!["a.h".to_string(), "a.h".to_string()],
-            include_dirs: vec![PathBuf::from("inc"), PathBuf::from("inc")],
-            compile_extra: vec!["-O2".to_string()],
-            link_extra: vec!["-lm".to_string()],
-            use_cpp_linker: false,
-            platform: Some("host".to_string()),
-            ..ExternalCompilationInfo::default()
-        };
-        let right = ExternalCompilationInfo {
-            includes: vec!["a.h".to_string(), "b.h".to_string()],
-            include_dirs: vec![PathBuf::from("inc"), PathBuf::from("other")],
-            compile_extra: vec!["-O2".to_string()],
-            link_extra: vec!["-lm".to_string()],
-            use_cpp_linker: true,
-            platform: Some("host".to_string()),
-            ..ExternalCompilationInfo::default()
-        };
-
-        let merged = left.merge(&[&right]).expect("matching platform");
-
-        assert_eq!(merged.includes, vec!["a.h", "b.h"]);
-        assert_eq!(
-            merged.include_dirs,
-            vec![PathBuf::from("inc"), PathBuf::from("other")]
-        );
-        assert_eq!(merged.compile_extra, vec!["-O2", "-O2"]);
-        assert_eq!(merged.link_extra, vec!["-lm", "-lm"]);
-        assert!(merged.use_cpp_linker);
     }
 
     #[test]

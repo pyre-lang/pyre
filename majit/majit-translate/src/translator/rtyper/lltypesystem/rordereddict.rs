@@ -28,8 +28,9 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::llinterp::eval_funcptr;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _ptr, Array, GCREF, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget, Struct,
-    cast_opaque_ptr, malloc,
+    cast_opaque_ptr, cast_primitive, malloc,
 };
+use crate::translator::rtyper::lltypesystem::rffi;
 use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{
@@ -47,39 +48,313 @@ fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
     }))
 }
 
-/// RPython `DICTINDEX_*` pointer aliases (`rordereddict.py:489-492`).
-///
-/// PyPy uses width-specific `rffi.UCHAR` / `USHORT` / `UINT` element types.
-/// Pyre's current `lltype`/`rffi` surface does not yet distinguish those C
-/// integer widths, so all four aliases carry the available unsigned primitive
-/// while preserving the exact public names and `Ptr(GcArray(...))` shape.
+/// RPython `TYPE_*` aliases (`rordereddict.py` `TYPE_BYTE` / `TYPE_SHORT` /
+/// `TYPE_INT` / `TYPE_LONG`): the sparse-index element types.
+pub static TYPE_BYTE: LazyLock<LowLevelType> = LazyLock::new(|| (*rffi::UCHAR).clone());
+pub static TYPE_SHORT: LazyLock<LowLevelType> = LazyLock::new(|| (*rffi::USHORT).clone());
+pub static TYPE_INT: LazyLock<LowLevelType> = LazyLock::new(|| (*rffi::UINT).clone());
+pub static TYPE_LONG: LazyLock<LowLevelType> = LazyLock::new(|| LowLevelType::Unsigned);
+
+/// RPython `DICTINDEX_*` pointer aliases (`rordereddict.py` `DICTINDEX_LONG` /
+/// `DICTINDEX_INT` / `DICTINDEX_SHORT` / `DICTINDEX_BYTE`):
+/// `Ptr(GcArray(TYPE_*))`.
 pub static DICTINDEX_LONG: LazyLock<LowLevelType> =
-    LazyLock::new(|| ptr_to_gc_array(LowLevelType::Unsigned));
+    LazyLock::new(|| ptr_to_gc_array((*TYPE_LONG).clone()));
 pub static DICTINDEX_INT: LazyLock<LowLevelType> =
-    LazyLock::new(|| ptr_to_gc_array(LowLevelType::Unsigned));
+    LazyLock::new(|| ptr_to_gc_array((*TYPE_INT).clone()));
 pub static DICTINDEX_SHORT: LazyLock<LowLevelType> =
-    LazyLock::new(|| ptr_to_gc_array(LowLevelType::Unsigned));
+    LazyLock::new(|| ptr_to_gc_array((*TYPE_SHORT).clone()));
 pub static DICTINDEX_BYTE: LazyLock<LowLevelType> =
-    LazyLock::new(|| ptr_to_gc_array(LowLevelType::Unsigned));
+    LazyLock::new(|| ptr_to_gc_array((*TYPE_BYTE).clone()));
 
 /// RPython `IS_64BIT = sys.maxint != 2 ** 31 - 1` (`rordereddict.py`).
-pub const IS_64BIT: bool = usize::BITS == 64;
+/// Follows the translation target word, the same source
+/// `rarithmetic.long_bit()` uses (`layout::target_word_size()`).
+#[allow(non_snake_case)]
+pub fn IS_64BIT() -> bool {
+    crate::layout::target_word_size() == 8
+}
 
-/// RPython lookup table selector constants (`rordereddict.py:496-503`).
-pub const FUNC_SHIFT: i64 = if IS_64BIT { 3 } else { 2 };
-pub const FUNC_MASK: i64 = if IS_64BIT { 0x07 } else { 0x03 };
+/// RPython lookup table selector constants (`rordereddict.py` `FUNC_SHIFT` /
+/// `FUNC_MASK` / `FUNC_BYTE` … `FUNC_MUST_REINDEX`).
+#[allow(non_snake_case)]
+pub fn FUNC_SHIFT() -> i64 {
+    if IS_64BIT() { 3 } else { 2 }
+}
+
+#[allow(non_snake_case)]
+pub fn FUNC_MASK() -> i64 {
+    if IS_64BIT() { 0x07 } else { 0x03 }
+}
+
 pub const FUNC_BYTE: i64 = 0;
 pub const FUNC_SHORT: i64 = 1;
-pub const FUNC_INT: i64 = 2;
-pub const FUNC_LONG: i64 = if IS_64BIT { 3 } else { 2 };
-pub const FUNC_MUST_REINDEX: i64 = if IS_64BIT { 4 } else { 3 };
 
-/// RPython `TYPE_*` aliases (`rordereddict.py:504-507`). See
-/// [`DICTINDEX_BYTE`] for the current width-collapsing note.
-pub const TYPE_BYTE: LowLevelType = LowLevelType::Unsigned;
-pub const TYPE_SHORT: LowLevelType = LowLevelType::Unsigned;
-pub const TYPE_INT: LowLevelType = LowLevelType::Unsigned;
-pub const TYPE_LONG: LowLevelType = LowLevelType::Unsigned;
+#[allow(non_snake_case)]
+pub fn FUNC_INT() -> i64 {
+    2
+}
+
+#[allow(non_snake_case)]
+pub fn FUNC_LONG() -> i64 {
+    if IS_64BIT() { 3 } else { 2 }
+}
+
+#[allow(non_snake_case)]
+pub fn FUNC_MUST_REINDEX() -> i64 {
+    if IS_64BIT() { 4 } else { 3 }
+}
+
+/// One row per live index width: `(FUNC_*, TYPE_*, DICTINDEX_*)`.
+/// `FUNC_INT` is present only when `IS_64BIT` (`rordereddict.py`).
+pub(crate) fn index_width_rows() -> Vec<(i64, LowLevelType, LowLevelType)> {
+    let mut rows = vec![
+        (FUNC_BYTE, (*TYPE_BYTE).clone(), (*DICTINDEX_BYTE).clone()),
+        (
+            FUNC_SHORT,
+            (*TYPE_SHORT).clone(),
+            (*DICTINDEX_SHORT).clone(),
+        ),
+    ];
+    if IS_64BIT() {
+        rows.push((FUNC_INT(), (*TYPE_INT).clone(), (*DICTINDEX_INT).clone()));
+    }
+    rows.push((FUNC_LONG(), (*TYPE_LONG).clone(), (*DICTINDEX_LONG).clone()));
+    rows
+}
+
+/// `funcdesc.cachedgraph(..., alt_name=funcdesc.name + "__" + TYPE._short_name())`
+/// (`annlowlevel.py` `specialize__genconst` / a constant-`T` ll helper).
+pub(crate) fn specialized_graph_name(name: &str, t: &LowLevelType) -> String {
+    format!("{name}__{}", t.short_name())
+}
+
+pub(crate) fn dictindex_array_lltype(dictindex: &LowLevelType) -> Result<LowLevelType, TyperError> {
+    match dictindex {
+        LowLevelType::Ptr(p) => Ok(LowLevelType::from(p.TO.clone())),
+        _ => Err(TyperError::message("DICTINDEX_* is not a Ptr")),
+    }
+}
+
+fn type_for_fun(fun: i64) -> Result<LowLevelType, TyperError> {
+    for (f, t, _) in index_width_rows() {
+        if f == fun {
+            return Ok(t);
+        }
+    }
+    Err(TyperError::message(format!(
+        "ll_call_*: invalid lookup_fun {fun}"
+    )))
+}
+
+fn dictindex_for_fun(fun: i64) -> Result<LowLevelType, TyperError> {
+    for (f, _, dictindex) in index_width_rows() {
+        if f == fun {
+            return Ok(dictindex);
+        }
+    }
+    Err(TyperError::message(format!(
+        "ll_call_*: invalid lookup_fun {fun}"
+    )))
+}
+
+fn index_slot_host_value(t: &LowLevelType, value: i64) -> Result<LowLevelValue, TyperError> {
+    match t {
+        LowLevelType::Unsigned => Ok(LowLevelValue::Unsigned(value as u64)),
+        LowLevelType::Number(n) => {
+            let cv = cast_primitive(t, &ConstValue::Int(value))
+                .map_err(|e| TyperError::message(format!("rffi.cast(T, value): {e}")))?;
+            match cv {
+                ConstValue::RInt(_, v, _) => Ok(LowLevelValue::Number(n.clone(), v)),
+                other => Err(TyperError::message(format!(
+                    "rffi.cast(T, value) produced {other:?}"
+                ))),
+            }
+        }
+        other => Err(TyperError::message(format!("index element type {other:?}"))),
+    }
+}
+
+fn none_void_const() -> Hlvalue {
+    Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::None,
+        LowLevelType::Void,
+    ))
+}
+
+/// FUNC_* if/elif chain (`ll_call_lookup_function` /
+/// `ll_call_insert_clean_function` / `ll_call_delete_by_entry_index`).
+/// `widths` is BYTE..LONG `(FUNC_*, leaf)`; each leaf already has the
+/// carried-variable inputargs. `last_false_args` is `Some(exception_args)`
+/// for the insert/delete `assert False` arm, `None` to pass the carried
+/// vars (no `fun`) into `false_target` (`ll_call_lookup_function` retry).
+/// `likely_byte` wraps `fun == FUNC_BYTE` in `likely` (`ll_call_lookup_function`).
+/// Returns the first check block. `ll_dict_reindex` keeps its own chain:
+/// its true-arm args inject `i = 0` rather than the carried vars.
+fn build_func_width_check_chain(
+    widths: &[(i64, BlockRef)],
+    carried: &[(&str, LowLevelType)],
+    false_target: BlockRef,
+    last_false_args: Option<Vec<Hlvalue>>,
+    likely_byte: bool,
+) -> Result<BlockRef, TyperError> {
+    if widths.is_empty() {
+        return Err(TyperError::message("FUNC_* dispatch: width table is empty"));
+    }
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_const = |b: bool| constant_with_lltype(ConstValue::Bool(b), LowLevelType::Bool);
+    let mut next_false = false_target;
+    let mut emit_else_args = true;
+    for (func_const, leaf) in widths.iter().rev() {
+        let mut check_vars: Vec<Variable> = carried
+            .iter()
+            .map(|(name, ty)| variable_with_lltype(name, ty.clone()))
+            .collect();
+        let cfun = variable_with_lltype("fun", LowLevelType::Signed);
+        check_vars.push(cfun.clone());
+        let check = Block::shared(
+            check_vars
+                .iter()
+                .map(|v| Hlvalue::Variable(v.clone()))
+                .collect(),
+        );
+        let eq = variable_with_lltype("eq", LowLevelType::Bool);
+        check.borrow_mut().operations.push(SpaceOperation::new(
+            "int_eq",
+            vec![Hlvalue::Variable(cfun), signed(*func_const)],
+            Hlvalue::Variable(eq.clone()),
+        ));
+        // `likely` `Entry.specialize_call` (`objectmodel.py`):
+        // `hop.genop('likely', [fun == FUNC_BYTE], resulttype=Bool)`.
+        let switch = if likely_byte && *func_const == FUNC_BYTE {
+            let likely = variable_with_lltype("likely", LowLevelType::Bool);
+            check.borrow_mut().operations.push(SpaceOperation::new(
+                "likely",
+                vec![Hlvalue::Variable(eq)],
+                Hlvalue::Variable(likely.clone()),
+            ));
+            likely
+        } else {
+            eq
+        };
+        check.borrow_mut().exitswitch = Some(Hlvalue::Variable(switch));
+        let carried_args: Vec<Hlvalue> = check_vars[..check_vars.len() - 1]
+            .iter()
+            .map(|v| Hlvalue::Variable(v.clone()))
+            .collect();
+        let false_args = if emit_else_args {
+            emit_else_args = false;
+            match &last_false_args {
+                Some(args) => args.clone(),
+                None => carried_args.clone(),
+            }
+        } else {
+            check_vars
+                .iter()
+                .map(|v| Hlvalue::Variable(v.clone()))
+                .collect()
+        };
+        check.closeblock(vec![
+            Link::new(carried_args, Some(leaf.clone()), Some(bool_const(true))).into_ref(),
+            Link::new(false_args, Some(next_false), Some(bool_const(false))).into_ref(),
+        ]);
+        next_false = check;
+    }
+    Ok(next_false)
+}
+
+/// `fun = d.lookup_function_no & FUNC_MASK()` then a FUNC_* if/elif chain of
+/// Void `direct_call` leaves, with `assert False` as the else arm
+/// (`ll_call_insert_clean_function` / `ll_call_delete_by_entry_index`).
+/// `fns` is `(FUNC_*, T, funcptr)` in BYTE..LONG order. `startblock`
+/// inputargs are `(d, extras...)`; this writes the mask ops and closes it.
+fn close_void_func_width_dispatch(
+    startblock: &BlockRef,
+    graph: &FunctionGraph,
+    dict_ptr: &LowLevelType,
+    extras: &[(&str, LowLevelType)],
+    fns: &[(i64, LowLevelType, Constant)],
+    make_call_args: impl Fn(&Constant, &LowLevelType, &[Variable]) -> Vec<Hlvalue>,
+) -> Result<(), TyperError> {
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let start_vars: Vec<Variable> = startblock
+        .borrow()
+        .inputargs
+        .iter()
+        .map(|h| match h {
+            Hlvalue::Variable(v) => Ok(v.clone()),
+            _ => Err(TyperError::message(
+                "FUNC_* dispatch startblock inputarg is not a Variable",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if start_vars.is_empty() {
+        return Err(TyperError::message("FUNC_* dispatch startblock missing d"));
+    }
+    let d = start_vars[0].clone();
+    let fun0 = variable_with_lltype("fun0", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(d.clone()),
+            void_field_const("lookup_function_no"),
+        ],
+        Hlvalue::Variable(fun0.clone()),
+    ));
+    let fun = variable_with_lltype("fun", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_and",
+        vec![Hlvalue::Variable(fun0), signed(FUNC_MASK())],
+        Hlvalue::Variable(fun.clone()),
+    ));
+
+    let mut widths = Vec::with_capacity(fns.len());
+    for (func_const, t, fn_const) in fns {
+        let mut leaf_vars = vec![variable_with_lltype("d", dict_ptr.clone())];
+        for (name, ty) in extras {
+            leaf_vars.push(variable_with_lltype(name, ty.clone()));
+        }
+        let leaf = Block::shared(
+            leaf_vars
+                .iter()
+                .map(|v| Hlvalue::Variable(v.clone()))
+                .collect(),
+        );
+        leaf.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            make_call_args(fn_const, t, &leaf_vars),
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+        leaf.closeblock(vec![
+            Link::new(
+                vec![none_void_const()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        widths.push((*func_const, leaf));
+    }
+    let mut carried: Vec<(&str, LowLevelType)> = Vec::with_capacity(1 + extras.len());
+    carried.push(("d", dict_ptr.clone()));
+    for (name, ty) in extras {
+        carried.push((*name, ty.clone()));
+    }
+    let first = build_func_width_check_chain(
+        &widths,
+        &carried,
+        graph.exceptblock.clone(),
+        Some(exception_args("AssertionError")?),
+        false,
+    )?;
+    let mut start_args: Vec<Hlvalue> = start_vars
+        .iter()
+        .map(|v| Hlvalue::Variable(v.clone()))
+        .collect();
+    start_args.push(Hlvalue::Variable(fun));
+    startblock.closeblock(vec![Link::new(start_args, Some(first), None).into_ref()]);
+    Ok(())
+}
 
 pub const PERTURB_SHIFT: i64 = 5;
 pub const FREE: i64 = 0;
@@ -142,6 +417,166 @@ fn keyeq_call_args(
     }
 }
 
+fn mint_write_indexes_widths(
+    rtyper: &RPythonTyper,
+    dict_ptr: &LowLevelType,
+) -> Result<Vec<(i64, LowLevelType, Constant)>, TyperError> {
+    let mut out = Vec::new();
+    for (func, t, _) in index_width_rows() {
+        let name = specialized_graph_name("_ll_write_indexes", &t);
+        let dict_ptr = dict_ptr.clone();
+        let t_for_builder = t.clone();
+        let name_for_builder = name.clone();
+        let fn_ = rtyper.lowlevel_helper_function_with_builder(
+            name,
+            vec![
+                dict_ptr.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Void,
+            ],
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_write_indexes_helper_graph(
+                    &name_for_builder,
+                    dict_ptr.clone(),
+                    t_for_builder.clone(),
+                )
+            },
+        )?;
+        out.push((func, t, sub_helper_funcptr_constant(rtyper, &fn_)?));
+    }
+    Ok(out)
+}
+
+fn mint_store_clean_widths(
+    rtyper: &RPythonTyper,
+    dict_ptr: &LowLevelType,
+    write_indexes: &[(i64, LowLevelType, Constant)],
+) -> Result<Vec<(i64, LowLevelType, Constant)>, TyperError> {
+    let mut out = Vec::new();
+    for (func, t, write_fn) in write_indexes {
+        let name = specialized_graph_name("ll_dict_store_clean", t);
+        let dict_ptr = dict_ptr.clone();
+        let t_for_builder = t.clone();
+        let write_fn = write_fn.clone();
+        let name_for_builder = name.clone();
+        let fn_ = rtyper.lowlevel_helper_function_with_builder(
+            name,
+            vec![
+                dict_ptr.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Void,
+            ],
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_dict_store_clean_helper_graph(
+                    &name_for_builder,
+                    dict_ptr.clone(),
+                    t_for_builder.clone(),
+                    write_fn.clone(),
+                )
+            },
+        )?;
+        out.push((*func, t.clone(), sub_helper_funcptr_constant(rtyper, &fn_)?));
+    }
+    Ok(out)
+}
+
+fn mint_delete_by_entry_widths(
+    rtyper: &RPythonTyper,
+    dict_ptr: &LowLevelType,
+    write_indexes: &[(i64, LowLevelType, Constant)],
+) -> Result<Vec<(i64, LowLevelType, Constant)>, TyperError> {
+    let mut out = Vec::new();
+    for (func, t, write_fn) in write_indexes {
+        let name = specialized_graph_name("ll_dict_delete_by_entry_index", t);
+        let dict_ptr = dict_ptr.clone();
+        let t_for_builder = t.clone();
+        let write_fn = write_fn.clone();
+        let name_for_builder = name.clone();
+        let fn_ = rtyper.lowlevel_helper_function_with_builder(
+            name,
+            vec![
+                dict_ptr.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Void,
+            ],
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_dict_delete_by_entry_index_helper_graph(
+                    &name_for_builder,
+                    dict_ptr.clone(),
+                    t_for_builder.clone(),
+                    write_fn.clone(),
+                )
+            },
+        )?;
+        out.push((*func, t.clone(), sub_helper_funcptr_constant(rtyper, &fn_)?));
+    }
+    Ok(out)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors ll_dict_lookup operands plus the eq/hash pair the graph closes over"
+)]
+fn mint_lookup_widths(
+    rtyper: &RPythonTyper,
+    dict_ptr: &LowLevelType,
+    entries_ptr: &LowLevelType,
+    key_lltype: &LowLevelType,
+    eq_fn_const: Option<Constant>,
+    eq_takes_dict: bool,
+    paranoia: bool,
+    hash_fn_const: &Constant,
+    hash_takes_dict: bool,
+) -> Result<Vec<(i64, LowLevelType, Constant)>, TyperError> {
+    let mut out = Vec::new();
+    for (func, t, _) in index_width_rows() {
+        let spec_name = specialized_graph_name("ll_dict_lookup", &t);
+        let dict_ptr = dict_ptr.clone();
+        let entries_ptr = entries_ptr.clone();
+        let key_lltype = key_lltype.clone();
+        let eq_fn_const = eq_fn_const.clone();
+        let hash_fn_for_lookup = hash_fn_const.clone();
+        let t_for_builder = t.clone();
+        let lookup_fn = mint_look_inside_iff(
+            rtyper,
+            &spec_name,
+            &["d", "key", "hash", "store_flag", "T"],
+            vec![
+                dict_ptr.clone(),
+                key_lltype.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Void,
+            ],
+            LowLevelType::Signed,
+            move |name| {
+                build_ll_dict_lookup_helper_graph(
+                    name,
+                    dict_ptr.clone(),
+                    entries_ptr.clone(),
+                    t_for_builder.clone(),
+                    key_lltype.clone(),
+                    eq_fn_const.clone(),
+                    eq_takes_dict,
+                    paranoia,
+                    Some(hash_fn_for_lookup.clone()),
+                    hash_takes_dict,
+                )
+            },
+            &[LookInsidePred::IsVirtual(0), LookInsidePred::IsConstant(1)],
+        )?;
+        out.push((func, t, sub_helper_funcptr_constant(rtyper, &lookup_fn)?));
+    }
+    Ok(out)
+}
+
 fn dictentry_has_f_hash(entries_ptr_lltype: &LowLevelType) -> bool {
     let LowLevelType::Ptr(ptr) = entries_ptr_lltype else {
         return false;
@@ -151,6 +586,31 @@ fn dictentry_has_f_hash(entries_ptr_lltype: &LowLevelType) -> bool {
             LowLevelType::Struct(s) => s._names.iter().any(|n| n == "f_hash"),
             _ => false,
         },
+        _ => false,
+    }
+}
+
+/// `getattr(ll_eq_function, 'no_direct_compare', False)` (`get_ll_dict`).
+fn ll_eq_function_no_direct_compare(eq_fn: Option<&LowLevelFunction>) -> bool {
+    eq_fn
+        .and_then(|f| f.graph.as_ref())
+        .is_some_and(|g| g.func.no_direct_compare)
+}
+
+/// `hasattr(ENTRIES, 'no_direct_compare')` (`ll_dict_lookup`).
+/// Presence of the adtmeth key, not its truth: `no_direct_compare = False`
+/// still disables direct compare. `get_ll_dict` stamps `entrymeths` on
+/// `GcArray(DICTENTRY, adtmeths=…)`, so the flag lives on `ENTRIES._adtmeths`.
+fn entries_has_no_direct_compare(entries_to: &PtrTarget) -> bool {
+    match entries_to {
+        PtrTarget::Array(arr) => arr._adtmeths.get("no_direct_compare").is_some(),
+        _ => false,
+    }
+}
+
+fn entries_ptr_no_direct_compare(entries_ptr_lltype: &LowLevelType) -> bool {
+    match entries_ptr_lltype {
+        LowLevelType::Ptr(ptr) => entries_has_no_direct_compare(&ptr.TO),
         _ => false,
     }
 }
@@ -570,6 +1030,45 @@ fn emit_bound_method_hlinvoke(
     }
 }
 
+/// `if direct_compare and checkingkey == key: return slot` (`ll_dict_lookup`).
+/// When `eq_op` is `None` (`ENTRIES.no_direct_compare`), skip the identity
+/// compare and fall through to the hash/keyeq miss path.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Mirrors the ll_dict_lookup direct-compare operands plus the miss edge"
+)]
+fn close_direct_compare_or_miss(
+    block: &BlockRef,
+    eq_op: Option<&str>,
+    ckey: &Variable,
+    key: &Variable,
+    slot: &Variable,
+    returnblock: BlockRef,
+    miss_args: Vec<Hlvalue>,
+    miss_target: BlockRef,
+) {
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    if let Some(eq_op) = eq_op {
+        let eq = variable_with_lltype("keyeq", LowLevelType::Bool);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            eq_op,
+            vec![var(ckey), var(key)],
+            Hlvalue::Variable(eq.clone()),
+        ));
+        block.borrow_mut().exitswitch = Some(var(&eq));
+        block.closeblock(vec![
+            Link::new(vec![var(slot)], Some(returnblock), Some(bool_true())).into_ref(),
+            Link::new(miss_args, Some(miss_target), Some(bool_false())).into_ref(),
+        ]);
+    } else {
+        block.closeblock(vec![
+            Link::new(miss_args, Some(miss_target), None).into_ref(),
+        ]);
+    }
+}
+
 /// After `found = d.keyeq(...)`. Without paranoia, switch on `found`.
 /// With paranoia, restart the lookup (`return ll_dict_lookup(...)`) if
 /// the user eq mutated the table; chained exitswitches because there is
@@ -602,7 +1101,7 @@ fn close_keyeq_found_or_paranoia(
     entries_ptr_lltype: &LowLevelType,
     indexes_ptr_lltype: &LowLevelType,
     key_lltype: &LowLevelType,
-    eq_op: &str,
+    eq_op: Option<&str>,
     paranoia: bool,
     t_const: Hlvalue,
 ) {
@@ -960,6 +1459,7 @@ fn close_keyeq_found_or_paranoia(
         &pk_now,
     );
     let pk_same = new_var("key_same", LowLevelType::Bool);
+    let eq_op = eq_op.expect("paranoia entries[slot].key != checkingkey");
     push(
         &block_para_key,
         eq_op,
@@ -1128,6 +1628,14 @@ impl OrderedDictRepr {
         let dictkey_lltype = key_repr.lowleveltype().clone();
         let dictvalue_lltype = value_repr.lowleveltype().clone();
 
+        // get_ll_dict (`rordereddict.py`): `ll_eq_function` is the key
+        // repr's `get_ll_eq_function` on the plain-dict arm, else None.
+        let ll_eq_function = if !custom_eq_hash {
+            key_repr.get_ll_eq_function(&rtyper)?
+        } else {
+            None
+        };
+
         let mut entryfields = vec![
             ("key".into(), dictkey_lltype.clone()),
             ("f_valid".into(), LowLevelType::Bool),
@@ -1136,8 +1644,17 @@ impl OrderedDictRepr {
         if !simple_hash_eq {
             entryfields.push(("f_hash".into(), LowLevelType::Signed));
         }
+        // get_ll_dict stamps `entrymeths` on `GcArray(DICTENTRY, adtmeths=…)`.
+        // `hasattr(ENTRIES, 'no_direct_compare')` reads `ENTRIES._adtmeths`.
+        let mut entrymeths = Vec::new();
+        if ll_eq_function_no_direct_compare(ll_eq_function.as_ref()) {
+            entrymeths.push(("no_direct_compare".into(), ConstValue::Bool(true)));
+        }
         let dictentry = Struct::new("odictentry", entryfields);
-        let dictentryarray = Array::gc(LowLevelType::Struct(Box::new(dictentry.clone())));
+        let dictentryarray = Array::gc_with_adtmeths(
+            LowLevelType::Struct(Box::new(dictentry.clone())),
+            entrymeths,
+        );
         let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Array(dictentryarray.clone()),
         }));
@@ -1184,8 +1701,8 @@ impl OrderedDictRepr {
                 "keyhash".into(),
                 sub_helper_funcptr_constant(&rtyper, &hash_fn)?.value,
             ));
-            let eq_value = match key_repr.get_ll_eq_function(&rtyper)? {
-                Some(eq_fn) => sub_helper_funcptr_constant(&rtyper, &eq_fn)?.value,
+            let eq_value = match &ll_eq_function {
+                Some(eq_fn) => sub_helper_funcptr_constant(&rtyper, eq_fn)?.value,
                 None => ConstValue::None,
             };
             adtmeths.push(("keyeq".into(), eq_value));
@@ -1367,9 +1884,9 @@ impl OrderedDictRepr {
         }))
     }
 
-    /// Mint the shared lookup chain (`ll_dict_lookup` ->
+    /// Mint the shared lookup chain (`ll_dict_lookup` per width ->
     /// `ll_malloc_indexes_and_choose_lookup` -> `ll_dict_create_initial_index`
-    /// -> `ll_ensure_indexes` -> `ll_call_lookup_function`) plus the key
+    /// -> `ll_call_lookup_function`'s FUNC_* loop) plus the key
     /// hash helper, returning both as callable `direct_call` funcptr
     /// constants for [`Repr::rtype_getitem`] / [`pair_ordereddict_repr_rtype_contains`]
     /// to bake into their own getitem/contains helper graphs.
@@ -1487,42 +2004,17 @@ impl OrderedDictRepr {
         };
 
         // `@jit.oopspec('ordereddict.lookup(...)')` is stamped on orig; `mint_look_inside_iff` moves it onto the trampoline (`rlib/jit.py look_inside_iff`).
-        let lookup_fn = {
-            let dict_ptr = dict_ptr.clone();
-            let entries_ptr = entries_ptr.clone();
-            let key_lltype = key_lltype.clone();
-            let eq_fn_const = eq_fn_const.clone();
-            let hash_fn_for_lookup = hash_fn_const.clone();
-            mint_look_inside_iff(
-                rtyper,
-                "ll_dict_lookup",
-                &["d", "key", "hash", "store_flag", "T"],
-                vec![
-                    dict_ptr.clone(),
-                    key_lltype.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Void,
-                ],
-                LowLevelType::Signed,
-                move |name| {
-                    build_ll_dict_lookup_helper_graph(
-                        name,
-                        dict_ptr.clone(),
-                        entries_ptr.clone(),
-                        LowLevelType::Unsigned,
-                        key_lltype.clone(),
-                        eq_fn_const.clone(),
-                        eq_takes_dict,
-                        paranoia,
-                        Some(hash_fn_for_lookup.clone()),
-                        hash_takes_dict,
-                    )
-                },
-                &[LookInsidePred::IsVirtual(0), LookInsidePred::IsConstant(1)],
-            )?
-        };
-        let lookup_fn_const = sub_helper_funcptr_constant(rtyper, &lookup_fn)?;
+        let lookup_fns = mint_lookup_widths(
+            rtyper,
+            &dict_ptr,
+            &entries_ptr,
+            &key_lltype,
+            eq_fn_const.clone(),
+            eq_takes_dict,
+            paranoia,
+            &hash_fn_const,
+            hash_takes_dict,
+        )?;
 
         let malloc_choose_fn = {
             let dict_ptr = dict_ptr.clone();
@@ -1541,49 +2033,19 @@ impl OrderedDictRepr {
         let malloc_choose_const = sub_helper_funcptr_constant(rtyper, &malloc_choose_fn)?;
 
         // `ll_dict_rehash_after_translation` (`rordereddict.py`) needs
-        // `ll_dict_reindex` → `ll_dict_store_clean` → `_ll_write_indexes`.
+        // `ll_dict_reindex` → per-width `ll_dict_store_clean` → `_ll_write_indexes`.
         // Minted here so `ll_dict_create_initial_index` can direct_call
         // the nonempty arm; later setitem minting hits the same
         // (name, args, result) cache.
-        let write_indexes_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "_ll_write_indexes",
-                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_write_indexes_helper_graph(
-                        "_ll_write_indexes",
-                        dict_ptr.clone(),
-                        LowLevelType::Unsigned,
-                    )
-                },
-            )?
-        };
-        let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
-        let store_clean_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "ll_dict_store_clean",
-                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_dict_store_clean_helper_graph(
-                        "ll_dict_store_clean",
-                        dict_ptr.clone(),
-                        write_indexes_const.clone(),
-                    )
-                },
-            )?
-        };
-        let store_clean_const = sub_helper_funcptr_constant(rtyper, &store_clean_fn)?;
+        let write_indexes_fns = mint_write_indexes_widths(rtyper, &dict_ptr)?;
+        let store_clean_fns = mint_store_clean_widths(rtyper, &dict_ptr, &write_indexes_fns)?;
         let clear_indexes_const = mint_ll_clear_indexes(rtyper, &dict_ptr)?;
         let reindex_fn = {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
             let malloc_choose_const = malloc_choose_const.clone();
             let clear_indexes_const = clear_indexes_const.clone();
-            let store_clean_const = store_clean_const.clone();
+            let store_clean_fns = store_clean_fns.clone();
             let keyhash_fn = hash_fn_const.clone();
             let hash_takes_dict = hash_takes_dict;
             rtyper.lowlevel_helper_function_with_builder(
@@ -1597,7 +2059,7 @@ impl OrderedDictRepr {
                         entries_ptr.clone(),
                         malloc_choose_const.clone(),
                         clear_indexes_const.clone(),
-                        store_clean_const.clone(),
+                        store_clean_fns.clone(),
                         Some(keyhash_fn.clone()),
                         hash_takes_dict,
                     )
@@ -1638,8 +2100,12 @@ impl OrderedDictRepr {
         let create_initial_index_const =
             sub_helper_funcptr_constant(rtyper, &create_initial_index_fn)?;
 
-        let ensure_indexes_fn = {
+        // `ll_ensure_indexes` (`rordereddict.py`) is used by
+        // `keys_with_hash` / `copy` / `update`, not by the lookup
+        // dispatcher. Mint it so those callers hit the same cache.
+        let _ensure_indexes_fn = {
             let dict_ptr = dict_ptr.clone();
+            let create_initial_index_const = create_initial_index_const.clone();
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_ensure_indexes",
                 vec![dict_ptr.clone()],
@@ -1653,11 +2119,12 @@ impl OrderedDictRepr {
                 },
             )?
         };
-        let ensure_indexes_const = sub_helper_funcptr_constant(rtyper, &ensure_indexes_fn)?;
 
         let call_lookup_fn = {
             let dict_ptr = dict_ptr.clone();
             let key_lltype = key_lltype.clone();
+            let lookup_fns = lookup_fns.clone();
+            let create_initial_index_const = create_initial_index_const.clone();
             mint_look_inside_iff(
                 rtyper,
                 "ll_call_lookup_function",
@@ -1674,8 +2141,8 @@ impl OrderedDictRepr {
                         name,
                         dict_ptr.clone(),
                         key_lltype.clone(),
-                        ensure_indexes_const.clone(),
-                        lookup_fn_const.clone(),
+                        lookup_fns.clone(),
+                        create_initial_index_const.clone(),
                     )
                 },
                 &[LookInsidePred::IsVirtual(0)],
@@ -1713,51 +2180,17 @@ impl OrderedDictRepr {
         let value_lltype = self.DICTVALUE.clone();
         let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
 
-        // _ll_write_indexes(d, i, value) (rordereddict.py) — the real
-        // helper exists for `build_ll_dict_lookup_helper_graph`'s
-        // inlined store path; mint it here as a callable funcptr for the
-        // non-inlined callers (`ll_dict_store_clean`).
-        let write_indexes_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "_ll_write_indexes",
-                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_write_indexes_helper_graph(
-                        "_ll_write_indexes",
-                        dict_ptr.clone(),
-                        LowLevelType::Unsigned,
-                    )
-                },
-            )?
-        };
-        let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
-
-        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py).
-        let store_clean_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "ll_dict_store_clean",
-                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_dict_store_clean_helper_graph(
-                        "ll_dict_store_clean",
-                        dict_ptr.clone(),
-                        write_indexes_const.clone(),
-                    )
-                },
-            )?
-        };
-        let store_clean_const = sub_helper_funcptr_constant(rtyper, &store_clean_fn)?;
+        // `_ll_write_indexes` / `ll_dict_store_clean` per T
+        // (`rordereddict.py`); the insert dispatcher picks the width.
+        let write_indexes_fns = mint_write_indexes_widths(rtyper, &dict_ptr)?;
+        let store_clean_fns = mint_store_clean_widths(rtyper, &dict_ptr, &write_indexes_fns)?;
 
         // ll_call_insert_clean_function(d, hash, i) (rordereddict.py)
-        // — FUNC_* dispatch collapses to a single `ll_dict_store_clean` call,
-        // same shape as `ll_call_lookup_function`.
+        // — FUNC_* 4-way (3-way on 32-bit) dispatch onto per-width
+        // `ll_dict_store_clean__T`.
         let insert_clean_fn = {
             let dict_ptr = dict_ptr.clone();
-            let store_clean_const = store_clean_const.clone();
+            let store_clean_fns = store_clean_fns.clone();
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_call_insert_clean_function",
                 vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
@@ -1766,7 +2199,7 @@ impl OrderedDictRepr {
                     build_ll_call_insert_clean_function_helper_graph(
                         "ll_call_insert_clean_function",
                         dict_ptr.clone(),
-                        store_clean_const.clone(),
+                        store_clean_fns.clone(),
                     )
                 },
             )?
@@ -1799,7 +2232,7 @@ impl OrderedDictRepr {
             let entries_ptr = entries_ptr.clone();
             let malloc_choose_const = malloc_choose_const.clone();
             let clear_indexes_const = clear_indexes_const.clone();
-            let store_clean_const = store_clean_const.clone();
+            let store_clean_fns = store_clean_fns.clone();
             let keyhash_fn = chain.hash_fn_const.clone();
             let hash_takes_dict = chain.hash_takes_dict;
             rtyper.lowlevel_helper_function_with_builder(
@@ -1813,7 +2246,7 @@ impl OrderedDictRepr {
                         entries_ptr.clone(),
                         malloc_choose_const.clone(),
                         clear_indexes_const.clone(),
-                        store_clean_const.clone(),
+                        store_clean_fns.clone(),
                         Some(keyhash_fn.clone()),
                         hash_takes_dict,
                     )
@@ -2139,56 +2572,18 @@ impl OrderedDictRepr {
         let value_lltype = self.DICTVALUE.clone();
         let entries_array_ty = LowLevelType::Array(Box::new(self.DICTENTRYARRAY.clone()));
 
-        // _ll_write_indexes(d, i, value) (rordereddict.py).
-        let write_indexes_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "_ll_write_indexes",
-                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_write_indexes_helper_graph(
-                        "_ll_write_indexes",
-                        dict_ptr.clone(),
-                        LowLevelType::Unsigned,
-                    )
-                },
-            )?
-        };
-        let write_indexes_const = sub_helper_funcptr_constant(rtyper, &write_indexes_fn)?;
-
-        // ll_dict_delete_by_entry_index(d, hash, locate_index, replace_with, T)
-        // (rordereddict.py).
-        let delete_by_entry_fn = {
-            let dict_ptr = dict_ptr.clone();
-            let write_indexes_const = write_indexes_const.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "ll_dict_delete_by_entry_index",
-                vec![
-                    dict_ptr.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_dict_delete_by_entry_index_helper_graph(
-                        "ll_dict_delete_by_entry_index",
-                        dict_ptr.clone(),
-                        write_indexes_const.clone(),
-                    )
-                },
-            )?
-        };
-        let delete_by_entry_const = sub_helper_funcptr_constant(rtyper, &delete_by_entry_fn)?;
+        // `_ll_write_indexes` / `ll_dict_delete_by_entry_index` /
+        // `ll_dict_store_clean` per T (`rordereddict.py`).
+        let write_indexes_fns = mint_write_indexes_widths(rtyper, &dict_ptr)?;
+        let delete_by_entry_fns =
+            mint_delete_by_entry_widths(rtyper, &dict_ptr, &write_indexes_fns)?;
+        let store_clean_fns = mint_store_clean_widths(rtyper, &dict_ptr, &write_indexes_fns)?;
 
         // ll_call_delete_by_entry_index(d, hash, i, replace_with)
-        // (rordereddict.py) — FUNC_* dispatch collapses to a single
-        // delete helper call for the same width-collapse reason as
-        // ll_call_insert_clean_function.
+        // (`rordereddict.py`) — FUNC_* 4-way (3-way on 32-bit) dispatch.
         let call_delete_fn = {
             let dict_ptr = dict_ptr.clone();
-            let delete_by_entry_const = delete_by_entry_const.clone();
+            let delete_by_entry_fns = delete_by_entry_fns.clone();
             rtyper.lowlevel_helper_function_with_builder(
                 "ll_call_delete_by_entry_index",
                 vec![
@@ -2202,31 +2597,12 @@ impl OrderedDictRepr {
                     build_ll_call_delete_by_entry_index_helper_graph(
                         "ll_call_delete_by_entry_index",
                         dict_ptr.clone(),
-                        delete_by_entry_const.clone(),
+                        delete_by_entry_fns.clone(),
                     )
                 },
             )?
         };
         let call_delete_const = sub_helper_funcptr_constant(rtyper, &call_delete_fn)?;
-
-        // ll_dict_store_clean(d, hash, index, T) (rordereddict.py),
-        // used by ll_dict_reindex below.
-        let store_clean_fn = {
-            let dict_ptr = dict_ptr.clone();
-            rtyper.lowlevel_helper_function_with_builder(
-                "ll_dict_store_clean",
-                vec![dict_ptr.clone(), LowLevelType::Signed, LowLevelType::Signed],
-                LowLevelType::Void,
-                move |_rtyper, _args, _result| {
-                    build_ll_dict_store_clean_helper_graph(
-                        "ll_dict_store_clean",
-                        dict_ptr.clone(),
-                        write_indexes_const.clone(),
-                    )
-                },
-            )?
-        };
-        let store_clean_const = sub_helper_funcptr_constant(rtyper, &store_clean_fn)?;
 
         let malloc_choose_fn = {
             let dict_ptr = dict_ptr.clone();
@@ -2250,7 +2626,7 @@ impl OrderedDictRepr {
             let entries_ptr = entries_ptr.clone();
             let malloc_choose_const = malloc_choose_const.clone();
             let clear_indexes_const = clear_indexes_const.clone();
-            let store_clean_const = store_clean_const.clone();
+            let store_clean_fns = store_clean_fns.clone();
             let keyhash_fn = chain.hash_fn_const.clone();
             let hash_takes_dict = chain.hash_takes_dict;
             rtyper.lowlevel_helper_function_with_builder(
@@ -2264,7 +2640,7 @@ impl OrderedDictRepr {
                         entries_ptr.clone(),
                         malloc_choose_const.clone(),
                         clear_indexes_const.clone(),
-                        store_clean_const.clone(),
+                        store_clean_fns.clone(),
                         Some(keyhash_fn.clone()),
                         hash_takes_dict,
                     )
@@ -2979,7 +3355,7 @@ pub(crate) fn build_ll_dict_bool_helper_graph(
 ///     return d
 ///
 /// def ll_no_initial_index(d):
-///     d.lookup_function_no = FUNC_MUST_REINDEX
+///     d.lookup_function_no = FUNC_MUST_REINDEX()
 ///     d.indexes = lltype.nullptr(llmemory.GCREF.TO)
 /// ```
 ///
@@ -3074,14 +3450,14 @@ pub(crate) fn build_ll_dict_newdict_helper_graph(
         Hlvalue::Variable(void_result()),
     ));
 
-    // ll_no_initial_index(d): d.lookup_function_no = FUNC_MUST_REINDEX;
+    // ll_no_initial_index(d): d.lookup_function_no = FUNC_MUST_REINDEX();
     // d.indexes = lltype.nullptr(llmemory.GCREF.TO).
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "setfield",
         vec![
             Hlvalue::Variable(d.clone()),
             void_field_const("lookup_function_no"),
-            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX), LowLevelType::Signed),
+            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX()), LowLevelType::Signed),
         ],
         Hlvalue::Variable(void_result()),
     ));
@@ -3164,27 +3540,21 @@ pub fn ll_newdict_size(DICT: &Struct, orig_length_estimate: usize) -> Result<_pt
 /// RPython `ll_malloc_indexes_and_choose_lookup(d, n)` (`rordereddict.py`):
 /// allocate a zeroed index array of length `n` and stamp
 /// `lookup_function_no` from the size cascade (`FUNC_BYTE` / `FUNC_SHORT`
-/// / `FUNC_INT` / `FUNC_LONG`).
+/// / `FUNC_INT()` / `FUNC_LONG()`).
 pub fn ll_malloc_indexes_and_choose_lookup(d: &mut _ptr, n: usize) -> Result<(), TyperError> {
     let func_no = if n <= 256 {
         FUNC_BYTE
     } else if n <= 65536 {
         FUNC_SHORT
-    } else if IS_64BIT && n <= (1usize << 32) {
-        FUNC_INT
+    } else if IS_64BIT() && n <= (1usize << 32) {
+        FUNC_INT()
     } else {
-        FUNC_LONG
+        FUNC_LONG()
     };
-    let LowLevelType::Ptr(index_ptr_t) = &*DICTINDEX_BYTE else {
-        return Err(TyperError::message("DICTINDEX_BYTE is not a Ptr"));
-    };
-    let indexes = malloc(
-        LowLevelType::from(index_ptr_t.TO.clone()),
-        Some(n),
-        MallocFlavor::Gc,
-        true,
-    )
-    .map_err(TyperError::message)?;
+    let dictindex = dictindex_for_fun(func_no)?;
+    let indexes_array_ty = dictindex_array_lltype(&dictindex)?;
+    let indexes =
+        malloc(indexes_array_ty, Some(n), MallocFlavor::Gc, true).map_err(TyperError::message)?;
     let LowLevelType::Ptr(gcref_ptr) = &*GCREF else {
         return Err(TyperError::message("GCREF is not a Ptr"));
     };
@@ -3207,7 +3577,7 @@ pub fn get_ll_dict() -> Result<(), TyperError> {
 
 /// RPython `ll_no_initial_index(d)` (`rordereddict.py`):
 /// `ll_assert(d.num_live_items == d.num_ever_used_items, ...)`,
-/// `lookup_function_no = FUNC_MUST_REINDEX`, `indexes = nullptr(GCREF.TO)`.
+/// `lookup_function_no = FUNC_MUST_REINDEX()`, `indexes = nullptr(GCREF.TO)`.
 pub fn ll_no_initial_index(d: &mut _ptr) -> Result<(), TyperError> {
     let live = dict_signed_field(d, "num_live_items")?;
     let ever_used = dict_signed_field(d, "num_ever_used_items")?;
@@ -3218,7 +3588,7 @@ pub fn ll_no_initial_index(d: &mut _ptr) -> Result<(), TyperError> {
     }
     d.setattr(
         "lookup_function_no",
-        LowLevelValue::Signed(FUNC_MUST_REINDEX),
+        LowLevelValue::Signed(FUNC_MUST_REINDEX()),
     )
     .map_err(TyperError::message)?;
     let LowLevelType::Ptr(gcref_ptr) = &*GCREF else {
@@ -3230,15 +3600,17 @@ pub fn ll_no_initial_index(d: &mut _ptr) -> Result<(), TyperError> {
 }
 
 /// RPython `ll_clear_indexes(d, n)` (`rordereddict.py`):
-/// `lookup_function_no &= FUNC_MASK`, then zero the index array.
+/// `lookup_function_no &= FUNC_MASK()`, then zero the index array.
 pub fn ll_clear_indexes(d: &mut _ptr, _n: usize) -> Result<(), TyperError> {
-    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK;
+    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
     set_dict_signed_field(d, "lookup_function_no", fun)?;
+    let t = type_for_fun(fun)?;
+    let zero = t._defl();
     let mut indexes = dict_indexes_array(d)?;
     // `rgc.ll_arrayclear`: the whole array, `n` is unused upstream too.
     for i in 0..indexes.len().map_err(TyperError::message)? {
         indexes
-            .setitem(i, LowLevelValue::Unsigned(0))
+            .setitem(i, zero.clone())
             .map_err(TyperError::message)?;
     }
     Ok(())
@@ -3257,12 +3629,11 @@ pub fn ll_clear_indexes(d: &mut _ptr, _n: usize) -> Result<(), TyperError> {
 ///
 /// Single-block graph storing `value` into the sparse index array at slot `i`.
 /// GCREF -> INDEXES is `cast_opaque_ptr` (`_ll_write_indexes`; `lltype.castable`
-/// rejects `cast_pointer` across an opaque type); `rffi.cast(T, value)` narrows
-/// the Signed slot value to the unsigned index element type via
-/// `cast_int_to_uint`. All `DICTINDEX_*` widths collapse to
-/// `Ptr(GcArray(Unsigned))` here, so this one impl serves every FUNC_* width.
-/// The `ll_assert` is a debug-only range check with no runtime effect after
-/// translation and is not modelled.
+/// rejects `cast_pointer` across an opaque type); `rffi.cast(T, value)` is
+/// `force_cast` (`ll2ctypes.ForceCastEntry`). One specialized graph is
+/// minted per `T` (`_ll_write_indexes__UCHAR`, …). The `ll_assert` is a
+/// debug-only range check with no runtime effect after translation and is
+/// not modelled. `T` is a Void inputarg (the specialized constant).
 pub fn build_ll_write_indexes_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -3273,10 +3644,12 @@ pub fn build_ll_write_indexes_helper_graph(
     let d = variable_with_lltype("d", dict_ptr_lltype);
     let i = variable_with_lltype("i", LowLevelType::Signed);
     let value = variable_with_lltype("value", LowLevelType::Signed);
+    let t = variable_with_lltype("T", LowLevelType::Void);
     let startblock = Block::shared(vec![
         Hlvalue::Variable(d.clone()),
         Hlvalue::Variable(i.clone()),
         Hlvalue::Variable(value.clone()),
+        Hlvalue::Variable(t),
     ]);
     let return_var = variable_with_lltype("result", LowLevelType::Void);
     let mut graph = FunctionGraph::with_return_var(
@@ -3298,11 +3671,10 @@ pub fn build_ll_write_indexes_helper_graph(
         vec![Hlvalue::Variable(v_gcref)],
         Hlvalue::Variable(v_indexes.clone()),
     ));
-    // cast_value = rffi.cast(T, value): narrow Signed slot value to the
-    // unsigned index element width.
+    // cast_value = rffi.cast(T, value) (`ForceCastEntry` → `force_cast`)
     let v_cast = variable_with_lltype("cast_value", index_elem_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "cast_int_to_uint",
+        "force_cast",
         vec![Hlvalue::Variable(value)],
         Hlvalue::Variable(v_cast.clone()),
     ));
@@ -3317,12 +3689,13 @@ pub fn build_ll_write_indexes_helper_graph(
         ],
         Hlvalue::Variable(v_void),
     ));
-    let none_const = Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::None,
-        LowLevelType::Void,
-    ));
     startblock.closeblock(vec![
-        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
     ]);
 
     let func = GraphFunc::new(
@@ -3332,7 +3705,12 @@ pub fn build_ll_write_indexes_helper_graph(
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
-        vec!["d".to_string(), "i".to_string(), "value".to_string()],
+        vec![
+            "d".to_string(),
+            "i".to_string(),
+            "value".to_string(),
+            "T".to_string(),
+        ],
         func,
     ))
 }
@@ -3417,18 +3795,20 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 ///         perturb >>= PERTURB_SHIFT
 /// ```
 ///
-/// **Scope (faithful subset):** `direct_compare` is always `True` here (no
-/// key repr this file wires sets `no_direct_compare`, e.g. `ll_streq` does
-/// not — see `rint.py:627`/`_rweakkeydict.py:107` for the two upstream cases
-/// that do, both out of scope). `d.keyeq` is `eq_fn_const` — `None` for
-/// identity keys (int/bool/char/unichar/instance-without-`__eq__`, matching
-/// `get_ll_eq_function() -> None`, `rordereddict.py`), or the key
+/// **Scope:** `direct_compare = not hasattr(ENTRIES, 'no_direct_compare')`
+/// (`ll_dict_lookup`). `get_ll_dict` copies `ll_eq_function.no_direct_compare`
+/// onto ENTRIES (`ll_eq_shortint` for shortint keys). The flag lives on
+/// `DICTENTRYARRAY._adtmeths`; when set,
+/// both `checkingkey == key` sites skip the primitive compare and go
+/// straight to the hash check + `d.keyeq` call. `d.keyeq` is `eq_fn_const`
+/// — `None` for identity keys (int/bool/char/unichar/instance-without-`__eq__`,
+/// matching `get_ll_eq_function() -> None`, `rordereddict.py`), or the key
 /// repr's `get_ll_eq_function()` result for keys with real structural
-/// equality (`Some(ll_streq)` for str) or `ll_keyeq_custom` for
-/// `custom_eq_hash` r_dicts. When `eq_fn_const` is `Some`, a
-/// direct-compare miss falls through to `direct_call(eq_fn_const, ...)`
-/// at both comparison sites. Custom ADT methods take `(d, checkingkey,
-/// key)` (`eq_takes_dict`); plain keyeq takes `(checkingkey, key)`.
+/// equality (`Some(ll_streq)` for str, `Some(ll_eq_shortint)` for shortint)
+/// or `ll_keyeq_custom` for `custom_eq_hash` r_dicts. When `eq_fn_const` is
+/// `Some`, a miss falls through to `direct_call(eq_fn_const, ...)` at both
+/// comparison sites. Custom ADT methods take `(d, checkingkey, key)`
+/// (`eq_takes_dict`); plain keyeq takes `(checkingkey, key)`.
 /// `d.paranoia` (`not simple_hash_eq` on a custom r_dict) restarts the
 /// lookup after a user eq call if the table mutated
 /// (`entries != d.entries or cast_opaque_ptr(GCREF, indexes) != d.indexes
@@ -3439,9 +3819,9 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// comparison sites (`ll_dict_lookup`). Custom equality may raise or
 /// mutate the table, so a hash mismatch must not call it.
 ///
-/// All `DICTINDEX_*` widths collapse to `Ptr(GcArray(Unsigned))`, so this one
-/// graph serves every `FUNC_*` width (the `T`/`ll_call_lookup_function`
-/// 4-way dispatch is inert).
+/// One specialized graph is minted per `T` (`ll_dict_lookup__UCHAR`, …).
+/// Slot reads and the inlined store write are `force_cast` (`rffi.cast` /
+/// `ll2ctypes.ForceCastEntry`).
 ///
 /// **Unsigned arithmetic is load-bearing, not cosmetic:** `i` and `perturb`
 /// are `r_uint`. `perturb >>= PERTURB_SHIFT` is a *logical* shift
@@ -3452,11 +3832,11 @@ fn lltype_must_clear_gc_ptr(lltype: &LowLevelType) -> bool {
 /// signed/unsigned index value bit-identical, but the shift is not.
 ///
 /// **Store path inlined:** `store_flag == FLAG_STORE` writes the index slot
-/// via `cast_int_to_uint` + `setarrayitem` on the already-extracted `indexes`
-/// — byte-equivalent to [`build_ll_write_indexes_helper_graph`]'s body (the
-/// `indexes` pointer is invariant across a lookup, which never resizes). The
-/// standalone `_ll_write_indexes` helper remains for the non-inlined callers
-/// (`ll_dict_store_clean`, reindex) ported in later slices.
+/// via `force_cast` (`rffi.cast`) + `setarrayitem` on the already-extracted
+/// `indexes` — byte-equivalent to [`build_ll_write_indexes_helper_graph`]'s
+/// body (the `indexes` pointer is invariant across a lookup, which never
+/// resizes). The standalone `_ll_write_indexes` helper remains for the
+/// non-inlined callers (`ll_dict_store_clean`, reindex).
 ///
 /// 13-block CFG (plus the returnblock) when `eq_fn_const` is `None`, 17-block
 /// when `Some` (hash-check + `direct_call(eq_fn_const, ...)` per
@@ -3482,7 +3862,12 @@ pub fn build_ll_dict_lookup_helper_graph(
     hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
     let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
-    let eq_op = direct_compare_op(&key_lltype)?;
+    let direct_compare = !entries_ptr_no_direct_compare(&entries_ptr_lltype);
+    let eq_op = if direct_compare {
+        Some(direct_compare_op(&key_lltype)?)
+    } else {
+        None
+    };
     let has_f_hash = dictentry_has_f_hash(&entries_ptr_lltype);
 
     // Value/const constructors.
@@ -3759,7 +4144,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     push(&startblock, "cast_int_to_uint", vec![var(&hashmask)], &i0);
     let i0_s = new_var("i_s", sig());
     push(&startblock, "cast_uint_to_int", vec![var(&i0)], &i0_s);
-    let elem0 = new_var("elem", uns());
+    let elem0 = new_var("elem", index_elem_lltype.clone());
     push(
         &startblock,
         "getarrayitem",
@@ -3767,7 +4152,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         &elem0,
     );
     let index0 = new_var("index", sig());
-    push(&startblock, "cast_uint_to_int", vec![var(&elem0)], &index0);
+    push(&startblock, "force_cast", vec![var(&elem0)], &index0);
     let ge0 = new_var("ge", LowLevelType::Bool);
     push(
         &startblock,
@@ -3817,14 +4202,6 @@ pub fn build_ll_dict_lookup_helper_graph(
         vec![var(&fv_entries), var(&fv_slot), key_field()],
         &fv_ckey,
     );
-    let fv_eq = new_var("keyeq", LowLevelType::Bool);
-    push(
-        &block_first_valid,
-        eq_op,
-        vec![var(&fv_ckey), var(&fv_key)],
-        &fv_eq,
-    );
-    block_first_valid.borrow_mut().exitswitch = Some(var(&fv_eq));
     let fv_loop_init_args = vec![
         var(&fv_d),
         var(&fv_entries),
@@ -3906,31 +4283,27 @@ pub fn build_ll_dict_lookup_helper_graph(
             &fkc_slot,
             &fkc_ckey,
         ));
-        block_first_valid.closeblock(vec![
-            Link::new(
-                vec![var(&fv_slot)],
-                Some(graph.returnblock.clone()),
-                Some(bool_true()),
-            )
-            .into_ref(),
-            Link::new(
-                vec![
-                    var(&fv_d),
-                    var(&fv_entries),
-                    var(&fv_indexes),
-                    var(&fv_mask),
-                    var(&fv_key),
-                    var(&fv_sf),
-                    var(&fv_hash),
-                    var(&fv_i),
-                    var(&fv_slot),
-                    var(&fv_ckey),
-                ],
-                Some(block_first_hashcheck.clone()),
-                Some(bool_false()),
-            )
-            .into_ref(),
-        ]);
+        close_direct_compare_or_miss(
+            &block_first_valid,
+            eq_op,
+            &fv_ckey,
+            &fv_key,
+            &fv_slot,
+            graph.returnblock.clone(),
+            vec![
+                var(&fv_d),
+                var(&fv_entries),
+                var(&fv_indexes),
+                var(&fv_mask),
+                var(&fv_key),
+                var(&fv_sf),
+                var(&fv_hash),
+                var(&fv_i),
+                var(&fv_slot),
+                var(&fv_ckey),
+            ],
+            block_first_hashcheck.clone(),
+        );
         let fhc_ok = emit_entry_hash_compare(
             &block_first_hashcheck,
             &fhc_entries,
@@ -4021,20 +4394,16 @@ pub fn build_ll_dict_lookup_helper_graph(
             lowlevel_type_const(index_elem_lltype.clone()),
         );
     } else {
-        block_first_valid.closeblock(vec![
-            Link::new(
-                vec![var(&fv_slot)],
-                Some(graph.returnblock.clone()),
-                Some(bool_true()),
-            )
-            .into_ref(),
-            Link::new(
-                fv_loop_init_args,
-                Some(block_loop_init.clone()),
-                Some(bool_false()),
-            )
-            .into_ref(),
-        ]);
+        close_direct_compare_or_miss(
+            &block_first_valid,
+            eq_op,
+            &fv_ckey,
+            &fv_key,
+            &fv_slot,
+            graph.returnblock.clone(),
+            fv_loop_init_args,
+            block_loop_init.clone(),
+        );
     }
 
     // block_first_notvalid: DELETED vs pristine FREE.
@@ -4127,7 +4496,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     let st_cast = new_var("cast_value", index_elem_lltype.clone());
     push(
         &block_store_at,
-        "cast_int_to_uint",
+        "force_cast",
         vec![var(&st_value)],
         &st_cast,
     );
@@ -4213,7 +4582,7 @@ pub fn build_ll_dict_lookup_helper_graph(
         vec![var(&lb_inew)],
         &lb_inew_s,
     );
-    let lb_elem = new_var("elem", uns());
+    let lb_elem = new_var("elem", index_elem_lltype.clone());
     push(
         &block_loop_body,
         "getarrayitem",
@@ -4223,7 +4592,7 @@ pub fn build_ll_dict_lookup_helper_graph(
     let lb_index = new_var("index", sig());
     push(
         &block_loop_body,
-        "cast_uint_to_int",
+        "force_cast",
         vec![var(&lb_elem)],
         &lb_index,
     );
@@ -4321,14 +4690,6 @@ pub fn build_ll_dict_lookup_helper_graph(
         vec![var(&lv_entries), var(&lv_slot), key_field()],
         &lv_ckey,
     );
-    let lv_eq = new_var("keyeq", LowLevelType::Bool);
-    push(
-        &block_loop_valid,
-        eq_op,
-        vec![var(&lv_ckey), var(&lv_key)],
-        &lv_eq,
-    );
-    block_loop_valid.borrow_mut().exitswitch = Some(var(&lv_eq));
     let lv_perturb_shift_args = vec![
         var(&lv_d),
         var(&lv_entries),
@@ -4423,33 +4784,29 @@ pub fn build_ll_dict_lookup_helper_graph(
             &lkc_slot,
             &lkc_ckey,
         ));
-        block_loop_valid.closeblock(vec![
-            Link::new(
-                vec![var(&lv_slot)],
-                Some(graph.returnblock.clone()),
-                Some(bool_true()),
-            )
-            .into_ref(),
-            Link::new(
-                vec![
-                    var(&lv_d),
-                    var(&lv_entries),
-                    var(&lv_indexes),
-                    var(&lv_mask),
-                    var(&lv_key),
-                    var(&lv_sf),
-                    var(&lv_hash),
-                    var(&lv_perturb),
-                    var(&lv_i),
-                    var(&lv_ds),
-                    var(&lv_slot),
-                    var(&lv_ckey),
-                ],
-                Some(block_loop_hashcheck.clone()),
-                Some(bool_false()),
-            )
-            .into_ref(),
-        ]);
+        close_direct_compare_or_miss(
+            &block_loop_valid,
+            eq_op,
+            &lv_ckey,
+            &lv_key,
+            &lv_slot,
+            graph.returnblock.clone(),
+            vec![
+                var(&lv_d),
+                var(&lv_entries),
+                var(&lv_indexes),
+                var(&lv_mask),
+                var(&lv_key),
+                var(&lv_sf),
+                var(&lv_hash),
+                var(&lv_perturb),
+                var(&lv_i),
+                var(&lv_ds),
+                var(&lv_slot),
+                var(&lv_ckey),
+            ],
+            block_loop_hashcheck.clone(),
+        );
         let lhc_ok = emit_entry_hash_compare(
             &block_loop_hashcheck,
             &lhc_entries,
@@ -4545,20 +4902,16 @@ pub fn build_ll_dict_lookup_helper_graph(
             lowlevel_type_const(index_elem_lltype.clone()),
         );
     } else {
-        block_loop_valid.closeblock(vec![
-            Link::new(
-                vec![var(&lv_slot)],
-                Some(graph.returnblock.clone()),
-                Some(bool_true()),
-            )
-            .into_ref(),
-            Link::new(
-                lv_perturb_shift_args,
-                Some(block_perturb_shift.clone()),
-                Some(bool_false()),
-            )
-            .into_ref(),
-        ]);
+        close_direct_compare_or_miss(
+            &block_loop_valid,
+            eq_op,
+            &lv_ckey,
+            &lv_key,
+            &lv_slot,
+            graph.returnblock.clone(),
+            lv_perturb_shift_args,
+            block_perturb_shift.clone(),
+        );
     }
 
     // block_loop_deleted: record first deleted slot (deletedslot == -1).
@@ -4718,28 +5071,23 @@ pub fn build_ll_dict_lookup_helper_graph(
 ///         d.indexes = ...; d.lookup_function_no = FUNC_BYTE
 ///     elif n <= 65536:
 ///         d.indexes = ...; d.lookup_function_no = FUNC_SHORT
-///     elif IS_64BIT and n <= 2 ** 32:
-///         d.indexes = ...; d.lookup_function_no = FUNC_INT
+///     elif IS_64BIT() and n <= 2 ** 32:
+///         d.indexes = ...; d.lookup_function_no = FUNC_INT()
 ///     else:
-///         d.indexes = ...; d.lookup_function_no = FUNC_LONG
+///         d.indexes = ...; d.lookup_function_no = FUNC_LONG()
 /// ```
 ///
-/// All `DICTINDEX_*` widths collapse to the identical `Ptr(GcArray(Unsigned))`
-/// shape locally (see [`DICTINDEX_BYTE`]), so every branch allocates the same
-/// array; only the `FUNC_*` selector constant stamped into
-/// `lookup_function_no` differs. `IS_64BIT` is a Rust compile-time constant
-/// here exactly as upstream's module-level `IS_64BIT and` guard is decided
-/// once, not per call — the `n <= 2 ** 32` check is only emitted when built
-/// for a 64-bit target (matching `FUNC_INT`'s own conditional definition,
-/// `:59-60`).
+/// Each arm mallocs its own `DICTINDEX_<W>.TO` (`zero=True` via the GC
+/// flavor of `malloc_varsize`) and `cast_opaque_ptr`s it to GCREF.
+/// `IS_64BIT()` follows `layout::target_word_size()` at translation
+/// time, matching upstream's module-level `IS_64BIT and` guard — the
+/// `n <= 2 ** 32` check is only emitted when the target is 64-bit
+/// (`FUNC_INT`).
 pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
-
-    let indexes_array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Unsigned)));
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
 
     let d0 = variable_with_lltype("d", dict_ptr_lltype.clone());
     let n0 = variable_with_lltype("n", LowLevelType::Signed);
@@ -4755,21 +5103,21 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
     );
     let returnblock = graph.returnblock.clone();
 
-    // Shared leaf body: malloc the (uniformly `Unsigned`-element) index
-    // array, then stamp `d.indexes` / `d.lookup_function_no`. Only
-    // `func_const` differs branch to branch.
-    let alloc_leaf = |func_const: i64| -> Result<BlockRef, TyperError> {
+    // Shared leaf body: malloc that width's `DICTINDEX_*.TO`, then stamp
+    // `d.indexes` / `d.lookup_function_no`.
+    let alloc_leaf = |func_const: i64, dictindex: LowLevelType| -> Result<BlockRef, TyperError> {
+        let indexes_array_ty = dictindex_array_lltype(&dictindex)?;
         let d = variable_with_lltype("d", dict_ptr_lltype.clone());
         let n = variable_with_lltype("n", LowLevelType::Signed);
         let block = Block::shared(vec![
             Hlvalue::Variable(d.clone()),
             Hlvalue::Variable(n.clone()),
         ]);
-        let arr = variable_with_lltype("arr", indexes_ptr_lltype.clone());
+        let arr = variable_with_lltype("arr", dictindex);
         block.borrow_mut().operations.push(SpaceOperation::new(
             "malloc_varsize",
             vec![
-                lowlevel_type_const(indexes_array_ty.clone()),
+                lowlevel_type_const(indexes_array_ty),
                 gc_flavor_const()?,
                 Hlvalue::Variable(n),
             ],
@@ -4799,28 +5147,24 @@ pub(crate) fn build_ll_malloc_indexes_and_choose_lookup_helper_graph(
             ],
             Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
         ));
-        let none_const = Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::None,
-            LowLevelType::Void,
-        ));
         block.closeblock(vec![
-            Link::new(vec![none_const], Some(returnblock.clone()), None).into_ref(),
+            Link::new(vec![none_void_const()], Some(returnblock.clone()), None).into_ref(),
         ]);
         Ok(block)
     };
 
     let mut thresholds: Vec<(i64, i64)> = vec![(256, FUNC_BYTE), (65536, FUNC_SHORT)];
-    if IS_64BIT {
-        thresholds.push((1i64 << 32, FUNC_INT));
+    if IS_64BIT() {
+        thresholds.push((1i64 << 32, FUNC_INT()));
     }
-    let long_leaf = alloc_leaf(FUNC_LONG)?;
+    let long_leaf = alloc_leaf(FUNC_LONG(), dictindex_for_fun(FUNC_LONG())?)?;
 
     // Cascade the threshold checks from the last (LONG fallback, no check
     // needed) to the first (BYTE), so each check block's false-edge target
     // already exists when the block closes.
     let mut false_target = long_leaf;
     for (threshold, func_const) in thresholds.into_iter().rev() {
-        let leaf = alloc_leaf(func_const)?;
+        let leaf = alloc_leaf(func_const, dictindex_for_fun(func_const)?)?;
         let d = variable_with_lltype("d", dict_ptr_lltype.clone());
         let n = variable_with_lltype("n", LowLevelType::Signed);
         let block = Block::shared(vec![
@@ -5285,10 +5629,10 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
 /// ```python
 /// def ll_ensure_indexes(d):
 ///     num = d.lookup_function_no
-///     if num == FUNC_MUST_REINDEX:
+///     if num == FUNC_MUST_REINDEX():
 ///         ll_dict_create_initial_index(d)
 ///     else:
-///         ll_assert((num & FUNC_MASK) != FUNC_MUST_REINDEX, "...")
+///         ll_assert((num & FUNC_MASK()) != FUNC_MUST_REINDEX(), "...")
 /// ```
 ///
 /// The `else` arm's `ll_assert` is a debug-only sanity check with no runtime
@@ -5326,7 +5670,7 @@ pub(crate) fn build_ll_ensure_indexes_helper_graph(
         "int_eq",
         vec![
             Hlvalue::Variable(num),
-            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX), LowLevelType::Signed),
+            constant_with_lltype(ConstValue::Int(FUNC_MUST_REINDEX()), LowLevelType::Signed),
         ],
         Hlvalue::Variable(is_must_reindex.clone()),
     ));
@@ -5391,75 +5735,133 @@ pub(crate) fn build_ll_ensure_indexes_helper_graph(
 /// ```python
 /// def ll_call_lookup_function(d, key, hash, flag):
 ///     while True:
-///         fun = d.lookup_function_no & FUNC_MASK
+///         fun = d.lookup_function_no & FUNC_MASK()
 ///         if likely(fun == FUNC_BYTE): return ll_dict_lookup(d, key, hash, flag, TYPE_BYTE)
 ///         elif fun == FUNC_SHORT: return ll_dict_lookup(d, key, hash, flag, TYPE_SHORT)
-///         elif IS_64BIT and fun == FUNC_INT: return ll_dict_lookup(d, key, hash, flag, TYPE_INT)
-///         elif fun == FUNC_LONG: return ll_dict_lookup(d, key, hash, flag, TYPE_LONG)
+///         elif IS_64BIT() and fun == FUNC_INT(): return ll_dict_lookup(d, key, hash, flag, TYPE_INT)
+///         elif fun == FUNC_LONG(): return ll_dict_lookup(d, key, hash, flag, TYPE_LONG)
 ///         else:
 ///             ll_dict_create_initial_index(d)
 ///             # then, retry
 /// ```
 ///
-/// Every `TYPE_*`/`DICTINDEX_*` width collapses to the same
-/// `Ptr(GcArray(Unsigned))` shape locally (see [`DICTINDEX_BYTE`]), so the
-/// 4-way `FUNC_*` dispatch always calls the *same*
-/// [`build_ll_dict_lookup_helper_graph`] specialization regardless of which
-/// selector `ll_ensure_indexes` chose — the `while True` retry loop
-/// collapses to "ensure the index exists, then look up once":
-/// [`build_ll_ensure_indexes_helper_graph`] already implements the
-/// `fun == FUNC_MUST_REINDEX` retry-trigger check, so calling it
-/// unconditionally before a single `ll_dict_lookup` call is behaviorally
-/// identical to the upstream loop for this port's collapsed width space.
+/// The `while True` loop: startblock holds no operations and links to a
+/// loop-head block with the same four inputargs. The head reads
+/// `d.lookup_function_no & FUNC_MASK()` and starts the FUNC_* chain. Each
+/// true arm `direct_call`s that width's `ll_dict_lookup__T` with `T` as
+/// the Void constant and returns its result. The else arm `direct_call`s
+/// `ll_dict_create_initial_index(d)` and links back to the loop head.
+/// `fun == FUNC_BYTE` feeds `likely` (`Entry.specialize_call` of
+/// `objectmodel.likely`) whose Bool result is the branch condition.
 pub(crate) fn build_ll_call_lookup_function_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
     key_lltype: LowLevelType,
-    ensure_indexes_fn: Constant,
-    lookup_fn: Constant,
+    lookup_fns: Vec<(i64, LowLevelType, Constant)>,
+    create_initial_index_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
-    let d = variable_with_lltype("d", dict_ptr_lltype);
-    let key = variable_with_lltype("key", key_lltype);
-    let hash = variable_with_lltype("hash", LowLevelType::Signed);
-    let store_flag = variable_with_lltype("store_flag", LowLevelType::Signed);
-    let startblock = Block::shared(vec![
-        Hlvalue::Variable(d.clone()),
-        Hlvalue::Variable(key.clone()),
-        Hlvalue::Variable(hash.clone()),
-        Hlvalue::Variable(store_flag.clone()),
-    ]);
-    let return_var = variable_with_lltype("result", LowLevelType::Signed);
-    let mut graph = FunctionGraph::with_return_var(
-        name.to_string(),
-        startblock.clone(),
-        Hlvalue::Variable(return_var),
-    );
+    let signed = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
+    let var = |v: &Variable| Hlvalue::Variable(v.clone());
 
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(ensure_indexes_fn),
-            Hlvalue::Variable(d.clone()),
-        ],
-        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    let d = new_var("d", dict_ptr_lltype.clone());
+    let key = new_var("key", key_lltype.clone());
+    let hash = new_var("hash", LowLevelType::Signed);
+    let store_flag = new_var("store_flag", LowLevelType::Signed);
+    let startblock = Block::shared(vec![var(&d), var(&key), var(&hash), var(&store_flag)]);
+    let return_var = new_var("result", LowLevelType::Signed);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
+
+    let hd = new_var("d", dict_ptr_lltype.clone());
+    let hkey = new_var("key", key_lltype.clone());
+    let hhash = new_var("hash", LowLevelType::Signed);
+    let hflag = new_var("store_flag", LowLevelType::Signed);
+    let loop_head = Block::shared(vec![var(&hd), var(&hkey), var(&hhash), var(&hflag)]);
+    let fun0 = new_var("fun0", LowLevelType::Signed);
+    loop_head.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![var(&hd), void_field_const("lookup_function_no")],
+        var(&fun0),
     ));
-    let index = variable_with_lltype("index", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(lookup_fn),
-            Hlvalue::Variable(d),
-            Hlvalue::Variable(key),
-            Hlvalue::Variable(hash),
-            Hlvalue::Variable(store_flag),
-            lowlevel_type_const(TYPE_LONG.clone()),
-        ],
-        Hlvalue::Variable(index.clone()),
+    let fun = new_var("fun", LowLevelType::Signed);
+    loop_head.borrow_mut().operations.push(SpaceOperation::new(
+        "int_and",
+        vec![var(&fun0), signed(FUNC_MASK())],
+        var(&fun),
     ));
+
+    let lookup_leaf = |t: &LowLevelType, lookup_fn: &Constant| -> BlockRef {
+        let d = new_var("d", dict_ptr_lltype.clone());
+        let key = new_var("key", key_lltype.clone());
+        let hash = new_var("hash", LowLevelType::Signed);
+        let flag = new_var("store_flag", LowLevelType::Signed);
+        let block = Block::shared(vec![var(&d), var(&key), var(&hash), var(&flag)]);
+        let index = new_var("index", LowLevelType::Signed);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(lookup_fn.clone()),
+                var(&d),
+                var(&key),
+                var(&hash),
+                var(&flag),
+                lowlevel_type_const(t.clone()),
+            ],
+            var(&index),
+        ));
+        block.closeblock(vec![
+            Link::new(vec![var(&index)], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        block
+    };
+
+    let else_block = {
+        let d = new_var("d", dict_ptr_lltype.clone());
+        let key = new_var("key", key_lltype.clone());
+        let hash = new_var("hash", LowLevelType::Signed);
+        let flag = new_var("store_flag", LowLevelType::Signed);
+        let block = Block::shared(vec![var(&d), var(&key), var(&hash), var(&flag)]);
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(create_initial_index_fn), var(&d)],
+            Hlvalue::Variable(new_var("v", LowLevelType::Void)),
+        ));
+        block.closeblock(vec![
+            Link::new(
+                vec![var(&d), var(&key), var(&hash), var(&flag)],
+                Some(loop_head.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        block
+    };
+
+    let mut widths = Vec::with_capacity(lookup_fns.len());
+    for (func_const, t, lookup_fn) in &lookup_fns {
+        widths.push((*func_const, lookup_leaf(t, lookup_fn)));
+    }
+    let carried = [
+        ("d", dict_ptr_lltype.clone()),
+        ("key", key_lltype.clone()),
+        ("hash", LowLevelType::Signed),
+        ("store_flag", LowLevelType::Signed),
+    ];
+    let first = build_func_width_check_chain(&widths, &carried, else_block, None, true)?;
+
+    loop_head.closeblock(vec![
+        Link::new(
+            vec![var(&hd), var(&hkey), var(&hhash), var(&hflag), var(&fun)],
+            Some(first),
+            None,
+        )
+        .into_ref(),
+    ]);
     startblock.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(index)],
-            Some(graph.returnblock.clone()),
+            vec![var(&d), var(&key), var(&hash), var(&store_flag)],
+            Some(loop_head),
             None,
         )
         .into_ref(),
@@ -5786,19 +6188,17 @@ pub fn pair_ordereddict_repr_rtype_contains(
 /// already present, so the probe only needs to find the first `FREE` slot.
 /// Same unsigned-arithmetic idiom as [`build_ll_dict_lookup_helper_graph`]
 /// (`i`/`perturb` are `r_uint`; the perturb shift is the *logical*
-/// `uint_rshift`). All `DICTINDEX_*` widths collapse to
-/// `Ptr(GcArray(Unsigned))` locally, so `T` is inert — this one graph serves
-/// every `FUNC_*` width (same collapse as `ll_call_lookup_function`).
-/// Calls the real [`build_ll_write_indexes_helper_graph`] helper for the
-/// final store (not inlined) — that helper's own doc note already flagged
-/// it as reserved for "the non-inlined callers (`ll_dict_store_clean`,
-/// reindex) ported in later slices".
+/// `uint_rshift`). One specialized graph per `T`. Slot reads are
+/// `force_cast` (`rffi.cast`); the final store `direct_call`s
+/// `_ll_write_indexes__T` with `T` passed through. `T` is a Void inputarg
+/// (the specialized constant).
 pub(crate) fn build_ll_dict_store_clean_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
+    index_elem_lltype: LowLevelType,
     write_indexes_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -5816,7 +6216,8 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
     let d = new_var("d", dict_ptr_lltype.clone());
     let hash = new_var("hash", sig());
     let index = new_var("index", sig());
-    let startblock = Block::shared(vec![var(&d), var(&hash), var(&index)]);
+    let t = new_var("T", LowLevelType::Void);
+    let startblock = Block::shared(vec![var(&d), var(&hash), var(&index), var(&t)]);
     let return_var = new_var("result", LowLevelType::Void);
     let mut graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
@@ -5906,7 +6307,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
     // block_cond body: read indexes[i]; branch on == FREE.
     let cd_i_s = new_var("i_s", sig());
     push(&block_cond, "cast_uint_to_int", vec![var(&cd_i)], &cd_i_s);
-    let cd_elem = new_var("elem", uns());
+    let cd_elem = new_var("elem", index_elem_lltype.clone());
     push(
         &block_cond,
         "getarrayitem",
@@ -5914,12 +6315,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         &cd_elem,
     );
     let cd_val = new_var("val", sig());
-    push(
-        &block_cond,
-        "cast_uint_to_int",
-        vec![var(&cd_elem)],
-        &cd_val,
-    );
+    push(&block_cond, "force_cast", vec![var(&cd_elem)], &cd_val);
     let cd_is_free = new_var("is_free", LowLevelType::Bool);
     push(
         &block_cond,
@@ -6012,7 +6408,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         .into_ref(),
     ]);
 
-    // block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET).
+    // block_write body: _ll_write_indexes(d, i_s, index + VALID_OFFSET, T).
     let wr_value = new_var("value", sig());
     push(
         &block_write,
@@ -6028,6 +6424,7 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
             var(&wr_d),
             var(&wr_i_s),
             var(&wr_value),
+            lowlevel_type_const(index_elem_lltype.clone()),
         ],
         &new_var("v", LowLevelType::Void),
     );
@@ -6050,7 +6447,12 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
-        vec!["d".to_string(), "hash".to_string(), "index".to_string()],
+        vec![
+            "d".to_string(),
+            "hash".to_string(),
+            "index".to_string(),
+            "T".to_string(),
+        ],
         func,
     ))
 }
@@ -6060,25 +6462,23 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
 ///
 /// ```python
 /// def ll_call_insert_clean_function(d, hash, i):
-///     fun = d.lookup_function_no & FUNC_MASK
+///     fun = d.lookup_function_no & FUNC_MASK()
 ///     if fun == FUNC_BYTE: ll_dict_store_clean(d, hash, i, TYPE_BYTE)
 ///     elif fun == FUNC_SHORT: ll_dict_store_clean(d, hash, i, TYPE_SHORT)
-///     elif IS_64BIT and fun == FUNC_INT: ll_dict_store_clean(d, hash, i, TYPE_INT)
-///     elif fun == FUNC_LONG: ll_dict_store_clean(d, hash, i, TYPE_LONG)
+///     elif IS_64BIT() and fun == FUNC_INT(): ll_dict_store_clean(d, hash, i, TYPE_INT)
+///     elif fun == FUNC_LONG(): ll_dict_store_clean(d, hash, i, TYPE_LONG)
 ///     else: ll_assert(False, "...")
 /// ```
 ///
-/// Same width-collapse rationale as `ll_call_lookup_function`'s FUNC_*
-/// dispatch: every `TYPE_*`/`DICTINDEX_*` width aliases the same
-/// `Ptr(GcArray(Unsigned))` shape locally, so the 4-way dispatch collapses
-/// to a single unconditional `ll_dict_store_clean` call. The `ll_assert`
-/// dead-fallthrough is debug-only and not modelled.
+/// FUNC_* 4-way (3-way on 32-bit) dispatch onto per-width
+/// `ll_dict_store_clean__T`. The else arm is `ll_assert(False, ...)` +
+/// `assert False` via exceptblock (`AssertionError`).
 pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
-    store_clean_fn: Constant,
+    store_clean_fns: Vec<(i64, LowLevelType, Constant)>,
 ) -> Result<PyGraph, TyperError> {
-    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let d = variable_with_lltype("d", dict_ptr_lltype.clone());
     let hash = variable_with_lltype("hash", LowLevelType::Signed);
     let i = variable_with_lltype("i", LowLevelType::Signed);
     let startblock = Block::shared(vec![
@@ -6093,23 +6493,22 @@ pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(store_clean_fn),
-            Hlvalue::Variable(d),
-            Hlvalue::Variable(hash),
-            Hlvalue::Variable(i),
-        ],
-        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
-    ));
-    let none_const = Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::None,
-        LowLevelType::Void,
-    ));
-    startblock.closeblock(vec![
-        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
-    ]);
+    close_void_func_width_dispatch(
+        &startblock,
+        &graph,
+        &dict_ptr_lltype,
+        &[("hash", LowLevelType::Signed), ("i", LowLevelType::Signed)],
+        &store_clean_fns,
+        |fn_const, t, vars| {
+            vec![
+                Hlvalue::Constant(fn_const.clone()),
+                Hlvalue::Variable(vars[0].clone()),
+                Hlvalue::Variable(vars[1].clone()),
+                Hlvalue::Variable(vars[2].clone()),
+                lowlevel_type_const(t.clone()),
+            ]
+        },
+    )?;
 
     let mut func = GraphFunc::new(
         name.to_string(),
@@ -6130,23 +6529,22 @@ pub(crate) fn build_ll_call_insert_clean_function_helper_graph(
 ///
 /// ```python
 /// def ll_call_delete_by_entry_index(d, hash, i, replace_with):
-///     fun = d.lookup_function_no & FUNC_MASK
+///     fun = d.lookup_function_no & FUNC_MASK()
 ///     if fun == FUNC_BYTE: ll_dict_delete_by_entry_index(..., TYPE_BYTE)
 ///     elif fun == FUNC_SHORT: ll_dict_delete_by_entry_index(..., TYPE_SHORT)
-///     elif IS_64BIT and fun == FUNC_INT: ll_dict_delete_by_entry_index(..., TYPE_INT)
-///     elif fun == FUNC_LONG: ll_dict_delete_by_entry_index(..., TYPE_LONG)
+///     elif IS_64BIT() and fun == FUNC_INT(): ll_dict_delete_by_entry_index(..., TYPE_INT)
+///     elif fun == FUNC_LONG(): ll_dict_delete_by_entry_index(..., TYPE_LONG)
 /// ```
 ///
-/// rordereddict.py — the `FUNC_*` dispatch collapses to one
-/// `ll_dict_delete_by_entry_index` call because all `DICTINDEX_*` aliases are
-/// currently `Ptr(GcArray(Unsigned))`; same #148-width deviation as
-/// [`build_ll_call_insert_clean_function_helper_graph`].
+/// FUNC_* 4-way (3-way on 32-bit) dispatch onto per-width
+/// `ll_dict_delete_by_entry_index__T`. The else arm is `ll_assert(False, ...)`
+/// + `assert False` via exceptblock (`AssertionError`).
 pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
-    delete_by_entry_index_fn: Constant,
+    delete_by_entry_fns: Vec<(i64, LowLevelType, Constant)>,
 ) -> Result<PyGraph, TyperError> {
-    let d = variable_with_lltype("d", dict_ptr_lltype);
+    let d = variable_with_lltype("d", dict_ptr_lltype.clone());
     let hash = variable_with_lltype("hash", LowLevelType::Signed);
     let i = variable_with_lltype("i", LowLevelType::Signed);
     let replace_with = variable_with_lltype("replace_with", LowLevelType::Signed);
@@ -6163,24 +6561,27 @@ pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            Hlvalue::Constant(delete_by_entry_index_fn),
-            Hlvalue::Variable(d),
-            Hlvalue::Variable(hash),
-            Hlvalue::Variable(i),
-            Hlvalue::Variable(replace_with),
+    close_void_func_width_dispatch(
+        &startblock,
+        &graph,
+        &dict_ptr_lltype,
+        &[
+            ("hash", LowLevelType::Signed),
+            ("i", LowLevelType::Signed),
+            ("replace_with", LowLevelType::Signed),
         ],
-        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
-    ));
-    let none_const = Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::None,
-        LowLevelType::Void,
-    ));
-    startblock.closeblock(vec![
-        Link::new(vec![none_const], Some(graph.returnblock.clone()), None).into_ref(),
-    ]);
+        &delete_by_entry_fns,
+        |fn_const, t, vars| {
+            vec![
+                Hlvalue::Constant(fn_const.clone()),
+                Hlvalue::Variable(vars[0].clone()),
+                Hlvalue::Variable(vars[1].clone()),
+                Hlvalue::Variable(vars[2].clone()),
+                Hlvalue::Variable(vars[3].clone()),
+                lowlevel_type_const(t.clone()),
+            ]
+        },
+    )?;
 
     let func = GraphFunc::new(
         name.to_string(),
@@ -6214,9 +6615,10 @@ pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
 pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
+    index_elem_lltype: LowLevelType,
     write_indexes_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
+    let indexes_ptr_lltype = _ll_ptr_to_array_of(index_elem_lltype.clone());
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -6237,11 +6639,13 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
     let hash = new_var("hash", sig());
     let locate_index = new_var("locate_index", sig());
     let replace_with = new_var("replace_with", sig());
+    let t = new_var("T", LowLevelType::Void);
     let startblock = Block::shared(vec![
         var(&d),
         var(&hash),
         var(&locate_index),
         var(&replace_with),
+        var(&t),
     ]);
     let return_var = new_var("result", LowLevelType::Void);
     let mut graph =
@@ -6339,7 +6743,7 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
 
     let cd_i_s = new_var("i_s", sig());
     push(&block_cond, "cast_uint_to_int", vec![var(&cd_i)], &cd_i_s);
-    let cd_elem = new_var("elem", uns());
+    let cd_elem = new_var("elem", index_elem_lltype.clone());
     push(
         &block_cond,
         "getarrayitem",
@@ -6347,12 +6751,7 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
         &cd_elem,
     );
     let cd_value = new_var("value", sig());
-    push(
-        &block_cond,
-        "cast_uint_to_int",
-        vec![var(&cd_elem)],
-        &cd_value,
-    );
+    push(&block_cond, "force_cast", vec![var(&cd_elem)], &cd_value);
     let found = new_var("found", LowLevelType::Bool);
     push(
         &block_cond,
@@ -6451,6 +6850,7 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
             var(&wr_d),
             var(&wr_i_s),
             var(&wr_replace),
+            lowlevel_type_const(index_elem_lltype.clone()),
         ],
         &new_var("v", LowLevelType::Void),
     );
@@ -6478,6 +6878,7 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
             "hash".to_string(),
             "locate_index".to_string(),
             "replace_with".to_string(),
+            "T".to_string(),
         ],
         func,
     ))
@@ -7374,20 +7775,20 @@ pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
 ///
 /// ```python
 /// def _ll_dict_entries_size_too_big(d, new_allocated):
-///     fun = d.lookup_function_no & FUNC_MASK
+///     fun = d.lookup_function_no & FUNC_MASK()
 ///     if fun == FUNC_BYTE:
 ///         assert d.num_live_items < ((1 << 8) - MIN_INDEXES_MINUS_ENTRIES)
 ///         return new_allocated > ((1 << 8) - MIN_INDEXES_MINUS_ENTRIES)
 ///     elif fun == FUNC_SHORT:
 ///         assert d.num_live_items < ((1 << 16) - MIN_INDEXES_MINUS_ENTRIES)
 ///         return new_allocated > ((1 << 16) - MIN_INDEXES_MINUS_ENTRIES)
-///     elif IS_64BIT and fun == FUNC_INT:
+///     elif IS_64BIT() and fun == FUNC_INT():
 ///         assert d.num_live_items < ((1 << 32) - MIN_INDEXES_MINUS_ENTRIES)
 ///         return new_allocated > ((1 << 32) - MIN_INDEXES_MINUS_ENTRIES)
 ///     return False
 /// ```
 ///
-/// The `IS_64BIT and` guard is decided once — the `FUNC_INT` arm is only
+/// The `IS_64BIT() and` guard is decided once — the `FUNC_INT()` arm is only
 /// emitted on a 64-bit target. Each true arm encodes `assert` as a
 /// conditional `AssertionError` raise to exceptblock
 /// (`build_ll_clear_indexes_helper_graph`), then returns
@@ -7433,7 +7834,7 @@ pub(crate) fn build__ll_dict_entries_size_too_big_helper_graph(
     push(
         &startblock,
         "int_and",
-        vec![var(&fun0), signed(FUNC_MASK)],
+        vec![var(&fun0), signed(FUNC_MASK())],
         &fun,
     );
 
@@ -7481,8 +7882,8 @@ pub(crate) fn build__ll_dict_entries_size_too_big_helper_graph(
         (FUNC_BYTE, (1i64 << 8) - MIN_INDEXES_MINUS_ENTRIES),
         (FUNC_SHORT, (1i64 << 16) - MIN_INDEXES_MINUS_ENTRIES),
     ];
-    if IS_64BIT {
-        widths.push((FUNC_INT, (1i64 << 32) - MIN_INDEXES_MINUS_ENTRIES));
+    if IS_64BIT() {
+        widths.push((FUNC_INT(), (1i64 << 32) - MIN_INDEXES_MINUS_ENTRIES));
     }
 
     // Cascade from the last FUNC_* check back to BYTE so each false-edge
@@ -7843,18 +8244,27 @@ fn mint_ll_clear_indexes(
     rtyper: &RPythonTyper,
     dict_ptr: &LowLevelType,
 ) -> Result<Constant, TyperError> {
-    let arrayclear_fn = rtyper.lowlevel_helper_function_with_builder(
-        "ll_arrayclear".to_string(),
-        vec![_ll_ptr_to_array_of(LowLevelType::Unsigned)],
-        LowLevelType::Void,
-        move |_r, _a, _res| {
-            crate::translator::rtyper::lltypesystem::rbuilder::build_ll_arrayclear_helper_graph(
-                "ll_arrayclear",
-                LowLevelType::Unsigned,
-            )
-        },
-    )?;
-    let arrayclear_const = sub_helper_funcptr_constant(rtyper, &arrayclear_fn)?;
+    let mut arrayclear_fns = Vec::new();
+    for (func, t, dictindex) in index_width_rows() {
+        let t_for = t.clone();
+        let array_ptr = dictindex.clone();
+        let arrayclear_fn = rtyper.lowlevel_helper_function_with_builder(
+            "ll_arrayclear".to_string(),
+            vec![array_ptr],
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                crate::translator::rtyper::lltypesystem::rbuilder::build_ll_arrayclear_helper_graph(
+                    "ll_arrayclear",
+                    t_for.clone(),
+                )
+            },
+        )?;
+        arrayclear_fns.push((
+            func,
+            dictindex,
+            sub_helper_funcptr_constant(rtyper, &arrayclear_fn)?,
+        ));
+    }
     let dict_ptr = dict_ptr.clone();
     let clear_indexes_fn = rtyper.lowlevel_helper_function_with_builder(
         "ll_clear_indexes",
@@ -7864,7 +8274,7 @@ fn mint_ll_clear_indexes(
             build_ll_clear_indexes_helper_graph(
                 "ll_clear_indexes",
                 dict_ptr.clone(),
-                arrayclear_const.clone(),
+                arrayclear_fns.clone(),
             )
         },
     )?;
@@ -7875,32 +8285,33 @@ fn mint_ll_clear_indexes(
 ///
 /// ```python
 /// def ll_clear_indexes(d, n):
-///     fun = d.lookup_function_no & FUNC_MASK
+///     fun = d.lookup_function_no & FUNC_MASK()
 ///     d.lookup_function_no = fun
 ///     if fun == FUNC_BYTE:
 ///         rgc.ll_arrayclear(lltype.cast_opaque_ptr(DICTINDEX_BYTE, d.indexes))
 ///     elif fun == FUNC_SHORT:
 ///         rgc.ll_arrayclear(lltype.cast_opaque_ptr(DICTINDEX_SHORT, d.indexes))
-///     elif IS_64BIT and fun == FUNC_INT:
+///     elif IS_64BIT() and fun == FUNC_INT():
 ///         rgc.ll_arrayclear(lltype.cast_opaque_ptr(DICTINDEX_INT, d.indexes))
-///     elif fun == FUNC_LONG:
+///     elif fun == FUNC_LONG():
 ///         rgc.ll_arrayclear(lltype.cast_opaque_ptr(DICTINDEX_LONG, d.indexes))
 ///     else:
 ///         assert False
 /// ```
 ///
-/// `IS_64BIT` is a Rust compile-time constant here exactly as upstream's
-/// module-level `IS_64BIT and` guard is decided once — the `FUNC_INT` arm
-/// is only emitted on a 64-bit target. Every `DICTINDEX_*` alias is still
-/// `Ptr(GcArray(Unsigned))` (see [`DICTINDEX_BYTE`]); the cascade still
-/// names each static so the result type of `cast_opaque_ptr` tracks the
-/// width once those aliases split. `n` is unused, as upstream. The if/elif
-/// chain is the same block/link construction as
-/// [`build_ll_malloc_indexes_and_choose_lookup_helper_graph`].
+/// `IS_64BIT()` follows `layout::target_word_size()` at translation
+/// time, matching upstream's module-level `IS_64BIT and` guard — the
+/// `FUNC_INT` arm is only emitted when the target is 64-bit. Each arm
+/// `cast_opaque_ptr`s to its own `DICTINDEX_<W>` and `direct_call`s
+/// the matching `ll_arrayclear`.
+/// `n` is unused, as upstream. The if/elif chain is the same block/link
+/// construction as [`build_ll_malloc_indexes_and_choose_lookup_helper_graph`].
+/// `arrayclear_fns` is `(FUNC_*, DICTINDEX_*, ll_arrayclear)` in BYTE..LONG
+/// order.
 pub(crate) fn build_ll_clear_indexes_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
-    arrayclear_fn: Constant,
+    arrayclear_fns: Vec<(i64, LowLevelType, Constant)>,
 ) -> Result<PyGraph, TyperError> {
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
@@ -7944,7 +8355,7 @@ pub(crate) fn build_ll_clear_indexes_helper_graph(
     push(
         &startblock,
         "int_and",
-        vec![var(&fun0), signed(FUNC_MASK)],
+        vec![var(&fun0), signed(FUNC_MASK())],
         &fun,
     );
     push(
@@ -7955,10 +8366,7 @@ pub(crate) fn build_ll_clear_indexes_helper_graph(
     );
 
     // Shared leaf: `rgc.ll_arrayclear(lltype.cast_opaque_ptr(DICTINDEX_X, d.indexes))`.
-    // The `direct_call ll_arrayclear` is the same clear lowering the previous
-    // single-width builder emitted; only the `cast_opaque_ptr` result type
-    // differs branch to branch.
-    let clear_leaf = |index_ty: LowLevelType| -> BlockRef {
+    let clear_leaf = |index_ty: LowLevelType, arrayclear_fn: Constant| -> BlockRef {
         let d = new_var("d", dict_ptr_lltype.clone());
         let block = Block::shared(vec![var(&d)]);
         let indexes_gcref = new_var("indexes_gcref", GCREF.clone());
@@ -7978,7 +8386,7 @@ pub(crate) fn build_ll_clear_indexes_helper_graph(
         push(
             &block,
             "direct_call",
-            vec![Hlvalue::Constant(arrayclear_fn.clone()), var(&indexes)],
+            vec![Hlvalue::Constant(arrayclear_fn), var(&indexes)],
             &new_var("v", LowLevelType::Void),
         );
         block.closeblock(vec![
@@ -7987,21 +8395,14 @@ pub(crate) fn build_ll_clear_indexes_helper_graph(
         block
     };
 
-    let mut widths: Vec<(i64, LowLevelType)> = vec![
-        (FUNC_BYTE, DICTINDEX_BYTE.clone()),
-        (FUNC_SHORT, DICTINDEX_SHORT.clone()),
-    ];
-    if IS_64BIT {
-        widths.push((FUNC_INT, DICTINDEX_INT.clone()));
-    }
-    widths.push((FUNC_LONG, DICTINDEX_LONG.clone()));
+    let widths = arrayclear_fns;
 
     // Cascade from LONG back to BYTE so each check's false-edge target
     // already exists when the block closes. The LONG false edge is
     // `assert False`.
     let mut false_target: Option<BlockRef> = None;
-    for (func_const, index_ty) in widths.into_iter().rev() {
-        let leaf = clear_leaf(index_ty);
+    for (func_const, index_ty, arrayclear_fn) in widths.into_iter().rev() {
+        let leaf = clear_leaf(index_ty, arrayclear_fn);
         let cd = new_var("d", dict_ptr_lltype.clone());
         let cfun = new_var("fun", sig());
         let block = Block::shared(vec![var(&cd), var(&cfun)]);
@@ -8079,10 +8480,10 @@ pub(crate) fn build_ll_clear_indexes_helper_graph(
 ///
 /// The reuse branch clears the existing array through `ll_clear_indexes`, so
 /// `_ll_dict_rescue`'s call with `_ll_len_of_d_indexes(d)` allocates nothing.
-/// The `fun`/`FUNC_*` 4-way dispatch in the loop collapses to a single
-/// `ll_dict_store_clean` call (same width-collapse rationale as
-/// `ll_call_lookup_function`, Slice 2). `entries.entry_hash(d, i)` is
-/// `ll_hash_from_cache` when `hasattr(ENTRY, 'f_hash')`, else
+/// `fun = d.lookup_function_no` (no `FUNC_MASK()`) is read once, then four
+/// (three on 32-bit) specialized loops call that width's
+/// `ll_dict_store_clean__T` (`ll_dict_reindex`). `entries.entry_hash(d, i)`
+/// is `ll_hash_from_cache` when `hasattr(ENTRY, 'f_hash')`, else
 /// `ll_hash_custom_fast` (`get_ll_dict` for `simple_hash_eq`): `hlinvoke` of
 /// `d.fnkeyhash` on `entries[i].key`. `entries.valid(i)` reads `f_valid`
 /// (`ll_valid_from_flag`).
@@ -8096,7 +8497,7 @@ pub(crate) fn build_ll_dict_reindex_helper_graph(
     entries_ptr_lltype: LowLevelType,
     malloc_choose_fn: Constant,
     clear_indexes_fn: Constant,
-    store_clean_fn: Constant,
+    store_clean_fns: Vec<(i64, LowLevelType, Constant)>,
     keyhash_fn: Option<Constant>,
     hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
@@ -8273,168 +8674,216 @@ pub(crate) fn build_ll_dict_reindex_helper_graph(
         vec![var(&bd0_d), void_field_const("num_ever_used_items")],
         &ibound,
     );
-
-    // block_cond(d, entries, ibound, i).
-    let cd_d = new_var("d", dict_ptr_lltype.clone());
-    let cd_entries = new_var("entries", entries_ptr_lltype.clone());
-    let cd_ibound = new_var("ibound", sig());
-    let cd_i = new_var("i", sig());
-    let block_cond = Block::shared(vec![
-        var(&cd_d),
-        var(&cd_entries),
-        var(&cd_ibound),
-        var(&cd_i),
-    ]);
-
-    body_block.closeblock(vec![
-        Link::new(
-            vec![var(&bd0_d), var(&entries), var(&ibound), signed(0)],
-            Some(block_cond.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
-
-    // block_body(d, entries, ibound, i): check f_valid.
-    let bd_d = new_var("d", dict_ptr_lltype.clone());
-    let bd_entries = new_var("entries", entries_ptr_lltype.clone());
-    let bd_ibound = new_var("ibound", sig());
-    let bd_i = new_var("i", sig());
-    let block_body = Block::shared(vec![
-        var(&bd_d),
-        var(&bd_entries),
-        var(&bd_ibound),
-        var(&bd_i),
-    ]);
-
-    let cond = new_var("cond", LowLevelType::Bool);
+    // `fun = d.lookup_function_no` (`ll_dict_reindex`); not masked.
+    let fun = new_var("fun", sig());
     push(
-        &block_cond,
-        "int_lt",
-        vec![var(&cd_i), var(&cd_ibound)],
-        &cond,
+        &body_block,
+        "getfield",
+        vec![var(&bd0_d), void_field_const("lookup_function_no")],
+        &fun,
     );
-    block_cond.borrow_mut().exitswitch = Some(var(&cond));
-    block_cond.closeblock(vec![
-        Link::new(
-            vec![var(&cd_d), var(&cd_entries), var(&cd_ibound), var(&cd_i)],
-            Some(block_body.clone()),
-            Some(bool_const(true)),
-        )
-        .into_ref(),
-        Link::new(
-            vec![none_void()],
-            Some(graph.returnblock.clone()),
-            Some(bool_const(false)),
-        )
-        .into_ref(),
-    ]);
 
-    // block_store(d, entries, ibound, i): entry_hash + store_clean.
-    let st_d = new_var("d", dict_ptr_lltype.clone());
-    let st_entries = new_var("entries", entries_ptr_lltype.clone());
-    let st_ibound = new_var("ibound", sig());
-    let st_i = new_var("i", sig());
-    let block_store = Block::shared(vec![
-        var(&st_d),
-        var(&st_entries),
-        var(&st_ibound),
-        var(&st_i),
-    ]);
+    let has_f_hash = dictentry_has_f_hash(&entries_ptr_lltype);
+    let returnblock = graph.returnblock.clone();
+    let exceptblock = graph.exceptblock.clone();
+    let exc_args = exception_args("AssertionError")?;
+    let key_ll_opt = dictentry_key_lltype(&entries_ptr_lltype);
 
-    // block_next(d, entries, ibound, i).
-    let nx_d = new_var("d", dict_ptr_lltype.clone());
-    let nx_entries = new_var("entries", entries_ptr_lltype.clone());
-    let nx_ibound = new_var("ibound", sig());
-    let nx_i = new_var("i", sig());
-    let block_next = Block::shared(vec![
-        var(&nx_d),
-        var(&nx_entries),
-        var(&nx_ibound),
-        var(&nx_i),
-    ]);
+    let make_loop = |store_fn: Constant, t: LowLevelType| -> Result<BlockRef, TyperError> {
+        let cd_d = new_var("d", dict_ptr_lltype.clone());
+        let cd_entries = new_var("entries", entries_ptr_lltype.clone());
+        let cd_ibound = new_var("ibound", sig());
+        let cd_i = new_var("i", sig());
+        let block_cond = Block::shared(vec![
+            var(&cd_d),
+            var(&cd_entries),
+            var(&cd_ibound),
+            var(&cd_i),
+        ]);
+        let bd_d = new_var("d", dict_ptr_lltype.clone());
+        let bd_entries = new_var("entries", entries_ptr_lltype.clone());
+        let bd_ibound = new_var("ibound", sig());
+        let bd_i = new_var("i", sig());
+        let block_body = Block::shared(vec![
+            var(&bd_d),
+            var(&bd_entries),
+            var(&bd_ibound),
+            var(&bd_i),
+        ]);
+        let st_d = new_var("d", dict_ptr_lltype.clone());
+        let st_entries = new_var("entries", entries_ptr_lltype.clone());
+        let st_ibound = new_var("ibound", sig());
+        let st_i = new_var("i", sig());
+        let block_store = Block::shared(vec![
+            var(&st_d),
+            var(&st_entries),
+            var(&st_ibound),
+            var(&st_i),
+        ]);
+        let nx_d = new_var("d", dict_ptr_lltype.clone());
+        let nx_entries = new_var("entries", entries_ptr_lltype.clone());
+        let nx_ibound = new_var("ibound", sig());
+        let nx_i = new_var("i", sig());
+        let block_next = Block::shared(vec![
+            var(&nx_d),
+            var(&nx_entries),
+            var(&nx_ibound),
+            var(&nx_i),
+        ]);
 
-    let valid = new_var("valid", LowLevelType::Bool);
-    push(
-        &block_body,
-        "getinteriorfield",
-        vec![var(&bd_entries), var(&bd_i), void_field_const("f_valid")],
-        &valid,
-    );
-    block_body.borrow_mut().exitswitch = Some(var(&valid));
-    block_body.closeblock(vec![
-        Link::new(
-            vec![var(&bd_d), var(&bd_entries), var(&bd_ibound), var(&bd_i)],
-            Some(block_store.clone()),
-            Some(bool_const(true)),
-        )
-        .into_ref(),
-        Link::new(
-            vec![var(&bd_d), var(&bd_entries), var(&bd_ibound), var(&bd_i)],
-            Some(block_next.clone()),
-            Some(bool_const(false)),
-        )
-        .into_ref(),
-    ]);
-
-    let h = new_var("h", sig());
-    if dictentry_has_f_hash(&entries_ptr_lltype) {
+        let cond = new_var("cond", LowLevelType::Bool);
         push(
-            &block_store,
-            "getinteriorfield",
-            vec![var(&st_entries), var(&st_i), void_field_const("f_hash")],
-            &h,
+            &block_cond,
+            "int_lt",
+            vec![var(&cd_i), var(&cd_ibound)],
+            &cond,
         );
-    } else {
-        // ll_hash_custom_fast: key = entries[i].key; hlinvoke hash(key)
-        let key_ll = dictentry_key_lltype(&entries_ptr_lltype).ok_or_else(|| {
-            TyperError::message("ll_dict_reindex: ll_hash_custom_fast needs ENTRY.key")
-        })?;
-        let entry_key = new_var("entry_key", key_ll);
-        push(
-            &block_store,
-            "getinteriorfield",
-            vec![var(&st_entries), var(&st_i), void_field_const("key")],
-            &entry_key,
-        );
-        let hf = keyhash_fn.clone().ok_or_else(|| {
-            TyperError::message(
-                "ll_dict_reindex: entry_hash needs f_hash or keyhash (ll_hash_custom_fast)",
+        block_cond.borrow_mut().exitswitch = Some(var(&cond));
+        block_cond.closeblock(vec![
+            Link::new(
+                vec![var(&cd_d), var(&cd_entries), var(&cd_ibound), var(&cd_i)],
+                Some(block_body.clone()),
+                Some(bool_const(true)),
             )
-        })?;
+            .into_ref(),
+            Link::new(
+                vec![none_void()],
+                Some(returnblock.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        ]);
+
+        let valid = new_var("valid", LowLevelType::Bool);
+        push(
+            &block_body,
+            "getinteriorfield",
+            vec![var(&bd_entries), var(&bd_i), void_field_const("f_valid")],
+            &valid,
+        );
+        block_body.borrow_mut().exitswitch = Some(var(&valid));
+        block_body.closeblock(vec![
+            Link::new(
+                vec![var(&bd_d), var(&bd_entries), var(&bd_ibound), var(&bd_i)],
+                Some(block_store.clone()),
+                Some(bool_const(true)),
+            )
+            .into_ref(),
+            Link::new(
+                vec![var(&bd_d), var(&bd_entries), var(&bd_ibound), var(&bd_i)],
+                Some(block_next.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        ]);
+
+        let h = new_var("h", sig());
+        if has_f_hash {
+            push(
+                &block_store,
+                "getinteriorfield",
+                vec![var(&st_entries), var(&st_i), void_field_const("f_hash")],
+                &h,
+            );
+        } else {
+            let key_ll = key_ll_opt.clone().ok_or_else(|| {
+                TyperError::message("ll_dict_reindex: ll_hash_custom_fast needs ENTRY.key")
+            })?;
+            let entry_key = new_var("entry_key", key_ll);
+            push(
+                &block_store,
+                "getinteriorfield",
+                vec![var(&st_entries), var(&st_i), void_field_const("key")],
+                &entry_key,
+            );
+            let hf = keyhash_fn.clone().ok_or_else(|| {
+                TyperError::message(
+                    "ll_dict_reindex: entry_hash needs f_hash or keyhash (ll_hash_custom_fast)",
+                )
+            })?;
+            push(
+                &block_store,
+                "direct_call",
+                keyhash_call_args(hf, &st_d, &entry_key, hash_takes_dict),
+                &h,
+            );
+        }
         push(
             &block_store,
             "direct_call",
-            keyhash_call_args(hf, &st_d, &entry_key, hash_takes_dict),
-            &h,
+            vec![
+                Hlvalue::Constant(store_fn),
+                var(&st_d),
+                var(&h),
+                var(&st_i),
+                lowlevel_type_const(t),
+            ],
+            &new_var("v", LowLevelType::Void),
         );
-    }
-    push(
-        &block_store,
-        "direct_call",
-        vec![
-            Hlvalue::Constant(store_clean_fn),
-            var(&st_d),
-            var(&h),
-            var(&st_i),
-        ],
-        &new_var("v", LowLevelType::Void),
-    );
-    block_store.closeblock(vec![
-        Link::new(
-            vec![var(&st_d), var(&st_entries), var(&st_ibound), var(&st_i)],
-            Some(block_next.clone()),
-            None,
-        )
-        .into_ref(),
-    ]);
+        block_store.closeblock(vec![
+            Link::new(
+                vec![var(&st_d), var(&st_entries), var(&st_ibound), var(&st_i)],
+                Some(block_next.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
 
-    let i_next = new_var("i", sig());
-    push(&block_next, "int_add", vec![var(&nx_i), signed(1)], &i_next);
-    block_next.closeblock(vec![
+        let i_next = new_var("i", sig());
+        push(&block_next, "int_add", vec![var(&nx_i), signed(1)], &i_next);
+        block_next.closeblock(vec![
+            Link::new(
+                vec![var(&nx_d), var(&nx_entries), var(&nx_ibound), var(&i_next)],
+                Some(block_cond.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        Ok(block_cond)
+    };
+
+    let mut false_target: Option<BlockRef> = None;
+    for (func_const, t, store_fn) in store_clean_fns.into_iter().rev() {
+        let loop_head = make_loop(store_fn, t)?;
+        let cd = new_var("d", dict_ptr_lltype.clone());
+        let centries = new_var("entries", entries_ptr_lltype.clone());
+        let cibound = new_var("ibound", sig());
+        let cfun = new_var("fun", sig());
+        let check = Block::shared(vec![var(&cd), var(&centries), var(&cibound), var(&cfun)]);
+        let eq = new_var("eq", LowLevelType::Bool);
+        push(&check, "int_eq", vec![var(&cfun), signed(func_const)], &eq);
+        check.borrow_mut().exitswitch = Some(var(&eq));
+        let false_link = match &false_target {
+            Some(next) => Link::new(
+                vec![var(&cd), var(&centries), var(&cibound), var(&cfun)],
+                Some(next.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+            None => Link::new(
+                exc_args.clone(),
+                Some(exceptblock.clone()),
+                Some(bool_const(false)),
+            )
+            .into_ref(),
+        };
+        check.closeblock(vec![
+            Link::new(
+                vec![var(&cd), var(&centries), var(&cibound), signed(0)],
+                Some(loop_head),
+                Some(bool_const(true)),
+            )
+            .into_ref(),
+            false_link,
+        ]);
+        false_target = Some(check);
+    }
+    let first =
+        false_target.ok_or_else(|| TyperError::message("ll_dict_reindex: width table is empty"))?;
+    body_block.closeblock(vec![
         Link::new(
-            vec![var(&nx_d), var(&nx_entries), var(&nx_ibound), var(&i_next)],
-            Some(block_cond),
+            vec![var(&bd0_d), var(&entries), var(&ibound), var(&fun)],
+            Some(first),
             None,
         )
         .into_ref(),
@@ -9017,7 +9466,7 @@ pub(crate) fn build_ll_dict_del_helper_graph(
     push(
         &block_empty,
         "int_and",
-        vec![var(&lookup_no), signed(FUNC_MASK)],
+        vec![var(&lookup_no), signed(FUNC_MASK())],
         &lookup_masked,
     );
     push(
@@ -10641,8 +11090,8 @@ pub(crate) fn build_ll_dict_insert_helper_graph(
 ///                 iter.index = nextindex
 ///                 return index
 ///             else:
-///                 if index == (dict.lookup_function_no >> FUNC_SHIFT):
-///                     dict.lookup_function_no += (1 << FUNC_SHIFT)
+///                 if index == (dict.lookup_function_no >> FUNC_SHIFT()):
+///                     dict.lookup_function_no += (1 << FUNC_SHIFT())
 ///             index = nextindex
 ///         iter.dict = nullptr(...)   # clear the reference, prevent restarts
 ///     raise StopIteration
@@ -10958,7 +11407,7 @@ pub fn build_ll_dictnext_helper_graph(
     push(
         &block_invalid,
         "int_rshift",
-        vec![var(&iv_lfn), signed(FUNC_SHIFT)],
+        vec![var(&iv_lfn), signed(FUNC_SHIFT())],
         &iv_shifted,
     );
     let iv_eq = new_var("is_head", LowLevelType::Bool);
@@ -11003,12 +11452,12 @@ pub fn build_ll_dictnext_helper_graph(
         .into_ref(),
     ]);
 
-    // block_bump: lookup_function_no += (1 << FUNC_SHIFT); loop back.
+    // block_bump: lookup_function_no += (1 << FUNC_SHIFT()); loop back.
     let bp_new_lfn = new_var("lfn", sig());
     push(
         &block_bump,
         "int_add",
-        vec![var(&bp_lfn), signed(1 << FUNC_SHIFT)],
+        vec![var(&bp_lfn), signed(1 << FUNC_SHIFT())],
         &bp_new_lfn,
     );
     let bp_void = new_var("v", LowLevelType::Void);
@@ -11065,7 +11514,7 @@ pub fn build_ll_dictnext_helper_graph(
 
 /// Synthesise `ll_dictiter(ITERPTR, d)` (`rordereddict.py`):
 /// allocate a dict iterator, store the source dict, seed the index from
-/// `d.lookup_function_no >> FUNC_SHIFT`, and return the iterator.
+/// `d.lookup_function_no >> FUNC_SHIFT()`, and return the iterator.
 pub fn build_ll_dictiter_helper_graph(
     name: &str,
     iter_ptr_lltype: LowLevelType,
@@ -11127,7 +11576,7 @@ pub fn build_ll_dictiter_helper_graph(
         "int_rshift",
         vec![
             Hlvalue::Variable(lookup_function_no),
-            constant_with_lltype(ConstValue::Int(FUNC_SHIFT), LowLevelType::Signed),
+            constant_with_lltype(ConstValue::Int(FUNC_SHIFT()), LowLevelType::Signed),
         ],
         Hlvalue::Variable(index.clone()),
     ));
@@ -11169,8 +11618,12 @@ pub fn ll_call_insert_clean_function(d: &_ptr, hash: i64, i: i64) -> Result<(), 
             "ll_call_insert_clean_function(): i < 0",
         ));
     }
-    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK;
-    if fun == FUNC_BYTE || fun == FUNC_SHORT || (IS_64BIT && fun == FUNC_INT) || fun == FUNC_LONG {
+    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
+    if fun == FUNC_BYTE
+        || fun == FUNC_SHORT
+        || (IS_64BIT() && fun == FUNC_INT())
+        || fun == FUNC_LONG()
+    {
         ll_dict_store_clean(d, hash, i)
     } else {
         Err(TyperError::message(
@@ -11186,8 +11639,12 @@ pub fn ll_call_delete_by_entry_index(
     i: i64,
     replace_with: i64,
 ) -> Result<(), TyperError> {
-    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK;
-    if fun == FUNC_BYTE || fun == FUNC_SHORT || (IS_64BIT && fun == FUNC_INT) || fun == FUNC_LONG {
+    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
+    if fun == FUNC_BYTE
+        || fun == FUNC_SHORT
+        || (IS_64BIT() && fun == FUNC_INT())
+        || fun == FUNC_LONG()
+    {
         ll_dict_delete_by_entry_index(d, hash, i, replace_with)
     } else {
         Err(TyperError::message(
@@ -11380,11 +11837,8 @@ fn dict_paranoia(d: &_ptr) -> bool {
     matches!(dict_adtmeth(d, "paranoia"), Some(ConstValue::Bool(true)))
 }
 
-fn entries_no_direct_compare(_entries: &_ptr) -> bool {
-    // `get_ll_dict` sets `ENTRIES.no_direct_compare` only when
-    // `ll_eq_function.no_direct_compare` (`ll_eq_shortint`). This host
-    // layout has no ARRAY adtmeths, and no key repr we wire sets that flag.
-    false
+fn entries_no_direct_compare(entries: &_ptr) -> bool {
+    entries_has_no_direct_compare(&entries._TYPE.TO)
 }
 
 fn dict_indexes_array(d: &_ptr) -> Result<_ptr, TyperError> {
@@ -11395,16 +11849,21 @@ fn dict_indexes_array(d: &_ptr) -> Result<_ptr, TyperError> {
     if !gcref.nonzero() {
         return Err(TyperError::message("indexes is null"));
     }
-    let LowLevelType::Ptr(index_ptr_t) = &*DICTINDEX_BYTE else {
-        return Err(TyperError::message("DICTINDEX_BYTE is not a Ptr"));
+    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
+    let dictindex = dictindex_for_fun(fun)?;
+    let LowLevelType::Ptr(index_ptr_t) = dictindex else {
+        return Err(TyperError::message("DICTINDEX_* is not a Ptr"));
     };
-    cast_opaque_ptr(index_ptr_t, &gcref).map_err(TyperError::message)
+    cast_opaque_ptr(&index_ptr_t, &gcref).map_err(TyperError::message)
 }
 
 fn indexes_signed_at(indexes: &_ptr, i: usize) -> Result<i64, TyperError> {
     match indexes.getitem(i).map_err(TyperError::message)? {
         LowLevelValue::Unsigned(n) => Ok(n as i64),
         LowLevelValue::Signed(n) => Ok(n),
+        LowLevelValue::Number(n, v) => {
+            Ok(crate::rlib::rarithmetic::rint_value(n._type, v).as_i64())
+        }
         other => Err(TyperError::message(format!(
             "index slot is not an integer: {other:?}"
         ))),
@@ -11412,9 +11871,11 @@ fn indexes_signed_at(indexes: &_ptr, i: usize) -> Result<i64, TyperError> {
 }
 
 fn _ll_write_indexes(d: &_ptr, i: usize, value: i64) -> Result<(), TyperError> {
+    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
+    let t = type_for_fun(fun)?;
     let mut indexes = dict_indexes_array(d)?;
     indexes
-        .setitem(i, LowLevelValue::Unsigned(value as u64))
+        .setitem(i, index_slot_host_value(&t, value)?)
         .map_err(TyperError::message)
 }
 
@@ -11460,11 +11921,11 @@ fn ll_call_lookup_function(
     flag: i64,
 ) -> Result<i64, TyperError> {
     loop {
-        let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK;
+        let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
         if fun == FUNC_BYTE
             || fun == FUNC_SHORT
-            || (IS_64BIT && fun == FUNC_INT)
-            || fun == FUNC_LONG
+            || (IS_64BIT() && fun == FUNC_INT())
+            || fun == FUNC_LONG()
         {
             return ll_dict_lookup_t(d, key, hash, flag);
         }
@@ -11473,7 +11934,8 @@ fn ll_call_lookup_function(
 }
 
 /// RPython `ll_dict_lookup(d, key, hash, store_flag, T)` (`rordereddict.py`).
-/// All `TYPE_*` widths collapse to `Ptr(GcArray(Unsigned))`.
+/// Host path: `dict_indexes_array` casts `d.indexes` to the live `DICTINDEX_*`
+/// for `lookup_function_no & FUNC_MASK()`, then reads slots as Signed.
 fn ll_dict_lookup_t(
     d: &mut _ptr,
     key: &LowLevelValue,
@@ -12005,12 +12467,12 @@ pub fn _overallocate_entries_len(baselen: usize) -> usize {
 
 /// RPython `_ll_dict_entries_size_too_big(d, new_allocated)`.
 pub fn _ll_dict_entries_size_too_big(d: &_ptr, new_allocated: usize) -> Result<bool, TyperError> {
-    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK;
+    let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
     let limit = if fun == FUNC_BYTE {
         (1usize << 8) - MIN_INDEXES_MINUS_ENTRIES as usize
     } else if fun == FUNC_SHORT {
         (1usize << 16) - MIN_INDEXES_MINUS_ENTRIES as usize
-    } else if IS_64BIT && fun == FUNC_INT {
+    } else if IS_64BIT() && fun == FUNC_INT() {
         (1usize << 32) - MIN_INDEXES_MINUS_ENTRIES as usize
     } else {
         return Ok(false);
@@ -12156,7 +12618,7 @@ pub fn ll_dict_reindex(d: &mut _ptr, new_size: usize) -> Result<(), TyperError> 
     }
     set_dict_signed_field(d, "resize_counter", rc)?;
     let lookup_no = dict_signed_field(d, "lookup_function_no")?;
-    if lookup_no >> FUNC_SHIFT != 0 {
+    if lookup_no >> FUNC_SHIFT() != 0 {
         return Err(TyperError::message("reindex: lookup_fun >> SHIFT"));
     }
     let entries = dict_entries(d)?;
@@ -12261,7 +12723,7 @@ fn _ll_dict_del(d: &mut _ptr, hash: i64, index: i64) -> Result<(), TyperError> {
     let live = dict_signed_field(d, "num_live_items")?;
     if live == 0 {
         set_dict_signed_field(d, "num_ever_used_items", 0)?;
-        let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK;
+        let fun = dict_signed_field(d, "lookup_function_no")? & FUNC_MASK();
         set_dict_signed_field(d, "lookup_function_no", fun)?;
     } else if index == dict_signed_field(d, "num_ever_used_items")? - 1 {
         let entries = dict_entries(d)?;
@@ -12745,10 +13207,11 @@ mod tests {
     use crate::translator::rtyper::lltypesystem::lltype::{
         _ptr_obj, FuncType, functionptr_for_graph_with_type,
     };
+    use crate::translator::rtyper::lltypesystem::rffi;
     use crate::translator::rtyper::lltypesystem::rstr::{UNICODE, ll_strhash_value, llstr};
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rfloat::float_repr;
-    use crate::translator::rtyper::rint::signed_repr;
+    use crate::translator::rtyper::rint::{getintegerrepr, signed_repr};
     use crate::translator::rtyper::rstr::{string_repr, unicode_repr};
     use crate::translator::rtyper::rtuple::TupleRepr;
     use crate::translator::rtyper::rtyper::LowLevelOpList;
@@ -12785,6 +13248,13 @@ mod tests {
             repr.DICTENTRY._names,
             vec!["key", "f_valid", "value", "f_hash"]
         );
+        assert!(
+            repr.DICTENTRYARRAY
+                ._adtmeths
+                .get("no_direct_compare")
+                .is_none(),
+            "Signed keys keep direct_compare; ENTRIES has no no_direct_compare"
+        );
         assert_eq!(
             repr.DICT._names,
             vec![
@@ -12818,13 +13288,21 @@ mod tests {
 
     #[test]
     fn lookup_constants_match_64bit_upstream_layout() {
-        assert_eq!(FUNC_SHIFT, 3);
-        assert_eq!(FUNC_MASK, 0x07);
+        assert_eq!(IS_64BIT(), crate::layout::target_word_size() == 8);
+        if IS_64BIT() {
+            assert_eq!(FUNC_SHIFT(), 3);
+            assert_eq!(FUNC_MASK(), 0x07);
+            assert_eq!(FUNC_INT(), 2);
+            assert_eq!(FUNC_LONG(), 3);
+            assert_eq!(FUNC_MUST_REINDEX(), 4);
+        } else {
+            assert_eq!(FUNC_SHIFT(), 2);
+            assert_eq!(FUNC_MASK(), 0x03);
+            assert_eq!(FUNC_LONG(), 2);
+            assert_eq!(FUNC_MUST_REINDEX(), 3);
+        }
         assert_eq!(FUNC_BYTE, 0);
         assert_eq!(FUNC_SHORT, 1);
-        assert_eq!(FUNC_INT, 2);
-        assert_eq!(FUNC_LONG, 3);
-        assert_eq!(FUNC_MUST_REINDEX, 4);
         assert_eq!(PERTURB_SHIFT, 5);
         assert_eq!(FREE, 0);
         assert_eq!(DELETED, 1);
@@ -12837,18 +13315,29 @@ mod tests {
 
     #[test]
     fn dictindex_aliases_keep_ptr_gcarray_shape() {
-        for alias in [
-            &*DICTINDEX_BYTE,
-            &*DICTINDEX_SHORT,
-            &*DICTINDEX_INT,
-            &*DICTINDEX_LONG,
-        ] {
-            assert_eq!(ptr_gcarray_of(alias).OF, LowLevelType::Unsigned);
+        let word = crate::layout::target_word_size() as i64;
+        assert_eq!(&ptr_gcarray_of(&*DICTINDEX_BYTE).OF, &*TYPE_BYTE);
+        assert_eq!(&ptr_gcarray_of(&*DICTINDEX_SHORT).OF, &*TYPE_SHORT);
+        assert_eq!(&ptr_gcarray_of(&*DICTINDEX_INT).OF, &*TYPE_INT);
+        assert_eq!(&ptr_gcarray_of(&*DICTINDEX_LONG).OF, &*TYPE_LONG);
+        assert_eq!(&*TYPE_BYTE, &*rffi::UCHAR);
+        assert_eq!(&*TYPE_SHORT, &*rffi::USHORT);
+        assert_eq!(&*TYPE_INT, &*rffi::UINT);
+        assert_eq!(*TYPE_LONG, LowLevelType::Unsigned);
+        assert_eq!(rffi::sizeof(&*TYPE_BYTE).unwrap(), ConstValue::Int(1));
+        assert_eq!(rffi::sizeof(&*TYPE_SHORT).unwrap(), ConstValue::Int(2));
+        assert_eq!(rffi::sizeof(&*TYPE_INT).unwrap(), ConstValue::Int(4));
+        assert_eq!(rffi::sizeof(&*TYPE_LONG).unwrap(), ConstValue::Int(word));
+        assert_ne!(&*TYPE_BYTE, &*TYPE_SHORT);
+        assert_ne!(&*TYPE_SHORT, &*TYPE_INT);
+        // `lltype.build_number` intern (`lltype.py` `_numbertypes`):
+        // `rffi.UINT` is `lltype.Unsigned` when C unsigned int has word
+        // width (`rordereddict.py` TYPE_INT / TYPE_LONG).
+        if word == 4 {
+            assert_eq!(&*TYPE_INT, &*TYPE_LONG);
+        } else {
+            assert_ne!(&*TYPE_INT, &*TYPE_LONG);
         }
-        assert_eq!(TYPE_BYTE, LowLevelType::Unsigned);
-        assert_eq!(TYPE_SHORT, LowLevelType::Unsigned);
-        assert_eq!(TYPE_INT, LowLevelType::Unsigned);
-        assert_eq!(TYPE_LONG, LowLevelType::Unsigned);
     }
 
     #[test]
@@ -12918,7 +13407,7 @@ mod tests {
     }
 
     /// `ll_dictiter` mints a fresh `dictiter{dict, index}`: `iter.dict = d`
-    /// and `iter.index = d.lookup_function_no >> FUNC_SHIFT`
+    /// and `iter.index = d.lookup_function_no >> FUNC_SHIFT()`
     /// (`rordereddict.py`) — no constant-zero index (unlike
     /// `ll_listiter`), since `_ll_dictnext`'s popitem(last=False)
     /// fast-forward hack stashes a resume offset in `lookup_function_no`.
@@ -13356,7 +13845,7 @@ mod tests {
                 "setfield",       // d.entries = entries
                 "setfield",       // d.num_live_items = 0
                 "setfield",       // d.num_ever_used_items = 0
-                "setfield",       // d.lookup_function_no = FUNC_MUST_REINDEX
+                "setfield",       // d.lookup_function_no = FUNC_MUST_REINDEX()
                 "setfield",       // d.indexes = nullptr(GCREF.TO)
             ]
         );
@@ -13387,11 +13876,11 @@ mod tests {
             ]
         );
 
-        // lookup_function_no is set to the FUNC_MUST_REINDEX selector.
+        // lookup_function_no is set to the FUNC_MUST_REINDEX() selector.
         let lookup_fn_value = &startblock.operations[5].args[2];
         assert!(
-            matches!(lookup_fn_value, Hlvalue::Constant(c) if c.value == ConstValue::Int(FUNC_MUST_REINDEX)),
-            "lookup_function_no must be seeded FUNC_MUST_REINDEX, got {lookup_fn_value:?}"
+            matches!(lookup_fn_value, Hlvalue::Constant(c) if c.value == ConstValue::Int(FUNC_MUST_REINDEX())),
+            "lookup_function_no must be seeded FUNC_MUST_REINDEX(), got {lookup_fn_value:?}"
         );
 
         // indexes is set to a null GCREF constant.
@@ -13416,8 +13905,9 @@ mod tests {
     }
 
     /// `_ll_write_indexes` is a single-block store: getfield(d,"indexes") ->
-    /// cast_opaque_ptr (GCREF->INDEXES) -> cast_int_to_uint(value) ->
-    /// setarrayitem(indexes, i, cast_value), Void return.
+    /// cast_opaque_ptr (GCREF->INDEXES) -> rffi.cast(T, value) (`force_cast`)
+    /// -> setarrayitem(indexes, i, cast_value), Void return. Every T uses
+    /// `force_cast` (`ForceCastEntry`).
     #[test]
     fn build_ll_write_indexes_casts_gcref_then_stores_slot() {
         let helper = build_ll_write_indexes_helper_graph(
@@ -13429,7 +13919,7 @@ mod tests {
         assert_eq!(helper.func.name, "_ll_write_indexes");
         let inner = helper.graph.borrow();
         let startblock = inner.startblock.borrow();
-        assert_eq!(startblock.inputargs.len(), 3); // d, i, value
+        assert_eq!(startblock.inputargs.len(), 4); // d, i, value, T
         let ops: Vec<&str> = startblock
             .operations
             .iter()
@@ -13437,12 +13927,7 @@ mod tests {
             .collect();
         assert_eq!(
             ops,
-            vec![
-                "getfield",
-                "cast_opaque_ptr",
-                "cast_int_to_uint",
-                "setarrayitem"
-            ]
+            vec!["getfield", "cast_opaque_ptr", "force_cast", "setarrayitem"]
         );
         let field = &startblock.operations[0].args[1];
         assert!(
@@ -13453,6 +13938,24 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+
+        let helper = build_ll_write_indexes_helper_graph(
+            "_ll_write_indexes__UCHAR",
+            sample_dict_ptr_lltype(),
+            (*TYPE_BYTE).clone(),
+        )
+        .expect("build_ll_write_indexes_helper_graph Number T");
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            ops,
+            vec!["getfield", "cast_opaque_ptr", "force_cast", "setarrayitem"]
+        );
     }
 
     /// Int-keyed sample `(dict_ptr, entries_ptr, key_lltype)` for the lookup
@@ -13586,6 +14089,16 @@ mod tests {
             .expect("exit target")
     }
 
+    fn unique_exit(block: &BlockRef) -> BlockRef {
+        let b = block.borrow();
+        assert!(
+            b.exitswitch.is_none(),
+            "expected a single fall-through exit"
+        );
+        assert_eq!(b.exits.len(), 1, "expected a single fall-through exit");
+        b.exits[0].borrow().target.clone().expect("exit target")
+    }
+
     fn reads_f_hash(block: &BlockRef) -> bool {
         block.borrow().operations.iter().any(|op| {
             op.opname == "getinteriorfield"
@@ -13705,7 +14218,7 @@ mod tests {
                 "cast_int_to_uint", // i = r_uint(...)
                 "cast_uint_to_int", // intmask(i)
                 "getarrayitem",     // indexes[intmask(i)]
-                "cast_uint_to_int", // rffi.cast(Signed, ...)
+                "force_cast",       // rffi.cast(Signed, ...)
                 "int_ge",           // index >= VALID_OFFSET
             ]
         );
@@ -13720,6 +14233,20 @@ mod tests {
         // 13 work blocks + the returnblock are all reachable.
         let (block_count, ops) = walk_blocks(&inner.startblock);
         assert_eq!(block_count, 14, "13 work blocks + returnblock");
+
+        // Signed keys keep `checkingkey == key` (`direct_compare`).
+        let first_valid = bool_exit(&inner.startblock, true);
+        let fv_ops: Vec<String> = first_valid
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(
+            fv_ops,
+            vec!["int_sub", "getinteriorfield", "int_eq"],
+            "Signed-key lookup emits checkingkey == key"
+        );
 
         // Distinctive ops of the probe must all appear.
         for needed in [
@@ -13945,9 +14472,9 @@ mod tests {
             "getinteriorfield", // entries.valid(index) = f_valid
             "setfield",         // iter.index = nextindex / iter.dict = null / lfn bump
             "int_lt",           // index < entries_len
-            "int_add",          // nextindex / lfn += (1 << FUNC_SHIFT)
-            "int_rshift",       // lookup_function_no >> FUNC_SHIFT
-            "int_eq",           // index == (lookup_function_no >> FUNC_SHIFT)
+            "int_add",          // nextindex / lfn += (1 << FUNC_SHIFT())
+            "int_rshift",       // lookup_function_no >> FUNC_SHIFT()
+            "int_eq",           // index == (lookup_function_no >> FUNC_SHIFT())
             "ptr_nonzero",      // if dict
         ] {
             assert!(
@@ -14049,8 +14576,137 @@ mod tests {
         );
     }
 
+    fn malloc_varsize_types(start: &BlockRef) -> Vec<LowLevelType> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![start.clone()];
+        let mut types = Vec::new();
+        while let Some(b) = stack.pop() {
+            if !seen.insert(Rc::as_ptr(&b) as usize) {
+                continue;
+            }
+            let bb = b.borrow();
+            for op in &bb.operations {
+                if op.opname == "malloc_varsize" {
+                    match op.args.first() {
+                        Some(Hlvalue::Constant(c)) => match &c.value {
+                            ConstValue::LowLevelType(t) => types.push((**t).clone()),
+                            other => panic!("malloc_varsize TYPE, got {other:?}"),
+                        },
+                        other => panic!("malloc_varsize arg0, got {other:?}"),
+                    }
+                }
+            }
+            for link in &bb.exits {
+                if let Some(t) = link.borrow().target.clone() {
+                    stack.push(t);
+                }
+            }
+        }
+        types
+    }
+
     fn dummy_funcptr_const() -> Constant {
         Constant::with_concretetype(ConstValue::None, LowLevelType::Void)
+    }
+
+    fn dummy_width_fns() -> Vec<(i64, LowLevelType, Constant)> {
+        index_width_rows()
+            .into_iter()
+            .map(|(f, t, _)| (f, t, dummy_funcptr_const()))
+            .collect()
+    }
+
+    fn tagged_width_fns(prefix: &str) -> Vec<(i64, LowLevelType, Constant)> {
+        index_width_rows()
+            .into_iter()
+            .map(|(f, t, _)| {
+                let name = specialized_graph_name(prefix, &t);
+                (f, t, tagged_funcptr_const(&name))
+            })
+            .collect()
+    }
+
+    fn dummy_arrayclear_fns() -> Vec<(i64, LowLevelType, Constant)> {
+        index_width_rows()
+            .into_iter()
+            .map(|(f, _, dictindex)| (f, dictindex, tagged_funcptr_const("ll_arrayclear")))
+            .collect()
+    }
+
+    /// Walk a FUNC_* if/elif chain of `direct_call` leaves. `parent` is the
+    /// block that links to the first check (`startblock` for insert/delete;
+    /// the loop head for `ll_call_lookup_function`). `call_argc` includes
+    /// the funcptr and the trailing Void `T`. `likely_byte` expects
+    /// `likely(fun == FUNC_BYTE)` on the first check. `last_false` checks
+    /// the final false target (exceptblock, or the lookup retry else-arm).
+    fn assert_func_width_dispatch(
+        parent: &BlockRef,
+        call_argc: usize,
+        likely_byte: bool,
+        last_false: impl Fn(&BlockRef),
+    ) {
+        let rows = index_width_rows();
+        let mut check = {
+            let parent = parent.borrow();
+            parent.exits[0]
+                .borrow()
+                .target
+                .clone()
+                .expect("first FUNC_* check")
+        };
+        let mut seen_t = Vec::new();
+        for (i, (func, t, _)) in rows.iter().enumerate() {
+            {
+                let cb = check.borrow();
+                if likely_byte && *func == FUNC_BYTE {
+                    assert_eq!(
+                        cb.operations.len(),
+                        2,
+                        "FUNC_BYTE check is int_eq then likely"
+                    );
+                    assert_eq!(cb.operations[0].opname, "int_eq");
+                    assert_eq!(cb.operations[1].opname, "likely");
+                    assert_eq!(cb.operations[1].args, vec![cb.operations[0].result.clone()]);
+                    assert_eq!(cb.exitswitch, Some(cb.operations[1].result.clone()));
+                } else {
+                    assert_eq!(cb.operations.len(), 1, "check block is a single int_eq");
+                    assert_eq!(cb.operations[0].opname, "int_eq");
+                }
+                match cb.operations[0].args.get(1) {
+                    Some(Hlvalue::Constant(c)) => {
+                        assert_eq!(c.value, ConstValue::Int(*func), "int_eq against FUNC_*")
+                    }
+                    other => panic!("int_eq FUNC const, got {other:?}"),
+                }
+            }
+            let leaf = bool_exit(&check, true);
+            {
+                let leafb = leaf.borrow();
+                assert_eq!(leafb.operations[0].opname, "direct_call");
+                let call = &leafb.operations[0];
+                assert_eq!(call.args.len(), call_argc, "direct_call argc");
+                match call.args.last() {
+                    Some(Hlvalue::Constant(c)) => {
+                        assert_eq!(c.concretetype, Some(LowLevelType::Void));
+                        assert_eq!(c.value, ConstValue::LowLevelType(Box::new(t.clone())));
+                        seen_t.push(t.clone());
+                    }
+                    other => panic!("T is a Void lltype constant, got {other:?}"),
+                }
+            }
+            let next = bool_exit(&check, false);
+            if i + 1 == rows.len() {
+                last_false(&next);
+            } else {
+                check = next;
+            }
+        }
+        assert_eq!(seen_t.len(), rows.len());
+        for i in 0..seen_t.len() {
+            for j in (i + 1)..seen_t.len() {
+                assert_ne!(seen_t[i], seen_t[j], "each width passes a distinct T");
+            }
+        }
     }
 
     fn tagged_funcptr_const(tag: &str) -> Constant {
@@ -14083,9 +14739,8 @@ mod tests {
     }
 
     /// `ll_malloc_indexes_and_choose_lookup` cascades `n <= 256` / `<= 65536`
-    /// / (64-bit) `<= 2**32` / else, each leaf allocating the (uniformly
-    /// `Unsigned`-element) index array and stamping `indexes` +
-    /// `lookup_function_no`.
+    /// / (64-bit) `<= 2**32` / else, each leaf allocating that width's
+    /// `DICTINDEX_<W>.TO` and stamping `indexes` + `lookup_function_no`.
     #[test]
     fn build_ll_malloc_indexes_and_choose_lookup_assembles_threshold_cascade() {
         let helper = build_ll_malloc_indexes_and_choose_lookup_helper_graph(
@@ -14102,26 +14757,40 @@ mod tests {
         assert_eq!(startblock.exits.len(), 1);
         drop(startblock);
 
+        let widths = index_width_rows();
         let (_block_count, ops) = walk_blocks(&inner.startblock);
         assert_eq!(
             ops.iter().filter(|o| *o == "int_le").count(),
-            3,
-            "3 threshold checks on a 64-bit target (BYTE/SHORT/INT), got {ops:?}"
+            widths.len() - 1,
+            "threshold checks for every width except LONG, got {ops:?}"
         );
         assert_eq!(
             ops.iter().filter(|o| *o == "malloc_varsize").count(),
-            4,
-            "4 leaves (BYTE/SHORT/INT/LONG), got {ops:?}"
+            widths.len(),
+            "one malloc leaf per width, got {ops:?}"
         );
         assert_eq!(
             ops.iter().filter(|o| *o == "cast_opaque_ptr").count(),
-            4,
+            widths.len(),
             "each leaf casts the freshly malloc'd array to GCREF, got {ops:?}"
         );
         assert_eq!(
             ops.iter().filter(|o| *o == "setfield").count(),
-            8,
+            widths.len() * 2,
             "each leaf sets indexes + lookup_function_no, got {ops:?}"
+        );
+
+        let malloc_types: std::collections::HashSet<LowLevelType> =
+            malloc_varsize_types(&inner.startblock)
+                .into_iter()
+                .collect();
+        let expected_types: std::collections::HashSet<LowLevelType> = widths
+            .iter()
+            .map(|(_, _, dictindex)| dictindex_array_lltype(dictindex).expect("DICTINDEX Ptr"))
+            .collect();
+        assert_eq!(
+            malloc_types, expected_types,
+            "each leaf mallocs a distinct DICTINDEX_<W>.TO"
         );
 
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
@@ -14190,7 +14859,7 @@ mod tests {
     }
 
     /// `ll_ensure_indexes` reads `lookup_function_no`, branches on `==
-    /// FUNC_MUST_REINDEX`; the True arm calls `ll_dict_create_initial_index`,
+    /// FUNC_MUST_REINDEX()`; the True arm calls `ll_dict_create_initial_index`,
     /// the False arm (`ll_assert`, debug-only) just returns.
     #[test]
     fn build_ll_ensure_indexes_branches_on_must_reindex() {
@@ -14228,45 +14897,72 @@ mod tests {
         );
     }
 
-    /// `ll_call_lookup_function` collapses the upstream `FUNC_*` 4-way
-    /// dispatch loop to "ensure the index exists, then look up once" — see
-    /// the builder's doc comment for why that is behaviorally identical
-    /// given this port's collapsed `DICTINDEX_*` widths.
+    /// `ll_call_lookup_function` is the upstream `while True` FUNC_* cascade:
+    /// startblock holds no operations and links to the loop head; the head
+    /// masks `lookup_function_no` and starts the chain. Each true arm
+    /// `direct_call`s that width's `ll_dict_lookup__T` with a distinct Void
+    /// `T` constant; the else arm calls `ll_dict_create_initial_index` and
+    /// links back to the loop head.
     #[test]
-    fn build_ll_call_lookup_function_calls_ensure_indexes_then_lookup() {
+    fn build_ll_call_lookup_function_dispatches_per_width_and_retries() {
         let (dict_ptr, _entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
         let helper = build_ll_call_lookup_function_helper_graph(
             "ll_call_lookup_function",
             dict_ptr,
             key_lltype,
-            dummy_funcptr_const(),
+            dummy_width_fns(),
             dummy_funcptr_const(),
         )
         .expect("build_ll_call_lookup_function_helper_graph");
         let inner = helper.graph.borrow();
-        let startblock = inner.startblock.borrow();
-        let ops: Vec<&str> = startblock
-            .operations
-            .iter()
-            .map(|op| op.opname.as_str())
-            .collect();
-        assert_eq!(ops, vec!["direct_call", "direct_call"]);
-        let lookup = &startblock.operations[1];
-        assert_eq!(
-            lookup.args.len(),
-            6,
-            "ll_dict_lookup(d, key, hash, flag, T)"
-        );
-        match &lookup.args[5] {
-            Hlvalue::Constant(c) => {
-                assert_eq!(c.concretetype, Some(LowLevelType::Void));
-                assert_eq!(
-                    c.value,
-                    ConstValue::LowLevelType(Box::new(TYPE_LONG.clone()))
-                );
-            }
-            other => panic!("T is a Void lltype constant, got {other:?}"),
+        let loop_head = {
+            let startblock = inner.startblock.borrow();
+            let ops: Vec<&str> = startblock
+                .operations
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect();
+            assert!(
+                ops.is_empty(),
+                "startblock holds no operations, got {ops:?}"
+            );
+            assert_eq!(startblock.exits.len(), 1);
+            startblock.exits[0]
+                .borrow()
+                .target
+                .clone()
+                .expect("loop head")
+        };
+        {
+            let head = loop_head.borrow();
+            let ops: Vec<&str> = head
+                .operations
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect();
+            assert_eq!(ops, vec!["getfield", "int_and"]);
+            assert_eq!(head.exits.len(), 1);
         }
+        assert_func_width_dispatch(&loop_head, 6, true, |next| {
+            let elseb = next.borrow();
+            assert_eq!(elseb.operations[0].opname, "direct_call");
+            assert_eq!(
+                elseb.operations[0].args.len(),
+                2,
+                "ll_dict_create_initial_index(d)"
+            );
+            assert_eq!(elseb.exits.len(), 1);
+            let back = elseb.exits[0].borrow().target.clone().expect("back-edge");
+            assert!(
+                Rc::ptr_eq(&back, &loop_head),
+                "else arm links back to the loop head"
+            );
+        });
+        let (_n, ops) = walk_blocks(&inner.startblock);
+        assert!(
+            ops.iter().any(|o| *o == "likely"),
+            "ll_call_lookup_function emits likely(fun == FUNC_BYTE), got {ops:?}"
+        );
 
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
@@ -14631,12 +15327,13 @@ mod tests {
         let helper = build_ll_dict_store_clean_helper_graph(
             "ll_dict_store_clean",
             dict_ptr,
+            LowLevelType::Unsigned,
             dummy_funcptr_const(),
         )
         .expect("build_ll_dict_store_clean_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_store_clean");
         let inner = helper.graph.borrow();
-        assert_eq!(inner.startblock.borrow().inputargs.len(), 3); // d, hash, index
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 4); // d, hash, index, T
 
         let (block_count, ops) = walk_blocks(&inner.startblock);
         assert_eq!(
@@ -14648,6 +15345,7 @@ mod tests {
             "cast_int_to_uint",
             "cast_uint_to_int",
             "getarrayitem",
+            "force_cast",
             "int_eq",
             "uint_lshift",
             "uint_add",
@@ -14666,15 +15364,15 @@ mod tests {
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
     }
 
-    /// `ll_call_insert_clean_function`'s FUNC_* dispatch collapses to a
-    /// single unconditional `ll_dict_store_clean` call.
+    /// `ll_call_insert_clean_function` is a FUNC_* cascade onto per-width
+    /// `ll_dict_store_clean__T`; the else arm raises AssertionError.
     #[test]
     fn build_ll_call_insert_clean_function_calls_store_clean_directly() {
         let dict_ptr = sample_dict_ptr_lltype();
         let helper = build_ll_call_insert_clean_function_helper_graph(
             "ll_call_insert_clean_function",
             dict_ptr,
-            dummy_funcptr_const(),
+            dummy_width_fns(),
         )
         .expect("build_ll_call_insert_clean_function_helper_graph");
         assert_eq!(helper.func.name, "ll_call_insert_clean_function");
@@ -14687,18 +15385,24 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert_eq!(ops, vec!["direct_call"]);
+        assert_eq!(ops, vec!["getfield", "int_and"]);
+        drop(startblock);
+        assert_func_width_dispatch(&inner.startblock, 5, false, |next| {
+            assert!(
+                Rc::ptr_eq(next, &inner.exceptblock),
+                "final false link raises AssertionError via exceptblock"
+            );
+        });
     }
 
-    /// `ll_call_delete_by_entry_index`'s FUNC_* dispatch collapses to a
-    /// single unconditional `ll_dict_delete_by_entry_index` call, matching
-    /// the current uniform `DICTINDEX_* = Unsigned` layout.
+    /// `ll_call_delete_by_entry_index` is a FUNC_* cascade onto per-width
+    /// `ll_dict_delete_by_entry_index__T`; the else arm raises AssertionError.
     #[test]
     fn build_ll_call_delete_by_entry_index_calls_delete_directly() {
         let helper = build_ll_call_delete_by_entry_index_helper_graph(
             "ll_call_delete_by_entry_index",
             sample_dict_ptr_lltype(),
-            dummy_funcptr_const(),
+            dummy_width_fns(),
         )
         .expect("build_ll_call_delete_by_entry_index_helper_graph");
         assert_eq!(helper.func.name, "ll_call_delete_by_entry_index");
@@ -14710,7 +15414,14 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert_eq!(ops, vec!["direct_call"]);
+        assert_eq!(ops, vec!["getfield", "int_and"]);
+        drop(startblock);
+        assert_func_width_dispatch(&inner.startblock, 6, false, |next| {
+            assert!(
+                Rc::ptr_eq(next, &inner.exceptblock),
+                "final false link raises AssertionError via exceptblock"
+            );
+        });
     }
 
     /// `ll_dict_delete_by_entry_index` probes by hash until the stored
@@ -14721,16 +15432,18 @@ mod tests {
         let helper = build_ll_dict_delete_by_entry_index_helper_graph(
             "ll_dict_delete_by_entry_index",
             sample_dict_ptr_lltype(),
+            LowLevelType::Unsigned,
             dummy_funcptr_const(),
         )
         .expect("build_ll_dict_delete_by_entry_index_helper_graph");
         assert_eq!(helper.func.name, "ll_dict_delete_by_entry_index");
         assert!(helper.func._jit_unroll_safe_);
         let inner = helper.graph.borrow();
-        assert_eq!(inner.startblock.borrow().inputargs.len(), 4);
+        assert_eq!(inner.startblock.borrow().inputargs.len(), 5);
         let (_block_count, ops) = walk_blocks(&inner.startblock);
         for needed in [
             "getarrayitem",
+            "force_cast",
             "int_eq",
             "uint_lshift",
             "uint_add",
@@ -14746,7 +15459,7 @@ mod tests {
     }
 
     /// `_ll_dict_entries_size_too_big` masks `lookup_function_no` then
-    /// compares `FUNC_BYTE` / `FUNC_SHORT` / (64-bit) `FUNC_INT`; each true
+    /// compares `FUNC_BYTE` / `FUNC_SHORT` / (64-bit) `FUNC_INT()`; each true
     /// arm asserts `num_live_items < LIMIT` and returns
     /// `new_allocated > LIMIT`. Fall-through returns False.
     #[test]
@@ -14778,8 +15491,8 @@ mod tests {
             (FUNC_BYTE, (1i64 << 8) - MIN_INDEXES_MINUS_ENTRIES),
             (FUNC_SHORT, (1i64 << 16) - MIN_INDEXES_MINUS_ENTRIES),
         ];
-        if IS_64BIT {
-            expected.push((FUNC_INT, (1i64 << 32) - MIN_INDEXES_MINUS_ENTRIES));
+        if IS_64BIT() {
+            expected.push((FUNC_INT(), (1i64 << 32) - MIN_INDEXES_MINUS_ENTRIES));
         }
 
         let mut check = {
@@ -15074,7 +15787,7 @@ mod tests {
             entries_ptr,
             malloc_choose_fn,
             clear_indexes_fn,
-            dummy_funcptr_const(),
+            tagged_width_fns("ll_dict_store_clean"),
             None,
             false,
         )
@@ -15083,11 +15796,8 @@ mod tests {
         let inner = helper.graph.borrow();
         assert_eq!(inner.startblock.borrow().inputargs.len(), 2); // d, new_size
 
-        let (block_count, ops) = walk_blocks(&inner.startblock);
-        assert_eq!(
-            block_count, 10,
-            "start + len + clear + malloc + body + cond + loop body + store + next + returnblock"
-        );
+        let widths = index_width_rows();
+        let (_block_count, ops) = walk_blocks(&inner.startblock);
         for needed in ["getinteriorfield", "int_lt", "int_add", "direct_call"] {
             assert!(
                 ops.iter().any(|o| o == needed),
@@ -15096,8 +15806,8 @@ mod tests {
         }
         assert_eq!(
             ops.iter().filter(|o| *o == "direct_call").count(),
-            3,
-            "clear_indexes + malloc_choose + store_clean"
+            2 + widths.len(),
+            "clear_indexes + malloc_choose + one store_clean per width"
         );
         let targets = direct_call_target_values(&inner.startblock);
         assert!(
@@ -15112,6 +15822,13 @@ mod tests {
                 .any(|v| *v == ConstValue::byte_str("ll_malloc_indexes_and_choose_lookup")),
             "reindex must direct_call ll_malloc_indexes_and_choose_lookup, got {targets:?}"
         );
+        for (_, t, _) in &widths {
+            let name = specialized_graph_name("ll_dict_store_clean", t);
+            assert!(
+                targets.iter().any(|v| *v == ConstValue::byte_str(&name)),
+                "reindex must direct_call {name}, got {targets:?}"
+            );
+        }
         let len_block = bool_exit(&inner.startblock, true);
         assert!(
             ops.iter()
@@ -15143,11 +15860,10 @@ mod tests {
     /// exceptblock.
     #[test]
     fn ll_clear_indexes_graph_masks_lookup_function_and_clears() {
-        let arrayclear_fn = tagged_funcptr_const("ll_arrayclear");
         let helper = build_ll_clear_indexes_helper_graph(
             "ll_clear_indexes",
             sample_dict_ptr_lltype(),
-            arrayclear_fn,
+            dummy_arrayclear_fns(),
         )
         .expect("build_ll_clear_indexes_helper_graph");
         assert_eq!(helper.func.name, "ll_clear_indexes");
@@ -15176,11 +15892,11 @@ mod tests {
 
         let mut expected_funcs = vec![FUNC_BYTE, FUNC_SHORT];
         let mut expected_types: Vec<&LowLevelType> = vec![&*DICTINDEX_BYTE, &*DICTINDEX_SHORT];
-        if IS_64BIT {
-            expected_funcs.push(FUNC_INT);
+        if IS_64BIT() {
+            expected_funcs.push(FUNC_INT());
             expected_types.push(&*DICTINDEX_INT);
         }
-        expected_funcs.push(FUNC_LONG);
+        expected_funcs.push(FUNC_LONG());
         expected_types.push(&*DICTINDEX_LONG);
 
         let mut check = {
@@ -16887,6 +17603,146 @@ mod tests {
         );
     }
 
+    /// Shortint keys (`getintegerrepr(UCHAR)`) use `ll_eq_shortint`, so
+    /// `get_ll_dict` stamps `ENTRIES.no_direct_compare` and
+    /// `ll_dict_lookup` skips `checkingkey == key`.
+    #[test]
+    fn build_ll_dict_lookup_uchar_keys_skip_direct_compare_and_call_eq() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let uchar = (*rffi::UCHAR).clone();
+        let key_repr = getintegerrepr(&uchar);
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let repr = OrderedDictRepr::new(
+            rtyper.clone(),
+            key_repr.clone() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("uchar-keyed ordered dict");
+        assert_eq!(
+            repr.DICTENTRYARRAY._adtmeths.get("no_direct_compare"),
+            Some(&ConstValue::Bool(true)),
+            "get_ll_dict copies ll_eq_shortint.no_direct_compare onto ENTRIES"
+        );
+        let eq_fn = key_repr
+            .get_ll_eq_function(&rtyper)
+            .expect("get_ll_eq_function(UCHAR)")
+            .expect("ll_eq_shortint");
+        assert_eq!(eq_fn.name, "ll_eq_shortint");
+        let eq_fn_const = sub_helper_funcptr_constant(&rtyper, &eq_fn).expect("eq funcptr");
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_lookup_helper_graph(
+            "ll_dict_lookup",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            LowLevelType::Unsigned,
+            repr.DICTKEY.clone(),
+            Some(eq_fn_const),
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("uchar-keyed ll_dict_lookup");
+        let inner = helper.graph.borrow();
+        let first_valid = bool_exit(&inner.startblock, true);
+        let fv_ops: Vec<String> = first_valid
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(
+            fv_ops,
+            vec!["int_sub", "getinteriorfield"],
+            "no_direct_compare skips checkingkey == key, got {fv_ops:?}"
+        );
+        let hashcheck = unique_exit(&first_valid);
+        assert!(
+            reads_f_hash(&hashcheck),
+            "no_direct_compare goes straight to entry_hash then keyeq"
+        );
+        let (_n, ops) = walk_blocks(&inner.startblock);
+        let direct_call_count = ops.iter().filter(|o| *o == "direct_call").count();
+        assert_eq!(
+            direct_call_count, 2,
+            "both comparison sites call ll_eq_shortint, got {ops:?}"
+        );
+    }
+
+    /// `hasattr(ENTRIES, 'no_direct_compare')` (`ll_dict_lookup`) is
+    /// presence, not truth: `no_direct_compare = False` still disables
+    /// `checkingkey == key`.
+    #[test]
+    fn build_ll_dict_lookup_no_direct_compare_false_still_disables_direct_compare() {
+        let (dict_ptr, entries_ptr, key_lltype) = sample_dict_lookup_lltypes();
+        let LowLevelType::Ptr(ptr) = &entries_ptr else {
+            panic!("entries is Ptr");
+        };
+        let PtrTarget::Array(arr) = &ptr.TO else {
+            panic!("entries is Array");
+        };
+        assert!(
+            arr._adtmeths.get("no_direct_compare").is_none(),
+            "sample Signed keys have no no_direct_compare"
+        );
+        let stamped = Array::gc_with_adtmeths(
+            arr.OF.clone(),
+            vec![("no_direct_compare".into(), ConstValue::Bool(false))],
+        );
+        assert!(
+            entries_has_no_direct_compare(&PtrTarget::Array(stamped.clone())),
+            "hasattr is presence: False still counts"
+        );
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(stamped),
+        }));
+        let helper = build_ll_dict_lookup_helper_graph(
+            "ll_dict_lookup",
+            dict_ptr,
+            entries_ptr,
+            LowLevelType::Unsigned,
+            key_lltype,
+            None,
+            false,
+            false,
+            None,
+            false,
+        )
+        .expect("False no_direct_compare still skips direct_compare");
+        let inner = helper.graph.borrow();
+        let first_valid = bool_exit(&inner.startblock, true);
+        let fv_ops: Vec<String> = first_valid
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(
+            fv_ops,
+            vec!["int_sub", "getinteriorfield"],
+            "no_direct_compare=False skips checkingkey == key, got {fv_ops:?}"
+        );
+        assert!(
+            first_valid.borrow().exitswitch.is_none(),
+            "no int_eq switch when hasattr(ENTRIES, no_direct_compare)"
+        );
+    }
+
     fn simple_hash_eq_custom_dict_repr() -> OrderedDictRepr {
         let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
         let rtyper = Rc::new(RPythonTyper::new(&ann));
@@ -16955,7 +17811,7 @@ mod tests {
             entries_ptr.clone(),
             dummy_funcptr_const(),
             dummy_funcptr_const(),
-            dummy_funcptr_const(),
+            dummy_width_fns(),
             Some(dummy_funcptr_const()),
             true,
         )
@@ -16963,10 +17819,11 @@ mod tests {
         let inner = reindex.graph.borrow();
         assert!(!graph_mentions_field(&inner.startblock, "f_hash"));
         let (_n, ops) = walk_blocks(&inner.startblock);
+        let n_widths = index_width_rows().len();
         assert_eq!(
             ops.iter().filter(|o| *o == "direct_call").count(),
-            4,
-            "clear_indexes + malloc_choose + ll_hash_custom_fast + store_clean"
+            2 + n_widths * 2,
+            "clear_indexes + malloc_choose + ll_hash_custom_fast + store_clean per width"
         );
 
         let arraycopy = build_ll_dict_entries_arraycopy_helper_graph(
@@ -17064,7 +17921,7 @@ mod tests {
         );
         assert_eq!(
             dict_signed_field(ptr, "lookup_function_no").expect("lookup_function_no"),
-            FUNC_MUST_REINDEX
+            FUNC_MUST_REINDEX()
         );
         let entries = ptr.getattr("entries").expect("entries");
         let LowLevelValue::Ptr(entries) = entries else {
@@ -17286,7 +18143,7 @@ mod tests {
         );
         assert_eq!(
             dict_signed_field(p1, "lookup_function_no").expect("lookup"),
-            FUNC_MUST_REINDEX
+            FUNC_MUST_REINDEX()
         );
         let indexes = p1.getattr("indexes").expect("indexes");
         let LowLevelValue::Ptr(indexes) = indexes else {
@@ -17432,8 +18289,52 @@ mod tests {
         ll_malloc_indexes_and_choose_lookup(&mut d_short, 65537).expect("long indexes");
         assert_eq!(
             dict_signed_field(&d_short, "lookup_function_no").expect("lookup_function_no"),
-            FUNC_INT
+            FUNC_INT()
         );
+    }
+
+    fn index_array_of(d: &_ptr) -> LowLevelType {
+        let array = dict_indexes_array(d).expect("cast indexes");
+        match &array._TYPE.TO {
+            PtrTarget::Array(a) => a.OF.clone(),
+            other => panic!("indexes TO is not Array, got {other:?}"),
+        }
+    }
+
+    /// Host `ll_malloc_indexes_and_choose_lookup` allocates the width-specific
+    /// `GcArray(TYPE_*)` and stamps the matching `FUNC_*`.
+    #[test]
+    fn ll_malloc_indexes_and_choose_lookup_picks_width_specific_arrays() {
+        let repr = signed_signed_ordered_dict_repr();
+        let mut d = ll_newdict_size(&repr.DICT, 4).expect("dict");
+        ll_malloc_indexes_and_choose_lookup(&mut d, 16).expect("n=16");
+        assert_eq!(
+            dict_signed_field(&d, "lookup_function_no").expect("lookup_function_no"),
+            FUNC_BYTE
+        );
+        assert_eq!(index_array_of(&d), *TYPE_BYTE);
+
+        ll_malloc_indexes_and_choose_lookup(&mut d, 300).expect("n=300");
+        assert_eq!(
+            dict_signed_field(&d, "lookup_function_no").expect("lookup_function_no"),
+            FUNC_SHORT
+        );
+        assert_eq!(index_array_of(&d), *TYPE_SHORT);
+
+        ll_malloc_indexes_and_choose_lookup(&mut d, 70000).expect("n=70000");
+        if IS_64BIT() {
+            assert_eq!(
+                dict_signed_field(&d, "lookup_function_no").expect("lookup_function_no"),
+                FUNC_INT()
+            );
+            assert_eq!(index_array_of(&d), *TYPE_INT);
+        } else {
+            assert_eq!(
+                dict_signed_field(&d, "lookup_function_no").expect("lookup_function_no"),
+                FUNC_LONG()
+            );
+            assert_eq!(index_array_of(&d), *TYPE_LONG);
+        }
     }
 
     /// `ll_dict_setitem` then `ll_dict_getitem` round-trip; missing key
@@ -17485,7 +18386,7 @@ mod tests {
         let mut d = as_dict_ptr(&c).clone();
         assert_eq!(
             dict_signed_field(&d, "lookup_function_no").expect("lookup"),
-            FUNC_MUST_REINDEX
+            FUNC_MUST_REINDEX()
         );
         for (k, v) in [(1, 10), (2, 20), (3, 30)] {
             let got = ll_dict_getitem(&mut d, &LowLevelValue::Signed(k)).expect("getitem");
@@ -17496,7 +18397,7 @@ mod tests {
         }
         assert_ne!(
             dict_signed_field(&d, "lookup_function_no").expect("lookup after rehash"),
-            FUNC_MUST_REINDEX
+            FUNC_MUST_REINDEX()
         );
     }
 
@@ -18233,7 +19134,7 @@ mod tests {
         let insert_clean = build_ll_call_insert_clean_function_helper_graph(
             "ll_call_insert_clean_function",
             sample_dict_ptr_lltype(),
-            dummy_funcptr_const(),
+            dummy_width_fns(),
         )
         .expect("insert_clean");
         assert_eq!(insert_clean.func._jit_look_inside_, Some(false));
@@ -18258,6 +19159,7 @@ mod tests {
         let delete_by_entry = build_ll_dict_delete_by_entry_index_helper_graph(
             "ll_dict_delete_by_entry_index",
             sample_dict_ptr_lltype(),
+            LowLevelType::Unsigned,
             dummy_funcptr_const(),
         )
         .expect("delete_by_entry");
@@ -18384,8 +19286,15 @@ mod tests {
             .graphs
             .borrow()
             .iter()
-            .find(|g| g.borrow().name == "ll_dict_lookup_trampoline")
-            .unwrap_or_else(|| panic!("missing ll_dict_lookup_trampoline"))
+            .find(|g| {
+                g.borrow().name == format!("ll_dict_lookup__{}_trampoline", TYPE_BYTE.short_name())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing ll_dict_lookup__{}_trampoline",
+                    TYPE_BYTE.short_name()
+                )
+            })
             .clone();
         let inner = trampoline.borrow();
         assert_eq!(

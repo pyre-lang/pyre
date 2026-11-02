@@ -226,6 +226,7 @@ fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType
         // UnsignedLongLongLong`.
         (ConstValue::Int128(_), LowLevelType::SignedLongLongLong) => true,
         (ConstValue::UInt128(_), LowLevelType::UnsignedLongLongLong) => true,
+        (ConstValue::RInt(c, _, _), LowLevelType::Number(n)) if *c == n._type => true,
         (ConstValue::Bool(_), LowLevelType::Bool) => true,
         // Upstream `lltype.typeOf(float) == Float`, `r_singlefloat →
         // SingleFloat`, `r_longfloat → LongFloat`. pyre flattens the

@@ -2703,6 +2703,7 @@ fn is_primitive_lowleveltype(lltype: &LowLevelType) -> bool {
             | LowLevelType::LongFloat
             | LowLevelType::Char
             | LowLevelType::UniChar
+            | LowLevelType::Number(_)
     )
 }
 
@@ -5405,6 +5406,7 @@ fn lowlevel_signed_wide_py_div_helper_graph(
     ));
     let zero = match &lltype {
         LowLevelType::SignedLongLongLong => ConstValue::Int128(0),
+        LowLevelType::Number(n) => ConstValue::rint(n._type, 0),
         _ => ConstValue::Int(0),
     };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5571,6 +5573,7 @@ fn lowlevel_signed_wide_py_mod_helper_graph(
     ));
     let zero = match &lltype {
         LowLevelType::SignedLongLongLong => ConstValue::Int128(0),
+        LowLevelType::Number(n) => ConstValue::rint(n._type, 0),
         _ => ConstValue::Int(0),
     };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -5767,6 +5770,7 @@ fn lowlevel_typed_zero_check_wrapper_graph(
         LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => ConstValue::UInt(0),
         LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(0),
         LowLevelType::SignedLongLongLong => ConstValue::Int128(0),
+        LowLevelType::Number(n) => ConstValue::rint(n._type, 0),
         _ => ConstValue::Int(0),
     };
     startblock.borrow_mut().operations.push(SpaceOperation::new(

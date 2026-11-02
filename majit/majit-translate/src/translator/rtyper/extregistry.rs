@@ -32,7 +32,9 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use crate::annotator::bookkeeper::Bookkeeper;
-use crate::annotator::model::{AnnotatorError, SomeBuiltin, SomeValue, s_none};
+use crate::annotator::model::{
+    AnnotatorError, KnownType, SomeBuiltin, SomeInteger, SomeValue, s_none,
+};
 use crate::flowspace::model::{ConstValue, Hlvalue, HostObject};
 use crate::rlib::jit::{
     JitDriverMeta, JitMarkerKind, ext_enter_leave_marker_compute_result_annotation,
@@ -129,14 +131,38 @@ pub enum ExtRegistryEntry {
     ///         return v_result
     /// ```
     ///
-    /// Matches the class object created by `build_int` (rarithmetic.py:
-    /// 546-600).  `instance` carries the class HostObject so
-    /// `compute_result_annotation` can store `knowntype=instance` per
-    /// upstream; signedness is derived from the knowntype itself inside
-    /// `SomeInteger::new_with_knowntype` (`unsigned = knowntype(-1) > 0`
-    /// per model.py:222), so no separate `unsigned` carrier is needed
-    /// here — that would duplicate state RPython does not.
-    ForType { instance: HostObject },
+    /// Matches the class object created by `build_int` (`ForTypeEntry`
+    /// nested in `build_int`) and `BaseIntTypeEntry` (`_about_ =
+    /// base_int`). `instance` is the class HostObject (`_about_ =
+    /// int_type`); `knowntype` is that class as a [`KnownType`] so
+    /// `compute_result_annotation` returns
+    /// `SomeInteger(knowntype=int_type)` for `r_uint` and every created
+    /// class through the same variant. `is_abstract` is `BaseIntTypeEntry`:
+    /// `compute_result_annotation` raises `TypeError("abstract base!")`.
+    ForType {
+        instance: HostObject,
+        knowntype: KnownType,
+        is_abstract: bool,
+    },
+    /// Upstream `rpython/rlib/rarithmetic.py ForValuesEntry` and
+    /// `BaseIntValueEntry`:
+    ///
+    /// ```python
+    /// class ForValuesEntry(extregistry.ExtRegistryEntry):
+    ///     _type_ = int_type
+    ///     def compute_annotation(self):
+    ///         return SomeInteger(knowntype=int_type)
+    /// ```
+    ///
+    /// Type-level entry keyed on the class HostObject. `immutablevalue`
+    /// of a `ConstValue::RInt` looks this up via `type(instance)`.
+    /// `lookup` constructs `Entry(type(instance), instance)`, so
+    /// `instance` is the value when this entry comes from value lookup
+    /// and `None` from `lookup_type` (`ExtRegistryEntry.__init__`).
+    ForValues {
+        knowntype: KnownType,
+        instance: Option<ConstValue>,
+    },
     /// Upstream `rpython/rlib/nonconst.py EntryNonConstant`:
     ///
     /// ```python
@@ -354,6 +380,10 @@ pub enum ExtRegistryEntryKey {
     ForType {
         instance_identity: usize,
     },
+    ForValues {
+        knowntype: KnownType,
+        instance: Option<ConstValue>,
+    },
     /// Singleton key for the `we_are_jitted` `_about_` entry
     /// (rlib/jit.py). No per-instance identity — the variant tag
     /// alone supplies `self.__class__` and there is no `self.instance`.
@@ -409,8 +439,15 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::LoopHeader { meta } => ExtRegistryEntryKey::LoopHeader {
                 driver_identity: meta.id.identity_id(),
             },
-            ExtRegistryEntry::ForType { instance } => ExtRegistryEntryKey::ForType {
+            ExtRegistryEntry::ForType { instance, .. } => ExtRegistryEntryKey::ForType {
                 instance_identity: instance.identity_id(),
+            },
+            ExtRegistryEntry::ForValues {
+                knowntype,
+                instance,
+            } => ExtRegistryEntryKey::ForValues {
+                knowntype: *knowntype,
+                instance: instance.clone(),
             },
             ExtRegistryEntry::WeAreJitted => ExtRegistryEntryKey::WeAreJitted,
             ExtRegistryEntry::ConditionalCall { is_value } => {
@@ -533,6 +570,13 @@ impl ExtRegistryEntry {
                 ));
                 Ok(SomeValue::Builtin(result))
             }
+            // `ForValuesEntry.compute_annotation` /
+            // `BaseIntValueEntry.compute_annotation` return
+            // `SomeInteger(knowntype=int_type)` (`r_ulonglong` for
+            // `base_int`).
+            ExtRegistryEntry::ForValues { knowntype, .. } => Ok(SomeValue::Integer(
+                SomeInteger::new_with_knowntype(false, *knowntype),
+            )),
             // RPython's `we_are_jitted` ExtRegistryEntry annotates the
             // call `SomeInteger(nonneg=True)` (rlib/jit.py); pyre's
             // `we_are_jitted() -> bool` makes the faithful annotation
@@ -664,26 +708,24 @@ impl ExtRegistryEntry {
             ExtRegistryEntry::LoopHeader { .. } => Ok(s_none()),
             ExtRegistryEntry::JitForceVirtualizable => Ok(s_none()),
             ExtRegistryEntry::JitForceQuasiImmutable => Ok(s_none()),
-            // upstream rarithmetic.py — `ForTypeEntry.\
-            // compute_result_annotation(self, *args_s, **kwds_s)` returns
-            // `SomeInteger(knowntype=int_type)`.  The instance is the int
-            // class object (`r_uint`, `r_ulonglong`, ...); pyre records
-            // it via `KnownType::Ruint` for r_uint and falls back to the
-            // generic untyped class until the KnownType enum gains entries
-            // for other ForType instances.  Signedness is derived inside
-            // `new_with_knowntype` per model.py:222 — no separate
-            // `unsigned` argument is passed (matches `SomeInteger(
-            // knowntype=int_type)` upstream).
-            ExtRegistryEntry::ForType { instance } => {
-                let knowntype = if instance.qualname() == "rarithmetic.r_uint" {
-                    crate::annotator::model::KnownType::Ruint
-                } else {
-                    crate::annotator::model::KnownType::Other
-                };
+            // `ForTypeEntry.compute_result_annotation(self, *args_s,
+            // **kwds_s)` returns `SomeInteger(knowntype=int_type)`.
+            // Signedness is derived inside `new_with_knowntype`
+            // (`unsigned = knowntype(-1) > 0`).
+            // `BaseIntTypeEntry.compute_result_annotation` raises
+            // `TypeError("abstract base!")`.
+            ExtRegistryEntry::ForType {
+                knowntype,
+                is_abstract,
+                ..
+            } => {
                 let _ = bookkeeper;
-                Ok(SomeValue::Integer(
-                    crate::annotator::model::SomeInteger::new_with_knowntype(false, knowntype),
-                ))
+                if *is_abstract {
+                    return Err(AnnotatorError::new("abstract base!"));
+                }
+                Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+                    false, *knowntype,
+                )))
             }
             other => other.compute_annotation_bk(bookkeeper),
         }
@@ -711,7 +753,11 @@ impl ExtRegistryEntry {
             )),
             ExtRegistryEntry::HostValueBuiltin { .. }
             | ExtRegistryEntry::HostTypeAnnotation { .. }
-            | ExtRegistryEntry::ExternalFunction(_) => Err(TyperError::message(
+            | ExtRegistryEntry::ExternalFunction(_)
+            | ExtRegistryEntry::ForValues { .. }
+            | ExtRegistryEntry::ForType {
+                is_abstract: true, ..
+            } => Err(TyperError::message(
                 "'ExtRegistryEntry' object has no attribute 'specialize_call'",
             )),
             // Marker variants override `specialize_call` upstream
@@ -733,27 +779,13 @@ impl ExtRegistryEntry {
                      `findbltintyper` cannot capture marker meta in a function pointer",
                 ))
             }
-            // upstream rarithmetic.py — `ForTypeEntry.\
-            // specialize_call(self, hop)`:
+            // `ForTypeEntry.specialize_call(self, hop)`:
             //     v_result, = hop.inputargs(hop.r_result.lowleveltype)
             //     hop.exception_cannot_occur()
             //     return v_result
-            // Pyre's `rtype_r_uint` (rbuiltin.rs) mirrors this
-            // verbatim — single `inputargs` call against
-            // `hop.r_result.lowleveltype`, exception_cannot_occur,
-            // then return.  Returning the function pointer here
-            // completes the extregistry dispatch surface end-to-end.
-            ExtRegistryEntry::ForType { instance, .. } => {
-                if instance.qualname() == "rarithmetic.r_uint" {
-                    Ok(super::rbuiltin::rtype_r_uint as BuiltinTyperFn)
-                } else {
-                    Err(TyperError::message(format!(
-                        "ExtRegistryEntry::ForType: specialize_call for {} is not yet wired \
-                         (rarithmetic.r_uint is the only int-class instance registered today)",
-                        instance.qualname()
-                    )))
-                }
-            }
+            // `rtype_r_uint` (rbuiltin.rs) is that conversion for every
+            // int class, `r_uint` included.
+            ExtRegistryEntry::ForType { .. } => Ok(super::rbuiltin::rtype_r_uint as BuiltinTyperFn),
             // rlib/jit.py — `Entry(_about_=we_are_jitted).\
             // specialize_call(self, hop)`:
             //     hop.exception_cannot_occur()
@@ -999,21 +1031,58 @@ pub(crate) fn register_host_value(
     Ok(())
 }
 
-/// Register `rarithmetic.r_uint` as an `ExtRegistryEntry::ForType`
-/// value-level entry mirroring upstream `ForTypeEntry(_about_=r_uint)`
-/// (rarithmetic.py).  Called from `HOST_ENV::populate_host_env`
-/// so the registration runs once during the first HOST_ENV access; a
-/// duplicate registration call is tolerated since `populate_host_env`
-/// is itself OnceLock-gated.
-pub(crate) fn register_r_uint(host: HostObject) {
+fn register_for_type(host: HostObject, knowntype: KnownType, is_abstract: bool) {
     let mut registry = host_value_registry().lock();
     if !registry.contains_key(&host) {
-        registry.insert(host.clone(), ExtRegistryEntry::ForType { instance: host });
+        registry.insert(
+            host.clone(),
+            ExtRegistryEntry::ForType {
+                instance: host,
+                knowntype,
+                is_abstract,
+            },
+        );
     }
 }
 
+fn register_for_values(host: HostObject, knowntype: KnownType) {
+    let _ = register_host_type(
+        host,
+        ExtRegistryEntry::ForValues {
+            knowntype,
+            instance: None,
+        },
+    );
+}
+
+/// Register `rarithmetic.r_uint` as an `ExtRegistryEntry::ForType`
+/// value-level entry mirroring upstream `ForTypeEntry(_about_=r_uint)`
+/// (`build_int`). Called from `HOST_ENV::populate_host_env` so the
+/// registration runs once during the first HOST_ENV access; a
+/// duplicate registration call is tolerated since `populate_host_env`
+/// is itself OnceLock-gated.
+pub(crate) fn register_r_uint(host: HostObject) {
+    register_for_type(host, KnownType::Ruint, false);
+}
+
+/// `ForTypeEntry(_about_=int_type)` and `ForValuesEntry(_type_=int_type)`
+/// nested in `build_int`.
+pub(crate) fn register_build_int_class(host: HostObject, knowntype: KnownType) {
+    register_for_type(host.clone(), knowntype, false);
+    register_for_values(host, knowntype);
+}
+
+/// `BaseIntTypeEntry(_about_=base_int)` and `BaseIntValueEntry(_type_=base_int)`.
+///
+/// Value-level `ForType { is_abstract: true }` raises `TypeError("abstract
+/// base!")` from `compute_result_annotation`. Type-level `ForValues`
+/// annotates `SomeInteger(knowntype=r_ulonglong)`.
+pub(crate) fn register_base_int(host: HostObject) {
+    register_for_type(host.clone(), KnownType::ULongLong, true);
+    register_for_values(host, KnownType::ULongLong);
+}
+
 /// Rust equivalent of `AutoRegisteringType._register_type`.
-#[cfg(test)]
 pub(crate) fn register_host_type(
     host_type: HostObject,
     entry: ExtRegistryEntry,
@@ -1029,7 +1098,7 @@ pub(crate) fn register_host_type(
     Ok(())
 }
 
-fn bind_lookup_instance(entry: ExtRegistryEntry, instance: &HostObject) -> ExtRegistryEntry {
+fn bind_lookup_const_instance(entry: ExtRegistryEntry, instance: &ConstValue) -> ExtRegistryEntry {
     match entry {
         ExtRegistryEntry::HostTypeAnnotation {
             type_obj,
@@ -1037,11 +1106,24 @@ fn bind_lookup_instance(entry: ExtRegistryEntry, instance: &HostObject) -> ExtRe
             ..
         } => ExtRegistryEntry::HostTypeAnnotation {
             type_obj,
-            instance: Some(instance.clone()),
+            instance: match instance {
+                ConstValue::HostObject(host) => Some(host.clone()),
+                _ => None,
+            },
             annotation,
+        },
+        // `lookup` returns `Entry(type(instance), instance)`;
+        // `ExtRegistryEntry.__eq__` / `__hash__` include `instance`.
+        ExtRegistryEntry::ForValues { knowntype, .. } => ExtRegistryEntry::ForValues {
+            knowntype,
+            instance: Some(instance.clone()),
         },
         other => other,
     }
+}
+
+fn bind_lookup_instance(entry: ExtRegistryEntry, instance: &HostObject) -> ExtRegistryEntry {
+    bind_lookup_const_instance(entry, &ConstValue::HostObject(instance.clone()))
 }
 
 fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
@@ -1157,6 +1239,9 @@ pub fn is_registered(instance: &ConstValue) -> bool {
     match instance {
         ConstValue::LLPtr(_) => true,
         ConstValue::HostObject(host) => lookup_host_object(host).is_some(),
+        ConstValue::RInt(c, _, _) => {
+            lookup_type(&crate::rlib::rarithmetic::rint_class_object(*c)).is_some()
+        }
         _ => false,
     }
 }
@@ -1178,6 +1263,8 @@ pub fn lookup(instance: &ConstValue) -> Option<ExtRegistryEntry> {
     match instance {
         ConstValue::LLPtr(ptr) => Some(ExtRegistryEntry::Ptr(Some((**ptr).clone()))),
         ConstValue::HostObject(host) => lookup_host_object(host),
+        ConstValue::RInt(c, _, _) => lookup_type(&crate::rlib::rarithmetic::rint_class_object(*c))
+            .map(|entry| bind_lookup_const_instance(entry, instance)),
         _ => None,
     }
 }
@@ -2184,5 +2271,82 @@ mod tests {
                 ._dont_reach_me_in_del_,
             "marker must set _dont_reach_me_in_del_ on the position_key graph"
         );
+    }
+
+    /// `lookup` returns `Entry(type(instance), instance)`;
+    /// `ExtRegistryEntry.__eq__` / `__hash__` include `instance`.
+    #[test]
+    fn lookup_rint_values_keep_instance() {
+        use crate::annotator::model::SomeObjectTrait;
+
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let one = ConstValue::rint(uchar, 1);
+        let two = ConstValue::rint(uchar, 2);
+        let e1 = lookup(&one).expect("r_uchar(1) is registered");
+        let e2 = lookup(&two).expect("r_uchar(2) is registered");
+        assert_ne!(e1.makekey(), e2.makekey());
+        match (&e1, &e2) {
+            (
+                ExtRegistryEntry::ForValues {
+                    knowntype: k1,
+                    instance: Some(v1),
+                },
+                ExtRegistryEntry::ForValues {
+                    knowntype: k2,
+                    instance: Some(v2),
+                },
+            ) => {
+                assert_eq!(*k1, KnownType::RInt(uchar));
+                assert_eq!(*k2, KnownType::RInt(uchar));
+                assert_ne!(v1, v2);
+            }
+            other => panic!("expected ForValues with instance, got {other:?}"),
+        }
+        match (
+            e1.compute_annotation().expect("r_uchar(1) annotates"),
+            e2.compute_annotation().expect("r_uchar(2) annotates"),
+        ) {
+            (SomeValue::Integer(a), SomeValue::Integer(b)) => {
+                assert_eq!(a.knowntype(), KnownType::RInt(uchar));
+                assert_eq!(b.knowntype(), KnownType::RInt(uchar));
+            }
+            other => panic!("expected SomeInteger, got {other:?}"),
+        }
+    }
+
+    /// `BaseIntTypeEntry.compute_result_annotation` raises
+    /// `TypeError("abstract base!")`.
+    #[test]
+    fn base_int_call_is_abstract_base() {
+        use crate::annotator::argument::ArgumentsForTranslation;
+
+        let host = crate::rlib::rarithmetic::base_int_class();
+        let bk = Rc::new(Bookkeeper::new());
+        let _guard = bk.at_position(None);
+        let s_cls = bk
+            .immutablevalue(&ConstValue::HostObject(host))
+            .expect("base_int class annotates");
+        let s_arg = bk
+            .immutablevalue(&ConstValue::Int(5))
+            .expect("int 5 annotates");
+        let args = ArgumentsForTranslation::new(vec![Some(s_arg)], None, None);
+        let err = s_cls.call(&args).expect_err("base_int(5) is abstract");
+        assert!(err.to_string().contains("abstract base!"), "got: {err}");
+    }
+
+    /// `BaseIntValueEntry.compute_annotation` returns
+    /// `SomeInteger(knowntype=r_ulonglong)`.
+    #[test]
+    fn base_int_type_entry_annotates_ulonglong() {
+        use crate::annotator::model::SomeObjectTrait;
+
+        let host = crate::rlib::rarithmetic::base_int_class();
+        let entry = lookup_type(&host).expect("BaseIntValueEntry is registered");
+        match entry.compute_annotation().expect("base_int type annotates") {
+            SomeValue::Integer(si) => {
+                assert_eq!(si.knowntype(), KnownType::ULongLong);
+            }
+            other => panic!("expected SomeInteger(r_ulonglong), got {other:?}"),
+        }
     }
 }

@@ -45,6 +45,7 @@
 
 use core::fmt;
 use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use super::super::flowspace::model::{BlockKey, BlockRef, Constant, HostObject, Variable};
@@ -106,6 +107,45 @@ thread_local! {
 
 // KnownType — mirror of upstream `SomeObject.knowntype` class attribute.
 
+/// A class made by `rarithmetic.build_int(name, sign, bits, force_creation)`.
+/// Each `type(name, ...)` call is a distinct class: `PartialEq`/`Eq`/`Hash`
+/// use `id` only, so two `force_creation` classes compare unequal.
+/// `_inttypes` still caches by `(sign, bits)` when `force_creation` is false.
+#[derive(Clone, Copy, Debug)]
+pub struct RIntClass {
+    pub name: &'static str,
+    pub sign: bool,
+    pub bits: u16,
+    pub id: u32,
+}
+
+impl PartialEq for RIntClass {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for RIntClass {}
+
+impl Hash for RIntClass {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl RIntClass {
+    /// `MASK = (2 ** bits) - 1` on the class `build_int` constructs.
+    pub fn mask(&self) -> u128 {
+        if self.bits == 0 {
+            0
+        } else if self.bits >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << self.bits) - 1
+        }
+    }
+}
+
 /// RPython stores `knowntype` as a live Python type object
 /// (`int`, `float`, `str`, the classdef's `classdesc.pyobj`, …).
 /// The Rust port carries the same information as an enum tag so that
@@ -121,6 +161,10 @@ pub enum KnownType {
     /// `SomeInteger.__init__` branch that promotes `unsigned=True` to
     /// `r_uint`.
     Int,
+    /// `r_int` — `build_int('r_int', True, LONG_BIT)` (`rarithmetic.py`).
+    /// Distinct from builtin `int`; shares the Signed low-level type
+    /// (`_numbertypes[r_int] = _numbertypes[int]` in `lltype.py`).
+    Rint,
     /// `r_uint` — the RPython sister of `int`, set when
     /// `SomeInteger.unsigned` is true.
     Ruint,
@@ -132,6 +176,10 @@ pub enum KnownType {
     ULongLong,
     /// `r_ulonglonglong` — RPython's unsigned extended integer type.
     ULongLongLong,
+    /// A `build_int` class other than the predefined `int`/`r_int`/
+    /// `r_uint`/`r_longlong`/`r_longlonglong`/`r_ulonglong`/
+    /// `r_ulonglonglong` families.
+    RInt(RIntClass),
     /// `bool` — the RPython `SomeBool.knowntype = bool`.
     Bool,
     /// `float` — the RPython `SomeFloat.knowntype = float`.
@@ -193,11 +241,15 @@ impl fmt::Display for KnownType {
             KnownType::Object => f.write_str("object"),
             KnownType::Type => f.write_str("type"),
             KnownType::Int => f.write_str("int"),
+            KnownType::Rint => f.write_str("r_int"),
             KnownType::Ruint => f.write_str("r_uint"),
             KnownType::LongLong => f.write_str("r_longlong"),
             KnownType::LongLongLong => f.write_str("r_longlonglong"),
             KnownType::ULongLong => f.write_str("r_ulonglong"),
             KnownType::ULongLongLong => f.write_str("r_ulonglonglong"),
+            // `build_int` names the class `name`; print that, not a
+            // reconstructed `r_[u]int<bits>` spelling.
+            KnownType::RInt(c) => f.write_str(c.name),
             KnownType::Bool => f.write_str("bool"),
             KnownType::Float => f.write_str("float"),
             KnownType::Singlefloat => f.write_str("r_singlefloat"),
@@ -574,23 +626,26 @@ impl SomeInteger {
 
     /// Construct with an explicit [`KnownType`] — mirrors RPython's
     /// `SomeInteger(knowntype=...)` keyword call used by binaryop.py's
-    /// `compute_restype(...)` path (binaryop.py:201-202, :218-219).
+    /// `compute_restype(...)` path.
     ///
-    /// upstream model.py:211-224 derives `unsigned` from the knowntype
-    /// itself (`knowntype(-1) > 0`) and raises
+    /// `SomeInteger.__init__` derives `unsigned` from the knowntype
+    /// itself (`unsigned = self.knowntype(-1) > 0`) and raises
     /// `TypeError('Conflicting specification for SomeInteger')` when
     /// an explicit `unsigned` is passed alongside a non-None
     /// `knowntype`. The Rust port follows that contract: `unsigned`
     /// is strictly derived, so callers cannot pin both signedness and
     /// `KnownType::Ruint` to contradictory values.
     pub fn new_with_knowntype(nonneg: bool, knowntype: KnownType) -> Self {
-        // upstream: `unsigned = self.knowntype(-1) > 0`. The unsigned
-        // rarithmetic integer families treat -1 as a positive value;
-        // all other integer KnownTypes are signed.
-        let unsigned = matches!(
-            knowntype,
-            KnownType::Ruint | KnownType::ULongLong | KnownType::ULongLongLong
-        );
+        // `SomeInteger.__init__`: `unsigned = self.knowntype(-1) > 0`.
+        // Unsigned rarithmetic families treat -1 as a positive value.
+        // A 0-bit unsigned class has MASK 0, so `-1` masks to 0 and is
+        // not unsigned (`!c.sign && c.mask() > 0`).
+        let unsigned = match knowntype {
+            KnownType::Ruint | KnownType::ULongLong | KnownType::ULongLongLong => true,
+            KnownType::Rint => false,
+            KnownType::RInt(c) => !c.sign && c.mask() > 0,
+            _ => false,
+        };
         SomeInteger {
             base: SomeObject::new(knowntype, true),
             nonneg: unsigned || nonneg,
@@ -4360,6 +4415,56 @@ mod tests {
         assert!(!s.nonneg);
         assert!(!s.unsigned);
         assert_eq!(s.knowntype(), KnownType::Int);
+    }
+
+    #[test]
+    fn someinteger_rint_uchar_is_unsigned() {
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        let s = SomeInteger::new_with_knowntype(false, KnownType::RInt(uchar));
+        assert!(s.unsigned);
+        assert!(s.nonneg);
+        assert_eq!(s.knowntype(), KnownType::RInt(uchar));
+    }
+
+    #[test]
+    fn someinteger_rint_short_is_signed() {
+        let short = crate::rlib::rarithmetic::built_rint("r_short", true, 16);
+        let s = SomeInteger::new_with_knowntype(false, KnownType::RInt(short));
+        assert!(!s.unsigned);
+        assert!(!s.nonneg);
+        assert_eq!(s.knowntype(), KnownType::RInt(short));
+    }
+
+    #[test]
+    fn someinteger_predefined_rint_is_signed() {
+        let s = SomeInteger::new_with_knowntype(false, KnownType::Rint);
+        assert!(!s.unsigned);
+        assert!(!s.nonneg);
+        assert_eq!(s.knowntype(), KnownType::Rint);
+        assert_eq!(format!("{}", KnownType::Rint), "r_int");
+        let uchar = crate::rlib::rarithmetic::built_rint("r_uchar", false, 8);
+        assert_eq!(format!("{}", KnownType::RInt(uchar)), "r_uchar");
+        let short = crate::rlib::rarithmetic::built_rint("r_short", true, 16);
+        assert_eq!(format!("{}", KnownType::RInt(short)), "r_short");
+    }
+
+    #[test]
+    fn someinteger_zero_bit_unsigned_is_not_unsigned() {
+        // `SomeInteger.__init__`: `unsigned = self.knowntype(-1) > 0`.
+        // 0-bit unsigned MASK is 0, so `-1` masks to 0.
+        let r_u0 = match crate::rlib::rarithmetic::build_int(Some("r_u0"), false, 0, true)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            KnownType::RInt(c) => c,
+            other => panic!("expected KnownType::RInt, got {other:?}"),
+        };
+        let s = SomeInteger::new_with_knowntype(false, KnownType::RInt(r_u0));
+        assert!(!s.unsigned);
+        assert!(!s.nonneg);
+        let s_nonneg = SomeInteger::new_with_knowntype(true, KnownType::RInt(r_u0));
+        assert!(!s_nonneg.unsigned);
+        assert!(s_nonneg.nonneg);
+        assert_eq!(format!("{}", KnownType::RInt(r_u0)), "r_u0");
     }
 
     #[test]

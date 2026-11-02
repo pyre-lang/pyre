@@ -3074,9 +3074,12 @@ pub fn rtyper_makerepr(
         // structured MissingRTypeOperation with the expected target
         // module so follow-up cascading ports can anchor on the
         // surface without guessing.
-        SomeValue::Integer(i) => Ok(crate::translator::rtyper::rint::getintegerrepr(
-            &lltype::build_number(None, i.base.knowntype),
-        ) as std::sync::Arc<dyn Repr>),
+        SomeValue::Integer(i) => {
+            let lltype =
+                lltype::build_number(None, i.base.knowntype).map_err(TyperError::message)?;
+            Ok(crate::translator::rtyper::rint::getintegerrepr(&lltype)
+                as std::sync::Arc<dyn Repr>)
+        }
         // rbool.py: SomeBool.rtyper_makerepr returns the singleton
         // `bool_repr`.
         SomeValue::Bool(_) => {

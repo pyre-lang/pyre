@@ -444,6 +444,9 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::UInt(value) => *value != 0,
         ConstValue::Int128(value) => *value != 0,
         ConstValue::UInt128(value) => *value != 0,
+        ConstValue::RInt(c, value, _) => {
+            !crate::rlib::rarithmetic::rint_value(*c, *value).is_zero()
+        }
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
         ConstValue::SingleFloat(_) => {
             panic!("TypeError: not supported on r_singlefloat instances")
@@ -531,6 +534,9 @@ fn lowleveltype_size_hint(lltype: &LowLevelType) -> Option<usize> {
         | LowLevelType::Ptr(_)
         | LowLevelType::InteriorPtr(_) => Some(std::mem::size_of::<usize>()),
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Some(16),
+        LowLevelType::Number(n) => {
+            Some(crate::translator::rtyper::lltypesystem::rffi::sizeof_number(n) as usize)
+        }
         LowLevelType::Struct(_)
         | LowLevelType::Array(_)
         | LowLevelType::FixedSizeArray(_)
@@ -848,6 +854,9 @@ pub(crate) fn constant_to_lowlevel_value(
         (LowLevelType::Unsigned, ConstValue::UInt(n)) => Ok(lltype::LowLevelValue::Unsigned(*n)),
         (LowLevelType::Unsigned, ConstValue::Int(n)) => {
             Ok(lltype::LowLevelValue::Unsigned(*n as u64))
+        }
+        (LowLevelType::Number(n), ConstValue::RInt(c, v, _)) if n._type == *c => {
+            Ok(lltype::LowLevelValue::Number(n.clone(), *v))
         }
         (LowLevelType::Signed, ConstValue::Bool(b)) => {
             Ok(lltype::LowLevelValue::Signed(i64::from(*b)))
@@ -5080,6 +5089,19 @@ pub(crate) type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+    #[test]
+    fn attr_reverse_size_number_floors_like_rffi_sizeof() {
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let n65 = rffi::number_from_forced_int("r_int65_rclass", true, 65);
+        assert_eq!(attr_reverse_size(&("f".into(), n65)), Some(-8));
+        assert_eq!(
+            attr_reverse_size(&("f".into(), (*rffi::UCHAR).clone())),
+            Some(-1)
+        );
+        let n128 = rffi::number_from_forced_int("r_int128_rclass", true, 128);
+        assert_eq!(attr_reverse_size(&("f".into(), n128)), Some(-16));
+    }
 
     #[test]
     #[should_panic(expected = "not supported on r_singlefloat instances")]

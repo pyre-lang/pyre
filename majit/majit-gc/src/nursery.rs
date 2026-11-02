@@ -65,34 +65,28 @@ pub const HAS_PROTECT: bool = true;
 #[cfg(target_arch = "wasm32")]
 pub const HAS_PROTECT: bool = false;
 
+/// Alignment of a nursery arena allocation.
+///
+/// `llimpl_arena_malloc` is a plain `calloc`/`malloc` with no extra alignment.
+/// On the 64-bit hosts this crate supports, those return 16-byte aligned
+/// blocks — enough for the bump allocator's `MEMORY_ALIGNMENT` objects.
+const NURSERY_ARENA_ALIGN: usize = 16;
+
 /// The granularity [`protect_arena`] works in.
 #[cfg(not(target_arch = "wasm32"))]
 fn page_size() -> usize {
     region::page::size()
 }
-/// wasm32 never protects, so the value only has to be a plausible power of two.
-#[cfg(target_arch = "wasm32")]
-fn page_size() -> usize {
-    65536
-}
-
-/// The whole pages a nursery of `size` bytes occupies.
-///
-/// Protection is applied to whole pages, so an arena sharing its last page
-/// with another allocation could not be made inaccessible without taking that
-/// one with it. Rounding the request up is what makes the page ours to
-/// protect.
-fn arena_bytes(size: usize) -> usize {
-    let page = page_size();
-    size.div_ceil(page) * page
-}
 
 /// The layout every arena is allocated and freed with.
+///
+/// `llimpl_arena_malloc` requests exactly `size` bytes; Drop uses this same
+/// layout so `dealloc` matches.
 fn arena_layout(size: usize) -> Layout {
-    Layout::from_size_align(arena_bytes(size), page_size()).expect("invalid nursery layout")
+    Layout::from_size_align(size, NURSERY_ARENA_ALIGN).expect("invalid nursery layout")
 }
 
-/// `llarena.arena_malloc(..., zero=True)` for one nursery-sized arena.
+/// `llimpl_arena_malloc(..., zero=True)` for one nursery-sized arena.
 fn alloc_arena(size: usize) -> *mut u8 {
     let layout = arena_layout(size);
     let start = unsafe { alloc::alloc_zeroed(layout) };
@@ -102,19 +96,33 @@ fn alloc_arena(size: usize) -> *mut u8 {
     start
 }
 
-/// `llarena.arena_protect`.
+/// `llimpl_arena_protect`.
+///
+/// Only whole pages strictly inside `[start, start+size)` are changed: start
+/// is rounded up and end down to [`page_size()`]. `llimpl_arena_protect`
+/// hardcodes 4096; the host page size is the granule `mprotect` actually
+/// requires. Partial first and last pages stay accessible, so allocator
+/// bookkeeping that shares those pages is not taken with the arena.
 ///
 /// A failure is dropped rather than reported, as `llimpl_protect` drops it
 /// ("ignore potential errors"): the protection is a debugging aid and a host
 /// that refuses it must still run the program.
 #[cfg(not(target_arch = "wasm32"))]
 fn protect_arena(start: *mut u8, size: usize, inaccessible: bool) {
-    let protection = if inaccessible {
-        region::Protection::NONE
-    } else {
-        region::Protection::READ_WRITE
-    };
-    let _ = unsafe { region::protect(start, arena_bytes(size), protection) };
+    let page = page_size();
+    let mask = !(page - 1);
+    let start_addr = start as usize;
+    let prot_start = (start_addr + page - 1) & mask;
+    let prot_end = (start_addr + size) & mask;
+    if prot_end > prot_start {
+        let protection = if inaccessible {
+            region::Protection::NONE
+        } else {
+            region::Protection::READ_WRITE
+        };
+        let _ =
+            unsafe { region::protect(prot_start as *mut u8, prot_end - prot_start, protection) };
+    }
 }
 /// wasm32 has no `arena_protect`; see [`HAS_PROTECT`].
 #[cfg(target_arch = "wasm32")]
@@ -410,12 +418,44 @@ impl Drop for Nursery {
 mod tests {
     use super::*;
 
-    /// Protection works in whole pages, so an arena that did not start on one
-    /// could not be made inaccessible without taking a neighbour with it.
+    /// `llimpl_arena_protect` only covers whole pages strictly inside the
+    /// arena, so a retired arena's partial edge pages stay accessible.
     #[test]
-    fn an_arena_starts_on_a_page_boundary() {
-        let nursery = Nursery::new(4096);
-        assert_eq!(nursery.start_ptr() as usize % page_size(), 0);
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_retired_arena_protects_interior_pages_only() {
+        if !HAS_PROTECT {
+            return;
+        }
+        let page = page_size();
+        let size = 4 * page + 123;
+        let mut nursery = Nursery::new(size);
+        nursery.install_debug_rotating_nurseries(1);
+        let retired = nursery.start_ptr() as usize;
+        assert!(nursery.debug_rotate());
+
+        let mask = !(page - 1);
+        let round_up = (retired + page - 1) & mask;
+        let first_page = retired & mask;
+        let last_page = (retired + size - 1) & mask;
+        let wholly_inside =
+            |page_start: usize| page_start >= retired && page_start + page <= retired + size;
+
+        let first = region::query(retired as *const u8).expect("first byte mapped");
+        if wholly_inside(first_page) {
+            assert_eq!(first.protection(), region::Protection::NONE);
+        } else {
+            assert!(first.is_readable());
+        }
+
+        let last = region::query((retired + size - 1) as *const u8).expect("last byte mapped");
+        if wholly_inside(last_page) {
+            assert_eq!(last.protection(), region::Protection::NONE);
+        } else {
+            assert!(last.is_readable());
+        }
+
+        let interior = region::query(round_up as *const u8).expect("interior page mapped");
+        assert_eq!(interior.protection(), region::Protection::NONE);
     }
 
     /// `debug_rotate_nursery` hands out the ring's front arena and sends the

@@ -38,6 +38,7 @@ pypy/goal/*.dll
 release/
 !pypy/tool/release/
 rpython/_cache/
+/majit/_cache/
 .cache/
 .hypothesis
 lib_pypy/_audioop_cffi*

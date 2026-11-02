@@ -8628,6 +8628,20 @@ pub fn try_getkind(
         | LowLevelType::Char
         | LowLevelType::UniChar
         | LowLevelType::Address => Ok(ConcreteType::Signed),
+        LowLevelType::Number(n) => {
+            // `rffi.sizeof(TYPE)` for a Number is `tp._type.BITS/8`.
+            let nbytes = crate::translator::rtyper::lltypesystem::rffi::sizeof_number(n) as usize;
+            let signed = crate::layout::target_signed_size();
+            if nbytes > signed {
+                if nbytes == 8 && supports_longlong {
+                    Ok(ConcreteType::Float)
+                } else {
+                    Err(GetkindError::TooLarge)
+                }
+            } else {
+                Ok(ConcreteType::Signed)
+            }
+        }
         // 16-byte primitives, and `LongFloat`, which the longlong arm
         // excludes. `supports_longlong` only rescues a width of 8.
         LowLevelType::SignedLongLongLong
@@ -11392,6 +11406,39 @@ mod tests {
         assert!(first.unroll_safe);
     }
     use super::*;
+
+    #[test]
+    fn getkind_number_floors_sizeof_like_rffi() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi;
+
+        assert_eq!(
+            crate::layout::target_signed_size(),
+            8,
+            "65-bit Number is int only when sizeof(Signed) is 8"
+        );
+
+        let n65 = rffi::number_from_forced_int("r_int65_getkind", true, 65);
+        match &n65 {
+            LowLevelType::Number(n) => assert_eq!(rffi::sizeof_number(n), 8),
+            other => panic!("expected Number, got {other:?}"),
+        }
+        assert_eq!(getkind(&n65), ConcreteType::Signed);
+        assert_eq!(
+            try_getkind(&n65, true, true, true),
+            Ok(ConcreteType::Signed)
+        );
+
+        assert_eq!(rffi::sizeof(&*rffi::UCHAR).unwrap(), ConstValue::Int(1));
+        assert_eq!(getkind(&*rffi::UCHAR), ConcreteType::Signed);
+
+        let n128 = rffi::number_from_forced_int("r_int128_getkind", true, 128);
+        assert_eq!(rffi::sizeof(&n128).unwrap(), ConstValue::Int(16));
+        assert_eq!(
+            try_getkind(&n128, true, true, true),
+            Err(GetkindError::TooLarge)
+        );
+    }
 
     fn test_inline_expansion(
         at_offset_zero: bool,
