@@ -8419,7 +8419,7 @@ mod tests {
             assert!(
                 matches!(
                     inst.function_desc.borrow().specializer.as_ref(),
-                    Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+                    Some(Specializer::Argtype { parms }) if parms == &[0]
                 ),
                 "residual inst must keep specialize:argtype"
             );

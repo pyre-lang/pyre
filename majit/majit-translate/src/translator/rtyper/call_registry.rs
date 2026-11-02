@@ -1892,7 +1892,7 @@ mod tests {
             assert!(
                 matches!(
                     inst_entry.function_desc.borrow().specializer.as_ref(),
-                    Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+                    Some(Specializer::Argtype { parms }) if parms == &[0]
                 ),
                 "materialize_residual_inst must copy specialize:argtype"
             );
@@ -2023,7 +2023,7 @@ mod tests {
             assert!(
                 matches!(
                     inst_entry.function_desc.borrow().specializer.as_ref(),
-                    Some(Specializer::Argtype { parms }) if parms == &["0".to_string()]
+                    Some(Specializer::Argtype { parms }) if parms == &[0]
                 ),
                 "get_or_register of a residual inst must copy specialize:argtype"
             );

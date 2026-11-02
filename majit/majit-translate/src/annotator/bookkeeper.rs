@@ -370,16 +370,16 @@ pub struct Bookkeeper {
     pub pending_specializations: RefCell<Vec<Box<dyn Fn() -> Result<(), AnnotatorError>>>>,
     /// RPython `self.all_specializations = {}` (bookkeeper.py).
     ///
-    /// One entry per memo-specialised function, keyed by the funcdesc's
-    /// pointer identity (upstream keys by the `funcdesc` object itself,
-    /// specialize.py). Each value is the
-    /// `UnionFind(compute_one_result)` upstream uses (specialize.py) —
-    /// the families of argument tuples that can be called together, merged
-    /// on `union`, with each result living in its
+    /// `{FuncDesc: specialization-info}` keyed by the funcdesc object's
+    /// [`DescKey`] (`Desc.identity`) — the same identity every other
+    /// bookkeeper table uses. Insertion-ordered (`IndexMap`) as a Python
+    /// dict. Each value is the `UnionFind(compute_one_result)` upstream
+    /// uses (`memo`) — the families of argument tuples that can be called
+    /// together, merged on `union`, with each result living in its
     /// [`super::specialize::MemoTable`]'s `table` — paired with a per-
     /// family host-call error latch (see [`super::specialize::MemoFamily`]).
     /// Consumed by [`super::specialize::memo`].
-    pub all_specializations: RefCell<HashMap<usize, super::specialize::MemoFamily>>,
+    pub all_specializations: RefCell<IndexMap<DescKey, super::specialize::MemoFamily>>,
     /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
     ///
     /// Upstream distinguishes "no position entered" (attribute absent)
@@ -1325,7 +1325,7 @@ impl Bookkeeper {
             _jit_annotation_cache: RefCell::new(HashMap::new()),
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
-            all_specializations: RefCell::new(HashMap::new()),
+            all_specializations: RefCell::new(IndexMap::new()),
             position_entered: std::cell::Cell::new(false),
             needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
             struct_fields: RefCell::new(None),

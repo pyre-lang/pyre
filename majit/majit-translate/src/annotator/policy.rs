@@ -55,9 +55,11 @@ use crate::annotator::bookkeeper::Bookkeeper;
 /// `rpython/annotator/specialize.py` (or
 /// `rpython/rtyper/annlowlevel.py` for the `Ll` / `LlAndArg`
 /// variants). Bodies are executed by
-/// [`super::description::FunctionDesc::specialize`] — the `Memo` and
-/// `Ll*` variants still raise because they depend on infrastructure
-/// (Python runtime / rtyper annlowlevel) that hasn't landed.
+/// [`super::description::FunctionDesc::specialize`]. `Memo` dispatches
+/// to [`super::specialize::memo`]. `Ll` / `LlAndArg` dispatch to
+/// `LowLevelAnnotatorPolicy`; `ArgLltype` / `GenConst` /
+/// `LowLevelDefault` / `MixLevelDefault` dispatch to
+/// `annlowlevel.py`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Specializer {
     /// RPython `default_specialize` (specialize.py) — the no-op
@@ -77,14 +79,14 @@ pub enum Specializer {
     Memo,
     /// `specialize:arg(N)` → `specialize.specialize_argvalue`. The
     /// `parms` tuple carries the argument indices.
-    Arg { parms: Vec<String> },
+    Arg { parms: Vec<usize> },
     /// `specialize:arg_or_var(N)` → `specialize.specialize_arg_or_var`.
-    ArgOrVar { parms: Vec<String> },
+    ArgOrVar { parms: Vec<usize> },
     /// `specialize:argtype(N)` → `specialize.specialize_argtype`.
-    Argtype { parms: Vec<String> },
+    Argtype { parms: Vec<usize> },
     /// `specialize:arglistitemtype(N)` →
     /// `specialize.specialize_arglistitemtype`.
-    Arglistitemtype { parms: Vec<String> },
+    Arglistitemtype { parms: Vec<usize> },
     /// `specialize:call_location` →
     /// `specialize.specialize_call_location`.
     CallLocation,
@@ -406,10 +408,18 @@ pub(crate) fn specializer_from_normalized(
     match normalized {
         "default_specialize" => Ok(Specializer::Default),
         "specialize__memo" => Ok(Specializer::Memo),
-        "specialize__arg" => Ok(Specializer::Arg { parms }),
-        "specialize__arg_or_var" => Ok(Specializer::ArgOrVar { parms }),
-        "specialize__argtype" => Ok(Specializer::Argtype { parms }),
-        "specialize__arglistitemtype" => Ok(Specializer::Arglistitemtype { parms }),
+        "specialize__arg" => Ok(Specializer::Arg {
+            parms: parse_integer_argindices("arg", parms)?,
+        }),
+        "specialize__arg_or_var" => Ok(Specializer::ArgOrVar {
+            parms: parse_integer_argindices("arg_or_var", parms)?,
+        }),
+        "specialize__argtype" => Ok(Specializer::Argtype {
+            parms: parse_integer_argindices("argtype", parms)?,
+        }),
+        "specialize__arglistitemtype" => Ok(Specializer::Arglistitemtype {
+            parms: parse_integer_argindices("arglistitemtype", parms)?,
+        }),
         "specialize__call_location" => Ok(Specializer::CallLocation),
         "specialize__ll" => Ok(Specializer::Ll { parms }),
         "specialize__ll_and_arg" => Ok(Specializer::LlAndArg { parms }),
@@ -417,6 +427,22 @@ pub(crate) fn specializer_from_normalized(
             "{other:?} specialize tag not defined in annotation policy AnnotatorPolicy"
         ))),
     }
+}
+
+/// `policy.py get_specializer` `eval`s specialize directive parms to
+/// ints before calling `specialize_argvalue` / `arg_or_var` /
+/// `argtype` / `arglistitemtype`.
+fn parse_integer_argindices(kind: &str, parms: Vec<String>) -> Result<Vec<usize>, PolicyError> {
+    parms
+        .into_iter()
+        .map(|parm| {
+            parm.parse::<usize>().map_err(|_| {
+                PolicyError(format!(
+                    "specialize:{kind} expects integer indices, got {parm:?}"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// RPython `raise AttributeError(...)` / `raise Exception(...)` from
@@ -449,12 +475,8 @@ mod tests {
     #[test]
     fn specialize_arg_parses_parm_lists() {
         let cases = [
-            ("single", "specialize:arg(0)", vec!["0".to_string()]),
-            (
-                "multi",
-                "specialize:arg(0, 1)",
-                vec!["0".to_string(), "1".to_string()],
-            ),
+            ("single", "specialize:arg(0)", vec![0]),
+            ("multi", "specialize:arg(0, 1)", vec![0, 1]),
         ];
         let pol = AnnotatorPolicy::new();
         for (name, spec, parms) in cases {

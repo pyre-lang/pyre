@@ -4,7 +4,10 @@
 //! together with the abstract `rpython/rtyper/rlist.py` pieces.  This
 //! module keeps the upstream lltypesystem import path available.
 
+use std::sync::LazyLock;
+
 use crate::annotator::bookkeeper::Bookkeeper;
+use crate::annotator::description::{DescKey, alloc_desc_key};
 use crate::annotator::specialize::memotable_for_args;
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
@@ -84,9 +87,8 @@ pub fn ll_newlist_hint() -> Result<(), TyperError> {
     Err(lltypesystem_rlist_deferred("ll_newlist_hint"))
 }
 
-/// Identity stand-in for `_ll_prebuilt_empty_array`'s missing FunctionDesc.
-/// `memo()` keys `all_specializations` by `funcdesc as *const FunctionDesc as usize`.
-static LL_PREBUILT_EMPTY_ARRAY_FUNCDESC_KEY: u8 = 0;
+/// Stands in for `_ll_prebuilt_empty_array`'s FunctionDesc identity.
+static LL_PREBUILT_EMPTY_ARRAY_FUNCDESC_KEY: LazyLock<DescKey> = LazyLock::new(alloc_desc_key);
 
 fn malloc_prebuilt_empty_array(args: &[ConstValue]) -> Result<ConstValue, String> {
     let ty = match args.first() {
@@ -107,13 +109,13 @@ fn malloc_prebuilt_empty_array(args: &[ConstValue]) -> Result<ConstValue, String
 /// HostObject with `GraphFunc.host_call` so it can run `func(*args)`
 /// and return a SpecializeResult (annotation / dispatch graph). This
 /// helper is a builder-defined rtyper function: no pyobj, and the
-/// rtyper needs the immortal `_ptr`. Same map, same key kind, keyed by
-/// this helper's identity.
+/// rtyper needs the immortal `_ptr`. Same map, keyed by this helper's
+/// FunctionDesc identity.
 pub fn _ll_prebuilt_empty_array(
     bookkeeper: &Bookkeeper,
     listitem: &LowLevelType,
 ) -> Result<_ptr, TyperError> {
-    let funcdesc_key = std::ptr::addr_of!(LL_PREBUILT_EMPTY_ARRAY_FUNCDESC_KEY) as usize;
+    let funcdesc_key = *LL_PREBUILT_EMPTY_ARRAY_FUNCDESC_KEY;
     let args = vec![ConstValue::LowLevelType(Box::new(listitem.clone()))];
     let memotable = memotable_for_args(
         bookkeeper,

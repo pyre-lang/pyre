@@ -446,9 +446,9 @@ impl LowLevelAnnotatorPolicy {
         args_s: &mut Vec<Option<SomeValue>>,
         key_for_args: &HashMap<usize, KeyComp>,
     ) -> Result<Rc<PyGraph>, TyperError> {
-        let (args_s_flat, key1, builder) = funcdesc
-            .flatten_star_args(args_s)
-            .map_err(|e| TyperError::message(e.to_string()))?;
+        let (args_s_flat, key1, builder) =
+            crate::annotator::specialize::flatten_star_args(funcdesc, args_s)
+                .map_err(|e| TyperError::message(e.to_string()))?;
         let mut key = Vec::new();
         let mut new_args_s: Vec<Option<SomeValue>> = Vec::new();
         for (i, s_slot) in args_s_flat.iter().enumerate() {
@@ -687,8 +687,7 @@ impl MixLevelAnnotatorPolicy {
         if name.starts_with("ll_") || name.starts_with("_ll_") {
             self.ll.default_specialize(funcdesc, args_s)
         } else {
-            funcdesc
-                .default_specialize(args_s)
+            crate::annotator::specialize::default_specialize(funcdesc, args_s)
                 .map_err(|e| TyperError::message(e.to_string()))
         }
     }
