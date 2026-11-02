@@ -645,7 +645,6 @@ impl<T> ConstFold<T> {
 ///     trace and the runtime guard fires
 ///   * a shift count is outside `0..64`, as rejected by
 ///     `blackhole.check_shift_count`
-///   * IntFloorDiv / IntMod with a zero divisor
 ///
 /// Non-OVF IntAdd/IntSub/IntMul match `bhimpl_int_add/_sub/_mul`
 /// compute `intmask(a + b)`, i.e. wrapping i64 arithmetic. Using
@@ -685,12 +684,6 @@ pub fn execute_binary_int_const_row(opcode: OpCode, a: i64, b: i64) -> ConstFold
         OpCode::UintLe => Some(((a as u64) <= (b as u64)) as i64),
         OpCode::UintGe => Some(((a as u64) >= (b as u64)) as i64),
         OpCode::UintGt => Some(((a as u64) > (b as u64)) as i64),
-        // Truncating, as `_ll_2_int_floordiv` / `_ll_2_int_mod` are and as the
-        // blackhole and every backend execute them. Wrapping keeps
-        // `i64::MIN / -1` off the panic path; the trace guards that corner out
-        // before it reaches either op.
-        OpCode::IntFloorDiv => (b != 0).then(|| a.wrapping_div(b)),
-        OpCode::IntMod => (b != 0).then(|| a.wrapping_rem(b)),
         // `blackhole.bhimpl_int_signext` delegates to `support.int_signext`.
         OpCode::IntSignext => (1..=8)
             .contains(&b)
@@ -1513,17 +1506,6 @@ mod execute_nonspec_const_tests {
             (
                 OpCode::IntRshift,
                 vec![Value::Int(1), Value::Int(-1)],
-                Type::Int,
-            ),
-            // Zero divisor.
-            (
-                OpCode::IntFloorDiv,
-                vec![Value::Int(5), Value::Int(0)],
-                Type::Int,
-            ),
-            (
-                OpCode::IntMod,
-                vec![Value::Int(5), Value::Int(0)],
                 Type::Int,
             ),
             // OVF opcodes are spelled with `checked_*`.

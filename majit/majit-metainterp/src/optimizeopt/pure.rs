@@ -1189,8 +1189,7 @@ fn propagate_shared(
             //      the fold itself must decline.
             //   2. Helper-internal narrow skips on `IntAddOvf` /
             //      `IntSubOvf` / `IntMulOvf` overflow, shift
-            //      count outside `0..64`, `IntFloorDiv` /
-            //      `IntMod` divide-by-zero, and CAST_FLOAT_TO_INT
+            //      count outside `0..64`, and CAST_FLOAT_TO_INT
             //      non-finite (`execute_binary_int_const` /
             //      `execute_cast_const` return `Ok(None)`).
             //      Upstream `do_int_add_ovf` would `assert

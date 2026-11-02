@@ -706,8 +706,6 @@ fn advances_loop_state(opcode: majit_ir::OpCode) -> bool {
             | IntSub
             | IntMul
             | UintMulHigh
-            | IntFloorDiv
-            | IntMod
             | IntAnd
             | IntOr
             | IntXor

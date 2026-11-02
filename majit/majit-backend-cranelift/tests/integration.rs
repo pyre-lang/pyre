@@ -495,7 +495,7 @@ fn build_power_of_two_div_trace(divisor: i64, token_id: u64) -> (CraneliftBacken
     (backend, token)
 }
 
-// Test 7: IntFloorDiv magic-number pipeline (divisor = 7)
+// Test 7: magic-number pipeline (divisor = 7)
 //
 // The magic-number algorithm produces floor division (towards -inf).
 
@@ -524,12 +524,12 @@ fn test_intdiv_magic_number_pipeline() {
         let actual = backend.get_int_value(&frame, 0);
         assert_eq!(
             actual, expected,
-            "IntFloorDiv: {input} // 7 = expected {expected}, got {actual}"
+            "intdiv: {input} // 7 = expected {expected}, got {actual}"
         );
     }
 }
 
-// Test 8: IntMod magic-number pipeline (divisor = 7)
+// Test 8: magic-number pipeline (divisor = 7)
 
 #[test]
 fn test_intmod_magic_number_pipeline() {
@@ -555,12 +555,12 @@ fn test_intmod_magic_number_pipeline() {
         let actual = backend.get_int_value(&frame, 0);
         assert_eq!(
             actual, expected,
-            "IntMod: {input} % 7 = expected {expected}, got {actual}"
+            "intmod: {input} % 7 = expected {expected}, got {actual}"
         );
     }
 }
 
-// Test 9: IntFloorDiv power-of-2 pipeline (divisor = 8)
+// Test 9: power-of-2 pipeline (divisor = 8)
 //
 // The power-of-2 strength reduction uses the Hacker's Delight formula:
 //   result = (x + ((x >> 63) & (2^n - 1))) >> n
@@ -591,12 +591,12 @@ fn test_intdiv_power_of_two_pipeline() {
         let actual = backend.get_int_value(&frame, 0);
         assert_eq!(
             actual, expected,
-            "IntFloorDiv(pow2): {input} / 8 = expected {expected}, got {actual}"
+            "intdiv(pow2): {input} / 8 = expected {expected}, got {actual}"
         );
     }
 }
 
-// Test 10: IntFloorDiv magic-number various divisors
+// Test 10: magic-number various divisors
 
 #[test]
 fn test_intdiv_various_divisors() {
@@ -622,7 +622,7 @@ fn test_intdiv_various_divisors() {
             let actual = backend.get_int_value(&frame, 0);
             assert_eq!(
                 actual, expected,
-                "IntFloorDiv: {input} // {divisor} = expected {expected}, got {actual}"
+                "intdiv: {input} // {divisor} = expected {expected}, got {actual}"
             );
         }
     }

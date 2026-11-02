@@ -318,9 +318,10 @@ mod tests {
         );
     }
 
-    /// `execute_binary_int_const` declines `IntFloorDiv` by zero rather than
-    /// answering the tracer's 0, so the operation is recorded and the trace
-    /// and the optimizer cannot disagree about what the constant is.
+    /// `execute_binary_int_const` declines `IntLshift` with a count of 64
+    /// rather than answering the tracer's 0, so the operation is recorded
+    /// and the trace and the optimizer cannot disagree about what the
+    /// constant is.
     #[test]
     fn a_declining_evaluator_records_instead_of_folding() {
         let mut ctx = fresh_ctx();
@@ -328,13 +329,13 @@ mod tests {
         let before = ctx.num_ops();
         let op = ctx.execute_and_record(
             Some(cpu.as_ref()),
-            OpCode::IntFloorDiv,
+            OpCode::IntLshift,
             None,
-            &[OpRef::ConstInt(5), OpRef::ConstInt(0)],
+            &[OpRef::ConstInt(5), OpRef::ConstInt(64)],
             Some(Value::Int(0)),
             0,
         );
-        assert!(!op.is_constant(), "div by zero must not fold");
+        assert!(!op.is_constant(), "out-of-range shift must not fold");
         assert_eq!(ctx.num_ops(), before + 1);
     }
 

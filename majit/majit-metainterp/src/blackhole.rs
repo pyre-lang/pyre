@@ -4135,11 +4135,6 @@ mod tests {
             OpCode::IntAdd | OpCode::IntAddOvf => bhimpl_int_add(a, b),
             OpCode::IntSub | OpCode::IntSubOvf => bhimpl_int_sub(a, b),
             OpCode::IntMul | OpCode::IntMulOvf => bhimpl_int_mul(a, b),
-            // INT_FLOORDIV / INT_MOD are residual calls to the C-truncating
-            // helpers (support.py:255-271). The zero-divisor and INT_MIN/-1
-            // corners are guarded out of the trace before the call.
-            OpCode::IntFloorDiv => _ll_2_int_floordiv(a, b),
-            OpCode::IntMod => _ll_2_int_mod(a, b),
             OpCode::IntAnd => bhimpl_int_and(a, b),
             OpCode::IntOr => bhimpl_int_or(a, b),
             OpCode::IntXor => bhimpl_int_xor(a, b),
@@ -4221,14 +4216,6 @@ mod tests {
         assert_eq!(exec_binop(OpCode::IntMul, 6, 7), 42);
         assert_eq!(exec_binop(OpCode::IntMul, -3, 4), -12);
         assert_eq!(exec_binop(OpCode::IntMul, 0, 999), 0);
-        // FLOORDIV
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, 17, 5), 3);
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, -17, 5), -3);
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, 100, 1), 100);
-        // MOD
-        assert_eq!(exec_binop(OpCode::IntMod, 17, 5), 2);
-        assert_eq!(exec_binop(OpCode::IntMod, 10, 3), 1);
-        assert_eq!(exec_binop(OpCode::IntMod, 6, 3), 0);
     }
 
     #[test]
@@ -4513,10 +4500,6 @@ mod tests {
         assert_eq!(exec_binop(OpCode::IntMul, i64::MIN, -1), i64::MIN); // wrapping
         // -i64::MIN wraps to i64::MIN (two's complement)
         assert_eq!(exec_unop(OpCode::IntNeg, i64::MIN), i64::MIN);
-        // i64::MIN / -1 would overflow; wrapping_div wraps to i64::MIN
-        assert_eq!(exec_binop(OpCode::IntFloorDiv, i64::MIN, -1), i64::MIN);
-        // i64::MIN % -1 would overflow; wrapping_rem wraps to 0
-        assert_eq!(exec_binop(OpCode::IntMod, i64::MIN, -1), 0);
     }
 
     // ── Float special values ──

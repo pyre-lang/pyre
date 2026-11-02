@@ -3921,15 +3921,6 @@ pub enum OpCode {
     IntSub,
     IntMul,
     UintMulHigh,
-    /// `int_floordiv` / `int_mod`: the C-truncating division primitives, as
-    /// `support.py _ll_2_int_floordiv` / `_ll_2_int_mod` define them —
-    /// the quotient rounds toward zero and the remainder carries the
-    /// dividend's sign. Python's floor forms are separate: they reach the
-    /// optimizer as the `int_py_div` / `int_py_mod` oopspec calls that
-    /// `OptRewrite::optimize_call_int_py_div` / `_mod` expand, and those
-    /// expansions build the floor correction on top of these two.
-    IntFloorDiv,
-    IntMod,
     IntAnd,
     IntOr,
     IntXor,
@@ -4987,8 +4978,6 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(IntSub, 2);
     set!(IntMul, 2);
     set!(UintMulHigh, 2);
-    set!(IntFloorDiv, 2);
-    set!(IntMod, 2);
     set!(IntAnd, 2);
     set!(IntOr, 2);
     set!(IntXor, 2);
@@ -5366,8 +5355,6 @@ static OPRESTYPE: [Type; OPCODE_COUNT] = {
         IntSub,
         IntMul,
         UintMulHigh,
-        IntFloorDiv,
-        IntMod,
         IntAnd,
         IntOr,
         IntXor,
@@ -5575,8 +5562,6 @@ static OPNAME: [&str; OPCODE_COUNT] = {
         IntSub,
         IntMul,
         UintMulHigh,
-        IntFloorDiv,
-        IntMod,
         IntAnd,
         IntOr,
         IntXor,
@@ -6375,8 +6360,6 @@ mod tests {
             OpCode::IntSub,
             OpCode::IntMul,
             OpCode::UintMulHigh,
-            OpCode::IntFloorDiv,
-            OpCode::IntMod,
             OpCode::IntAnd,
             OpCode::IntOr,
             OpCode::IntXor,
@@ -6503,8 +6486,6 @@ mod tests {
             OpCode::IntAdd,
             OpCode::IntSub,
             OpCode::IntMul,
-            OpCode::IntFloorDiv,
-            OpCode::IntMod,
             OpCode::IntAnd,
             OpCode::IntOr,
             OpCode::IntXor,

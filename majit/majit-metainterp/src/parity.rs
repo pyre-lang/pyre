@@ -237,35 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn div_and_mod_ops_match_expected_trace_shape() {
-        let mut recorder = Trace::new();
-        let i0 = recorder.record_input_arg(Type::Int);
-        let mut ctx = TraceCtx::new(
-            recorder,
-            0,
-            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
-        );
-
-        let three = ctx.const_int(3);
-        let div = ctx.record_op(OpCode::IntFloorDiv, &[i0, three]);
-        let rem = ctx.record_op(OpCode::IntMod, &[i0, three]);
-        let sum = ctx.record_op(OpCode::IntAdd, &[div, rem]);
-        let (trace, constants) = finish_trace_ctx(ctx, &[sum]);
-
-        let case = TraceParityCase {
-            name: "div_and_mod_ops",
-            rpython_reference: "rpython/jit/metainterp/pyjitpl.py: int_c_div / int_c_mod tracing path",
-            expected_lines: &[
-                "v1 = IntFloorDiv(v0, 3)",
-                "v2 = IntMod(v0, 3)",
-                "v3 = IntAdd(v1, v2)",
-                "Finish(v3)",
-            ],
-        };
-        assert_trace_parity(&trace, &constants, &case);
-    }
-
-    #[test]
     fn shift_ops_match_expected_trace_shape() {
         let mut recorder = Trace::new();
         let i0 = recorder.record_input_arg(Type::Int);
