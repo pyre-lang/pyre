@@ -27,11 +27,12 @@ use crate::annotator::annrpython::apply_renaming;
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::description::DescEntry;
 use crate::annotator::model::{
-    SomeInstance, SomeInteger, SomeNone, SomeObjectTrait, SomeTypeOf, SomeValue, r#typeof,
+    SomeInstance, SomeInteger, SomeNone, SomeObjectTrait, SomePtr, SomeTypeOf, SomeValue, s_uint,
+    r#typeof,
 };
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType, VecFieldPart};
 use crate::translator::rtyper::error::TyperError;
 
 enum Incoming {
@@ -154,17 +155,22 @@ fn complete_pending_blocks(
                     }
                     _ => infer_op_type(&op.kind),
                 };
-                // `SomeObject.hint` returns `self` (unaryop.py); `same_as`
-                // likewise keeps the operand annotation, including a
-                // nonneg `SomeInteger` (`bind_array_view_len_in_block`
-                // plants `same_as` with `result_ty: Int`).
+                // `SomeObject.hint` returns `self` (unaryop.py). `same_as`
+                // keeps PBC / Bool; a `SomeInteger` operand goes through
+                // `integer_annotation_incoming` so a signedness-changing
+                // `result_ty` is `r_uint` / `intmask` rather than identity
+                // (`bind_array_view_len_in_block` still plants `same_as`
+                // with `result_ty: Int`, same signedness, nonneg kept).
                 let keep_operand = match &op.kind {
                     OpKind::Hint { value, .. } => read_binding_some(value),
                     OpKind::UnaryOp {
                         op: opname,
                         operand,
                         ..
-                    } if opname == "same_as" => read_binding_some(operand),
+                    } if opname == "same_as" => match read_binding_some(operand) {
+                        Some(rc) if matches!(rc.as_ref(), SomeValue::Integer(_)) => None,
+                        other => other,
+                    },
                     _ => None,
                 };
                 let incoming = match keep_operand {
@@ -178,9 +184,11 @@ fn complete_pending_blocks(
                     }
                     _ => typed_null_raw_incoming(bookkeeper, &op.kind)
                         .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
+                        .or_else(|| raw_ptr_annotation_incoming(result, &op.kind))
                         .or_else(|| type_someobject_incoming(&op.kind))
                         .or_else(|| option_payload_const_none_incoming(result, &op.kind))
                         .or_else(|| integer_annotation_incoming(&op.kind, bookkeeper))
+                        .or_else(|| binop_integer_incoming(&op.kind))
                         .unwrap_or(Incoming::Flat(inferred)),
                 };
                 if let Incoming::Annotation(sv) = &incoming
@@ -627,7 +635,9 @@ fn integer_const_incoming(value: &ConstValue, bookkeeper: Option<&Rc<Bookkeeper>
 
 /// `unaryop.py` `SomeObject.len` / `SomeString.len` and `SomeChar.ord`
 /// return `SomeInteger(nonneg=True)`. `infer_op_type` still reports
-/// flat `Int` for `read_binding`.
+/// flat `Int` for `read_binding`. Container-length `FieldRead` is the
+/// same count (`rlist.py` `ll_length`; `("length", Signed)`), not a
+/// possibly-negative struct field.
 fn integer_annotation_incoming(
     kind: &OpKind,
     bookkeeper: Option<&Rc<Bookkeeper>>,
@@ -651,8 +661,106 @@ fn integer_annotation_incoming(
         {
             Some(nonneg_signed_integer_incoming())
         }
+        OpKind::FieldRead {
+            field,
+            ty: ValueType::Int,
+            ..
+        } if is_container_len_field(field) => Some(nonneg_signed_integer_incoming()),
+        OpKind::UnaryOp {
+            op,
+            operand,
+            result_ty,
+        } if op == "same_as" => same_as_integer_incoming(operand, result_ty),
         _ => None,
     }
+}
+
+/// `rarithmetic.py` `r_uint(x)` / `intmask(x)` are signedness casts:
+/// `ForTypeEntry.compute_result_annotation` → `SomeInteger(knowntype=
+/// r_uint)`; `builtin.py` `rarith_intmask` → `SomeInteger()`.
+/// `rffi.cast` (`ForceCastEntry.compute_result_annotation`) annotates
+/// from the TARGET (`lltype_to_annotation`). Same signedness copies
+/// the operand (`unaryop.py` identity; nonneg preserved).
+fn same_as_integer_incoming(operand: &Variable, result_ty: &ValueType) -> Option<Incoming> {
+    let rc = read_binding_some(operand)?;
+    let SomeValue::Integer(i) = rc.as_ref() else {
+        return None;
+    };
+    match result_ty {
+        ValueType::Unsigned if !i.unsigned => Some(Incoming::Annotation(Rc::new(s_uint()))),
+        ValueType::Int if i.unsigned => Some(Incoming::Annotation(Rc::new(SomeValue::Integer(
+            SomeInteger::new(false, false),
+        )))),
+        _ => Some(Incoming::Annotation(rc)),
+    }
+}
+
+/// `unaryop.py` `SomeObject.len` / `rlist.py` `ll_length`. `vec_part`
+/// `Len` / `FatLen` are length words; `IntArray` / `FloatArray` `"len"`
+/// is `typed_array_len_owner`. `FatMeta` is the dyn vtable word
+/// (`rtuple.py` `TupleRepr.rtype_getitem` of `two_word_fat_struct`)
+/// and keeps the element's signed `SomeInteger`. A signed field that
+/// is not a length (`Buffer::Sub.size`, `last_instr`) stays out.
+fn is_container_len_field(field: &crate::model::FieldDescriptor) -> bool {
+    matches!(
+        field.vec_part,
+        Some(VecFieldPart::Len | VecFieldPart::FatLen)
+    ) || (field.name == "len"
+        && matches!(field.owner_root.as_deref(), Some("IntArray" | "FloatArray")))
+}
+
+/// `binaryop.py` `pairtype(SomeInteger, SomeInteger)`: `or_ = xor =
+/// add = mul = _clone(union, [])` (`integer_arith_union`); `sub` →
+/// `SomeInteger(knowntype=restype)` (`integer_sub`, nonneg False);
+/// `and_` → `nonneg = int1.nonneg or int2.nonneg` (`integer_and`,
+/// `integer_family_nonneg`). Two `SomeBool` operands take
+/// `pairtype(SomeBool, SomeBool)` `and_` / `or_` / `xor`
+/// (`bool_and_values` / `bool_or_values` / `bool_xor_values`).
+/// `rarithmetic.py` `compute_restype` supplies knowntype (`bool, bool`
+/// → `int`). Operand shells come from the live binding (`SomeInteger` /
+/// `SomeBool`); a `ConstInt` / `ConstUInt` producer already stored that
+/// shell via `bookkeeper.py immutablevalue`. Unbound operands and other
+/// ops (shifts, div, mod, comparisons) stay on the Flat `result_ty`
+/// path. A signedness `UnionError` from `integer_arith_union` also
+/// falls back to Flat — the result slot merge still raises if that
+/// conflicts.
+fn binop_integer_incoming(kind: &OpKind) -> Option<Incoming> {
+    use crate::annotator::binaryop::{
+        bool_and_values, bool_or_values, bool_xor_values, integer_arith_union,
+        integer_family_nonneg,
+    };
+    let OpKind::BinOp { op, lhs, rhs, .. } = kind else {
+        return None;
+    };
+    let s0 = integer_family_operand(lhs)?;
+    let s1 = integer_family_operand(rhs)?;
+    let both_bool = matches!(
+        (s0.as_ref(), s1.as_ref()),
+        (SomeValue::Bool(_), SomeValue::Bool(_))
+    );
+    let result = match op.as_str() {
+        "or" | "or_" | "or_ovf" | "bitor" if both_bool => bool_or_values(s0.as_ref(), s1.as_ref()),
+        "xor" | "bitxor" | "xor_ovf" if both_bool => bool_xor_values(s0.as_ref(), s1.as_ref()),
+        "and" | "and_" | "bitand" if both_bool => bool_and_values(s0.as_ref(), s1.as_ref()),
+        "add" | "add_ovf" | "mul" | "mul_ovf" | "or" | "or_" | "or_ovf" | "bitor" | "xor"
+        | "bitxor" | "xor_ovf" => integer_arith_union(s0.as_ref(), s1.as_ref()).ok()?,
+        "sub" | "sub_ovf" => {
+            let kt = crate::rlib::rarithmetic::compute_restype(s0.knowntype(), s1.knowntype());
+            SomeValue::Integer(SomeInteger::new_with_knowntype(false, kt))
+        }
+        "and" | "and_" | "bitand" => {
+            let nonneg = integer_family_nonneg(s0.as_ref()) || integer_family_nonneg(s1.as_ref());
+            let kt = crate::rlib::rarithmetic::compute_restype(s0.knowntype(), s1.knowntype());
+            SomeValue::Integer(SomeInteger::new_with_knowntype(nonneg, kt))
+        }
+        _ => return None,
+    };
+    Some(Incoming::Annotation(Rc::new(result)))
+}
+
+fn integer_family_operand(var: &Variable) -> Option<Rc<SomeValue>> {
+    let rc = read_binding_some(var)?;
+    is_integer_family_shell(rc.as_ref()).then_some(rc)
 }
 
 fn nonneg_signed_integer_incoming() -> Incoming {
@@ -760,6 +868,156 @@ fn typed_null_raw_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) -
         Ok(sv @ SomeValue::Instance(_)) => Some(Incoming::Annotation(Rc::new(sv))),
         _ => None,
     }
+}
+
+/// `lltype.py` `SomePtr` / `ann_malloc` / `ann_cast_int_to_ptr`. A raw
+/// `*mut u8` / `*const u8` is `SomePtr(CCHARP)` (`rffi.py` `CCHARP`),
+/// never `SomeInteger`. `infer_op_type` still reports the JIT bank
+/// (`history.py` `getkind` of a raw `Ptr` is `'int'`).
+fn raw_ptr_annotation_incoming(result: &Variable, kind: &OpKind) -> Option<Incoming> {
+    match kind {
+        OpKind::RawMalloc { owner, TYPE, .. } => {
+            // Str-family TYPE/owner stays Flat so `infer_op_type` `Str`
+            // wins (`rstr.py` `mallocstr` / `SomeString`). `ann_malloc` of
+            // a typed container is `SomePtr(Ptr(s_T.const))`; a TYPE-less
+            // byte buffer is `raw_alloc_ptr_somevalue` → `SomePtr(CCHARP)`.
+            if crate::front::mir::is_str_family_class_root(owner)
+                || crate::front::mir::is_rstr_str_layout_declaration(owner)
+            {
+                return None;
+            }
+            Some(Incoming::Annotation(Rc::new(someptr_from_raw_malloc_type(
+                TYPE.as_ref(),
+            ))))
+        }
+        OpKind::Call {
+            target,
+            args,
+            result_ty,
+            ..
+        } if matches!(
+            target.path_segments().as_deref(),
+            Some([.., "lltype", "cast_int_to_ptr"])
+        ) =>
+        {
+            Some(Incoming::Annotation(Rc::new(someptr_from_cast_int_to_ptr(
+                result, args, result_ty,
+            ))))
+        }
+        OpKind::Call { target, .. } if is_get_raw_address_of_string(target) => {
+            Some(ccharp_someptr_incoming())
+        }
+        OpKind::Call { .. } | OpKind::FieldRead { .. } | OpKind::Input { .. }
+            if var_concretetype_is_ccharp(result) =>
+        {
+            Some(ccharp_someptr_incoming())
+        }
+        OpKind::FieldRead {
+            field,
+            ty: ValueType::Unsigned,
+            ..
+        } if field.vec_part == Some(VecFieldPart::FatData) => Some(ccharp_someptr_incoming()),
+        _ => None,
+    }
+}
+
+/// Same shell as `builtin.rs` `raw_alloc_ptr_somevalue`: `SomePtr` of
+/// `rffi.py` `CCHARP`.
+fn ccharp_someptr() -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+    let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+        unreachable!("CCHARP is a pointer");
+    };
+    SomeValue::Ptr(SomePtr::new(*ptr_ty))
+}
+
+fn ccharp_someptr_incoming() -> Incoming {
+    Incoming::Annotation(Rc::new(ccharp_someptr()))
+}
+
+/// `lltype.py` `ann_malloc`: `SomePtr(Ptr(s_T.const))` when TYPE is the
+/// allocated Struct/Array (`Ptr::from_container_type`). `TYPE: None` is
+/// a front-end scalar spill / `std::alloc` byte buffer
+/// (`builtin.rs` `raw_alloc_ptr_somevalue` → `SomePtr(CCHARP)`).
+#[allow(non_snake_case)]
+fn someptr_from_raw_malloc_type(
+    TYPE: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr};
+    let Some(t) = TYPE else {
+        return ccharp_someptr();
+    };
+    if let LowLevelType::Ptr(ptr_ty) = t {
+        return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
+    }
+    match Ptr::from_container_type(t.clone()) {
+        Ok(ptr) => SomeValue::Ptr(SomePtr::new(ptr)),
+        Err(_) => ccharp_someptr(),
+    }
+}
+
+/// `history.py` `getkind` of a raw `Ptr` is `'int'`. `resolve_types`
+/// `commit_concretetype` keeps a `Ptr(Array)` (`rffi.py` `CCHARP`) and
+/// will not replace it with the `Ref` projection of
+/// `somevalue_to_valuetype(SomePtr)`.
+fn stamp_someptr_lltype(var: &Variable, sv: &SomeValue) {
+    let SomeValue::Ptr(p) = sv else {
+        return;
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    var.set_concretetype(Some(LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()))));
+}
+
+/// `ann_cast_int_to_ptr(PtrT, s_int)` → `SomePtr(PtrT.const)`. Dest
+/// already carrying a `Ptr` (`emit_dest_typed_cast_int_to_ptr`) keeps
+/// that `PtrT`. 1-arg `cast_int_to_ptr_call` omits PtrT; dest is
+/// `llmemory.GCREF` (`emit_host_cast_llop` / `result_ty: Ref`). Missing
+/// PtrT on a non-Ref dest is `CCHARP` (`emit_ccharp_nullptr`).
+fn someptr_from_cast_int_to_ptr(
+    result: &Variable,
+    args: &[LinkArg],
+    result_ty: &ValueType,
+) -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if let Some(LinkArg::Const(c)) = args.first()
+        && let ConstValue::LowLevelType(ll) = &c.value
+        && let LowLevelType::Ptr(ptr_ty) = ll.as_ref()
+    {
+        return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
+    }
+    if let Some(ct) = result.concretetype().as_ref()
+        && let LowLevelType::Ptr(ptr_ty) = ct
+    {
+        return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
+    }
+    if FunctionGraph::concretetype_of(result) == crate::model::ConcreteType::GcRef
+        || matches!(result_ty, ValueType::Ref(_))
+    {
+        return crate::annotator::bookkeeper::gcref_ptr_annotation();
+    }
+    ccharp_someptr()
+}
+
+fn is_get_raw_address_of_string(target: &CallTarget) -> bool {
+    let Some(segs) = target.path_segments() else {
+        return false;
+    };
+    matches!(
+        segs.last().copied(),
+        Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+            | Some(crate::codewriter::get_raw_address::LL_GET_RAW_ADDRESS_OF_STRING)
+    )
+}
+
+/// Production stamps `rffi.py` `CCHARP` / `CONST_CCHARP` on a declared
+/// `*mut u8` / `*const u8` (`stamp_raw_u8_ccharp` / `stamp_as_ccharp`).
+fn var_concretetype_is_ccharp(var: &Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::rffi::{CCHARP, CONST_CCHARP};
+    matches!(
+        var.concretetype().as_ref(),
+        Some(ct) if *ct == *CCHARP || *ct == *CONST_CCHARP
+    )
 }
 
 /// `getFrozenPBCRepr`: `follow_link` / `mergeinputargs` union incoming
@@ -1101,6 +1359,7 @@ fn store_annotation_union(
 ) -> Result<bool, TyperError> {
     match crate::annotator::model::union(existing, incoming) {
         Ok(u) if u != *existing => {
+            stamp_someptr_lltype(var, &u);
             *var.annotation.borrow_mut() = Some(Rc::new(u));
             Ok(true)
         }
@@ -1198,6 +1457,7 @@ fn merge_ptr_family_binding(
 ) -> Result<bool, TyperError> {
     match read_binding_some(var) {
         None => {
+            stamp_someptr_lltype(var, incoming.as_ref());
             *var.annotation.borrow_mut() = Some(incoming);
             Ok(true)
         }
@@ -1221,6 +1481,7 @@ fn merge_ptr_family_binding(
             }
             match crate::annotator::model::union(existing.as_ref(), incoming.as_ref()) {
                 Ok(u) if u != *existing => {
+                    stamp_someptr_lltype(var, &u);
                     *var.annotation.borrow_mut() = Some(Rc::new(u));
                     Ok(true)
                 }
@@ -1544,6 +1805,41 @@ fn const_value_type(value: &ConstValue) -> ValueType {
 ///
 /// RPython equivalent: annotator dispatch (e.g., `annotate_int_add`
 /// returns `SomeInteger()`).
+/// `rstr.py` `mallocstr` → `malloc(STR, n)` → `Ptr(STR)` / `SomeString`.
+#[allow(non_snake_case)]
+fn malloc_owner_is_str(
+    owner: &str,
+    TYPE: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> bool {
+    if crate::front::mir::is_str_family_class_root(owner)
+        || crate::front::mir::is_rstr_str_layout_declaration(owner)
+    {
+        return true;
+    }
+    let Some(t) = TYPE else {
+        return false;
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let name = match t {
+        LowLevelType::Struct(s) => s._name.as_str(),
+        LowLevelType::Ptr(p) => match &p.TO {
+            PtrTarget::Struct(s) => s._name.as_str(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    crate::front::mir::is_str_family_class_root(name)
+        || crate::front::mir::is_rstr_str_layout_declaration(name)
+}
+
+fn malloc_new_result_type(owner: &str) -> ValueType {
+    if malloc_owner_is_str(owner, None) {
+        ValueType::Str
+    } else {
+        ValueType::Ref(Some(owner.to_string()))
+    }
+}
+
 fn infer_op_type(kind: &OpKind) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
@@ -1580,11 +1876,22 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         OpKind::RawStore { .. } => ValueType::Void,
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,
-        OpKind::New { owner } => ValueType::Ref(Some(owner.clone())),
-        OpKind::NewWithVtable { owner, .. } => ValueType::Ref(Some(owner.clone())),
+        // `rstr.py` `mallocstr` → `malloc(STR, n)` → `Ptr(STR)` /
+        // `SomeString`. A str-family owner is `Str`, not `Ref(PyObject)`.
+        OpKind::New { owner } => malloc_new_result_type(owner),
+        OpKind::NewWithVtable { owner, .. } => malloc_new_result_type(owner),
         // Fixed-size `lltype.malloc(T, flavor='raw')` returns a Signed
-        // address. `lltype.free(p, flavor='raw')` returns nothing.
-        OpKind::RawMalloc { .. } => ValueType::Int,
+        // address except str-family TYPE/owner (`mallocstr`). Immortal
+        // `alloc_varsize_with_gc_header_immortal` of a STR is dest-Str
+        // after the Call (`GCRefRepr.convert_from_to`). `lltype.free`
+        // returns nothing.
+        OpKind::RawMalloc { owner, TYPE, .. } => {
+            if malloc_owner_is_str(owner, TYPE.as_ref()) {
+                ValueType::Str
+            } else {
+                ValueType::Int
+            }
+        }
         OpKind::RawFree { .. } => ValueType::Void,
         // `new_array_clear` yields a `Ref` to the freshly allocated,
         // zero-cleared items array (`Ptr(GcArray(OBJECTPTR))`).
@@ -1827,7 +2134,8 @@ fn union_type(a: &ValueType, b: &ValueType) -> ValueType {
 mod tests {
     use super::*;
     use crate::model::{
-        CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
+        CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, ValueType,
+        VecFieldPart, exception_exitcase,
     };
 
     #[test]
@@ -3892,5 +4200,943 @@ mod tests {
             "merge_flat error: {err}"
         );
         assert_eq!(read_binding(&mix), ValueType::Str);
+    }
+
+    #[test]
+    fn str_family_malloc_phi_is_str() {
+        // `rstr.py` `mallocstr` → `malloc(STR, n)` → `Ptr(STR)` /
+        // `SomeString`. `try_alloc_bytes_block` Managed GC New ∪ immortal
+        // STR RawMalloc.
+        let mut graph = FunctionGraph::new("try_alloc_bytes_block_shape");
+        let pred_gc = graph.create_block();
+        let pred_immortal = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let gc_var = graph
+            .push_op_var(
+                pred_gc,
+                OpKind::New {
+                    owner: "unicodeobject::Utf8Str".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let immortal_var = graph
+            .push_op_var(
+                pred_immortal,
+                OpKind::raw_malloc_with_flags(
+                    "unicodeobject::Utf8Str",
+                    None,
+                    false,
+                    true,
+                    false,
+                    vec![],
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_gc, pred_immortal);
+        graph.set_goto(pred_gc, join, vec![gc_var]);
+        graph.set_goto(pred_immortal, join, vec![immortal_var]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("STR New ∪ STR RawMalloc");
+        assert_eq!(read_binding(&phi), ValueType::Str);
+        assert!(
+            matches!(
+                read_binding_some(&phi).as_deref(),
+                Some(SomeValue::String(_))
+            ),
+            "phi is SomeString, got {:?}",
+            read_binding_some(&phi)
+        );
+    }
+
+    #[test]
+    fn object_new_phi_str_is_union_error() {
+        // A real `PyObject` New ∪ Str is still UnionError
+        // (`binaryop.py` `pairtype(SomeObject, SomeObject).union`).
+        let mut graph = FunctionGraph::new("pyobject_new_phi_str");
+        let pred_obj = graph.create_block();
+        let pred_str = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let obj_var = graph
+            .push_op_var(
+                pred_obj,
+                OpKind::New {
+                    owner: "pyobject::PyObject".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let str_var = graph
+            .push_op_var(pred_str, OpKind::ConstStr(b"x".to_vec()), true)
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_obj, pred_str);
+        graph.set_goto(pred_obj, join, vec![obj_var]);
+        graph.set_goto(pred_str, join, vec![str_var]);
+        graph.set_return(join, Some(phi));
+        let err = annotate_inner(&graph, None).expect_err("PyObject New ∪ Str is UnionError");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    #[test]
+    fn fatlen_fieldread_phi_unsigned_is_unsigned() {
+        // `unaryop.py` `SomeObject.len` / `SomeString.len` →
+        // `SomeInteger(nonneg=True)`. Slice `FatLen` is that count
+        // (`rlist.py` `ll_length`).
+        let mut graph = FunctionGraph::new("fatlen_phi_unsigned");
+        let pred_len = graph.create_block();
+        let pred_unsigned = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let base = graph
+            .push_op_var(
+                pred_len,
+                OpKind::Input {
+                    name: "window".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let len_var = graph
+            .push_op_var(
+                pred_len,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("as_bytes", None)
+                        .with_vec_part(VecFieldPart::FatLen),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let unsigned_var = graph
+            .push_op_var(
+                pred_unsigned,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_len, pred_unsigned);
+        graph.set_goto(pred_len, join, vec![len_var]);
+        graph.set_goto(pred_unsigned, join, vec![unsigned_var]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("FieldRead FatLen ∪ Unsigned");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.unsigned, "unsigned won, got {i:?}");
+            }
+            other => panic!("phi is SomeInteger unsigned, got {other:?}"),
+        }
+        assert_eq!(read_binding(&phi), ValueType::Unsigned);
+    }
+
+    #[test]
+    fn size_fieldread_phi_unsigned_is_union_error() {
+        // A signed field that is not a length stays `nonneg=False`
+        // (`binaryop.py` `pairtype(SomeInteger, SomeInteger).union`).
+        let mut graph = FunctionGraph::new("size_phi_unsigned");
+        let pred_size = graph.create_block();
+        let pred_unsigned = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let base = graph
+            .push_op_var(
+                pred_size,
+                OpKind::Input {
+                    name: "sub".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let size_var = graph
+            .push_op_var(
+                pred_size,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("size", None),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let unsigned_var = graph
+            .push_op_var(
+                pred_unsigned,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_size, pred_unsigned);
+        graph.set_goto(pred_size, join, vec![size_var]);
+        graph.set_goto(pred_unsigned, join, vec![unsigned_var]);
+        graph.set_return(join, Some(phi));
+        let err = annotate_inner(&graph, None).expect_err("FieldRead size ∪ Unsigned");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    #[test]
+    fn fatmeta_fieldread_is_signed_not_nonneg() {
+        // `FatMeta` is the `&dyn Trait` metadata word (`rtuple.py`
+        // `TupleRepr.rtype_getitem` of `two_word_fat_struct`), not
+        // `unaryop.py` `SomeObject.len`. Flat `Int` is
+        // `SomeInteger()` (`nonneg=False`).
+        let mut graph = FunctionGraph::new("fatmeta_signed");
+        let entry = graph.startblock;
+        let base = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "slot".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let meta_var = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("slot", None).with_vec_part(VecFieldPart::FatMeta),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(meta_var.clone()));
+        annotate_inner(&graph, None).expect("FieldRead FatMeta");
+        match read_binding_some(&meta_var).as_deref() {
+            Some(SomeValue::Integer(i)) => {
+                assert!(!i.nonneg, "FatMeta is not a length, got {i:?}");
+                assert!(!i.unsigned, "FatMeta stays signed, got {i:?}");
+            }
+            other => panic!("FatMeta is signed SomeInteger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fatmeta_fieldread_phi_unsigned_is_union_error() {
+        // `FatMeta` keeps the element's signed `SomeInteger`
+        // (`rtuple.py` `TupleRepr.rtype_getitem`). Joining with
+        // unsigned is `binaryop.py`
+        // `pairtype(SomeInteger, SomeInteger).union`.
+        let mut graph = FunctionGraph::new("fatmeta_phi_unsigned");
+        let pred_meta = graph.create_block();
+        let pred_unsigned = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let base = graph
+            .push_op_var(
+                pred_meta,
+                OpKind::Input {
+                    name: "slot".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let meta_var = graph
+            .push_op_var(
+                pred_meta,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("slot", None).with_vec_part(VecFieldPart::FatMeta),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let unsigned_var = graph
+            .push_op_var(
+                pred_unsigned,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_meta, pred_unsigned);
+        graph.set_goto(pred_meta, join, vec![meta_var]);
+        graph.set_goto(pred_unsigned, join, vec![unsigned_var]);
+        graph.set_return(join, Some(phi));
+        let err = annotate_inner(&graph, None).expect_err("FieldRead FatMeta ∪ Unsigned");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    #[test]
+    fn binop_add_const_and_len_phi_unsigned_is_unsigned() {
+        // `binaryop.py` `add = _clone(union, [])` (`integer_union`).
+        // `ConstInt(1)` is nonneg (`bookkeeper.py immutablevalue`);
+        // FatLen is `SomeObject.len`. Their union stays nonneg.
+        let mut graph = FunctionGraph::new("binop_add_phi_unsigned");
+        let pred_add = graph.create_block();
+        let pred_unsigned = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let base = graph
+            .push_op_var(
+                pred_add,
+                OpKind::Input {
+                    name: "window".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let len_var = graph
+            .push_op_var(
+                pred_add,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("as_bytes", None)
+                        .with_vec_part(VecFieldPart::FatLen),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = graph
+            .push_op_var(pred_add, OpKind::ConstInt(1), true)
+            .unwrap();
+        let add_var = graph
+            .push_op_var(
+                pred_add,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: one,
+                    rhs: len_var,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let unsigned_var = graph
+            .push_op_var(
+                pred_unsigned,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_add, pred_unsigned);
+        graph.set_goto(pred_add, join, vec![add_var]);
+        graph.set_goto(pred_unsigned, join, vec![unsigned_var]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("BinOp add(ConstInt(1), FatLen) ∪ Unsigned");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.unsigned, "unsigned won, got {i:?}");
+            }
+            other => panic!("phi is SomeInteger unsigned, got {other:?}"),
+        }
+        assert_eq!(read_binding(&phi), ValueType::Unsigned);
+    }
+
+    #[test]
+    fn binop_sub_len_and_const_phi_unsigned_is_union_error() {
+        // `binaryop.py` `sub` (`integer_sub`) returns
+        // `SomeInteger(knowntype=restype)` with nonneg False.
+        let mut graph = FunctionGraph::new("binop_sub_phi_unsigned");
+        let pred_sub = graph.create_block();
+        let pred_unsigned = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let base = graph
+            .push_op_var(
+                pred_sub,
+                OpKind::Input {
+                    name: "window".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let len_var = graph
+            .push_op_var(
+                pred_sub,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("as_bytes", None)
+                        .with_vec_part(VecFieldPart::FatLen),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let one = graph
+            .push_op_var(pred_sub, OpKind::ConstInt(1), true)
+            .unwrap();
+        let sub_var = graph
+            .push_op_var(
+                pred_sub,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: len_var,
+                    rhs: one,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let unsigned_var = graph
+            .push_op_var(
+                pred_unsigned,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_sub, pred_unsigned);
+        graph.set_goto(pred_sub, join, vec![sub_var]);
+        graph.set_goto(pred_unsigned, join, vec![unsigned_var]);
+        graph.set_return(join, Some(phi));
+        let err =
+            annotate_inner(&graph, None).expect_err("BinOp sub(FatLen, ConstInt(1)) ∪ Unsigned");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    #[test]
+    fn binop_add_two_equal_constants_is_not_constant() {
+        // `binaryop.py` `_clone(union, [])`: add/mul/xor allocate a
+        // fresh `SomeInteger` and never copy `const`.
+        let bk = Rc::new(Bookkeeper::new());
+        for op in ["add", "mul", "xor"] {
+            let mut graph = FunctionGraph::new(format!("binop_{op}_two_const"));
+            let entry = graph.startblock;
+            let lhs = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+            let rhs = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+            let result = graph
+                .push_op_var(
+                    entry,
+                    OpKind::BinOp {
+                        op: op.into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(result.clone()));
+            annotate_inner(&graph, Some(&bk)).unwrap_or_else(|e| panic!("{op}(2, 2): {e}"));
+            match read_binding_some(&result).as_deref() {
+                Some(SomeValue::Integer(i)) => {
+                    assert!(
+                        !i.is_constant(),
+                        "{op}(2, 2) must drop operand const, got {i:?}"
+                    );
+                    assert!(i.nonneg, "{op}(2, 2) is nonneg, got {i:?}");
+                }
+                other => panic!("{op}(2, 2) is SomeInteger, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn binop_add_two_bools_is_integer() {
+        // `pairtype(SomeInteger, SomeInteger)` add is `_clone(union)`;
+        // `rarithmetic.py` `compute_restype(bool, bool)` is `int`.
+        use crate::annotator::model::KnownType;
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = FunctionGraph::new("binop_add_two_bools");
+        let entry = graph.startblock;
+        let lhs = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let rhs = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+        annotate_inner(&graph, Some(&bk)).expect("bool + bool");
+        match read_binding_some(&result).as_deref() {
+            Some(SomeValue::Integer(i)) => {
+                assert_eq!(i.base.knowntype, KnownType::Int);
+                assert!(i.nonneg, "bool+bool is nonneg, got {i:?}");
+            }
+            other => panic!("bool + bool is SomeInteger(Int), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binop_and_two_bools_is_bool() {
+        // `pairtype(SomeBool, SomeBool).and_` returns `SomeBool`.
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = FunctionGraph::new("binop_and_two_bools");
+        let entry = graph.startblock;
+        let lhs = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let rhs = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "and".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+        annotate_inner(&graph, Some(&bk)).expect("bool and bool");
+        match read_binding_some(&result).as_deref() {
+            Some(SomeValue::Bool(_)) => {}
+            other => panic!("bool and bool is SomeBool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binop_xor_two_true_constants_is_false() {
+        // `pairtype(SomeBool, SomeBool).xor` folds `const ^ const`.
+        // `ConstBool` ops do not go through `immutablevalue`, so the
+        // operands are seeded the way `bookkeeper.py immutablevalue`
+        // stamps `const_box` on a bool constant.
+        let bk = Rc::new(Bookkeeper::new());
+        let s_true = bk
+            .immutablevalue(&ConstValue::Bool(true))
+            .expect("immutablevalue of true");
+        let mut graph = FunctionGraph::new("binop_xor_two_true");
+        let entry = graph.startblock;
+        let lhs = graph.alloc_value_var();
+        let rhs = graph.alloc_value_var();
+        *lhs.annotation.borrow_mut() = Some(Rc::new(s_true.clone()));
+        *rhs.annotation.borrow_mut() = Some(Rc::new(s_true));
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::BinOp {
+                    op: "xor".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(result.clone()));
+        annotate_inner(&graph, Some(&bk)).expect("true ^ true");
+        match read_binding_some(&result).as_deref() {
+            Some(sv @ SomeValue::Bool(_)) => {
+                assert!(sv.is_constant(), "true ^ true is constant, got {sv:?}");
+                assert_eq!(sv.const_(), Some(&ConstValue::Bool(false)));
+            }
+            other => panic!("true ^ true is SomeBool const false, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_as_unsigned_of_integer_sub_phi_constint1_is_unsigned() {
+        // `rarithmetic.py` `r_uint(x)` / `ForTypeEntry.compute_result_annotation`
+        // → `SomeInteger(knowntype=r_uint)`. `parse_format` `rep as usize`
+        // after `integer_sub` (`c - b'0'`) phis the else-arm `1`.
+        let mut graph = FunctionGraph::new("same_as_uint_of_sub");
+        let pred_cast = graph.create_block();
+        let pred_one = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let c = graph
+            .push_op_var(pred_cast, OpKind::ConstInt(i64::from(b'5')), true)
+            .unwrap();
+        let zero = graph
+            .push_op_var(pred_cast, OpKind::ConstInt(i64::from(b'0')), true)
+            .unwrap();
+        let sub_var = graph
+            .push_op_var(
+                pred_cast,
+                OpKind::BinOp {
+                    op: "sub".into(),
+                    lhs: c,
+                    rhs: zero,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let same_var = graph
+            .push_op_var(
+                pred_cast,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: sub_var,
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let one = graph
+            .push_op_var(pred_one, OpKind::ConstInt(1), true)
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_cast, pred_one);
+        graph.set_goto(pred_cast, join, vec![same_var]);
+        graph.set_goto(pred_one, join, vec![one]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("same_as Unsigned of integer_sub ∪ ConstInt(1)");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.unsigned, "unsigned won, got {i:?}");
+            }
+            other => panic!("phi is SomeInteger unsigned, got {other:?}"),
+        }
+        assert_eq!(read_binding(&phi), ValueType::Unsigned);
+    }
+
+    #[test]
+    fn same_as_int_of_signed_nonneg_keeps_nonneg() {
+        // Same signedness copies (`unaryop.py` identity);
+        // `bind_array_view_len_in_block` plants `same_as` with
+        // `result_ty: Int`.
+        let mut graph = FunctionGraph::new("same_as_int_keeps_nonneg");
+        let entry = graph.startblock;
+        let const_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
+        let same_var = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: const_var,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(same_var.clone()));
+        annotate_inner(&graph, None).expect("same_as Int of signed nonneg");
+        match read_binding_some(&same_var).as_deref() {
+            Some(SomeValue::Integer(i)) => {
+                assert!(i.nonneg, "nonneg preserved, got {i:?}");
+                assert!(!i.unsigned, "signedness unchanged, got {i:?}");
+            }
+            other => panic!("same_as is signed nonneg SomeInteger, got {other:?}"),
+        }
+        assert_eq!(read_binding(&same_var), ValueType::Int);
+    }
+
+    #[test]
+    fn same_as_int_of_unsigned_phi_unsigned_is_union_error() {
+        // `builtin.py` `rarith_intmask` → `SomeInteger()` (signed,
+        // nonneg False). `binaryop.py` `pairtype(SomeInteger,
+        // SomeInteger).union` rejects signed nonneg=False ∪ unsigned.
+        let mut graph = FunctionGraph::new("same_as_int_of_uint");
+        let pred_cast = graph.create_block();
+        let pred_unsigned = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let unsigned_src = graph
+            .push_op_var(
+                pred_cast,
+                OpKind::Input {
+                    name: "u".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let same_var = graph
+            .push_op_var(
+                pred_cast,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: unsigned_src,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let unsigned_var = graph
+            .push_op_var(
+                pred_unsigned,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_cast, pred_unsigned);
+        graph.set_goto(pred_cast, join, vec![same_var]);
+        graph.set_goto(pred_unsigned, join, vec![unsigned_var]);
+        graph.set_return(join, Some(phi));
+        let err = annotate_inner(&graph, None).expect_err("same_as Int of Unsigned ∪ Unsigned");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    fn stamp_ccharp(var: &Variable) {
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        var.set_concretetype(Some((*CCHARP).clone()));
+    }
+
+    fn unsigned_ccharp_fieldread(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        field: &str,
+    ) -> Variable {
+        let base = graph
+            .push_op_var(
+                block,
+                OpKind::Input {
+                    name: "obj".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let ptr = graph
+            .push_op_var(
+                block,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new(field, None),
+                    ty: ValueType::Unsigned,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        stamp_ccharp(&ptr);
+        ptr
+    }
+
+    #[test]
+    fn raw_malloc_phi_u8_fieldread_is_someptr() {
+        // `ann_malloc` / `raw_alloc_ptr_somevalue` → `SomePtr(CCHARP)`.
+        // `tuple_field_value_type("*mut u8")` stamps the same `CCHARP`.
+        // `llannotation.py` `pairtype(SomePtr, SomePtr).union`.
+        let mut graph = FunctionGraph::new("raw_malloc_phi_u8");
+        let pred_malloc = graph.create_block();
+        let pred_field = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let malloc_var = graph
+            .push_op_var(
+                pred_malloc,
+                OpKind::raw_malloc_with_flags("alloc::raw", None, false, true, false, vec![], None),
+                true,
+            )
+            .unwrap();
+        let field_var = unsigned_ccharp_fieldread(&mut graph, pred_field, "cpy_ref");
+        branch_start_to_preds(&mut graph, pred_malloc, pred_field);
+        graph.set_goto(pred_malloc, join, vec![malloc_var]);
+        graph.set_goto(pred_field, join, vec![field_var]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("RawMalloc ∪ *mut u8 FieldRead");
+        assert!(
+            matches!(read_binding_some(&phi).as_deref(), Some(SomeValue::Ptr(_))),
+            "phi is SomePtr, got {:?}",
+            read_binding_some(&phi)
+        );
+    }
+
+    #[test]
+    fn ccharp_nullptr_phi_u8_fieldread_is_someptr() {
+        // `ann_cast_int_to_ptr` → `SomePtr(CCHARP)` (`emit_ccharp_nullptr`
+        // Call `lltype.cast_int_to_ptr`).
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        let mut graph = FunctionGraph::new("ccharp_nullptr_phi_u8");
+        let pred_null = graph.create_block();
+        let pred_field = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let null_var = graph
+            .push_op_var(
+                pred_null,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]),
+                    args: vec![
+                        LinkArg::from(ConstValue::LowLevelType(Box::new((*CCHARP).clone()))),
+                        LinkArg::from(ConstValue::Int(0)),
+                    ],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let field_var = unsigned_ccharp_fieldread(&mut graph, pred_field, "cpy_ref");
+        branch_start_to_preds(&mut graph, pred_null, pred_field);
+        graph.set_goto(pred_null, join, vec![null_var]);
+        graph.set_goto(pred_field, join, vec![field_var]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("cast_int_to_ptr ∪ *mut u8 FieldRead");
+        assert!(
+            matches!(read_binding_some(&phi).as_deref(), Some(SomeValue::Ptr(_))),
+            "phi is SomePtr, got {:?}",
+            read_binding_some(&phi)
+        );
+    }
+
+    #[test]
+    fn constint_neg1_phi_u8_fieldread_is_union_error() {
+        // `SomeInteger` ∪ `SomePtr` (`pairtype(SomeObject, SomeObject).union`).
+        let mut graph = FunctionGraph::new("constint_neg1_phi_u8");
+        let pred_int = graph.create_block();
+        let pred_field = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let int_var = graph
+            .push_op_var(pred_int, OpKind::ConstInt(-1), true)
+            .unwrap();
+        let field_var = unsigned_ccharp_fieldread(&mut graph, pred_field, "cpy_ref");
+        branch_start_to_preds(&mut graph, pred_int, pred_field);
+        graph.set_goto(pred_int, join, vec![int_var]);
+        graph.set_goto(pred_field, join, vec![field_var]);
+        graph.set_return(join, Some(phi));
+        let err = annotate_inner(&graph, None).expect_err("ConstInt(-1) ∪ *mut u8 FieldRead");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_malloc_typed_gcarray_is_someptr_of_ptr_type() {
+        // `ann_malloc` → `SomePtr(Ptr(s_T.const))`. A phi of two mallocs
+        // of the same TYPE is `pairtype(SomePtr, SomePtr).union`.
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let expected = Ptr::from_container_type(array_ll.clone()).expect("GcArray ptr");
+        let mut graph = FunctionGraph::new("raw_malloc_typed_gcarray");
+        let entry = graph.startblock;
+        let malloc_var = graph
+            .push_op_var(
+                entry,
+                OpKind::raw_malloc_with_flags(
+                    "alloc::raw",
+                    Some(array_ll.clone()),
+                    false,
+                    true,
+                    false,
+                    vec![],
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(malloc_var.clone()));
+        annotate_inner(&graph, None).expect("typed RawMalloc");
+        match read_binding_some(&malloc_var).as_deref() {
+            Some(SomeValue::Ptr(p)) => {
+                assert_eq!(p.ll_ptrtype, expected, "ll_ptrtype is Ptr(GcArray)");
+            }
+            other => panic!("typed RawMalloc is SomePtr, got {other:?}"),
+        }
+
+        let mut graph = FunctionGraph::new("raw_malloc_typed_phi");
+        let pred_a = graph.create_block();
+        let pred_b = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let a = graph
+            .push_op_var(
+                pred_a,
+                OpKind::raw_malloc_with_flags(
+                    "alloc::raw",
+                    Some(array_ll.clone()),
+                    false,
+                    true,
+                    false,
+                    vec![],
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
+        let b = graph
+            .push_op_var(
+                pred_b,
+                OpKind::raw_malloc_with_flags(
+                    "alloc::raw",
+                    Some(array_ll),
+                    false,
+                    true,
+                    false,
+                    vec![],
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_a, pred_b);
+        graph.set_goto(pred_a, join, vec![a]);
+        graph.set_goto(pred_b, join, vec![b]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, None).expect("phi of two typed RawMalloc");
+        match read_binding_some(&phi).as_deref() {
+            Some(SomeValue::Ptr(p)) => {
+                assert_eq!(p.ll_ptrtype, expected, "phi ll_ptrtype is Ptr(GcArray)");
+            }
+            other => panic!("phi is SomePtr, got {other:?}"),
+        }
     }
 }
