@@ -14875,4 +14875,214 @@ mod tests {
         getclassrepr(&rtyper, Some(&classdef)).expect("getclassrepr");
         let _ = llexitcase_of(&classdef);
     }
+
+    fn hierarchy_e() -> crate::front::llbc_hints::ExceptionClassHint {
+        crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: "E".to_string(),
+            overrides: "C(B)".to_string(),
+            variants: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        }
+    }
+
+    fn class_names_exception_and_not_builtin(classdef: &Rc<RefCell<ClassDef>>, name: &str) {
+        let borrowed = classdef.borrow();
+        assert_eq!(borrowed.name, name);
+        let desc = borrowed.classdesc.borrow();
+        assert!(
+            desc.is_exception_class(),
+            "{name} must subclass BaseException"
+        );
+        let host = desc.pyobj.clone();
+        let builtin = HOST_ENV.lookup_exception_class(host.simple_name());
+        assert!(
+            builtin.is_none() || builtin.as_ref() != Some(&host),
+            "{name} must not be a HOST_ENV builtin"
+        );
+    }
+
+    fn id_contains(parent: &Rc<RefCell<ClassDef>>, child: &Rc<RefCell<ClassDef>>) {
+        let parent_min = parent.borrow().minid.expect("parent minid");
+        let parent_max = parent.borrow().maxid.expect("parent maxid");
+        let child_min = child.borrow().minid.expect("child minid");
+        assert!(
+            parent_min < child_min && child_min < parent_max,
+            "range {parent_min}..{parent_max} does not contain {child_min}"
+        );
+    }
+
+    /// `E { A, B, C }` with `"C(B)"`: `EC ⊂ EB ⊂ E`, `EA ⊂ E`, `EA` not ⊂ `EB`.
+    /// The carrier class is not a subclass of `E`. After
+    /// `assign_inheritance_ids` and `getclassrepr`, each class has a
+    /// distinct vtable whose subclass range matches `minid`/`maxid`.
+    #[test]
+    fn minted_exception_hierarchy_ranges_and_vtables() {
+        let (ann, rtyper) = fresh_exception_typer();
+        let bk = &ann.bookkeeper;
+        bk.set_exception_carrier("error::PyErrorObject");
+        let carrier = bk.exception_carrier_class().expect("carrier host");
+        let carrier_def = bk.getuniqueclassdef(&carrier).expect("carrier classdef");
+        bk.mint_exception_class_hierarchies(&[hierarchy_e()]);
+
+        let base = bk.exception_class_base("E").expect("base E");
+        let ea = bk.exception_class_variant("E", "A").expect("EA");
+        let eb = bk.exception_class_variant("E", "B").expect("EB");
+        let ec = bk.exception_class_variant("E", "C").expect("EC");
+        assert!(bk.exception_class_variant("E", "Nope").is_none());
+        assert!(bk.exception_class_base("Nope").is_none());
+        assert!(bk.exception_class_variant("Nope", "A").is_none());
+        assert!(Rc::ptr_eq(
+            &bk.exception_class_base("fixture::E")
+                .expect("crate-prefixed E"),
+            &base
+        ));
+
+        class_names_exception_and_not_builtin(&base, "E");
+        class_names_exception_and_not_builtin(&ea, "EA");
+        class_names_exception_and_not_builtin(&eb, "EB");
+        class_names_exception_and_not_builtin(&ec, "EC");
+        assert!(ec.borrow().issubclass(&eb));
+        assert!(eb.borrow().issubclass(&base));
+        assert!(ec.borrow().issubclass(&base));
+        assert!(ea.borrow().issubclass(&base));
+        assert!(!ea.borrow().issubclass(&eb));
+        assert!(!eb.borrow().issubclass(&ea));
+        assert!(!carrier_def.borrow().issubclass(&base));
+        assert!(!base.borrow().issubclass(&carrier_def));
+
+        bk.mint_exception_class_hierarchies(&[hierarchy_e()]);
+        assert!(Rc::ptr_eq(
+            &bk.exception_class_base("E").expect("second mint"),
+            &base
+        ));
+        assert!(Rc::ptr_eq(
+            &bk.exception_class_variant("E", "C").expect("second mint C"),
+            &ec
+        ));
+
+        assign_inheritance_ids(&ann);
+        for classdef in [&base, &ea, &eb, &ec] {
+            getclassrepr(&rtyper, Some(classdef)).expect("getclassrepr");
+        }
+        id_contains(&base, &ea);
+        id_contains(&base, &eb);
+        id_contains(&base, &ec);
+        id_contains(&eb, &ec);
+        let eb_min = eb.borrow().minid.expect("EB minid");
+        let eb_max = eb.borrow().maxid.expect("EB maxid");
+        let ea_min = ea.borrow().minid.expect("EA minid");
+        assert!(
+            !(eb_min < ea_min && ea_min < eb_max),
+            "EA must not sit inside EB ({eb_min}..{eb_max} vs {ea_min})"
+        );
+
+        let lls = [
+            llexitcase_of(&base),
+            llexitcase_of(&ea),
+            llexitcase_of(&eb),
+            llexitcase_of(&ec),
+        ];
+        let words: Vec<i64> = lls.iter().map(vtable_word).collect();
+        for (index, word) in words.iter().enumerate() {
+            assert_ne!(*word, 0);
+            for other in &words[index + 1..] {
+                assert_ne!(word, other);
+            }
+        }
+        for (ll, classdef) in lls.iter().zip([&base, &ea, &eb, &ec]) {
+            let (min, max) = subclass_range(vtable_ptr(ll));
+            assert_eq!(min, classdef.borrow().minid.expect("minid"));
+            assert_eq!(max, classdef.borrow().maxid.expect("maxid"));
+        }
+    }
+
+    /// Exitcase `EB` catches an `EC` instance and misses `EA`.
+    #[test]
+    fn minted_exception_exitcase_eb_catches_ec_misses_ea() {
+        let (ann, rtyper) = fresh_exception_typer();
+        ann.bookkeeper
+            .mint_exception_class_hierarchies(&[hierarchy_e()]);
+        let ea = ann
+            .bookkeeper
+            .exception_class_variant("E", "A")
+            .expect("EA");
+        let eb = ann
+            .bookkeeper
+            .exception_class_variant("E", "B")
+            .expect("EB");
+        let ec = ann
+            .bookkeeper
+            .exception_class_variant("E", "C")
+            .expect("EC");
+        assign_inheritance_ids(&ann);
+        let base = ann.bookkeeper.exception_class_base("E").expect("base E");
+        // `getclassrepr` only queues `ClassRepr`. `llexitcase_of` runs
+        // `Repr::setup`, which resolves `vtable_type` before
+        // `get_reusable_prebuilt_instance` (`ClassRepr.init_vtable`).
+        // Parents before children, matching
+        // `rpython_exception_class_link_catches_subclass_misses_sibling`.
+        for classdef in [&base, &ea, &eb, &ec] {
+            getclassrepr(&rtyper, Some(classdef)).expect("getclassrepr");
+        }
+        let _base_ll = llexitcase_of(&base);
+        let _ea_ll = llexitcase_of(&ea);
+        let eb_ll = llexitcase_of(&eb);
+        let _ec_ll = llexitcase_of(&ec);
+        let eb_ptr = vtable_ptr(&eb_ll);
+        let ea_inst = raised_instance(&rtyper, &ea);
+        let ec_inst = raised_instance(&rtyper, &ec);
+        assert!(
+            handler_catches(&ec_inst, eb_ptr),
+            "exitcase EB catches a raised EC"
+        );
+        assert!(
+            !handler_catches(&ea_inst, eb_ptr),
+            "exitcase EB misses a raised EA"
+        );
+    }
+
+    /// Literal class key `ArgErr` stays a different host from the origin
+    /// struct `argument::ArgErr` (`canonical_struct_name`).
+    #[test]
+    fn minted_exception_class_keeps_literal_key_beside_struct_origin() {
+        let (ann, _rtyper) = fresh_exception_typer();
+        let _guard = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("ArgErr".to_string(), "argument".to_string())]),
+        );
+        let struct_host = ann.bookkeeper.intern_class_by_qualname("ArgErr");
+        assert_eq!(struct_host.qualname(), "argument::ArgErr");
+        ann.bookkeeper.mint_exception_class_hierarchies(&[
+            crate::front::llbc_hints::ExceptionClassHint {
+                enum_path: "argument::ArgErr".to_string(),
+                overrides: "TooManyMethod(TooMany)".to_string(),
+                variants: vec![
+                    "Missing".to_string(),
+                    "TooMany".to_string(),
+                    "TooManyMethod".to_string(),
+                ],
+            },
+        ]);
+        let base = ann
+            .bookkeeper
+            .exception_class_base("argument::ArgErr")
+            .expect("base by intern key");
+        let by_leaf = ann
+            .bookkeeper
+            .exception_class_base("ArgErr")
+            .expect("base by leaf");
+        assert!(Rc::ptr_eq(&base, &by_leaf));
+        let exc_host = base.borrow().classdesc.borrow().pyobj.clone();
+        assert_eq!(exc_host.qualname(), "ArgErr");
+        assert_ne!(exc_host, struct_host);
+        let roots = ann.bookkeeper.struct_root_classes.borrow();
+        assert_ne!(
+            roots.get("ArgErr").expect("literal key"),
+            roots.get("argument::ArgErr").expect("struct key")
+        );
+        drop(roots);
+        assert!(
+            base.borrow().attrs.is_empty(),
+            "literal ArgErr copied struct attrs: {:?}",
+            base.borrow().attrs.keys().collect::<Vec<_>>()
+        );
+    }
 }

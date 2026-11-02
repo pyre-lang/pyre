@@ -1012,6 +1012,11 @@ pub struct SemanticProgram {
     /// key of the one struct the marker resolves to
     /// (`llbc_hints::harvest_alloc_flavor_raw_from_llbcs`).
     pub raw_alloc_flavor_structs: std::collections::HashSet<String>,
+    /// `_exception_class_<Enum>` rows. Each is the enum intern key, the
+    /// raw override list, and the `TypeDecl` variant names in declaration
+    /// order (`llbc_hints::harvest_exception_class_hints_from_llbcs`).
+    /// The codewriter mints the RPython exception classes from this vec.
+    pub exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
     /// Enum discriminant → variant name, keyed by enum type (both the
     /// qualified path and the bare leaf, mirroring `struct_fields`).
     /// The opcode-dispatch MIR extractor reads
@@ -1617,5 +1622,69 @@ mod tests {
         );
         assert!(acc.struct_fields.fields.contains_key("core::A"));
         assert!(acc.struct_fields.fields.contains_key("alloc::B"));
+    }
+
+    fn exception_hint(enum_path: &str) -> crate::front::llbc_hints::ExceptionClassHint {
+        crate::front::llbc_hints::ExceptionClassHint {
+            enum_path: enum_path.to_string(),
+            overrides: String::new(),
+            variants: vec!["A".to_string()],
+        }
+    }
+
+    fn absorb_hints(
+        first: SemanticProgram,
+        second: SemanticProgram,
+    ) -> crate::front::semantic::SemanticProgram {
+        let mut merged = None;
+        let mut seen_function_keys = std::collections::HashSet::new();
+        let mut seen_struct_names = std::collections::HashSet::new();
+        let mut seen_trait_names = std::collections::HashSet::new();
+        let dedup = |func: &SemanticFunction| func.name.clone();
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            first,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            second,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        merged.expect("merged program")
+    }
+
+    #[test]
+    fn absorb_appends_exception_class_hints() {
+        let mut first = SemanticProgram::default();
+        first.exception_class_hints.push(exception_hint("synth::E"));
+        let mut second = SemanticProgram::default();
+        second
+            .exception_class_hints
+            .push(exception_hint("argument::ArgErr"));
+        let acc = absorb_hints(first, second);
+        assert_eq!(
+            acc.exception_class_hints
+                .iter()
+                .map(|hint| hint.enum_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["synth::E", "argument::ArgErr"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "_exception_class_ E: duplicate hierarchy `E`")]
+    fn absorb_duplicate_exception_class_hint_panics() {
+        let mut first = SemanticProgram::default();
+        first.exception_class_hints.push(exception_hint("E"));
+        let mut second = SemanticProgram::default();
+        second.exception_class_hints.push(exception_hint("E"));
+        let _ = absorb_hints(first, second);
     }
 }

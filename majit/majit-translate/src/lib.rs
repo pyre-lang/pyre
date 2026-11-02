@@ -428,6 +428,7 @@ fn build_semantic_program_via_active_frontend(
                 struct_fields: front::semantic::StructFieldRegistry::default(),
                 immutable_fields: std::collections::HashMap::new(),
                 raw_alloc_flavor_structs: std::collections::HashSet::new(),
+                exception_class_hints: Vec::new(),
                 enum_variant_by_discriminant: std::collections::HashMap::new(),
                 struct_origins: std::collections::HashMap::new(),
                 struct_field_attrs: std::collections::HashMap::new(),
@@ -1903,6 +1904,7 @@ fn analyze_pipeline_from_module_paths(
     // `is_immutable` on `StructFieldLayout`).
     call_control.immutable_fields_by_struct = immutable_fields;
     call_control.raw_alloc_flavor_structs = program.raw_alloc_flavor_structs.clone();
+    call_control.exception_class_hints = program.exception_class_hints.clone();
     // `descr.py ARRAY_INSIDE._immutable_field(None)` parity.
     // Summarise `field[*]` annotations into the array-type-keyed set so
     // `arraydescrof_concrete` can fold field-level immutability into the

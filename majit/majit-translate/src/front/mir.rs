@@ -426,6 +426,20 @@ pub(crate) fn absorb_semantic_program(
             }
             acc.raw_alloc_flavor_structs
                 .extend(prog.raw_alloc_flavor_structs);
+            for hint in prog.exception_class_hints {
+                if acc
+                    .exception_class_hints
+                    .iter()
+                    .any(|existing| existing.enum_path == hint.enum_path)
+                {
+                    let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+                    panic!(
+                        "_exception_class_ {enum_name}: duplicate hierarchy `{}`",
+                        hint.enum_path
+                    );
+                }
+                acc.exception_class_hints.push(hint);
+            }
             acc.atomic_load_decls.extend(prog.atomic_load_decls);
         }
     }
@@ -566,6 +580,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered<L: std::borrow::
             struct_fields: crate::front::semantic::StructFieldRegistry::default(),
             immutable_fields: std::collections::HashMap::new(),
             raw_alloc_flavor_structs: std::collections::HashSet::new(),
+            exception_class_hints: Vec::new(),
             enum_variant_by_discriminant: std::collections::HashMap::new(),
             struct_origins: std::collections::HashMap::new(),
             struct_field_attrs: std::collections::HashMap::new(),
@@ -1698,6 +1713,11 @@ pub(crate) struct CrateLoweringState {
     /// Harvested `_alloc_flavor_ = raw` structs. `get_type_flag` banks a
     /// pointer to one as an unsigned int word (`descr.py get_type_flag`).
     raw_alloc_flavor_structs: std::collections::HashSet<String>,
+    /// `_exception_class_<Enum>` rows from this artefact. Bodies do not
+    /// read them. `finish` copies the vec; earlier crates stay out so
+    /// `absorb_semantic_program` is the only merge (a second copy of the
+    /// same intern key panics there).
+    exception_class_hints: Vec<crate::front::llbc_hints::ExceptionClassHint>,
     /// `_immutable_fields_<Struct>` harvested once for this artefact
     /// (`harvest_immutable_fields_from_llbcs`). Overlay dests and the
     /// raw-storage classifier look the struct up by the same keys the
@@ -1770,6 +1790,12 @@ impl CrateLoweringState {
             ));
         // Flavor is a program-wide class property; a dependency's raw classes count here too.
         raw_alloc_flavor_structs.extend(program_raw_alloc_flavor_structs.iter().cloned());
+        // This crate's markers only. A later crate's copy is merged by
+        // `absorb_semantic_program`, which rejects a repeated intern key.
+        let exception_class_hints =
+            crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+                std::slice::from_ref(llbc),
+            );
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1942,6 +1968,7 @@ impl CrateLoweringState {
             tombstoned_leaves,
             gc_struct_ids: gc_struct_ids.clone(),
             raw_alloc_flavor_structs,
+            exception_class_hints,
             immutable_fields,
             dont_look_inside,
             elidable_residual,
@@ -2677,6 +2704,7 @@ impl CrateLoweringState {
             // proc-macro hints).
             immutable_fields: std::collections::HashMap::new(),
             raw_alloc_flavor_structs: self.raw_alloc_flavor_structs.clone(),
+            exception_class_hints: self.exception_class_hints.clone(),
             enum_variant_by_discriminant,
             struct_origins,
             struct_field_attrs,

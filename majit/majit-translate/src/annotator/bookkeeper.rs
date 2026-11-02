@@ -493,6 +493,21 @@ pub struct Bookkeeper {
     /// `classdesc.py ClassDesc.__init__` reads `cls.__dict__['_immutable_fields_']`;
     /// intern stamps that list onto matching hosts.
     immutable_fields_structs: RefCell<HashMap<String, Vec<(String, crate::model::ImmutableRank)>>>,
+    /// Hierarchies minted from `_exception_class_<Enum>`. A `Vec`: a
+    /// program declares a handful, and lookup walks it. Lives on the
+    /// bookkeeper next to `exception_carrier`.
+    exception_class_hierarchies: RefCell<Vec<MintedExceptionHierarchy>>,
+}
+
+/// One `_exception_class_<Enum>` hierarchy after mint.
+///
+/// `variants` is mint order: a parent variant precedes its child so
+/// `ClassDef.basedef` is already wired.
+#[derive(Clone)]
+struct MintedExceptionHierarchy {
+    enum_path: String,
+    base: Rc<RefCell<ClassDef>>,
+    variants: Vec<(String, Rc<RefCell<ClassDef>>)>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -1389,6 +1404,7 @@ impl Bookkeeper {
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
             raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
             immutable_fields_structs: RefCell::new(HashMap::new()),
+            exception_class_hierarchies: RefCell::new(Vec::new()),
         }
     }
 
@@ -4126,6 +4142,176 @@ impl Bookkeeper {
             .borrow_mut()
             .insert(key, host.clone());
         host
+    }
+
+    /// Intern an RPython exception class under the literal name.
+    ///
+    /// `intern_class_by_qualname_with_bases` runs `canonical_struct_name`.
+    /// A bare leaf in `STRUCT_ORIGIN_REGISTRY` becomes `module::Leaf`,
+    /// which would merge `argument.py` `class ArgErr(Exception)` with
+    /// the value ADT. The key here is the name as given (`ArgErr`,
+    /// `ArgErrMissing`). First mint wins: a key that is already present
+    /// is returned unchanged.
+    fn intern_exception_class(&self, name: &str, bases: Vec<HostObject>) -> HostObject {
+        if let Some(existing) = self.struct_root_classes.borrow().get(name) {
+            return existing.clone();
+        }
+        let host = HostObject::new_class(name.to_string(), bases);
+        crate::virtualizable_decl::stamp_host_virtualizable(&host, name);
+        self.stamp_raw_alloc_flavor(&host, name);
+        self.struct_root_classes
+            .borrow_mut()
+            .insert(name.to_string(), host.clone());
+        host
+    }
+
+    /// Mint each `_exception_class_<Enum>` hierarchy.
+    ///
+    /// The base subclasses the host `Exception`
+    /// (`HOST_ENV.lookup_exception_class`, the base
+    /// `default_class_bases` gives the error carrier). Each variant
+    /// subclasses its parent exception class, not the Rust enum variant.
+    /// Class names are `exception_class_qualname` (enum leaf, or that
+    /// leaf concatenated with the variant). `getuniqueclassdef` runs
+    /// here so `basedef` is wired. `assign_inheritance_ids` does not:
+    /// `run_two_phase_prepass` numbers classdefs after phase A and
+    /// before phase B, `CallRegistry::ensure_session` numbers the
+    /// session prefix, and `RPythonTyper::convert_helper_exception_links`
+    /// numbers again after `finish_exceptiondata` and before
+    /// `_convert_link`. `getclassrepr` stays demand-driven
+    /// (`rclass::getclassrepr`) and must follow those ids before
+    /// `exception_class_llexitcase`.
+    ///
+    /// A hierarchy whose intern key is already recorded is left as it
+    /// is (`exception_class_enum_path_matches`).
+    pub fn mint_exception_class_hierarchies(
+        self: &Rc<Self>,
+        hints: &[crate::front::llbc_hints::ExceptionClassHint],
+    ) {
+        for hint in hints {
+            let already = self
+                .exception_class_hierarchies
+                .borrow()
+                .iter()
+                .any(|stored| {
+                    crate::front::llbc_hints::exception_class_enum_path_matches(
+                        &stored.enum_path,
+                        &hint.enum_path,
+                    )
+                });
+            if already {
+                continue;
+            }
+            self.mint_one_exception_hierarchy(hint);
+        }
+    }
+
+    fn mint_one_exception_hierarchy(
+        self: &Rc<Self>,
+        hint: &crate::front::llbc_hints::ExceptionClassHint,
+    ) {
+        let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+        let order = crate::front::llbc_hints::parse_exception_class_overrides(
+            enum_name,
+            &hint.overrides,
+            &hint.variants,
+        );
+        let exception = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("HOST_ENV missing builtin Exception");
+        let base_name = crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, None);
+        if base_name.is_empty() {
+            panic!("_exception_class_ {enum_name}: empty class name");
+        }
+        let base_host = self.intern_exception_class(&base_name, vec![exception]);
+        let base = self.getuniqueclassdef(&base_host).unwrap_or_else(|err| {
+            panic!("_exception_class_ {enum_name}: getuniqueclassdef({base_name}): {err}")
+        });
+        let mut hosts: Vec<(String, HostObject)> = Vec::new();
+        let mut variants = Vec::with_capacity(order.len());
+        for (variant, parent) in order {
+            let parent_host = match parent.as_deref() {
+                None => base_host.clone(),
+                Some(parent_name) => hosts
+                    .iter()
+                    .find(|(name, _)| name == parent_name)
+                    .map(|(_, host)| host.clone())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "_exception_class_ {enum_name}: parent `{parent_name}` was not minted \
+                             before `{variant}`"
+                        )
+                    }),
+            };
+            let class_name =
+                crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(&variant));
+            if class_name.is_empty() {
+                panic!("_exception_class_ {enum_name}: empty class name");
+            }
+            let host = self.intern_exception_class(&class_name, vec![parent_host]);
+            let classdef = self.getuniqueclassdef(&host).unwrap_or_else(|err| {
+                panic!("_exception_class_ {enum_name}: getuniqueclassdef({class_name}): {err}")
+            });
+            hosts.push((variant.clone(), host));
+            variants.push((variant, classdef));
+        }
+        self.exception_class_hierarchies
+            .borrow_mut()
+            .push(MintedExceptionHierarchy {
+                enum_path: hint.enum_path.clone(),
+                base,
+                variants,
+            });
+    }
+
+    fn matched_exception_hierarchy(&self, enum_path: &str) -> Option<MintedExceptionHierarchy> {
+        let hierarchies = self.exception_class_hierarchies.borrow();
+        let mut found: Option<MintedExceptionHierarchy> = None;
+        for stored in hierarchies.iter() {
+            if !crate::front::llbc_hints::exception_class_enum_path_matches(
+                &stored.enum_path,
+                enum_path,
+            ) {
+                continue;
+            }
+            if found.is_some() {
+                panic!(
+                    "_exception_class_ {}: ambiguous hierarchy",
+                    crate::front::llbc_hints::exception_class_leaf(enum_path)
+                );
+            }
+            found = Some(stored.clone());
+        }
+        found
+    }
+
+    /// The base class of the hierarchy `enum_path` names.
+    ///
+    /// `enum_path` is the harvested intern key, or a spelling
+    /// `exception_class_enum_path_matches` accepts (the query's
+    /// `canonical_struct_name`, or the crate-stripped query). `None`
+    /// when no hierarchy matches.
+    pub fn exception_class_base(&self, enum_path: &str) -> Option<Rc<RefCell<ClassDef>>> {
+        self.matched_exception_hierarchy(enum_path)
+            .map(|hierarchy| hierarchy.base)
+    }
+
+    /// The variant class `<Enum><Variant>` of the hierarchy `enum_path` names.
+    ///
+    /// `None` when the hierarchy or the variant is absent.
+    pub fn exception_class_variant(
+        &self,
+        enum_path: &str,
+        variant: &str,
+    ) -> Option<Rc<RefCell<ClassDef>>> {
+        self.matched_exception_hierarchy(enum_path)
+            .and_then(|hierarchy| {
+                hierarchy
+                    .variants
+                    .into_iter()
+                    .find(|(name, _)| name == variant)
+                    .map(|(_, classdef)| classdef)
+            })
     }
 
     /// Prebuilt singleton instance of the interned class for `qualname`.
