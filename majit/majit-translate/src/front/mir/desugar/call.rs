@@ -1220,9 +1220,22 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if args.len() == 1
+                    && self.try_lower_widening_int_from(
+                        mir_bb,
+                        &reg,
+                        args[0].clone(),
+                        dest_local,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                        &arg_locals,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
+                if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
-                        || self.is_widening_int_from(&reg)
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
                         || self.is_raw_ptr_as_ref(&reg)
@@ -3326,6 +3339,56 @@ impl<'a> Lowering<'a> {
                 // the method name never reaches the rtyper as a
                 // `ptr.getattr`.
                 if args.len() == 1 && self.is_ptr_identity_cast(&reg) {
+                    // Dest-Str restore (`op_gc_restore_root` /
+                    // `GCRefRepr.convert_from_to`) before aliasing
+                    // immortal `*mut u8` (`alloc_varsize_with_gc_header_immortal`)
+                    // onto rstr `STR` (`rstr.py` `mallocstr`). `<*mut u8>::cast::<BytesBlock>()`
+                    // is the method twin of `CastKind::RawPtr`; dest
+                    // layout is rstr even when dest_kind is `Str`.
+                    // `__cast_instance_intrinsic` of a string root
+                    // (`builtin.py`) requires a pointer operand. The
+                    // receiver of `<*mut T>::cast` is always RawPtr, so
+                    // dest-Str only when the word is a GC ref or a
+                    // stamped CCHARP (`ann_cast_int_to_ptr`). An i64
+                    // aliased onto that RawPtr (`alloc_utf8_payload`)
+                    // stays the identity alias.
+                    let src_kind = first_arg_ty.as_ref().map(|ty| {
+                        tyref_to_value_type_with(
+                            ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    });
+                    let src_root = first_arg_ty.as_ref().and_then(|ty| {
+                        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+                    });
+                    let src_is_pointer_operand = matches!(src_kind, Some(ValueType::Ref(_)))
+                        || args[0]
+                            .concretetype()
+                            .as_ref()
+                            .is_some_and(lltype_is_ccharp);
+                    if self.dest_ty_is_rstr_str(&call.dest.ty)
+                        && src_is_pointer_operand
+                        && let Some((kind, res)) = self.ptr_cast_marker(
+                            src_kind.as_ref(),
+                            src_root.as_deref(),
+                            &call.dest.ty,
+                            &args[0],
+                            src_is_pointer_operand,
+                        )
+                    {
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                     // When the cast target names a registered struct root
                     // (`ptr.cast::<W_SRE_Pattern>()` then a field read),
                     // narrow the result to `SomeInstance(root)` exactly
@@ -4069,6 +4132,11 @@ impl<'a> Lowering<'a> {
                                     None,
                                     &call.dest.ty,
                                     &orig,
+                                    self.cast_src_is_pointer(
+                                        None,
+                                        Some(&ValueType::Ref(None)),
+                                        &orig,
+                                    ),
                                 ) {
                                     Some((kind, res)) => {
                                         self.graph.block_mut(bb_id).operations.push(
@@ -4096,6 +4164,11 @@ impl<'a> Lowering<'a> {
                                     None,
                                     &call.dest.ty,
                                     &orig,
+                                    self.cast_src_is_pointer(
+                                        None,
+                                        Some(&ValueType::Ref(None)),
+                                        &orig,
+                                    ),
                                 ) {
                                     Some((kind, res)) => {
                                         self.graph.block_mut(bb_id).operations.push(

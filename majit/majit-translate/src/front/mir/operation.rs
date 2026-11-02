@@ -2120,6 +2120,27 @@ impl<'a> Lowering<'a> {
                         self.gc_struct_ids,
                         &self.raw_alloc_flavor_structs,
                     );
+                    // Dest-Str restore (`op_gc_restore_root` /
+                    // `GCRefRepr.convert_from_to`) before a bank-crossing
+                    // `cast_int_to_ptr` of immortal `*mut u8` onto STR
+                    // (`rstr.py` `mallocstr`).
+                    let src_is_pointer = pointer_word
+                        || self.cast_src_is_pointer(
+                            operand_tyref(&operand),
+                            src_kind.as_ref(),
+                            &arg,
+                        );
+                    if self.dest_ty_is_rstr_str(dest_ty)
+                        && let Some((op, res)) = self.ptr_cast_marker(
+                            src_kind.as_ref(),
+                            src_root.as_deref(),
+                            dest_ty,
+                            &arg,
+                            src_is_pointer,
+                        )
+                    {
+                        return Ok((Some(op), res));
+                    }
                     // An integer cast to a narrower unsigned type keeps only
                     // the low bytes. The JIT carries every integer in one
                     // machine word, so the truncation has to be an explicit
@@ -2196,8 +2217,13 @@ impl<'a> Lowering<'a> {
                     // keep `SomePtr(GCREF)` on a `SomeInstance(PyObject)`
                     // slot (`pairtype(SomePtr, SomeObject).union`).
                     if src_is_prebuilt_once_value && matches!(dst_kind, ValueType::Ref(_)) {
-                        match self.ptr_cast_marker(Some(&ValueType::Ref(None)), None, dest_ty, &arg)
-                        {
+                        match self.ptr_cast_marker(
+                            Some(&ValueType::Ref(None)),
+                            None,
+                            dest_ty,
+                            &arg,
+                            self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &arg),
+                        ) {
                             Some((op, res)) => return Ok((Some(op), res)),
                             None => return Ok((None, arg)),
                         }
@@ -2248,24 +2274,8 @@ impl<'a> Lowering<'a> {
                             ValueType::Int
                         )
                     {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        return Ok((
-                            Some(OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: ["rpython", "rlib", "rarithmetic", "intmask"]
-                                        .into_iter()
-                                        .map(str::to_string)
-                                        .collect(),
-                                    fun_decl_id: None,
-                                    specialization: crate::parse::GraphSpecialization::Regular,
-                                },
-                                args: crate::model::call_args(vec![arg]),
-                                result_ty: ValueType::Int,
-                            }),
-                            res,
-                        ));
+                        let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
+                        return Ok((Some(kind), res));
                     }
                     // An Int-banked pointer — `history.getkind` of
                     // `Ptr(FuncType)`, or of `Ptr(Struct(raw) "RustVec")` —
@@ -2314,9 +2324,6 @@ impl<'a> Lowering<'a> {
                             ValueType::Unsigned
                         )
                     {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         // `history.getkind` already banks `Ptr` of a Raw struct
                         // as `int`, so `p as usize` is this `r_uint` and not
                         // `cast_ptr_to_int`. `GcRef(p as usize)` still retypes
@@ -2340,21 +2347,8 @@ impl<'a> Lowering<'a> {
                                 return Ok((Some(op), res));
                             }
                         }
-                        return Ok((
-                            Some(OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
-                                        .into_iter()
-                                        .map(str::to_string)
-                                        .collect(),
-                                    fun_decl_id: None,
-                                    specialization: crate::parse::GraphSpecialization::Regular,
-                                },
-                                args: crate::model::call_args(vec![arg]),
-                                result_ty: ValueType::Unsigned,
-                            }),
-                            res,
-                        ));
+                        let (kind, res) = signedness_retype_op(&mut self.graph, arg, false);
+                        return Ok((Some(kind), res));
                     }
                     // Pointer -> unsigned-word cast is two operations in
                     // RPython, not a `cast_ptr_to_int` whose result is merely
@@ -2437,6 +2431,7 @@ impl<'a> Lowering<'a> {
                             None,
                             dest_ty,
                             &orig,
+                            self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &orig),
                         ) {
                             Some((op, res)) => return Ok((Some(op), res)),
                             None => return Ok((None, orig)),
@@ -2456,6 +2451,7 @@ impl<'a> Lowering<'a> {
                             None,
                             dest_ty,
                             &orig,
+                            self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &orig),
                         ) {
                             Some((op, res)) => return Ok((Some(op), res)),
                             None => return Ok((None, orig)),
@@ -2554,6 +2550,7 @@ impl<'a> Lowering<'a> {
                                     src_root.as_deref(),
                                     dest_ty,
                                     &arg,
+                                    src_is_pointer,
                                 ) {
                                     Some((op, res)) => (Some(op), res),
                                     None => match self.raw_owner_retype(
@@ -2777,7 +2774,14 @@ impl<'a> Lowering<'a> {
                 );
                 let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
                 let dst_int = self.literal_int_width(&ty);
+                let src_is_pointer_from_ty = operand_tyref(&operand).map(|src_ty| {
+                    tyref_node(src_ty, self.llbc)
+                        .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some())
+                });
                 let v = self.resolve_operand(mir_bb, operand)?;
+                let src_is_pointer = self.pointer_word_vars.contains(&v)
+                    || src_is_pointer_from_ty
+                        .unwrap_or_else(|| self.cast_src_is_pointer(None, src_kind.as_ref(), &v));
                 if cast_kind_is_unsize(&kind)
                     && let Some((op, res)) = self.object_array_unsize_newlist(dest_ty, &v)
                 {
@@ -2830,11 +2834,18 @@ impl<'a> Lowering<'a> {
                         &self.raw_alloc_flavor_structs,
                     ),
                     ValueType::Str
-                ) || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc);
+                ) || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
+                    || self.dest_ty_is_rstr_str(&ty);
                 let dest_is_gcref = tyref_is_gcref_spelling(&ty, self.llbc);
                 if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str || dest_is_gcref)
                     && let Some((op, res)) = self
-                        .ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
+                        .ptr_cast_marker(
+                            src_kind.as_ref(),
+                            src_root.as_deref(),
+                            &ty,
+                            &v,
+                            src_is_pointer,
+                        )
                         .or_else(|| {
                             self.raw_owner_retype(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                         })
@@ -4476,13 +4487,16 @@ impl<'a> Lowering<'a> {
     /// * **narrow** — `obj as *const RegisteredStruct`; see
     ///   `__cast_instance_intrinsic` below.
     /// * **dest-Str** — `shadow_stack_get(slot) as *mut Utf8Str` (or the
-    ///   `{hash, len}` overlay). Src is a GCREF / `PyObjectRef`
-    ///   (`ValueType::Ref`); dest layout is rstr `STR`
-    ///   (`is_rstr_str_layout_declaration`, `ValueType::Str`). `Ref` and
-    ///   `Str` share bank 1, so aliasing keeps `SomePtr(GCREF)` on a
-    ///   `*mut Utf8Str` local and `mergeinputargs` panics `Ptr ∪ String`.
-    ///   Upstream `op_gc_restore_root` recasts with the livevar's own
-    ///   lltype (`cast_adr_to_ptr` → `Ptr(STR)` / `SomeString`);
+    ///   `{hash, len}` overlay), a GCREF / `PyObjectRef` recast, or
+    ///   immortal `alloc_varsize_with_gc_header_immortal` `*mut u8` as
+    ///   STR (`rstr.py` `mallocstr`). Dest layout is rstr `STR`
+    ///   (`is_rstr_str_layout_declaration`) even when dest_kind is
+    ///   `Ref(Utf8Str)` (registered GC ptr) or src is an int-banked
+    ///   pointer (`*mut u8`). `Ref` and `Str` share bank 1, so aliasing
+    ///   keeps `SomePtr(GCREF)` on a `*mut Utf8Str` local and
+    ///   `mergeinputargs` panics `Ptr ∪ String`. Upstream
+    ///   `op_gc_restore_root` recasts with the livevar's own lltype
+    ///   (`cast_adr_to_ptr` → `Ptr(STR)` / `SomeString`);
     ///   `GCRefRepr.convert_from_to` is `cast_opaque_ptr` onto
     ///   `r_to.lowleveltype`. Stamp `__cast_instance_intrinsic` with
     ///   `ValueType::Str`, not
@@ -4500,18 +4514,47 @@ impl<'a> Lowering<'a> {
     ///   `__cast_instance_intrinsic("GCREF")`. A GCREF→GCREF or raw/int
     ///   source stays an alias.
     ///
-    /// A `Ref` source is required: an `addr_usize as *const Struct`
-    /// reinterpret is `cast_int_to_ptr` territory and must alias instead.
+    /// A `Ref` source is required for the narrow / address arms: an
+    /// `addr_usize as *const Struct` reinterpret is `cast_int_to_ptr`
+    /// territory and must alias instead. Dest-Str is the STR exception
+    /// for a pointer source (`rbuiltin.py` `gen_cast`).
+    pub(in crate::front::mir) fn dest_ty_is_rstr_str(&self, dest_ty: &TyRef) -> bool {
+        tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
+            .is_some_and(|root| is_rstr_str_layout_declaration(&root))
+            || tyref_is_string_value(dest_ty, self.llbc)
+            || tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
+    }
+
+    /// Pointer-ness of a dest-STR restore source (`rbuiltin.py` `gen_cast`:
+    /// Ptr→Ptr is `cast_pointer`; Primitive→Ptr is `cast_int_to_ptr`).
+    /// When the source Rust type is available, [`one_level_pointer_pointee`]
+    /// (`*mut`/`*const`, `&`/`&mut`, thin `Box`, `NonNull`). Otherwise
+    /// `Ref(_)` or a stamped CCHARP / GCREF concretetype (`<*mut T>::cast`).
+    pub(in crate::front::mir) fn cast_src_is_pointer(
+        &self,
+        src_ty: Option<&TyRef>,
+        src_kind: Option<&ValueType>,
+        arg: &Variable,
+    ) -> bool {
+        if let Some(ty) = src_ty {
+            return tyref_node(ty, self.llbc)
+                .is_some_and(|node| one_level_pointer_pointee(node, self.llbc).is_some());
+        }
+        matches!(src_kind, Some(ValueType::Ref(_)))
+            || arg.concretetype().as_ref().is_some_and(|ct| {
+                lltype_is_ccharp(ct)
+                    || ct == &*crate::translator::rtyper::lltypesystem::lltype::GCREF
+            })
+    }
+
     pub(in crate::front::mir) fn ptr_cast_marker(
         &mut self,
         src_kind: Option<&ValueType>,
         src_root: Option<&str>,
         dest_ty: &TyRef,
         arg: &Variable,
+        src_is_pointer: bool,
     ) -> Option<(OpKind, Variable)> {
-        if !matches!(src_kind, Some(ValueType::Ref(_))) {
-            return None;
-        }
         let dest_kind = tyref_to_value_type_with(
             dest_ty,
             self.llbc,
@@ -4519,22 +4562,25 @@ impl<'a> Lowering<'a> {
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
         );
-        // Dest-Str restore: GCREF → rstr `STR` pointer. Upstream
-        // `LLFrame.op_gc_restore_root` recasts with the livevar's own
-        // lltype (`cast_adr_to_ptr`); `GCRefRepr.convert_from_to` is
-        // `cast_opaque_ptr` onto `r_to.lowleveltype`. Every dest whose
-        // layout is rstr `STR` (`is_rstr_str_layout_declaration`) takes
-        // the same Ptr(STR) restore. The blackhole `{hash, len}` overlay
-        // is that layout; its `.length` FieldRead is `len(s)`
-        // (`LLHelpers.ll_strlen`). Wrappers around a STR pointer
-        // (`celldict::StrKey` / `dictmultiobject::BytesKey`) are not this
-        // layout. The dest must already be `ValueType::Str` or a raw
-        // pointer to that layout (`tyref_raw_ptr_pointee_is_string_value`).
-        if (matches!(dest_kind, ValueType::Str)
-            || tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc))
-            && let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
+        // Dest-Str restore first: GCREF / FieldRead Str / immortal
+        // `*mut u8` → rstr `STR` (`op_gc_restore_root` /
+        // `GCRefRepr.convert_from_to`). Dest layout is rstr `STR`
+        // (`is_rstr_str_layout_declaration`) even when dest_kind is
+        // `Ref(Utf8Str)` or src is not `Ref`. Wrappers around a STR
+        // pointer (`celldict::StrKey` / `dictmultiobject::BytesKey`)
+        // are not this layout.
+        // `rbuiltin.py` `gen_cast`: Ptr→Ptr is `cast_pointer`;
+        // Primitive→Ptr is `cast_int_to_ptr`. A genuine integer never
+        // takes the pointer-only instance cast.
+        // `__cast_instance_intrinsic` of a string root (`builtin.py`)
+        // requires a pointer operand; `i64 as *mut Utf8Str`
+        // (`alloc_utf8_payload`) stays the identity alias.
+        if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)
             && is_rstr_str_layout_declaration(&root)
         {
+            if !src_is_pointer {
+                return None;
+            }
             let res = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -4542,6 +4588,9 @@ impl<'a> Lowering<'a> {
                 crate::model::cast_instance_call_result(root, arg.clone(), ValueType::Str),
                 res,
             ));
+        }
+        if !matches!(src_kind, Some(ValueType::Ref(_))) {
+            return None;
         }
         if !matches!(dest_kind, ValueType::Ref(_)) {
             return None;
@@ -6427,7 +6476,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::FieldRead {
                             base,
                             field,
-                            ty,
+                            ty: ty.clone(),
                             pure: false,
                         },
                     });
@@ -6450,6 +6499,30 @@ impl<'a> Lowering<'a> {
                         self.guard_word_vars.insert(res.clone());
                     }
                     if narrow_instance_class {
+                        // Dest-Str restore on the Managed STR payload
+                        // (`op_gc_restore_root` / `GCRefRepr.convert_from_to`)
+                        // before W_ROOT paints `PyObject` onto a `Ptr(STR)`
+                        // the BlockRoute phi then unions (`rstr.py`
+                        // `mallocstr`).
+                        if matches!(ty, ValueType::Str)
+                            || self.dest_ty_is_rstr_str(&place_ty)
+                            || self.dest_ty_is_rstr_str(&field_ty)
+                        {
+                            if let Some((kind, narrowed)) = self.ptr_cast_marker(
+                                Some(&ty),
+                                None,
+                                &place_ty,
+                                &res,
+                                self.cast_src_is_pointer(Some(&field_ty), Some(&ty), &res),
+                            ) {
+                                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                    result: Some(narrowed.clone()),
+                                    kind,
+                                });
+                                return Ok(narrowed);
+                            }
+                            return Ok(res);
+                        }
                         let narrowed = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -8461,44 +8534,12 @@ impl<'a> Lowering<'a> {
         Some(match action {
             IntCastAction::Alias => (None, arg),
             IntCastAction::RUint => {
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                (
-                    Some(OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect(),
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        },
-                        args: crate::model::call_args(vec![arg]),
-                        result_ty: ValueType::Unsigned,
-                    }),
-                    res,
-                )
+                let (kind, res) = signedness_retype_op(&mut self.graph, arg, false);
+                (Some(kind), res)
             }
             IntCastAction::IntMask => {
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                (
-                    Some(OpKind::Call {
-                        target: CallTarget::FunctionPath {
-                            segments: ["rpython", "rlib", "rarithmetic", "intmask"]
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect(),
-                            fun_decl_id: None,
-                            specialization: crate::parse::GraphSpecialization::Regular,
-                        },
-                        args: crate::model::call_args(vec![arg]),
-                        result_ty: ValueType::Int,
-                    }),
-                    res,
-                )
+                let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
+                (Some(kind), res)
             }
             IntCastAction::And(mask) => {
                 let mask_var = self
@@ -9962,6 +10003,22 @@ pub(in crate::front::mir) fn rarithmetic_mask(
         args: crate::model::call_args(vec![arg]),
         result_ty,
     }
+}
+
+/// `rarithmetic.intmask` (`result_ty: Int`) or `r_uint` (`result_ty: Unsigned`).
+/// `rarithmetic.py` `intmask` / `r_uint`; `rffi.cast` annotates from the target.
+pub(in crate::front::mir) fn signedness_retype_op(
+    graph: &mut FunctionGraph,
+    arg: Variable,
+    dest_signed: bool,
+) -> (OpKind, Variable) {
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let kind = if dest_signed {
+        rarithmetic_mask("intmask", arg, ValueType::Int)
+    } else {
+        rarithmetic_mask("r_uint", arg, ValueType::Unsigned)
+    };
+    (kind, result)
 }
 
 /// Emit RPython's pointer-to-Unsigned primitive cast sequence.

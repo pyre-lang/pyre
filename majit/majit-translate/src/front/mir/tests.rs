@@ -1250,6 +1250,323 @@ fn gcref_cast_to_utf8str_emits_cast_instance_str() {
     );
 }
 
+/// Immortal `alloc_varsize_with_gc_header_immortal` `*mut u8` recast onto
+/// rstr `STR` (`rstr.py` `mallocstr`). UnaryOp Cast and Rvalue RawPtr both
+/// emit `__cast_instance_intrinsic` with a Utf8Str-family root and
+/// `result_ty == ValueType::Str`.
+#[test]
+fn unsigned_cast_to_utf8str_emits_cast_instance_str() {
+    use crate::model::{OpKind, ValueType};
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty =
+        serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let n = usize_ty();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_immortal_str_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_immortal_str_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [utf8],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_utf8str_str_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                ) && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
+                    super::lltype::is_str_family_class_root(root)
+                        && majit_ir::descr::class_root_leaf(root) == "Utf8Str"
+                })
+            })
+        })
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_immortal_str_cast")
+        .expect("lower UnaryOp Cast *mut u8 to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&unary_graph),
+        "UnaryOp Cast *mut u8 as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_immortal_str_cast")
+        .expect("lower Rvalue RawPtr Cast *mut u8 to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&rvalue_graph),
+        "Rvalue::Cast RawPtr *mut u8 as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+/// A genuine `usize` (`ValueType::Unsigned`) cast onto rstr `STR` is
+/// `rbuiltin.py` `gen_cast` Primitive→Ptr (`cast_int_to_ptr`), not the
+/// pointer-only dest-Str restore. UnaryOp Cast and Rvalue RawPtr both
+/// skip `__cast_instance_intrinsic`.
+#[test]
+fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = usize_ty();
+    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let n = usize_ty();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "addr", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_usize_str_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_usize_str_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [utf8],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let has_cast_instance = |graph: &crate::model::FunctionGraph| {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| crate::model::cast_instance_root(&op.kind).is_some())
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_usize_str_cast")
+        .expect("lower UnaryOp Cast usize to *mut Utf8Str");
+    assert!(
+        !has_cast_instance(&unary_graph),
+        "UnaryOp Cast usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_usize_str_cast")
+        .expect("lower Rvalue RawPtr Cast usize to *mut Utf8Str");
+    assert!(
+        !has_cast_instance(&rvalue_graph),
+        "Rvalue::Cast RawPtr usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+/// `try_alloc_bytes_block` Managed payload and immortal STR recast are
+/// dest-Str (`rstr.py` `mallocstr` / `op_gc_restore_root`), not W_ROOT
+/// `PyObject`.
+#[test]
+fn try_alloc_bytes_block_str_malloc_not_object() {
+    use crate::model::{OpKind, ValueType};
+
+    let llbc =
+        Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("load pyre-object.ullbc");
+    let graph = super::lower_function(&llbc, "try_alloc_bytes_block")
+        .or_else(|_| {
+            super::lower_function(&llbc, "pyre_object::bytesobject::try_alloc_bytes_block")
+        })
+        .expect("lower try_alloc_bytes_block");
+    let mut managed_w_root = false;
+    let mut dest_str = false;
+    for block in &graph.blocks {
+        for window in block.operations.windows(2) {
+            if let OpKind::FieldRead { field, ty, .. } = &window[0].kind
+                && field.name == "__pos_0"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|owner| owner.contains("Managed"))
+            {
+                if crate::model::cast_instance_root(&window[1].kind)
+                    == Some(super::W_ROOT_CLASS_ROOT)
+                {
+                    managed_w_root = true;
+                }
+                if matches!(ty, ValueType::Str)
+                    || matches!(
+                        &window[1].kind,
+                        OpKind::Call {
+                            result_ty: ValueType::Str,
+                            ..
+                        }
+                    )
+                {
+                    dest_str = true;
+                }
+            }
+        }
+        for op in &block.operations {
+            if matches!(
+                &op.kind,
+                OpKind::Call {
+                    result_ty: ValueType::Str,
+                    ..
+                }
+            ) && crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| super::lltype::is_rstr_str_layout_declaration(root))
+            {
+                dest_str = true;
+            }
+        }
+    }
+    assert!(
+        !managed_w_root,
+        "Managed *mut BytesBlock must not W_ROOT; graph={}",
+        graph.dump()
+    );
+    assert!(
+        dest_str,
+        "try_alloc_bytes_block STR recast is dest-Str; graph={}",
+        graph.dump()
+    );
+    // Immortal `<*mut u8>::cast::<BytesBlock>()` is a dest-Str block of
+    // its own (`op_gc_restore_root`); Managed dest-Str shares the
+    // FieldRead block, `null_mut` dest-Str shares the nullptr Call.
+    let immortal_dest_str = graph.blocks.iter().any(|block| {
+        let has_field = block
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::FieldRead { .. }));
+        let has_null = block.operations.iter().any(|op| {
+            matches!(&op.kind, OpKind::Call { target, .. } if target.path_segments().is_some_and(|segs| segs.last() == Some(&"null_mut")))
+        });
+        let has_dest_str = block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    result_ty: ValueType::Str,
+                    ..
+                }
+            ) && crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| super::lltype::is_rstr_str_layout_declaration(root))
+        });
+        has_dest_str && !has_field && !has_null
+    });
+    assert!(
+        immortal_dest_str,
+        "immortal *mut u8.cast::<BytesBlock>() is dest-Str; graph={}",
+        graph.dump()
+    );
+}
+
 /// Ref-source cast onto `LowlevelStringHeader` takes the dest-Str arm:
 /// that overlay is rstr `STR` (`is_rstr_str_layout_declaration`), so
 /// `op_gc_restore_root` restores Ptr(STR). The following `.length` read
@@ -13750,6 +14067,73 @@ fn map_or_i64_from_fn_item_is_identity_select() {
         branches, 1,
         "the core body branches to Some/None arms, got {branches}"
     );
+}
+
+/// `i64::from(u8)` (`core::convert::num::<Impl>::from`) is
+/// `rarithmetic.intmask` with `result_ty: Int`. Same marker
+/// `Rvalue::Cast` uses for unsigned→signed (`rarithmetic.py` `intmask`;
+/// `rffi.cast` annotates from the target).
+#[test]
+fn i64_from_u8_lowers_to_intmask() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let i64_ty = interior_i64();
+    let from = interior_opaque(
+        1,
+        &["core", "convert", "num", "<Impl>", "from"],
+        vec![u8_ty.clone()],
+        i64_ty.clone(),
+    );
+    let caller = interior_caller(
+        "from_u8",
+        1,
+        vec![u8_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &u8_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &u8_ty))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![caller, from]);
+    let graph = lower_interior(&llbc, "from_u8");
+    let intmask = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected intmask; graph={}", graph.dump()));
+    match &intmask.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &ValueType::Int,
+                "intmask result_ty is Int; graph={}",
+                graph.dump()
+            );
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
 }
 
 /// `opt.map_or(-1, plus_one)` with a local function item: the caller
