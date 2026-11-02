@@ -6273,7 +6273,9 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // separate objects, and each is rooted on its own. Restore writes the
     // forwarded snapshot address (`pyjitpl.py` holds the virtualizable in a
     // box the GC traces).
-    let saved_vable_root = SavedVableRoot::push(saved_vable_heap_ptr.filter(|p| !p.is_null()));
+    let mut saved_vable_root = Some(SavedVableRoot::push(
+        saved_vable_heap_ptr.filter(|p| !p.is_null()),
+    ));
     // #57 Option C (Finding #1, R1 double-apply guard): whether THIS residual
     // could commit an irreversible heap mutation the journals do not cover,
     // while an in-flight FOR_ITER item is already captured (a consume ran
@@ -6786,7 +6788,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
             // snapshot) → `vable_after_residual_call` / `SwitchToBlackhole(ABORT_ESCAPE)`.
             let identity = **obj as usize;
             if let Some(snapshot_ptr) = saved_vable_root
-                .forwarded()
+                .as_ref()
+                .and_then(SavedVableRoot::forwarded)
                 .or_else(|| ctx.trace_ctx.virtualizable_heap_ptr())
                 .filter(|p| !p.is_null() && *p as usize != identity)
             {
@@ -7101,10 +7104,13 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
     // Restore the synchronization target (snapshot), not the token object
     // (identity). The two are separate and each was rooted on its own.
     let restored_vable_heap_ptr = saved_vable_root
-        .forwarded()
+        .as_ref()
+        .and_then(SavedVableRoot::forwarded)
         .or(saved_vable_heap_ptr)
         .unwrap_or(std::ptr::null());
-    drop(saved_vable_root);
+    if vable_root_depth.is_none() {
+        saved_vable_root.take();
+    }
     ctx.trace_ctx
         .set_virtualizable_heap_ptr(restored_vable_heap_ptr);
     // `do_residual_call` steps 3 and 4. `vrefs_after_residual_call` /
@@ -7167,6 +7173,8 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
         if let Some(depth) = vable_root_depth {
             majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
         }
+        // Snapshot after identity: resume-ref roots pop LIFO (`push_roots`/`pop_roots`).
+        saved_vable_root.take();
         // Match `LiveLastInstrGuard` by restoring both halves after the
         // residual.  A force is excluded because the callee made the heap
         // authoritative and its escape walk reloads the shadow; restoring a

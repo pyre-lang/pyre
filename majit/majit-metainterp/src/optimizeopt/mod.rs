@@ -3446,12 +3446,12 @@ impl OptContext {
 
     /// `emit_for_force` with the owning `Optimizer`, so a force-time STRLEN
     /// or string store follows `Optimization.emit_extra` immediately
-    /// (`emit_extra_immediate`) instead of parking on `extra_operations_after`.
-    /// `force_direct` or `in_final_emission`, when an optimizer is present,
-    /// appends through `Optimizer.emit_extra` → `emit` → `emit_operation_inner`,
-    /// which forces every argument before the append. Without an optimizer
-    /// the direct branch still `emit_rc`s and does not force arguments
-    /// (`force_box_inline` / tests).
+    /// (`send_extra_operation_after`). Past the last pass the walk ends in
+    /// `Optimizer.emit`. `force_direct` or `in_final_emission`, when an
+    /// optimizer is present, appends through `Optimizer.emit_extra` → `emit` →
+    /// `emit_operation_inner`, which forces every argument before the append.
+    /// Without an optimizer the direct branch still `emit_rc`s and does not
+    /// force arguments (`force_box_inline` / tests).
     pub(crate) fn emit_for_force_with(
         &mut self,
         optimizer: &mut Option<&mut optimizer::Optimizer>,
@@ -3489,7 +3489,7 @@ impl OptContext {
             // `vstring.py` `optstring.emit_extra` / `Optimization.emit_extra`:
             // same entry index as `emit_extra_rc` (`current_pass_idx + 1`).
             if let Err(crate::optimize::InvalidLoop(reason)) =
-                opt.emit_extra_immediate(self.current_pass_idx, &op, self)
+                opt.send_extra_operation_after(self.current_pass_idx, &op, self)
             {
                 self.signal_invalid_loop(reason);
             }
@@ -4179,7 +4179,7 @@ impl OptContext {
     /// `opt=first_optimization`) enters at pass 0.
     /// Assign a result position to an extra op and check the box-type
     /// invariant. Shared by the queued `emit_extra` path and
-    /// `Optimizer::emit_extra_immediate`.
+    /// `Optimizer::send_extra_operation_after`.
     pub(crate) fn assign_extra_pos(&mut self, op: &majit_ir::OpRc) {
         if op.pos().get().is_none() {
             // Typed allocation, same rationale as `emit`.

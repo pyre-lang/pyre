@@ -6,9 +6,10 @@ use majit_ir::operand::Operand;
 /// Rewrites operations into equivalent, cheaper operations.
 /// This includes constant folding for pure ops and algebraic identities.
 use majit_ir::{Const, Op, OpCode, OpRc, OpRef, Value};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::optimizeopt::info::{PreambleOp, PtrInfoExt};
+use crate::optimizeopt::optimizer::{Optimizer, send_extra_operation_from};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult, intdiv};
 
 /// rewrite.py: loop_invariant_results value.
@@ -133,27 +134,25 @@ enum Nullness {
 /// - Pointer equality on same OpRef
 /// - Cast and convert round-trip elimination
 /// - Guard-no-exception removal after removed calls
-pub struct OptRewriteState {
+pub struct OptRewrite {
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
-    loop_invariant_results: indexmap::IndexMap<i64, LoopInvariantEntry>,
+    loop_invariant_results: RefCell<IndexMap<i64, LoopInvariantEntry>>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py).
-    loop_invariant_producer: indexmap::IndexMap<i64, OpRc>,
+    loop_invariant_producer: RefCell<IndexMap<i64, OpRc>>,
     /// rewrite.py `CallLoopinvariantOptimizationResult` — the key its
     /// `_callback` records once the rewritten call has been emitted.
-    pending_loopinvariant_key: Option<i64>,
-}
-
-pub struct OptRewrite {
-    state: RefCell<OptRewriteState>,
+    pending_loopinvariant_key: Cell<Option<i64>>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         Self {
-            state: RefCell::new(OptRewriteState::new()),
+            loop_invariant_results: RefCell::new(IndexMap::new()),
+            loop_invariant_producer: RefCell::new(IndexMap::new()),
+            pending_loopinvariant_key: Cell::new(None),
         }
     }
 }
@@ -161,24 +160,20 @@ impl OptRewrite {
 /// The loop `rewrite.py` runs over an `intdiv` result: send each operation
 /// from the head of the pass chain and take the last one, which computes the
 /// value.
-fn send_extra_operations(ctx: &mut OptContext, operations: Vec<majit_ir::OpRc>) -> Operand {
+fn send_extra_operations(
+    opt: &mut Option<&mut Optimizer>,
+    ctx: &mut OptContext,
+    operations: Vec<majit_ir::OpRc>,
+) -> Operand {
     let mut newop = None;
     for operation in operations {
-        ctx.send_extra_operation_rc(operation.clone());
+        send_extra_operation_from(opt, &operation, ctx);
         newop = Some(operation);
     }
     Operand::from_bound_op(&newop.expect("intdiv returns at least two operations"))
 }
 
-impl OptRewriteState {
-    pub fn new() -> Self {
-        OptRewriteState {
-            loop_invariant_results: indexmap::IndexMap::new(),
-            loop_invariant_producer: indexmap::IndexMap::new(),
-            pending_loopinvariant_key: None,
-        }
-    }
-
+impl OptRewrite {
     // ── Constant folding for binary integer ops ──
 
     /// Constant-fold for the pyre-opcode strength-reduction rules below
@@ -210,6 +205,7 @@ impl OptRewriteState {
         &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let arg0 = op.arg(0);
@@ -299,6 +295,7 @@ impl OptRewriteState {
                 // rewrite.py:770 `known_nonneg = b1.known_nonnegative()`:
                 // a non-negative dividend skips the sign-correction ops.
                 let b_res = send_extra_operations(
+                    opt,
                     ctx,
                     intdiv::division_operations(&arg0, divisor, known_nonneg),
                 );
@@ -318,6 +315,7 @@ impl OptRewriteState {
         &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let arg0 = op.arg(0);
@@ -395,8 +393,11 @@ impl OptRewriteState {
             && known_nonneg
             && ctx.supports_efficient_uint_mul_high
         {
-            let b_res =
-                send_extra_operations(ctx, intdiv::modulo_operations(&arg0, divisor, known_nonneg));
+            let b_res = send_extra_operations(
+                opt,
+                ctx,
+                intdiv::modulo_operations(&arg0, divisor, known_nonneg),
+            );
             let b_old = Operand::from_bound_op(op_rc);
             ctx.make_equal_to(&b_old, &b_res);
             return OptimizationResult::Remove;
@@ -1104,7 +1105,7 @@ impl OptRewriteState {
     /// rewrite.py: _optimize_CALL_INT_UDIV
     /// x / 1 → x
     fn optimize_call_int_udiv(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1128,9 +1129,10 @@ impl OptRewriteState {
 
     /// rewrite.py: _optimize_CALL_INT_PY_MOD
     fn optimize_call_int_py_mod(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         if op.num_args() < 3 {
@@ -1177,14 +1179,19 @@ impl OptRewriteState {
             let arg_mask = Operand::const_(Const::Int(val - 1));
             let mut and_op = Op::new(OpCode::IntAnd, &[arg1, arg_mask.clone()]);
             and_op.pos().set(op.pos().get());
-            ctx.send_extra_operation(and_op);
+            let and_op = OpRc::new(and_op);
+            send_extra_operation_from(opt, &and_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:797-805: intdiv.modulo_operations fallback, which emits
         // UINT_MUL_HIGH unconditionally.  The residual call always goes away.
         let known_nonneg = b1.known_nonnegative();
-        let b_res = send_extra_operations(ctx, intdiv::modulo_operations(&arg1, val, known_nonneg));
+        let b_res = send_extra_operations(
+            opt,
+            ctx,
+            intdiv::modulo_operations(&arg1, val, known_nonneg),
+        );
         let b_old = Operand::from_bound_op(op_rc);
         ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
@@ -1193,9 +1200,10 @@ impl OptRewriteState {
 
     /// rewrite.py: _optimize_CALL_INT_PY_DIV
     fn optimize_call_int_py_div(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> Option<OptimizationResult> {
         if op.num_args() < 3 {
@@ -1236,7 +1244,8 @@ impl OptRewriteState {
                     let arg_shift = shiftvar.clone();
                     let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
                     rshift_op.pos().set(op.pos().get());
-                    ctx.send_extra_operation(rshift_op);
+                    let rshift_op = OpRc::new(rshift_op);
+                    send_extra_operation_from(opt, &rshift_op, ctx);
                     ctx.last_op_removed = true;
                     return Some(OptimizationResult::Remove);
                 }
@@ -1248,7 +1257,8 @@ impl OptRewriteState {
         if val == -1 && b1.known_gt_const(i64::MIN) {
             let mut neg_op = Op::new(OpCode::IntNeg, &[arg1]);
             neg_op.pos().set(op.pos().get());
-            ctx.send_extra_operation(neg_op);
+            let neg_op = OpRc::new(neg_op);
+            send_extra_operation_from(opt, &neg_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
@@ -1270,15 +1280,19 @@ impl OptRewriteState {
             let arg_shift = Operand::const_(Const::Int(shift));
             let mut rshift_op = Op::new(OpCode::IntRshift, &[arg1, arg_shift.clone()]);
             rshift_op.pos().set(op.pos().get());
-            ctx.send_extra_operation(rshift_op);
+            let rshift_op = OpRc::new(rshift_op);
+            send_extra_operation_from(opt, &rshift_op, ctx);
             ctx.last_op_removed = true;
             return Some(OptimizationResult::Remove);
         }
         // rewrite.py:758-766: intdiv.division_operations fallback, which emits
         // UINT_MUL_HIGH unconditionally.  The residual call always goes away.
         let known_nonneg = b1.known_nonnegative();
-        let b_res =
-            send_extra_operations(ctx, intdiv::division_operations(&arg1, val, known_nonneg));
+        let b_res = send_extra_operations(
+            opt,
+            ctx,
+            intdiv::division_operations(&arg1, val, known_nonneg),
+        );
         let b_old = Operand::from_bound_op(op_rc);
         ctx.make_equal_to(&b_old, &b_res);
         ctx.last_op_removed = true;
@@ -1294,13 +1308,14 @@ impl OptRewriteState {
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
     )]
     fn optimize_call_arrayop(
-        &mut self,
+        &self,
         op: &Op,
         source_box: OpRef,
         dest_box: OpRef,
         source_start_box: OpRef,
         dest_start_box: OpRef,
         length_box: OpRef,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> bool {
         // rewrite.py:601-602: length = self.get_constant_box(length_box)
@@ -1477,7 +1492,7 @@ impl OptRewriteState {
                 let mut getop = Op::new(opcode, &[arg_source.clone(), arg_idx.clone()]);
                 getop.setdescr(arraydescr.clone());
                 let getop = OpRc::new(getop);
-                ctx.send_extra_operation_rc(getop.clone());
+                send_extra_operation_from(opt, &getop, ctx);
                 Some(Operand::from_bound_op(&getop))
             };
 
@@ -1503,7 +1518,8 @@ impl OptRewriteState {
                     &[arg_dest.clone(), arg_idx.clone(), arg_val.clone()],
                 );
                 setop.setdescr(arraydescr.clone());
-                ctx.send_extra_operation(setop);
+                let setop = OpRc::new(setop);
+                send_extra_operation_from(opt, &setop, ctx);
             }
         }
         true
@@ -1732,12 +1748,12 @@ impl OptRewriteState {
     }
 }
 
-impl OptRewriteState {
+impl OptRewrite {
     fn propagate_forward(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
-        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         // Track last_op_removed for GuardNoException optimization.
@@ -1760,8 +1776,8 @@ impl OptRewriteState {
             // IntFloorDiv / IntMod are pyre opcodes (upstream lowers // and %
             // to residual calls, see optimize_call_int_py_div / _py_mod), so
             // their strength-reduction rules stay here with the opcode.
-            OpCode::IntFloorDiv => self.optimize_int_floor_div(op, op_rc, ctx),
-            OpCode::IntMod => self.optimize_int_mod(op, op_rc, ctx),
+            OpCode::IntFloorDiv => self.optimize_int_floor_div(op, op_rc, opt, ctx),
+            OpCode::IntMod => self.optimize_int_mod(op, op_rc, opt, ctx),
 
             // Tagged-int box/unbox round-trip fold. The autogen IntRshift
             // rules live in OptIntBounds (autogenintrules.rs); this pyre-only
@@ -2195,13 +2211,15 @@ impl OptRewriteState {
                         }
                         // rewrite.py:689: OS_INT_PY_DIV
                         majit_ir::OopSpecIndex::IntPyDiv => {
-                            if let Some(result) = self.optimize_call_int_py_div(op, op_rc, ctx) {
+                            if let Some(result) = self.optimize_call_int_py_div(op, op_rc, opt, ctx)
+                            {
                                 return result;
                             }
                         }
                         // rewrite.py:692: OS_INT_PY_MOD
                         majit_ir::OopSpecIndex::IntPyMod => {
-                            if let Some(result) = self.optimize_call_int_py_mod(op, op_rc, ctx) {
+                            if let Some(result) = self.optimize_call_int_py_mod(op, op_rc, opt, ctx)
+                            {
                                 return result;
                             }
                         }
@@ -2226,6 +2244,7 @@ impl OptRewriteState {
                         .find(|(k, _)| *k == func_val)
                         && !self
                             .loop_invariant_results
+                            .borrow()
                             .iter()
                             .any(|(k, _)| *k == func_val)
                     {
@@ -2243,7 +2262,7 @@ impl OptRewriteState {
                         let source_op = ctx.materialize_operand_at(source);
                         let mut replay = Op::new(OpCode::SameAsI, std::slice::from_ref(&source_op));
                         replay.pos().set(replay_pos);
-                        self.loop_invariant_results.insert(
+                        self.loop_invariant_results.borrow_mut().insert(
                             func_val,
                             LoopInvariantEntry::Preamble(PreambleOp {
                                 op: source_op,
@@ -2257,12 +2276,15 @@ impl OptRewriteState {
                     }
                     // rewrite.py:453-458: isinstance(resvalue, PreambleOp)
                     // → force_op_from_preamble → replace in dict
-                    if let Some(entry) = self.loop_invariant_results.get(&func_val).cloned() {
+                    if let Some(entry) =
+                        self.loop_invariant_results.borrow().get(&func_val).cloned()
+                    {
                         let cached_result = match entry {
                             LoopInvariantEntry::Preamble(ref pop) => {
                                 // unroll.py: force_op_from_preamble(preamble_op)
                                 let forced = ctx.force_op_from_preamble_op(pop).to_opref();
                                 self.loop_invariant_results
+                                    .borrow_mut()
                                     .insert(func_val, LoopInvariantEntry::Direct(forced));
                                 forced
                             }
@@ -2276,10 +2298,11 @@ impl OptRewriteState {
                     }
                     // Cache miss: demote and record result
                     self.loop_invariant_results
+                        .borrow_mut()
                         .insert(func_val, LoopInvariantEntry::Direct(op.pos().get()));
                     // rewrite.py `CallLoopinvariantOptimizationResult`:
                     // `_callback` records the emitted producer.
-                    self.pending_loopinvariant_key = Some(func_val);
+                    self.pending_loopinvariant_key.set(Some(func_val));
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let new_op = op.copy_and_change(call_opcode, None, None);
@@ -2373,6 +2396,7 @@ impl OptRewriteState {
                                         op.arg(3).to_opref(),
                                         op.arg(4).to_opref(),
                                         op.arg(5).to_opref(), // src_start, dst_start, length
+                                        opt,
                                         ctx,
                                     ) {
                                         return OptimizationResult::Remove;
@@ -2389,6 +2413,7 @@ impl OptRewriteState {
                                         op.arg(2).to_opref(),
                                         op.arg(3).to_opref(),
                                         op.arg(4).to_opref(),
+                                        opt,
                                         ctx,
                                     ) {
                                         return OptimizationResult::Remove;
@@ -2405,13 +2430,13 @@ impl OptRewriteState {
         }
     }
 
-    fn setup(&mut self) {
+    fn setup(&self) {
         // ctx.last_op_removed is initialised by OptContext::new() and
         // maintained cross-pass by propagate_from_pass_range +
         // emit_operation — no per-pass setup needed.
-        self.loop_invariant_results.clear();
-        self.loop_invariant_producer.clear();
-        self.pending_loopinvariant_key = None;
+        self.loop_invariant_results.borrow_mut().clear();
+        self.loop_invariant_producer.borrow_mut().clear();
+        self.pending_loopinvariant_key.set(None);
     }
 
     fn have_postprocess(&self) -> bool {
@@ -2438,11 +2463,13 @@ impl OptRewriteState {
     /// the same value and the constant is correct for all of them. PyPy's
     /// stable-Box vs majit's stable-OpRef yield the same observable
     /// behavior.
-    fn propagate_postprocess(&mut self, op: &Op, op_rc: &OpRc, ctx: &mut OptContext) {
+    fn propagate_postprocess(&self, op: &Op, op_rc: &OpRc, ctx: &mut OptContext) {
         // rewrite.py `CallLoopinvariantOptimizationResult._callback`:
         // `loop_invariant_producer[key] = self.optimizer.getlastop()`.
         if let Some(key) = self.pending_loopinvariant_key.take() {
-            self.loop_invariant_producer.insert(key, op_rc.clone());
+            self.loop_invariant_producer
+                .borrow_mut()
+                .insert(key, op_rc.clone());
         }
         match op.opcode {
             OpCode::GuardTrue => {
@@ -2480,7 +2507,13 @@ impl OptRewriteState {
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
         ctx: &mut OptContext,
     ) {
-        for (_, op) in &self.loop_invariant_producer {
+        let producers: Vec<OpRc> = self
+            .loop_invariant_producer
+            .borrow()
+            .values()
+            .cloned()
+            .collect();
+        for op in &producers {
             sb.add_loopinvariant_op(ctx, op);
         }
     }
@@ -2488,6 +2521,7 @@ impl OptRewriteState {
     /// rewrite.py serialize_optrewrite
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
         self.loop_invariant_results
+            .borrow()
             .iter()
             .map(|(func_ptr, entry)| match entry {
                 LoopInvariantEntry::Direct(r) => (*func_ptr, *r),
@@ -2497,9 +2531,10 @@ impl OptRewriteState {
     }
 
     /// rewrite.py deserialize_optrewrite
-    fn deserialize_optrewrite(&mut self, entries: &[(i64, OpRef)]) {
+    fn deserialize_optrewrite(&self, entries: &[(i64, OpRef)]) {
         for &(func_ptr, result) in entries {
             self.loop_invariant_results
+                .borrow_mut()
                 .insert(func_ptr, LoopInvariantEntry::Direct(result));
         }
     }
@@ -2513,13 +2548,11 @@ impl Optimization for OptRewrite {
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.state
-            .borrow_mut()
-            .propagate_forward(op, op_rc, opt, ctx)
+        OptRewrite::propagate_forward(self, op, op_rc, opt, ctx)
     }
 
     fn setup(&self) {
-        self.state.borrow_mut().setup();
+        OptRewrite::setup(self);
     }
 
     fn name(&self) -> &'static str {
@@ -2527,13 +2560,11 @@ impl Optimization for OptRewrite {
     }
 
     fn have_postprocess(&self) -> bool {
-        self.state.borrow().have_postprocess()
+        OptRewrite::have_postprocess(self)
     }
 
     fn propagate_postprocess(&self, op: &Op, op_rc: &OpRc, ctx: &mut OptContext) {
-        self.state
-            .borrow_mut()
-            .propagate_postprocess(op, op_rc, ctx);
+        OptRewrite::propagate_postprocess(self, op, op_rc, ctx);
     }
 
     fn produce_potential_short_preamble_ops(
@@ -2541,17 +2572,15 @@ impl Optimization for OptRewrite {
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
         ctx: &mut OptContext,
     ) {
-        self.state
-            .borrow()
-            .produce_potential_short_preamble_ops(sb, ctx);
+        OptRewrite::produce_potential_short_preamble_ops(self, sb, ctx);
     }
 
     fn serialize_optrewrite(&self) -> Vec<(i64, OpRef)> {
-        self.state.borrow().serialize_optrewrite()
+        OptRewrite::serialize_optrewrite(self)
     }
 
     fn deserialize_optrewrite(&self, entries: &[(i64, OpRef)]) {
-        self.state.borrow_mut().deserialize_optrewrite(entries);
+        OptRewrite::deserialize_optrewrite(self, entries);
     }
 }
 

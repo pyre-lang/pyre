@@ -614,6 +614,23 @@ pub(crate) enum ImportedVirtualKind {
     Struct,
 }
 
+/// `self.optimizer.send_extra_operation(op)` from inside a pass.
+pub(super) fn send_extra_operation_from(
+    optimizer: &mut Option<&mut Optimizer>,
+    op: &OpRc,
+    ctx: &mut OptContext,
+) {
+    if ctx.in_final_emission {
+        ctx.emit_rc(op.clone());
+    } else if let Some(opt) = optimizer.as_deref_mut() {
+        if let Err(crate::optimize::InvalidLoop(reason)) = opt.send_extra_operation(op, ctx) {
+            ctx.signal_invalid_loop(reason);
+        }
+    } else {
+        ctx.send_extra_operation_rc(op.clone());
+    }
+}
+
 impl Optimizer {
     pub(crate) fn register_preamble_cached_field(
         &mut self,
@@ -2116,9 +2133,9 @@ impl Optimizer {
     pub fn flush(&mut self, ctx: &mut OptContext) -> Result<(), crate::optimize::InvalidLoop> {
         for pass_idx in 0..self.passes.len() {
             // heap.flush() resolves the "next_optimization" emit_extra
-            // target through `ctx.current_pass_idx`. Heap walks remaining
-            // passes immediately (`send_extra_operation_after`); other
-            // passes still queue. Set it so those extras start after this
+            // target through `ctx.current_pass_idx`. Immediate-send extras
+            // (`send_extra_operation` / `send_extra_operation_after`) walk
+            // from this index. Set it so those extras start after this
             // pass — RPython parity with `self.next_optimization`.
             ctx.current_pass_idx = pass_idx;
             let pass = Rc::clone(&self.passes[pass_idx]);
@@ -2151,18 +2168,24 @@ impl Optimizer {
         op_rc: &OpRc,
         ctx: &mut OptContext,
     ) -> Result<(), crate::optimize::InvalidLoop> {
+        ctx.assign_extra_pos(op_rc);
         // Register the producer for op_rc.pos before dispatch so a pass that
         // folds it via make_equal_to(from_bound_op(op_rc), ..) writes the
         // forwarding onto a host find_producer_op can reach (the normal trace
         // path registers via bind_input_resops; emit_extra does the same).
         ctx.register_extra_producer(op_rc);
-        self.propagate_from_pass(0, op_rc, ctx)
+        let saved = ctx.current_pass_idx;
+        let result = self.propagate_from_pass(0, op_rc, ctx);
+        ctx.current_pass_idx = saved;
+        result
     }
 
     /// `Optimization.emit_extra(op, emit=False)`:
     /// `send_extra_operation(op, self.next_optimization)`. Walks the passes after
     /// `after_pass_idx` on this `OpRc`; past the last pass the walk ends in
-    /// `Optimizer.emit`. Restores `current_pass_idx`.
+    /// `Optimizer.emit`. Restores `current_pass_idx`. Force-time emits
+    /// (`info.py` `AbstractVirtualPtrInfo.force_box` `optforce.emit_extra`)
+    /// come through here too.
     pub(super) fn send_extra_operation_after(
         &mut self,
         after_pass_idx: usize,
@@ -2174,34 +2197,6 @@ impl Optimizer {
         let saved = ctx.current_pass_idx;
         let end_pass = self.extra_operation_end_pass();
         let result = self.propagate_from_pass_range(after_pass_idx + 1, end_pass, op, ctx);
-        ctx.current_pass_idx = saved;
-        result
-    }
-
-    /// `Optimization.emit_extra` / `send_extra_operation(op, next_optimization)`.
-    /// Same entry index as `emit_extra_rc` (`after_pass_idx + 1`) and the same
-    /// `OpRc` (box identity). Restores `current_pass_idx`.
-    ///
-    /// No pass sits at `next_optimization` (`start >= passes.len()`): `emit_extra`
-    /// leaves the op queued at that entry index. An empty `propagate_from_pass`
-    /// still reads `SameAs*.arg(0)` and then calls `_emit_operation`. That panics
-    /// on the 0-arg synthetic a producer-less virtual box mints, and it skips
-    /// the `OptEarlyForce.next` slot `force_box` enters at.
-    pub(super) fn emit_extra_immediate(
-        &mut self,
-        after_pass_idx: usize,
-        op: &OpRc,
-        ctx: &mut OptContext,
-    ) -> Result<(), crate::optimize::InvalidLoop> {
-        let start_pass = after_pass_idx + 1;
-        if start_pass >= self.passes.len() {
-            ctx.emit_extra_rc(after_pass_idx, op.clone());
-            return Ok(());
-        }
-        ctx.assign_extra_pos(op);
-        ctx.register_extra_producer(op);
-        let saved = ctx.current_pass_idx;
-        let result = self.propagate_from_pass(start_pass, op, ctx);
         ctx.current_pass_idx = saved;
         result
     }
@@ -5038,12 +5033,12 @@ impl Optimizer {
     /// (`emit_extra` / `_force_elements`): the allocation and its field stores
     /// propagate immediately and are not parked here.
     ///
-    /// Other `emit_extra` producers (rewrite, virtualize, string ops that
-    /// are not on the force path, pure's postponed op) still park on
-    /// `extra_pending` / `extra_operations_after`. Heap lazy sets walk the
-    /// remaining passes immediately (`send_extra_operation_after`). Propagate
-    /// that one parked definition here, ahead of the operation that reads it.
-    /// Everything else keeps its queued order.
+    /// Extra operations from rewrite / virtualize / string / pure / heap
+    /// walk the chain immediately when an optimizer is present. A pass run
+    /// without one (unit tests) still parks on `extra_pending` /
+    /// `extra_operations_after`. Propagate that one parked definition here,
+    /// ahead of the operation that reads it. Everything else keeps its
+    /// queued order.
     pub(super) fn flush_queued_producer(
         &mut self,
         opref: OpRef,

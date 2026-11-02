@@ -4,7 +4,7 @@ use majit_ir::operand::Operand;
 use majit_ir::{Const, EffectInfo, OopSpecIndex, Op, OpCode, OpRc, OpRef, Value};
 
 use crate::optimizeopt::info::{PtrInfo, PtrInfoExt, VStringVariant};
-use crate::optimizeopt::optimizer::Optimizer;
+use crate::optimizeopt::optimizer::{Optimizer, send_extra_operation_from};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 pub use crate::optimizeopt::info::{
@@ -49,7 +49,7 @@ pub fn _int_add(box1: &Operand, box2: &Operand, ctx: &mut OptContext) -> Operand
 /// from `first_optimization`, so OptIntBounds (before OptString) bounds the
 /// add before NEWSTR. Not keyed off `force_direct`: a child string forced
 /// through `Optimizer.force_box` still reenters from pass 0. During
-/// `in_final_emission`, `send_extra_operation_rc` appends directly.
+/// `in_final_emission` the helper appends through `emit_rc`.
 pub(crate) fn _int_add_with(
     optimizer: &mut Option<&mut Optimizer>,
     box1: &Operand,
@@ -79,18 +79,8 @@ pub(crate) fn _int_add_with(
     let arg1 = ctx.resolve_operand_operand(box1);
     let arg2 = ctx.resolve_operand_operand(box2);
     let op = majit_ir::OpRc::new(Op::new(OpCode::IntAdd, &[arg1, arg2]));
-    // vstring.py:380 optstring.optimizer.send_extra_operation(op).
-    if ctx.in_final_emission || optimizer.is_none() {
-        ctx.send_extra_operation_rc(op.clone());
-    } else if let Some(opt) = optimizer.as_deref_mut() {
-        ctx.assign_extra_pos(&op);
-        let saved = ctx.current_pass_idx;
-        let result = opt.send_extra_operation(&op, ctx);
-        ctx.current_pass_idx = saved;
-        if let Err(crate::optimize::InvalidLoop(reason)) = result {
-            ctx.signal_invalid_loop(reason);
-        }
-    }
+    // vstring.py `_int_add`: `optstring.optimizer.send_extra_operation(op)`.
+    send_extra_operation_from(optimizer, &op, ctx);
     Operand::from_bound_op(&op)
 }
 
@@ -959,6 +949,7 @@ impl OptString {
     /// vstring.py _optimize_COPYSTRCONTENT
     fn optimize_copystrcontent(
         &mut self,
+        opt: &mut Option<&mut Optimizer>,
         op: &Op,
         mode: u8,
         ctx: &mut OptContext,
@@ -1008,10 +999,19 @@ impl OptString {
                     // vresult])` then `string_optimizer.emit_extra(new_op)`.
                     let pass_idx = ctx.current_pass_idx;
                     let arg_dst_index = Operand::const_(Const::Int(dst_start + index));
-                    ctx.emit_extra(
-                        pass_idx,
-                        Op::new(setitem_opcode, &[dst_ref.clone(), arg_dst_index, char_box]),
-                    );
+                    let setitem = OpRc::new(Op::new(
+                        setitem_opcode,
+                        &[dst_ref.clone(), arg_dst_index, char_box],
+                    ));
+                    if let Some(o) = opt.as_deref_mut() {
+                        if let Err(crate::optimize::InvalidLoop(reason)) =
+                            o.send_extra_operation_after(pass_idx, &setitem, ctx)
+                        {
+                            ctx.signal_invalid_loop(reason);
+                        }
+                    } else {
+                        ctx.emit_extra_rc(pass_idx, setitem);
+                    }
                 }
             }
             if dst_virtual {
@@ -1066,7 +1066,13 @@ impl OptString {
     /// level. Non-constant subs emit an INT_SUB operation that is re-dispatched
     /// from `first_optimization` via `send_extra_operation`, so OptIntBounds —
     /// a pass before OptString — computes the result bound.
-    fn int_sub(&self, a: &Operand, b: &Operand, ctx: &mut OptContext) -> Operand {
+    fn int_sub(
+        &self,
+        optimizer: &mut Option<&mut Optimizer>,
+        a: &Operand,
+        b: &Operand,
+        ctx: &mut OptContext,
+    ) -> Operand {
         if let Some(vb) = ctx
             .resolve_operand_operand_opt(b)
             .and_then(|cb| cb.const_int())
@@ -1085,7 +1091,7 @@ impl OptString {
         let arg_b = ctx.resolve_operand_operand(b);
         let op = majit_ir::OpRc::new(Op::new(OpCode::IntSub, &[arg_a.clone(), arg_b.clone()]));
         // `optimizer.send_extra_operation` re-dispatches from `first_optimization`.
-        ctx.send_extra_operation_rc(op.clone());
+        send_extra_operation_from(optimizer, &op, ctx);
         Operand::from_bound_op(&op)
     }
 
@@ -1241,7 +1247,7 @@ impl OptString {
             ctx.make_nonnull_str(&s, mode);
             let mut start = ctx.resolve_operand_operand(&op.arg(2));
             let stop = ctx.resolve_operand_operand(&op.arg(3));
-            let lgtop = self.int_sub(&stop, &start, ctx);
+            let lgtop = self.int_sub(opt, &stop, &start, ctx);
             // vstring.py:682-685: double slicing s[i:j][k:l]
             if let Some(info) = self.get_slice_info(&s, ctx) {
                 let source = info.s;
@@ -1704,14 +1710,14 @@ impl OptString {
             OpCode::Strsetitem => self.optimize_strsetitem(op, opt, ctx),
             OpCode::Strgetitem => self.optimize_strgetitem(op, op_rc, mode_string, opt, ctx),
             OpCode::Strlen => self.optimize_strlen(op, op_rc, ctx),
-            OpCode::Copystrcontent => self.optimize_copystrcontent(op, mode_string, ctx),
+            OpCode::Copystrcontent => self.optimize_copystrcontent(opt, op, mode_string, ctx),
 
             // vstring.py: Unicode operations — same logic as string ops
             // but with unicode-specific opcodes.
             OpCode::Unicodesetitem => self.optimize_strsetitem(op, opt, ctx),
             OpCode::Unicodegetitem => self.optimize_strgetitem(op, op_rc, mode_unicode, opt, ctx),
             OpCode::Unicodelen => self.optimize_strlen(op, op_rc, ctx),
-            OpCode::Copyunicodecontent => self.optimize_copystrcontent(op, mode_unicode, ctx),
+            OpCode::Copyunicodecontent => self.optimize_copystrcontent(opt, op, mode_unicode, ctx),
 
             // vstring.py: STRHASH/UNICODEHASH — force virtual string and emit.
             OpCode::Strhash | OpCode::Unicodehash => {

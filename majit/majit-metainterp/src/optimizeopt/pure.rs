@@ -829,8 +829,21 @@ impl OptPureState {
     /// then flushes BETWEEN the OVF op and its GUARD_NO_OVERFLOW — breaking
     /// the adjacency `aarch64/assembler.py _walk_operations`
     /// asserts and the backends rely on to read the overflow flags.
-    fn emit_postponed_downstream(&mut self, postponed: OpRc, ctx: &mut OptContext) {
-        ctx.emit_extra_rc(ctx.current_pass_idx, postponed);
+    fn emit_postponed_downstream(
+        &mut self,
+        optimizer: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        postponed: OpRc,
+        ctx: &mut OptContext,
+    ) {
+        if let Some(opt) = optimizer.as_deref_mut() {
+            if let Err(crate::optimize::InvalidLoop(reason)) =
+                opt.send_extra_operation_after(ctx.current_pass_idx, &postponed, ctx)
+            {
+                ctx.signal_invalid_loop(reason);
+            }
+        } else {
+            ctx.emit_extra_rc(ctx.current_pass_idx, postponed);
+        }
     }
 
     /// pure.py _same_args
@@ -1112,7 +1125,7 @@ fn propagate_shared(
             this.cache.borrow_mut().insert(key, postponed_box.clone());
             // pure.py:321-322 walks `_newoperations` for is_ovf followed
             // by GUARD_NO_OVERFLOW; do not keep a parallel candidate list.
-            this.emit_postponed_downstream(postponed, ctx);
+            this.emit_postponed_downstream(optimizer, postponed, ctx);
             return OptimizationResult::PassOn; // guard passes through
         } else {
             // Not a GUARD_NO_OVERFLOW: emit the postponed op now.
@@ -1120,7 +1133,7 @@ fn propagate_shared(
                 let forced = this.force_virtual(optimizer, &postponed.arg(i), ctx);
                 postponed.setarg(i, forced);
             }
-            this.emit_postponed_downstream(postponed, ctx);
+            this.emit_postponed_downstream(optimizer, postponed, ctx);
         }
     }
 

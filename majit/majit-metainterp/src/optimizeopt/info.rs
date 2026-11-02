@@ -1238,7 +1238,7 @@ fn force_box_emit(
     // `force_direct` or `in_final_emission`: `Optimizer.emit_extra` →
     // `_emit_operation` (force each arg, then append).
     // Otherwise, with an optimizer: `Optimization.emit_extra` walks from the
-    // next pass immediately (`emit_extra_immediate`) on this `OpRc`.
+    // next pass immediately (`send_extra_operation_after`) on this `OpRc`.
     // Without an optimizer the op stays on the `emit_extra` queue.
     // The op that landed is `Optimizer.getlastop`'s question (`emit_forced`).
     fn emit_op_rc(
@@ -1266,7 +1266,7 @@ fn force_box_emit(
             }
         } else if let Some(opt) = optimizer.as_deref_mut() {
             if let Err(crate::optimize::InvalidLoop(reason)) =
-                opt.emit_extra_immediate(ctx.current_pass_idx, &op, ctx)
+                opt.send_extra_operation_after(ctx.current_pass_idx, &op, ctx)
             {
                 ctx.signal_invalid_loop(reason);
             }

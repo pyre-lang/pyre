@@ -6,7 +6,7 @@
 /// Instead of emitting the allocation, fields are tracked in the optimizer.
 /// If a virtual escapes (e.g., passed to a call or stored in a non-virtual),
 /// it gets "forced" (materialized by emitting the allocation + setfield ops).
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use majit_ir::operand::Operand;
@@ -16,6 +16,7 @@ use crate::optimizeopt::info::{
     ArrayStructInfo, PtrInfo, PtrInfoExt, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
     VirtualizableFieldState, w_class_value_is_covered_by_alloc,
 };
+use crate::optimizeopt::optimizer::{Optimizer, send_extra_operation_from};
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
 /// Optimizer-level config for virtualizable frame tracking.
@@ -244,79 +245,53 @@ impl VirtualizableTracker {
 }
 
 /// The virtualize optimization pass.
-pub struct OptVirtualizeState {
+pub struct OptVirtualize {
     /// Standard-virtualizable identity marker; carries no field-value cache.
-    vable: Option<VirtualizableTracker>,
+    vable: RefCell<Option<VirtualizableTracker>>,
     /// optimizer.py REMOVED + virtualize.py optimize_GUARD_NO_EXCEPTION:
-    last_emitted_was_removed: bool,
+    last_emitted_was_removed: Cell<bool>,
     /// virtualize.py:48
-    last_guard_not_forced_2: Option<Op>,
+    last_guard_not_forced_2: RefCell<Option<Op>>,
     /// virtualize.py:81 / 84
-    finish_guard_op: Option<Op>,
-    /// `virtualize.py:140` `vrefinfo =
+    finish_guard_op: RefCell<Option<Op>>,
+    /// `virtualize.py` `vrefinfo =
     /// self.optimizer.metainterp_sd.virtualref_info` parity — the
     /// cached `VirtualRefInfo` whose `descr_forced` /
     /// `descr_virtual_token` / `descr` Arcs `optimize_virtual_ref` and
     /// `optimize_virtual_ref_finish` stamp onto SETFIELD_GC ops.
     /// Cloned cheaply (3 `Arc`s); production passes the live
     /// `MetaInterp.virtualref_info`, tests use `Default`.
-    vrefinfo: crate::virtualref::VirtualRefInfo,
-}
-
-pub struct OptVirtualize {
-    state: RefCell<OptVirtualizeState>,
+    vrefinfo: RefCell<crate::virtualref::VirtualRefInfo>,
 }
 
 impl OptVirtualize {
     pub fn new() -> Self {
         Self {
-            state: RefCell::new(OptVirtualizeState::new()),
+            vable: RefCell::new(None),
+            last_emitted_was_removed: Cell::new(false),
+            last_guard_not_forced_2: RefCell::new(None),
+            finish_guard_op: RefCell::new(None),
+            vrefinfo: RefCell::new(crate::virtualref::VirtualRefInfo::new()),
         }
     }
 
     pub(crate) fn with_virtualizable(config: VirtualizableConfig) -> Self {
         Self {
-            state: RefCell::new(OptVirtualizeState::with_virtualizable(config)),
+            vable: RefCell::new(Some(VirtualizableTracker::new(config))),
+            last_emitted_was_removed: Cell::new(false),
+            last_guard_not_forced_2: RefCell::new(None),
+            finish_guard_op: RefCell::new(None),
+            vrefinfo: RefCell::new(crate::virtualref::VirtualRefInfo::new()),
         }
     }
 
     pub fn with_vrefinfo(self, vrefinfo: crate::virtualref::VirtualRefInfo) -> Self {
-        self.state.borrow_mut().vrefinfo = vrefinfo;
+        *self.vrefinfo.borrow_mut() = vrefinfo;
         self
     }
 }
 
-impl OptVirtualizeState {
-    pub fn new() -> Self {
-        OptVirtualizeState {
-            vable: None,
-            last_emitted_was_removed: false,
-            last_guard_not_forced_2: None,
-            finish_guard_op: None,
-            vrefinfo: crate::virtualref::VirtualRefInfo::new(),
-        }
-    }
-
-    /// Create with virtualizable config for frame field tracking.
-    pub(crate) fn with_virtualizable(config: VirtualizableConfig) -> Self {
-        OptVirtualizeState {
-            vable: Some(VirtualizableTracker::new(config)),
-            last_emitted_was_removed: false,
-            last_guard_not_forced_2: None,
-            finish_guard_op: None,
-            vrefinfo: crate::virtualref::VirtualRefInfo::new(),
-        }
-    }
-
-    /// `virtualize.py:140` parity: install the live `VirtualRefInfo`
-    /// from `MetaInterp.virtualref_info` so emit sites read the cached
-    /// `vrefinfo.descr_*` Arcs through this field instead of
-    /// reconstructing them on demand.
-    pub fn with_vrefinfo(mut self, vrefinfo: crate::virtualref::VirtualRefInfo) -> Self {
-        self.vrefinfo = vrefinfo;
-        self
-    }
-
+impl OptVirtualize {
     // ── PtrInfo accessors (delegated to ctx) ──
 
     fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
@@ -344,7 +319,7 @@ impl OptVirtualizeState {
     /// `self.parent.getitem_raw(self.offset + offset, ...)`, so the
     /// equivalent walk happens at access time in `resolve_raw_slice`.
     fn make_virtual_raw_slice(
-        &mut self,
+        &self,
         offset: i64,
         parent: OpRef,
         source_op: &Op,
@@ -367,7 +342,7 @@ impl OptVirtualizeState {
     /// result. `func` comes from source_op.getarg(0); size is the
     /// constant-folded allocation length.
     fn make_virtual_raw_memory(
-        &mut self,
+        &self,
         size: usize,
         func: i64,
         source_op: &Op,
@@ -407,7 +382,7 @@ impl OptVirtualizeState {
     // ── Per-opcode handlers ──
 
     fn optimize_new_with_vtable(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -434,7 +409,7 @@ impl OptVirtualizeState {
     }
 
     fn optimize_new(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -447,7 +422,7 @@ impl OptVirtualizeState {
     }
 
     fn optimize_new_array(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -546,7 +521,7 @@ impl OptVirtualizeState {
     /// mirror of the upstream dispatch table.
     #[allow(dead_code)]
     fn optimize_new_array_clear(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -554,7 +529,7 @@ impl OptVirtualizeState {
         self.optimize_new_array(op, op_rc, ctx)
     }
 
-    fn optimize_setfield_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_setfield_gc(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let value_ref = ctx.resolve_operand_operand(&op.arg(1));
         let setfield_descr_arc = op
@@ -725,7 +700,7 @@ impl OptVirtualizeState {
     }
 
     fn optimize_getfield_gc(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1034,7 +1009,7 @@ impl OptVirtualizeState {
         OptimizationResult::PassOn
     }
 
-    fn optimize_setarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_setarrayitem_gc(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let value_ref = ctx.resolve_operand_operand(&op.arg(2));
 
@@ -1073,7 +1048,7 @@ impl OptVirtualizeState {
 
     /// virtualize.py optimize_GETARRAYITEM_GC_I (aliased to R/F and PURE variants)
     fn optimize_getarrayitem_gc(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1115,7 +1090,7 @@ impl OptVirtualizeState {
 
     /// virtualize.py optimize_ARRAYLEN_GC
     fn optimize_arraylen_gc(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1145,7 +1120,7 @@ impl OptVirtualizeState {
 
     /// virtualize.py optimize_GETINTERIORFIELD_GC_I (aliased to R/F)
     fn optimize_getinteriorfield_gc(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1199,11 +1174,7 @@ impl OptVirtualizeState {
     }
 
     /// virtualize.py optimize_SETINTERIORFIELD_GC
-    fn optimize_setinteriorfield_gc(
-        &mut self,
-        op: &Op,
-        ctx: &mut OptContext,
-    ) -> OptimizationResult {
+    fn optimize_setinteriorfield_gc(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_box = ctx.resolve_operand_operand_opt(&op.arg(0));
         let value_ref = ctx.resolve_operand_operand(&op.arg(2));
         // `info.py setinteriorfield_virtual` indexes the per-element
@@ -1276,7 +1247,7 @@ impl OptVirtualizeState {
     /// accumulate offsets. This matches `info.RawSlicePtrInfo.getitem_raw`,
     /// which delegates to `self.parent.getitem_raw(self.offset + offset, ...)`.
     fn optimize_int_add(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1302,7 +1273,7 @@ impl OptVirtualizeState {
     }
 
     fn optimize_raw_load(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1365,7 +1336,7 @@ impl OptVirtualizeState {
         OptimizationResult::PassOn
     }
 
-    fn optimize_raw_store(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_raw_store(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let buf_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let offset_ref = op.arg(1).to_opref();
         let value_ref = ctx.resolve_operand_operand(&op.arg(2));
@@ -1452,7 +1423,7 @@ impl OptVirtualizeState {
     /// `RawSlicePtrInfo.getitem_raw` (`info.py`) recursing through
     /// `self.parent.getitem_raw(self.offset + offset, ...)`.
     fn optimize_getarrayitem_raw(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1583,7 +1554,7 @@ impl OptVirtualizeState {
     ///     self.make_nonnull(op.getarg(0))
     ///     return self.emit(op)
     /// ```
-    fn optimize_setarrayitem_raw(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    fn optimize_setarrayitem_raw(&self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.resolve_operand_operand(&op.arg(0)).to_opref();
         let value_ref = ctx.resolve_operand_operand(&op.arg(2));
 
@@ -1700,18 +1671,28 @@ impl OptVirtualizeState {
     ///   The typeptr/vtable at offset 0 is handled by NEW_WITH_VTABLE when
     ///   the vref is forced — not stored as a tracked virtual field.
     fn optimize_virtual_ref(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        // `virtualize.py:140` `vrefinfo = ... metainterp_sd.virtualref_info`
-        // / `virtualize.py:123` `vrefinfo.descr` parity.
-        let vref_descr: DescrRef = self.vrefinfo.descr.clone();
+        // `virtualize.py` `vrefinfo = ... metainterp_sd.virtualref_info`
+        // / `virtualize.py` `vrefinfo.descr` parity.
+        let vref_descr: DescrRef = self.vrefinfo.borrow().descr.clone();
 
-        // virtualize.py:127: token = ResOperation(rop.FORCE_TOKEN, [])
+        // virtualize.py: token = ResOperation(rop.FORCE_TOKEN, [])
         let token_op = majit_ir::OpRc::new(Op::new(OpCode::ForceToken, &[]));
-        let token_ref = ctx.emit_extra_rc(ctx.current_pass_idx, token_op.clone());
+        let token_ref = if let Some(o) = opt.as_deref_mut() {
+            if let Err(crate::optimize::InvalidLoop(reason)) =
+                o.send_extra_operation_after(ctx.current_pass_idx, &token_op, ctx)
+            {
+                ctx.signal_invalid_loop(reason);
+            }
+            token_op.pos().get()
+        } else {
+            ctx.emit_extra_rc(ctx.current_pass_idx, token_op.clone())
+        };
         if let Some(b) = ctx.get_box_replacement_operand_opt(token_ref) {
             ctx.set_ptr_info(&b, PtrInfo::nonnull());
         }
@@ -1781,7 +1762,15 @@ impl OptVirtualizeState {
     ///    normally. Just clear the vref.virtual_token.
     /// 2. Forced case: `objbox` is the real virtual object — the vref was
     ///    already forced during tracing, so store it into vref.forced.
-    fn optimize_virtual_ref_finish(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+    ///
+    /// The SETFIELD_GC stores walk the chain (`optimizer.send_extra_operation`)
+    /// before this handler returns.
+    fn optimize_virtual_ref_finish(
+        &self,
+        opt: &mut Option<&mut Optimizer>,
+        op: &Op,
+        ctx: &mut OptContext,
+    ) -> OptimizationResult {
         let vref_box = ctx.resolve_operand_operand(&op.arg(0));
         let obj_box = ctx.resolve_operand_operand(&op.arg(1));
 
@@ -1791,27 +1780,37 @@ impl OptVirtualizeState {
         // tolerates a non-const terminal, so the null check is read-only.
         let obj_is_null = ctx.is_const_null(&obj_box);
 
+        let (descr_forced, descr_virtual_token) = {
+            let vrefinfo = self.vrefinfo.borrow();
+            (
+                vrefinfo.descr_forced.clone(),
+                vrefinfo.descr_virtual_token.clone(),
+            )
+        };
+
         // `optimize_VIRTUAL_REF_FINISH`: set 'forced' to the real object via
         // `vrefinfo.descr_forced` (the cached `fielddescrof` from
         // `VirtualRefInfo.__init__`). `optimizer.send_extra_operation`
-        // (opt=None) re-dispatches from `first_optimization` so
+        // re-dispatches from `first_optimization` so
         // `optimize_SETFIELD_GC` absorbs the write while the vref is
         // still virtual.
         if !obj_is_null {
             let arg_vref = vref_box.clone();
             let arg_obj = obj_box.clone();
             let mut set_forced = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_obj.clone()]);
-            set_forced.setdescr(self.vrefinfo.descr_forced.clone());
-            ctx.send_extra_operation(set_forced);
+            set_forced.setdescr(descr_forced);
+            let set_forced = OpRc::new(set_forced);
+            send_extra_operation_from(opt, &set_forced, ctx);
         }
 
-        // virtualize.py:155-158: set 'virtual_token' to CONST_NULL via
-        // `vrefinfo.descr_virtual_token` (`virtualref.py:40-41`).
+        // virtualize.py: set 'virtual_token' to CONST_NULL via
+        // `vrefinfo.descr_virtual_token` (`virtualref.py`).
         let arg_vref = vref_box.clone();
         let arg_null = Operand::const_(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL));
         let mut set_token = Op::new(OpCode::SetfieldGc, &[arg_vref.clone(), arg_null.clone()]);
-        set_token.setdescr(self.vrefinfo.descr_virtual_token.clone());
-        ctx.send_extra_operation(set_token);
+        set_token.setdescr(descr_virtual_token);
+        let set_token = OpRc::new(set_token);
+        send_extra_operation_from(opt, &set_token, ctx);
 
         OptimizationResult::Remove
     }
@@ -1845,7 +1844,7 @@ impl OptVirtualizeState {
     /// frame-leave path), and its `forced` field must point at a non-null
     /// object (set by VirtualRefFinish in the forced-during-tracing path).
     fn optimize_jit_force_virtual(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
@@ -1900,7 +1899,7 @@ impl OptVirtualizeState {
         let b_forced = forced_box.expect("forced virtual terminal must resolve to a bound operand");
         ctx.make_equal_to(&b_old, &b_forced);
         // self.last_emitted_operation = REMOVED
-        self.last_emitted_was_removed = true;
+        self.last_emitted_was_removed.set(true);
         true
     }
 }
@@ -1911,15 +1910,15 @@ impl Default for OptVirtualize {
     }
 }
 
-impl OptVirtualizeState {
+impl OptVirtualize {
     fn propagate_forward(
-        &mut self,
+        &self,
         op: &Op,
         op_rc: &majit_ir::OpRc,
-        _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+        opt: &mut Option<&mut Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        if let Some(ref mut vt) = self.vable {
+        if let Some(ref mut vt) = *self.vable.borrow_mut() {
             vt.ensure_setup(ctx);
         }
         // optimizer.py base emit/emit_result reset last_emitted_operation
@@ -1930,8 +1929,8 @@ impl OptVirtualizeState {
         // flag back to true before returning Remove. virtualize.py
         // optimize_GUARD_NO_EXCEPTION / optimize_GUARD_NOT_FORCED read the
         // snapshot.
-        let prior_emitted_was_removed = self.last_emitted_was_removed;
-        self.last_emitted_was_removed = false;
+        let prior_emitted_was_removed = self.last_emitted_was_removed.get();
+        self.last_emitted_was_removed.set(false);
         match op.opcode {
             // virtualize.py: optimize_NEW_WITH_VTABLE → make_virtual.
             // InstancePtrInfo(descr, known_class, is_virtual=True)
@@ -2012,9 +2011,11 @@ impl OptVirtualizeState {
             // need to pre-process guard fail_args here.
 
             // VirtualRef: replace with a virtual struct tracking token + forced fields
-            OpCode::VirtualRefR | OpCode::VirtualRefI => self.optimize_virtual_ref(op, op_rc, ctx),
+            OpCode::VirtualRefR | OpCode::VirtualRefI => {
+                self.optimize_virtual_ref(op, op_rc, opt, ctx)
+            }
             // VirtualRefFinish: finalize the virtual ref
-            OpCode::VirtualRefFinish => self.optimize_virtual_ref_finish(op, ctx),
+            OpCode::VirtualRefFinish => self.optimize_virtual_ref_finish(opt, op, ctx),
 
             // virtualize.py optimize_GUARD_NO_EXCEPTION
             //   if self.last_emitted_operation is REMOVED:
@@ -2043,7 +2044,7 @@ impl OptVirtualizeState {
             // The op is NOT emitted here; it is stashed and re-inserted just
             // before the FINISH op in postprocess_FINISH below.
             OpCode::GuardNotForced2 => {
-                self.last_guard_not_forced_2 = Some(op.clone());
+                *self.last_guard_not_forced_2.borrow_mut() = Some(op.clone());
                 OptimizationResult::Remove
             }
 
@@ -2101,7 +2102,8 @@ impl OptVirtualizeState {
             // `pending_guard_class_postprocess` uses, and
             // `drain_pending_finish_guard_postprocess` does the insert.
             OpCode::Finish => {
-                self.finish_guard_op = self.last_guard_not_forced_2.take();
+                *self.finish_guard_op.borrow_mut() =
+                    self.last_guard_not_forced_2.borrow_mut().take();
                 OptimizationResult::PassOn
             }
 
@@ -2172,7 +2174,7 @@ impl OptVirtualizeState {
                                     "virtualize.py:53 source_op.getarg(0) must be ConstInt",
                                 );
                             self.make_virtual_raw_memory(size as usize, func, op, op_rc, ctx);
-                            self.last_emitted_was_removed = true;
+                            self.last_emitted_was_removed.set(true);
                             return OptimizationResult::Remove;
                         }
                         return OptimizationResult::PassOn;
@@ -2237,13 +2239,13 @@ impl OptVirtualizeState {
         }
     }
 
-    fn setup(&mut self) {
-        self.last_emitted_was_removed = false;
-        self.last_guard_not_forced_2 = None;
-        if let Some(ref mut vt) = self.vable {
+    fn setup(&self) {
+        self.last_emitted_was_removed.set(false);
+        self.last_guard_not_forced_2.replace(None);
+        if let Some(ref mut vt) = *self.vable.borrow_mut() {
             vt.setup();
         }
-        self.finish_guard_op = None;
+        self.finish_guard_op.replace(None);
     }
 
     // virtualize.py postprocess_FINISH
@@ -2263,11 +2265,11 @@ impl OptVirtualizeState {
         matches!(opcode, OpCode::Finish)
     }
 
-    fn propagate_postprocess(&mut self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
+    fn propagate_postprocess(&self, op: &Op, _op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
         if op.opcode != OpCode::Finish {
             return;
         }
-        if let Some(guard_op) = self.finish_guard_op.take() {
+        if let Some(guard_op) = self.finish_guard_op.borrow_mut().take() {
             debug_assert!(
                 ctx.pending_finish_guard_postprocess.is_none(),
                 "postprocess_FINISH queued multiple guards"
@@ -2276,8 +2278,8 @@ impl OptVirtualizeState {
         }
     }
 
-    fn set_vrefinfo(&mut self, vrefinfo: crate::virtualref::VirtualRefInfo) {
-        self.vrefinfo = vrefinfo;
+    fn set_vrefinfo(&self, vrefinfo: crate::virtualref::VirtualRefInfo) {
+        *self.vrefinfo.borrow_mut() = vrefinfo;
     }
 }
 
@@ -2289,23 +2291,19 @@ impl Optimization for OptVirtualize {
         opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        self.state
-            .borrow_mut()
-            .propagate_forward(op, op_rc, opt, ctx)
+        OptVirtualize::propagate_forward(self, op, op_rc, opt, ctx)
     }
 
     fn setup(&self) {
-        self.state.borrow_mut().setup();
+        OptVirtualize::setup(self);
     }
 
     fn have_postprocess_op(&self, opcode: OpCode) -> bool {
-        self.state.borrow().have_postprocess_op(opcode)
+        OptVirtualize::have_postprocess_op(self, opcode)
     }
 
     fn propagate_postprocess(&self, op: &Op, op_rc: &majit_ir::OpRc, ctx: &mut OptContext) {
-        self.state
-            .borrow_mut()
-            .propagate_postprocess(op, op_rc, ctx);
+        OptVirtualize::propagate_postprocess(self, op, op_rc, ctx);
     }
 
     fn name(&self) -> &'static str {
@@ -2313,7 +2311,7 @@ impl Optimization for OptVirtualize {
     }
 
     fn set_vrefinfo(&self, vrefinfo: crate::virtualref::VirtualRefInfo) {
-        self.state.borrow_mut().set_vrefinfo(vrefinfo);
+        OptVirtualize::set_vrefinfo(self, vrefinfo);
     }
 }
 
@@ -4715,8 +4713,7 @@ mod tests {
         });
         pass.setup();
         {
-            let mut st = pass.state.borrow_mut();
-            if let Some(ref mut vt) = st.vable {
+            if let Some(ref mut vt) = *pass.vable.borrow_mut() {
                 vt.ensure_setup(&mut ctx);
             }
         }

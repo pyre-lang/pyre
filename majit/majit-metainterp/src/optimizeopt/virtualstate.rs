@@ -2956,6 +2956,42 @@ mod tests {
         Arc::new(TestDescr(idx))
     }
 
+    /// Bind a `NEW` producer at `virtual_ref` and attach `VirtualStruct` info
+    /// on that box (`info.py` `AbstractVirtualPtrInfo.force_box` emits `op`).
+    fn plant_virtual_struct(ctx: &mut OptContext, virtual_ref: OpRef, descr: DescrRef) {
+        let alloc = Op::new(OpCode::New, &[]);
+        alloc.setdescr(descr.clone());
+        alloc.pos().set(virtual_ref);
+        let alloc_rc = majit_ir::OpRc::new(alloc);
+        ctx.bind_input_resops(std::slice::from_ref(&alloc_rc));
+        let virtual_box = ctx.materialize_operand_at(virtual_ref);
+        ctx.set_ptr_info(
+            &virtual_box,
+            PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)),
+        );
+    }
+
+    /// Records opcodes that reach this pass. Used to check that a force-time
+    /// `NEW` enters at `OptEarlyForce.next`, not at earlier passes.
+    struct Seen(std::rc::Rc<std::cell::RefCell<Vec<OpCode>>>);
+
+    impl crate::optimizeopt::Optimization for Seen {
+        fn propagate_forward(
+            &self,
+            op: &Op,
+            _op_rc: &majit_ir::OpRc,
+            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
+            _ctx: &mut OptContext,
+        ) -> crate::optimizeopt::OptimizationResult {
+            self.0.borrow_mut().push(op.opcode);
+            crate::optimizeopt::OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "seen"
+        }
+    }
+
     // ── Per-entry structural checks ──
     //
     // virtualstate.py generalization_of drives the per-entry
@@ -3788,11 +3824,7 @@ mod tests {
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         // Generous Ref-typed inputarg pool for the test fixture.
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let virtual_box = ctx.materialize_operand_at(virtual_ref);
-        ctx.set_ptr_info(
-            &virtual_box,
-            PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)),
-        );
+        plant_virtual_struct(&mut ctx, virtual_ref, descr);
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
 
         assert!(
@@ -3814,13 +3846,20 @@ mod tests {
             ctx.get_replacement_opref(virtual_ref)
         );
         assert!(virtuals.is_empty());
+        assert_eq!(
+            ctx.new_operations
+                .iter()
+                .filter(|op| op.opcode == OpCode::New)
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn test_make_inputargs_forces_through_earlyforce_next() {
         // virtualstate.py `VirtualState.make_inputargs` replaces `optimizer`
         // with `optimizer.optearlyforce` before enum_forced_boxes.  A force
-        // requested after heap.flush() must consequently enqueue the
+        // requested after heap.flush() must consequently send the
         // allocation at earlyforce.next (= heap), not after the stale heap
         // cursor.  Otherwise OptHeap misses the initializing stores and the
         // imported short preamble re-emits redundant GETFIELD_GC operations.
@@ -3828,12 +3867,17 @@ mod tests {
         let virtual_ref = OpRef::ref_op(20);
         let state = VirtualState::new(vec![VirtualStateInfo::NonNull]);
         let mut ctx = OptContext::with_inputarg_types(32, &vec![Type::Ref; 1024]);
-        let virtual_box = ctx.materialize_operand_at(virtual_ref);
-        ctx.set_ptr_info(
-            &virtual_box,
-            PtrInfo::VirtualStruct(VirtualStructInfo::new(descr)),
-        );
+        plant_virtual_struct(&mut ctx, virtual_ref, descr);
+        let before = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let after = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut optimizer = crate::optimizeopt::optimizer::Optimizer::new();
+        for _ in 0..5 {
+            optimizer.add_pass(Box::new(Seen(std::rc::Rc::clone(&before))));
+        }
+        optimizer.add_pass(Box::new(
+            crate::optimizeopt::earlyforce::OptEarlyForce::new(),
+        ));
+        optimizer.add_pass(Box::new(Seen(std::rc::Rc::clone(&after))));
         ctx.optearlyforce_idx = 5;
         ctx.current_pass_idx = 6;
 
@@ -3842,11 +3886,15 @@ mod tests {
             .expect("force_boxes=True should materialize the virtual");
 
         assert_eq!(ctx.current_pass_idx, 6, "restore the caller's pass cursor");
-        assert_eq!(ctx.extra_operations_after.len(), 1);
-        assert_eq!(
-            ctx.extra_operations_after.front().map(|(start, _)| *start),
-            Some(6),
+        assert!(
+            after.borrow().contains(&OpCode::New),
             "forced operations must enter at OptEarlyForce.next"
         );
+        assert!(
+            !before.borrow().contains(&OpCode::New),
+            "passes before OptEarlyForce.next must not see the allocation"
+        );
+        assert!(ctx.extra_operations_after.is_empty());
+        assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
     }
 }

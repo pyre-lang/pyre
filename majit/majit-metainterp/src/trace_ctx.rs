@@ -5641,8 +5641,12 @@ impl TraceCtx {
             values.push(concrete);
         }
         boxes.push(vable_box);
-        // The vable identity's concrete value is the heap pointer itself.
-        values.push(Value::Ref(majit_ir::GcRef(vable_ptr as usize)));
+        // The identity box is appended unchanged; its concrete value stays the live frame
+        // (`MetaInterp.load_fields_from_virtualizable`).
+        let identity_ptr = self
+            .standard_virtualizable_ptr()
+            .unwrap_or(vable_ptr as usize);
+        values.push(Value::Ref(majit_ir::GcRef(identity_ptr)));
         self.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
     }
 
