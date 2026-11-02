@@ -436,6 +436,57 @@ pub(in crate::front::mir) fn compute_reassigned_param_locals(
     out
 }
 
+/// Locals whose value the body can change through a mutable borrow of the
+/// local itself (`&mut l`, `&raw mut l`, or of a field or element of `l`
+/// reached without a deref). No `Assign` names the local for such a write,
+/// so these locals have no single definition.
+pub(in crate::front::mir) fn compute_mutably_borrowed_locals(
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> Vec<usize> {
+    let forward_blocks = forward_reachable_mask(llbc, body);
+    let mut out = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(_, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let place = match rvalue {
+                Rvalue::Ref { place, kind, .. }
+                    if kind.as_str() == Some("Mut") || kind.as_str() == Some("TwoPhaseMut") =>
+                {
+                    place
+                }
+                Rvalue::RawPtr { place, kind, .. } if kind.as_str() == Some("Mut") => place,
+                _ => continue,
+            };
+            let mut current = place;
+            let local = loop {
+                match &current.kind {
+                    PlaceKind::Projection(inner, elem) => {
+                        if matches!(elem, ProjectionElem::Atom(name) if name == "Deref") {
+                            break None;
+                        }
+                        current = inner;
+                    }
+                    PlaceKind::Local(i) => break Some(*i as usize),
+                    PlaceKind::Global { .. } | PlaceKind::Unknown => break None,
+                }
+            };
+            if let Some(i) = local
+                && !out.contains(&i)
+            {
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// The owning type of a functional-concat string builder: `Wtf8Buf` (the
 /// interpreter's repr accumulator) or std `String` (the byte / leaf / module
 /// repr helpers).  Both annotate to the immutable `ValueType::Str`, so a

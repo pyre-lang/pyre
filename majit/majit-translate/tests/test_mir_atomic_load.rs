@@ -159,6 +159,13 @@ enum Receiver {
     Copied,
     ReassignedBase,
     ReassignedParam,
+    MutBorrowedOwner,
+    SuffixIndex,
+}
+
+enum AtomicOp {
+    Load(&'static str),
+    RelaxedStore,
 }
 
 fn quasi_atomic_u64_field_fixture(
@@ -166,6 +173,7 @@ fn quasi_atomic_u64_field_fixture(
     field: &str,
     entries: Option<&str>,
     receiver: Receiver,
+    op: AtomicOp,
 ) -> Llbc {
     let span = json!({"data": {"file_id": 0,
         "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
@@ -178,6 +186,7 @@ fn quasi_atomic_u64_field_fixture(
     };
     let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
     let word = json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let unit = json!({"Adt": {"id": 99, "builtin": "Tuple", "generics": generics}});
     let atomic = json!({"Adt": {"id": 0, "generics":
         {"regions": [], "types": [word], "const_generics": [], "trait_refs": []}}});
     let owner_adt = json!({"Adt": {"id": 2, "generics": generics, "builtin": null}});
@@ -186,20 +195,55 @@ fn quasi_atomic_u64_field_fixture(
     let adt_ord = json!({"Adt": {"id": 1, "generics": generics}});
     let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
     let reassigned_param = matches!(receiver, Receiver::ReassignedParam);
-    let ordering_local = if reassigned_param { 3 } else { 2 };
-    let recv_bind = if reassigned_param { 4 } else { 3 };
+    let is_store = matches!(op, AtomicOp::RelaxedStore);
+    let arg_count = 1 + usize::from(reassigned_param) + usize::from(is_store);
+    let value_local = arg_count;
+    let ordering_local = arg_count + 1;
+    let recv_bind = arg_count + 2;
+    let extra_local = arg_count + 3;
     let field_base = match receiver {
-        Receiver::ReassignedBase => 4,
+        Receiver::ReassignedBase => extra_local,
         _ => 1,
     };
-    let field_place = json!({
+    let dest_ty = if is_store { unit.clone() } else { word.clone() };
+    let suffix_index = matches!(receiver, Receiver::SuffixIndex);
+    let array_len = json!([
+        {"Integer": {"Unsigned": ["Usize", "2"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let array_ty = json!({"Array": [atomic, array_len, null]});
+    let field_proj = json!({
         "kind": {"Projection": [
             {"kind": {"Projection": [place(field_base, &owner_ref), "Deref"]}, "ty": owner_adt},
             {"Field": [null, 0]}
         ]},
-        "ty": atomic
+        "ty": if suffix_index { array_ty.clone() } else { atomic.clone() }
     });
+    let field_place = if suffix_index {
+        json!({
+            "kind": {"Projection": [
+                field_proj,
+                {"Index": {"offset": {"Const": [
+                    {"Integer": {"Unsigned": ["Usize", "1"]}},
+                    {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+                ]}, "from_end": true}}
+            ]},
+            "ty": atomic
+        })
+    } else {
+        field_proj
+    };
+    let owner_field_ty = if suffix_index {
+        array_ty
+    } else {
+        atomic.clone()
+    };
     let variants = ["Relaxed", "Acquire", "SeqCst", "Release", "AcqRel"];
+    let ordering_name = match op {
+        AtomicOp::Load(name) => name,
+        AtomicOp::RelaxedStore => "Relaxed",
+    };
+    let ordering_index = variants.iter().position(|v| *v == ordering_name).unwrap();
     let attr = json!({"attributes": [], "inline": null, "rename": null, "public": true});
     let global_decls = match entries {
         Some(joined) => json!([{
@@ -215,26 +259,29 @@ fn quasi_atomic_u64_field_fixture(
         None => json!([]),
     };
     let mut locals = vec![
-        json!({"index": 0, "name": null, "span": span, "ty": word}),
+        json!({"index": 0, "name": null, "span": span, "ty": dest_ty}),
         json!({"index": 1, "name": "owner", "span": span, "ty": owner_ref}),
     ];
     if reassigned_param {
         locals.push(json!({"index": 2, "name": "other", "span": span, "ty": owner_ref}));
     }
+    if is_store {
+        locals.push(json!({"index": value_local, "name": "value", "span": span, "ty": word}));
+    }
     locals.push(json!({"index": ordering_local, "name": "ordering", "span": span, "ty": adt_ord}));
     locals.push(json!({"index": recv_bind, "name": "recv", "span": span, "ty": recv_ty}));
     let mut statements = vec![
         json!({"span": span, "kind": {"Assign": [place(ordering_local, &adt_ord),
-            {"Aggregate": [{"Adt": [1, 1, null, generics]}, []]}]}}),
+            {"Aggregate": [{"Adt": [1, ordering_index, null, generics]}, []]}]}}),
     ];
     if matches!(receiver, Receiver::ReassignedBase) {
-        locals.push(json!({"index": 4, "name": "_b", "span": span, "ty": owner_ref}));
+        locals.push(json!({"index": extra_local, "name": "_b", "span": span, "ty": owner_ref}));
         statements.push(
-            json!({"span": span, "kind": {"Assign": [place(4, &owner_ref),
+            json!({"span": span, "kind": {"Assign": [place(extra_local, &owner_ref),
             {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
         );
         statements.push(
-            json!({"span": span, "kind": {"Assign": [place(4, &owner_ref),
+            json!({"span": span, "kind": {"Assign": [place(extra_local, &owner_ref),
             {"Use": [{"Copy": place(1, &owner_ref)}, "Yes"]}]}}),
         );
     }
@@ -242,6 +289,14 @@ fn quasi_atomic_u64_field_fixture(
         json!({"span": span, "kind": {"Assign": [place(recv_bind, &recv_ty),
             {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}),
     );
+    if matches!(receiver, Receiver::MutBorrowedOwner) {
+        let mut_ty = json!({"Ref": ["Erased", owner_ref, "Mut"]});
+        locals.push(json!({"index": extra_local, "name": "_m", "span": span, "ty": mut_ty}));
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(extra_local, &mut_ty),
+            {"Ref": {"place": place(1, &owner_ref), "kind": "Mut", "ptr_metadata": null}}]}}),
+        );
+    }
     if reassigned_param {
         statements.push(
             json!({"span": span, "kind": {"Assign": [place(1, &owner_ref),
@@ -249,12 +304,42 @@ fn quasi_atomic_u64_field_fixture(
         );
     }
     let recv_local = if matches!(receiver, Receiver::Copied) {
-        locals.push(json!({"index": 4, "name": "alias", "span": span, "ty": recv_ty}));
-        statements.push(json!({"span": span, "kind": {"Assign": [place(4, &recv_ty),
-            {"Use": [{"Copy": place(3, &recv_ty)}, "Yes"]}]}}));
-        4
+        locals.push(json!({"index": extra_local, "name": "alias", "span": span, "ty": recv_ty}));
+        statements.push(
+            json!({"span": span, "kind": {"Assign": [place(extra_local, &recv_ty),
+            {"Use": [{"Copy": place(recv_bind, &recv_ty)}, "Yes"]}]}}),
+        );
+        extra_local
     } else {
         recv_bind
+    };
+    let mut inputs = vec![owner_ref.clone()];
+    if reassigned_param {
+        inputs.push(owner_ref.clone());
+    }
+    if is_store {
+        inputs.push(word.clone());
+    }
+    let call_args = if is_store {
+        json!([
+            {"Copy": place(recv_local, &recv_ty)},
+            {"Copy": place(value_local, &word)},
+            {"Copy": place(ordering_local, &adt_ord)}
+        ])
+    } else {
+        json!([
+            {"Copy": place(recv_local, &recv_ty)},
+            {"Copy": place(ordering_local, &adt_ord)}
+        ])
+    };
+    let (atomic_method, atomic_inputs, atomic_output) = if is_store {
+        (
+            "store",
+            json!([recv_ty, word, adt_ord]),
+            json!({"Adt": {"id": 99, "builtin": "Tuple", "generics": generics}}),
+        )
+    } else {
+        ("load", json!([recv_ty, adt_ord]), word.clone())
     };
     let file = json!({"charon_version": "0.1.201", "has_errors": false,
         "translated": {"crate_name": "fixture",
@@ -267,32 +352,28 @@ fn quasi_atomic_u64_field_fixture(
                  })).collect::<Vec<_>>()}},
                 {"def_id": 2, "item_meta": meta(&["fixture", owner]),
                  "kind": {"Struct": [{
-                    "name": field, "ty": atomic, "attr_info": attr
+                    "name": field, "ty": owner_field_ty, "attr_info": attr
                  }]}}
             ],
             "fun_decls": [
                 {"def_id": 0, "item_meta": meta(&["fixture", "read_field"]),
                  "signature": {"is_unsafe": false,
-                    "inputs": if reassigned_param {
-                        vec![owner_ref.clone(), owner_ref.clone()]
-                    } else {
-                        vec![owner_ref.clone()]
-                    },
-                    "output": word},
+                    "inputs": inputs,
+                    "output": dest_ty},
                  "body": {"Unstructured": {"span": span,
-                    "locals": {"arg_count": if reassigned_param { 2 } else { 1 }, "locals": locals},
+                    "locals": {"arg_count": arg_count, "locals": locals},
                     "body": [
                         {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
-                                "args": [{"Copy": place(recv_local, &recv_ty)}, {"Copy": place(ordering_local, &adt_ord)}],
-                                "dest": place(0, &word)}, "target": 1, "on_unwind": 2
+                                "args": call_args,
+                                "dest": place(0, &dest_ty)}, "target": 1, "on_unwind": 2
                         }}}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                         {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                     ]
                  }}},
-                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", "load"]),
-                 "signature": {"is_unsafe": false, "inputs": [recv_ty, adt_ord], "output": word}, "body": "Opaque"}
+                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", atomic_method]),
+                 "signature": {"is_unsafe": false, "inputs": atomic_inputs, "output": atomic_output}, "body": "Opaque"}
             ], "global_decls": global_decls, "trait_decls": [], "trait_impls": []
         }
     });
@@ -300,13 +381,14 @@ fn quasi_atomic_u64_field_fixture(
 }
 
 #[test]
-fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
+fn atomic_field_access_lowers_through_a_stable_borrow_only() {
     let graph = lower_function(
         &quasi_atomic_u64_field_fixture(
             "Owner",
             "version_tag",
             Some("version_tag?"),
             Receiver::Borrow,
+            AtomicOp::Load("Acquire"),
         ),
         "read_field",
     )
@@ -326,7 +408,13 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
     );
 
     let result = lower_function(
-        &quasi_atomic_u64_field_fixture("Plain", "hot_counter", None, Receiver::Borrow),
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::Borrow,
+            AtomicOp::Load("Acquire"),
+        ),
         "read_field",
     );
     assert!(
@@ -342,6 +430,7 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
             "version_tag",
             Some("version_tag?"),
             Receiver::Copied,
+            AtomicOp::Load("Acquire"),
         ),
         "read_field",
     );
@@ -358,6 +447,7 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
             "version_tag",
             Some("version_tag?"),
             Receiver::ReassignedBase,
+            AtomicOp::Load("Acquire"),
         ),
         "read_field",
     );
@@ -374,6 +464,7 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
             "version_tag",
             Some("version_tag?"),
             Receiver::ReassignedParam,
+            AtomicOp::Load("Acquire"),
         ),
         "read_field",
     );
@@ -382,6 +473,124 @@ fn acquire_quasi_atomic_field_lowers_and_non_quasi_still_errors() {
             if message.contains("atomic load ordering Acquire")
                 && message.contains("requires address-preserving ordered lowering")),
         "Acquire load through a reassigned owner parameter must stay unsupported, got {result:?}"
+    );
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::Borrow,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    )
+    .expect("Relaxed load of a stable AtomicU64 field borrow lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. }
+                    if field.name == "hot_counter"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "lowered Relaxed load of a stable borrow has no hot_counter field read"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::ReassignedParam,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed load through a reassigned owner parameter must stay unsupported, got {result:?}"
+    );
+
+    let graph = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::Borrow,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    )
+    .expect("Relaxed store of a stable AtomicU64 field borrow lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldWrite { field, .. }
+                    if field.name == "hot_counter"
+            )
+        })
+    });
+    assert!(
+        saw,
+        "lowered Relaxed store of a stable borrow has no hot_counter field write"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::ReassignedParam,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic store ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed store through a reassigned owner parameter must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::MutBorrowedOwner,
+            AtomicOp::RelaxedStore,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic store ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed store through a mutably borrowed owner must stay unsupported, got {result:?}"
+    );
+
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Plain",
+            "hot_counter",
+            None,
+            Receiver::SuffixIndex,
+            AtomicOp::Load("Relaxed"),
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic load ordering Relaxed")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Relaxed load through a suffix index must stay unsupported, got {result:?}"
     );
 }
 

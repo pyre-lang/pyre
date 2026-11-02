@@ -3515,6 +3515,16 @@ impl<'a> Lowering<'a> {
                         // `from_ptr` identity leaves the field *address*;
                         // loading that word is `raw_load`, not aliasing the
                         // pointer (Unsigned) onto the Signed memo.
+                        // A recorded borrow through a rebound local stays
+                        // unsupported: the re-read would name another object.
+                        if self.atomic_receiver_has_recorded_borrow(&arg_locals)
+                            && !self.atomic_referent_is_stable(&arg_locals)
+                        {
+                            return Err(LowerError::Unsupported(
+                                "atomic load ordering Relaxed requires address-preserving ordered lowering"
+                                    .to_string(),
+                            ));
+                        }
                         if self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
                             dest_local,
@@ -3572,7 +3582,7 @@ impl<'a> Lowering<'a> {
                     let ordering_label = ordering.unwrap_or("unknown").to_string();
                     if is_acquire
                         && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
-                        && self.atomic_load_referent_is_stable(&arg_locals)
+                        && self.atomic_referent_is_stable(&arg_locals)
                         && self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
                             dest_local,
@@ -3632,13 +3642,22 @@ impl<'a> Lowering<'a> {
                 {
                     // A receiver this body did not bind as a borrow of a
                     // field — or one borrowing a whole local rather than a
-                    // field of one, or one rebound elsewhere in the body —
-                    // leaves no place to write to.  Fall through to the
-                    // ordinary call path, which is what an unrecognised
-                    // `store` already lowers to, rather than inventing a
-                    // target or failing a graph that compiles today.  The
-                    // place is copied, not taken: one borrow stored through
-                    // twice folds both times.
+                    // field of one — leaves no place to write to.  Fall
+                    // through to the ordinary call path, which is what an
+                    // unrecognised `store` already lowers to, rather than
+                    // inventing a target or failing a graph that compiles
+                    // today.  A recorded borrow whose place goes through a
+                    // rebound local is unsupported: writing the place now
+                    // would name another object.  The place is copied, not
+                    // taken: one borrow stored through twice folds both times.
+                    if self.atomic_receiver_has_recorded_borrow(&arg_locals)
+                        && !self.atomic_referent_is_stable(&arg_locals)
+                    {
+                        return Err(LowerError::Unsupported(
+                            "atomic store ordering Relaxed requires address-preserving ordered lowering"
+                                .to_string(),
+                        ));
+                    }
                     let referent = arg_locals
                         .first()
                         .copied()
