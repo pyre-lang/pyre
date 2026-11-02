@@ -900,8 +900,14 @@ pub struct DictKeyError;
 /// construction or `space.eq_w` during the bucket probe.  Reading clears
 /// both flags.  The concrete `PyError` rides the interpreter-side
 /// pending slot, retrieved via `take_pending_hash_error`.
+///
+/// Drain this where the lookup returns: `AbstractTypedStrategy.getitem` /
+/// `getitem_str` propagate the `r_dict` error there.
+///
+/// # Safety
+/// Thread-local flag read and clear; no pointer is dereferenced.
 #[inline]
-pub(crate) unsafe fn take_dict_key_error() -> bool {
+pub unsafe fn take_dict_key_error() -> bool {
     let hash = crate::dict_eq_hook::take_hash_error();
     let eq = crate::dict_eq_hook::take_eq_error();
     hash || eq
@@ -4248,48 +4254,6 @@ pub unsafe fn w_dict_getitem_str_object_strategy_hashed(
     dict_entries_get_str(entries, key, hash)
 }
 
-/// Jitted `objspace.py StdObjSpace.finditem_str` for a regular dict.
-///
-/// Pin the holder (`celldict.py ModuleDictStrategy.getdictvalue_no_unwrapping`
-/// promotes `self`) then `strategy_is` on `kind` (`w_dict_lookup_checked`).
-/// Unicode and Object share the object-table hashed probe; Empty misses.
-/// Remaining strategies residualise through
-/// [`w_dict_getitem_str_hashed_residual`].  No `DictOperationGuard`:
-/// `finditem_str` calls `w_obj.getitem_str(key)` without the user-facing lock.
-///
-/// # Safety
-/// `obj` must be a live `W_DictObject` (not a module dict).
-pub unsafe fn w_dict_getitem_str_shortcut_hashed(
-    obj: PyObjectRef,
-    key: &str,
-    hash: i64,
-) -> PyObjectRef {
-    let holder = (*(obj as *const W_DictObject)).dstrategy;
-    let dstrategy = &*majit_ir::jit::promote(holder as *const DictStrategyRef);
-    if strategy_is(dstrategy, StrategyKind::Empty)
-        || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
-    {
-        return PY_NULL;
-    }
-    if strategy_is(dstrategy, StrategyKind::Unicode) || strategy_is(dstrategy, StrategyKind::Object)
-    {
-        return w_dict_getitem_str_object_strategy_hashed(obj, key, hash).unwrap_or(PY_NULL);
-    }
-    w_dict_getitem_str_hashed_residual(obj, key, hash)
-}
-
-/// Residual arm of [`w_dict_getitem_str_shortcut_hashed`] for a strategy that
-/// is not Empty, Unicode, or Object.  `dont_look_inside` emits the word-ABI
-/// trampoline `llmodel.py bh_call_r` needs for a `&str` argument.
-#[majit_macros::dont_look_inside]
-pub unsafe fn w_dict_getitem_str_hashed_residual(
-    obj: PyObjectRef,
-    key: &str,
-    hash: i64,
-) -> PyObjectRef {
-    w_dict_get_strategy(obj).getitem_str_hashed(obj, key, hash)
-}
-
 /// `W_DictMultiObject.setitem_str` — `w_dict.get_strategy().setitem_str(w_dict, key, value)`.
 /// The module-dict arm is looked inside through [`w_dict_setitem_str_hashed`]
 /// into `ModuleDictStrategy.setitem_str`; the generic arm is the residual
@@ -7602,6 +7566,12 @@ impl DictStrategy for EmptyKwargsDictStrategy {
         EMPTY_DICT_STRATEGY.getitem(w_dict, w_key)
     }
 
+    /// `kwargsdict.py EmptyKwargsDictStrategy` inherits
+    /// `EmptyDictStrategy.getitem_str` (`return None`).
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
+        EMPTY_DICT_STRATEGY.getitem_str(w_dict, key)
+    }
+
     unsafe fn setitem(
         &self,
         mut w_dict: PyObjectRef,
@@ -7728,6 +7698,11 @@ impl DictStrategy for EmptyDictStrategy {
         // routed through a future Result-aware variant.  Tracked in
         // MEMORY as the "hash hook error propagation" epic.
         let _ = crate::dict_eq_hook::try_hash_w(w_key);
+        PY_NULL
+    }
+
+    /// `dictmultiobject.py EmptyDictStrategy.getitem_str` — `return None`.
+    unsafe fn getitem_str(&self, _w_dict: PyObjectRef, _key: &str) -> PyObjectRef {
         PY_NULL
     }
 
@@ -7912,7 +7887,10 @@ impl DictStrategy for ObjectDictStrategy {
     }
 
     /// `dictmultiobject.py ObjectDictStrategy.getitem_str` —
-    /// upstream just delegates to `getitem` after wrapping the key.
+    /// `AbstractTypedStrategy.getitem_str` wraps `newtext(key)` then
+    /// `getitem`. `StdObjSpace.finditem_str` / `W_DictMultiObject.getitem_str`
+    /// dispatch here; the hashed override is the body the trace descends
+    /// into (borrowed-str object-table probe).
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }
@@ -8361,7 +8339,10 @@ impl DictStrategy for UnicodeDictStrategy {
         dict_write_barrier(roots.get(dict_slot));
     }
 
-    /// `dictmultiobject.py getitem_str` override.
+    /// `dictmultiobject.py UnicodeDictStrategy.getitem_str`.
+    /// `StdObjSpace.finditem_str` / `W_DictMultiObject.getitem_str` dispatch
+    /// here. The hashed override is the body the trace descends into: a
+    /// borrowed-str object-table probe rather than wrapping `newtext(key)`.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }

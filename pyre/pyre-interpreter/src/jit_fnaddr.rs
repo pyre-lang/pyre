@@ -201,23 +201,6 @@ unsafe fn str_from_rstr_word(word: i64) -> &'static str {
     unsafe { core::str::from_utf8_unchecked(majit_ir::helper_fnaddr::rstr_payload(word)) }
 }
 
-/// Word-ABI residual for `w_dict_getitem_str_shortcut_hashed`.
-/// `llmodel.py bh_call_r` passes `&str` as one rstr STR word.
-#[inline(never)]
-pub(crate) extern "C" fn w_dict_getitem_str_shortcut_hashed_word(
-    obj: i64,
-    key: i64,
-    hash: i64,
-) -> i64 {
-    majit_ir::icf_identity!("jit_fnaddr::w_dict_getitem_str_shortcut_hashed_word");
-    let obj = obj as usize as pyre_object::PyObjectRef;
-    let key = unsafe { str_from_rstr_word(key) };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_getitem_str_shortcut_hashed(obj, key, hash) as usize
-            as i64
-    }
-}
-
 /// Word-ABI residual for `w_dict_getitem_str_object_strategy_hashed`.
 /// `llmodel.py bh_call_r` passes `&str` as one rstr STR word.
 #[inline(never)]
@@ -5143,21 +5126,9 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // the reloc path the codewriter records (`llmodel.py bh_call_r`).
     cpa3!(
         &mut entries,
-        "pyre_object::dictmultiobject::w_dict_getitem_str_shortcut_hashed",
-        "pyre_object::w_dict_getitem_str_shortcut_hashed",
-        w_dict_getitem_str_shortcut_hashed_word,
-    );
-    cpa3!(
-        &mut entries,
         "pyre_object::dictmultiobject::w_dict_getitem_str_object_strategy_hashed",
         "pyre_object::w_dict_getitem_str_object_strategy_hashed",
         w_dict_getitem_str_object_strategy_hashed_word,
-    );
-    cpa3!(
-        &mut entries,
-        "pyre_object::dictmultiobject::w_dict_getitem_str_hashed_residual",
-        "pyre_object::w_dict_getitem_str_hashed_residual",
-        pyre_object::dictmultiobject::__majit_call_target_w_dict_getitem_str_hashed_residual,
     );
     cp3!(
         &mut entries,
@@ -7342,10 +7313,9 @@ mod tests {
         pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
-        w_dict_getitem_str_object_strategy_hashed_word, w_dict_getitem_str_shortcut_hashed_word,
-        w_dict_lookup_bytes_strategy_word, w_dict_lookup_identity_strategy_word,
-        w_dict_lookup_int_strategy_word, w_list_pop_end_inner_word, w_list_pop_end_word,
-        w_module_dict_lookup_object_entries_word,
+        w_dict_getitem_str_object_strategy_hashed_word, w_dict_lookup_bytes_strategy_word,
+        w_dict_lookup_identity_strategy_word, w_dict_lookup_int_strategy_word,
+        w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
 
@@ -7857,10 +7827,6 @@ mod tests {
             "must not publish the Option-returning Rust item"
         );
         for (path, expected) in [
-            (
-                "pyre_object::dictmultiobject::w_dict_getitem_str_shortcut_hashed",
-                w_dict_getitem_str_shortcut_hashed_word as *const () as usize as i64,
-            ),
             (
                 "dictmultiobject::UnicodeDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::UnicodeDictStrategy>>::getitem_str_hashed",
                 unicode_dict_getitem_str_hashed_word as *const () as usize as i64,

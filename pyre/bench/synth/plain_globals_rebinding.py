@@ -42,4 +42,42 @@ for g, k in ((types.ModuleType('m').__dict__, 1), ({}, 13), ({}, 71)):
     assert builtin_hot(10000) == 70000
     del g['len']
     assert builtin_hot(10000) == 0
+
+
+# Object-strategy globals: a colliding key whose __eq__ raises must surface
+# through LOAD_GLOBAL, matching AbstractTypedStrategy.getitem / getitem_str
+# propagating the r_dict error. A miss would become NameError.
+class Other:
+    pass
+
+
+class Boom:
+    def __hash__(self):
+        return hash('x')
+
+    def __eq__(self, other):
+        raise RuntimeError('eq boom')
+
+
+eq_code = compile(
+    '''
+acc = 0
+i = 0
+while i < 10000:
+    acc = acc + x
+    i = i + 1
+''',
+    '<eq-boom-global>',
+    'exec',
+)
+g = {Other(): 0, 'x': 1}
+exec(eq_code, g)
+print('warm', g['acc'])
+del g['x']
+g[Boom()] = 2
+try:
+    exec(eq_code, g)
+    print('after-replace ok')
+except Exception as e:
+    print('after-replace', type(e).__name__, str(e))
 print('PASS')

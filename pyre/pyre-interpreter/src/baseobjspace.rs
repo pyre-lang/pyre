@@ -6142,12 +6142,49 @@ pub fn finditem_str_named(
         // `sys.modules` read.  Under the JIT the compiled loop has already
         // pinned the dict identity; the interpreter keeps the locked wrapper.
         if majit_metainterp::jit::we_are_jitted() {
-            let hash = named_key_hash(key, pycode, nameindex);
-            return Ok(pyre_object::dictmultiobject::nullable_to_option(unsafe {
-                pyre_object::dictmultiobject::w_dict_getitem_str_shortcut_hashed(obj, key, hash)
-            }));
+            // `W_DictObject.get_strategy` is `return self.dstrategy` with no
+            // `jit.promote`. `W_DictMultiObject.getitem_str` is
+            // `get_strategy().getitem_str`. Every strategy implements
+            // `getitem_str_hashed` (Unicode/Object probe with the digest;
+            // Empty returns None; others discard the digest and run
+            // `getitem_str`). A key `__eq__`/`__hash__` can raise; drain
+            // then reads `pycode` for `wrapped_key`. Keep it rooted.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&[pycode]);
+            let hash = named_key_hash(
+                key,
+                pyre_object::gc_roots::shadow_stack_get(base),
+                nameindex,
+            );
+            let hit = unsafe {
+                pyre_object::dictmultiobject::w_dict_get_strategy(obj)
+                    .getitem_str_hashed(obj, key, hash)
+            };
+            return finditem_str_drain(
+                key,
+                pyre_object::gc_roots::shadow_stack_get(base),
+                nameindex,
+                hit,
+            );
         }
-        return finditem_str_shortcut_interp(obj, key, pycode, nameindex);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, pycode]);
+        let hash = named_key_hash(
+            key,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            nameindex,
+        );
+        let hit = finditem_str_shortcut_interp_hit(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            key,
+            hash,
+        );
+        return finditem_str_drain(
+            key,
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            nameindex,
+            hit,
+        );
     }
     // `wrapped_key` realizes the code object's name slot, or interns a fresh
     // `w_str` for a caller that named none; either allocates.  Keep this arm
@@ -6159,7 +6196,9 @@ pub fn finditem_str_named(
 
 /// Interpreter-only shortcut-dict arm of [`finditem_str_named`]: hashed
 /// getitem plus the wrap-key hash-error recovery.  The wrap allocates, so
-/// the descent scan must not enter it after an effect.
+/// the descent scan must not enter it after an effect.  Residual ABI is
+/// `(obj, key, pycode, nameindex)`; the look-inside graph shares
+/// [`finditem_str_drain`] instead.
 #[majit_macros::dont_look_inside]
 pub(crate) fn finditem_str_shortcut_interp(
     obj: PyObjectRef,
@@ -6174,20 +6213,48 @@ pub(crate) fn finditem_str_shortcut_interp(
         pyre_object::gc_roots::shadow_stack_get(base + 1),
         nameindex,
     );
+    finditem_str_drain(
+        key,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        nameindex,
+        finditem_str_shortcut_interp_hit(pyre_object::gc_roots::shadow_stack_get(base), key, hash),
+    )
+}
+
+/// Locked hashed getitem for the interpreter arm of [`finditem_str_named`].
+/// The lock is an effect, so the descent scan must not enter this after a
+/// red dict.  Drain sits in [`finditem_str_drain`] after the lookup returns.
+#[majit_macros::dont_look_inside]
+fn finditem_str_shortcut_interp_hit(obj: PyObjectRef, key: &str, hash: i64) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj]);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(
+        pyre_object::dictmultiobject::w_dict_getitem_str_hashed(
             pyre_object::gc_roots::shadow_stack_get(base),
             key,
             hash,
         )
     }
-    .map_err(|_| {
-        take_pending_dict_key_error(wrapped_key(
-            key,
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-            nameindex,
-        ))
-    })
+    .unwrap_or(pyre_object::PY_NULL)
+}
+
+/// Shared tail of the shortcut-dict `finditem_str` probe: drain a pending
+/// `r_dict` key `__eq__`/`__hash__` error, then convert the nullable hit.
+/// `AbstractTypedStrategy.getitem` / `getitem_str` propagate that error
+/// through `r_dict`.  Sit here, after the lookup returns, so a later
+/// virtual `getitem_str` dispatch keeps the same recovery.
+fn finditem_str_drain(
+    key: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+    hit: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if unsafe { pyre_object::dictmultiobject::take_dict_key_error() } {
+        return Err(take_pending_dict_key_error(wrapped_key(
+            key, pycode, nameindex,
+        )));
+    }
+    Ok(pyre_object::dictmultiobject::nullable_to_option(hit))
 }
 
 /// `objspace.py StdObjSpace.finditem_str` generic arm: wrap the key and
