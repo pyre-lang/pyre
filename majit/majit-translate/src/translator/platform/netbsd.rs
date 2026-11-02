@@ -1,5 +1,6 @@
 //! Port of `rpython/translator/platform/netbsd.py` (`Netbsd`, `Netbsd_64`).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use super::bsd::localbase_or;
@@ -53,6 +54,34 @@ pub(super) fn preprocess_library_dirs(library_dirs: &[PathBuf]) -> Vec<PathBuf> 
     dirs
 }
 
+/// `Netbsd._include_dirs_for_libffi`.
+pub(super) fn _include_dirs_for_libffi(
+    _plat: &Platform,
+) -> Result<Vec<OsString>, super::posix::ValueError> {
+    Ok(_include_dirs_for_libffi_from(
+        localbase_or("/usr/pkg").into_os_string(),
+    ))
+}
+
+/// `os.path.join(LOCALBASE, "include")` (`Netbsd._include_dirs_for_libffi`).
+fn _include_dirs_for_libffi_from(localbase: OsString) -> Vec<OsString> {
+    vec![PathBuf::from(localbase).join("include").into_os_string()]
+}
+
+/// `Netbsd._library_dirs_for_libffi`.
+pub(super) fn _library_dirs_for_libffi(
+    _plat: &Platform,
+) -> Result<Vec<OsString>, super::posix::ValueError> {
+    Ok(_library_dirs_for_libffi_from(
+        localbase_or("/usr/pkg").into_os_string(),
+    ))
+}
+
+/// `os.path.join(LOCALBASE, "lib")` (`Netbsd._library_dirs_for_libffi`).
+fn _library_dirs_for_libffi_from(localbase: OsString) -> Vec<OsString> {
+    vec![PathBuf::from(localbase).join("lib").into_os_string()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +110,18 @@ mod tests {
         assert!(
             dirs.iter()
                 .any(|dir| dir == &PathBuf::from("/usr/pkg/include") || dir.ends_with("include"))
+        );
+    }
+
+    #[test]
+    fn netbsd_libffi_include_joins_empty_and_trailing_slash() {
+        assert_eq!(
+            _include_dirs_for_libffi_from(OsString::from("")),
+            vec![OsString::from("include")]
+        );
+        assert_eq!(
+            _include_dirs_for_libffi_from(OsString::from("/usr/local/")),
+            vec![OsString::from("/usr/local/include")]
         );
     }
 }
