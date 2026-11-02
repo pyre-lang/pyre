@@ -548,6 +548,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::ConstSymbolic { ty, .. }
         | OpKind::FieldRead { ty, .. }
         | OpKind::FieldWrite { ty, .. }
+        | OpKind::InteriorPtrExpose { ty, .. }
         | OpKind::VableFieldRead { ty, .. }
         | OpKind::VableFieldWrite { ty, .. }
         | OpKind::LoadStatic { ty, .. } => out.push(ty),
@@ -634,6 +635,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::NewTuple { .. }
         | OpKind::NewList { .. }
         | OpKind::GetSlice { .. }
+        | OpKind::StoreThroughPtr { .. }
         | OpKind::LoweredBlackholeOp { .. } => {}
     }
 }

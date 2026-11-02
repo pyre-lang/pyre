@@ -28956,6 +28956,10 @@ fn interior_shared(inner: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Ref": [null, inner, "Shared"]})
 }
 
+fn interior_mut(inner: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": [null, inner, "Mut"]})
+}
+
 fn interior_layout(size: u64, offsets: &[u64], transparent: bool) -> serde_json::Value {
     serde_json::json!([{
         "key": "fixture-target",
@@ -29123,8 +29127,20 @@ pub(in crate::front::mir) fn interior_caller(
     locals: Vec<serde_json::Value>,
     body: Vec<serde_json::Value>,
 ) -> serde_json::Value {
+    interior_fun(0, name, arg_count, inputs, output, locals, body)
+}
+
+fn interior_fun(
+    def_id: u64,
+    name: &str,
+    arg_count: u64,
+    inputs: Vec<serde_json::Value>,
+    output: serde_json::Value,
+    locals: Vec<serde_json::Value>,
+    body: Vec<serde_json::Value>,
+) -> serde_json::Value {
     serde_json::json!({
-        "def_id": 0,
+        "def_id": def_id,
         "item_meta": interior_meta(&["fixture", name], true),
         "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
         "body": {
@@ -30223,8 +30239,10 @@ fn interior_field_const_index_stays_direct_ptradd() {
     assert_direct_ptradd_not_residual_add(&ops);
 }
 
-/// `&(*p.add(i)).y` is an address, not a value read, so the add stays
-/// `direct_ptradd`. The census test is the guard; this locks the lowering.
+/// `&(*p.add(i)).y` is an address of a GcArray element field: getitem SSA
+/// plus `_interior_ptr._expose` (offsets carry `Field(name)`, `TO` is the
+/// field type), not a value read and not `direct_ptradd`. Fusion census
+/// still counts this Other.
 #[test]
 fn interior_field_address_of_stays_direct_ptradd() {
     let i64_ty = interior_i64();
@@ -30280,7 +30298,651 @@ fn interior_field_address_of_stays_direct_ptradd() {
     let graph = lower_interior(&llbc, "addr_point");
     let ops = graph_ops(&graph);
     assert_no_interior(&ops);
-    assert_direct_ptradd_not_residual_add(&ops);
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "element ptr::add must emit getitem; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::InteriorPtrExpose { .. })),
+        "address-of (*elem).field must emit InteriorPtrExpose; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
+        "element address-of must not stay direct_ptradd; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops)
+            .iter()
+            .any(|leaf| leaf == "add" || leaf == "sub"),
+        "element address-of must not residualize ptr::add; ops={ops:?}"
+    );
+}
+
+/// Helper `Option<(&K, &mut V)>` from a GcArray-of-struct element; caller
+/// `*h(i).unwrap().1 = v` lowers without `Unsupported`.
+#[test]
+fn get_slot_mut_option_tuple_store_through_ptr() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let k_ref = interior_shared(i64_ty.clone());
+    let v_ref = interior_mut(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [k_ref.clone(), v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let option_ty = option_adt_node(1, tuple_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let key_field = interior_field(3, &ptr, &adt, &i64_ty, 0);
+    let value_field = interior_field(3, &ptr, &adt, &i64_ty, 1);
+    let helper = interior_fun(
+        0,
+        "get_slot_mut",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        option_ty.clone(),
+        vec![
+            interior_local(0, None, &option_ty),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+            interior_local(4, Some("k"), &k_ref),
+            interior_local(5, Some("v"), &v_ref),
+            interior_local(6, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(4, &k_ref),
+                        serde_json::json!({
+                            "Ref": {"place": key_field, "kind": "Shared", "ptr_metadata": null}
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(5, &v_ref),
+                        serde_json::json!({
+                            "Ref": {"place": value_field, "kind": "Mut", "ptr_metadata": null}
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(6, &tuple_ty),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [
+                                    {
+                                        "id": 0,
+                                        "builtin": "Tuple",
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [k_ref.clone(), v_ref.clone()],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    },
+                                    null,
+                                    null
+                                ]},
+                                [
+                                    {"Move": interior_place(4, &k_ref)},
+                                    {"Move": interior_place(5, &v_ref)}
+                                ]
+                            ]
+                        }),
+                    ),
+                    interior_assign(
+                        interior_place(0, &option_ty),
+                        serde_json::json!({
+                            "Aggregate": [
+                                {"Adt": [
+                                    {
+                                        "id": 1,
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [tuple_ty.clone()],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    },
+                                    1,
+                                    null
+                                ]},
+                                [{"Move": interior_place(6, &tuple_ty)}]
+                            ]
+                        }),
+                    ),
+                ],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![ptr.clone(), usize_ty.clone()],
+        ptr.clone(),
+    );
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(5, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let caller = interior_fun(
+        2,
+        "store_through_unwrap_field",
+        3,
+        vec![ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("v"), &i64_ty),
+            interior_local(4, Some("opt"), &option_ty),
+            interior_local(5, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &option_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(4, &option_ty))],
+                    interior_place(5, &tuple_ty),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(3, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let unwrap = interior_opaque(
+        3,
+        &["core", "option", "<Impl>", "unwrap"],
+        vec![option_ty.clone()],
+        tuple_ty,
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_point(), option_enum(1)],
+        vec![helper, add, caller, unwrap],
+    );
+    let helper_graph = lower_interior(&llbc, "get_slot_mut");
+    let helper_ops = graph_ops(&helper_graph);
+    assert!(
+        helper_ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "helper must emit getitem; ops={helper_ops:?}"
+    );
+    let expose = helper_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorPtrExpose { .. }))
+        .count();
+    assert!(
+        expose >= 2,
+        "helper must emit address-of for key and value; ops={helper_ops:?}"
+    );
+    let caller_graph = lower_interior(&llbc, "store_through_unwrap_field");
+    let caller_ops = graph_ops(&caller_graph);
+    let stores = caller_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        .count();
+    assert_eq!(
+        stores, 1,
+        "caller must emit one store-through; ops={caller_ops:?}"
+    );
+    assert!(
+        caller_ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::RawStore { .. })),
+        "caller must not raw_store; ops={caller_ops:?}"
+    );
+}
+
+/// Helper returns `&mut (*elem).field` from a GcArray-of-struct element
+/// (`InteriorPtrExpose`); caller `*h(p, i) = v` is one `StoreThroughPtr`.
+#[test]
+fn get_slot_mut_direct_mut_ref_store_through_ptr() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let adt = interior_adt(0);
+    let ptr = interior_raw_mut(adt.clone());
+    let v_ref = interior_mut(i64_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let value_field = interior_field(3, &ptr, &adt, &i64_ty, 1);
+    let helper = interior_fun(
+        0,
+        "get_slot_mut",
+        2,
+        vec![ptr.clone(), usize_ty.clone()],
+        v_ref.clone(),
+        vec![
+            interior_local(0, None, &v_ref),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("slot"), &ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(3, &ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &v_ref),
+                    serde_json::json!({
+                        "Ref": {"place": value_field, "kind": "Mut", "ptr_metadata": null}
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let add = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+        vec![ptr.clone(), usize_ty.clone()],
+        ptr.clone(),
+    );
+    let caller = interior_fun(
+        2,
+        "store_through_unwrap_field",
+        3,
+        vec![ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &ptr),
+            interior_local(2, Some("i"), &usize_ty),
+            interior_local(3, Some("v"), &i64_ty),
+            interior_local(4, Some("slot"), &v_ref),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(
+                    0,
+                    vec![
+                        interior_copy(interior_place(1, &ptr)),
+                        interior_copy(interior_place(2, &usize_ty)),
+                    ],
+                    interior_place(4, &v_ref),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_deref(4, &v_ref, &i64_ty),
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(3, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![interior_point()], vec![helper, add, caller]);
+    let helper_graph = lower_interior(&llbc, "get_slot_mut");
+    let helper_ops = graph_ops(&helper_graph);
+    assert!(
+        helper_ops
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "helper must emit getitem; ops={helper_ops:?}"
+    );
+    let expose = helper_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::InteriorPtrExpose { .. }))
+        .count();
+    assert!(
+        expose >= 1,
+        "helper must emit address-of for the value field; ops={helper_ops:?}"
+    );
+    let caller_graph = lower_interior(&llbc, "store_through_unwrap_field");
+    let caller_ops = graph_ops(&caller_graph);
+    let stores = caller_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        .count();
+    assert_eq!(
+        stores, 1,
+        "caller must emit one store-through; ops={caller_ops:?}"
+    );
+    assert!(
+        caller_ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::RawStore { .. })),
+        "caller must not raw_store; ops={caller_ops:?}"
+    );
+}
+
+/// `*h().1 = v` through field 1 of a Call-returned `(&mut i64, &mut i64)`
+/// tuple is one `StoreThroughPtr` (`unwrap().1` of `get_slot_mut`).
+#[test]
+fn deref_store_through_returned_tuple_field_emits_store_through_ptr() {
+    let i64_ty = interior_i64();
+    let v_ref = interior_mut(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [v_ref.clone(), v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(2, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let helper = interior_opaque(0, &["fixture", "get_pair"], vec![], tuple_ty.clone());
+    let caller = interior_fun(
+        1,
+        "store_through_tuple_field",
+        1,
+        vec![i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("v"), &i64_ty),
+            interior_local(2, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(0, vec![], interior_place(2, &tuple_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(1, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![helper, caller]);
+    let caller_graph = lower_interior(&llbc, "store_through_tuple_field");
+    let caller_ops = graph_ops(&caller_graph);
+    let stores = caller_ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::StoreThroughPtr { .. }))
+        .count();
+    assert_eq!(
+        stores, 1,
+        "caller must emit one store-through; ops={caller_ops:?}"
+    );
+}
+
+/// `*iter_mut().enumerate().next().unwrap().1 = v` over a host `Vec<i64>`
+/// is a store through a library iterator slot, not a translated
+/// interior pointer.
+#[test]
+fn deref_store_through_enumerate_next_unwrap_field_is_unsupported() {
+    let i64_ty = interior_i64();
+    let usize_ty = interior_usize();
+    let v_ref = interior_mut(i64_ty.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [usize_ty, v_ref.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let tuple_field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(3, &tuple_ty),
+                {"Field": [null, 1]}
+            ]
+        },
+        "ty": v_ref
+    });
+    let deref_field = serde_json::json!({
+        "kind": {"Projection": [tuple_field, "Deref"]},
+        "ty": i64_ty
+    });
+    let next = interior_opaque(
+        0,
+        &["core", "iter", "adapters", "enumerate", "<Impl>", "next"],
+        vec![],
+        tuple_ty.clone(),
+    );
+    let unwrap = interior_opaque(
+        1,
+        &["core", "option", "<Impl>", "unwrap"],
+        vec![tuple_ty.clone()],
+        tuple_ty.clone(),
+    );
+    let caller = interior_fun(
+        2,
+        "store_through_enumerate_unwrap_field",
+        1,
+        vec![i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("v"), &i64_ty),
+            interior_local(2, Some("opt"), &tuple_ty),
+            interior_local(3, Some("pair"), &tuple_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(0, vec![], interior_place(2, &tuple_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &tuple_ty))],
+                    interior_place(3, &tuple_ty),
+                    4,
+                    3,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    deref_field,
+                    serde_json::json!({
+                        "Use": [{"Copy": interior_place(1, &i64_ty)}, "No"]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![next, unwrap, caller]);
+    let err = super::lower_function(&llbc, "store_through_enumerate_unwrap_field")
+        .expect_err("enumerate next unwrap field store must decline");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert_eq!(
+                msg,
+                "bb4: deref store is not a field, array element, or raw word"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `*p = n` through a `&mut i64` function argument is not a store
+/// through a same-body Call result.
+#[test]
+fn deref_store_of_i64_through_mut_arg_is_unsupported() {
+    let i64_ty = interior_i64();
+    let mut_i64 = interior_mut(i64_ty.clone());
+    let unit = serde_json::json!({
+        "Adt": {"id": 0, "builtin": "Tuple", "generics": {"types": []}}
+    });
+    let caller = interior_caller(
+        "store_through_arg",
+        2,
+        vec![mut_i64.clone(), i64_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &mut_i64),
+            interior_local(2, Some("n"), &i64_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_deref(1, &mut_i64, &i64_ty),
+                serde_json::json!({
+                    "Use": [{"Copy": interior_place(2, &i64_ty)}, "No"]
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![caller]);
+    let err = super::lower_function(&llbc, "store_through_arg")
+        .expect_err("arg-sourced i64 deref store must decline");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert_eq!(
+                msg,
+                "bb0: deref store is not a field, array element, or raw word"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `*p = s` through `&mut String` is not a leaf field of a GcArray-of-Struct
+/// (`rewrite_op_setinteriorfield`). The rust-heap header is not a copy
+/// scalar or GC pointer word.
+#[test]
+fn deref_store_of_string_through_mut_ref_is_unsupported() {
+    let string_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "string", "String"], false),
+        "kind": "Opaque"
+    });
+    let err =
+        lower_deref_store_mut_self(vec![string_decl]).expect_err("String deref store must decline");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert_eq!(
+                msg,
+                "bb0: deref store is not a field, array element, or raw word"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
 }
 
 /// A `repr(transparent)` pointee is the inner word, not a GcArray of

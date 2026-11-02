@@ -78,6 +78,8 @@ pub static UNARY_OPERATIONS: &[OpKind] = &[
     OpKind::GetAttr,
     OpKind::SimpleCall,
     OpKind::CallArgs,
+    OpKind::InteriorPtrExpose,
+    OpKind::StoreThroughPtr,
     // `Contains` is removed from UNARY_OPERATIONS upstream line 28 —
     // it's a binary op on the `in` operand semantically. The `@op.contains.register`
     // hooks below still live in unaryop.py, so they land here.
@@ -4298,6 +4300,63 @@ fn init_someptr_overrides(
             can_only_throw: CanOnlyThrow::Absent,
         },
     );
+    register(
+        reg,
+        OpKind::InteriorPtrExpose,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: pure(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("ptr.interior_ptr_expose: self unbound");
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("ptr.interior_ptr_expose: attr unbound");
+                with_ptr_like(
+                    &s,
+                    |_| {
+                        std::panic::panic_any(AnnotatorError::new(
+                            "interior_ptr_expose on non-interior ptr",
+                        ))
+                    },
+                    |ptr| {
+                        ptr.interior_ptr_expose(&s_attr)
+                            .unwrap_or_else(|err| std::panic::panic_any(err))
+                    },
+                )
+            }),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    register(
+        reg,
+        OpKind::StoreThroughPtr,
+        SomeValueTag::Ptr,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s = ann
+                    .annotation(&hl.args[0])
+                    .expect("ptr.store_through_ptr: self unbound");
+                let s_value = ann
+                    .annotation(&hl.args[1])
+                    .expect("ptr.store_through_ptr: value unbound");
+                with_ptr_like(
+                    &s,
+                    |_| {
+                        std::panic::panic_any(AnnotatorError::new(
+                            "store_through_ptr on non-interior ptr",
+                        ))
+                    },
+                    |ptr| {
+                        ptr.store_through_ptr(&s_value)
+                            .unwrap_or_else(|err| std::panic::panic_any(err));
+                    },
+                );
+                None
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
 }
 
 // unaryop.py — class __extend__(SomeNone)
@@ -5304,6 +5363,8 @@ mod tests {
         assert!(!UNARY_OPERATIONS.contains(&OpKind::Contains));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Len));
         assert!(UNARY_OPERATIONS.contains(&OpKind::Bool));
+        assert!(UNARY_OPERATIONS.contains(&OpKind::InteriorPtrExpose));
+        assert!(UNARY_OPERATIONS.contains(&OpKind::StoreThroughPtr));
     }
 
     #[test]
@@ -5929,6 +5990,196 @@ mod tests {
             panic!("expected SomeInteger");
         };
         assert!(i.nonneg);
+    }
+
+    #[test]
+    fn consider_interior_ptr_expose_extends_offsets_and_sets_field_to() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let ann = mk_ann();
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let mut v = Variable::named("p");
+        ann.setbinding(
+            &mut v,
+            SomeValue::InteriorPtr(super::super::model::SomeInteriorPtr::new(InteriorPtr {
+                PARENTTYPE: Box::new(array_type),
+                TO: Box::new(LowLevelType::Struct(Box::new(Struct::new(
+                    "Entry",
+                    vec![("value".into(), LowLevelType::Signed)],
+                )))),
+                offsets: vec![InteriorOffset::Index(0)],
+            })),
+        );
+        let hl = HLOperation::new(
+            OpKind::InteriorPtrExpose,
+            vec![
+                Hlvalue::Variable(v),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("value"))),
+            ],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        let SomeValue::InteriorPtr(ptr) = r else {
+            panic!("expose must return SomeInteriorPtr, got {r:?}");
+        };
+        assert_eq!(
+            ptr.ll_ptrtype.offsets,
+            vec![
+                InteriorOffset::Index(0),
+                InteriorOffset::Field("value".into()),
+            ]
+        );
+        assert_eq!(*ptr.ll_ptrtype.TO, LowLevelType::Signed);
+    }
+
+    #[test]
+    fn consider_store_through_ptr_on_leaf_to_returns_none() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let ann = mk_ann();
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(
+            &mut v_ptr,
+            SomeValue::InteriorPtr(super::super::model::SomeInteriorPtr::new(InteriorPtr {
+                PARENTTYPE: Box::new(array_type),
+                TO: Box::new(LowLevelType::Signed),
+                offsets: vec![
+                    InteriorOffset::Index(0),
+                    InteriorOffset::Field("value".into()),
+                ],
+            })),
+        );
+        let mut v_value = Variable::named("v");
+        ann.setbinding(
+            &mut v_value,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::StoreThroughPtr,
+            vec![Hlvalue::Variable(v_ptr), Hlvalue::Variable(v_value)],
+        );
+        let r = hl.consider(&ann).unwrap();
+        assert!(
+            r.is_none(),
+            "void store-through should return None, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn consider_interior_ptr_expose_on_someptr_is_annotator_error() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let s_ptr = super::super::model::SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(&mut v_ptr, SomeValue::Ptr(s_ptr));
+        let hl = HLOperation::new(
+            OpKind::InteriorPtrExpose,
+            vec![
+                Hlvalue::Variable(v_ptr),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("value"))),
+            ],
+        );
+        let err = hl
+            .consider(&ann)
+            .expect_err("expose on SomePtr must be AnnotatorError");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("non-interior ptr"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn consider_store_through_ptr_on_someptr_is_annotator_error() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let ann = mk_ann();
+        let s_ptr = super::super::model::SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        });
+        let mut v_ptr = Variable::named("p");
+        ann.setbinding(&mut v_ptr, SomeValue::Ptr(s_ptr));
+        let mut v_value = Variable::named("v");
+        ann.setbinding(
+            &mut v_value,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        let hl = HLOperation::new(
+            OpKind::StoreThroughPtr,
+            vec![Hlvalue::Variable(v_ptr), Hlvalue::Variable(v_value)],
+        );
+        let err = hl
+            .consider(&ann)
+            .expect_err("store-through on SomePtr must be AnnotatorError");
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("non-interior ptr"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn consider_sometuple_getitem_yields_interior_ptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, InteriorOffset, InteriorPtr, LowLevelType, Struct,
+        };
+
+        let array_type = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(
+            Struct::new("Entry", vec![("value".into(), LowLevelType::Signed)]),
+        )))));
+        let s_interior =
+            SomeValue::InteriorPtr(super::super::model::SomeInteriorPtr::new(InteriorPtr {
+                PARENTTYPE: Box::new(array_type),
+                TO: Box::new(LowLevelType::Signed),
+                offsets: vec![
+                    InteriorOffset::Index(0),
+                    InteriorOffset::Field("value".into()),
+                ],
+            }));
+        let ann = mk_ann();
+        let mut v_tup = Variable::named("t");
+        ann.setbinding(
+            &mut v_tup,
+            SomeValue::Tuple(SomeTuple::new(vec![s_interior.clone(), s_interior.clone()])),
+        );
+        let mut v_idx = Variable::named("i");
+        let mut s_idx = SomeInteger::new(true, false);
+        s_idx.base.const_box = Some(Constant::new(ConstValue::Int(1)));
+        ann.setbinding(&mut v_idx, SomeValue::Integer(s_idx));
+        let hl = HLOperation::new(
+            OpKind::GetItem,
+            vec![Hlvalue::Variable(v_tup), Hlvalue::Variable(v_idx)],
+        );
+        let r = hl.consider(&ann).unwrap().unwrap();
+        assert!(
+            matches!(r, SomeValue::InteriorPtr(_)),
+            "tuple getitem of interiors must yield SomeInteriorPtr, got {r:?}"
+        );
     }
 
     #[test]

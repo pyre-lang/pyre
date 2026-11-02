@@ -843,6 +843,15 @@ pub(crate) fn remap_op_kind(
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
         },
+        OpKind::InteriorPtrExpose { base, field, ty } => OpKind::InteriorPtrExpose {
+            base: remap_var(base),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        OpKind::StoreThroughPtr { ptr, value } => OpKind::StoreThroughPtr {
+            ptr: remap_var(ptr),
+            value: remap_var(value),
+        },
         OpKind::Call {
             target,
             args,
@@ -1325,6 +1334,8 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         OpKind::InteriorFieldWrite {
             base, index, value, ..
         } => vec![clone_var(base), clone_var(index), clone_var(value)],
+        OpKind::InteriorPtrExpose { base, .. } => vec![clone_var(base)],
+        OpKind::StoreThroughPtr { ptr, value } => vec![clone_var(ptr), clone_var(value)],
         OpKind::Call { args, .. } => args
             .iter()
             .filter_map(|arg| arg.as_variable().map(clone_var))
@@ -1559,6 +1570,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::ArrayRead { .. }
         | OpKind::ArrayLen { .. }
         | OpKind::InteriorFieldRead { .. }
+        | OpKind::InteriorPtrExpose { .. }
         // Pure virtualizable reads — no heap mutation.
         | OpKind::VableFieldRead { .. }
         | OpKind::VableArrayRead { .. }
@@ -1612,6 +1624,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         OpKind::FieldWrite { .. }
         | OpKind::ArrayWrite { .. }
         | OpKind::InteriorFieldWrite { .. }
+        | OpKind::StoreThroughPtr { .. }
         | OpKind::VableFieldWrite { .. }
         | OpKind::VableArrayWrite { .. }
         | OpKind::Call { .. }

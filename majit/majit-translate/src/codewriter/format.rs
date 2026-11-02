@@ -816,7 +816,8 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         | OpKind::IndirectCall { result_ty, .. } => value_type_kind(result_ty),
         OpKind::Input { ty, .. }
         | OpKind::FieldRead { ty, .. }
-        | OpKind::VableFieldRead { ty, .. } => value_type_kind(ty),
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::InteriorPtrExpose { ty, .. } => value_type_kind(ty),
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),

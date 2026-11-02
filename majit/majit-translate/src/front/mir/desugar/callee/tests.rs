@@ -1428,6 +1428,7 @@ fn add_dest_struct_field_guard_classifies_uses() {
     };
     let llbc = fixture_llbc();
     let accepts = |body: &Unstructured| super::add_dest_used_only_as_struct_field(&llbc, body, 1);
+    let elem_accepts = |body: &Unstructured| super::add_dest_used_as_struct_elem(&llbc, body, 1);
 
     let read = body_of(vec![
         stmt(serde_json::json!({"StorageLive": 1})),
@@ -1468,6 +1469,20 @@ fn add_dest_struct_field_guard_classifies_uses() {
         }]
     }))]);
     assert!(!accepts(&address), "&(*dest).field is not a value read");
+    assert!(
+        elem_accepts(&address),
+        "&(*dest).field is an element use for getitem SSA"
+    );
+
+    let reborrow = body_of(vec![stmt(serde_json::json!({
+        "Assign": [place_local(2), {
+            "Ref": {"place": deref_place(1), "kind": "Mut", "ptr_metadata": null}
+        }]
+    }))]);
+    assert!(
+        elem_accepts(&reborrow),
+        "&mut *dest is an element use for getitem SSA"
+    );
 
     let deeper = body_of(vec![stmt(serde_json::json!({
         "Assign": [place_local(2), {"Use": [{"Copy": {

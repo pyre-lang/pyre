@@ -612,4 +612,176 @@ mod tests {
             "PtrRepr.rtype_simple_call emits indirect_call"
         );
     }
+
+    #[test]
+    fn array_read_expose_store_through_ptr_rtypes_to_interior_field_write_r() {
+        use crate::annotator::model::SomePtr;
+        use crate::codewriter::call::effect_graph_from_rtyped_helper;
+        use crate::model::{ArrayGcKind, FieldDescriptor, ValueType};
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, GCREF, Ptr, PtrTarget, Struct,
+        };
+
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("leaf_store_through");
+        let entry = graph.startblock;
+        let entries = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "entries".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "v".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, entries.clone());
+        graph.push_inputarg_var(entry, index.clone());
+        graph.push_inputarg_var(entry, value.clone());
+        let elem = graph
+            .push_op_var(
+                entry,
+                OpKind::ArrayRead {
+                    base: entries,
+                    index,
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: None,
+                    nolength: false,
+                    gckind: ArrayGcKind::Gc,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let exposed = graph
+            .push_op_var(
+                entry,
+                OpKind::InteriorPtrExpose {
+                    base: elem,
+                    field: FieldDescriptor::new("value", Some("Entry".into())),
+                    ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::StoreThroughPtr {
+                ptr: exposed,
+                value,
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+
+        let gcref_ptr = match GCREF.clone() {
+            LowLevelType::Ptr(p) => *p,
+            other => panic!("GCREF must be Ptr, got {other:?}"),
+        };
+        let entry_struct = Struct::new("Entry", vec![("value".into(), GCREF.clone())]);
+        let array = Array::gc(LowLevelType::Struct(Box::new(entry_struct)));
+        let s_entries = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Array(array),
+        }));
+        let s_index = SomeValue::Integer(SomeInteger::new(false, false));
+        let s_value = SomeValue::Ptr(SomePtr::new(gcref_ptr));
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let lifted = function_graph_to_flowspace(&graph, &registry)
+            .expect("ArrayRead + InteriorPtrExpose + StoreThroughPtr must lift");
+        let start_ops = lifted.graph.borrow().startblock.borrow().operations.clone();
+        assert!(
+            start_ops
+                .iter()
+                .any(|op| op.opname == "interior_ptr_expose"),
+            "adapter must emit interior_ptr_expose; ops={start_ops:?}"
+        );
+        assert!(
+            start_ops.iter().any(|op| op.opname == "store_through_ptr"),
+            "adapter must emit store_through_ptr; ops={start_ops:?}"
+        );
+
+        let (ann, rtyper) = registry.ensure_session().expect("session");
+        ann.build_graph_types(
+            &lifted.graph,
+            &[Some(s_entries), Some(s_index), Some(s_value)],
+            true,
+        )
+        .expect("annotate ArrayRead + expose + store-through");
+        rtyper
+            .specialize_more_blocks()
+            .expect("rtype leaf-TO store-through");
+
+        let flow = lifted.graph.borrow();
+        let rtyped_ops = flow.startblock.borrow().operations.clone();
+        let rtyped_names: Vec<&str> = rtyped_ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            !rtyped_names
+                .iter()
+                .any(|name| *name == "interior_ptr_expose"
+                    || *name == "store_through_ptr"
+                    || *name == "raw_store"),
+            "rtyper must lower expose/store-through; ops={rtyped_names:?}"
+        );
+        assert_eq!(
+            rtyped_names
+                .iter()
+                .filter(|name| **name == "setinteriorfield")
+                .count(),
+            1,
+            "exactly one setinteriorfield; ops={rtyped_names:?}"
+        );
+
+        let converted = effect_graph_from_rtyped_helper(&flow);
+        let writes: Vec<_> = converted
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::InteriorFieldWrite { item_ty, field, .. } => {
+                    Some((item_ty.clone(), field.name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![(ValueType::Ref(None), "value".to_string())],
+            "one InteriorFieldWrite of kind r; ops={:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            converted.iter_block_ops().all(|(_, op)| !matches!(
+                op.kind,
+                OpKind::RawStore { .. }
+                    | OpKind::StoreThroughPtr { .. }
+                    | OpKind::InteriorPtrExpose { .. }
+            )),
+            "no RawStore / StoreThroughPtr / InteriorPtrExpose left"
+        );
+    }
 }

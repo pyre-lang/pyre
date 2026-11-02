@@ -14743,7 +14743,10 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
     //   anything else truthy -> Yes
     match op {
         // RPython LL: getfield_gc, setfield_gc → cannot raise
-        OpKind::FieldRead { .. } | OpKind::FieldWrite { .. } => RaiseClass::No,
+        OpKind::FieldRead { .. }
+        | OpKind::FieldWrite { .. }
+        | OpKind::InteriorPtrExpose { .. }
+        | OpKind::StoreThroughPtr { .. } => RaiseClass::No,
         // `malloc` / `malloc_varsize` can only raise MemoryError; with
         // `ignore_memoryerror` it is treated as non-raising
         // (canraise = (MemoryError,)).  `new_array_clear` is the cleared

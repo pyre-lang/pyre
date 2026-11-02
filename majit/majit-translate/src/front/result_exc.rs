@@ -3556,6 +3556,8 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::InteriorFieldWrite {
             base, index, value, ..
         } => vec![base.clone(), index.clone(), value.clone()],
+        OpKind::InteriorPtrExpose { base, .. } => vec![base.clone()],
+        OpKind::StoreThroughPtr { ptr, value } => vec![ptr.clone(), value.clone()],
         OpKind::VableArrayRead {
             base, elem_index, ..
         } => vec![base.clone(), elem_index.clone()],
@@ -15142,6 +15144,7 @@ fn concrete_type_of_producer(kind: &OpKind) -> Option<crate::model::ConcreteType
         | OpKind::UnaryOp { result_ty: ty, .. }
         | OpKind::FieldRead { ty, .. }
         | OpKind::VableFieldRead { ty, .. }
+        | OpKind::InteriorPtrExpose { ty, .. }
         | OpKind::ArrayRead { item_ty: ty, .. }
         | OpKind::InteriorFieldRead { item_ty: ty, .. }
         | OpKind::VableArrayRead { item_ty: ty, .. }

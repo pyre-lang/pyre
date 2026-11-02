@@ -30,10 +30,11 @@ use crate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 /// `FunctionGraph::concretetype_of(&v)`.
 pub use crate::model::ConcreteType;
 
-/// Copy each typed Variable's `concretetype` onto the legacy graph
-/// Variable it was seeded from, so subsequent
+/// Copy each typed Variable's `concretetype` and `annotation` onto the
+/// legacy graph Variable it was seeded from, so subsequent
 /// `FunctionGraph::concretetype_of(&v)` reads route through the
-/// rtyper's `Variable.concretetype` directly.
+/// rtyper's `Variable.concretetype` directly and a leaf-TO
+/// `SomeInteriorPtr` keeps its `offsets` for `rewrite_store_through_ptr`.
 ///
 /// `value_to_var` is keyed by the legacy graph Variable's object
 /// identity (`legacy_var -> typed_var`).  Each legacy Variable's
@@ -56,10 +57,13 @@ pub fn apply_from_flowspace_variables(
     value_to_var: &crate::translator::rtyper::flowspace_adapter::LegacyToTyped,
 ) {
     for (legacy_var, typed_var) in value_to_var.iter() {
-        let Some(ct) = typed_var.concretetype() else {
-            continue;
-        };
-        legacy_var.set_concretetype(Some(ct));
+        if let Some(ct) = typed_var.concretetype() {
+            legacy_var.set_concretetype(Some(ct));
+        }
+        let typed_ann = typed_var.annotation.borrow().clone();
+        if typed_ann.is_some() {
+            *legacy_var.annotation.borrow_mut() = typed_ann;
+        }
     }
 }
 
@@ -179,7 +183,9 @@ pub(crate) fn authoritative_result_type_from_op(
             ty,
             raw_alloc_flavor_structs,
         )),
-        OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
+        OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::InteriorPtrExpose { ty, .. } => {
             concrete_if_known(valuetype_to_concrete_for_legacy(
                 ty,
                 raw_alloc_flavor_structs,
@@ -1203,6 +1209,28 @@ mod tests {
         map.insert(legacy.clone(), typed);
         apply_from_flowspace_variables(&map);
         assert_eq!(legacy.concretetype().as_ref(), Some(&header));
+    }
+
+    #[test]
+    fn apply_from_flowspace_variables_copies_annotation() {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use std::rc::Rc;
+        let legacy = crate::flowspace::model::Variable::new();
+        let typed = crate::flowspace::model::Variable::new();
+        typed.set_concretetype(Some(LowLevelType::Signed));
+        *typed.annotation.borrow_mut() =
+            Some(Rc::new(SomeValue::Integer(SomeInteger::new(false, false))));
+        let mut map = crate::translator::rtyper::flowspace_adapter::LegacyToTyped::new();
+        map.insert(legacy.clone(), typed);
+        apply_from_flowspace_variables(&map);
+        assert!(
+            matches!(
+                legacy.annotation.borrow().as_ref().map(|rc| rc.as_ref()),
+                Some(SomeValue::Integer(_))
+            ),
+            "Match publish copies annotation, not only kinds"
+        );
     }
 
     #[test]

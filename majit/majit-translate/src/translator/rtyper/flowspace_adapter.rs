@@ -3788,6 +3788,35 @@ pub fn translate_op(
                 ),
             ])
         }
+        // `_interior_ptr._expose` applied to a field address.
+        // Rust takes the address of a GCREF/primitive field; offsets
+        // carry Field(name) and TO is the field type. Distinct from
+        // getattr-as-load (`FieldRead` → `getattr`).
+        OpKind::InteriorPtrExpose { base, field, .. } => {
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "interior_ptr_expose",
+                vec![
+                    base_hl,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                ],
+                result,
+            )])
+        }
+        // setattr-shaped store through a pointer: operands ptr + value,
+        // no field name. Annotator/rtyper form is leaf-TO
+        // `SomeInteriorPtr` / `InteriorPtrRepr` `setinteriorfield`.
+        OpKind::StoreThroughPtr { ptr, value } => {
+            let ptr_hl = lookup_operand(value_map, ptr, op, "ptr")?;
+            let value_hl = lookup_operand(value_map, value, op, "value")?;
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "store_through_ptr",
+                vec![ptr_hl, value_hl],
+                result,
+            )])
+        }
 
         // ─── Call port (CallTarget per variant) ───
         // RPython `flowspace/operation.py SimpleCall.opname =
@@ -4736,6 +4765,8 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::ArrayWrite { .. } => "ArrayWrite",
         OpKind::InteriorFieldRead { .. } => "InteriorFieldRead",
         OpKind::InteriorFieldWrite { .. } => "InteriorFieldWrite",
+        OpKind::InteriorPtrExpose { .. } => "InteriorPtrExpose",
+        OpKind::StoreThroughPtr { .. } => "StoreThroughPtr",
         OpKind::Call { .. } => "Call",
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
@@ -13797,6 +13828,49 @@ mod tests {
         assert_eq!(translated[0].opname, "getitem");
         assert_eq!(translated[1].opname, "setattr");
         assert_eq!(translated[1].args.len(), 3);
+    }
+
+    #[test]
+    fn translate_op_interior_ptr_expose_emits_interior_ptr_expose() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[0].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::InteriorPtrExpose {
+                base: vars[0].clone(),
+                field: crate::model::FieldDescriptor::new("value", Some("Entry".into())),
+                ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("InteriorPtrExpose arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "interior_ptr_expose");
+        assert_eq!(translated[0].args.len(), 2);
+    }
+
+    #[test]
+    fn translate_op_store_through_ptr_emits_store_through_ptr() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        value_map.insert(vars[0].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::StoreThroughPtr {
+                ptr: vars[0].clone(),
+                value: vars[1].clone(),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("StoreThroughPtr arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "store_through_ptr");
+        assert_eq!(translated[0].args.len(), 2);
     }
 
     #[test]

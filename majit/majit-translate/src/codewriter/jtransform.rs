@@ -5096,6 +5096,15 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
+            OpKind::InteriorPtrExpose { .. } => panic!(
+                "OpKind::InteriorPtrExpose reached jtransform; the rtyper must lower \
+                 _interior_ptr._expose before codewriter emission (InteriorPtrRepr)"
+            ),
+            OpKind::StoreThroughPtr { .. } => panic!(
+                "OpKind::StoreThroughPtr reached jtransform; the rtyper must lower \
+                 this store-through to setinteriorfield \
+                 (InteriorPtrRepr.rtype_store_through_ptr)"
+            ),
             // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
             // is `_int_to_int_cast` returning None (identity).
             OpKind::UnaryOp {
@@ -16610,6 +16619,15 @@ fn remap_op_renamings(
             value: remap_value(value, aliases),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
+        },
+        OpKind::InteriorPtrExpose { base, field, ty } => OpKind::InteriorPtrExpose {
+            base: remap_value(base, aliases),
+            field: field.clone(),
+            ty: ty.clone(),
+        },
+        OpKind::StoreThroughPtr { ptr, value } => OpKind::StoreThroughPtr {
+            ptr: remap_value(ptr, aliases),
+            value: remap_value(value, aliases),
         },
         OpKind::Call {
             target,

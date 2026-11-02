@@ -344,6 +344,10 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// MIR local.
     pub(in crate::front::mir) interior_field_alias:
         std::collections::HashMap<usize, InteriorFieldAlias>,
+    /// Same-body MIR locals whose `ptr::add` dest is a first-class GcArray
+    /// element (`getitem`). Address-of `(*dest).field` consults this set.
+    /// Not a cross-call side table.
+    pub(in crate::front::mir) interior_elem_locals: std::collections::HashSet<usize>,
     /// MIR locals bound by `_i = &place` / `&raw place`, mapped to the place
     /// they borrowed, for the place-addressed consumers of a borrow (`*p = v`,
     /// `core::mem::{replace,swap,take}`, raw / scalar alias paths). The atomic
@@ -1988,6 +1992,7 @@ impl<'a> Lowering<'a> {
             accum: accum.clone(),
             index_elem_alias: std::collections::HashMap::new(),
             interior_field_alias: std::collections::HashMap::new(),
+            interior_elem_locals: std::collections::HashSet::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
             scalar_address_locals: Vec::new(),
