@@ -3001,12 +3001,17 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
     }
 }
 
-/// `operation.py len` after the inlined `__len__` returns.
+/// `operation.py len` after the inlined `__len__` returns, and the
+/// generator `_send_ex` tail after the inlined body returns.
 ///
-/// The tail level's jitcode is `-live-`, `residual_call_r_r bh_len_tail`,
+/// The tail level's jitcode is `-live-`, `residual_call_r_r bh_*_tail`,
 /// `ref_return`. `finishframe` (`pyjitpl.py`) writes the callee result into
 /// `code[position - 1]`; walking from the resume pc records that call on the
 /// same box, and a raise leaves through the residual's exception guard.
+/// Seed the reconstructed registers so a tail that names more than r0
+/// (`bh_send_ex_tail`'s generator, Format's receiver) keeps those boxes;
+/// `drive_bridge_frame_subwalk` then overwrites the call dest with
+/// `child_result`.
 fn walk_len_operator_tail<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
@@ -3031,9 +3036,9 @@ fn walk_len_operator_tail<Sym: WalkSym>(
         0,
         0,
         middle_entry,
-        &[],
-        &[],
-        &[],
+        &middle.registers_r,
+        &middle.registers_i,
+        &middle.registers_f,
         &[],
         &[],
         &[],

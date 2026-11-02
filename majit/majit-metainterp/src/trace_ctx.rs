@@ -1918,6 +1918,14 @@ impl TraceCtx {
         self.virtualref_boxes.len()
     }
 
+    /// Innermost open vref pointer: the last `virtualref_boxes` entry.
+    /// `MetaInterp.rebuild_state_after_failure` reconnects pairs before
+    /// the virtualizable fill; pyre's `setup_bridge_sym` reads this for
+    /// the `ExecutionContext.topframeref` rewrite.
+    pub fn last_virtualref_ptr(&self) -> Option<usize> {
+        self.virtualref_boxes.last().map(|&(_, ptr)| ptr)
+    }
+
     /// Snapshot the open virtual-ref scopes before a non-committal sub-walk.
     /// If that walk is cut from the recorder, its stack mutations must be
     /// rolled back with the operations.
