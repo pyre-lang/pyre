@@ -596,16 +596,18 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler<Value = PyObjectRef> {
     /// on call sites that need true immutability to make a copy.
     fn bytes_constant(&mut self, value: &[u8]) -> Result<Self::Value, PyError>;
     fn code_constant(&mut self, code: &CodeObject) -> Result<Self::Value, PyError>;
-    /// `getconstant_w(index) -> co_consts_w[index]` (`pyopcode.py`).
-    /// The default realizes from the compiler constant; `PyFrame` overrides it
-    /// to return the object owned by `self.pycode.co_consts_w[index]`.
+    /// `pyopcode.py getconstant_w(index) -> self.getcode().co_consts_w[index]`.
+    ///
+    /// No default: a fallback that indexed `enclosing.constants` (the
+    /// compiler `Constants(Box<[ConstantData]>)` wrapper) was walked as
+    /// `getfield_gc_r Constants.__pos_0` and treated a `ConstIdx` integer
+    /// as a GCREF. `PyFrame` is the only implementor and reads
+    /// `self.pycode.co_consts_w[index]` directly.
     fn constant_at(
         &mut self,
         index: crate::bytecode::oparg::ConstIdx,
         enclosing: &CodeObject,
-    ) -> Result<Self::Value, PyError> {
-        load_const_value(self, &enclosing.constants[index])
-    }
+    ) -> Result<Self::Value, PyError>;
     fn none_constant(&mut self) -> Result<Self::Value, PyError>;
     fn ellipsis_constant(&mut self) -> Result<Self::Value, PyError>;
     fn slice_constant(
@@ -763,12 +765,12 @@ pub fn opcode_store_fast_store_fast<H: LocalOpcodeHandler + ?Sized>(
 }
 
 /// The `nameindex` a caller passes when it addresses no `co_names_w` slot
-/// (`pycode.py:127-129`).
+/// (`pycode.py` `new_interned_str` fills every real index).
 ///
 /// `0` cannot say this — it is a valid index, and naming the first entry of the
-/// name table is exactly the wrong answer.  Out of range for every table, so
-/// `w_code_getname_w` resolves it to `PY_NULL` and the key is minted the way it
-/// was before the table existed.
+/// name table is exactly the wrong answer. Out of range for every table, so
+/// the caller interns the literal it already holds and does not read
+/// `co_names_w`.
 ///
 /// The caller that needs it is the implicit class-body `__class__` store, whose
 /// name is a literal rather than a `co_names` entry.  (The JIT's
@@ -3434,6 +3436,7 @@ where
         unreachable!()
     };
     let idx = u32_as_usize(namei.get(op_arg));
+    // pyopcode.py LOAD_NAME: `getname_w` then `space.finditem_str`.
     executor.load_name(code.names[idx].as_ref(), idx)?;
     Ok(StepResult::Continue)
 }
@@ -3453,6 +3456,7 @@ where
     let raw = u32_as_usize(namei.get(op_arg));
     let name_idx = raw >> 1;
     let push_null = (raw & 1) != 0;
+    // pyopcode.py LOAD_GLOBAL: `getname_w` then `LOAD_GLOBAL_cached`.
     executor.load_global(code.names[name_idx].as_ref(), name_idx, push_null)?;
     Ok(StepResult::Continue)
 }

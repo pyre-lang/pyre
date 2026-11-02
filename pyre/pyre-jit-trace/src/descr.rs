@@ -8149,6 +8149,37 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `pycode.py PyCode._immutable_fields_`: `co_nlocals`,
+            // `co_stacksize`, `co_flags`. `co_nfreevars` is the length of
+            // `_immutable_fields_ co_freevars[*]`.
+            int_field(
+                "co_nlocals",
+                std::mem::offset_of!(PyCode, co_nlocals),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
+            int_field(
+                "co_stacksize",
+                std::mem::offset_of!(PyCode, co_stacksize),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
+            int_field(
+                "co_nfreevars",
+                std::mem::offset_of!(PyCode, co_nfreevars),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
+            int_field(
+                "co_flags",
+                std::mem::offset_of!(PyCode, co_flags),
+                std::mem::size_of::<u32>(),
+                false,
+                true,
+            ),
             word_int(
                 "cell_families",
                 std::mem::offset_of!(PyCode, cell_families),
@@ -10567,7 +10598,7 @@ mod tests {
                 WORD,
                 Type::Ref,
                 false,
-                17,
+                21,
                 false,
             ),
             (
@@ -10577,7 +10608,7 @@ mod tests {
                 WORD,
                 Type::Ref,
                 false,
-                18,
+                22,
                 true,
             ),
         ];
@@ -10643,6 +10674,10 @@ mod tests {
                 "PyCode.hidden_applevel",
                 "PyCode.fast_natural_arity",
                 "PyCode.npure_cellvars",
+                "PyCode.co_nlocals",
+                "PyCode.co_stacksize",
+                "PyCode.co_nfreevars",
+                "PyCode.co_flags",
                 "PyCode.cell_families",
                 "PyCode.globals_caches",
                 "PyCode.mapdict_caches",
@@ -10659,6 +10694,20 @@ mod tests {
                 "PyCode._signature",
             ]
         );
+        // `heaptracker.py get_fielddescr_index_in` numbers after the
+        // typeptr skip. The group lists payload fields in `PyCode`
+        // declaration order and the mint adds the inherited `w_class`
+        // leaf at listed[0], so listed position *is* `index_in_parent`.
+        for (i, fd) in size.all_fielddescrs().iter().enumerate() {
+            assert_eq!(
+                fd.index_in_parent(),
+                i,
+                "field {} has index_in_parent {} at listed position {}",
+                fd.field_name(),
+                fd.index_in_parent(),
+                i,
+            );
+        }
     }
 
     #[test]

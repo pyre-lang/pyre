@@ -6181,6 +6181,9 @@ fn wrapped_key(key: &str, pycode: PyObjectRef, nameindex: usize) -> PyObjectRef 
 /// yet is realized (one interned string per name value), and a caller holding
 /// no code object gets zero.
 pub(crate) fn named_key_hash(key: &str, pycode: PyObjectRef, nameindex: usize) -> i64 {
+    if unsafe { !crate::pycode::w_code_name_index_covered(pycode, nameindex) } {
+        return 0;
+    }
     let w_name = unsafe { crate::pycode::w_code_getname_w(pycode, nameindex) };
     if w_name.is_null() {
         return 0;
