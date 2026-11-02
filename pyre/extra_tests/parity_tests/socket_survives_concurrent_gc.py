@@ -3,6 +3,8 @@
 # collection at the blocking-mode syscall and the boxed state-field stores.
 # parity-tests reason: the socket receiver must be reloaded after GC moves it;
 # a pinned caller alone does not update a Rust argument evaluated before GC.
+# Sockets are created unconnected. A connected pair is emulated over loopback
+# TCP on Windows and exhausts its buffers.
 
 import gc
 import socket
@@ -17,7 +19,8 @@ def work():
     try:
         barrier.wait()
         for _ in range(100):
-            left, right = socket.socketpair()
+            left = socket.socket()
+            right = socket.socket()
             for sock in (left, right):
                 sock.settimeout(0.125)
                 assert sock.gettimeout() == 0.125

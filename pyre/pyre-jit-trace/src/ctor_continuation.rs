@@ -43,7 +43,8 @@
 //! the None check are that graph's own jitcode, and this module deletes.
 //! Until then the stand-in is deliberately the smallest thing that can hold a
 //! resume coordinate: the placeholder call, two `-live-` anchors, the None
-//! check, and `ref_return`, entered only by resume, never compiled.
+//! check, the after-call `-live-` (`handle_residual_call`), and `ref_return`,
+//! entered only by resume, never compiled.
 //!
 //! Without such a level the constructor route cannot be seeded at all.  A
 //! blackhole level's return kind is decided by the `*_return` op the callee
@@ -66,6 +67,7 @@
 //!   resume_pc:  -live-                       [r0 live, r1 pending]
 //!   assembler:  -live-                       [r0 live, r1 live]
 //!               residual_call_r_v  bh_check_init_returned_none(init_result)
+//!               -live-                       [r0 live]
 //!               ref_return         instance
 //! ```
 //!
@@ -212,6 +214,16 @@ fn build() -> Option<(i32, usize, usize)> {
         calldescr,
     );
 
+    // `handle_residual_call` emits `[op1, SpaceOperation('-live-', [], None)]`
+    // whenever `calldescr_canraise(calldescr)`. `bh_check_init_returned_none`
+    // can raise TypeError, so this is the after-call resume coordinate
+    // (`after_residual_guard_marker`). Live refs are the instance only:
+    // `INIT_RESULT_REG` is dead after the check; `ref_return` reads
+    // `INSTANCE_REG`.
+    let after_call_liveness = crate::state::intern_liveness(&[], &[INSTANCE_REG as u8], &[])?;
+    let after_call_live_patch = builder.live_placeholder();
+    builder.patch_live_offset(after_call_live_patch, after_call_liveness);
+
     // `descr_call` returns `w_newobject`, not `__init__`'s result.
     builder.ref_return(INSTANCE_REG);
 
@@ -272,10 +284,10 @@ mod tests {
         // `run_inner` asserts membership on every dispatched position, not
         // only the entry one, so the tail's ops need theirs too: `inline_call`,
         // in-call `-live-`, assembler `-live-`, `residual_call_r_v`,
-        // `ref_return`.
+        // after-call `-live-`, `ref_return`.
         assert_eq!(
             startpoints.len(),
-            5,
+            6,
             "startpoints must cover every op in the tail, got {startpoints:?}",
         );
     }
@@ -301,6 +313,71 @@ mod tests {
             payload.resolve_resume_pc_with_jitcode_pc(resume_pc as i32, crate::state::op_live()),
             Some(resume_pc),
             "the parent loop must resolve the anchor to itself",
+        );
+    }
+
+    /// `handle_residual_call` trails a raising residual with `-live-`. The
+    /// None check is such a residual, and `ref_return` then reads only the
+    /// instance, so that marker's live refs are `[INSTANCE_REG]`.
+    #[test]
+    fn residual_call_is_followed_by_a_live_naming_the_instance() {
+        let Some((index, _, _)) = level() else {
+            return;
+        };
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the tail was just installed at this index");
+        let ops: Vec<_> =
+            crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice()).collect();
+        let residual_idx = ops
+            .iter()
+            .position(|op| op.opname.starts_with("residual_call"))
+            .expect("the tail emits the None-check residual");
+        let after = ops
+            .get(residual_idx + 1)
+            .expect("the residual has a following op");
+        assert_eq!(
+            after.opname, "live",
+            "handle_residual_call emits a trailing `-live-`",
+        );
+        let startpoints = payload
+            .jitcode
+            .startpoints
+            .as_ref()
+            .expect("the builder records one startpoint per emitted instruction");
+        assert!(
+            startpoints.contains(&after.pc),
+            "the after-call `-live-` must be addressable as a resume coordinate",
+        );
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(after.pc, crate::state::op_live()),
+            "the after-call `-live-` must decode its live vars",
+        );
+        let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            index,
+            after.pc as i32,
+        )
+        .expect("the after-call `-live-` must decode");
+        assert_eq!(
+            live.int,
+            Vec::<u32>::new(),
+            "no int is live after the check"
+        );
+        assert_eq!(
+            live.ref_,
+            vec![INSTANCE_REG as u32],
+            "only INSTANCE_REG is live after the check",
+        );
+        assert_eq!(
+            live.float,
+            Vec::<u32>::new(),
+            "no float is live after the check",
+        );
+        assert_eq!(
+            crate::state::frame_value_count_at(index, after.pc as i32),
+            1,
+            "only INSTANCE_REG is live after the check",
         );
     }
 
