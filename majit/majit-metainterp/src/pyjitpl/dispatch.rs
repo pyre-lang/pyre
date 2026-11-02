@@ -1158,9 +1158,8 @@ pub trait JitCodeRuntime {
     /// which calloc's a frame and passes the frame ptr in reg0) — it is NOT
     /// a positional C-ABI function, so it cannot be called through
     /// `call_int_function`.  The runtime drives `execute_token_raw(token,
-    /// reds)` (mirroring `run_compiled_raw_detailed_with_values`
-    /// in `pyjitpl.rs`) and decodes the single int FINISH output.  `reds` are
-    /// the marshalled red call args (greens are baked into the loop the
+    /// reds)` and decodes the single int FINISH output.  `reds` are the
+    /// marshalled red call args (greens are baked into the loop the
     /// `token` already names).  Returns `None` when the loop did not finish
     /// with an int result or when the runtime has no backend (the default,
     /// for standalone test runtimes), in which case the caller aborts.

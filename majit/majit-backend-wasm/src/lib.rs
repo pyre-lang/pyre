@@ -3169,11 +3169,11 @@ pub(crate) struct PendingInline {
     /// alive for the rest of the thread.
     owner: Weak<JitCellToken>,
     region: codegen::InlinedBridge,
-    /// When the source guard lived on a standalone parent bridge, remap
-    /// `(parent_trace_id, parent_local_fail_index)` at install once that
+    /// The source guard's descr when it lived on a standalone parent bridge;
+    /// install resolves its merged ordinal with `merged_exit_index` once that
     /// parent is in the owner's merged stream. `None` is the ordinary
     /// owner-stream index already stored on `region`.
-    remap: Option<(u64, u32)>,
+    remap: Option<majit_ir::DescrRef>,
     /// Set when a one-shot trip leftover is waiting on a sibling peel
     /// (`uninitialized_label`). Ordinary deferred entries stay false so a
     /// hot sibling cannot pull them in before their own threshold.
@@ -3239,28 +3239,33 @@ fn discard_invalidated_owner_inlines(owner: &Arc<JitCellToken>) {
     }
 }
 
-/// The merged-stream exit ordinal of a guard belonging to a region already
-/// merged into this loop, or `None` when `trace_id` names no such region.
+/// Exit ordinal of the guard whose descr is `meta` in the merged stream: the
+/// owner's own ops followed by every region's, in attach order, numbered
+/// across the whole of it (`collect_guards_and_vars` order per piece).
 ///
-/// `InlinedBridge::source_fail_index` indexes the merged stream — the owner's
-/// own ops followed by every region's, in attach order — whose exits are
-/// numbered across the whole of it. A guard in the owner itself is already at
-/// its own ordinal; a region's guards start past the owner's and past every
-/// region attached before it. The answer stays valid however long a deferred
-/// merge waits, because merging only ever appends.
-fn merged_region_fail_index(
+/// Merging only appends, so the answer stays valid while a deferred merge
+/// waits.
+fn merged_exit_index(
     inputs: &codegen::ModuleBuildInputs,
-    trace_id: u64,
-    region_fail_index: u32,
+    meta: &majit_ir::DescrRef,
 ) -> Option<u32> {
-    let mut ordinal = codegen::guard_exit_count(&inputs.inputargs, &inputs.ops);
-    for region in &inputs.inlined_bridges {
-        let count = codegen::guard_exit_count(&region.inputargs, &region.ops);
-        if region.trace_id == trace_id {
-            return ((region_fail_index as usize) < count)
-                .then(|| (ordinal + region_fail_index as usize) as u32);
+    let mut ordinal = 0u32;
+    for (inputargs, ops) in std::iter::once((inputs.inputargs.as_slice(), inputs.ops.as_slice()))
+        .chain(
+            inputs
+                .inlined_bridges
+                .iter()
+                .map(|region| (region.inputargs.as_slice(), region.ops.as_slice())),
+        )
+    {
+        let descrs = codegen::guard_exit_descrs(inputargs, ops);
+        if let Some(pos) = descrs
+            .iter()
+            .position(|descr| descr.as_ref().is_some_and(|d| Arc::ptr_eq(d, meta)))
+        {
+            return Some(ordinal + pos as u32);
         }
-        ordinal += count;
+        ordinal += descrs.len() as u32;
     }
     None
 }
@@ -3330,7 +3335,7 @@ fn register_pending_inline(
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
     owner_module_bytes: u32,
-    remap: Option<(u64, u32)>,
+    remap: Option<majit_ir::DescrRef>,
 ) -> codegen::InlineTripProbe {
     // A region placed outside the loop re-enters its prefix every iteration
     // (`jump_to_preamble`), so the owner-size term would postpone the merge
@@ -3994,8 +3999,9 @@ impl WasmBackend {
             // SAFETY: `addr` passed `pending_slot_is_member` above, and this
             // install has not freed the owner's blocks.
             if let Some(item) = unsafe { pending_slot_at(addr) }.entry.borrow_mut().take() {
-                // Remapped children still name a parent-local fail index;
-                // the owner's descr array does not hold that guard.
+                // Remapped children still name the parent guard's descr; the
+                // owner's descr array does not hold that guard until the parent
+                // is merged.
                 work.push((addr, item.region, item.remap));
             }
         }
@@ -4007,9 +4013,9 @@ impl WasmBackend {
         // The compiled probe still names the slot it was registered under.
         // Leftover remaps must go back into that same slot; a fresh one
         // would leave the already-emitted trip calling a hole.
-        let remap_pending_ids: HashMap<(u64, u32), usize> = work
+        let remap_pending_ids: Vec<(majit_ir::DescrRef, usize)> = work
             .iter()
-            .filter_map(|(addr, _, remap)| remap.map(|key| (key, *addr)))
+            .filter_map(|(addr, _, remap)| remap.as_ref().map(|key| (key.clone(), *addr)))
             .collect();
         let fail_pending_ids: HashMap<u32, usize> = work
             .iter()
@@ -4021,17 +4027,19 @@ impl WasmBackend {
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
         );
-        let put_back = |addr: usize, region: codegen::InlinedBridge, remap: Option<(u64, u32)>| {
-            // SAFETY: `addr` is a slot box still stored in this owner's
-            // `pending_inlines`. This install takes the `Option` and does not
-            // drop the box; re-emission only pushes new blocks.
-            *unsafe { pending_slot_at(addr) }.entry.borrow_mut() = Some(PendingInline {
-                owner: Arc::downgrade(&owner),
-                region,
-                remap,
-                retry_on_sibling: remap.is_none(),
-            });
-        };
+        let put_back =
+            |addr: usize, region: codegen::InlinedBridge, remap: Option<majit_ir::DescrRef>| {
+                // SAFETY: `addr` is a slot box still stored in this owner's
+                // `pending_inlines`. This install takes the `Option` and does not
+                // drop the box; re-emission only pushes new blocks.
+                let retry_on_sibling = remap.is_none();
+                *unsafe { pending_slot_at(addr) }.entry.borrow_mut() = Some(PendingInline {
+                    owner: Arc::downgrade(&owner),
+                    region,
+                    remap,
+                    retry_on_sibling,
+                });
+            };
         // Optional remaps / leftover labels must not make the newly
         // tripped region fail the whole rebuild.
         if terminal && leftover.len() > 1 && !owner.is_invalidated() {
@@ -4039,7 +4047,9 @@ impl WasmBackend {
                 leftover
                     .into_iter()
                     .partition(|(region, remap)| match remap {
-                        Some(key) => remap_pending_ids.get(key) == Some(&trigger_id),
+                        Some(key) => remap_pending_ids
+                            .iter()
+                            .any(|(k, addr)| Arc::ptr_eq(k, key) && *addr == trigger_id),
                         None => {
                             fail_pending_ids.get(&region.source_fail_index) == Some(&trigger_id)
                         }
@@ -4048,8 +4058,11 @@ impl WasmBackend {
                 (leftover, terminal) = self.install_inline_region_batch(&owner, trigger_left);
                 if !terminal && !owner.is_invalidated() {
                     for (region, remap) in optional_left {
-                        let addr = match remap {
-                            Some(key) => remap_pending_ids.get(&key).copied(),
+                        let addr = match &remap {
+                            Some(key) => remap_pending_ids
+                                .iter()
+                                .find(|(k, _)| Arc::ptr_eq(k, key))
+                                .map(|(_, addr)| *addr),
                             None => fail_pending_ids.get(&region.source_fail_index).copied(),
                         };
                         let Some(addr) = addr else {
@@ -4074,8 +4087,11 @@ impl WasmBackend {
         // pending so a later install can pick them up. The compiled probe
         // still names this slot.
         for (region, remap) in leftover {
-            let addr = match remap {
-                Some(key) => remap_pending_ids.get(&key).copied(),
+            let addr = match &remap {
+                Some(key) => remap_pending_ids
+                    .iter()
+                    .find(|(k, _)| Arc::ptr_eq(k, key))
+                    .map(|(_, addr)| *addr),
                 None => fail_pending_ids.get(&region.source_fail_index).copied(),
             };
             let Some(addr) = addr else {
@@ -4148,14 +4164,18 @@ impl WasmBackend {
         addrs
     }
 
+    /// The owner's exit at merged-stream ordinal `fail_index`. The owner's exits occupy positions
+    /// `[0, num_guard_cells)` of `fail_descrs` in merged-stream order (position at emit,
+    /// `assembler.py` `self.faildescr.index = i`); descrs past that prefix belong to standalone bridges.
     fn owner_guard_descr(
         source_loop: &CompiledWasmLoop,
         fail_index: u32,
     ) -> Option<Arc<WasmFailDescr>> {
-        source_loop.fail_descrs.borrow().iter().find_map(|descr| {
-            (descr.trace_id == source_loop.trace_id && descr.fail_index == fail_index)
-                .then(|| Arc::clone(descr))
-        })
+        let index = fail_index as usize;
+        if index >= source_loop.num_guard_cells.get() {
+            return None;
+        }
+        source_loop.fail_descrs.borrow().get(index).cloned()
     }
 
     /// Re-point a guard's dispatch cell at the bridge slot stored on its descr.
@@ -4188,8 +4208,11 @@ impl WasmBackend {
     fn install_inline_region_batch(
         &self,
         owner: &JitCellToken,
-        regions: Vec<(codegen::InlinedBridge, Option<(u64, u32)>)>,
-    ) -> (Vec<(codegen::InlinedBridge, Option<(u64, u32)>)>, bool) {
+        regions: Vec<(codegen::InlinedBridge, Option<majit_ir::DescrRef>)>,
+    ) -> (
+        Vec<(codegen::InlinedBridge, Option<majit_ir::DescrRef>)>,
+        bool,
+    ) {
         if regions.is_empty() {
             return (Vec::new(), false);
         }
@@ -4218,10 +4241,8 @@ impl WasmBackend {
             let mut progressed = false;
             let mut still = Vec::new();
             for (mut region, remap) in leftover {
-                if let Some((parent_trace_id, parent_fail_index)) = remap {
-                    let Some(idx) =
-                        merged_region_fail_index(&candidate, parent_trace_id, parent_fail_index)
-                    else {
+                if let Some(meta) = remap.as_ref() {
+                    let Some(idx) = merged_exit_index(&candidate, meta) else {
                         still.push((region, remap));
                         continue;
                     };
@@ -6067,9 +6088,9 @@ impl majit_backend::Backend for WasmBackend {
         // lift (the host round-trip path still handles the CALL_ASSEMBLER).
         let ca_targets = bridge_call_assembler_target(ops);
         let ca_candidate = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
-        // The source guard this bridge attaches to. `fail_index` is its index in
-        // the source loop's `fail_descrs` / cell array; `trace_id` identifies the
-        // owning trace.
+        // Metainterp stamp pair, kept for log/decline strings only. Guard
+        // identity is the descr object (`assemble_bridge`,
+        // `handle_guard_failure`).
         let source_trace_id = fail_descr.trace_id();
         let source_fail_index = fail_descr.fail_index();
 
@@ -6082,6 +6103,8 @@ impl majit_backend::Backend for WasmBackend {
             source_frame,
             is_direct,
             source_used_homes,
+            source_meta,
+            source_pos,
         ) = {
             let source_loop = original_token
                 .compiled
@@ -6092,16 +6115,23 @@ impl majit_backend::Backend for WasmBackend {
                         "wasm backend: bridge source token has no compiled loop".into(),
                     )
                 })?;
-            let is_direct = source_trace_id == source_loop.trace_id;
             let fail_ptr = fail_descr as *const dyn FailDescr as *const ();
             let descrs = source_loop.fail_descrs.borrow();
-            let wasm_guard = descrs.iter().find_map(|descr| {
+            let source_pos = descrs.iter().position(|descr| {
                 descr
                     .meta_descr
                     .as_ref()
                     .is_some_and(|meta| std::sync::Arc::as_ptr(meta) as *const () == fail_ptr)
-                    .then(|| Arc::clone(descr))
             });
+            let wasm_guard = source_pos.map(|pos| Arc::clone(&descrs[pos]));
+            let source_meta = wasm_guard.as_ref().and_then(|d| d.meta_descr.clone());
+            // Directness is the source guard was emitted by the owner's own
+            // compile, decided by descr identity against the owner's exits.
+            // Those occupy the first `guard_fail_arg_counts.len()` positions of
+            // `fail_descrs`; a re-emit keeps them first because the merged
+            // stream starts with the owner's ops.
+            let is_direct =
+                source_pos.is_some_and(|pos| pos < source_loop.guard_fail_arg_counts.len());
             let source_used_homes = wasm_guard
                 .as_ref()
                 .filter(|_descr| !is_direct)
@@ -6111,16 +6141,14 @@ impl majit_backend::Backend for WasmBackend {
                     source_loop.used_label_homes.get(),
                 ));
             let guard = if is_direct {
+                let pos = source_pos.expect("direct guard occupies a fail_descrs slot");
                 Some((
                     source_loop
                         .guard_fail_arg_advanced
-                        .get(source_fail_index as usize)
+                        .get(pos)
                         .cloned()
                         .unwrap_or_default(),
-                    source_loop
-                        .guard_fail_arg_counts
-                        .get(source_fail_index as usize)
-                        .copied(),
+                    source_loop.guard_fail_arg_counts.get(pos).copied(),
                     source_loop.bridge_param_dispatch,
                 ))
             } else {
@@ -6145,6 +6173,8 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.frame,
                 is_direct,
                 source_used_homes,
+                source_meta,
+                source_pos,
             )
         };
         // The bridge cell hangs off `fail_descr.adr_jump_offset`, including
@@ -6414,7 +6444,8 @@ impl majit_backend::Backend for WasmBackend {
             });
         // Set by the inline block below to the owner of a merge candidate whose
         // merge waits on `INLINE_TRIP_THRESHOLD` entries into this bridge.
-        let mut defer_inline: Option<(Arc<JitCellToken>, u32, bool, Option<(u64, u32)>)> = None;
+        let mut defer_inline: Option<(Arc<JitCellToken>, u32, bool, Option<majit_ir::DescrRef>)> =
+            None;
         {
             // `model.py`: a bridge compiled after `invalidate_loop`
             // starts valid, and only a later invalidation activates its
@@ -6427,26 +6458,24 @@ impl majit_backend::Backend for WasmBackend {
             // By value: the id this compile will take, which the eager arm
             // below consumes before the last `decline` call is out of scope.
             let bridge_trace_id = self.trace_counter;
-            // `source_fail_index` is the SOURCE TRACE's own exit ordinal, and
-            // stays that everywhere else in this function: the dispatch cell
-            // is keyed by it, and the metainterp re-derives that key off the
-            // FailDescr. The region handed to the owner is the one thing that
-            // indexes the merged stream instead.
+            // Direct position in `fail_descrs`, or the merged-stream ordinal of
+            // the same descr once the parent region is attached. The stamp pair
+            // above is logs only.
             let merged_source_fail_index = if is_direct {
-                // The owner's own guards come first in the merged stream, so a
-                // direct guard's two numberings coincide.
-                Some(source_fail_index)
+                source_pos.map(|pos| pos as u32)
             } else {
-                original_token
-                    .compiled
-                    .get()
-                    .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
-                    .and_then(|loop_| {
-                        let inputs = loop_.reemit.borrow();
-                        inputs.as_ref().and_then(|inputs| {
-                            merged_region_fail_index(inputs, source_trace_id, source_fail_index)
+                source_meta.as_ref().and_then(|meta| {
+                    original_token
+                        .compiled
+                        .get()
+                        .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
+                        .and_then(|loop_| {
+                            let inputs = loop_.reemit.borrow();
+                            inputs
+                                .as_ref()
+                                .and_then(|inputs| merged_exit_index(inputs, meta))
                         })
-                    })
+                })
             };
             let decline = |reason: &str| {
                 record_inline_decline(format!(
@@ -6487,16 +6516,20 @@ impl majit_backend::Backend for WasmBackend {
                             .borrow()
                             .as_ref()
                             .is_some_and(|item| {
-                                item.same_owner(&owner) && item.region.trace_id == source_trace_id
+                                item.same_owner(&owner)
+                                    && source_meta.as_ref().is_some_and(|meta| {
+                                        item.region.ops.iter().any(|op| {
+                                            op.opcode.is_guard()
+                                                && op
+                                                    .getdescr()
+                                                    .as_ref()
+                                                    .is_some_and(|descr| Arc::ptr_eq(descr, meta))
+                                        })
+                                    })
                             })
                     });
-                    if parent_pending {
-                        defer_inline = Some((
-                            owner,
-                            0,
-                            !resumes_at_loop_header,
-                            Some((source_trace_id, source_fail_index)),
-                        ));
+                    if parent_pending && let Some(meta) = source_meta.clone() {
+                        defer_inline = Some((owner, 0, !resumes_at_loop_header, Some(meta)));
                     }
                 }
             } else if !bridge_is_loop_closing {
@@ -6514,8 +6547,9 @@ impl majit_backend::Backend for WasmBackend {
                 // outside the loop, and a body past the loop's `end` that only
                 // the entry dispatch re-enters — so the header question below
                 // is not asked of it.
-                let source_in_preamble =
-                    codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index);
+                let source_in_preamble = merged_source_fail_index.is_some_and(|idx| {
+                    codegen::source_guard_precedes_loop_label(&candidate.ops, idx)
+                });
                 if candidate
                     .inlined_bridges
                     .iter()
@@ -6700,12 +6734,11 @@ impl majit_backend::Backend for WasmBackend {
             }
         };
 
-        // The region carries the trace id of the bridge standing in for it, so
-        // a guard of this bridge that fails later resolves to its merged region
-        // (`merged_region_fail_index`) when the owner is finally rebuilt.
         // Built before the probe so a rejected module drops the slot with
         // these resources instead of publishing it (`push_resources` is only
-        // reached once the host has accepted the bridge).
+        // reached once the host has accepted the bridge). A later guard of
+        // this bridge resolves by descr identity (`merged_exit_index`) once
+        // the owner is rebuilt.
         let mut asm_resources = release::LoopAsmResources::default();
         asm_resources.exit_cells = Some(std::sync::Arc::clone(&self.exit_cells));
         let inline_trip = defer_inline.map(|(owner, merged_fail_index, outside_loop, remap)| {

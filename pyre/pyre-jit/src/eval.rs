@@ -8759,7 +8759,7 @@ fn run_compiled_generatorentry(
             }
             return Some(Ok(word as pyre_object::PyObjectRef));
         }
-        if fail_index == u32::MAX || !has_storage {
+        if !has_storage {
             if dbg {
                 eprintln!("[jd2] run_compiled no resume fail_index={fail_index}");
             }
@@ -9073,32 +9073,23 @@ fn drive_unpack_iterable_trace(
             // Extract owned copies so the `&mut meta` borrow held by the
             // `CompileResult` is released before the blackhole resume (which
             // re-acquires `driver_pair()`).
-            let Some((
-                is_finish,
-                is_exception_exit,
-                fail_index,
-                has_storage,
-                mut values,
-                descr_arc,
-                guard_exc,
-            )) = meta
-                .run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
-                .map(|r| {
-                    (
-                        r.is_finish,
-                        // Off the result: a finish exit carries no guard descr,
-                        // and the flag is this word.
-                        r.is_exit_frame_with_exception,
-                        r.fail_index,
-                        r.descr_arc
-                            .as_ref()
-                            .and_then(majit_metainterp::resume::get_resumestorage)
-                            .is_some(),
-                        majit_metainterp::raw_exit_values(&r.typed_values),
-                        r.descr_arc.clone(),
-                        r.exception.exc_value,
-                    )
-                })
+            let Some((is_finish, is_exception_exit, has_storage, mut values, descr_arc, guard_exc)) =
+                meta.run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
+                    .map(|r| {
+                        (
+                            r.is_finish,
+                            // Off the result: a finish exit carries no guard descr,
+                            // and the flag is this word.
+                            r.is_exit_frame_with_exception,
+                            r.descr_arc
+                                .as_ref()
+                                .and_then(majit_metainterp::resume::get_resumestorage)
+                                .is_some(),
+                            majit_metainterp::raw_exit_values(&r.typed_values),
+                            r.descr_arc.clone(),
+                            r.exception.exc_value,
+                        )
+                    })
             else {
                 // No compiled loop / backend refused — leave the rest to `ln`.
                 break;
@@ -9114,10 +9105,10 @@ fn drive_unpack_iterable_trace(
                 }
                 break;
             }
-            // A normal back-edge JUMP (`fail_index == u32::MAX`) or a guard exit
-            // that carries no resume storage cannot be blackhole-resumed; hand
-            // the rest to `ln` rather than panic in the resume decoder.
-            if fail_index == u32::MAX || !has_storage {
+            // A guard exit that carries no resume storage cannot be
+            // blackhole-resumed; hand the rest to `ln` rather than panic in
+            // the resume decoder.
+            if !has_storage {
                 break;
             }
             // A guard exit already carrying a non-StopIteration exception is

@@ -4295,6 +4295,18 @@ pub fn guard_exit_count(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     collect_guards_and_vars(inputargs, ops).0.len()
 }
 
+/// Each exit's `GuardExit.meta_descr` in `collect_guards_and_vars` order.
+pub(crate) fn guard_exit_descrs(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+) -> Vec<Option<majit_ir::DescrRef>> {
+    collect_guards_and_vars(inputargs, ops)
+        .0
+        .into_iter()
+        .map(|g| g.meta_descr)
+        .collect()
+}
+
 /// Dense wasm-local assignment and type lookup for each addressed SSA value.
 fn collect_value_types(
     inputargs: &[InputArgRc],

@@ -7650,12 +7650,25 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
 }
 
 /// Minimal `FailDescr` for driving `Backend::compile_bridge` from the host.
-/// `trace_id` defaults to 0, which is also a freshly compiled loop's, so the
-/// bridge reads as a direct guard of the source loop.
+/// Stamp the same Arc on the source guard so `compile_bridge` finds it by
+/// descr identity (`assemble_bridge`, `handle_guard_failure`).
 #[derive(Debug)]
 struct HostFailDescr {
     fail_index: u32,
     arg_types: Vec<Type>,
+}
+
+fn stamp_host_fail_descr(loop_ops: &[OpRc]) -> std::sync::Arc<HostFailDescr> {
+    let fail_descr = std::sync::Arc::new(HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    });
+    loop_ops
+        .iter()
+        .find(|op| op.opcode.is_guard())
+        .expect("owner loop has a source guard")
+        .setdescr(fail_descr.clone() as majit_ir::DescrRef);
+    fail_descr
 }
 
 impl majit_ir::Descr for HostFailDescr {}
@@ -7860,6 +7873,7 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
         );
     }
 
+    let fail_descr = stamp_host_fail_descr(&loop_ops);
     let owner = backend
         .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
         .unwrap_or_else(|_| panic!("case {case}: the owner loop compiles"));
@@ -7872,10 +7886,6 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
     }
     assert!(!token.is_invalidated(), "case {case}");
 
-    let fail_descr = HostFailDescr {
-        fail_index: 0,
-        arg_types: vec![Type::Int, Type::Int],
-    };
     let declines_before = majit_backend_wasm::bridge_diag(50);
     let deferred_before = majit_backend_wasm::bridge_diag(54);
     let trials_before = majit_backend_wasm::bridge_diag(37);
@@ -7883,8 +7893,12 @@ fn assert_valid_owner_defers_inline_trial(case: &str, preamble: bool, large_head
     // A merge is only considered once there is a callback to act on the
     // entry-count trip; the guest publishes the real one.
     majit_backend_wasm::set_inline_trip_helper_slot(1);
-    let compiled =
-        backend.compile_bridge(&fail_descr, &host_bridge_inputargs(), &bridge_ops, &token);
+    let compiled = backend.compile_bridge(
+        fail_descr.as_ref(),
+        &host_bridge_inputargs(),
+        &bridge_ops,
+        &token,
+    );
     majit_backend_wasm::set_inline_trip_helper_slot(0);
     compiled.unwrap_or_else(|_| panic!("case {case}: the loop-closing bridge compiles"));
 
@@ -7937,13 +7951,11 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
     clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
     token.set_compiled_loop_token(Some(clt));
     let label_descr = majit_ir::make_loop_target_descr(71, false);
+    let loop_ops = host_oversized_loop_ops(&label_descr);
+    let fail_descr = stamp_host_fail_descr(&loop_ops);
 
     let owner = backend
-        .compile_loop(
-            &host_loop_inputargs(),
-            &host_oversized_loop_ops(&label_descr),
-            &token,
-        )
+        .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
         .expect("the owner loop compiles");
     assert!(
         owner.code_size > 4096,
@@ -7951,17 +7963,13 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
         owner.code_size
     );
 
-    let fail_descr = HostFailDescr {
-        fail_index: 0,
-        arg_types: vec![Type::Int, Type::Int],
-    };
     let deferred_before = majit_backend_wasm::bridge_diag(54);
     let inline_ok_before = majit_backend_wasm::bridge_diag(32);
     let pending_before = majit_backend_wasm::pending_inline_count(&token);
     majit_backend_wasm::set_inline_trip_helper_slot(1);
     backend
         .compile_bridge(
-            &fail_descr,
+            fail_descr.as_ref(),
             &host_bridge_inputargs(),
             &host_gni_bridge_ops(&label_descr),
             &token,

@@ -159,7 +159,7 @@ use majit_ir::{
 use crate::blackhole::ExceptionState;
 use crate::compile;
 use crate::compile::make_jitcell_token;
-pub use crate::compile::{CompileResult, ExitRawValues, ExitValues, RawCompileResult};
+pub use crate::compile::{CompileResult, ExitRawValues, ExitValues};
 use crate::io_buffer;
 use crate::jitdriver::JitDriverStaticData;
 #[cfg(test)]
@@ -2964,10 +2964,12 @@ pub struct JitHooks {
     /// shape questions (`Jump` present? `GuardAlwaysFails` absent?) and the
     /// full `Op` carries a `ResumeGuardDescr` whose `Debug` is enormous.
     pub on_compile_loop: Option<Box<dyn Fn(u64, usize, usize, &[OpCode]) + Send>>,
-    /// Called when a bridge is compiled. Args: (green_key, fail_index, num_ops).
-    pub on_compile_bridge: Option<Box<dyn Fn(u64, u32, usize) + Send>>,
-    /// Called on guard failure. Args: (green_key, fail_index, fail_count).
-    pub on_guard_failure: Option<Box<dyn Fn(u64, u32, u32) + Send>>,
+    /// Called when a bridge is compiled. Args: (green_key, descr_id, num_ops).
+    /// Upstream `JitHookInterface.after_compile_bridge(debug_info)` receives
+    /// the fail descr.
+    pub on_compile_bridge: Option<Box<dyn Fn(u64, usize, usize) + Send>>,
+    /// Called on guard failure. Args: (green_key, descr_id, count).
+    pub on_guard_failure: Option<Box<dyn Fn(u64, usize, u32) + Send>>,
     /// Called when tracing starts. Args: (green_key).
     pub on_trace_start: Option<Box<dyn Fn(u64) + Send>>,
     /// Called when tracing is aborted. Args: (green_key, permanent).
@@ -4454,16 +4456,6 @@ impl<M: Clone> MetaInterp<M> {
         io_buffer::io_buffer_commit();
     }
 
-    #[inline]
-    fn is_jump_exit(is_finish: bool, fail_index: u32) -> bool {
-        !is_finish && fail_index == u32::MAX
-    }
-
-    #[inline]
-    fn should_record_guard_failure(is_finish: bool, fail_index: u32) -> bool {
-        !is_finish && !Self::is_jump_exit(is_finish, fail_index)
-    }
-
     /// `back_edge_poll` splits the total: a failing eval-breaker poll left
     /// machine code because the collector asked for a safepoint, not because
     /// the compiled code assumed something that turned out false. Only the
@@ -4472,28 +4464,22 @@ impl<M: Clone> MetaInterp<M> {
     /// attribution still apply to the poll.
     #[inline]
     ///
-    /// `trace_id` names the trace the failing descr belongs to, and it is not
-    /// redundant with `fail_index`: an index is allocated per trace, so a
-    /// bridge's own guards re-use the numbers of the loop they hang off.
-    /// Without it an event log cannot say whether a coordinate that keeps
-    /// arriving is the ORIGINAL guard — which `send_bridge_to_backend` should
-    /// have patched away once a bridge attached (`compile.py`) — or a fresh
-    /// guard inside each new bridge.  `MAX_TRACE_ABORT_COUNT` records the
-    /// measurement that made the distinction load-bearing.
+    /// The descr identity distinguishes the original guard from each new
+    /// bridge's guards.
     pub(crate) fn record_guard_failure_event(
         &mut self,
         green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
+        descr: &dyn majit_ir::FailDescr,
         back_edge_poll: bool,
     ) {
+        let descr_id = descr as *const dyn majit_ir::FailDescr as *const () as usize;
         if guardlog_enabled() {
-            eprintln!("@@@GUARD key={green_key} tid={trace_id} fail={fail_index}");
+            eprintln!("@@@GUARD key={green_key} descr=0x{descr_id:x}");
         }
         if crate::majit_log_enabled() {
             eprintln!(
-                "[jit] guard failure at key={}, tid={}, guard={}",
-                green_key, trace_id, fail_index
+                "[jit] guard failure at key={}, descr=0x{:x}",
+                green_key, descr_id
             );
         }
         let tally = if back_edge_poll {
@@ -4502,12 +4488,12 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.stats.guard_failures
         };
         *tally += 1;
-        crate::guard_census_record(green_key, trace_id, fail_index);
+        crate::guard_census_record(green_key, descr_id);
         // logger.py has no per-fail IndexMap; jitprof.py counts
         // Counters.OPS / ABORT_* as integers. The integer
         // `stats.guard_failures` tally above is the port of that.
         if let Some(ref hook) = self.hooks.on_guard_failure {
-            hook(green_key, fail_index, 0);
+            hook(green_key, descr_id, 0);
         }
     }
 
@@ -4528,15 +4514,6 @@ impl<M: Clone> MetaInterp<M> {
     /// rationale as `count_ops` above.
     pub fn count(&self, kind: i32, inc: usize) {
         self.staticdata.profiler.count(kind, inc);
-    }
-
-    #[inline]
-    fn run_result_for_jump_exit(
-        fail_index: u32,
-        values: Vec<i64>,
-        savedata: Option<GcRef>,
-    ) -> Option<RunResult> {
-        (fail_index == u32::MAX).then_some(RunResult::Jump { values, savedata })
     }
 
     fn alloc_trace_id(&mut self) -> u64 {
@@ -6483,12 +6460,14 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Set a callback for bridge compilation events.
-    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, u32, usize) + Send + 'static) {
+    /// `f` receives `(green_key, descr_id, num_ops)`.
+    pub fn set_on_compile_bridge(&mut self, f: impl Fn(u64, usize, usize) + Send + 'static) {
         self.hooks.on_compile_bridge = Some(Box::new(f));
     }
 
     /// Set a callback for guard failure events.
-    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, u32, u32) + Send + 'static) {
+    /// `f` receives `(green_key, descr_id, count)`.
+    pub fn set_on_guard_failure(&mut self, f: impl Fn(u64, usize, u32) + Send + 'static) {
         self.hooks.on_guard_failure = Some(Box::new(f));
     }
 
@@ -7514,7 +7493,7 @@ impl<M: Clone> MetaInterp<M> {
         };
         // recursive-call concrete recursive-callee execution: run the compiled loop
         // through the JITFRAME-ABI `execute_token_raw` and decode the int
-        // FINISH output (mirrors `run_compiled_raw_detailed_with_values`).
+        // FINISH output.
         let executing_tokens = &*self.executing_tokens;
         let memory_manager = &self.memory_manager;
         // Registers the callee's token like `enter_execute` (`warmstate.py execute_assembler` keeps `loop_token` live through `func_execute_token`).
@@ -11888,7 +11867,11 @@ impl<M: Clone> MetaInterp<M> {
                 self.staticdata.log_bridge_compile(fail_index);
                 self.stats.bridges_compiled += 1;
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
-                    hook(green_key, fail_index, num_combined_ops);
+                    hook(
+                        green_key,
+                        majit_ir::descr_identity(&bridge.source_descr),
+                        num_combined_ops,
+                    );
                 }
                 true
             }
@@ -13404,95 +13387,6 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing.as_ref().map(|ctx| ctx.green_key)
     }
 
-    /// Typed-input raw fast-path runner.  Avoids explicit deadframe decoding
-    /// in the caller while preserving typed exits, savedata, and exception
-    /// state. Slot types and resume storage come off the descr the deadframe
-    /// named (`compile.py ResumeGuardDescr.get_resumestorage` returns self).
-    pub fn run_compiled_raw_detailed_with_values(
-        &mut self,
-        green_key: u64,
-        live_values: &[Value],
-    ) -> Option<RawCompileResult> {
-        // `warmstate.py` `maybe_compile_and_run` reads
-        // `procedure_token = cell.get_procedure_token()` and enters on THAT:
-        // execution must use the cell's current, invalidation-filtered token.
-        // Executing a predecessor re-enters invalidated machine code and
-        // repeatedly fails GUARD_NOT_INVALIDATED.
-        // warmstate.py maybe_compile_and_run: production portal entry is
-        // driver 0, not leftover active_jitdriver_sd.
-        let token = self.get_procedure_token_on_driver(0, green_key)?;
-
-        Self::prepare_compiled_run_io();
-        self.enter_execute(&token);
-        let result = self.backend.execute_token_raw(&token, live_values);
-        self.leave_execute(&token);
-        Self::finish_compiled_run_io();
-
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
-
-        // `compile.py AbstractResumeGuardDescr.handle_fail` reads `self`.
-        // Slot types are `descr.fail_arg_types()`; resume storage is the
-        // descr (`ResumeGuardDescr.get_resumestorage`).
-        let descr_is_finish = result
-            .descr_arc
-            .as_fail_descr()
-            .is_some_and(|fd| fd.is_finish());
-        let effective_is_finish = result.is_finish || descr_is_finish;
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit] run_compiled_exit: gk={} fi={} tid={} result.finish={} descr.finish={} effective={}",
-                green_key,
-                fail_index,
-                trace_id,
-                result.is_finish,
-                descr_is_finish,
-                effective_is_finish
-            );
-        }
-
-        if Self::should_record_guard_failure(effective_is_finish, fail_index) {
-            let back_edge_poll = result
-                .descr_arc
-                .as_fail_descr()
-                .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
-        }
-        // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
-        let exc_class = if result.exception_value.is_null() {
-            0
-        } else {
-            // `typeptr` is one machine word at offset 0, so read it at
-            // pointer width: an i64 read on a 32-bit target would pull the
-            // adjacent header word into the high half and the class value
-            // would never compare equal to a pointer-width one
-            // (`Cpu::bh_classof`, `jit_exc_raise`).
-            unsafe { *(result.exception_value.0 as *const usize) as i64 }
-        };
-        let exception = ExceptionState {
-            exc_class,
-            exc_value: result.exception_value.0 as i64,
-            ovf_flag: false,
-        };
-        let descr_arc = result.descr_arc.clone();
-
-        Some(RawCompileResult {
-            // The backend already owns these as heap vectors, so the inline
-            // spelling adopts the buffers rather than re-decoding into them.
-            values: ExitRawValues::from_vec(result.outputs),
-            typed_values: ExitValues::from_vec(result.typed_outputs),
-            fail_index,
-            trace_id,
-            descr_arc,
-            is_finish: effective_is_finish,
-            is_exit_frame_with_exception: result.is_exit_frame_with_exception,
-            savedata: result.savedata,
-            exception,
-            status: result.status,
-            guard_value_operand: result.guard_value_operand,
-        })
-    }
-
     /// Run compiled code and return detailed guard failure information.
     ///
     /// Unlike `run_compiled`, this returns the full `CompileResult` including
@@ -13530,8 +13424,7 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
-        // `compile.py` `PropagateExceptionDescr.handle_fail`, before the
-        // `fail_index == u32::MAX` back-edge reading below.
+        // `compile.py` `PropagateExceptionDescr.handle_fail`.
         if let Some(exc) = majit_backend::propagate_exception_handle_fail(descr, {
             let grabbed = self.backend.grab_exc_value(&frame);
             grabbed.0 as i64
@@ -13564,11 +13457,10 @@ impl<M: Clone> MetaInterp<M> {
         let rd_loop_token = majit_backend::descr_owning_green_key(descr);
         Self::finish_compiled_run_io();
 
-        if Self::should_record_guard_failure(is_finish, fail_index) {
-            let back_edge_poll = descr_arc
-                .as_fail_descr()
-                .is_some_and(|fd| fd.is_back_edge_poll());
-            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
+        if !is_finish {
+            if let Some(fd) = descr_arc.as_fail_descr() {
+                self.record_guard_failure_event(green_key, fd, fd.is_back_edge_poll());
+            }
         }
 
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
@@ -13670,9 +13562,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> CompileResult {
         let mut result =
             self.execute_assembler_at_dispatch_key(token, green_key, live_values, dispatch_key);
-        if let Some(descr_arc) = &result.descr_arc
-            && !Self::is_jump_exit(result.is_finish, result.fail_index)
-        {
+        if let Some(descr_arc) = &result.descr_arc {
             // `execute_assembler_at_dispatch_key` decodes no values on a guard
             // exit; this runner's callers hand a dense list to
             // `resume_in_blackhole`, so read the fail-arg slots off the
@@ -13705,9 +13595,9 @@ impl<M: Clone> MetaInterp<M> {
             .map(|slot| self.backend.get_value_direct(frame, slot))
     }
 
-    /// `compile.py _DoneWithThisFrameDescr.get_result` and the JUMP arm's
-    /// `restore_values` read: decode a returned frame's exit slots into the
-    /// typed list those two arms consume.
+    /// `compile.py _DoneWithThisFrameDescr.get_result` read: decode a
+    /// returned frame's exit slots into the typed list the finish arm
+    /// consumes.
     ///
     /// A guard-failure does not call this. `compile.py ResumeGuardDescr.handle_fail`
     /// leaves the values in the deadframe; `resume.py ResumeDataDirectReader.decode_int`
@@ -13853,7 +13743,7 @@ impl<M: Clone> MetaInterp<M> {
         // the descr straight off the deadframe, and for a DoneWithThisFrame it
         // goes to `fail_descr.get_result(cpu, deadframe)` without building any
         // per-exit description; only the general `handle_fail` case needs one.
-        // Finish and JUMP decode on their own arms. A guard-failure leaves
+        // Finish decodes on its own arm. A guard-failure leaves
         // the slots in the deadframe: `compile.py ResumeGuardDescr.handle_fail`
         // does not copy them out.
         // The deadframe decode, amplified. It READS the frame the run returned
@@ -13892,10 +13782,8 @@ impl<M: Clone> MetaInterp<M> {
         // final descr resumes nothing, is counted by nothing, and owns no
         // resume data, so every one of those is gathered and dropped unread.
         //
-        // `compile.py` `PropagateExceptionDescr.handle_fail`, before any
-        // back-edge test. `fail_index` is `u32::MAX` and `is_finish` is
-        // false, which is also how a loop-carried JUMP is spelled; the class
-        // check is what keeps this exit out of that arm.
+        // The class check routes this exit to
+        // `compile.py` `PropagateExceptionDescr.handle_fail`.
         if descr
             .as_any()
             .is_some_and(|any| any.is::<majit_backend::PropagateExceptionDescr>())
@@ -13962,7 +13850,6 @@ impl<M: Clone> MetaInterp<M> {
         let descr: &dyn majit_ir::FailDescr = descr_arc
             .as_fail_descr()
             .expect("get_latest_descr_arc returned a non-FailDescr Descr");
-        let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         let back_edge_poll = descr.is_back_edge_poll();
@@ -13973,35 +13860,19 @@ impl<M: Clone> MetaInterp<M> {
         // `GUARD_NOT_FORCED`. Other guards leave those cells NULL.
         let is_guard_forced = descr.is_guard_forced();
         let grab_pending_exc = descr.is_guard_exc() || is_guard_forced;
-        // A plain loop back-edge carries neither a guard nor a resume point.
-        // `warmstate.py execute_assembler` never builds a description for one:
-        // the JUMP has already re-entered the loop's own LABEL, and what comes
-        // back out is the loop-carried state, not a failure to recover from.
-        let is_jump_exit = Self::is_jump_exit(is_finish, fail_index);
-        // JUMP still hands typed values to `state.restore_values`. A
-        // guard-failure does not: `resume.py ResumeDataDirectReader.decode_int`
-        // reads named slots off the deadframe.
-        let typed_values = if is_jump_exit {
-            Self::decode_exit_slots(&self.backend, &frame, exit_types)
-        } else {
-            ExitValues::new()
-        };
+        // A guard-failure does not copy fail-args out:
+        // `resume.py ResumeDataDirectReader.decode_int` reads named slots
+        // off the deadframe.
+        let typed_values = ExitValues::new();
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
-        // Only `descr_owning_green_key` and the `must_compile` identity read
-        // it, and a JUMP exit reaches neither, so the owning-key resolution
-        // is not paid on the back edge.
-        let rd_loop_token = if is_jump_exit {
-            None
-        } else {
-            majit_backend::descr_owning_green_key(descr)
-        };
+        let rd_loop_token = majit_backend::descr_owning_green_key(descr);
         Self::finish_compiled_run_io();
 
         // RPython: guard failure counter tick and bridge compilation happen
         // in handle_fail → must_compile (compile.py).
         // must_compile handles tick.
-        if Self::should_record_guard_failure(is_finish, fail_index) {
-            self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
+        if let Some(fd) = descr_arc.as_fail_descr() {
+            self.record_guard_failure_event(green_key, fd, back_edge_poll);
         }
 
         // The guard arm in `jitdriver` reads the descr, as
@@ -16438,7 +16309,11 @@ impl<M: Clone> MetaInterp<M> {
                 // (x86/runner.py, model.py:309-314 parity).  allow-line-citation
 
                 if let Some(ref hook) = self.hooks.on_compile_bridge {
-                    hook(green_key, fail_index, num_optimized_ops);
+                    hook(
+                        green_key,
+                        majit_ir::descr_identity(fail_descr_arc),
+                        num_optimized_ops,
+                    );
                 }
                 true
             }
@@ -17133,71 +17008,6 @@ impl<M: Clone> MetaInterp<M> {
             }
             PrepareResumeFromFailure::Continue => self.interpret(sym, portal_pc),
         }
-    }
-
-    /// Assemble a `GuardRecovery` from a compiled-run guard failure:
-    /// fail values, optional typed values, backend savedata, and exception state.
-    pub fn recover_guard_state(
-        &mut self,
-        trace_id: u64,
-        fail_index: u32,
-        fail_values: &[i64],
-        typed_fail_values: Option<&[Value]>,
-        savedata: Option<GcRef>,
-        exception: ExceptionState,
-    ) -> Option<GuardRecovery> {
-        Some(GuardRecovery {
-            trace_id,
-            fail_index,
-            fail_values: fail_values.to_vec(),
-            typed_fail_values: typed_fail_values.map(|values| values.to_vec()),
-            savedata,
-            exception,
-        })
-    }
-
-    /// Run compiled code and handle guard failures automatically.
-    ///
-    /// This is a convenience wrapper around `run_compiled_detailed` +
-    /// `handle_guard_failure`.
-    pub fn run_and_recover(&mut self, green_key: u64, live_values: &[i64]) -> Option<RunResult> {
-        let result = self.run_compiled_detailed(green_key, live_values)?;
-        let fail_index = result.fail_index;
-        let trace_id = result.trace_id;
-        let is_finish = result.is_finish;
-        let values = crate::compile::raw_exit_values(&result.typed_values).into_vec();
-        let typed_values = result.typed_values.clone();
-        let savedata = result.savedata;
-        let exception = result.exception.clone();
-
-        if is_finish {
-            // Normal finish (not a guard failure)
-            return Some(RunResult::Finished { values, savedata });
-        }
-
-        if let Some(jump) = Self::run_result_for_jump_exit(fail_index, values.clone(), savedata) {
-            return Some(jump);
-        }
-
-        // Guard failure — recover. The detailed run always carries that descr
-        // on a guard exit (`cpu.get_latest_descr`).
-        result.descr_arc.as_ref()?;
-        let recovery = self.recover_guard_state(
-            trace_id,
-            fail_index,
-            &values,
-            Some(&typed_values),
-            savedata,
-            exception,
-        );
-
-        Some(RunResult::GuardFailure {
-            values,
-            trace_id,
-            fail_index,
-            savedata,
-            recovery,
-        })
     }
 
     /// Start retracing from a guard failure point.
@@ -21163,46 +20973,6 @@ impl<M: Clone> MetaInterp<M> {
 /// Default maximum inlining depth during tracing.
 /// Configurable via WarmEnterState::set_max_inline_depth().
 const MAX_INLINE_DEPTH: usize = 10;
-
-/// Describes the recovery state after a guard failure.
-#[derive(Debug, Clone)]
-pub struct GuardRecovery {
-    /// Compiled trace identifier for the failing exit.
-    pub trace_id: u64,
-    /// Index of the failed guard.
-    pub fail_index: u32,
-    /// Raw fail_values from the DeadFrame.
-    pub fail_values: Vec<i64>,
-    /// Typed fail values decoded from the backend deadframe, when available.
-    pub typed_fail_values: Option<Vec<Value>>,
-    /// Optional saved-data GC ref captured from the failing exit.
-    pub savedata: Option<GcRef>,
-    /// Pending exception state captured from the failing deadframe.
-    pub exception: ExceptionState,
-}
-
-/// Result of running compiled code with automatic recovery.
-#[derive(Debug, Clone)]
-pub enum RunResult {
-    /// The loop finished normally.
-    Finished {
-        values: Vec<i64>,
-        savedata: Option<GcRef>,
-    },
-    /// The trace exited via a normal back-edge jump.
-    Jump {
-        values: Vec<i64>,
-        savedata: Option<GcRef>,
-    },
-    /// A guard failed.
-    GuardFailure {
-        values: Vec<i64>,
-        trace_id: u64,
-        fail_index: u32,
-        savedata: Option<GcRef>,
-        recovery: Option<GuardRecovery>,
-    },
-}
 
 pub enum DetailedDriverRunOutcome {
     Finished {
@@ -34961,7 +34731,7 @@ mod tests {
         // when a bridge is compiled.
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let bridge_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         meta.set_on_compile_bridge(move |gk, fi, nops| {
             ev.lock().push((gk, fi, nops));
@@ -35014,7 +34784,7 @@ mod tests {
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.
         if let Some(ref hook) = meta.hooks.on_compile_bridge {
-            hook(green_key.get_uhash(), 3, 5);
+            hook(green_key.get_uhash(), 3usize, 5);
         }
         let events = bridge_events.lock();
         assert_eq!(events.len(), 1);
@@ -35028,7 +34798,7 @@ mod tests {
         // Parity with test_get_stats: guard failure hook fires with correct args.
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let failure_events: Arc<Mutex<Vec<(u64, u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let failure_events: Arc<Mutex<Vec<(u64, usize, u32)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = failure_events.clone();
         meta.set_on_guard_failure(move |gk, fi, fc| {
             ev.lock().push((gk, fi, fc));
@@ -35036,40 +34806,15 @@ mod tests {
 
         // Verify the hook is correctly installed and callable
         if let Some(ref hook) = meta.hooks.on_guard_failure {
-            hook(42, 3, 1);
-            hook(42, 3, 2);
-            hook(42, 5, 1);
+            hook(42, 3usize, 1);
+            hook(42, 3usize, 2);
+            hook(42, 5usize, 1);
         }
         let events = failure_events.lock();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0], (42, 3, 1));
         assert_eq!(events[1], (42, 3, 2));
         assert_eq!(events[2], (42, 5, 1));
-    }
-
-    #[test]
-    fn test_should_record_guard_failure_skips_jump_exit() {
-        assert!(!MetaInterp::<()>::should_record_guard_failure(
-            false,
-            u32::MAX
-        ));
-        assert!(MetaInterp::<()>::should_record_guard_failure(false, 7));
-        assert!(!MetaInterp::<()>::should_record_guard_failure(true, 7));
-    }
-
-    #[test]
-    fn test_run_result_for_jump_exit_returns_jump() {
-        let result = MetaInterp::<()>::run_result_for_jump_exit(u32::MAX, vec![42], None)
-            .expect("jump exit should produce a direct Jump result");
-        match result {
-            RunResult::Jump { values, .. } => assert_eq!(values, vec![42]),
-            other => panic!("expected Jump result, got {other:?}"),
-        }
-
-        assert!(
-            MetaInterp::<()>::run_result_for_jump_exit(3, vec![42], None).is_none(),
-            "guard failure exits must keep using recovery paths"
-        );
     }
 
     #[test]
