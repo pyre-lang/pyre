@@ -82,10 +82,12 @@ impl EciInput {
     }
 }
 
-/// The `llexternal!` tokens `compile_crate_ecis` reads: attributes (discarded),
+/// The `llexternal!` tokens `compile_crate_ecis` reads: outer attributes,
 /// visibility, name, c_name, argument types, result type, then `key = expr`
-/// pairs. Only `macro` and `compilation_info` are kept.
+/// pairs. Only `macro` and `compilation_info` are kept; `attrs` is the outer
+/// attribute list so a `cfg` on the declaration can skip it.
 pub struct LlexternalHead {
+    pub attrs: Vec<Attribute>,
     pub name: Ident,
     pub c_name: String,
     pub args: Vec<Type>,
@@ -96,7 +98,7 @@ pub struct LlexternalHead {
 
 impl Parse for LlexternalHead {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let _attrs = input.call(Attribute::parse_outer)?;
+        let attrs = input.call(Attribute::parse_outer)?;
         let _vis: Visibility = input.parse()?;
         let name: Ident = input.parse()?;
         input.parse::<Token![=]>()?;
@@ -129,6 +131,7 @@ impl Parse for LlexternalHead {
             return Err(input.error("unexpected tokens after llexternal arguments"));
         }
         Ok(LlexternalHead {
+            attrs,
             name,
             c_name: c_name.value(),
             args: args.into_iter().collect(),

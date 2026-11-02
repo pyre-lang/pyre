@@ -2,7 +2,9 @@
 
 use syn::Type;
 
-/// Struct tags `gettype` spells as `struct <name>`.
+/// Struct tags `gettype` spells as `struct <name>`. libc's Rust types
+/// carry no `c_name`/typedef hint, so this table stands in for the `Struct`
+/// hints `database.py gettype` reads.
 const STRUCT_TAGS: &[&str] = &[
     "stat",
     "dirent",
@@ -36,11 +38,19 @@ pub fn cdecl(ctype: &str, cname: &str) -> String {
         .to_string()
 }
 
+/// A path `gettype` resolved in the crate: an alias to expand, a path into
+/// another crate, or a crate-local struct.
+pub enum Resolved {
+    Alias(syn::Type, Vec<String>),
+    Extern(Vec<String>),
+    LocalStruct(String),
+}
+
 /// `LowLevelDatabase.gettype` type template for `ty`. `@` marks the declarator.
 pub fn gettype(
     ty: &syn::Type,
     module_path: &[String],
-    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<(syn::Type, Vec<String>)>,
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
 ) -> Result<String, String> {
     match ty {
         Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("void @".into()),
@@ -84,25 +94,47 @@ pub fn gettype(
                 return gettype(inner, module_path, resolve);
             }
             let segments = &type_path.path.segments;
-            let Some(first) = segments.first() else {
-                return Err(format!(
-                    "unsupported type for generate_macro_wrapper: {}",
+            if segments.len() == 1 {
+                let name = segments[0].ident.to_string();
+                if matches!(
+                    name.as_str(),
+                    "i8" | "u8"
+                        | "i16"
+                        | "u16"
+                        | "i32"
+                        | "u32"
+                        | "i64"
+                        | "u64"
+                        | "isize"
+                        | "usize"
+                        | "f32"
+                        | "f64"
+                ) {
+                    return Ok(format!("{} @", last_segment_c_type(&name)));
+                }
+            }
+            match resolve(&type_path.path, module_path) {
+                Some(Resolved::Alias(target, alias_module)) => {
+                    gettype(&target, &alias_module, resolve)
+                }
+                Some(Resolved::Extern(p)) => match p.last() {
+                    Some(last) => Ok(format!("{} @", last_segment_c_type(last))),
+                    None => Err(format!(
+                        "cannot resolve type `{}` for generate_macro_wrapper",
+                        tokens(ty)
+                    )),
+                },
+                Some(Resolved::LocalStruct(n)) => {
+                    // `database.py gettype` spells an `lltype.Struct` as
+                    // `struct <c_name>` unless it has a `typedef` hint; a crate
+                    // `#[repr(C)]` struct is such a struct.
+                    Ok(format!("struct {n} @"))
+                }
+                None => Err(format!(
+                    "cannot resolve type `{}` for generate_macro_wrapper",
                     tokens(ty)
-                ));
-            };
-            let last = segments
-                .last()
-                .expect("path has a first segment")
-                .ident
-                .to_string();
-            let first = first.ident.to_string();
-            if matches!(first.as_str(), "libc" | "std" | "core" | "ffi") {
-                return Ok(format!("{} @", last_segment_c_type(&last)));
+                )),
             }
-            if let Some((target, alias_module)) = resolve(&type_path.path, module_path) {
-                return gettype(&target, &alias_module, resolve);
-            }
-            Ok(format!("{} @", last_segment_c_type(&last)))
         }
         Type::Paren(paren) => gettype(&paren.elem, module_path, resolve),
         Type::Group(group) => gettype(&group.elem, module_path, resolve),

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
-use syn::{Attribute, Expr, Item, Lit, Meta, Token};
+use syn::{Attribute, Expr, Item, Lit, Meta, Token, UseTree};
 
 use crate::ExternalCompilationInfo;
 use crate::parse::{EciInput, LlexternalHead};
@@ -49,7 +49,13 @@ pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), c
         build.file(&path);
     }
     for dir in &e.include_dirs {
-        build.include(resolve_against(&manifest, dir));
+        let path = resolve_against(&manifest, dir);
+        // genc's Makefile makes each object depend on the headers it includes;
+        // Cargo reruns this script when a file under a package include dir changes.
+        if path.starts_with(&manifest) && path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        build.include(&path);
     }
     build.include(cdir());
     for flag in &e.compile_extra {
@@ -57,20 +63,6 @@ pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), c
     }
     build.warnings(false);
     build.try_compile(libname)?;
-    if e.use_cpp_linker {
-        // genc links with `g++` when `use_cpp_linker` (`posix.py` `CC_LINK`); rustc
-        // drives the link here, so add the C++ runtime `g++` links.
-        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-        if env != "msvc" {
-            let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-            let runtime = if matches!(os.as_str(), "macos" | "ios" | "freebsd" | "openbsd") {
-                "c++"
-            } else {
-                "stdc++"
-            };
-            println!("cargo:rustc-link-lib={runtime}");
-        }
-    }
     Ok(())
 }
 
@@ -97,14 +89,52 @@ fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
     }
     for file in &eci.link_files {
         let path = Path::new(file);
-        if let Some(parent) = path.parent() {
-            println!("cargo:rustc-link-search=native={}", parent.display());
-        }
-        if let Some(name) = path.file_name() {
-            println!(
-                "cargo:rustc-link-lib=static:+verbatim={}",
-                name.to_string_lossy()
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext == "a" || ext == "lib" {
+            if let Some(parent) = path.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+            if let Some(name) = path.file_name() {
+                println!(
+                    "cargo:rustc-link-lib=static:+verbatim={}",
+                    name.to_string_lossy()
+                );
+            }
+        } else {
+            // `_linkfiles` hands object files to the linker directly; Cargo links
+            // only libraries, so the object is archived first.
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
+            let name = format!(
+                "eci_linkfile_{}",
+                stem.chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>()
             );
+            cc::Build::new()
+                .object(path)
+                .cargo_warnings(false)
+                .try_compile(&name)
+                .unwrap_or_else(|err| panic!("{file}: {err}"));
+        }
+    }
+    if eci.use_cpp_linker {
+        // genc links with `g++` when `use_cpp_linker` (`posix.py` `CC_LINK`); rustc
+        // drives the link here, so add the C++ runtime `g++` links.
+        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if env != "msvc" {
+            let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+            let runtime = if matches!(os.as_str(), "macos" | "ios" | "freebsd" | "openbsd") {
+                "c++"
+            } else {
+                "stdc++"
+            };
+            println!("cargo:rustc-link-lib={runtime}");
         }
     }
 }
@@ -130,6 +160,7 @@ pub fn compile_crate_ecis(extra: &ExternalCompilationInfo) {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let lib = manifest.join("src/lib.rs");
     let mut collected = CrateItems::default();
+    collected.modules.push(Vec::new());
     let submodule_dir = submodule_dir_for_file(&lib);
     walk_file(&lib, &submodule_dir, &[], &mut collected);
     merge_macro_wrappers(&mut collected);
@@ -163,11 +194,31 @@ struct CollectedLlexternal {
     head: LlexternalHead,
 }
 
+struct CollectedUse {
+    module_path: Vec<String>,
+    binding: Option<String>,
+    target: Vec<String>,
+    leading_colon: bool,
+}
+
+enum Target {
+    Local(Vec<String>, String),
+    Extern(Vec<String>),
+}
+
+enum ModuleTarget {
+    Local(Vec<String>),
+    Extern(Vec<String>),
+}
+
 #[derive(Default)]
 struct CrateItems {
     ecis: Vec<CollectedEci>,
     aliases: Vec<CollectedAlias>,
     llexternals: Vec<CollectedLlexternal>,
+    uses: Vec<CollectedUse>,
+    modules: Vec<Vec<String>>,
+    structs: Vec<(Vec<String>, String)>,
 }
 
 /// `rffi.py generate_macro_wrapper`: merge each `macro` llexternal's C
@@ -189,16 +240,28 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
         };
         let source = {
             let resolve =
-                |path: &syn::Path, module_path: &[String]| -> Option<(syn::Type, Vec<String>)> {
-                    let idx = resolve_index(
-                        &collected.aliases,
-                        path,
-                        module_path,
-                        |alias| alias.name.as_str(),
-                        |alias| alias.module_path.as_slice(),
-                    )?;
-                    let alias = &collected.aliases[idx];
-                    Some((alias.ty.clone(), alias.module_path.clone()))
+                |path: &syn::Path, module_path: &[String]| -> Option<crate::cdecl::Resolved> {
+                    match resolve_path(collected, path, module_path, 0) {
+                        Some(Target::Local(m, n)) => {
+                            if let Some(alias) = collected
+                                .aliases
+                                .iter()
+                                .find(|a| a.module_path == m && a.name == n)
+                            {
+                                Some(crate::cdecl::Resolved::Alias(alias.ty.clone(), m))
+                            } else if collected
+                                .structs
+                                .iter()
+                                .any(|(tm, tn)| *tm == m && *tn == n)
+                            {
+                                Some(crate::cdecl::Resolved::LocalStruct(n))
+                            } else {
+                                None
+                            }
+                        }
+                        Some(Target::Extern(p)) => Some(crate::cdecl::Resolved::Extern(p)),
+                        None => None,
+                    }
                 };
             let args: Vec<String> = item
                 .head
@@ -237,14 +300,36 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                         item.head.name
                     );
                 };
-                match resolve_index(
-                    &collected.ecis,
-                    path,
-                    &item.module_path,
-                    |eci| eci.name.as_str(),
-                    |eci| eci.module_path.as_slice(),
-                ) {
-                    Some(idx) => idx,
+                match resolve_path(collected, path, &item.module_path, 0) {
+                    Some(Target::Local(m, n)) => {
+                        match collected
+                            .ecis
+                            .iter()
+                            .position(|eci| eci.module_path == m && eci.name == n)
+                        {
+                            Some(idx) => idx,
+                            None => {
+                                let eci_name = path
+                                    .segments
+                                    .last()
+                                    .map(|seg| seg.ident.to_string())
+                                    .unwrap_or_default();
+                                panic!(
+                                    "{}: llexternal `{}`: compilation_info `{eci_name}` not found",
+                                    item.file_path.display(),
+                                    item.head.name
+                                )
+                            }
+                        }
+                    }
+                    Some(Target::Extern(_)) => {
+                        panic!(
+                            "{}: llexternal `{}`: compilation_info `{}` is outside this crate",
+                            item.file_path.display(),
+                            item.head.name,
+                            path_text(path)
+                        )
+                    }
                     None => {
                         let eci_name = path
                             .segments
@@ -291,76 +376,255 @@ fn expr_as_path(expr: &Expr) -> Option<&syn::Path> {
     }
 }
 
-fn candidate_modules(path: &syn::Path, module_path: &[String]) -> Vec<Vec<String>> {
-    let n = path.segments.len();
-    if n == 0 {
-        return vec![module_path.to_vec()];
+fn path_text(path: &syn::Path) -> String {
+    let mut s = String::new();
+    if path.leading_colon.is_some() {
+        s.push_str("::");
     }
-    let prefix: Vec<String> = path
+    for (i, seg) in path.segments.iter().enumerate() {
+        if i > 0 {
+            s.push_str("::");
+        }
+        s.push_str(&unraw_ident(&seg.ident));
+    }
+    s
+}
+
+fn is_module(collected: &CrateItems, path: &[String]) -> bool {
+    collected.modules.iter().any(|m| m.as_slice() == path)
+}
+
+fn defines_name(collected: &CrateItems, module: &[String], name: &str) -> bool {
+    collected
+        .ecis
+        .iter()
+        .any(|e| e.module_path.as_slice() == module && e.name == name)
+        || collected
+            .aliases
+            .iter()
+            .any(|a| a.module_path.as_slice() == module && a.name == name)
+        || collected
+            .structs
+            .iter()
+            .any(|(m, n)| m.as_slice() == module && n == name)
+}
+
+fn find_binding_use(
+    collected: &CrateItems,
+    module: &[String],
+    name: &str,
+    skip: Option<usize>,
+) -> Option<usize> {
+    collected.uses.iter().enumerate().position(|(i, u)| {
+        skip != Some(i) && u.module_path.as_slice() == module && u.binding.as_deref() == Some(name)
+    })
+}
+
+fn resolve_path(
+    collected: &CrateItems,
+    path: &syn::Path,
+    module: &[String],
+    depth: usize,
+) -> Option<Target> {
+    let segs: Vec<String> = path
         .segments
         .iter()
-        .take(n - 1)
-        .map(|seg| unraw_ident(&seg.ident))
+        .map(|s| unraw_ident(&s.ident))
         .collect();
-    if prefix.is_empty() {
-        return vec![module_path.to_vec()];
+    resolve_segs(
+        collected,
+        &segs,
+        path.leading_colon.is_some(),
+        module,
+        depth,
+        None,
+    )
+}
+
+fn resolve_use_target(collected: &CrateItems, use_idx: usize, depth: usize) -> Option<Target> {
+    let u = &collected.uses[use_idx];
+    let segs = u.target.clone();
+    let leading = u.leading_colon;
+    let module = u.module_path.clone();
+    resolve_segs(collected, &segs, leading, &module, depth, Some(use_idx))
+}
+
+fn resolve_segs(
+    collected: &CrateItems,
+    segs: &[String],
+    leading_colon: bool,
+    module: &[String],
+    depth: usize,
+    skip_use: Option<usize>,
+) -> Option<Target> {
+    if depth > 32 {
+        return None;
     }
-    match prefix[0].as_str() {
-        "crate" => vec![prefix[1..].to_vec()],
-        "self" => {
-            let mut m = module_path.to_vec();
-            m.extend(prefix[1..].iter().cloned());
-            vec![m]
+    if segs.is_empty() {
+        return None;
+    }
+    if leading_colon {
+        return Some(Target::Extern(segs.to_vec()));
+    }
+    if segs.len() == 1 && !matches!(segs[0].as_str(), "crate" | "self" | "super") {
+        return lookup_name(collected, module, &segs[0], depth, skip_use);
+    }
+    let last = &segs[segs.len() - 1];
+    match resolve_module(
+        collected,
+        &segs[..segs.len() - 1],
+        leading_colon,
+        module,
+        depth,
+        skip_use,
+    ) {
+        Some(ModuleTarget::Local(m)) => lookup_name(collected, &m, last, depth, skip_use),
+        Some(ModuleTarget::Extern(mut p)) => {
+            p.push(last.clone());
+            Some(Target::Extern(p))
         }
-        "super" => {
-            let mut m = module_path.to_vec();
-            let mut rest = 0;
-            for (i, seg) in prefix.iter().enumerate() {
-                if seg == "super" {
-                    let _ = m.pop();
-                    rest = i + 1;
-                } else {
-                    break;
-                }
-            }
-            m.extend(prefix[rest..].iter().cloned());
-            vec![m]
-        }
-        _ => {
-            let mut child = module_path.to_vec();
-            child.extend(prefix.iter().cloned());
-            vec![child, prefix.to_vec()]
-        }
+        None => None,
     }
 }
 
-fn resolve_index<T>(
-    items: &[T],
-    path: &syn::Path,
-    module_path: &[String],
-    name_of: impl Fn(&T) -> &str,
-    module_of: impl Fn(&T) -> &[String],
-) -> Option<usize> {
-    let last = path.segments.last()?.ident.to_string();
-    for cand in candidate_modules(path, module_path) {
-        if let Some(idx) = items
-            .iter()
-            .position(|item| module_of(item) == cand.as_slice() && name_of(item) == last)
-        {
-            return Some(idx);
+fn walk_module_seg(
+    collected: &CrateItems,
+    cur: &[String],
+    seg: &str,
+    after: &[String],
+    depth: usize,
+    skip_use: Option<usize>,
+) -> Option<ModuleTarget> {
+    let mut child = cur.to_vec();
+    child.push(seg.to_string());
+    if is_module(collected, &child) {
+        return Some(ModuleTarget::Local(child));
+    }
+    if let Some(idx) = find_binding_use(collected, cur, seg, skip_use) {
+        match resolve_use_target(collected, idx, depth + 1) {
+            Some(Target::Local(m, n)) => {
+                let mut p = m;
+                p.push(n);
+                if is_module(collected, &p) {
+                    Some(ModuleTarget::Local(p))
+                } else {
+                    None
+                }
+            }
+            Some(Target::Extern(mut p)) => {
+                p.extend(after.iter().cloned());
+                Some(ModuleTarget::Extern(p))
+            }
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn resolve_module(
+    collected: &CrateItems,
+    segs: &[String],
+    leading_colon: bool,
+    module: &[String],
+    depth: usize,
+    skip_use: Option<usize>,
+) -> Option<ModuleTarget> {
+    if depth > 32 {
+        return None;
+    }
+    if leading_colon {
+        return Some(ModuleTarget::Extern(segs.to_vec()));
+    }
+    if segs.is_empty() {
+        return Some(ModuleTarget::Local(module.to_vec()));
+    }
+    let (cur, rest): (Vec<String>, &[String]) = match segs[0].as_str() {
+        "crate" => (Vec::new(), &segs[1..]),
+        "self" => (module.to_vec(), &segs[1..]),
+        "super" => {
+            let mut cur = module.to_vec();
+            let mut i = 0;
+            while i < segs.len() && segs[i] == "super" {
+                cur.pop();
+                i += 1;
+            }
+            return walk_module_rest(collected, cur, &segs[i..], depth, skip_use);
+        }
+        _ => {
+            let x = &segs[0];
+            let mut child = module.to_vec();
+            child.push(x.clone());
+            if is_module(collected, &child) {
+                (child, &segs[1..])
+            } else if let Some(idx) = find_binding_use(collected, module, x, skip_use) {
+                let mut spliced = collected.uses[idx].target.clone();
+                spliced.extend(segs[1..].iter().cloned());
+                let leading = collected.uses[idx].leading_colon;
+                return resolve_module(collected, &spliced, leading, module, depth + 1, Some(idx));
+            } else {
+                return Some(ModuleTarget::Extern(segs.to_vec()));
+            }
+        }
+    };
+    walk_module_rest(collected, cur, rest, depth, skip_use)
+}
+
+fn walk_module_rest(
+    collected: &CrateItems,
+    mut cur: Vec<String>,
+    rest: &[String],
+    depth: usize,
+    skip_use: Option<usize>,
+) -> Option<ModuleTarget> {
+    for i in 0..rest.len() {
+        let after = &rest[i + 1..];
+        match walk_module_seg(collected, &cur, &rest[i], after, depth, skip_use)? {
+            ModuleTarget::Local(next) => cur = next,
+            ModuleTarget::Extern(p) => return Some(ModuleTarget::Extern(p)),
         }
     }
-    // A single identifier with no hit in its own module stands in for a `use`
-    // import, which the walker does not track.
-    if path.segments.len() == 1 {
-        let matches: Vec<usize> = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| name_of(item) == last)
-            .map(|(idx, _)| idx)
-            .collect();
-        if matches.len() == 1 {
-            return Some(matches[0]);
+    Some(ModuleTarget::Local(cur))
+}
+
+fn lookup_name(
+    collected: &CrateItems,
+    module: &[String],
+    name: &str,
+    depth: usize,
+    skip_use: Option<usize>,
+) -> Option<Target> {
+    if depth > 32 {
+        return None;
+    }
+    if defines_name(collected, module, name) {
+        return Some(Target::Local(module.to_vec(), name.to_string()));
+    }
+    if let Some(idx) = find_binding_use(collected, module, name, skip_use) {
+        return resolve_use_target(collected, idx, depth + 1);
+    }
+    for (i, u) in collected.uses.iter().enumerate() {
+        if u.binding.is_some() || u.module_path.as_slice() != module {
+            continue;
+        }
+        match resolve_module(
+            collected,
+            &u.target,
+            u.leading_colon,
+            module,
+            depth + 1,
+            Some(i),
+        ) {
+            Some(ModuleTarget::Local(m)) => {
+                if let Some(t) = lookup_name(collected, &m, name, depth + 1, None) {
+                    return Some(t);
+                }
+            }
+            Some(ModuleTarget::Extern(mut p)) => {
+                p.push(name.to_string());
+                return Some(Target::Extern(p));
+            }
+            None => {}
         }
     }
     None
@@ -409,6 +673,9 @@ fn walk_file(file_path: &Path, submodule_dir: &Path, mod_path: &[String], out: &
     let file = syn::parse_file(&src).unwrap_or_else(|err| {
         panic!("{}: {err}", file_path.display());
     });
+    if !attrs_cfgs_hold(&file.attrs, file_path) {
+        return;
+    }
     walk_items(&file.items, file_path, submodule_dir, mod_path, out);
 }
 
@@ -427,9 +694,22 @@ fn walk_items(
             Item::Type(alias) if alias.generics.params.is_empty() => {
                 out.aliases.push(CollectedAlias {
                     module_path: mod_path.to_vec(),
-                    name: alias.ident.to_string(),
+                    name: unraw_ident(&alias.ident),
                     ty: (*alias.ty).clone(),
                 });
+            }
+            Item::Struct(item) => {
+                out.structs
+                    .push((mod_path.to_vec(), unraw_ident(&item.ident)));
+            }
+            Item::Use(item) => {
+                flatten_use(
+                    mod_path,
+                    item.leading_colon.is_some(),
+                    &item.tree,
+                    Vec::new(),
+                    &mut out.uses,
+                );
             }
             Item::Macro(mac) => {
                 let last = mac
@@ -449,7 +729,7 @@ fn walk_items(
                         });
                         out.ecis.push(CollectedEci {
                             module_path: mod_path.to_vec(),
-                            name: parsed.name.to_string(),
+                            name: unraw_ident(&parsed.name),
                             eci,
                         });
                     }
@@ -458,7 +738,7 @@ fn walk_items(
                             .unwrap_or_else(|err| {
                                 panic!("{}: {err}", file_path.display());
                             });
-                        if parsed.macro_.is_some() {
+                        if attrs_cfgs_hold(&parsed.attrs, file_path) && parsed.macro_.is_some() {
                             out.llexternals.push(CollectedLlexternal {
                                 file_path: file_path.to_path_buf(),
                                 module_path: mod_path.to_vec(),
@@ -473,6 +753,7 @@ fn walk_items(
                 let name = unraw_ident(&module.ident);
                 let mut child_path = mod_path.to_vec();
                 child_path.push(name.clone());
+                out.modules.push(child_path.clone());
                 match &module.content {
                     Some((_, items)) => {
                         let nested_dir = submodule_dir.join(&name);
@@ -483,7 +764,7 @@ fn walk_items(
                             file_path,
                             submodule_dir,
                             &name,
-                            path_attr(&module.attrs),
+                            path_attr(&module.attrs, file_path),
                         );
                         let child_dir = submodule_dir_for_file(&child_file);
                         walk_file(&child_file, &child_dir, &child_path, out);
@@ -501,6 +782,70 @@ fn unraw_ident(ident: &syn::Ident) -> String {
     match name.strip_prefix("r#") {
         Some(stem) => stem.to_string(),
         None => name,
+    }
+}
+
+fn flatten_use(
+    module_path: &[String],
+    leading_colon: bool,
+    tree: &UseTree,
+    prefix: Vec<String>,
+    out: &mut Vec<CollectedUse>,
+) {
+    match tree {
+        UseTree::Path(p) => {
+            let mut prefix = prefix;
+            prefix.push(unraw_ident(&p.ident));
+            flatten_use(module_path, leading_colon, &p.tree, prefix, out);
+        }
+        UseTree::Name(n) => {
+            if n.ident == "self" {
+                if let Some(binding) = prefix.last().cloned() {
+                    out.push(CollectedUse {
+                        module_path: module_path.to_vec(),
+                        binding: Some(binding),
+                        target: prefix,
+                        leading_colon,
+                    });
+                }
+            } else {
+                let ident = unraw_ident(&n.ident);
+                let mut target = prefix;
+                target.push(ident.clone());
+                out.push(CollectedUse {
+                    module_path: module_path.to_vec(),
+                    binding: Some(ident),
+                    target,
+                    leading_colon,
+                });
+            }
+        }
+        UseTree::Rename(r) => {
+            let binding = unraw_ident(&r.rename);
+            let mut target = prefix;
+            if r.ident != "self" {
+                target.push(unraw_ident(&r.ident));
+            }
+            out.push(CollectedUse {
+                module_path: module_path.to_vec(),
+                binding: Some(binding),
+                target,
+                leading_colon,
+            });
+        }
+        UseTree::Glob(_) => {
+            out.push(CollectedUse {
+                module_path: module_path.to_vec(),
+                binding: None,
+                target: prefix,
+                leading_colon,
+            });
+        }
+        UseTree::Group(g) => {
+            for tree in &g.items {
+                flatten_use(module_path, leading_colon, tree, prefix.clone(), out);
+            }
+        }
     }
 }
 
@@ -531,16 +876,16 @@ fn resolve_mod_file(
     panic!("{}", rs.display());
 }
 
-fn path_attr(attrs: &[Attribute]) -> Option<String> {
-    for attr in attrs {
-        if !attr.path().is_ident("path") {
+fn path_attr(attrs: &[Attribute], file_path: &Path) -> Option<String> {
+    for meta in expand_cfg_attr(attrs, file_path) {
+        if !meta.path().is_ident("path") {
             continue;
         }
-        let Meta::NameValue(nv) = &attr.meta else {
+        let Meta::NameValue(nv) = meta else {
             continue;
         };
-        if let Expr::Lit(expr_lit) = &nv.value
-            && let Lit::Str(s) = &expr_lit.lit
+        if let Expr::Lit(expr_lit) = nv.value
+            && let Lit::Str(s) = expr_lit.lit
         {
             return Some(s.value());
         }
@@ -570,14 +915,53 @@ fn item_attrs(item: &Item) -> &[Attribute] {
 }
 
 fn item_cfgs_hold(item: &Item, file_path: &Path) -> bool {
-    for attr in item_attrs(item) {
-        if !attr.path().is_ident("cfg") {
+    attrs_cfgs_hold(item_attrs(item), file_path)
+}
+
+fn expand_cfg_attr(attrs: &[Attribute], file_path: &Path) -> Vec<Meta> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        expand_meta(&attr.meta, file_path, &mut out);
+    }
+    out
+}
+
+fn expand_meta(meta: &Meta, file_path: &Path, out: &mut Vec<Meta>) {
+    if meta.path().is_ident("cfg_attr") {
+        let Meta::List(list) = meta else {
+            return;
+        };
+        let nested =
+            match Punctuated::<Meta, Token![,]>::parse_terminated.parse2(list.tokens.clone()) {
+                Ok(p) => p,
+                Err(err) => panic!("{}: {err}", file_path.display()),
+            };
+        let mut iter = nested.into_iter();
+        let Some(pred) = iter.next() else {
+            return;
+        };
+        if cfg_holds(&pred) {
+            for inner in iter {
+                expand_meta(&inner, file_path, out);
+            }
+        }
+    } else {
+        out.push(meta.clone());
+    }
+}
+
+fn attrs_cfgs_hold(attrs: &[Attribute], file_path: &Path) -> bool {
+    for meta in expand_cfg_attr(attrs, file_path) {
+        if !meta.path().is_ident("cfg") {
             continue;
         }
-        let meta = attr.parse_args::<Meta>().unwrap_or_else(|err| {
+        let Meta::List(list) = meta else {
+            return false;
+        };
+        let pred = syn::parse2::<Meta>(list.tokens).unwrap_or_else(|err| {
             panic!("{}: {err}", file_path.display());
         });
-        if !cfg_holds(&meta) {
+        if !cfg_holds(&pred) {
             return false;
         }
     }

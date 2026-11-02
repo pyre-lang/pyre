@@ -2455,6 +2455,9 @@ crate::rffi::llexternal!(
 // the inheritable `separate_module_sources`. `%(HAVE_DUP3)d` is the
 // `rffi_platform` probe; `majit-rlib/build.rs` probes `dup3` (`rffi_platform.Has`)
 // and defines `HAVE_DUP3` to 0 or 1.
+// The `ioctl_works` / `dup3_works` caches are relaxed atomics, as
+// `set_inheritable` (`Python/fileutils.c`) and `os_dup2_impl` keep them for
+// the free-threaded build.
 // [3.15-spec] `rpy_set_inheritable` returns -1 on an O_PATH descriptor's EBADF;
 // `set_inheritable` in `Python/fileutils.c` falls through to `fcntl` (bpo-44849).
 // Observable: `lib-python/3/test/test_os/test_os.py` `test_get_set_inheritable_o_path`.
@@ -2481,11 +2484,11 @@ int rpy_set_inheritable(int fd, int inheritable)
     static int ioctl_works = -1;
     int flags;
 
-    if (ioctl_works != 0) {
+    if (__atomic_load_n(&ioctl_works, __ATOMIC_RELAXED) != 0) {
         int request = inheritable ? FIONCLEX : FIOCLEX;
         int err = ioctl(fd, request, NULL);
         if (!err) {
-            ioctl_works = 1;
+            __atomic_store_n(&ioctl_works, 1, __ATOMIC_RELAXED);
             return 0;
         }
 
@@ -2503,7 +2506,7 @@ int rpy_set_inheritable(int fd, int inheritable)
             /* ENOTTY: The ioctl is declared but not supported by the
                kernel.  EACCES: SELinux policy, this can be the case on
                Android. */
-            ioctl_works = 0;
+            __atomic_store_n(&ioctl_works, 0, __ATOMIC_RELAXED);
         }
         /* fallback to fcntl() if ioctl() does not work */
     }
@@ -2554,12 +2557,15 @@ int rpy_dup2_noninheritable(int fd, int fd2)
 #else
 # if HAVE_DUP3
     static int dup3_works = -1;
-    if (dup3_works != 0) {
+    int works = __atomic_load_n(&dup3_works, __ATOMIC_RELAXED);
+    if (works != 0) {
         if (dup3(fd, fd2, O_CLOEXEC) >= 0)
             return 0;
-        if (dup3_works == -1)
-            dup3_works = (errno != ENOSYS);
-        if (dup3_works)
+        if (works == -1) {
+            works = (errno != ENOSYS);
+            __atomic_store_n(&dup3_works, works, __ATOMIC_RELAXED);
+        }
+        if (works)
             return -1;
     }
 # endif

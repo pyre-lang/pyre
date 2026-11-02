@@ -291,15 +291,19 @@ mod tests {
             "RPY_EXTERN void pypy_macro_wrapper_FD_ZERO(fd_set *arg0) { FD_ZERO(arg0); }"
         );
 
-        fn no_resolve(_: &syn::Path, _: &[String]) -> Option<(syn::Type, Vec<String>)> {
-            None
-        }
         let none: &[String] = &[];
+        let resolve_extern = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            match segs.first().map(String::as_str) {
+                Some("libc" | "std") => Some(cdecl::Resolved::Extern(segs)),
+                _ => None,
+            }
+        };
         assert_eq!(
             cdecl::gettype(
                 &syn::parse_str("*mut libc::stat").unwrap(),
                 none,
-                &no_resolve
+                &resolve_extern
             )
             .unwrap(),
             "struct stat *@"
@@ -308,7 +312,7 @@ mod tests {
             cdecl::gettype(
                 &syn::parse_str("*const libc::c_char").unwrap(),
                 none,
-                &no_resolve
+                &resolve_extern
             )
             .unwrap(),
             "const char *@"
@@ -317,7 +321,7 @@ mod tests {
             cdecl::gettype(
                 &syn::parse_str("*const *mut libc::c_char").unwrap(),
                 none,
-                &no_resolve
+                &resolve_extern
             )
             .unwrap(),
             "char *const *@"
@@ -327,21 +331,31 @@ mod tests {
                 &syn::parse_str("Option<unsafe extern \"C\" fn(libc::c_int) -> libc::c_int>")
                     .unwrap(),
                 none,
-                &no_resolve
+                &resolve_extern
             )
             .unwrap(),
             "int (*@)(int)"
         );
-        let resolve_int = |path: &syn::Path, _: &[String]| -> Option<(syn::Type, Vec<String>)> {
+        let resolve_int = |path: &syn::Path, module_path: &[String]| -> Option<cdecl::Resolved> {
             if path.segments.len() == 1 && path.segments[0].ident == "INT" {
-                Some((syn::parse_str("std::ffi::c_int").unwrap(), Vec::new()))
+                Some(cdecl::Resolved::Alias(
+                    syn::parse_str("std::ffi::c_int").unwrap(),
+                    Vec::new(),
+                ))
             } else {
-                None
+                resolve_extern(path, module_path)
             }
         };
         assert_eq!(
             cdecl::gettype(&syn::parse_str("INT").unwrap(), none, &resolve_int).unwrap(),
             "int @"
+        );
+        let resolve_foo = |_: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            Some(cdecl::Resolved::LocalStruct("Foo".into()))
+        };
+        assert_eq!(
+            cdecl::gettype(&syn::parse_str("Foo").unwrap(), none, &resolve_foo).unwrap(),
+            "struct Foo @"
         );
     }
 }
