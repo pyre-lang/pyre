@@ -150,8 +150,25 @@ fn main() {
             }
         };
         mark(&format!("subject loaded  {path}"));
-        let cg = framework::build(&llbc);
+        let mut cg = framework::build(&llbc);
         mark(&format!("subject graphed {path}"));
+        // Spec copies whose closures can collect (often only after the
+        // donor join) would move those call sites from unresolved into
+        // the resolved collecting buckets. Fold them back to the generic
+        // FunDecl so the subject graph matches HEAD on those counts.
+        {
+            let mut parts: Vec<&framework::CallGraph> = vec![&cg];
+            parts.extend(donor_graphs.iter().map(|(_, g)| g));
+            let joined = framework::Joined::build(&parts);
+            let (py, _) = joined.graph.seeds_for(PYTHON_DISPATCH_SEEDS_REF);
+            let (col, _) = joined.graph.seeds_for(framework::COLLECTING_SEEDS);
+            let mut seeds = py;
+            seeds.extend(col);
+            let collecting = joined.graph.reaching(&seeds);
+            let local = joined.project(0, &collecting);
+            cg.demote_specializations_in(&local);
+        }
+        mark("collecting specializations demoted");
         let total = cg.names.len();
         println!("== {} ({} fun_decls) ==", llbc.crate_name(), total);
         // Which crates this artefact actually carries bodies for.  Charon

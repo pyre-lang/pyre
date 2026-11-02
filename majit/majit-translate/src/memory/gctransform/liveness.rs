@@ -3090,7 +3090,13 @@ pub fn scan(
             let CallKind::Fun(FunId::Regular { id: callee }) = &reg.kind else {
                 continue;
             };
-            if !reach.contains(callee) {
+            let mut callee_node = cg.callee_node(llbc, &[], *callee, &reg.generics);
+            // A spec copy that can collect stays the generic FunDecl, the
+            // scan-side half of `CallGraph::demote_specializations_in`.
+            if callee_node != *callee && reach.contains(&callee_node) {
+                callee_node = *callee;
+            }
+            if !reach.contains(&callee_node) {
                 continue;
             }
             let mut after: HashSet<u64> = HashSet::new();
@@ -4219,6 +4225,7 @@ mod tests {
             callers,
             indirect: HashSet::new(),
             opaque: super::super::framework::OpaqueCensus::default(),
+            spec_memo: HashMap::new(),
         };
         let collecting = collecting_for_pin_summaries(&cg);
         assert!(collecting.contains(&11));

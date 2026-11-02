@@ -1068,6 +1068,7 @@ impl<'a> Lowering<'a> {
                             &base,
                             &src,
                             nested,
+                            dest_ty,
                             &container_field,
                             at_offset_zero,
                         );
