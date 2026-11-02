@@ -518,10 +518,17 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         | ConstValue::LowLevelType(_)
         | ConstValue::None
         | ConstValue::Code(_)
-        | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_)
         | ConstValue::Opaque(_) => ConcreteType::GcRef,
+        // `history.getkind` of `Ptr(FuncType)` is `'int'`. Other `LLPtr`
+        // pointees stay `GcRef` here.
+        ConstValue::LLPtr(p) => match &p._TYPE.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_) => {
+                ConcreteType::Signed
+            }
+            _ => ConcreteType::GcRef,
+        },
         // Bare-constant repr selection after annotation: one FrozenDesc
         // (`getFrozenPBCRepr` → `SingleFrozenPBCRepr`).
         // `SingleFrozenPBCRepr.lowleveltype` is `Void`; `history.getkind(Void)`

@@ -874,10 +874,15 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::Graphs(_)
         | ConstValue::LowLevelType(_)
         | ConstValue::Code(_)
-        | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
         | ConstValue::HostObject(_)
         | ConstValue::Opaque(_) => ValueType::Ref(None),
+        // `history.getkind` of `Ptr(FuncType)` is `'int'` (`FuncType._gckind
+        // == 'raw'`). GC and other raw pointees stay `Ref` here.
+        ConstValue::LLPtr(p) => match &p._TYPE.TO {
+            crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_) => ValueType::Int,
+            _ => ValueType::Ref(None),
+        },
         // Bare-constant repr selection after annotation: one FrozenDesc
         // (`getFrozenPBCRepr` → `SingleFrozenPBCRepr`).
         // `SingleFrozenPBCRepr.lowleveltype` is `Void`; `history.getkind(Void)`
