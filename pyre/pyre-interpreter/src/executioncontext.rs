@@ -1639,7 +1639,7 @@ impl ExecutionContext {
         // carry a line but may not start one, and `-1` is what both guards
         // below are written against.
         let lineno = unsafe { (*anchor.live()).get_lineno_for_pc_tracing() };
-        let (want_line, want_opcode) = unsafe {
+        let want_line = unsafe {
             // `getorcreatedebug()` with no argument: reached only through
             // `bytecode_only_trace`, which returns early unless
             // `get_w_f_trace()` is non-null, so the debug block already exists
@@ -1653,24 +1653,27 @@ impl ExecutionContext {
             if lineno != -1 {
                 d.f_lineno = lineno;
             }
-            let want_line = d.f_trace_lines
+            d.f_trace_lines
                 && lineno != -1
-                && (lastline != lineno || last_instr < d.instr_prev_plus_one);
-            let want_opcode = d.f_trace_opcodes;
-            (want_line, want_opcode)
+                && (lastline != lineno || last_instr < d.instr_prev_plus_one)
         };
         if want_line {
             self._trace(anchor.live(), "line", pyre_object::w_none(), None)?;
         }
+        // `executioncontext.py run_trace_func` reads `d.f_trace_opcodes` after
+        // the line event: a line callback can set `frame.f_trace_opcodes`.
+        // `_trace` runs Python and can move the frame, so re-fetch
+        // `getorcreatedebug(-1)` from `anchor.live()`.
+        let want_opcode = unsafe { (*anchor.live()).getorcreatedebug(-1).f_trace_opcodes };
         if want_opcode {
             self._trace(anchor.live(), "opcode", pyre_object::w_none(), None)?;
         }
         let frame = anchor.live();
-        // `d.instr_prev_plus_one = frame.last_instr + 1` — the next-PC sentinel
-        // that makes a backward jump re-fire the line event even when it stays
-        // on the same source line.
+        // `d.instr_prev_plus_one = frame.last_instr + 1` after both callbacks,
+        // so a line callback that jumped via `f_lineno` writes the sentinel
+        // from the live `last_instr`.
         unsafe {
-            (*frame).getorcreatedebug(-1).instr_prev_plus_one = last_instr + 1;
+            (*frame).getorcreatedebug(-1).instr_prev_plus_one = (*frame).last_instr + 1;
         }
         Ok(())
     }

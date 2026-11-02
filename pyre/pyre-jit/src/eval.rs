@@ -11596,7 +11596,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
 
         // `dispatch_bytecode` reads `co_code` once. One walk yields the
         // opcode pc and the packed opcode/oparg.
-        let (opcode_pc, packed_instruction) = decode_instruction_forward_dispatch(code, pc);
+        let (mut opcode_pc, packed_instruction) = decode_instruction_forward_dispatch(code, pc);
         if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
             return Err(pyre_interpreter::PyError::new(
                 pyre_interpreter::PyErrorKind::BytecodeCorruption,
@@ -11606,9 +11606,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let opcode = (packed_instruction & 0xff) as u8;
         // SAFETY: the packed opcode came from a live `CodeUnit`, whose opcode
         // field is a valid repr(u8) `Instruction` discriminant.
-        let instruction =
+        let mut instruction =
             unsafe { std::mem::transmute::<u8, pyre_interpreter::Instruction>(opcode) };
-        let op_arg = pyre_interpreter::oparg_from_u32((packed_instruction >> 8) as u32);
+        let mut op_arg = pyre_interpreter::oparg_from_u32((packed_instruction >> 8) as u32);
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
         unsafe { &mut *f }.last_instr = pc as isize;
@@ -11689,22 +11689,29 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // bytecode_trace may allocate (tracer callback) → the frame may
                 // have moved; re-seed before reading it again.
                 f = reload_loop_frame!(f, root_slot);
-                // A trace callback may perform a debugger line-jump by
-                // setting `frame.f_lineno` (`fset_f_lineno` → `last_instr
-                // = best_addr`).  The opcode for this iteration was
-                // decoded from the pre-jump `pc`; honour the jump by
-                // restarting the loop so the target is re-decoded,
-                // mirroring the interpreter loop's post-trace redirect.
-                // The baseline set before the trace is `last_instr =
-                // opcode_pc` (line above); a moved `last_instr` is the
-                // jump target.  This loop reads `pc = frame.next_instr()`
-                // (= `last_instr + 1`) at the top, so rebase the target
-                // through `set_last_instr_from_next_instr` for the next
-                // iteration to land on it rather than one past it.
+                // `pyopcode.py dispatch_bytecode`: `next_instr = r_uint(self.last_instr)`
+                // then decode and dispatch that opcode in this iteration. A line
+                // callback that jumped via `f_lineno` (`fset_f_lineno` →
+                // `last_instr = best_addr`) must not re-enter `bytecode_trace`
+                // for the landing instruction — restarting the loop would fire
+                // a second line event because `last_instr < instr_prev_plus_one`.
                 if unsafe { &*f }.last_instr as usize != opcode_pc {
                     let jump_target = unsafe { &*f }.last_instr as usize;
-                    unsafe { &mut *f }.set_last_instr_from_next_instr(jump_target);
-                    continue;
+                    let (new_opcode_pc, new_packed) =
+                        decode_instruction_forward_dispatch(code, jump_target);
+                    if new_opcode_pc == usize::MAX || new_packed == u64::MAX {
+                        return Err(pyre_interpreter::PyError::new(
+                            pyre_interpreter::PyErrorKind::BytecodeCorruption,
+                            "bytecode corruption",
+                        ));
+                    }
+                    opcode_pc = new_opcode_pc;
+                    let opcode = (new_packed & 0xff) as u8;
+                    instruction =
+                        unsafe { std::mem::transmute::<u8, pyre_interpreter::Instruction>(opcode) };
+                    op_arg = pyre_interpreter::oparg_from_u32((new_packed >> 8) as u32);
+                    unsafe { &mut *f }.last_instr = jump_target as isize;
+                    unsafe { &mut *f }.set_last_instr_from_next_instr(opcode_pc + 1);
                 }
             } else {
                 // executioncontext.py:163-165 — `actionflag.

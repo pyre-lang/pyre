@@ -162,9 +162,95 @@ def a_warm_generator_loop_reports_its_end():
     assert rows[-1] == [('consume', 'StopIteration')], rows
 
 
+def events_of(fn, on_event):
+    """`(event, lineno-rel)` for `fn` only, plus `fn`'s return value."""
+    seen = []
+    first = fn.__code__.co_firstlineno
+
+    def tracer(frame, event, arg):
+        if frame.f_code is not fn.__code__:
+            return tracer
+        seen.append((event, frame.f_lineno - first))
+        on_event(frame, event, arg)
+        return tracer
+
+    sys.settrace(tracer)
+    try:
+        result = fn()
+    finally:
+        sys.settrace(None)
+    return seen, result
+
+
+def a_line_callback_arms_opcode_events_for_that_instruction():
+    """`run_trace_func` reads `f_trace_opcodes` after the line event."""
+
+    def traced():
+        a = 1
+        b = 2
+        return b
+
+    def on_event(frame, event, arg):
+        if event == 'line' and frame.f_lineno == traced.__code__.co_firstlineno + 1:
+            frame.f_trace_opcodes = True
+
+    seen, result = events_of(traced, on_event)
+    print('opcode-arm events:', seen)
+    assert result == 2, result
+    assert seen == [
+        ('call', 0),
+        ('line', 1),
+        ('opcode', 1),
+        ('opcode', 1),
+        ('line', 2),
+        ('opcode', 2),
+        ('opcode', 2),
+        ('line', 3),
+        ('opcode', 3),
+        ('opcode', 3),
+        ('return', 3),
+    ], seen
+
+
+def a_line_callback_jump_backwards_rereads_last_instr():
+    """`run_trace_func` writes `instr_prev_plus_one` from live `last_instr`."""
+
+    def traced():
+        n = 0
+        n += 1
+        n += 10
+        return n
+
+    first = traced.__code__.co_firstlineno
+    jumped = {'done': False}
+
+    def on_event(frame, event, arg):
+        if jumped['done']:
+            return
+        if event == 'line' and frame.f_lineno == first + 3:
+            frame.f_lineno = first + 2
+            jumped['done'] = True
+
+    seen, result = events_of(traced, on_event)
+    print('lineno-jump events:', seen)
+    print('lineno-jump result:', result)
+    assert result == 12, result
+    assert seen == [
+        ('call', 0),
+        ('line', 1),
+        ('line', 2),
+        ('line', 3),
+        ('line', 3),
+        ('line', 4),
+        ('return', 4),
+    ], seen
+
+
 a_python_level_next_reports_to_the_consuming_frame()
 the_rule_is_the_traceback_and_not_the_iterator()
 a_natively_signalled_end_reports_nothing()
 the_loop_still_ends_normally()
 a_warm_generator_loop_reports_its_end()
+a_line_callback_arms_opcode_events_for_that_instruction()
+a_line_callback_jump_backwards_rereads_last_instr()
 print('OK')
