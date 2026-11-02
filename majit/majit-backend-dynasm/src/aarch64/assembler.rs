@@ -971,8 +971,6 @@ pub struct CompiledCode {
     /// AtomicUsize for redirect_call_assembler's update_frame_info
     /// parity: may be updated through &CompiledCode (shared ref).
     pub frame_depth: std::sync::atomic::AtomicUsize,
-    /// `None` for root loops; bridges set `(source_trace_id, source_fail_index_per_trace)`.
-    pub source_guard: Option<(u64, u32)>,
     /// `assembler.py process_pending_guards` — the `GUARD_NOT_INVALIDATED`
     /// sites this trace left for `clt.invalidate_positions`.
     pub invalidate_positions: Vec<majit_backend::InvalidatePosition>,
@@ -2246,7 +2244,6 @@ impl<'a> AssemblerARM64<'a> {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
-            source_guard: None,
             invalidate_positions,
             data_blocks,
         })
@@ -2322,7 +2319,7 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:623 assemble_bridge: compile a bridge trace.
     pub fn assemble_bridge(
         mut self,
-        fail_descr: &dyn FailDescr,
+        _fail_descr: &dyn FailDescr,
         arglocs: &[Loc],
     ) -> Result<CompiledCode, BackendError> {
         if crate::majit_log_enabled() {
@@ -2406,7 +2403,6 @@ impl<'a> AssemblerARM64<'a> {
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
-            source_guard: Some((fail_descr.trace_id(), fail_descr.fail_index_per_trace())),
             invalidate_positions,
             data_blocks,
         })

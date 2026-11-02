@@ -2926,8 +2926,8 @@ impl DynasmBackend {
 
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm] descr: fi={} finish={} types={} rd_locs={:?}",
-                descr_fd.fail_index_per_trace(),
+                "[dynasm] descr: descr=0x{:x} finish={} types={} rd_locs={:?}",
+                descr_fd as *const dyn FailDescr as *const () as usize,
                 descr_fd.is_finish(),
                 descr_fd.fail_arg_types().len(),
                 descr_fd.rd_locs()
@@ -3530,9 +3530,9 @@ impl Backend for DynasmBackend {
         let trace_ops_diag = crate::trace_ops_diag_id() == Some(trace_id);
         if trace_ops_diag {
             eprintln!(
-                "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
+                "--- dynasm bridge prepared ops (trace_id={}, source=0x{:x}) ---\n{}",
                 trace_id,
-                fail_descr.fail_index_per_trace(),
+                fail_descr as *const dyn FailDescr as *const () as usize,
                 majit_ir::format_trace(&prepared_ops, &IndexMap::<u32, i64>::new(),)
             );
         }
@@ -3666,9 +3666,8 @@ impl Backend for DynasmBackend {
             (!gcrefs.is_empty()).then(|| unsafe { majit_gc::GcTable::in_code(rawstart, &gcrefs) });
         if crate::dynasm_exec_diag_enabled() {
             eprintln!(
-                "[dynasm-bridge] trace={trace_id} source={}:{} addr={bridge_addr:#x} len={code_size}",
-                fail_descr.trace_id(),
-                fail_descr.fail_index_per_trace(),
+                "[dynasm-bridge] trace={trace_id} source=0x{:x} addr={bridge_addr:#x} len={code_size}",
+                fail_descr as *const dyn FailDescr as *const () as usize,
             );
         }
         // `rpython/jit/backend/x86/assembler.py` `assemble_bridge`:
@@ -3702,11 +3701,8 @@ impl Backend for DynasmBackend {
         let ajo = guard_fd.adr_jump_offset();
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm-bridge] patch: trace_id={} fail_index={} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
-                guard_fd.trace_id(),
-                guard_fd.fail_index_per_trace(),
-                ajo,
-                bridge_addr
+                "[dynasm-bridge] patch: descr=0x{:x} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
+                guard_fd as *const dyn FailDescr as *const () as usize, ajo, bridge_addr
             );
         }
         if ajo != 0 {
@@ -3954,8 +3950,6 @@ impl Backend for DynasmBackend {
             typed_outputs,
             savedata: (!savedata.is_null()).then_some(savedata),
             exception_value,
-            fail_index: descr_fd.fail_index_per_trace(),
-            trace_id: descr_fd.trace_id(),
             is_finish: descr_fd.is_finish(),
             is_exit_frame_with_exception: descr_fd.is_exit_frame_with_exception(),
             status: descr_fd.get_status(),

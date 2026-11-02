@@ -203,10 +203,6 @@ pub struct RawExecResult {
     pub savedata: Option<GcRef>,
     /// Pending exception value captured by this exit (`GcRef::NULL` = none).
     pub exception_value: GcRef,
-    /// Backend fail-index for this exit.
-    pub fail_index: u32,
-    /// Compiled trace identifier for this exit.
-    pub trace_id: u64,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
     /// compile.py ExitFrameWithExceptionDescrRef parity.
@@ -3165,8 +3161,6 @@ pub trait Backend: Send {
             typed_outputs,
             savedata,
             exception_value,
-            fail_index: descr.fail_index(),
-            trace_id: descr.trace_id(),
             is_finish: descr.is_finish(),
             is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
             status: descr.get_status(),
