@@ -9701,9 +9701,11 @@ pub fn ec_topframeref_descr() -> DescrRef {
 ///
 /// Marked `w_tracefunc?` so the pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// Recorded at an inlined call by `walker_call_trace_hook_reads`
-/// (`jitcode_dispatch/mod.rs`).  Same group as the two accessors above, so
-/// the read shares their struct identity.
+/// An inlined callee records the slot by walking generated `call_trace`
+/// (`walker_inline_execute_frame_call_trace`); `CALL_ASSEMBLER` and
+/// generator resume pin it through `walker_call_trace_hook_reads`.
+/// Same group as the two accessors above, so the read shares their
+/// struct identity.
 pub fn ec_w_tracefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_W_TRACEFUNC_OFFSET)
 }

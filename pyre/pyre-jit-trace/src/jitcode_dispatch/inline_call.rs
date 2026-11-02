@@ -6803,6 +6803,62 @@ fn walker_ec_enter(
     vref
 }
 
+/// `pyframe.py execute_frame`: after `enter`, `executioncontext.call_trace(self)`.
+///
+/// The inline door still declines when `ec_hook_installed()`. An unarmed
+/// trace that inlined a callee still has to see a hook armed later: walking
+/// the generated `call_trace` jitcode records `gettrace()`'s
+/// `jit.promote(self.w_tracefunc)`.
+///
+/// Compact tests that omit the helper (null `snapshot_sym`, missing jitcode)
+/// skip silently; production tables must contain the Regular `call_trace`
+/// graph (`call_trace_jitcode_index`). A walk `Err` propagates; the
+/// `null_fn` residual that used to force a cut is a constant 0
+/// (`jtransform.py` `lltype.nullptr(FUNC)`).
+pub(crate) fn walker_inline_execute_frame_call_trace<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callee_ec: OpRef,
+    callee_frame: OpRef,
+    concrete_ec: *mut pyre_interpreter::PyExecutionContext,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+) -> Result<(), DispatchError> {
+    if ctx.fbw_mode.snapshot_sym.is_null() {
+        return Ok(());
+    }
+    let Some(jitcode_index) = crate::jitcode_runtime::call_trace_jitcode_index() else {
+        return Ok(());
+    };
+    let Some(sub_body) = crate::jitcode_dispatch::sub_jitcode_body_by_index(jitcode_index) else {
+        return Ok(());
+    };
+    if crate::state::ensure_build_time_jitcode_at(jitcode_index).is_none() {
+        return Ok(());
+    }
+    let r_args = [callee_ec, callee_frame];
+    if r_args.len() > sub_body.num_regs_r {
+        return Ok(());
+    }
+    let r_concretes = [
+        ConcreteValue::Ref(concrete_ec as pyre_object::PyObjectRef),
+        ConcreteValue::Ref(concrete_frame as pyre_object::PyObjectRef),
+    ];
+    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode_index);
+    let walk = super::specialize::run_codewriter_helper_inline_call(
+        ctx,
+        op_pc,
+        &sub_body,
+        &[],
+        &[],
+        &r_args,
+        &r_concretes,
+        &[],
+    );
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
+    walk.map(|_| ())
+}
+
 /// The box this walk holds for the frame at `frame_ptr`: the virtual of a
 /// `virtual_ref` pair still open (an inlined caller), else the portal
 /// virtualizable.  `None` when the walk has no box for it.
@@ -6847,26 +6903,27 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// from `pyframe.py execute_frame` rather than from `enter` / `leave`.
 /// Whatever inlines the callee inlines those `ec.gettrace()` reads with it, so
 /// upstream's trace carries a guard on them and a tracer installed later cannot
-/// be missed.  This walker inlines neither, so an inlined callee reports
-/// nothing for as long as the loop stays compiled.
+/// be missed.  This walker inlines `call_trace` at the callee entry
+/// (`walker_inline_execute_frame_call_trace`); `return_trace` stays with
+/// `execute_frame` on residual paths.
 ///
-/// What keeps the omission sound is that there is no inlined callee to lose
-/// events for while a hook is installed:
+/// What keeps the omission of `return_trace` sound is that there is no inlined
+/// callee to lose events for while a hook is installed:
 /// `try_walker_inline_resolved_user_call_inner` declines the inline outright
 /// once `ec.w_tracefunc` or `ec.profilefunc` is set, so the callee becomes a
 /// residual call and reaches the interpreter's own `execute_frame`, which runs
 /// `call_trace` / `return_trace` / `leave`.  A hook installed AFTER the trace
-/// was recorded is answered by the `call_trace` reads
-/// `walker_call_trace_hook_reads` records at the call, and by the
-/// `is_being_profiled` green / back-edge read for a profiler.
+/// was recorded fails `gettrace()`'s `jit.promote` inside the inlined
+/// `call_trace` walk; `CALL_ASSEMBLER` and `walk_generator_resume` pin the
+/// same reads through `walker_call_trace_hook_reads`. A profiler uses the
+/// `is_being_profiled` green / back-edge read.
 ///
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
 /// which `frame_tracing_active` holds to `execute_frame_plain` is a
 /// compilation gate, not a reporting one.  The portal frame's jitted arm
-/// reads that frame's own `debugdata.w_f_trace`; it says nothing about a
-/// callee whose own `call_trace` / `return_trace` this walker declines to
-/// inline, and it does not fire at all for a global tracer that leaves the
-/// caller's `f_trace` unset.
+/// reads that frame's own `debugdata.w_f_trace`; a global tracer that
+/// leaves the caller's `f_trace` unset is the inlined `call_trace`
+/// `gettrace()` pin.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and
 /// forces the leaving vref; in the trace it records the force as
@@ -9817,7 +9874,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
     // `executioncontext.py leave` adds `_trace(frame, 'leaveframe', ...)` when
     // a profiler is installed.  `walker_ec_enter` / `walker_ec_leave` port the
-    // frame-chain half of that bracket and nothing else, and the walker has no
+    // frame-chain half; `walker_inline_execute_frame_call_trace` walks the
+    // generated `call_trace` jitcode at the callee entry.  The walker has no
     // route to record `_trace` — it calls back into app-level Python with the
     // callee frame as an argument.  So while a hook is installed there is no
     // shape of this inline that can report what the callee owes, and the
@@ -11656,6 +11714,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_concrete_frame,
                 concrete_ec,
             );
+            // `pyframe.py execute_frame`: `executioncontext.call_trace(self)`
+            // after `enter`. Unarmed recording inlines this generated
+            // jitcode so a later-armed hook fails `gettrace()`'s promote.
+            if let Err(err) = walker_inline_execute_frame_call_trace(
+                ctx,
+                op.pc,
+                ca_callee_ec,
+                ca_callee_frame,
+                concrete_ec,
+                ca_concrete_frame,
+            ) {
+                // `execute_frame`'s `finally` still runs `leave` when
+                // `call_trace` fails after `enter`.
+                walker_ec_leave(
+                    ctx.trace_ctx,
+                    ca_callee_frame,
+                    ca_callee_ec,
+                    ca_concrete_frame,
+                    concrete_ec,
+                    false,
+                );
+                return Err(err);
+            }
             // This inlined level is an activation `execute_frame` would have
             // charged the recursion counter for.  Counting it at RUN time is
             // what a recorded call would do, and that is exactly wrong here: a

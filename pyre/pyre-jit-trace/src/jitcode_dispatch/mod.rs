@@ -14802,9 +14802,10 @@ fn fused_goto_if_not_int<Sym: WalkSym>(
 /// Read live off the running context rather than from a recorded box.  The
 /// answer only decides whether to record a door at all, and every caller bails
 /// before recording any IR; the other half — a hook installed after the trace
-/// was recorded — is the `call_trace` reads [`walker_call_trace_hook_reads`]
-/// records at the call, and the `is_being_profiled` green / back-edge read
-/// for a profiler.
+/// was recorded — is `gettrace()`'s `jit.promote` inside the inlined
+/// `call_trace` walk (`walker_inline_execute_frame_call_trace`), the
+/// [`walker_call_trace_hook_reads`] pins on `CALL_ASSEMBLER` and generator
+/// resume, and the `is_being_profiled` green / back-edge read for a profiler.
 pub(crate) fn ec_hook_installed() -> bool {
     let ec = pyre_interpreter::call::getexecutioncontext();
     !ec.is_null() && unsafe { !(*ec).w_tracefunc().is_null() || (*ec).profilefunc.is_some() }
