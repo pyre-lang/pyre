@@ -4,18 +4,23 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use super::{CompilerInvocation, FamilySpec, HostFamily, Platform, os_flags, prefixed_path};
+use super::{
+    CompilerInvocation, FamilySpec, HostFamily, Platform, os_flags, posix, prefixed_path,
+    rpythonroot,
+};
 
 pub(super) const RELEVANT_ENVIRON: &[&str] = &["PATH", "INCLUDE", "LIB"];
 
-/// `MsvcPlatform` (`Windows` / `Windows_x64`).
+/// `MsvcPlatform` returned by the `Windows` / `Windows_x64` factory functions.
+/// Those names are factories, not classes; `class_name` is `MsvcPlatform`.
+/// `x64` still selects `ml64.exe` vs `ml.exe`.
 pub(super) fn msvc_platform(host_triple: String, x64: bool) -> Platform {
     let masm_name = if x64 { "ml64.exe" } else { "ml.exe" };
-    Platform::from_spec(
+    let mut plat = Platform::from_spec(
         host_triple,
         FamilySpec {
             name: "msvc".to_string(),
-            class_name: if x64 { "Windows_x64" } else { "Windows" },
+            class_name: "MsvcPlatform",
             family: HostFamily::Msvc,
             relevant_environ: RELEVANT_ENVIRON,
             cflags: os_flags(["/MD", "/O2"]),
@@ -33,7 +38,15 @@ pub(super) fn msvc_platform(host_triple: String, x64: bool) -> Platform {
             link_path: PathBuf::from("link.exe"),
             masm_path: PathBuf::from(masm_name),
         },
-    )
+    );
+    // `MsvcPlatform.__init__` calls `patch_os_env(self.externals)` then
+    // `self.c_environ = os.environ.copy()`. Process-wide `set_var` is not
+    // used (unsafe in this edition and races other threads); the pairs are
+    // applied per compiler/linker/masm `Command`.
+    plat.c_environ_patch = patch_os_env(&rpythonroot().join("externals"), |name| {
+        std::env::var(name).ok()
+    });
+    plat
 }
 
 /// `MingwPlatform`.
@@ -44,7 +57,7 @@ pub(super) fn mingw_platform(host_triple: String) -> Platform {
             name: "mingw32".to_string(),
             class_name: "MingwPlatform",
             family: HostFamily::Mingw,
-            relevant_environ: RELEVANT_ENVIRON,
+            relevant_environ: posix::RELEVANT_ENVIRON,
             cflags: os_flags(["-O3"]),
             link_flags: Vec::new(),
             standalone_only: Vec::new(),
@@ -174,6 +187,35 @@ pub(super) fn msvc_link_invocation(
 /// `MsvcPlatform._exportsymbols_link_flags` (inherits `Platform` → empty).
 pub(super) fn msvc_exportsymbols_link_flags() -> Vec<OsString> {
     Vec::new()
+}
+
+/// `patch_os_env` (`windows.py`). Returns the `(name, new_value)` pairs
+/// upstream would write into `os.environ`. The `not in` tests are substring
+/// checks; PATH/INCLUDE/LIB use `;` and `\bin`/`\include`/`\lib` suffixes.
+pub(super) fn patch_os_env(
+    externals: &Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let externals = externals.to_string_lossy();
+    let binpath = format!(r"{externals}\bin");
+    let mut out = Vec::new();
+    if let Some(path) = get("PATH")
+        && !path.contains(&binpath)
+    {
+        out.push(("PATH".to_string(), format!("{binpath};{path}")));
+    }
+    let include = get("INCLUDE").unwrap_or_default();
+    if !include.contains(externals.as_ref()) {
+        out.push((
+            "INCLUDE".to_string(),
+            format!(r"{externals}\include;{include}"),
+        ));
+    }
+    let lib = get("LIB").unwrap_or_default();
+    if !lib.contains(externals.as_ref()) {
+        out.push(("LIB".to_string(), format!(r"{externals}\lib;{lib}")));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -309,5 +351,34 @@ mod tests {
         let compile = plat._compile_args_from_eci(&ExternalCompilationInfo::default(), true);
         assert!(compile.iter().any(|flag| flag == "-O3"));
         assert!(compile.iter().all(|flag| flag != "-pthread"));
+    }
+
+    #[test]
+    fn patch_os_env_prepends_missing_and_skips_present() {
+        let ext = Path::new(r"C:\externals");
+        let without_bin = |name: &str| match name {
+            "PATH" => Some(r"C:\Windows".to_string()),
+            _ => None,
+        };
+        let patched = patch_os_env(ext, without_bin);
+        let path = patched
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(path, Some(r"C:\externals\bin;C:\Windows"));
+        let include = patched
+            .iter()
+            .find(|(k, _)| k == "INCLUDE")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(include, Some(r"C:\externals\include;"));
+
+        let already = |name: &str| match name {
+            "PATH" => Some(r"C:\externals\bin;C:\Windows".to_string()),
+            "INCLUDE" => Some(r"C:\externals\include;".to_string()),
+            "LIB" => Some(r"C:\externals\lib;".to_string()),
+            _ => None,
+        };
+        let patched = patch_os_env(ext, already);
+        assert!(patched.iter().all(|(k, _)| k != "PATH"));
     }
 }

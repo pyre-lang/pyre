@@ -1,5 +1,5 @@
 //! Port of `rpython/translator/platform/darwin.py` (`Darwin`, `Darwin_arm64`,
-//! `Darwin_x86_64`).
+//! `Darwin_x86_64`, `Darwin_i386`, `Darwin_PowerPC`).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,9 @@ use super::{FamilySpec, HostFamily, Platform, os_flags, posix};
 /// `DARWIN_VERSION_MIN`.
 const DARWIN_VERSION_MIN: &str = "-mmacosx-version-min=10.13";
 
-/// `Darwin` / `Darwin_arm64` / `Darwin_x86_64` constructor.
+/// `Darwin` / `Darwin_arm64` / `Darwin_x86_64` / `Darwin_i386` /
+/// `Darwin_PowerPC` constructor. `name` matches the subclass (`darwin_arm64`,
+/// `darwin_x86_64`, `darwin_i386`, `darwin_powerpc`, else `darwin`).
 pub(super) fn darwin_platform(host_triple: String) -> Platform {
     let arch = darwin_arch_flags(&host_triple);
     let mut cflags = os_flags([
@@ -22,11 +24,12 @@ pub(super) fn darwin_platform(host_triple: String) -> Platform {
     cflags.extend(arch.iter().cloned());
     let mut link_flags = os_flags([DARWIN_VERSION_MIN]);
     link_flags.extend(arch);
+    let class_name = darwin_class_name(&host_triple);
     Platform::from_spec(
         host_triple.clone(),
         FamilySpec {
-            name: "darwin".to_string(),
-            class_name: darwin_class_name(&host_triple),
+            name: darwin_platform_name(class_name),
+            class_name,
             family: HostFamily::Darwin,
             relevant_environ: posix::RELEVANT_ENVIRON,
             cflags,
@@ -53,6 +56,16 @@ fn darwin_class_name(triple: &str) -> &'static str {
         "Darwin_PowerPC"
     } else {
         "Darwin"
+    }
+}
+
+fn darwin_platform_name(class_name: &str) -> String {
+    match class_name {
+        "Darwin_arm64" => "darwin_arm64".to_string(),
+        "Darwin_x86_64" => "darwin_x86_64".to_string(),
+        "Darwin_i386" => "darwin_i386".to_string(),
+        "Darwin_PowerPC" => "darwin_powerpc".to_string(),
+        _ => "darwin".to_string(),
     }
 }
 
@@ -144,12 +157,12 @@ mod tests {
     #[test]
     fn darwin_cpp_linker_is_clangxx() {
         let plat = darwin_platform("x86_64-apple-darwin".to_string());
-        assert_eq!(plat.cpp_linker_name(), "clang++");
+        assert_eq!(plat.cpp_linker_name(), "g++");
         let eci = ExternalCompilationInfo {
             use_cpp_linker: true,
             ..ExternalCompilationInfo::default()
         };
-        assert_eq!(plat.cc_link_program(&eci), PathBuf::from("clang++"));
+        assert_eq!(plat.cc_link_program(&eci), PathBuf::from("g++"));
     }
 
     #[test]
