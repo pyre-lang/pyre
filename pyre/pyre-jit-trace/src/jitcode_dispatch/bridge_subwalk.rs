@@ -1516,32 +1516,87 @@ pub(crate) enum FrameHandlerEntry {
 
 /// Seed one bridge-resume shadow slot.
 ///
-/// A `Ref` whose OpRef is `NONE` has no box. `_opimpl_getarrayitem_vable`
-/// returns the box, so that copy is not stored. `Int` / `Float` and a
-/// boxed or constant `Ref` are.
+/// `resume.py rebuild_from_resumedata` / `consume_boxes` fill
+/// `MIFrame.registers_r` with boxes that already carry values. An
+/// uninitialized register is `None` (absent), never a box without a
+/// value. `NONE`+`Void` stays absent. A `Ref` whose OpRef is `NONE` has
+/// no box (`_opimpl_getarrayitem_vable` returns the box), so that copy
+/// is not stored. A SOME opref needs a reconstructable concrete
+/// (`Int` / `Float` / `Ref` other than `GcRef::NO_CONCRETE`); `Void`
+/// and `Ref(NO_CONCRETE)` decline rather than leave a 4e/4d hole.
 fn seed_bridge_shadow_concrete(
     shadow: &mut CalleeLocalsShadow,
     frame_reg: u16,
     slot: i64,
     opref: OpRef,
     value: Value,
-) {
-    if opref.is_none() && matches!(value, Value::Ref(_)) {
-        return;
+    pc: usize,
+) -> Result<(), DispatchError> {
+    if !opref.is_none() && !vable_store_concrete_is_reconstructable(value) {
+        return Err(DispatchError::VableArrayValueNotConcrete { pc, value: opref });
     }
+    if opref.is_none() && matches!(value, Value::Ref(_)) {
+        return Ok(());
+    }
+    shadow.set_opref(slot, opref);
     shadow.set_concrete(frame_reg, slot, value);
+    Ok(())
+}
+
+/// Keep-or-discard choice when the carrier region cannot be supplied.
+///
+/// `virtualizable.py write_boxes` always has every box, so a publish
+/// failure is a producer deviation tracked separately — not a state
+/// `blackhole.py convert_and_run_from_pyjitpl` can be in. A deeper
+/// helper's complete image must still resume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CarrierPublishFailure {
+    KeepDeeperImage,
+    DiscardCarrierImage,
+}
+
+/// Who owns the latched image when carrier publish fails.
+///
+/// `image_latched_before` is [`abort_blackhole_latched`] sampled at
+/// [`latch_bridge_abort_and_publish_carrier_locals`] entry, before this
+/// tail's own latch. `accepted` is this call's own carrier latch.
+pub(crate) fn carrier_publish_failure_disposition(
+    image_latched_before: bool,
+    accepted: bool,
+) -> CarrierPublishFailure {
+    match (image_latched_before, accepted) {
+        (true, true) | (true, false) => CarrierPublishFailure::KeepDeeperImage,
+        (false, true) | (false, false) => CarrierPublishFailure::DiscardCarrierImage,
+    }
+}
+
+fn apply_carrier_publish_failure(
+    session: &std::cell::RefCell<WalkSession>,
+    image_latched_before: bool,
+    accepted: bool,
+) -> bool {
+    match carrier_publish_failure_disposition(image_latched_before, accepted) {
+        CarrierPublishFailure::KeepDeeperImage => accepted,
+        CarrierPublishFailure::DiscardCarrierImage => {
+            discard_staged_abort(session);
+            false
+        }
+    }
 }
 
 /// Abort-image decision for a reconstructed carrier, then publish its
 /// [`CalleeLocalsShadow`] onto the concrete `PyFrame` when a blackhole
 /// image will resume.
 ///
-/// `virtualizable.py write_boxes` publishes every box before
+/// `virtualizable.py write_boxes` always has every box before
 /// `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
-/// A carrier region that cannot be supplied — a written slot with no
-/// reconstructable concrete half — discards the latched image
-/// (`discard_staged_abort`), as `materialize_published_callee_locals`
-/// returning `Some(false)` does on the residual force path.
+/// A written slot without a reconstructable concrete half is a producer
+/// deviation tracked separately. On that hole, or a broken flush
+/// invariant, `debug_assert` and keep an image a deeper helper already
+/// latched; `discard_staged_abort` only the carrier image this call just
+/// staged. Discarding a complete deeper image would force guard replay,
+/// and `handle_guard_failure` converts through
+/// `run_blackhole_interp_to_cancel_tracing` without replaying.
 ///
 /// `blackhole_if_trace_too_long` stops in the innermost MIFrame. Preserve
 /// the image that frame already captured while the error unwinds, as `walk`
@@ -1556,35 +1611,38 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
     concrete_callee_frame: *mut pyre_interpreter::PyFrame,
     portal_frame_reg: u16,
 ) -> bool {
-    let accepted =
-        if matches!(error, DispatchError::TraceTooLong { .. }) && abort_blackhole_latched() {
-            false
-        } else if abort_blackhole_latched() && error.leaves_complete_image() {
-            // A deeper helper already staged its MIFrame. Replacing that
-            // image with a carrier-rooted latch would resume the CALL
-            // whose body already ran (`SwitchToBlackhole` just unwinds).
-            false
-        } else if error.is_clean_decline() {
-            // The refuse is a clean decline of a speculative inline
-            // (`pyjitpl.py do_residual_call`), not
-            // `run_blackhole_interp_to_cancel_tracing`, so no carrier
-            // image is latched; the outermost `BinopRewindInlineGuard`
-            // entry residualizes the operator.
-            false
-        } else {
-            latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
-        };
+    // Sampled at entry, before this tail's own latch, so a publish
+    // failure can tell a deeper helper's image from the carrier image
+    // staged below.
+    let image_latched_before = abort_blackhole_latched();
+    let accepted = if matches!(error, DispatchError::TraceTooLong { .. }) && image_latched_before {
+        false
+    } else if image_latched_before && error.leaves_complete_image() {
+        // A deeper helper already staged its MIFrame. Replacing that
+        // image with a carrier-rooted latch would resume the CALL
+        // whose body already ran (`SwitchToBlackhole` just unwinds).
+        false
+    } else if error.is_clean_decline() {
+        // The refuse is a clean decline of a speculative inline
+        // (`pyjitpl.py do_residual_call`), not
+        // `run_blackhole_interp_to_cancel_tracing`, so no carrier
+        // image is latched; the outermost `BinopRewindInlineGuard`
+        // entry residualizes the operator.
+        false
+    } else {
+        latch_abort_blackhole(sub_wc, error.stop_pc(), "bridge1361")
+    };
     // The carrier frame keeps locals in its shadow
     // (`InlineConcreteFrameGuard` is not installed on this walk).
-    // `virtualizable.py write_boxes` publishes every box before
+    // `virtualizable.py write_boxes` always has every box before
     // `blackhole.py convert_and_run_from_pyjitpl` copies MIFrame registers.
     // The blackhole resumes from whichever image is latched, deeper helper's
     // or this carrier's; the carrier's locals live in `CalleeLocalsShadow`,
-    // so the region is flushed whenever any image will resume. A region that
-    // cannot be supplied discards that image (`discard_staged_abort`), as
-    // `materialize_published_callee_locals` returning `Some(false)` does.
-    // When no image is latched the walk's writes are discarded with it, so
-    // the flush stays off.
+    // so the region is flushed whenever any image will resume. A hole here
+    // is a producer deviation tracked separately: keep a deeper helper's
+    // already-latched image, and discard only the carrier image this call
+    // just staged. When no image is latched the walk's writes are discarded
+    // with it, so the flush stays off.
     if accepted || abort_blackhole_latched() {
         match publish_callee_locals_region(
             &sub_wc.frame_state,
@@ -1593,10 +1651,17 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
         ) {
             CalleeLocalsPublish::Written => {}
             CalleeLocalsPublish::Unreconstructable => {
-                discard_staged_abort(sub_wc.session);
-                return false;
+                let result =
+                    apply_carrier_publish_failure(sub_wc.session, image_latched_before, accepted);
+                debug_assert!(
+                    false,
+                    "carrier shadow hole; the producer wrote a slot without a concrete value"
+                );
+                return result;
             }
             CalleeLocalsPublish::BrokenInvariant => {
+                let result =
+                    apply_carrier_publish_failure(sub_wc.session, image_latched_before, accepted);
                 debug_assert!(
                     false,
                     "carrier locals flush hit a broken invariant \
@@ -1604,8 +1669,7 @@ pub(crate) fn latch_bridge_abort_and_publish_carrier_locals<Sym: WalkSym>(
                      no shadow, frame_reg mismatch, stale Void, or \
                      store_pinned_frame_locals failure)"
                 );
-                discard_staged_abort(sub_wc.session);
-                return false;
+                return result;
             }
         }
     }
@@ -2148,21 +2212,19 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // `getarrayitem_vable(frame, slot)` read fold to its value, so a nested
         // self-recursive call's int arg is known (`arg_is_int`) and the call
         // folds to `CALL_ASSEMBLER` instead of declining.
-        for (slot, &opref) in local_oprefs.iter().enumerate() {
-            sub_wc
-                .frame_state
-                .borrow_mut()
-                .callee_shadow
-                .as_mut()
-                .unwrap()
-                .set_opref(slot as i64, opref);
-        }
-        for (slot, &v) in rooted_local_concretes.iter().enumerate() {
+        // Pair opref and concrete: `rebuild_from_resumedata` / `consume_boxes`
+        // never install a box without a value.
+        let n_local = local_oprefs.len().max(rooted_local_concretes.len());
+        for slot in 0..n_local {
             let opref = local_oprefs
                 .get(slot)
                 .copied()
                 .unwrap_or(majit_ir::OpRef::NONE);
-            seed_bridge_shadow_concrete(
+            let v = rooted_local_concretes
+                .get(slot)
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            if let Err(error) = seed_bridge_shadow_concrete(
                 sub_wc
                     .frame_state
                     .borrow_mut()
@@ -2173,7 +2235,15 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 slot as i64,
                 opref,
                 v,
-            );
+                entry,
+            ) {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[bridge-seed] local slot={slot} opref={opref:?} value={v:?} error={error:?}"
+                    );
+                }
+                return Some(Err(error));
+            }
         }
         // The decoded multi-frame recipe carries this callee's semantic
         // operand stack after its locals/cells prefix.  Preserve that red
@@ -2181,21 +2251,17 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // from it; dropping these slots collapses bridge resume onto the root
         // frame and later CALL operands reconstruct as NULL.
         let stack_base = local_oprefs.len();
-        for (s, &opref) in resumed_stack_oprefs.iter().enumerate() {
-            sub_wc
-                .frame_state
-                .borrow_mut()
-                .callee_shadow
-                .as_mut()
-                .unwrap()
-                .set_opref((stack_base + s) as i64, opref);
-        }
-        for (s, &value) in rooted_stack_concretes.iter().enumerate() {
+        let n_stack = resumed_stack_oprefs.len().max(rooted_stack_concretes.len());
+        for s in 0..n_stack {
             let opref = resumed_stack_oprefs
                 .get(s)
                 .copied()
                 .unwrap_or(majit_ir::OpRef::NONE);
-            seed_bridge_shadow_concrete(
+            let value = rooted_stack_concretes
+                .get(s)
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            if let Err(error) = seed_bridge_shadow_concrete(
                 sub_wc
                     .frame_state
                     .borrow_mut()
@@ -2206,7 +2272,16 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 (stack_base + s) as i64,
                 opref,
                 value,
-            );
+                entry,
+            ) {
+                if fbw_debug_abort_enabled() {
+                    eprintln!(
+                        "[bridge-seed] stack slot={} opref={opref:?} value={value:?} error={error:?}",
+                        stack_base + s
+                    );
+                }
+                return Some(Err(error));
+            }
         }
         if let Some(frame) = ActiveResumeFrame::current(session, root_sym_ptr)
             && frame.0.jitcode.code.as_ptr() == callee_code.as_ptr()
@@ -2652,23 +2727,23 @@ mod bridge_seed_tests {
     fn seed_bridge_shadow_concrete_skips_a_ref_with_no_box() {
         let mut shadow = CalleeLocalsShadow::default();
         let copied = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
-        seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, copied);
+        seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, copied, 0).unwrap();
         assert!(shadow.concrete.get(&0).is_none());
         assert!(shadow.opref.get(&0).is_none());
 
-        seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Int(7));
+        seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Int(7), 0).unwrap();
         assert_eq!(
             shadow.concrete.get(&1).map(|entry| entry.value),
             Some(Value::Int(7))
         );
-        seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Float(1.25));
+        seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Float(1.25), 0).unwrap();
         assert_eq!(
             shadow.concrete.get(&1).map(|entry| entry.value),
             Some(Value::Float(1.25))
         );
 
         let boxed = OpRef::input_arg_ref(0);
-        seed_bridge_shadow_concrete(&mut shadow, 4, 2, boxed, copied);
+        seed_bridge_shadow_concrete(&mut shadow, 4, 2, boxed, copied, 0).unwrap();
         assert_eq!(
             shadow
                 .concrete
@@ -2676,6 +2751,7 @@ mod bridge_seed_tests {
                 .map(|entry| (entry.frame_reg, entry.value)),
             Some((4, copied))
         );
+        assert_eq!(shadow.opref.get(&2).copied(), Some(boxed));
 
         let constant = OpRef::const_ptr(majit_ir::GcRef(pyre_object::w_bool_from(true) as usize));
         seed_bridge_shadow_concrete(
@@ -2684,7 +2760,58 @@ mod bridge_seed_tests {
             3,
             constant,
             Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(true) as usize)),
-        );
+            0,
+        )
+        .unwrap();
         assert!(shadow.concrete.get(&3).is_some());
+        assert_eq!(shadow.opref.get(&3).copied(), Some(constant));
+    }
+
+    #[test]
+    fn seed_bridge_shadow_concrete_declines_some_opref_with_void() {
+        let mut shadow = CalleeLocalsShadow::default();
+        let boxed = OpRef::input_arg_ref(0);
+        assert_eq!(
+            seed_bridge_shadow_concrete(&mut shadow, 4, 0, boxed, Value::Void, 0),
+            Err(DispatchError::VableArrayValueNotConcrete {
+                pc: 0,
+                value: boxed
+            })
+        );
+        assert!(shadow.opref.get(&0).is_none());
+        assert!(shadow.concrete.get(&0).is_none());
+    }
+
+    #[test]
+    fn seed_bridge_shadow_concrete_declines_some_opref_with_no_concrete() {
+        let mut shadow = CalleeLocalsShadow::default();
+        let boxed = OpRef::input_arg_ref(0);
+        assert_eq!(
+            seed_bridge_shadow_concrete(
+                &mut shadow,
+                4,
+                0,
+                boxed,
+                Value::Ref(majit_ir::GcRef::NO_CONCRETE),
+                0
+            ),
+            Err(DispatchError::VableArrayValueNotConcrete {
+                pc: 0,
+                value: boxed
+            })
+        );
+        assert!(shadow.opref.get(&0).is_none());
+        assert!(shadow.concrete.get(&0).is_none());
+    }
+
+    #[test]
+    fn seed_bridge_shadow_concrete_none_void_stays_absent() {
+        let mut shadow = CalleeLocalsShadow::default();
+        assert_eq!(
+            seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, Value::Void, 0),
+            Ok(())
+        );
+        assert!(shadow.opref.get(&0).is_none());
+        assert!(shadow.concrete.get(&0).is_none());
     }
 }

@@ -2649,11 +2649,22 @@ impl TraceCtx {
         self.active_bridge_inline_carrier.as_deref()
     }
 
+    /// A Ref that names a real object. Null and [`GcRef::NO_CONCRETE`] are
+    /// not objects (`resume.py consume_boxes`) and are never forwarded.
+    /// Shared with `rooted_recipe_ref`.
+    pub fn is_live_object_ref(value: Value) -> bool {
+        matches!(value, Value::Ref(r) if !r.is_null() && r != GcRef::NO_CONCRETE)
+    }
+
     /// `box.getref_base()` of each Ref register of `recipe`: `concrete_r` was
     /// read off the guard's deadframe when the carrier was decoded, and a
     /// collection since then moved the objects it names. The register boxes
     /// are roots while the carrier is active, so their `_resref` is current.
     /// A slot whose box has no Ref concrete keeps the decoded value.
+    /// `resume.py rebuild_from_resumedata` / `consume_boxes` fill
+    /// `MIFrame.registers_r` with boxes that already carry values;
+    /// `GcRef::NO_CONCRETE` is not an object and is never forwarded
+    /// (`rooted_recipe_ref`).
     pub fn reconstruct_recipe_with_current_refs(
         &self,
         recipe: &ReconstructRecipe,
@@ -2669,7 +2680,9 @@ impl TraceCtx {
             if opref.is_none() {
                 continue;
             }
-            if let Some(value @ Value::Ref(_)) = self.concrete_of_opref(opref) {
+            if let Some(value) = self.concrete_of_opref(opref)
+                && Self::is_live_object_ref(value)
+            {
                 *slot = value;
             }
         }
@@ -8720,6 +8733,41 @@ mod tests {
             ctx.recover_ref_value(known, 8),
             Some(Value::Ref(majit_ir::GcRef(0x1000)))
         );
+    }
+
+    /// A captured live Ref whose box is stamped `NO_CONCRETE` keeps the
+    /// captured pointer. `resume.py consume_boxes` never forwards that
+    /// sentinel (`rooted_recipe_ref`).
+    #[test]
+    fn reconstruct_recipe_with_current_refs_keeps_captured_live_ref_when_box_is_no_concrete() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let opref = ctx.recorder.inputargs()[0].opref();
+        let captured = Value::Ref(majit_ir::GcRef(0x5c100));
+        assert!(ctx.try_set_opref_concrete(opref, Value::Ref(majit_ir::GcRef::NO_CONCRETE)));
+        assert_eq!(
+            ctx.concrete_of_opref(opref),
+            Some(Value::Ref(majit_ir::GcRef::NO_CONCRETE))
+        );
+        let recipe = ReconstructRecipe {
+            code_ptr: std::ptr::null(),
+            jitcode_index: 0,
+            jitcode_pc: 0,
+            nlocals: 1,
+            valuestackdepth: 0,
+            registers_i: Vec::new(),
+            registers_r: vec![opref],
+            registers_f: Vec::new(),
+            concrete_r: vec![captured],
+            registers_r_color: Vec::new(),
+            frame: majit_ir::OpRef::NONE,
+            nargs: 0,
+            ctor_tail: false,
+            len_tail: false,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
+        };
+        let current = ctx.reconstruct_recipe_with_current_refs(&recipe);
+        assert_eq!(current.concrete_r[0], captured);
     }
 
     /// With no cpu wired, `field_sanity_load` returns `None` —

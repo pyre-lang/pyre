@@ -19853,6 +19853,285 @@ fn nested_helper_trace_too_long_does_not_replay_the_parent_call() {
     reset_single_frame_blackhole();
 }
 
+fn install_named_helper_jitcode(
+    name: &str,
+    code: Vec<u8>,
+    startpoints: impl IntoIterator<Item = usize>,
+    num_regs_i: u8,
+    num_regs_r: u8,
+) -> usize {
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new(name);
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some(startpoints.into_iter().collect()),
+        c_num_regs_i: num_regs_i,
+        c_num_regs_r: num_regs_r,
+        ..Default::default()
+    });
+    let jitcode = std::sync::Arc::new(runtime_jc);
+    // Unique source so `canonical_code_key_opt` does not collapse onto the
+    // null-key `guard_resume_test` slot `fresh_trace_ctx` installs.
+    let source = format!("{name} = None");
+    let py_code = pyre_interpreter::compile_exec(&source).expect("test code should compile");
+    let raw = Box::into_raw(Box::new(py_code));
+    let _wrapper = pyre_interpreter::w_code_new(raw as *const ());
+    let mut pyjit = crate::PyJitCode::skeleton(raw);
+    pyjit.jitcode = jitcode;
+    let installed = crate::state::install_jitcode_for(raw as *const (), std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*installed).index as usize };
+    assert!(
+        index >= crate::jitcode_runtime::jitcode_count(),
+        "test helper must sit above the build-time table, got {index}"
+    );
+    let resolved = super::residual_call::helper_jitcode_arc(index)
+        .expect("installed helper jitcode must resolve");
+    assert_eq!(resolved.name(), name);
+    index
+}
+
+struct ClearTestHelperArm;
+
+impl Drop for ClearTestHelperArm {
+    fn drop(&mut self) {
+        super::inline_call::clear_test_helper_abort_arm();
+    }
+}
+
+/// Nested helper that applies an effect, then a later opcode aborts with
+/// `OrthodoxSubWalkTraceUnsupported`. `arm` runs after the helper jitcodes
+/// are installed and before `walk`.
+fn probe_nested_helper_later_abort(
+    grandchild_name: &'static str,
+    child_name: &'static str,
+    arm: impl FnOnce(usize, usize),
+) -> (
+    Result<(DispatchOutcome, usize), DispatchError>,
+    Option<LatchedMultiFrameBlackhole>,
+    u64,
+    u64,
+) {
+    let _clear = ClearTestHelperArm;
+    let void_ret = *insns_opname_to_byte()
+        .get("void_return/")
+        .expect("`void_return/` must be in insns table");
+    let inline_byte = *insns_opname_to_byte()
+        .get("inline_call_ir_v/dIR")
+        .expect("`inline_call_ir_v/dIR` must be in insns table");
+    let int_add = *insns_opname_to_byte()
+        .get("int_add/ii>i")
+        .expect("`int_add/ii>i` must be in insns table");
+    let fail_pc = 4;
+    let grandchild_code: &'static [u8] = Box::leak(Box::new([int_add, 0, 1, 2, int_add, 0, 1, 2]));
+    let child_code: &'static [u8] = Box::leak(Box::new([
+        inline_byte,
+        0x08,
+        0x00,
+        0x02,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        void_ret,
+    ]));
+    let mut tc = fresh_trace_ctx();
+    let grandchild_index = install_named_helper_jitcode(
+        grandchild_name,
+        grandchild_code.to_vec(),
+        [0_usize, fail_pc],
+        3,
+        1,
+    );
+    let child_index =
+        install_named_helper_jitcode(child_name, child_code.to_vec(), [0_usize, 8], 3, 1);
+    let grandchild_body = SubJitCodeBody {
+        code: grandchild_code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: Some(grandchild_index),
+    };
+    let child_body = SubJitCodeBody {
+        code: child_code,
+        num_regs_r: 1,
+        num_regs_i: 3,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: Some(child_index),
+    };
+    let lookup = {
+        let child_body = child_body.clone();
+        let grandchild_body = grandchild_body.clone();
+        move |idx: usize| match idx {
+            7 => Some(child_body.clone()),
+            8 => Some(grandchild_body.clone()),
+            _ => None,
+        }
+    };
+    let caller_code = [
+        inline_byte,
+        0x07,
+        0x00,
+        0x02,
+        0x00,
+        0x01,
+        0x01,
+        0x00,
+        void_ret,
+    ];
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let a = dummy_int_add_box(&mut tc);
+    let b = dummy_int_add_box(&mut tc);
+    let mut concrete_i = [
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+        ConcreteValue::Int(0),
+    ];
+    let regs_i = [a, b, a];
+    tc.clear_merge_points();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    arm(grandchild_index, child_index);
+    let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    descr_pool[7] = make_jitcode_descr(7);
+    descr_pool[8] = make_jitcode_descr(8);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let (_direct_before, replay_before) = super::subwalk_resume_counts();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            transparent_helper_effects_at_entry: Some(0),
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = walk(&caller_code, 0, &mut wc);
+    let (_direct_after, replay_after) = super::subwalk_resume_counts();
+    drop(wc);
+    let latched = take_multi_frame_blackhole();
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+    (result, latched, replay_before, replay_after)
+}
+
+/// Journaled GC stores are undone by the cut, so residualizing the CALL is
+/// `do_residual_call`. Convert would abort the portal walk.
+#[test]
+fn helper_journaled_store_then_later_abort_residualizes() {
+    let (result, latched, _, _) = probe_nested_helper_later_abort(
+        "journaled_nested_grandchild_abort",
+        "journaled_nested_child_abort",
+        |grandchild, _child| {
+            super::inline_call::arm_test_helper_journaled_then_abort(grandchild, 4);
+        },
+    );
+    assert!(
+        latched.is_none(),
+        "a journaled helper decline must not convert"
+    );
+    assert!(
+        !abort_blackhole_latched(),
+        "a journaled helper decline must not leave a staged image"
+    );
+    assert!(
+        result.is_ok()
+            || matches!(
+                result,
+                Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
+            ),
+        "caller residualizes (production list.append wrapper returns Ok(None); \
+         synthetic fnaddr 0 may surface the same decline class): {result:?}"
+    );
+}
+
+/// An unjournaled residual / heap-writing bump since the helper CALL cannot
+/// be undone by the cut. Convert the live framestack
+/// (`run_blackhole_interp_to_cancel_tracing` /
+/// `convert_and_run_from_pyjitpl`).
+#[test]
+fn helper_unjournaled_residual_then_later_abort_converts() {
+    let (result, latched, replay_before, replay_after) = probe_nested_helper_later_abort(
+        "unjournaled_nested_grandchild_abort",
+        "unjournaled_nested_child_abort",
+        |grandchild, _child| {
+            super::inline_call::arm_test_helper_unjournaled_then_abort(grandchild, 4);
+        },
+    );
+    assert!(
+        matches!(
+            result,
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 4, .. })
+        ),
+        "grandchild later abort must stay OrthodoxSubWalkTraceUnsupported: {result:?}"
+    );
+    let latched = latched.expect("unjournaled nested helper abort must latch a multi-frame image");
+    let top = latched
+        .framestack
+        .frames
+        .last()
+        .expect("a latched helper image has a top frame");
+    assert_eq!(latched.origin, "mod2730-helper");
+    let names: Vec<(String, usize)> = latched
+        .framestack
+        .frames
+        .iter()
+        .map(|frame| (frame.jitcode.name().to_string(), frame.pc))
+        .collect();
+    assert_eq!(
+        top.jitcode.name(),
+        "unjournaled_nested_grandchild_abort",
+        "latched frames={names:?}"
+    );
+    assert_eq!(
+        top.pc, 4,
+        "MIFrame.pc is the failing opcode_position (`_get_opimpl_method`)"
+    );
+    assert!(
+        latched.framestack.frames.len() >= 2,
+        "convert_and_run_from_pyjitpl copies the live helper stack, got {names:?}"
+    );
+    assert_eq!(
+        replay_after, replay_before,
+        "SubWalkDriver must not replay the parent CALL after an unrewindable nested abort"
+    );
+}
+
 /// Finding 2: a helper JitCode is a real `MIFrame` identity. Filling its
 /// banks at a post-step pc is what `_copy_data_from_miframe` does for that
 /// frame; the blackhole then `setposition`s onto the helper body.
@@ -20203,6 +20482,39 @@ fn helper_residual_effect_without_live_after_does_not_infer_next_pc() {
     );
     fbw_store_journal_reset();
     reset_single_frame_blackhole();
+}
+
+/// A helper abort image resumes at the published `live_after` when that
+/// coordinate equals the decoded `next_pc`. `MIFrame._get_opimpl_method`
+/// (`pyjitpl.py`) advances `self.pc` past the opimpl;
+/// `_copy_data_from_miframe` (`blackhole.py`) copies that pc. Progress is
+/// the published coordinate, not the executed-effect counter.
+#[test]
+fn helper_abort_resume_pc_prefers_published_live_after() {
+    fbw_store_journal_reset();
+    let residual = residual_call_with_funcbox(0);
+    let opcode_position = 0;
+    let next_pc = crate::jitcode_runtime::decode_op_at(&residual, opcode_position)
+        .expect("residual_call_r_i must decode")
+        .next_pc;
+    let effects_at_step = fbw_executed_effect_count();
+    assert_eq!(
+        helper_abort_resume_pc(&residual, opcode_position, next_pc, effects_at_step),
+        Some(next_pc),
+        "live_after equal to next_pc is the completed opcode, counter irrelevant",
+    );
+    assert_eq!(
+        helper_abort_resume_pc(&residual, opcode_position, usize::MAX, effects_at_step),
+        Some(opcode_position),
+        "unset live_after with an unchanged counter resumes at opcode_position",
+    );
+    fbw_bump_executed_effect("test-helper-abort-resume-pc-moved-counter");
+    assert_eq!(
+        helper_abort_resume_pc(&residual, opcode_position, usize::MAX, effects_at_step),
+        None,
+        "an effect without a published live_after does not infer next_pc",
+    );
+    fbw_store_journal_reset();
 }
 
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
@@ -20598,14 +20910,36 @@ fn carrier_abort_tail_publishes_shadow_when_a_helper_image_is_latched() {
     reset_single_frame_blackhole();
 }
 
+/// A publish failure keeps a deeper helper's image and discards only this
+/// call's own carrier latch. `image_latched_before` is sampled at tail
+/// entry; `accepted` is this call's own latch.
+#[test]
+fn carrier_publish_failure_disposition_keeps_or_discards_by_who_latched() {
+    use CarrierPublishFailure::{DiscardCarrierImage, KeepDeeperImage};
+
+    let cases = [
+        (true, false, KeepDeeperImage),
+        (true, true, KeepDeeperImage),
+        (false, true, DiscardCarrierImage),
+        (false, false, DiscardCarrierImage),
+    ];
+    for (image_latched_before, accepted, want) in cases {
+        assert_eq!(
+            carrier_publish_failure_disposition(image_latched_before, accepted),
+            want,
+            "image_latched_before={image_latched_before} accepted={accepted}"
+        );
+    }
+}
+
 /// A written shadow slot with no reconstructable concrete (4e: opref and no
 /// concrete half; 4d: `GcRef::NO_CONCRETE`) cannot supply the carrier region.
-/// `virtualizable.py write_boxes` would have written every box; the residual
-/// force path declines the same hole (`materialize_published_callee_locals`
-/// `Some(false)`), so the abort tail discards the latched image rather than
-/// resuming on the unwritten array.
+/// `virtualizable.py write_boxes` always has every box; the hole is a
+/// producer deviation tracked separately. A deeper helper already latched a
+/// complete image, so the abort tail keeps that image rather than forcing
+/// `handle_guard_failure` to replay from the guard.
 #[test]
-fn carrier_abort_unreconstructable_shadow_discards_the_latched_image() {
+fn carrier_abort_unreconstructable_shadow_keeps_a_deeper_latched_image() {
     use majit_ir::{GcRef, Value};
 
     fn run(prepare_shadow: impl FnOnce(&mut CalleeLocalsShadow)) {
@@ -20696,23 +21030,35 @@ fn carrier_abort_unreconstructable_shadow_discards_the_latched_image() {
             "the abort tail's helper-preserve arm is the complete-image skip"
         );
 
-        let accepted = latch_bridge_abort_and_publish_carrier_locals(
-            &wc,
-            &error,
-            frame_ptr as *mut pyre_interpreter::PyFrame,
-            0,
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            latch_bridge_abort_and_publish_carrier_locals(
+                &wc,
+                &error,
+                frame_ptr as *mut pyre_interpreter::PyFrame,
+                0,
+            )
+        }));
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                outcome.is_err(),
+                "the tail debug_asserts a carrier shadow hole"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(
+                matches!(outcome, Ok(false)),
+                "an unreconstructable carrier region is not a carrier latch"
+            );
+        }
+        assert!(
+            abort_blackhole_latched(),
+            "the deeper helper image stays latched"
         );
         assert!(
-            !accepted,
-            "an unreconstructable carrier region is not a carrier latch"
-        );
-        assert!(
-            !abort_blackhole_latched(),
-            "the latched image must be discarded with the unwritten region"
-        );
-        assert!(
-            !session.borrow().abort_in_subwalk,
-            "discard_staged_abort drops the one-shot coordinate claim"
+            session.borrow().abort_in_subwalk,
+            "keeping the image leaves the one-shot coordinate claim"
         );
         let raw_after =
             crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
@@ -20734,6 +21080,89 @@ fn carrier_abort_unreconstructable_shadow_discards_the_latched_image() {
     run(|shadow| {
         shadow.set_concrete(0, 0, Value::Ref(GcRef::NO_CONCRETE));
     });
+}
+
+/// The abort tail `debug_assert`s a carrier shadow hole (4e) as a producer
+/// deviation `write_boxes` never sees.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "carrier shadow hole")]
+fn carrier_abort_unreconstructable_shadow_asserts_a_producer_hole() {
+    fbw_store_journal_reset();
+    reset_single_frame_blackhole();
+
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let mut shadow = CalleeLocalsShadow {
+        concrete_frame: frame_ptr,
+        code_ptr: &code,
+        ..Default::default()
+    };
+    shadow.set_opref(0, OpRef::ref_op(7));
+
+    let mut tc = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().abort_in_subwalk = true;
+    let lookup = { move |_idx: usize| None };
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            carrier_resume: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    stage_test_helper_abort_image();
+    let error = DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 };
+    let _accepted = latch_bridge_abort_and_publish_carrier_locals(
+        &wc,
+        &error,
+        frame_ptr as *mut pyre_interpreter::PyFrame,
+        0,
+    );
 }
 
 /// The bridge carrier abort tail declines a clean rewind refuse and keeps

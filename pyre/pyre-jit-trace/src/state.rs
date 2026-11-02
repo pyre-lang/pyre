@@ -16936,12 +16936,9 @@ pub(crate) fn rooted_recipe_ref(
     }
     // Only a real ref copy is stale. A Void or NULL slot is a hole; the
     // recorder may hold some other use of the same OpRef.
-    if let majit_ir::Value::Ref(captured_gc) = captured
-        && !captured_gc.is_null()
-        && captured_gc != majit_ir::GcRef::NO_CONCRETE
-        && let Some(live @ majit_ir::Value::Ref(gc)) = ctx.lookup_opref_concrete(opref)
-        && !gc.is_null()
-        && gc != majit_ir::GcRef::NO_CONCRETE
+    if TraceCtx::is_live_object_ref(captured)
+        && let Some(live) = ctx.lookup_opref_concrete(opref)
+        && TraceCtx::is_live_object_ref(live)
     {
         return live;
     }

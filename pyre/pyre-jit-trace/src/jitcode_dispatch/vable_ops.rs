@@ -663,6 +663,25 @@ fn ref_copy_without_box(value: OpRef, live: Value) -> bool {
     value.is_none() && matches!(live, Value::Ref(_))
 }
 
+/// `_opimpl_setarrayitem_vable` stores `valuebox`; `write_box_at` unwraps
+/// `getint` / `getref_base` / `getfloatstorage`. `Void` and
+/// `Ref(NO_CONCRETE)` are not a stored box value.
+pub(crate) fn vable_store_concrete_is_reconstructable(live: Value) -> bool {
+    match live {
+        Value::Int(_) | Value::Float(_) => true,
+        Value::Ref(r) => r != majit_ir::GcRef::NO_CONCRETE,
+        Value::Void => false,
+    }
+}
+
+fn vable_store_unreconstructable(pc: usize, value: OpRef, live: Value) -> Option<DispatchError> {
+    if value.is_none() || vable_store_concrete_is_reconstructable(live) {
+        None
+    } else {
+        Some(DispatchError::VableArrayValueNotConcrete { pc, value })
+    }
+}
+
 /// `publish_fresh_recipe_ref`: a real Ref is stamped on its box before any
 /// shadow copy. Constants and `NONE` have no recorder slot; null and
 /// `GcRef::NO_CONCRETE` are not objects.
@@ -689,16 +708,24 @@ fn live_after_vable_store(store_root: &VableStoreRoot, value_bank: char, capture
     }
 }
 
-/// Non-fold shadow publish. The box is stamped first. A `NONE` Ref is not
-/// written: there is no box to forward, and clearing the slot would drop a
-/// fold entry the root walker has already updated.
+/// Non-fold shadow publish. `_opimpl_setarrayitem_vable` writes `valuebox`
+/// into `virtualizable_boxes[index]`; `write_box_at` unwraps that box. A
+/// SOME OpRef therefore needs a reconstructable concrete (`Int` / `Float` /
+/// `Ref` other than `GcRef::NO_CONCRETE`); otherwise the walk declines
+/// rather than leaving a 4e/4d hole. The box is stamped first. A `NONE`
+/// Ref is not written: there is no box to forward, and clearing the slot
+/// would drop a fold entry the root walker has already updated.
 fn publish_nonfold_slot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
     frame_reg: u16,
     slot: i64,
     value: OpRef,
     live: Value,
-) {
+) -> Result<(), DispatchError> {
+    if let Some(err) = vable_store_unreconstructable(pc, value, live) {
+        return Err(err);
+    }
     stamp_real_ref_on_box(ctx.trace_ctx, value, live);
     // The `borrow_mut` temporary has to live for the whole shadow update.
     if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
@@ -707,6 +734,7 @@ fn publish_nonfold_slot<Sym: WalkSym>(
             shadow.set_concrete(frame_reg, slot, live);
         }
     }
+    Ok(())
 }
 
 /// `frame` when this walk is a generator resume writing its OWN suspended
@@ -1791,6 +1819,13 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     if index_value >= 0
         && let Some(frame) = own_frame_vable_store_target(ctx, vable)
     {
+        // `_opimpl_setarrayitem_vable` / `write_box_at` never store a box
+        // without a value. Decline before `store_live_frame_array_slot`,
+        // which would accept `Ref(NO_CONCRETE)` as an array word.
+        let live = live_after_vable_store(&store_root, value_bank, concrete);
+        if let Some(err) = vable_store_unreconstructable(op.pc, value, live) {
+            return Err(err);
+        }
         if let Some(frame) = durable_resume_frame(ctx, frame) {
             fbw_arm_durable_frame_undo(frame);
             fbw_note_generator_stack_store(GeneratorStackStore {
@@ -1804,16 +1839,12 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
         // Re-read after `vable_setarrayitem_checked`. The array store may
         // itself collect, so the shadow reads the pin again below.
-        crate::state::store_live_frame_array_slot(
-            frame,
-            index_value as usize,
-            live_after_vable_store(&store_root, value_bank, concrete),
-        );
+        crate::state::store_live_frame_array_slot(frame, index_value as usize, live);
         // Only this level's own frame: a store to a foreign vable must not
         // bind in `locals()` through this shadow. The published word is the
         // pin after both calls. A `NONE` Ref has no box and is not stored.
         let live = live_after_vable_store(&store_root, value_bank, concrete);
-        publish_nonfold_slot(ctx, code[op.pc + 1] as u16, index_value, value, live);
+        publish_nonfold_slot(ctx, op.pc, code[op.pc + 1] as u16, index_value, value, live)?;
     }
     let _ = _write;
     // A Ref stored to the operand-stack region of the vable array is an
@@ -2330,20 +2361,75 @@ mod callee_ref_owner_tests {
             Vec::new(),
             &raw_pool,
             |wc| {
-                publish_nonfold_slot(wc, 3, 1, value, live);
+                publish_nonfold_slot(wc, 0, 3, 1, value, live).unwrap();
                 assert_eq!(shadow_slot(wc, 1), Some(to_v));
                 assert_eq!(shadow_op(wc, 1), Some(value));
                 // `NONE` + `Ref` has no box. Do not store it, and do not
                 // clear the integer already in the slot.
-                publish_nonfold_slot(wc, 3, 0, OpRef::NONE, from_v);
+                publish_nonfold_slot(wc, 0, 3, 0, OpRef::NONE, from_v).unwrap();
                 assert_eq!(shadow_op(wc, 0), None);
                 assert_eq!(shadow_slot(wc, 0), Some(Value::Int(5)));
-                publish_nonfold_slot(wc, 3, 2, OpRef::NONE, Value::Int(9));
+                publish_nonfold_slot(wc, 0, 3, 2, OpRef::NONE, Value::Int(9)).unwrap();
                 assert_eq!(shadow_slot(wc, 2), Some(Value::Int(9)));
-                publish_nonfold_slot(wc, 3, 2, OpRef::NONE, Value::Float(1.5));
+                publish_nonfold_slot(wc, 0, 3, 2, OpRef::NONE, Value::Float(1.5)).unwrap();
                 assert_eq!(shadow_slot(wc, 2), Some(Value::Float(1.5)));
             },
         );
         assert_eq!(tc.concrete_of_opref(value), Some(to_v));
+    }
+
+    #[test]
+    fn publish_nonfold_slot_refuses_an_opref_without_a_concrete() {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let value = OpRef::input_arg_ref(0);
+        let shadow = CalleeLocalsShadow::default();
+        let raw_pool: Vec<majit_metainterp::jitcode::RuntimeBhDescr> = Vec::new();
+        with_ctx(
+            &mut tc,
+            Some(shadow),
+            &[],
+            &[],
+            Vec::new(),
+            &raw_pool,
+            |wc| {
+                assert_eq!(
+                    publish_nonfold_slot(wc, 0, 3, 1, value, Value::Void),
+                    Err(DispatchError::VableArrayValueNotConcrete { pc: 0, value })
+                );
+                assert_eq!(shadow_op(wc, 1), None);
+                assert_eq!(shadow_slot(wc, 1), None);
+            },
+        );
+    }
+
+    #[test]
+    fn publish_nonfold_slot_refuses_no_concrete_sentinel() {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let value = OpRef::input_arg_ref(0);
+        let shadow = CalleeLocalsShadow::default();
+        let raw_pool: Vec<majit_metainterp::jitcode::RuntimeBhDescr> = Vec::new();
+        with_ctx(
+            &mut tc,
+            Some(shadow),
+            &[],
+            &[],
+            Vec::new(),
+            &raw_pool,
+            |wc| {
+                assert_eq!(
+                    publish_nonfold_slot(
+                        wc,
+                        0,
+                        3,
+                        1,
+                        value,
+                        Value::Ref(majit_ir::GcRef::NO_CONCRETE)
+                    ),
+                    Err(DispatchError::VableArrayValueNotConcrete { pc: 0, value })
+                );
+                assert_eq!(shadow_op(wc, 1), None);
+                assert_eq!(shadow_slot(wc, 1), None);
+            },
+        );
     }
 }

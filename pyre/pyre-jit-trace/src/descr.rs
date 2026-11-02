@@ -4695,14 +4695,17 @@ pub fn w_list_size_descr() -> DescrRef {
 /// `_version_tag` / `name` / `mro_w`). `mutate_*_lock` is the second word
 /// `FUNCTION_DESCR_GROUP` declares for each `mutate_<name>`.
 ///
-/// `bases`, `dict`, `lifeline`, `w_qualname`, `w_doc`, `name`, `qualname`,
-/// and `w_class` are the other GC pointer slots
-/// `type_object_custom_trace` visits. A named `Type::Ref` row puts the
-/// slot in `gc_fielddescrs`, so `rewrite.py clear_gc_fields` zeros it on
-/// JIT NEW and `handle_write_barrier_setfield` emits `COND_CALL_GC_WB`
-/// for a `SETFIELD_GC`. `weak_subclasses` and `terminator` are walked
-/// too, but they are not MiniMark pointers (`Box` / `malloc_raw`
-/// intern_node); `extra_clear` birth-zeros them without a write barrier.
+/// `bases`, `dict`, `lifeline`, `w_qualname`, `w_doc`, `name`, and
+/// `qualname` are the other GC pointer slots `type_object_custom_trace`
+/// visits. A named `Type::Ref` row puts the slot in `gc_fielddescrs`, so
+/// `rewrite.py clear_gc_fields` zeros it on JIT NEW and
+/// `handle_write_barrier_setfield` emits `COND_CALL_GC_WB` for a
+/// `SETFIELD_GC`. `w_class` is the inherited `PyObject` header leaf
+/// (`descr.py get_field_descr(gccache, PyObject, "w_class")`), prepended
+/// the way `heaptracker.py all_fielddescrs` yields the parent's class
+/// word. `weak_subclasses` and `terminator` are walked too, but they are
+/// not MiniMark pointers (`Box` / `malloc_raw` intern_node); `extra_clear`
+/// birth-zeros them without a write barrier.
 ///
 /// `w_type_get_version_tag`'s Acquire load lowers to this row's getfield, and
 /// the stored bit makes the executable read Acquire. The Relaxed sibling
@@ -4751,7 +4754,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 flag,
                 virtualizable: false,
                 index_in_parent,
-                is_class_word: Some(false),
+                is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                 load_is_acquire,
             }
         };
@@ -4964,6 +4967,23 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
         let cache_key = majit_ir::descr::path_hash("typeobject::W_TypeObject");
         let type_id = pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
         let headerless = type_id == 0;
+        // `heaptracker.py all_fielddescrs` prepends
+        // `get_field_descr(gccache, PyObject, "w_class")`; drop a spec
+        // that names those bytes so the outer list holds one descr.
+        let payload: Vec<_> = specs
+            .into_iter()
+            .filter(|s| headerless || s.offset != pyre_object::pyobject::W_CLASS_OFFSET)
+            .enumerate()
+            .map(|(index_in_parent, mut spec)| {
+                spec.index_in_parent = index_in_parent;
+                spec
+            })
+            .collect();
+        let extra_gc: Vec<Arc<dyn FieldDescr>> = if headerless {
+            Vec::new()
+        } else {
+            vec![inherited_w_class_gc_edge()]
+        };
         let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             core::mem::size_of::<W_TypeObject>(),
@@ -4972,8 +4992,8 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
             &pyre_object::TYPE_TYPE as *const _ as usize,
             true,
             headerless,
-            &specs,
-            &[],
+            &payload,
+            &extra_gc,
         );
         group.size_descr.set_extra_clear_field_offsets(vec![
             core::mem::offset_of!(W_TypeObject, weak_subclasses),
@@ -11652,6 +11672,41 @@ mod tests {
                     pyre_object::typeobject::W_TypeObject,
                     terminator
                 ))
+        );
+    }
+
+    /// `descr.py get_field_descr(gccache, PyObject, "w_class")` is one Arc;
+    /// `heaptracker.py all_fielddescrs` yields that parent leaf for every
+    /// subclass, and `rewrite.py handle_malloc_operation` /
+    /// `gen_initialize_vtable` recognise it via `class_word_field()`.
+    #[test]
+    fn type_object_w_class_row_is_the_shared_class_word_descr() {
+        LazyLock::force(&W_TYPE_OBJECT_DESCR_GROUP);
+        let size = W_TYPE_OBJECT_DESCR_GROUP
+            .size_descr
+            .as_size_descr()
+            .expect("W_TypeObject SizeDescr");
+        let w_class = size
+            .gc_fielddescrs()
+            .iter()
+            .find(|fd| fd.field_key() == "w_class")
+            .expect("W_TypeObject group lists w_class");
+        assert!(
+            w_class.is_w_class(),
+            "W_TypeObject.w_class must declare the class word"
+        );
+        let class_word = size
+            .class_word_field()
+            .expect("W_TypeObject SizeDescr has a class word");
+        assert!(
+            std::sync::Arc::ptr_eq(class_word, w_class),
+            "class_word_field() must answer this row"
+        );
+        let shared = w_class_descr();
+        assert_eq!(
+            w_class.index(),
+            shared.index(),
+            "W_TypeObject.w_class must be the shared PyObject.w_class leaf"
         );
     }
 

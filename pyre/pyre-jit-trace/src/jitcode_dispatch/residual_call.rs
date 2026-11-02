@@ -1383,6 +1383,42 @@ pub(crate) fn build_helper_parent_miframe(
     .then_some(AbortHandoffFrame { miframe, banks })
 }
 
+#[cfg(test)]
+fn latch_test_helper_without_snapshot<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    resume_pc: usize,
+    origin: &'static str,
+    last_exc_value: i64,
+) -> bool {
+    let Some(index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
+        latchdbg!("origin={origin} test-helper no jitcode index");
+        return false;
+    };
+    let Some(jitcode) = helper_jitcode_arc(index) else {
+        latchdbg!("origin={origin} test-helper jitcode {index} unresolved");
+        return false;
+    };
+    let Some(AbortHandoffFrame { miframe, banks }) =
+        build_trace_too_long_single_frame_miframe(ctx, jitcode, resume_pc)
+    else {
+        latchdbg!("origin={origin} test-helper fill declined pc={resume_pc}");
+        return false;
+    };
+    let mut framestack = majit_metainterp::MIFrameStack::empty();
+    framestack.push(miframe);
+    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
+        *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
+            framestack,
+            banks: vec![banks],
+            last_exc_value,
+            raising_exception: false,
+            mirror_stack: None,
+            origin,
+        });
+    });
+    true
+}
+
 pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     resume_pc: usize,
@@ -1493,6 +1529,15 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         });
         true
     } else if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.transparent_helper_subwalk {
+        // Unit-test WalkContexts leave `snapshot_sym` null, so
+        // `build_paused_portal_miframe` / `multi_frame_blackhole_preflight`
+        // cannot run. Stage the helper MIFrame the walk already holds so
+        // tests can observe `convert_and_run_from_pyjitpl` /
+        // `_copy_data_from_miframe` (`blackhole.py`) of that level.
+        #[cfg(test)]
+        if ctx.fbw_mode.transparent_helper_subwalk && ctx.fbw_mode.snapshot_sym.is_null() {
+            return latch_test_helper_without_snapshot(ctx, resume_pc, origin, last_exc_value);
+        }
         let Some((framestack, banks)) =
             build_multi_frame_miframe(ctx, resume_pc, InnermostMiframeBuild::TraceTooLong, origin)
         else {

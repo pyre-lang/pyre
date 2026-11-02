@@ -1927,6 +1927,26 @@ pub(crate) fn fbw_journaled_effects_since(
     })
 }
 
+/// Whether residualizing the CALL that entered this helper would re-apply
+/// an effect the cut does not undo.
+///
+/// `SubWalkRewind::nothing_unrewindable_applied` subtracts
+/// [`fbw_journaled_effects_since`] so journaled stores (`gc_store_journal`,
+/// and the other journals the cut / walk-end roll back) stay residualize
+/// (`pyjitpl.py do_residual_call`). Heap-writing residuals are a separate
+/// odometer (`InlineFrame::entry_heap_writing_effects`); CALL-entry replay
+/// cannot undo them, so convert (`run_blackhole_interp_to_cancel_tracing`
+/// / `convert_and_run_from_pyjitpl`).
+pub(crate) fn fbw_unrewindable_since(
+    effects_at_entry: usize,
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    heap_writing_at_entry: usize,
+) -> bool {
+    fbw_executed_effect_count().saturating_sub(fbw_journaled_effects_since(&pre_fold_pos))
+        != effects_at_entry
+        || fbw_heap_writing_effect_count() != heap_writing_at_entry
+}
+
 /// Keep, without an undo entry, the journaled stores into `obj` pushed since
 /// `mark`.
 ///
