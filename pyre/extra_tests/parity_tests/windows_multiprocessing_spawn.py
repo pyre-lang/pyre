@@ -1,7 +1,5 @@
 # pyre-check: platforms=win32
 # pyre-check: requires-modules=_multiprocessing,_winapi,mmap
-# pyre-check: pypy-diverges: PyPy's Windows shared_memory attachment calls
-# the absent _winapi.UnmapViewOfFile; its spawn/Pipe/Semaphore path works.
 # CPython-suite gap: test_multiprocessing_spawn is not in the Windows CI gate.
 # parity-tests reason: interp_semaphore.W_SemLock.acquire binds block/timeout
 # by name; multiprocessing synchronization and spawned children rely on it.
