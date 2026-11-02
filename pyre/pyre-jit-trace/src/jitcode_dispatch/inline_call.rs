@@ -17702,7 +17702,7 @@ fn descend_generatorentry<Sym: WalkSym>(
 ///   0:          inline_call_r_r <placeholder> -> result
 ///   resume_pc:  -live-                        [r0 pending result, r1 generator]
 ///               residual_call_r_r  bh_send_ex_tail(result, generator) -> answer
-///               -live-
+///               -live-                        [r0 live]
 ///               ref_return         answer
 /// ```
 const SEND_EX_RESULT_REG: u16 = 0;
@@ -17770,7 +17770,6 @@ fn build_send_ex_continuation() -> Option<(i32, usize)> {
         Some(SEND_EX_RESULT_REG),
     );
     let resume_pc = builder.current_pos();
-    let live_empty = crate::state::intern_liveness(&[], &[], &[])?;
     let live_at_resume = crate::state::intern_liveness(
         &[],
         &[SEND_EX_RESULT_REG as u8, SEND_EX_GENERATOR_REG as u8],
@@ -17799,8 +17798,14 @@ fn build_send_ex_continuation() -> Option<(i32, usize)> {
         calldescr,
         SEND_EX_RESULT_REG,
     );
+    // `handle_residual_call` trails a raising residual with `-live-`. This
+    // is the after-call resume coordinate (`after_residual_guard_marker`).
+    // Live refs are the return register: `ref_return` reads
+    // `SEND_EX_RESULT_REG`, so backward liveness
+    // (`liveness.py` `_compute_liveness_must_continue`) names it here.
+    let after_call_liveness = crate::state::intern_liveness(&[], &[SEND_EX_RESULT_REG as u8], &[])?;
     let after_call = builder.live_placeholder();
-    builder.patch_live_offset(after_call, live_empty);
+    builder.patch_live_offset(after_call, after_call_liveness);
     builder.ref_return(SEND_EX_RESULT_REG);
     let jitcode = builder.try_finish()?;
     let payload = std::sync::Arc::new(PyJitCode::from_core_degenerate(
@@ -17902,6 +17907,67 @@ mod send_ex_continuation_tests {
             payload.resolve_resume_pc_with_jitcode_pc(resume_pc as i32, crate::state::op_live()),
             Some(resume_pc),
             "the parent loop must resolve the anchor to itself",
+        );
+    }
+
+    /// `handle_residual_call` trails a raising residual with `-live-`.
+    /// `bh_send_ex_tail` is such a residual, and `ref_return` then reads
+    /// the answer, so that marker's live refs are `[SEND_EX_RESULT_REG]`.
+    #[test]
+    fn residual_call_is_followed_by_a_live_naming_the_return_register() {
+        let Some((index, _)) = send_ex_continuation_level() else {
+            return;
+        };
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the tail was just installed at this index");
+        let ops: Vec<_> =
+            crate::jitcode_runtime::decoded_ops(payload.jitcode.code.as_slice()).collect();
+        let residual_idx = ops
+            .iter()
+            .position(|op| op.opname.starts_with("residual_call"))
+            .expect("the tail emits the send_ex residual");
+        let after = ops
+            .get(residual_idx + 1)
+            .expect("the residual has a following op");
+        assert_eq!(
+            after.opname, "live",
+            "handle_residual_call emits a trailing `-live-`",
+        );
+        let startpoints = payload
+            .jitcode
+            .startpoints
+            .as_ref()
+            .expect("the builder records one startpoint per emitted instruction");
+        assert!(
+            startpoints.contains(&after.pc),
+            "the after-call `-live-` must be addressable as a resume coordinate",
+        );
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(after.pc, crate::state::op_live()),
+            "the after-call `-live-` must decode its live vars",
+        );
+        let live = crate::state::try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
+            index,
+            after.pc as i32,
+        )
+        .expect("the after-call `-live-` must decode");
+        assert_eq!(live.int, Vec::<u32>::new(), "no int is live after the call");
+        assert_eq!(
+            live.ref_,
+            vec![SEND_EX_RESULT_REG as u32],
+            "only SEND_EX_RESULT_REG is live after the call",
+        );
+        assert_eq!(
+            live.float,
+            Vec::<u32>::new(),
+            "no float is live after the call",
+        );
+        assert_eq!(
+            crate::state::frame_value_count_at(index, after.pc as i32),
+            1,
+            "only SEND_EX_RESULT_REG is live after the call",
         );
     }
 }
