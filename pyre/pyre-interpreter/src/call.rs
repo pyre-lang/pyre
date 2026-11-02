@@ -5559,13 +5559,14 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
 /// non-None result raises `TypeError: __init__() should return None, not
 /// 'X'`.
 ///
-/// The trailing `, not 'X'` follows the pinned CPython rather than
-/// `descr_call`, which raises the bare `__init__() should return None`.
-/// Measured at the version in `lib-python/stdlib-version.txt` (3.14.6):
-/// CPython answers `"__init__() should return None, not 'int'"` where PyPy
-/// answers `"__init__() should return None"`.  Only the message text differs
-/// — the exception type, the condition that raises it, and the value the call
-/// then produces are `descr_call`'s.
+/// [3.15-spec] ours `"__init__() should return None, not 'X'"` ↔ pypy
+/// `"__init__() should return None"` — observable TypeError message text;
+/// evidence: `Objects/typeobject.c slot_tp_init` at tag v3.15.2 raises
+/// `"__init__() should return None, not '%.200s'"`, and a measured
+/// `python3.15` (`Python 3.15.0rc2`) run of a class whose `__init__`
+/// returns 1 raises `__init__() should return None, not 'int'`.  Only
+/// the message text differs — the exception type, the condition that
+/// raises it, and the value the call then produces are `descr_call`'s.
 ///
 /// A null `result` means `__init__` already raised.  Callers are
 /// responsible for detecting that (via `result.is_null()` or a
