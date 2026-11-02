@@ -4053,6 +4053,17 @@ impl PyFrame {
     }
 
     /// `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
+    /// Returns the W_Code pointer so `pyopcode.py getname_w` /
+    /// `getconstant_w` can index `co_names_w` / `co_consts_w` off the
+    /// promoted code. `pycode` is a virtualizable field, so a trace reads
+    /// it as a box; the promote records `getfield_vable` + `guard_value`
+    /// and `replace_box`s the vable slot for the rest of the trace.
+    #[inline]
+    pub fn getcode_w(&self) -> PyObjectRef {
+        majit_metainterp::jit::promote(self.pycode) as PyObjectRef
+    }
+
+    /// `pyframe.py PyFrame.getcode`: `hint(self.pycode, promote=True)`.
     /// `pycode` is a virtualizable field, so a trace reads it as a box; the
     /// promote is what makes the code object — and every code-invariant the
     /// callers below read off it — a constant for the compiled loop.  The
@@ -4060,10 +4071,7 @@ impl PyFrame {
     /// through `self.pycode` directly.
     #[inline]
     pub fn getcode(&self) -> &CodeObject {
-        let pycode = majit_metainterp::jit::promote(self.pycode);
-        unsafe {
-            &*(crate::w_code_get_ptr(pycode as pyre_object::PyObjectRef) as *const CodeObject)
-        }
+        unsafe { &*(crate::w_code_get_ptr(self.getcode_w()) as *const CodeObject) }
     }
 
     /// PyPy-compatible `fget_code`.
@@ -4099,12 +4107,12 @@ impl PyFrame {
         if self.pycode.is_null() {
             return pyre_object::PY_NULL;
         }
-        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.  Without
-        // the promote the code object stays a varying value on the trace and
-        // the globals read is a load the optimizer cannot fold; `w_globals` is
-        // not a virtualizable field, so nothing else pins it to a constant.
-        let pycode = majit_metainterp::jit::promote(self.pycode);
-        unsafe { crate::w_code_get_w_globals(pycode as PyObjectRef) }
+        // `pyframe.py get_w_globals` `return jit.promote(self.pycode).w_globals`.
+        // [`Self::getcode_w`] is that promote. Without it the code object
+        // stays a varying value on the trace and the globals read is a load
+        // the optimizer cannot fold; `w_globals` is not a virtualizable
+        // field, so nothing else pins it to a constant.
+        unsafe { crate::w_code_get_w_globals(self.getcode_w()) }
     }
 
     /// `pyframe.py PyFrame.set_w_globals`: force the rare globals override
@@ -5571,7 +5579,7 @@ impl PyFrame {
     /// `frame.f_code` yields to Python — not the inner `CodeObject`.
     #[inline]
     pub fn fget_f_code(&self) -> PyObjectRef {
-        majit_metainterp::jit::promote(self.pycode) as PyObjectRef
+        self.getcode_w()
     }
 
     /// pyframe.py descr_repr — `<frame at 0x…, file '…', line …,
@@ -6949,9 +6957,9 @@ impl PyFrame {
 
     /// Load a constant from the code object by raw index.
     /// Used by the blackhole interpreter's bh_load_const_fn.
+    /// `pyopcode.py getconstant_w`: `self.getcode().co_consts_w[index]`.
     pub fn load_const_pyobj(&self, idx: usize) -> PyObjectRef {
-        let value =
-            unsafe { crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, idx) };
+        let value = unsafe { crate::pycode::w_code_const(self.getcode_w(), idx) };
         if value.is_null() {
             pyre_object::w_none()
         } else {

@@ -3143,7 +3143,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                     crate::baseobjspace::finditem_str_named(
                         w_locals,
                         name,
-                        self.pycode as PyObjectRef,
+                        self.getcode_w(),
                         nameindex,
                     )
                 )? {
@@ -3185,13 +3185,12 @@ impl NamespaceOpcodeHandler for PyFrame {
         let _ = roots.pin_root(value);
         let locals_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(self.get_or_create_w_locals());
-        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
+        let w_code = self.getcode_w();
+        let hash = crate::baseobjspace::named_key_hash(name, w_code, nameindex);
         if store_name_into_dict(roots.get(locals_slot), name, hash, roots.get(value_slot)) {
             return Ok(());
         }
-        let key = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-        };
+        let key = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, nameindex, name) };
         crate::baseobjspace::setitem(roots.get(locals_slot), key, roots.get(value_slot))?;
         Ok(())
     }
@@ -3216,13 +3215,12 @@ impl NamespaceOpcodeHandler for PyFrame {
         let _ = roots.pin_root(value);
         let globals_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(self.get_w_globals());
-        let hash = crate::baseobjspace::named_key_hash(name, self.pycode as PyObjectRef, nameindex);
+        let w_code = self.getcode_w();
+        let hash = crate::baseobjspace::named_key_hash(name, w_code, nameindex);
         if !roots.get(globals_slot).is_null()
             && !store_name_into_dict(roots.get(globals_slot), name, hash, roots.get(value_slot))
         {
-            let key = unsafe {
-                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-            };
+            let key = unsafe { crate::pycode::w_code_getname_w_or_new(w_code, nameindex, name) };
             crate::baseobjspace::setitem(roots.get(globals_slot), key, roots.get(value_slot))?;
         }
         Ok(())
@@ -3289,18 +3287,22 @@ impl NamespaceOpcodeHandler for PyFrame {
             }
         }
         // `_load_global_fallback` → `_load_global` (`pyopcode.py`):
+        // `varname = self.getname_u(nameindex)` then
         // `space.finditem_str(self.get_w_globals(), varname)`.  finditem_str
         // takes a borrowed-string fast path for real W_DictObject /
         // W_ModuleDictObject layouts and dispatches a dict subclass through
         // the general mapping object, so a raising key `__eq__` propagates
         // instead of being swallowed as a miss.  A cached miss lands here too
         // and finds nothing again before the `NameError`.
+        // `getname_u` is `text_w(getname_w(index))`; `getname_w` reads
+        // `self.getcode().co_names_w`. Re-read `getcode_w` at each probe:
+        // `get_builtin` can collect, and a copied W_Code pointer would go stale.
         if !w_globals.is_null()
             && let Some(value) = pyre_object::with_roots!(w_globals =>
                 crate::baseobjspace::finditem_str_named(
                     w_globals,
                     name,
-                    self.pycode as PyObjectRef,
+                    self.getcode_w(),
                     nameindex,
                 )
             )?
@@ -3319,7 +3321,7 @@ impl NamespaceOpcodeHandler for PyFrame {
                     crate::baseobjspace::finditem_str_named(
                         w_dict,
                         name,
-                        self.pycode as PyObjectRef,
+                        self.getcode_w(),
                         nameindex,
                     )
                 )?
@@ -4238,7 +4240,7 @@ impl ConstantOpcodeHandler for PyFrame {
         // `pyopcode.py getconstant_w`: `return self.getcode().co_consts_w[index]`.
         // `getcode` is `hint(self.pycode, promote=True)` (`pyframe.py`); the
         // promoted wrapper's `co_consts_w[*]` item is then one GC array read.
-        let pycode = majit_metainterp::jit::promote(self.pycode);
+        let pycode = self.getcode_w();
         Ok(unsafe {
             let table = (*(pycode as *const crate::pycode::PyCode)).co_consts_w;
             (&*table)[usize::from(index)]
@@ -5027,9 +5029,8 @@ impl OpcodeStepExecutor for PyFrame {
         let flag_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(self.pop());
         let anchor = FrameAnchor::new(self);
-        let w_modulename = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-        };
+        let w_modulename =
+            unsafe { crate::pycode::w_code_getname_w_or_new(self.getcode_w(), nameindex, name) };
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_modulename);
         let w_obj = if flags & 2 == 0 {
@@ -5447,9 +5448,8 @@ impl OpcodeStepExecutor for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let mapping_slot = roots.base();
         let _ = roots.pin_root(self.pop());
-        let key = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-        };
+        let key =
+            unsafe { crate::pycode::w_code_getname_w_or_new(self.getcode_w(), nameindex, name) };
         let anchor = FrameAnchor::new(self);
         match crate::baseobjspace::getitem(roots.get(mapping_slot), key) {
             Ok(value) => {
@@ -5744,9 +5744,8 @@ impl OpcodeStepExecutor for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let locals_slot = roots.base();
         let _ = roots.pin_root(self.get_or_create_w_locals());
-        let key = unsafe {
-            crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
-        };
+        let key =
+            unsafe { crate::pycode::w_code_getname_w_or_new(self.getcode_w(), nameindex, name) };
         crate::baseobjspace::delitem(roots.get(locals_slot), key).map_err(|err| {
             if matches!(err.kind, PyErrorKind::KeyError) {
                 PyError::oefmt_name_error_text(format!("name '{name}' is not defined"), name)
@@ -6109,7 +6108,7 @@ impl OpcodeStepExecutor for PyFrame {
         is_method: bool,
         is_two_arg: bool,
     ) -> Result<(), PyError> {
-        let w_code = self.pycode as PyObjectRef;
+        let w_code = self.getcode_w();
         let name = &self.code().names[name_idx];
         // Resolve while the three opcode operands still live in the frame's
         // value stack.  First realization may allocate; after publication the
@@ -6230,7 +6229,7 @@ impl OpcodeStepExecutor for PyFrame {
         let roots = pyre_object::gc_roots::push_roots();
         let obj_slot = roots.base();
         let obj = roots.pin_root(obj);
-        let pycode = self.pycode as PyObjectRef;
+        let pycode = self.getcode_w();
         let anchor = FrameAnchor::new(self);
         let w_value = unsafe {
             crate::objspace::std::mapdict::load_attr_caching(pycode, obj, nameindex, name)
@@ -6259,7 +6258,7 @@ impl OpcodeStepExecutor for PyFrame {
         let value = self.pop_value()?;
         unsafe {
             crate::objspace::std::mapdict::store_attr_caching(
-                self.pycode as PyObjectRef,
+                self.getcode_w(),
                 obj,
                 nameindex,
                 name,

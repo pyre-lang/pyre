@@ -1575,10 +1575,7 @@ fn exc_info_load_const(
 ) -> PyObjectRef {
     match instruction {
         crate::bytecode::Instruction::LoadConst { consti } => unsafe {
-            crate::pycode::w_code_const(
-                frame.pycode as PyObjectRef,
-                usize::from(consti.get(op_arg)),
-            )
+            crate::pycode::w_code_const(frame.getcode_w(), usize::from(consti.get(op_arg)))
         },
         // CPython 3.14's compiler uses this compact spelling for the small
         // non-negative indices PyPy spells as LOAD_CONST.  It denotes the

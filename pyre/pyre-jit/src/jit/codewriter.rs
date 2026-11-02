@@ -12137,17 +12137,17 @@ impl CodeWriter {
                             let name_idx = attr.name_idx() as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
-                            // rtyper-surrogate operands for the splice
-                            // lowering: the jitcode's own PyCode as a
-                            // post-rtype `Signed(ptr) + Kind::Ref` constant
-                            // (per-code jitcode ⇒ fixed pointer) and the
-                            // co_names index `bh_load_attr_fn` resolves the
-                            // name with.
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
+                            // pyopcode.py LOAD_ATTR jitted arm: getname_w then
+                            // space.getattr. getname_w indexes
+                            // getcode().co_names_w; pyframe.py getcode is
+                            // hint(self.pycode, promote=True).
+                            let pycode = emit_getcode(
+                                &mut graph,
+                                &current_block.block(),
+                                frame_var,
+                                py_pc as i64,
+                            );
+                            let w_code_arg: super::flow::FlowValue = pycode.into();
                             let name_idx_const: super::flow::FlowValue =
                                 super::flow::Constant::signed(name_idx as i64).into();
                             let _ = emit_popvalue_ref!(current_depth, py_pc);
@@ -12157,7 +12157,7 @@ impl CodeWriter {
                                 &current_block.block(),
                                 obj_value.clone(),
                                 attr_name.into(),
-                                code_const.clone(),
+                                w_code_arg.clone(),
                                 name_idx_const.clone(),
                                 py_pc as i64,
                             );
@@ -12174,7 +12174,7 @@ impl CodeWriter {
                                     &current_block.block(),
                                     obj_value,
                                     result_value.into(),
-                                    code_const,
+                                    w_code_arg,
                                     name_idx_const,
                                     py_pc as i64,
                                 );

@@ -7267,7 +7267,20 @@ impl PyreSym {
         };
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
         self.nlocals = nlocals;
-        self.locals_cells_stack_array_ref = if self.is_active_vable_owner {
+        // Standard virtualizable: `rebuild_state_after_failure` leaves
+        // `virtualizable_boxes` live (scalars + array items + vable box).
+        // Array access is `_opimpl_getarrayitem_vable` on those boxes;
+        // `GETFIELD_GC_R(frame, locals_cells_stack_w)` exists only as the
+        // compile-time preamble
+        // `patch_new_loop_to_load_virtualizable_fields`. A bridge that
+        // already seeded the boxes (`setup_bridge_sym`) therefore records
+        // no array GETFIELD here. Owner-true portal traces skip for the
+        // same reason (`virtualizable.py` `read_boxes` is interpreter-side
+        // at portal start, not a recorded op).
+        self.locals_cells_stack_array_ref = if self.is_active_vable_owner
+            || ctx.has_virtualizable_boxes()
+            || self.bridge_local_oprefs.is_some()
+        {
             OpRef::NONE
         } else {
             frame_locals_cells_stack_array(ctx, self.frame)
@@ -14982,6 +14995,80 @@ mod tests {
                 OpCode::GetfieldRawI,
                 "standard virtualizable init should not read locals array from heap"
             );
+        }
+    }
+
+    #[test]
+    fn test_init_symbolic_skips_heap_array_read_for_seeded_bridge_virtualizable() {
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+        let code = compile_exec("1 + 2").expect("test code should compile");
+        let mut frame = PyFrame::new(code.clone());
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        install_test_jitcode(&code, frame.pycode);
+        let array_len = concrete_frame_array_len(frame_ptr).unwrap_or(1);
+        let mut input_types = vec![
+            Type::Ref, // frame
+            Type::Ref, // ec
+            Type::Int, // last_instr
+            Type::Ref, // pycode
+            Type::Int, // valuestackdepth
+            Type::Ref, // debugdata
+        ];
+        input_types.extend(std::iter::repeat(Type::Ref).take(array_len));
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.become_active_vable_owner();
+        let array_items: Vec<OpRef> = (0..array_len)
+            .map(|i| OpRef::input_arg_ref(6 + i as u32))
+            .collect();
+        seed_virtualizable_boxes(
+            &mut ctx,
+            OpRef::input_arg_ref(0),
+            majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
+            &[
+                OpRef::input_arg_int(2),
+                OpRef::input_arg_ref(3),
+                OpRef::input_arg_int(4),
+                OpRef::input_arg_ref(5),
+            ],
+            &array_items,
+            array_len,
+            &[],
+            std::ptr::null(),
+        );
+        // `setup_bridge_sym` seeds boxes then `clear_active_vable`: the
+        // resume virtualizable is standard, the six-slot portal header is
+        // not.
+        sym.clear_active_vable();
+        sym.bridge_local_oprefs.replace(Vec::new());
+        assert!(ctx.has_virtualizable_boxes());
+        assert!(!sym.is_active_vable_owner);
+        assert!(sym.vable_array_base.is_none());
+
+        let locals_descr = frame_locals_cells_stack_descr();
+        sym.init_symbolic(&mut ctx, frame_ptr);
+
+        assert_eq!(sym.locals_cells_stack_array_ref, OpRef::NONE);
+        assert!(!sym.is_active_vable_owner);
+        assert!(sym.vable_array_base.is_none());
+        assert!(ctx.has_virtualizable_boxes());
+        let recorder = ctx.into_recorder();
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_raw_pos(pos) else {
+                continue;
+            };
+            if op.opcode == OpCode::GetfieldGcR {
+                let descr = op.getdescr();
+                assert!(
+                    descr
+                        .as_ref()
+                        .is_none_or(|d| d.index() != locals_descr.index()),
+                    "bridge init_symbolic must not record GetfieldGcR(locals_cells_stack_w)"
+                );
+            }
         }
     }
 
