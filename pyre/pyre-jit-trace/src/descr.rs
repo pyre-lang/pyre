@@ -17002,10 +17002,12 @@ pub fn make_struct_array_descr_full_keyed(
         descrs.push(ifd);
     }
 
-    // `descr.py arraydescr.all_interiorfielddescrs = descrs`
-    // set-once via OnceLock.  Cache-hit case: a prior populator already
-    // set the list; our set is a no-op which is the desired semantic.
-    array_descr_for_interior.set_all_interiorfielddescrs(descrs);
+    // `descr.py get_array_descr` assigns interiors then
+    // `gccache.init_array_descr`. Cache-hit first-wins does not
+    // re-register.
+    gc_cache()
+        .lock()
+        .attach_array_interiorfielddescrs(&array_descr_dyn, descrs);
     array_descr_dyn
 }
 

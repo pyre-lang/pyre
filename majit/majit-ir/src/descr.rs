@@ -2139,30 +2139,40 @@ impl GcCache {
     /// Upstream writes `layoutbuilder.get_type_id(A)` into `descr.tid`.
     /// `get_array_descr` already returns the cached Arc on `LLType` hit
     /// (`descr.py` `_cache_array[ARRAY]` / `id_of_type[TYPE]`), so this
-    /// miss arm is `get_type_id`'s `KeyError`. `descr.py` attaches
-    /// `all_interiorfielddescrs` before `init_array_descr`; pyre attaches
-    /// them after the Arc wrap, so a struct array still waits for
-    /// [`Self::register_unresolved_array_tids`] once interiors exist.
-    /// Pointer and primitive arrays stamp here when a collector is
-    /// installed. A later `get_array_descr` of a new key is another
-    /// `KeyError`: stamp it by calling this again while
-    /// `can_add_new_types` (`TypeRegistry::register`). After
+    /// miss arm is `get_type_id`'s `KeyError`. `descr.py get_array_descr`
+    /// assigns `arraydescr.all_interiorfielddescrs` before this call;
+    /// pyre attaches them after the Arc wrap via
+    /// [`Self::attach_array_interiorfielddescrs`], which runs this same
+    /// stamp once interiors exist. Pointer and primitive arrays stamp
+    /// here when a collector is installed. A later `get_array_descr` of
+    /// a new key is another `KeyError`: stamp it by calling this again
+    /// while `can_add_new_types` (`TypeRegistry::register`). After
     /// `freeze_types` that callback panics, matching
     /// `get_type_id`'s `assert self.can_add_new_types`.
     ///
     /// Two distinct `LLType` keys that share `encode_type_shape` reuse a
     /// collector tid only in `register_array_layout` /
     /// `TypeRegistry::find_varsize_type`.
-    pub fn init_array_descr(&mut self, key: &LLType, arraydescr: &mut SimpleArrayDescr) {
+    pub fn init_array_descr(&self, key: &LLType, arraydescr: &SimpleArrayDescr) {
         if !arraydescr.is_gc_managed() {
             return;
         }
         if let Some(existing) = self._cache_array.get(key).and_then(|d| d.as_array_descr()) {
             let tid = existing.type_id();
-            if !array_tid_is_unresolved(tid) {
+            if is_collector_array_tid(tid) {
                 arraydescr.set_type_id(tid);
                 return;
             }
+        }
+        self.stamp_simple_array_descr(arraydescr);
+    }
+
+    fn stamp_simple_array_descr(&self, arraydescr: &SimpleArrayDescr) {
+        if !arraydescr.is_gc_managed() {
+            return;
+        }
+        if is_collector_array_tid(arraydescr.type_id()) {
+            return;
         }
         if arraydescr.is_array_of_structs() && arraydescr.get_all_interiorfielddescrs().is_none() {
             arraydescr.set_type_id(UNSET_GC_TYPE_ID);
@@ -2184,6 +2194,33 @@ impl GcCache {
             }
         }
         arraydescr.set_type_id(UNSET_GC_TYPE_ID);
+    }
+
+    /// `descr.py get_array_descr`: `arraydescr.all_interiorfielddescrs = descrs`
+    /// then `gccache.init_array_descr(ARRAY_OR_STRUCT, arraydescr)`.
+    ///
+    /// First attach stamps through `array_tid_register` (`can_add_new_types`
+    /// is that callback). A later call is `OnceLock` first-wins and does
+    /// not invoke the register again.
+    pub fn attach_array_interiorfielddescrs(&self, descr: &DescrRef, descrs: Vec<DescrRef>) {
+        let Some(arraydescr) = descr
+            .as_any()
+            .and_then(|any| any.downcast_ref::<SimpleArrayDescr>())
+        else {
+            if let Some(ad) = descr.as_array_descr() {
+                ad.set_all_interiorfielddescrs(descrs);
+            }
+            return;
+        };
+        if arraydescr.get_all_interiorfielddescrs().is_some() {
+            return;
+        }
+        arraydescr.set_all_interiorfielddescrs(descrs);
+        if arraydescr.cache_key() != 0 {
+            self.init_array_descr(&LLType::Array(arraydescr.cache_key()), arraydescr);
+        } else {
+            self.stamp_simple_array_descr(arraydescr);
+        }
     }
 }
 
@@ -3474,13 +3511,13 @@ impl GcCache {
             ad.set_cache_key(*k);
         }
         // descr.py: gccache.init_array_descr(ARRAY_OR_STRUCT, arraydescr)
-        // gc.py:544-549: sets descr.tid — must happen BEFORE Arc wrap.
-        self.init_array_descr(&key, &mut ad);
+        // gc.py GcLLDescr_framework.init_array_descr stamps descr.tid.
+        // Struct arrays wait for attach_array_interiorfielddescrs
+        // (`descr.py get_array_descr` assigns interiors first).
+        self.init_array_descr(&key, &ad);
         let descr: DescrRef = Arc::new(ad);
-        // descr.py:371: cache[ARRAY_OR_STRUCT] = arraydescr
+        // descr.py: cache[ARRAY_OR_STRUCT] = arraydescr
         self._cache_array.insert(key, descr.clone());
-        // descr.py:372-375: all_interiorfielddescrs for struct arrays
-        // — set externally via SimpleArrayDescr::set_all_interiorfielddescrs
         descr
     }
 
@@ -8615,12 +8652,11 @@ impl SimpleArrayDescr {
         self.cache_key = key;
     }
 
-    /// RPython: arraydescr.all_interiorfielddescrs = descrs
-    /// Settable through `&self` so the publication can target the same
-    /// `Arc<SimpleArrayDescr>` the `InteriorFieldDescr` constructors
-    /// already cloned into their `array_descr` field.  Subsequent calls
-    /// silently ignore the new list (matching RPython's "set once" use
-    /// at `descr.py` inside `get_array_descr`).
+    /// `descr.py get_array_descr` `arraydescr.all_interiorfielddescrs = descrs`.
+    /// Store-only: production attach goes through
+    /// `GcCache::attach_array_interiorfielddescrs` so `init_array_descr`
+    /// stamps `descr.tid` once interiors exist. Subsequent calls
+    /// silently ignore the new list (`OnceLock` first-wins).
     pub fn set_all_interiorfielddescrs(&self, descrs: Vec<DescrRef>) {
         let _ = self.all_interiorfielddescrs.set(descrs);
     }
@@ -9744,6 +9780,50 @@ mod register_keyed_size_authority_tests {
             panic!("mint-time array stamp leaves the census with no per-entry work")
         });
         assert_eq!(count, 0);
+    }
+
+    fn test_mint_array_tid_forbidden(
+        _base: usize,
+        _item: usize,
+        _len: usize,
+        _offs: Vec<usize>,
+        _is_ptr: bool,
+    ) -> u32 {
+        panic!("repeat attach must not re-register")
+    }
+
+    #[test]
+    fn attach_array_interiorfielddescrs_stamps_tid_without_a_census() {
+        let mut gc = GcCache::new();
+        gc.set_collector_tid_register(None, Some(test_mint_array_tid));
+        let cache_key = 0x0c4b_0001_u64;
+        let descr = gc.get_array_descr(
+            LLType::Array(cache_key),
+            8,
+            16,
+            ArrayFlag::Struct,
+            Type::Ref,
+            false,
+            0,
+            false,
+            '\x00',
+        );
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), UNSET_GC_TYPE_ID);
+        let array_arc: Arc<dyn ArrayDescr> = try_downcast_arc::<SimpleArrayDescr>(descr.clone())
+            .expect("SimpleArrayDescr")
+            as Arc<dyn ArrayDescr>;
+        let field: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false));
+        let interior: DescrRef = Arc::new(SimpleInteriorFieldDescr::new(0, array_arc, field));
+        gc.attach_array_interiorfielddescrs(&descr, vec![interior]);
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), 99);
+        let count = gc.register_unresolved_array_tids(|_, _, _, _, _| {
+            panic!("attach-time array stamp leaves the census with no per-entry work")
+        });
+        assert_eq!(count, 0);
+
+        gc.set_collector_tid_register(None, Some(test_mint_array_tid_forbidden));
+        gc.attach_array_interiorfielddescrs(&descr, Vec::new());
+        assert_eq!(descr.as_array_descr().unwrap().type_id(), 99);
     }
 
     #[test]
@@ -13008,11 +13088,12 @@ pub fn make_array_descr_full(
 ///
 /// `interior_field_descrs` mirrors `descr.py arraydescr.
 /// all_interiorfielddescrs` — every interior FieldDescr must carry
-/// the SAME `arraydescr` Arc identity the array itself uses.  Pyre's
-/// `SimpleArrayDescr::set_all_interiorfielddescrs` writes through a
-/// `OnceLock` AFTER the parent Arc is minted; the caller is expected
-/// to have pre-built each `SimpleInteriorFieldDescr` referencing this
-/// parent.  Pass `Vec::new()` for primitive-item arrays.
+/// the SAME `arraydescr` Arc identity the array itself uses.  Pyre
+/// attaches them after the parent Arc is minted through
+/// `GcCache::attach_array_interiorfielddescrs` (`descr.py get_array_descr`
+/// then `init_array_descr`). The caller is expected to have pre-built
+/// each `SimpleInteriorFieldDescr` referencing this parent.  Pass
+/// `Vec::new()` for primitive-item arrays.
 ///
 /// Field provenance (RPython `descr.py ArrayDescr.__init__`):
 /// - `lendescr`: `descr.py self.lendescr = lendescr` — points
@@ -13084,15 +13165,13 @@ pub fn make_array_descr_from_lltype_shape(
         arc.set_ei_index(ei_index);
     }
     if !interior_field_descrs.is_empty() {
-        // RPython `descr.py:372-375` populates
-        // `arraydescr.all_interiorfielddescrs` after the array descr is
-        // minted, using the same arraydescr Arc inside each
-        // InteriorFieldDescr (`descr.py InteriorFieldDescr.__init__`).
-        // The caller must therefore have built the `interior_field_descrs`
-        // with `arc` as their parent — pyre's
-        // `SimpleArrayDescr::set_all_interiorfielddescrs` writes through
-        // `OnceLock`, leaving the parent Arc identity stable.
-        arc.set_all_interiorfielddescrs(interior_field_descrs);
+        // `descr.py get_array_descr` assigns interiors after the
+        // ArrayDescr exists (`InteriorFieldDescr.__init__` holds that
+        // same arraydescr) then `init_array_descr`.
+        let descr_ref: DescrRef = arc.clone();
+        gc_cache()
+            .lock()
+            .attach_array_interiorfielddescrs(&descr_ref, interior_field_descrs);
     }
     arc
 }
