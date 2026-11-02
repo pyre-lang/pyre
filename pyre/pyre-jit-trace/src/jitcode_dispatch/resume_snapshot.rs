@@ -418,6 +418,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     if let Some((instance, init_result)) = scope.constructor_assembler {
         return walker_capture_constructor_assembler_guard(ctx, op_pc, instance, init_result);
     }
+    if let Some((generator, pending)) = scope.send_ex_assembler {
+        return walker_capture_send_ex_assembler_guard(ctx, op_pc, generator, pending);
+    }
     // Snapshot semantics for walker-emitted guards
     // (`pyjitpl.py generate_guard` + `capture_resumedata`):
     //
@@ -3521,6 +3524,43 @@ fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
     instance: OpRef,
     init_result: OpRef,
 ) -> Result<(), DispatchError> {
+    let tail = super::ctor_continuation_assembler_parent_frame(instance, init_result)
+        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail)
+}
+
+/// `generator.py GeneratorOrCoroutine._send_ex` after `_invoke_execute_frame`:
+/// `opimpl_jit_merge_point` records `CALL_ASSEMBLER` in the `_send_ex` frame
+/// (`finishframe` popped only the recursive portal). A force resumes there,
+/// runs `frame_finished_execution`, and either yields the portal result or
+/// collapses a finished frame to null. Pyre's walker synthesises `_send_ex`,
+/// so this capture plants `send_ex_continuation`'s assembler resume above
+/// the FOR_ITER caller with the portal result in the pending slot.
+fn walker_capture_send_ex_assembler_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    generator: OpRef,
+    pending: OpRef,
+) -> Result<(), DispatchError> {
+    let Some(mut tail) = super::send_ex_continuation_parent_frame(generator) else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    match tail.boxes.first_mut() {
+        Some(slot) => *slot = pending,
+        None => return Err(DispatchError::callee_inline_unsupported(op_pc)),
+    }
+    walker_capture_assembler_continuation_guard(ctx, op_pc, tail)
+}
+
+/// Paused callers, then a synthesised assembler-resume tail as the innermost
+/// parent. Constructor and send_ex `CALL_ASSEMBLER` share this capture:
+/// `do_recursive_call` records the call in the frame that `finishframe`
+/// left on top (`pyjitpl.py` `opimpl_jit_merge_point`).
+fn walker_capture_assembler_continuation_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    tail: InlineParentFrame,
+) -> Result<(), DispatchError> {
     let mut parent_frames = {
         let session = ctx.session.borrow();
         session
@@ -3537,8 +3577,6 @@ fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
         Err(_) if ctx.fbw_mode.snapshot_sym.is_null() => {}
         Err(_) => return Err(DispatchError::callee_inline_unsupported(op_pc)),
     }
-    let tail = super::ctor_continuation_assembler_parent_frame(instance, init_result)
-        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
     parent_frames.push(tail);
     walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, GuardStampTarget::LastOp)
 }

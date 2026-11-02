@@ -4449,6 +4449,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     w_code: *const (),
     is_being_profiled: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
+    send_ex_generator: Option<OpRef>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let _ = nlocals;
     let Some(recorded) = record_walker_loop_callee_portal_call(
@@ -4464,6 +4465,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         is_being_profiled,
         false,
         constructor_result,
+        send_ex_generator,
     )?
     else {
         // Recorder preflight missed after the prologue ran. The sub-walk
@@ -4542,6 +4544,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     is_being_profiled: bool,
     leave_callee_ec: bool,
     constructor_result: Option<(OpRef, ConcreteValue)>,
+    send_ex_generator: Option<OpRef>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     // The bridge resume captures its after-call guards on the paused callers;
@@ -4760,16 +4763,27 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // A constructor is the exception: `__init__`'s return is not the CALL's
     // value (`W_TypeObject.descr_call` returns `w_newobject` after the None
     // check), so the escape image is the assembler tail plus the caller.
-    let blackhole_result = if constructor_result.is_some() {
+    // A generator resume is the same shape: the portal return is `_send_ex`'s
+    // pending result, not the FOR_ITER item, until `bh_send_ex_tail` checks
+    // `frame_finished_execution`.
+    let blackhole_result = if constructor_result.is_some() || send_ex_generator.is_some() {
         None
     } else {
         resume_pc
             .zip(dst)
             .map(|(next_pc, (bank, color))| (next_pc, bank, color))
     };
-    let constructor_assembler_escape = constructor_result
-        .as_ref()
-        .map(|(instance, _)| (pc, *instance));
+    let assembler_continuation_escape = if let Some((instance, _)) = constructor_result.as_ref() {
+        Some(AssemblerContinuationEscape::Constructor {
+            call_pc: pc,
+            instance: *instance,
+        })
+    } else {
+        send_ex_generator.map(|generator| AssemblerContinuationEscape::SendEx {
+            call_pc: pc,
+            generator,
+        })
+    };
     // Concrete half of the enter recorded above: `vm.py` `getframe` /
     // `executioncontext.py` `gettopframe_nohidden` walk `topframeref`
     // while the executor runs `do_recursive_call`. Publish the callee
@@ -4847,7 +4861,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
             portal_view,
             pc,
             blackhole_result,
-            constructor_assembler_escape,
+            assembler_continuation_escape,
             false,
             Some(&mut record_call),
         )
@@ -4946,9 +4960,10 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // records the call. A non-constructor captures the callers alone. A
     // constructor plants `descr_call`'s tail above them (`W_TypeObject.descr_call`
     // is still on `framestack` when `do_recursive_call` records
-    // `GUARD_NOT_FORCED`).
+    // `GUARD_NOT_FORCED`). A generator resume plants `_send_ex`'s tail
+    // (`generator.py` after `_invoke_execute_frame`).
     let scope = GuardCaptureScope {
-        finished_callee_result: if record_init_none_check {
+        finished_callee_result: if record_init_none_check || send_ex_generator.is_some() {
             None
         } else {
             dst.is_none().then_some(ca_result)
@@ -4956,6 +4971,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         constructor_assembler: constructor_result
             .as_ref()
             .map(|(instance, _)| (*instance, ca_result)),
+        send_ex_assembler: send_ex_generator.map(|generator| (generator, ca_result)),
         ..Default::default()
     };
 
@@ -12790,6 +12806,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as *const (),
                 is_being_profiled,
                 constructor_result,
+                None,
             );
             record_deferred_portal_leave(deferred_portal_leave);
             emitted
@@ -18554,6 +18571,10 @@ fn walk_generator_resume<Sym: WalkSym>(
                 Some(token) => Some(token),
                 None => super::portal_assembler_token(w_code, target_pc, is_being_profiled),
             };
+            // `do_recursive_call` records CALL_ASSEMBLER in `_send_ex`,
+            // after `finishframe` popped only the portal. Pass the generator
+            // so GUARD_NOT_FORCED / GUARD_NO_EXCEPTION capture that tail
+            // above the FOR_ITER caller (`send_ex_continuation_parent_frame`).
             let emitted = emit_walker_loop_callee_call_assembler(
                 ctx,
                 op,
@@ -18567,6 +18588,7 @@ fn walk_generator_resume<Sym: WalkSym>(
                 w_code,
                 is_being_profiled,
                 None,
+                Some(iter_op),
             );
             record_deferred_portal_leave(deferred_portal_leave);
             match emitted? {

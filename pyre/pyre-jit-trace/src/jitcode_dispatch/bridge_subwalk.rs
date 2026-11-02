@@ -1318,6 +1318,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         is_being_profiled,
         false,
         None,
+        None,
     ) {
         Ok(Some(recorded)) => {
             // `opimpl_jit_merge_point`: `finishframe(None, leave_portal_frame=False)`

@@ -8755,6 +8755,14 @@ pub(crate) struct GuardCaptureScope {
     /// the instance (`W_TypeObject.descr_call` after `get_and_call_args`).
     pub constructor_assembler: Option<(OpRef, OpRef)>,
 
+    /// Generator-resume `CALL_ASSEMBLER`: the iterator and the portal result.
+    /// Assembler `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION` capture `_send_ex`'s
+    /// tail (`send_ex_continuation` assembler resume) above the FOR_ITER
+    /// caller, so a force still runs `bh_send_ex_tail`'s
+    /// `frame_finished_execution` check (`generator.py` `_send_ex` after
+    /// `_invoke_execute_frame`). The pending slot is the portal return.
+    pub send_ex_assembler: Option<(OpRef, OpRef)>,
+
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:
     /// `_nonstandard_virtualizable` (pyjitpl.py) emits its promote
