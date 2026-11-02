@@ -5374,14 +5374,11 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
     zip_next_w(zip_receiver(args, "__next__")?)
 }
 
-/// `objspace.py:752-753` / `:763-764` — the receiver gate both
-/// `StdObjSpace.finditem_str` and `StdObjSpace.finditem` apply before
-/// taking their shortcut: `isinstance(w_obj, W_DictMultiObject) and not
-/// w_obj.user_overridden_class`.  `is_dict` is the `isinstance` half (it
-/// answers the user-visible question, so a module dict passes); the exact
-/// class comparison is the `user_overridden_class` half, keeping a dict
-/// subclass — whose `__getitem__` or `__missing__` may override the probe
-/// — on the generic path.
+/// `objspace.py StdObjSpace.finditem_str` / `finditem` receiver gate:
+/// `isinstance(w_obj, W_DictMultiObject) and not w_obj.user_overridden_class`.
+/// A dict subclass instance is a `W_ObjectObject` with `DICT_DATA_SLOT` and
+/// its own typeptr, so `is_dict` (typeptr `DICT_TYPE` / `MODULE_DICT_TYPE`)
+/// is the whole answer — no class-word read.
 ///
 /// An exact `frozendict` shares the `W_DictObject` payload, so it takes
 /// the same shortcut. The test sits on the miss path: LOAD_GLOBAL's
@@ -5391,11 +5388,7 @@ pub(crate) fn zip_next_method(args: &[PyObjectRef]) -> PyResult {
 fn is_shortcut_dict(obj: PyObjectRef) -> bool {
     unsafe {
         if pyre_object::is_dict(obj) {
-            let Some(w_type) = crate::typedef::r#type(obj) else {
-                return false;
-            };
-            let dict_type = crate::typedef::gettypeobject(&pyre_object::DICT_TYPE);
-            return !dict_type.is_null() && std::ptr::eq(w_type.as_ptr(), dict_type);
+            return true;
         }
         // Exact `frozendict` is `ob_type == FROZENDICT_TYPE`; a subclass
         // stores its payload in a reserved slot and stays on the generic path.
@@ -27552,6 +27545,44 @@ mod tests {
         expected.push(rustpython_wtf8::CodePoint::from_char('n'));
         expected.push_str("' object has no getter");
         assert_eq!(surrogate.message_wtf8(), expected);
+    }
+
+    /// `objspace.py StdObjSpace.finditem_str`: a dict subclass is not
+    /// `W_DictMultiObject` here (own typeptr + `DICT_DATA_SLOT`), so it
+    /// misses `is_shortcut_dict`; a plain dict takes the shortcut.
+    #[test]
+    fn shortcut_dict_is_exact_dict_not_a_subclass_instance() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = roots.base();
+        let _ = roots.pin_root(w_dict_new());
+        assert!(is_shortcut_dict(roots.get(slot)));
+
+        let _ = roots.pin_root(crate::typedef::gettypeobject(&pyre_object::DICT_TYPE));
+        let _ = roots.pin_root(w_str_new("DictSub"));
+        let _ = roots.pin_root(w_tuple_new(vec![roots.get(slot + 1)]));
+        let _ = roots.pin_root(w_dict_new());
+        let cls = crate::builtins::type_descr_new(&[
+            crate::typedef::w_type(),
+            roots.get(slot + 2),
+            roots.get(slot + 3),
+            roots.get(slot + 4),
+        ])
+        .expect("class DictSub(dict)");
+        let _ = roots.pin_root(cls);
+        crate::call::clear_call_error();
+        let _ = roots.pin_root(w_tuple_new(Vec::new()));
+        let obj = call(roots.get(slot + 5), roots.get(slot + 6), None);
+        assert!(
+            !obj.is_null(),
+            "DictSub(): {}",
+            crate::call::take_call_error()
+                .map(|err| err.message_text())
+                .unwrap_or_else(|| "null without error".to_string())
+        );
+        let _ = roots.pin_root(obj);
+        assert!(!is_shortcut_dict(roots.get(slot + 7)));
     }
 }
 

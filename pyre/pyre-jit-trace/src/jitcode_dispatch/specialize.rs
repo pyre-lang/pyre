@@ -7493,13 +7493,14 @@ fn emit_int_ovf_to_long<Sym: WalkSym>(
 }
 
 /// The machine-int body of `int_add` / `int_sub` / `int_mul` / bitwise
-/// and of `int_floordiv` / `int_mod` (`descroperation.rs`): unbox,
-/// `int_*_ovf` or `int_and`/`or`/`xor` or the `OS_INT_PY_DIV` /
+/// `or`/`xor` and of `int_floordiv` / `int_mod` (`descroperation.rs`):
+/// unbox, `int_*_ovf` or `int_or`/`xor` or the `OS_INT_PY_DIV` /
 /// `OS_INT_PY_MOD` elidable, rebox.  Used when a helper walk cannot
 /// stamp its resume word (`GuardResumeCoordinateUnavailable`) so the
 /// call would otherwise become `CallMayForce`.  Does not walk
 /// `binary_value_from_tag` — that re-enters the same `add` inline and
-/// recurses.
+/// recurses.  `&` declines so `and_` / `_invoke_binop` /
+/// `_check_notimplemented` record (`intshortcut` is add/sub only).
 pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -7554,7 +7555,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
         Some(B::Multiply | B::InplaceMultiply) => OpCode::IntMulOvf,
-        Some(B::And | B::InplaceAnd) => OpCode::IntAnd,
         Some(B::Or | B::InplaceOr) => OpCode::IntOr,
         Some(B::Xor | B::InplaceXor) => OpCode::IntXor,
         Some(B::FloorDivide | B::InplaceFloorDivide | B::Remainder | B::InplaceRemainder) => {
@@ -7629,7 +7629,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     } else {
         let raw = ctx.trace_ctx.record_op(opcode, &[lhs_raw, rhs_raw]);
         let concrete = match opcode {
-            OpCode::IntAnd => la & rb,
             OpCode::IntOr => la | rb,
             OpCode::IntXor => la ^ rb,
             _ => return Ok(None),
@@ -7647,7 +7646,7 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
         .map(|pin| pin.get().0 as pyre_object::PyObjectRef)
         .unwrap_or(rhs_obj);
     let both_bools = unsafe { pyre_object::is_bool(lhs_obj) && pyre_object::is_bool(rhs_obj) };
-    if both_bools && matches!(opcode, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor) {
+    if both_bools && matches!(opcode, OpCode::IntOr | OpCode::IntXor) {
         let observed = concrete != 0;
         let Some(boxed) = walker_newbool_guarded(ctx, op_pc, raw, observed, dst_bank)? else {
             return Ok(None);

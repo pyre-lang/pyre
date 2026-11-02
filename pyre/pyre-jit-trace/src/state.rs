@@ -14969,6 +14969,39 @@ mod tests {
         }
     }
 
+    /// `MIFrame.opimpl_getfield_gc_i`: unboxing a constant `W_IntObject`
+    /// through the always-pure `intval` descr executes the load now and
+    /// yields `ConstInt`, recording no op.
+    #[test]
+    fn test_trace_unbox_int_const_w_intobject_records_no_op() {
+        pyre_interpreter::typedef::init_typeobjects();
+        let cpu = FieldLoadTestCpu;
+        let mut ctx = crate::trace_ctx_for_test(0);
+        ctx.set_cpu(Some(&cpu));
+        let w_int = w_int_new(77);
+        let obj = ctx.const_ref(w_int as i64);
+        let ops_before = ctx.num_ops();
+        let payload = crate::trace_unbox_int(
+            &mut ctx,
+            obj,
+            &INT_TYPE as *const PyType as i64,
+            crate::descr::int_intval_descr(),
+        );
+        assert_eq!(
+            ctx.num_ops(),
+            ops_before,
+            "unboxing a constant W_IntObject records no op"
+        );
+        assert_eq!(
+            payload.inline_const_to_value(),
+            Some(majit_ir::Value::Int(77)),
+            "the fold yields the constant intval"
+        );
+        let prof = ctx.profiler().snapshot();
+        assert_eq!(prof.ops, 0);
+        assert_eq!(prof.recorded_ops, 0);
+    }
+
     #[test]
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
         use pyre_interpreter::pyframe::PyFrame;

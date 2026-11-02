@@ -84,6 +84,30 @@ fn getfield_gc_i_pureornot(
     result
 }
 
+/// `MIFrame.opimpl_getfield_gc_i`: an always-pure descr on a constant box
+/// executes the load now and returns `ConstInt`, recording nothing;
+/// otherwise `_opimpl_getfield_gc_any_pureornot`.
+fn getfield_gc_i(
+    ctx: &mut crate::TraceCtx,
+    obj: majit_ir::OpRef,
+    descr: majit_ir::DescrRef,
+) -> majit_ir::OpRef {
+    use majit_ir::Value;
+    if obj.is_constant() && descr.is_always_pure() {
+        if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(Value::Int(n)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Int)
+                {
+                    return ctx.const_int(n);
+                }
+            }
+        }
+    }
+    getfield_gc_i_pureornot(ctx, obj, descr)
+}
+
 pub fn trace_unbox_int(
     ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
@@ -105,7 +129,7 @@ pub fn trace_unbox_int(
         ctx.record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         ctx.heap_cache_mut().class_now_known(obj);
     }
-    getfield_gc_i_pureornot(ctx, obj, intval_descr)
+    getfield_gc_i(ctx, obj, intval_descr)
 }
 
 /// Box a raw i64 into a Python int object.
@@ -294,6 +318,30 @@ pub fn getfield_gc_f_pureornot(
     result
 }
 
+/// `MIFrame.opimpl_getfield_gc_f`: an always-pure descr on a constant box
+/// executes the load now and returns `ConstFloat`, recording nothing;
+/// otherwise `_opimpl_getfield_gc_any_pureornot`.
+fn getfield_gc_f(
+    ctx: &mut crate::TraceCtx,
+    obj: majit_ir::OpRef,
+    descr: majit_ir::DescrRef,
+) -> majit_ir::OpRef {
+    use majit_ir::Value;
+    if obj.is_constant() && descr.is_always_pure() {
+        if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
+            let struct_ptr = struct_ref.0 as i64;
+            if struct_ptr != 0 && struct_ptr != usize::MAX as i64 {
+                if let Some(Value::Float(f)) =
+                    ctx.field_sanity_load(struct_ptr, &descr, majit_ir::Type::Float)
+                {
+                    return ctx.const_float(f.to_bits() as i64);
+                }
+            }
+        }
+    }
+    getfield_gc_f_pureornot(ctx, obj, descr)
+}
+
 pub fn trace_unbox_float(
     ctx: &mut crate::TraceCtx,
     obj: majit_ir::OpRef,
@@ -306,7 +354,7 @@ pub fn trace_unbox_float(
         ctx.record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         ctx.heap_cache_mut().class_now_known(obj);
     }
-    getfield_gc_f_pureornot(ctx, obj, floatval_descr)
+    getfield_gc_f(ctx, obj, floatval_descr)
 }
 
 /// Box a raw f64 into a Python float object: emit New + SetfieldGc.
