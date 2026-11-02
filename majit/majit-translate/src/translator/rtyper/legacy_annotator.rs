@@ -747,10 +747,15 @@ fn merge_binding(var: &Variable, incoming: Incoming, bookkeeper: Option<&Rc<Book
                 _ => merge_flat(var, ValueType::Ref(None), bookkeeper),
             },
             // `consider_op` / `setbinding` recomputes the op result.
-            // `pairtype(SomePtr, SomePtr).union` rebuilds a non-constant
-            // `SomePtr`; keep the existing cell when `ll_ptrtype` matches
-            // so `ann_nullptr`'s `immutablevalue` const survives the
-            // fixpoint.
+            // `llannotation.py pairtype(SomePtr, SomePtr).union` returns a
+            // fresh non-constant `SomePtr(p1.ll_ptrtype)` (UnionError on
+            // different types). `annrpython.py mergeinputargs` /
+            // `model.py unionof` keep the old cell only when the union
+            // equals it: same `ll_ptrtype` and the same constness/const
+            // value stay unchanged (a recomputed `ann_nullptr`
+            // `immutablevalue` must not churn); otherwise rebind through
+            // `model::union`. Independently minted nullptr constants
+            // compare equal through `_abstract_ptr.__eq__`.
             SomeValue::Ptr(incoming_ptr) => match read_binding_some(var) {
                 None => {
                     *var.annotation.borrow_mut() = Some(sv.clone());
@@ -758,7 +763,8 @@ fn merge_binding(var: &Variable, incoming: Incoming, bookkeeper: Option<&Rc<Book
                 }
                 Some(existing) => match existing.as_ref() {
                     SomeValue::Ptr(existing_ptr)
-                        if existing_ptr.ll_ptrtype == incoming_ptr.ll_ptrtype =>
+                        if existing_ptr.ll_ptrtype == incoming_ptr.ll_ptrtype
+                            && someptr_same_const(existing_ptr, incoming_ptr) =>
                     {
                         false
                     }
@@ -777,6 +783,25 @@ fn merge_binding(var: &Variable, incoming: Incoming, bookkeeper: Option<&Rc<Book
             },
             _ => merge_flat(var, somevalue_to_valuetype(&sv), bookkeeper),
         },
+    }
+}
+
+/// `SomeObject.__eq__` on `const` uses `_abstract_ptr.__eq__` (null-null
+/// is equal). Flow-space `Constant` keys an `LLPtr` by Hashable identity;
+/// independently minted `ann_nullptr` cells still match as the same nullptr.
+fn someptr_same_const(
+    a: &crate::annotator::model::SomePtr,
+    b: &crate::annotator::model::SomePtr,
+) -> bool {
+    match (&a.base.const_box, &b.base.const_box) {
+        (None, None) => true,
+        (Some(ca), Some(cb)) => match (&ca.value, &cb.value) {
+            (ConstValue::LLPtr(pa), ConstValue::LLPtr(pb)) => {
+                pa._TYPE == pb._TYPE && pa.as_ref() == pb.as_ref()
+            }
+            _ => ca == cb,
+        },
+        _ => false,
     }
 }
 
@@ -2064,6 +2089,80 @@ mod tests {
                 }
                 other => panic!("spelling {spelling:?}: expected constant SomePtr, got {other:?}"),
             }
+        }
+    }
+
+    /// A join of constant `null_fn` (`ann_nullptr` `immutablevalue`) with a
+    /// non-constant same-type `SomePtr` drops the constant
+    /// (`llannotation.py pairtype(SomePtr, SomePtr).union`,
+    /// `annrpython.py mergeinputargs` / `model.py unionof`). Two identical
+    /// constants stay constant.
+    #[test]
+    fn typed_null_fn_join_drops_constant_unless_both_sides_match() {
+        use crate::annotator::model::SomeObjectTrait;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let spelling = "fn() -> i64";
+        let s_fn =
+            crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(spelling, Some(&bk))
+                .expect("fn spelling");
+        assert!(
+            matches!(&s_fn, SomeValue::Ptr(_)) && !s_fn.is_constant(),
+            "Some of Option<fn> is a non-constant SomePtr, got {s_fn:?}"
+        );
+
+        // Constant arrives first, then a non-constant of the same
+        // `ll_ptrtype`. Without the join fix the same-type arm keeps the
+        // first arrival unchanged, so this stays a constant null.
+        let mixed = {
+            let mut graph = FunctionGraph::new("typed_null_fn_mixed_join");
+            let pred_const = graph.create_block();
+            let pred_live = graph.create_block();
+            let null_var = graph.push_null_fn_ptr_with_spelling(pred_const, Some(spelling));
+            let live_var = graph.alloc_value_var();
+            *live_var.annotation.borrow_mut() = Some(Rc::new(s_fn.clone()));
+            let (join, phi_args) = graph.create_block_with_arg_vars(1);
+            let phi_var = phi_args[0].clone();
+            branch_start_to_preds(&mut graph, pred_const, pred_live);
+            graph.set_goto(pred_const, join, vec![null_var]);
+            graph.set_goto(pred_live, join, vec![live_var]);
+            graph.set_return(join, Some(phi_var.clone()));
+            annotate_with_bookkeeper(&graph, Some(&bk));
+            phi_var
+        };
+        match read_binding_some(&mixed).as_deref() {
+            Some(sv @ SomeValue::Ptr(_)) => {
+                assert!(
+                    !sv.is_constant(),
+                    "const null_fn ∪ live same-type ptr must drop the constant, got {sv:?}"
+                );
+            }
+            other => panic!("expected non-constant SomePtr join, got {other:?}"),
+        }
+
+        let identical = {
+            let mut graph = FunctionGraph::new("typed_null_fn_identical_join");
+            let pred1 = graph.create_block();
+            let pred2 = graph.create_block();
+            let null1 = graph.push_null_fn_ptr_with_spelling(pred1, Some(spelling));
+            let null2 = graph.push_null_fn_ptr_with_spelling(pred2, Some(spelling));
+            let (join, phi_args) = graph.create_block_with_arg_vars(1);
+            let phi_var = phi_args[0].clone();
+            branch_start_to_preds(&mut graph, pred1, pred2);
+            graph.set_goto(pred1, join, vec![null1]);
+            graph.set_goto(pred2, join, vec![null2]);
+            graph.set_return(join, Some(phi_var.clone()));
+            annotate_with_bookkeeper(&graph, Some(&bk));
+            phi_var
+        };
+        match read_binding_some(&identical).as_deref() {
+            Some(sv @ SomeValue::Ptr(_)) => {
+                assert!(
+                    sv.is_constant(),
+                    "join of two identical null_fn constants must stay constant, got {sv:?}"
+                );
+            }
+            other => panic!("expected constant SomePtr join, got {other:?}"),
         }
     }
 }
