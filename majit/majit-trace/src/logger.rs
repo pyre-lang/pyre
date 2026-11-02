@@ -112,8 +112,8 @@ impl Logger {
         *self.loop_entries.entry(green_key).or_default() += 1;
     }
 
-    /// Record a bridge compilation for the given guard index.
-    pub fn log_bridge_compile(&mut self, _guard_index: u32) {
+    /// Record a bridge compilation.
+    pub fn log_bridge_compile(&mut self) {
         self.bridges_compiled += 1;
     }
 
@@ -431,8 +431,8 @@ mod tests {
     fn test_bridge_compile_tracking() {
         let mut log = Logger::new(false);
         assert_eq!(log.bridges_compiled(), 0);
-        log.log_bridge_compile(0);
-        log.log_bridge_compile(1);
+        log.log_bridge_compile();
+        log.log_bridge_compile();
         assert_eq!(log.bridges_compiled(), 2);
     }
 

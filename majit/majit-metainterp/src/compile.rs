@@ -159,13 +159,10 @@ pub struct CompileResult {
     /// `resume.py ResumeDataDirectReader.decode_int` reads named slots via
     /// `self.cpu.get_int_value(self.deadframe, num)`.
     pub typed_values: ExitValues,
-    pub fail_index: u32,
-    pub trace_id: u64,
-    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
-    /// backend-side guard descr recovered from the failing frame.  Pyre
-    /// currently has split metainterp/backend descr objects, so this is
-    /// the runtime descr carrying the same `rd_loop_token_clt` /
-    /// `fail_index_per_trace` identity used for bridge routing.
+    /// `cpu.get_latest_descr(deadframe)` (`history.py AbstractFailDescr` /
+    /// `llmodel.py get_latest_descr`) — the guard descr recovered from the
+    /// failing frame. Identity is the descr object (`descr_identity` /
+    /// `id(descr)`).
     ///
     /// Carried for a guard exit only. Every reader of it is a bridge or
     /// blackhole consumer, and a final descr resumes nothing, so the finish
