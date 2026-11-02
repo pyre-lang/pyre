@@ -2492,6 +2492,17 @@ impl<'a> Lowering<'a> {
                         let raw = emit_cast_int_to_ccharp(&mut self.graph, bb_id, arg);
                         return Ok((None, raw));
                     }
+                    // Dest `*mut` / `*const c_void` from an int is
+                    // `cast_int_to_ptr(VOIDP, addr)` (`rffi.py` `VOIDP` /
+                    // `lltype.py` `ann_cast_int_to_ptr`). Aliasing the
+                    // `isize` keeps `SomeInteger` beside `SomePtr(VOIDP)`.
+                    if tyref_is_raw_c_void_ptr(dest_ty, self.llbc)
+                        && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let raw = emit_cast_int_to_voidp(&mut self.graph, bb_id, arg);
+                        return Ok((None, raw));
+                    }
                     if tyref_is_raw_u8_ptr(dest_ty, self.llbc)
                         && matches!(src_kind, Some(ValueType::Ref(_)))
                         && !graph_is_items_block_base_accessor(&self.graph.name)
@@ -9681,17 +9692,30 @@ pub(in crate::front::mir) fn emit_cast_int_to_ccharp(
     )
 }
 
-/// Null CCHARP: `lltype.nullptr(rffi.CCHARP.TO)` (`lltype.py` `nullptr`).
-/// `cast_int_to_ptr(CCHARP, 0)` is that nullptr (`lltype.py`
-/// `cast_int_to_ptr` when `oddint == 0`). Integer 0, not `null_raw`
-/// Address. `ann_cast_int_to_ptr` returns `SomePtr(CCHARP)`.
-pub(in crate::front::mir) fn emit_ccharp_nullptr(
+/// `cast_int_to_ptr(VOIDP, int)` (`rffi.py` `VOIDP` / `lltype.py`
+/// `ann_cast_int_to_ptr`). Same 2-arg body as overlay CCHARP.
+pub(in crate::front::mir) fn emit_cast_int_to_voidp(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
+    addr: Variable,
+) -> Variable {
+    emit_dest_typed_cast_int_to_ptr(
+        graph,
+        bb_id,
+        addr,
+        (*crate::translator::rtyper::lltypesystem::rffi::VOIDP).clone(),
+    )
+}
+
+/// Typed nullptr: `lltype.cast_int_to_ptr(PTRTYPE, 0)`.
+/// `cast_int_to_ptr` when `oddint == 0` is `nullptr(PTRTYPE.TO)`;
+/// `ann_cast_int_to_ptr` returns `SomePtr(PTRTYPE)`.
+pub(in crate::front::mir) fn emit_typed_nullptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
     use crate::flowspace::model::ConstValue;
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    let ptr_ty = lltype_for_direct_ptradd_pointer(None, &LowLevelType::Char);
     let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     raw.set_concretetype(Some(ptr_ty.clone()));
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -9712,6 +9736,32 @@ pub(in crate::front::mir) fn emit_ccharp_nullptr(
         },
     });
     raw
+}
+
+/// Null CCHARP: [`emit_typed_nullptr`] of `rffi.CCHARP`.
+/// `cast_int_to_ptr` when `oddint == 0` is `nullptr(PTRTYPE.TO)`;
+/// `ann_cast_int_to_ptr` returns `SomePtr(CCHARP)`.
+pub(in crate::front::mir) fn emit_ccharp_nullptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+) -> Variable {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let ptr_ty = lltype_for_direct_ptradd_pointer(None, &LowLevelType::Char);
+    emit_typed_nullptr(graph, bb_id, ptr_ty)
+}
+
+/// Null VOIDP: [`emit_typed_nullptr`] of `rffi.VOIDP`.
+/// `cast_int_to_ptr` when `oddint == 0` is `nullptr(PTRTYPE.TO)`;
+/// `ann_cast_int_to_ptr` returns `SomePtr(VOIDP)`.
+pub(in crate::front::mir) fn emit_voidp_nullptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+) -> Variable {
+    emit_typed_nullptr(
+        graph,
+        bb_id,
+        (*crate::translator::rtyper::lltypesystem::rffi::VOIDP).clone(),
+    )
 }
 
 /// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw

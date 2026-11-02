@@ -6913,6 +6913,24 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
         == Some("u8")
 }
 
+/// `*mut` / `*const` whose pointee is `c_void` (`rffi.py` `VOIDP`).
+/// Charon spells `core::ffi::c_void`; a `std::ffi` / `libc` re-export
+/// is the same VOIDP word.
+pub(in crate::front::mir) fn tyref_is_raw_c_void_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+        return false;
+    };
+    let Some(node) = type_node_peel_aliases(pointee, llbc) else {
+        return false;
+    };
+    adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            path == "c_void" || path.ends_with("::c_void")
+        })
+}
+
 /// The return is a `u8` list, or a `Result` whose `Ok` payload is one.
 /// `rffi.py` `charpsize2str` returns the str and raises `MemoryError`;
 /// `Result<Vec<u8>, MemoryError>` spells that raise as the `Err` arm, so
@@ -7325,6 +7343,11 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
         || owner_root_guard::tyref_is_guard(&payload, llbc)
     {
         return None;
+    }
+    // `Option<*mut c_void>` / `Option<*const c_void>` is the nullable
+    // `rffi.VOIDP` word. `history.py` `getkind` of a raw `Ptr` is `'int'`.
+    if tyref_is_raw_c_void_ptr(&payload, llbc) {
+        return Some(ValueType::Int);
     }
     if niche_option_storage_raw_struct_root(ty, llbc, tombstoned).is_some() {
         return Some(ValueType::Int);
