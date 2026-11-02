@@ -4595,6 +4595,11 @@ fn init_someinstance_overrides(
                 // case, the same value the classdef-less arm returns, so the
                 // read does not block the inference.
                 if attr == "__discriminant" {
+                    // The value is the exception instance. There is no tag
+                    // field and no variant-narrowing knowntypedata.
+                    if ann.bookkeeper.classdef_is_exception_class(classdef) {
+                        return s_attr;
+                    }
                     let mut si = match &s_attr {
                         SomeValue::Integer(si) => si.clone(),
                         _ => super::model::SomeInteger::new(true, false),

@@ -3497,6 +3497,14 @@ impl<'a> Lowering<'a> {
                     let tag = option_none_discriminant(&place.ty, self.llbc).unwrap_or(0);
                     return Ok((Some(OpKind::ConstInt(tag)), res));
                 }
+                // A marked exception class is the scrutinee. There is no
+                // `__discriminant` field. Record the alias so `SwitchInt`
+                // emits an exact isinstance cascade on this variable.
+                if let Some(info) = self.exception_disc_info_for_ty(&place.ty) {
+                    let base = self.resolve_place(mir_bb, place)?;
+                    self.exception_disc_vars.insert(base.id(), info);
+                    return Ok((None, base));
+                }
                 // `*p` on a raw address is the enum's bytes, not the
                 // explicit sum shell. Load the host tag and decode it to
                 // the variant index `host_variant_index` returns;
@@ -8222,6 +8230,11 @@ impl<'a> Lowering<'a> {
                     majit_charon_reader::ullbc::positional_field_name(field_idx)
                 });
                 let ty = tyref_subst_bound_typevar(&f.ty, base_ty, self.llbc);
+                if let Some(class_name) =
+                    self.exception_class_attr_owner(&name_path, variants, &variant.name, &name)
+                {
+                    return Some((class_name, name, ty, None, host_index));
+                }
                 // owner_root = the variant subclass `{enum_leaf}::{variant}`
                 // — the read resolves the variant's own field at its exact
                 // enum-relative offset (`variant_layouts[vidx].field_offsets`,
@@ -8238,6 +8251,104 @@ impl<'a> Lowering<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Marked-enum discriminant table for `ty`, or `None` when `ty` is
+    /// not that enum. Fieldless enums stay the tag integer.
+    pub(in crate::front::mir) fn exception_disc_info_for_ty(
+        &self,
+        ty: &TyRef,
+    ) -> Option<ExceptionDiscInfo> {
+        if tyref_is_fieldless_enum_free(ty, self.llbc)
+            || tyref_is_borrowed_fieldless_enum_free(ty, self.llbc)
+            || !tyref_is_enum_free(ty, self.llbc)
+        {
+            return None;
+        }
+        let path = adt_path_of_tyref(ty, self.llbc)?;
+        let canon = strip_crate_prefix(&path);
+        let hint =
+            exception_class_hint_for_paths(llbc_exception_class_hints(self.llbc), &path, &canon)?;
+        let node = tyref_node(ty, self.llbc).and_then(|node| strip_ty_wrappers(node, self.llbc))?;
+        let id = adt_node_def_id(node)?;
+        let td = self.llbc.type_by_id(id)?;
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return None;
+        };
+        let mut by_discr = Vec::new();
+        for variant in variants {
+            if let Some(discr) = variant.discriminant_i64() {
+                by_discr.push((discr, variant.name.clone()));
+            }
+        }
+        let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+        let parent_of = crate::front::llbc_hints::parse_exception_class_overrides(
+            enum_name,
+            &hint.overrides,
+            &hint.variants,
+        );
+        Some(ExceptionDiscInfo {
+            enum_path: hint.enum_path.clone(),
+            by_discr,
+            parent_of,
+        })
+    }
+
+    /// Literal class that declares `field` on a marked enum variant.
+    ///
+    /// The furthest ancestor that publishes the same spelling owns the
+    /// attr. A hint with no such ancestor still names this variant's
+    /// own class. `None` when the enum is not marked.
+    fn exception_class_attr_owner(
+        &self,
+        name_path: &str,
+        variants: &[majit_charon_reader::ullbc::VariantDecl],
+        variant: &str,
+        field: &str,
+    ) -> Option<String> {
+        let canon = strip_crate_prefix(name_path);
+        let hint = exception_class_hint_for_paths(
+            llbc_exception_class_hints(self.llbc),
+            name_path,
+            &canon,
+        )?;
+        let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+        let links = crate::front::llbc_hints::parse_exception_class_overrides(
+            enum_name,
+            &hint.overrides,
+            &hint.variants,
+        );
+        let mut owner = variant;
+        loop {
+            let parent = links
+                .iter()
+                .find(|(name, _)| name == owner)
+                .and_then(|(_, parent)| parent.as_deref());
+            let Some(parent) = parent else {
+                break;
+            };
+            let declares = variants.iter().any(|candidate| {
+                candidate.name == parent
+                    && candidate
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .any(|(index, field_decl)| {
+                            let spelling = field_decl.name.clone().unwrap_or_else(|| {
+                                majit_charon_reader::ullbc::positional_field_name(index)
+                            });
+                            spelling == field
+                        })
+            });
+            if !declares {
+                break;
+            }
+            owner = parent;
+        }
+        Some(crate::front::llbc_hints::exception_class_qualname(
+            &hint.enum_path,
+            Some(owner),
+        ))
     }
 
     /// Scalar field of an opaque dependency struct.

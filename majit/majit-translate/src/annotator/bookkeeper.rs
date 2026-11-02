@@ -4252,6 +4252,17 @@ impl Bookkeeper {
             let classdef = self.getuniqueclassdef(&host).unwrap_or_else(|err| {
                 panic!("_exception_class_ {enum_name}: getuniqueclassdef({class_name}): {err}")
             });
+            let project = {
+                let guard = self.struct_fields.borrow();
+                guard
+                    .as_ref()
+                    .is_some_and(|reg| reg.fields.contains_key(&class_name))
+            };
+            if project {
+                self.project_struct_rows(&class_name).unwrap_or_else(|err| {
+                    panic!("_exception_class_ {enum_name}: project {class_name}: {err}")
+                });
+            }
             hosts.push((variant.clone(), host));
             variants.push((variant, classdef));
         }
@@ -4312,6 +4323,42 @@ impl Bookkeeper {
                     .find(|(name, _)| name == variant)
                     .map(|(_, classdef)| classdef)
             })
+    }
+
+    /// Whether `classdef` is a minted exception base or variant class.
+    pub fn classdef_is_exception_class(&self, classdef: &Rc<RefCell<ClassDef>>) -> bool {
+        let ptr = Rc::as_ptr(classdef);
+        self.exception_class_hierarchies
+            .borrow()
+            .iter()
+            .any(|hierarchy| {
+                Rc::as_ptr(&hierarchy.base) == ptr
+                    || hierarchy
+                        .variants
+                        .iter()
+                        .any(|(_, variant)| Rc::as_ptr(variant) == ptr)
+            })
+    }
+
+    /// Literal variant class names of the hierarchy `enum_path` names.
+    ///
+    /// Empty when no hierarchy matches. The strings are
+    /// `exception_class_qualname` (`EA`), not the variant leaves.
+    pub fn exception_variant_class_names(&self, enum_path: &str) -> Vec<String> {
+        self.matched_exception_hierarchy(enum_path)
+            .map(|hierarchy| {
+                hierarchy
+                    .variants
+                    .iter()
+                    .map(|(variant, _)| {
+                        crate::front::llbc_hints::exception_class_qualname(
+                            &hierarchy.enum_path,
+                            Some(variant),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Prebuilt singleton instance of the interned class for `qualname`.

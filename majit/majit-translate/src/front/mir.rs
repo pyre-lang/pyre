@@ -1185,6 +1185,7 @@ fn register_ref_enum_instantiation_rows(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    exception_class_hints: &[crate::front::llbc_hints::ExceptionClassHint],
 ) {
     for inst in insts {
         let Some(td) = llbc.type_by_id(inst.def_id) else {
@@ -1196,6 +1197,9 @@ fn register_ref_enum_instantiation_rows(
         let name = td.item_meta.name_path();
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
         let canon_base = strip_crate_prefix(&name);
+        if exception_class_hint_for_paths(exception_class_hints, &name, &canon_base).is_some() {
+            continue;
+        }
         // The bare leaf survives in `enum_variant_by_discriminant` only when
         // `harden_duplicate_leaf_metadata` did not withdraw it on cross-decl
         // collision; gate the ambiguous bare spellings on that, same as the
@@ -1811,6 +1815,7 @@ impl CrateLoweringState {
             gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
+            &exception_class_hints,
         );
         promote_cross_crate_stripped_keys(
             llbc,
@@ -1880,6 +1885,7 @@ impl CrateLoweringState {
             &mut struct_fields,
             &mut struct_ids,
             gc_struct_ids,
+            &exception_class_hints,
         );
         // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
         // `key` is a type variable; extra descrs for `OS_DICT_LOOKUP`
@@ -3928,11 +3934,122 @@ fn note_raw_word_owner(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
 )]
+/// Variant fields of a marked exception-class enum, on the minted classes.
+///
+/// A name an ancestor already publishes is inherited and is not registered
+/// again. An empty variant and a variant whose fields are all inherited
+/// get no rows. The base class gets none. A field that is not one
+/// translated word panics with the enum, variant class, field, and type.
+fn register_exception_class_variant_fields(
+    td: &TypeDecl,
+    hint: &crate::front::llbc_hints::ExceptionClassHint,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_field_attrs: &mut std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) {
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return;
+    };
+    let enum_name = crate::front::llbc_hints::exception_class_leaf(&hint.enum_path);
+    let links = crate::front::llbc_hints::parse_exception_class_overrides(
+        enum_name,
+        &hint.overrides,
+        &hint.variants,
+    );
+    let mut published: Vec<(String, Vec<String>)> = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let names = variant
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| field_decl_name(index, field))
+            .collect();
+        published.push((variant.name.clone(), names));
+    }
+    for variant_name in &hint.variants {
+        let Some(variant) = variants
+            .iter()
+            .find(|variant| variant.name == *variant_name)
+        else {
+            continue;
+        };
+        let class_name =
+            crate::front::llbc_hints::exception_class_qualname(&hint.enum_path, Some(variant_name));
+        let mut rows = Vec::new();
+        let mut attrs = Vec::new();
+        for (index, field) in variant.fields.iter().enumerate() {
+            let fname = field_decl_name(index, field);
+            if exception_ancestor_declares(&links, &published, variant_name, &fname) {
+                continue;
+            }
+            if !exception_class_attr_is_one_word(
+                &field.ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ) {
+                let spelling = tyref_to_ast_string(&field.ty, llbc);
+                panic!(
+                    "exception class {class_name}.{fname}: field type {spelling} is not a one-word attr"
+                );
+            }
+            let row_ty = annotation_struct_field_type(
+                &field.ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
+            let attr_ty = tyref_to_attr_value_type_with(
+                &field.ty,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
+            attrs.push((fname.clone(), attr_ty));
+            rows.push(field_row_from_decl(index, field, row_ty, llbc));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        struct_fields.fields.insert(class_name.clone(), rows);
+        struct_field_attrs.insert(class_name, attrs);
+    }
+}
+
+fn exception_ancestor_declares(
+    links: &[(String, Option<String>)],
+    published: &[(String, Vec<String>)],
+    variant: &str,
+    field: &str,
+) -> bool {
+    let mut current = links
+        .iter()
+        .find(|(name, _)| name == variant)
+        .and_then(|(_, parent)| parent.clone());
+    while let Some(parent) = current {
+        if published.iter().any(|(name, names)| {
+            name == &parent && names.iter().any(|candidate| candidate == field)
+        }) {
+            return true;
+        }
+        let next = parent.clone();
+        current = links
+            .iter()
+            .find(|(name, _)| name == &next)
+            .and_then(|(_, parent)| parent.clone());
+    }
+    false
+}
+
 fn derive_program_metadata(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    exception_class_hints: &[crate::front::llbc_hints::ExceptionClassHint],
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -4226,6 +4343,20 @@ fn derive_program_metadata(
                 struct_origins.entry(leaf.clone()).or_insert(module);
                 known_struct_names.insert(name.clone());
                 known_struct_names.insert(leaf.clone());
+                let marked_hint =
+                    exception_class_hint_for_paths(exception_class_hints, &name, &canon_base);
+                if let Some(hint) = marked_hint {
+                    register_exception_class_variant_fields(
+                        td,
+                        hint,
+                        llbc,
+                        gc_struct_ids,
+                        raw_alloc_flavor_structs,
+                        &mut struct_fields,
+                        &mut struct_field_attrs,
+                    );
+                }
+                let marked = marked_hint.is_some();
                 // Register the enum base class in `struct_fields` with
                 // only the synthetic `__discriminant` tag — the sum-type
                 // base carries the discriminant, each variant subclass
@@ -4294,7 +4425,7 @@ fn derive_program_metadata(
                     && enum_layout
                         .as_ref()
                         .is_some_and(|layout| layout.has_branch_discriminant());
-                if !fieldless && !tag_recorded_but_unspellable {
+                if !fieldless && !tag_recorded_but_unspellable && !marked {
                     let discr_ty = discr_ty.unwrap_or("i64").to_string();
                     let rows: Vec<(String, String)> =
                         vec![("__discriminant".to_string(), discr_ty)];
@@ -4409,7 +4540,7 @@ fn derive_program_metadata(
                 let host = enum_layout
                     .as_ref()
                     .map(crate::front::host_layout::host_layout_from_type);
-                if !fieldless {
+                if !fieldless && !marked {
                     if explicit_sum_shell {
                         let mut base_offsets = std::collections::HashMap::new();
                         base_offsets.insert("__discriminant".to_string(), 0);
@@ -4440,8 +4571,9 @@ fn derive_program_metadata(
                 // Per-variant subclasses carry each variant's OWN payload
                 // fields; a fieldless enum has none, so it needs no variant
                 // subclass registration.  Only the payload-enum sum type
-                // reaches here.
-                if !fieldless {
+                // reaches here. A marked exception class projects its
+                // fields onto the minted variant classes instead.
+                if !fieldless && !marked {
                     for (vidx, v) in variants.iter().enumerate() {
                         let variant_qual = format!("{name}::{}", v.name);
                         let variant_leaf = format!("{leaf}::{}", v.name);
@@ -4620,19 +4752,22 @@ fn derive_program_metadata(
                 }
                 // discriminant → variant name, published under both the
                 // qualified path and the bare leaf so the opcode-dispatch
-                // extractor can resolve by either spelling.
-                let mut by_discr: std::collections::HashMap<i64, String> =
-                    std::collections::HashMap::new();
-                for v in variants {
-                    let variant_path = format!("{name}::{}", v.name);
-                    known_struct_names.insert(variant_path.clone());
-                    if let Some(d) = v.discriminant_i64() {
-                        by_discr.insert(d, v.name.clone());
+                // extractor can resolve by either spelling. A marked
+                // exception class has no tag and no `{enum}::{variant}` row.
+                if !marked {
+                    let mut by_discr: std::collections::HashMap<i64, String> =
+                        std::collections::HashMap::new();
+                    for v in variants {
+                        let variant_path = format!("{name}::{}", v.name);
+                        known_struct_names.insert(variant_path.clone());
+                        if let Some(d) = v.discriminant_i64() {
+                            by_discr.insert(d, v.name.clone());
+                        }
                     }
-                }
-                if !by_discr.is_empty() {
-                    enum_variant_by_discriminant.insert(name.clone(), by_discr.clone());
-                    enum_variant_by_discriminant.insert(leaf, by_discr);
+                    if !by_discr.is_empty() {
+                        enum_variant_by_discriminant.insert(name.clone(), by_discr.clone());
+                        enum_variant_by_discriminant.insert(leaf, by_discr);
+                    }
                 }
             }
             // A union's fields all start at offset 0 and only one is live,
@@ -5058,6 +5193,9 @@ impl DuplicateLeafFacts {
                 &harvest_declared_gc_facts(llbc).gc_struct_ids(),
                 no_immutable_fields(),
                 &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                    std::slice::from_ref(llbc),
+                ),
+                &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
                     std::slice::from_ref(llbc),
                 ),
             );
@@ -5627,6 +5765,9 @@ impl<'a> LowerContext<'a> {
             &gc_struct_ids,
             &immutable_fields,
             &raw_alloc_flavor_structs,
+            &crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(
+                std::slice::from_ref(llbc),
+            ),
         );
         Self {
             llbc,

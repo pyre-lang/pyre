@@ -2148,6 +2148,17 @@ pub(in crate::front::mir) fn adt_def_is_raw_storage(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
+    // A marked exception-class enum is the minted class, not a raw word
+    // bag. `&E` must stay `Ref` so the parameter carries the class root.
+    // An unmarked enum keeps the raw-storage answer below.
+    if matches!(&td.kind, TypeDeclKind::Enum(_)) {
+        let path = td.item_meta.name_path();
+        let canon = strip_crate_prefix(&path);
+        if exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon).is_some()
+        {
+            return false;
+        }
+    }
     if struct_id_is_declared_gc(
         gc_struct_ids,
         struct_id_for_type_decl(td),
@@ -2828,6 +2839,11 @@ pub(in crate::front::mir) struct ValueTypeInputs {
 pub(in crate::front::mir) struct LlbcDerived {
     pub(in crate::front::mir) value_type_inputs: std::sync::OnceLock<ValueTypeInputs>,
     pub(in crate::front::mir) struct_decls_by_owner: std::sync::OnceLock<StructDeclsByOwner>,
+    /// `_exception_class_<Enum>` hints of this artefact. Paint reads them.
+    /// Registration receives the same harvest from the lowering entry.
+    /// A copied TypeDecl in a later crate does not see a marker that
+    /// lives only on the defining artefact.
+    exception_class_hints: std::sync::OnceLock<Vec<crate::front::llbc_hints::ExceptionClassHint>>,
 }
 
 pub(in crate::front::mir) fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
@@ -4077,7 +4093,62 @@ pub(in crate::front::mir) fn tyref_payload_enum_class_root_with(
     if !tyref_is_enum_free(ty, llbc) {
         return None;
     }
+    // A marked enum is an instance of the minted exception class. The
+    // literal leaf (`E`, `ArgErr`) is that class. The tagged ADT root
+    // stays the paint for every unmarked payload enum.
+    if let Some(leaf) = tyref_exception_class_leaf(ty, llbc) {
+        return Some(leaf);
+    }
     tyref_class_root_with(ty, llbc, tombstoned)
+}
+
+/// Harvested `_exception_class_<Enum>` hints of one artefact.
+pub(in crate::front::mir) fn llbc_exception_class_hints(
+    llbc: &Llbc,
+) -> &Vec<crate::front::llbc_hints::ExceptionClassHint> {
+    llbc_derived(llbc).exception_class_hints.get_or_init(|| {
+        crate::front::llbc_hints::harvest_exception_class_hints_from_llbcs(std::slice::from_ref(
+            llbc,
+        ))
+    })
+}
+
+/// The hint whose harvested identity names `name` or `canon_base`.
+///
+/// `name` is the TypeDecl path. `canon_base` is `strip_crate_prefix` of
+/// that path. Matching is [`exception_class_enum_path_matches`].
+pub(in crate::front::mir) fn exception_class_hint_for_paths<'a>(
+    hints: &'a [crate::front::llbc_hints::ExceptionClassHint],
+    name: &str,
+    canon_base: &str,
+) -> Option<&'a crate::front::llbc_hints::ExceptionClassHint> {
+    hints.iter().find(|hint| {
+        crate::front::llbc_hints::exception_class_enum_path_matches(&hint.enum_path, name)
+            || crate::front::llbc_hints::exception_class_enum_path_matches(
+                &hint.enum_path,
+                canon_base,
+            )
+    })
+}
+
+/// Literal base-class name of a marked exception-class enum, or `None`.
+///
+/// Fieldless enums stay the tag integer. The helper does not call
+/// [`tyref_payload_enum_class_root_with`].
+pub(in crate::front::mir) fn tyref_exception_class_leaf(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    if tyref_is_fieldless_enum_free(ty, llbc) || tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+        return None;
+    }
+    if !tyref_is_enum_free(ty, llbc) {
+        return None;
+    }
+    let path = adt_path_of_tyref(ty, llbc)?;
+    let canon = strip_crate_prefix(&path);
+    let hint = exception_class_hint_for_paths(llbc_exception_class_hints(llbc), &path, &canon)?;
+    Some(crate::front::llbc_hints::exception_class_qualname(
+        &hint.enum_path,
+        None,
+    ))
 }
 
 /// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
@@ -5166,6 +5237,77 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     Some(td)
 }
 
+/// By-value ADT after leaving `Ref` and `RawPtr` in place.
+///
+/// `Box<T>` and a thin box are addresses, not the pointee. [`strip_ty_wrappers`]
+/// peels `Ref`, so it is the wrong peel for this question.
+fn exception_class_by_value_adt<'a>(ty: &TyRef, llbc: &'a Llbc) -> Option<&'a TypeDecl> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let obj = node.as_object()?;
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
+        return None;
+    }
+    if type_node_is_thin_box(node, llbc) {
+        return None;
+    }
+    let id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(id)?;
+    if td.item_meta.name_path() == "alloc::boxed::Box" {
+        return None;
+    }
+    Some(td)
+}
+
+/// Whether a marked-enum variant field is one translated word.
+///
+/// A by-value `String`, a `Vec` whose items are not one word, a by-value
+/// `VecDeque`, and a by-value raw-flavor or multi-word struct are not.
+/// A pointer or borrow of those types is the address. `Wtf8Buf`, a `Vec`
+/// of one-word items, scalars, and GC refs are.
+pub(in crate::front::mir) fn exception_class_attr_is_one_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if exception_class_by_value_adt(ty, llbc)
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+    {
+        return false;
+    }
+    if tyref_is_string_value(ty, llbc) {
+        return true;
+    }
+    if super::views::tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return true;
+    }
+    if exception_class_by_value_adt(ty, llbc).is_some_and(|td| {
+        let path = td.item_meta.name_path();
+        path == "alloc::vec::Vec" || path == "alloc::collections::vec_deque::VecDeque"
+    }) {
+        return false;
+    }
+    let Some(td) = tyref_by_value_struct_decl(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) else {
+        return true;
+    };
+    let path = td.item_meta.name_path();
+    if crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, &path) {
+        return false;
+    }
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let size = td
+        .layout_for_target(llbc, &target)
+        .and_then(|layout| layout.size);
+    let word = crate::layout::target_word_size() as u64;
+    matches!(size, Some(size) if size <= word)
+}
+
 /// `Struct` declarations of one artefact by owner spelling, for [`type_decl_by_owner_root`].
 pub(in crate::front::mir) struct StructDeclsByOwner {
     /// `(spelling, table position)` for each `Struct` decl's `name_path()` and its
@@ -5509,6 +5651,11 @@ pub(in crate::front::mir) fn tyref_input_class_root(
     }
     if let Some(ValueType::Ref(root)) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
         return root;
+    }
+    // A marked enum parameter is the minted base class (`E`), not the
+    // tagged ADT identity. `derive_subject_inputcells` seeds that ClassDef.
+    if let Some(leaf) = tyref_exception_class_leaf(ty, llbc) {
+        return Some(leaf);
     }
     let leaf = tyref_class_root_with(ty, llbc, tombstoned);
     if leaf

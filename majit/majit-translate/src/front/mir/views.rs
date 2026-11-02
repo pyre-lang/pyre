@@ -1257,6 +1257,15 @@ impl<'a> Lowering<'a> {
             .into_iter()
             .map(|id| remap.get(&id).map(Variable::id).unwrap_or(id))
             .collect();
+        let discs = std::mem::take(&mut self.exception_disc_vars);
+        let mut kept = std::collections::HashMap::new();
+        for (id, info) in discs {
+            if let Some(copy) = remap.get(&id) {
+                kept.insert(copy.id(), info.clone());
+            }
+            kept.insert(id, info);
+        }
+        self.exception_disc_vars = kept;
         for (_, var) in &mut self.string_array_view_locals {
             if let Some(copy) = remap.get(&var.id()) {
                 *var = copy.clone();

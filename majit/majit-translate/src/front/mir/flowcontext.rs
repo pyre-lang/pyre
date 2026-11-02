@@ -97,6 +97,15 @@ pub(in crate::front::mir) struct TaggedPairAggregateSite {
     pub(in crate::front::mir) payload_ty: ValueType,
 }
 
+/// Variant table of one marked exception-class enum, recorded on the
+/// discriminant alias so `SwitchInt` can emit an `isinstance` cascade.
+#[derive(Clone, Debug)]
+pub(in crate::front::mir) struct ExceptionDiscInfo {
+    pub(in crate::front::mir) enum_path: String,
+    pub(in crate::front::mir) by_discr: Vec<(i64, String)>,
+    pub(in crate::front::mir) parent_of: Vec<(String, Option<String>)>,
+}
+
 pub(in crate::front::mir) struct Lowering<'a> {
     pub(in crate::front::mir) graph: FunctionGraph,
     pub(in crate::front::mir) llbc: &'a Llbc,
@@ -592,6 +601,16 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// two-variant enum tag switches (real `__discriminant` reads) are absent
     /// and keep the `Int`-exitcase path.
     pub(in crate::front::mir) niche_disc_vars: std::collections::HashSet<u64>,
+    /// Marked exception-class discriminant aliases. The key is the
+    /// scrutinee variable. Remap copies the entry onto the new id and
+    /// keeps the old one. `lower_switch` reads it before the niche test.
+    pub(in crate::front::mir) exception_disc_vars:
+        std::collections::HashMap<u64, ExceptionDiscInfo>,
+    /// Blocks `lower_exception_class_switch` inserted between a MIR
+    /// `SwitchInt` and its variant arms. They are not MIR blocks, so
+    /// framestate's successor walk has to follow them or the arms look
+    /// unreached.
+    pub(in crate::front::mir) exception_cascade_blocks: Vec<BlockId>,
     /// Source GC pointer of each `cast_ptr_to_int` / `p as usize` result.
     /// A following `cast_int_to_ptr` is `jtransform.py rewrite_op_cast_opaque_ptr`.
     pub(in crate::front::mir) cast_ptr_to_int_src: std::collections::HashMap<Variable, Variable>,
@@ -1584,6 +1603,8 @@ impl<'a> Lowering<'a> {
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
+            exception_disc_vars: std::collections::HashMap::new(),
+            exception_cascade_blocks: Vec::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             raw_address_uint_src: std::collections::HashMap::new(),
             pointer_word_vars: std::collections::HashSet::new(),
@@ -1993,6 +2014,81 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).dead = true;
     }
 
+    /// MIR blocks reached from `origin`'s exits, following exception-class
+    /// cascade blocks. Those blocks are not in `block_to_mir` (they are
+    /// created while the switch lowers), so a direct exit walk never sees
+    /// the variant arms behind them. Each arm is returned once.
+    fn framestate_mir_successors(&self, origin: BlockId, block_to_mir: &[usize]) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut seen_cascade = Vec::new();
+        let mut stack: Vec<BlockId> = self
+            .graph
+            .block(origin)
+            .exits
+            .iter()
+            .map(|link| link.target)
+            .collect();
+        while let Some(tgt) = stack.pop() {
+            if self.exception_cascade_blocks.contains(&tgt) {
+                if seen_cascade.contains(&tgt) {
+                    continue;
+                }
+                seen_cascade.push(tgt);
+                stack.extend(self.graph.block(tgt).exits.iter().map(|link| link.target));
+                continue;
+            }
+            let Some(tmir) = block_to_mir.get(tgt.0).copied() else {
+                continue;
+            };
+            if tmir == usize::MAX || out.contains(&tmir) {
+                continue;
+            }
+            out.push(tmir);
+        }
+        out
+    }
+
+    /// `true` when an exception-class cascade block is the only predecessor.
+    /// Pass 2 rewrites MIR-to-MIR links only, so this arm must keep the
+    /// inputargs `set_branch` already matched to the cascade link. A second
+    /// predecessor would need both arities at once; decline to monotonic.
+    fn cascade_arm_keeps_prebind_inputs(&self, bb_id: BlockId) -> Result<bool, LowerError> {
+        let mut from_cascade = false;
+        let mut from_other = false;
+        for block in &self.graph.blocks {
+            if !block.exits.iter().any(|link| link.target == bb_id) {
+                continue;
+            }
+            if self.exception_cascade_blocks.contains(&block.id) {
+                from_cascade = true;
+            } else {
+                from_other = true;
+            }
+        }
+        if from_cascade && from_other {
+            return Err(LowerError::Unsupported(
+                "exception-class cascade arm has a non-cascade predecessor".to_string(),
+            ));
+        }
+        if from_cascade {
+            let arity = self.graph.block(bb_id).inputargs.len();
+            let mismatch = self.graph.blocks.iter().any(|block| {
+                self.exception_cascade_blocks.contains(&block.id)
+                    && block
+                        .exits
+                        .iter()
+                        .any(|link| link.target == bb_id && link.args.len() != arity)
+            });
+            if mismatch {
+                return Err(LowerError::Unsupported(
+                    "exception-class cascade link arity disagrees with the arm inputargs"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(from_cascade)
+    }
+
     /// Lower the body threading locals as block inputargs / phis via
     /// per-block [`FrameState`]s, instead of the function-wide monotonic
     /// `local_var` table.  Handles both acyclic and cyclic bodies; this
@@ -2124,7 +2220,11 @@ impl<'a> Lowering<'a> {
             let bb_id = self.block_id[bb];
             // The startblock keeps its parameter inputargs + Input ops;
             // it is never a merge target in an acyclic body.
-            if bb != 0 {
+            // An arm entered only from an exception-class cascade keeps
+            // the inputargs the cascade link was built against. Pass 2
+            // does not rewrite that link (its source is not a MIR block).
+            let keep_prebind = self.cascade_arm_keeps_prebind_inputs(bb_id)?;
+            if bb != 0 && !keep_prebind {
                 let inputargs = st.getvariables(&self.graph);
                 self.graph.block_mut(bb_id).inputargs = inputargs;
                 // Anchor the block body to the framestate locals.
@@ -2176,24 +2276,16 @@ impl<'a> Lowering<'a> {
             }
             exit_state[row] = Some(PackedFrameState::pack(ex.clone()));
             // Union this exit into each model successor's entry state.
-            // Successors are read off the just-closed exits (the model
-            // edges), skipping the return / except sinks and any
-            // non-MIR target.
-            let succ_targets: Vec<BlockId> = self
-                .graph
-                .block(bb_id)
-                .exits
-                .iter()
-                .map(|l| l.target)
-                .collect();
-            for tgt in succ_targets {
-                if tgt == returnblock || tgt == exceptblock {
-                    continue;
-                }
-                let tmir = block_to_mir.get(tgt.0).copied().unwrap_or(usize::MAX);
-                if tmir == usize::MAX {
-                    continue;
-                }
+            // Successors are the just-closed exits, plus the MIR arms an
+            // exception-class cascade reaches: those blocks are not MIR
+            // blocks, and stopping at them left every later variant arm
+            // with an empty entry. Pass 1 then `stub_dead_block`s the arm
+            // (`set_raise` of AssertionError) and `remove_assertion_errors`
+            // deletes the isinstance test that only existed to reach it.
+            // Return / except sinks stay out (`block_to_mir` leaves them
+            // as `usize::MAX`).
+            let mir_succs = self.framestate_mir_successors(bb_id, &block_to_mir);
+            for tmir in mir_succs {
                 // A loop-header successor keeps its pre-seeded entry
                 // (Pass 0): its live-in phis are fixed, and this
                 // predecessor threads into them in pass 2.  Unioning the
@@ -3199,6 +3291,11 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
             SwitchTargets::SwitchInt(_int_ty, arms, default) => {
+                if let Some(info) = self.exception_disc_for_var(discr_var.id()) {
+                    return self.lower_exception_class_switch(
+                        mir_bb, bb_id, discr_var, info, arms, default,
+                    );
+                }
                 // A `SwitchInt` on a one-word niche `Option` discriminant
                 // switches on the pointer null-test `ne(base, null)` — a
                 // `SomeBool`, not an `Int` tag.  RPython never switches on a
@@ -3256,6 +3353,305 @@ impl<'a> Lowering<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// The marked-enum info recorded on `id`, following block-input copies.
+    pub(in crate::front::mir) fn exception_disc_for_var(
+        &self,
+        id: u64,
+    ) -> Option<ExceptionDiscInfo> {
+        let mut current = id;
+        for _ in 0..8 {
+            if let Some(info) = self.exception_disc_vars.get(&current) {
+                return Some(info.clone());
+            }
+            let Some(prev) = self.input_copied_from.get(&current).copied() else {
+                break;
+            };
+            current = prev;
+        }
+        None
+    }
+
+    /// `SwitchInt` on a marked exception class. Each arm is
+    /// `isinstance(scrutinee, VariantClass)` (`flowspace` `isinstance`,
+    /// [`InstanceRepr::rtype_isinstance`](crate::translator::rtyper::rclass::InstanceRepr::rtype_isinstance)).
+    /// A subclass is tested before its parent, the order
+    /// `Arguments.parse_obj` uses for `except ArgErrUnknownKwds` then
+    /// `except ArgErr`.
+    ///
+    /// Before a class that has subclasses, every descendant variant is
+    /// tested, deepest first. A descendant the match does not list takes
+    /// the otherwise target. A leaf adds no test. The last arm is the
+    /// `ExitCase::Bool(false)` edge only when the default is a panic
+    /// abort and the cascade already covers every variant.
+    pub(in crate::front::mir) fn lower_exception_class_switch(
+        &mut self,
+        mir_bb: usize,
+        bb_id: BlockId,
+        discr_var: Variable,
+        info: ExceptionDiscInfo,
+        arms: Vec<(serde_json::Value, u64)>,
+        default: u64,
+    ) -> Result<(), LowerError> {
+        let mut present: Vec<(String, u64)> = Vec::new();
+        for (scalar, bb) in &arms {
+            let case = scalar_to_const_value(scalar, self.llbc).ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: exception-class SwitchInt case scalar shape not supported: {scalar}"
+                ))
+            })?;
+            let discr = match case {
+                ConstValue::Int(value) => value,
+                ConstValue::UInt(value) => i64::try_from(value).map_err(|_| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: exception-class SwitchInt case {value} does not fit i64"
+                    ))
+                })?,
+                other => {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: exception-class SwitchInt case {other:?} is not an integer"
+                    )));
+                }
+            };
+            let variant = info
+                .by_discr
+                .iter()
+                .find(|(stored, _)| *stored == discr)
+                .map(|(_, name)| name.clone())
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: exception-class SwitchInt discriminant {discr} is not a variant of {}",
+                        info.enum_path
+                    ))
+                })?;
+            present.push((variant, *bb));
+        }
+        let depth_of = |name: &str| -> usize {
+            let mut depth = 1usize;
+            let mut current = info
+                .parent_of
+                .iter()
+                .find(|(variant, _)| variant == name)
+                .and_then(|(_, parent)| parent.clone());
+            while let Some(parent) = current {
+                depth += 1;
+                let next = parent.clone();
+                current = info
+                    .parent_of
+                    .iter()
+                    .find(|(variant, _)| variant == &next)
+                    .and_then(|(_, parent)| parent.clone());
+            }
+            depth
+        };
+        // Listed arms, then every unlisted descendant of a listed class
+        // that has subclasses. The descendant takes its own arm when the
+        // match names it, and the otherwise target when it does not.
+        // `sort_by` is stable, so equal depths keep switch order.
+        let mut ordered = present.clone();
+        let mut seen: Vec<String> = present.iter().map(|(name, _)| name.clone()).collect();
+        for (name, _) in &present {
+            let mut frontier = vec![name.clone()];
+            while !frontier.is_empty() {
+                let mut next_frontier = Vec::new();
+                for current in &frontier {
+                    for (child, parent) in &info.parent_of {
+                        if parent.as_deref() != Some(current.as_str()) {
+                            continue;
+                        }
+                        if seen.iter().any(|have| have == child) {
+                            continue;
+                        }
+                        seen.push(child.clone());
+                        ordered.push((child.clone(), default));
+                        next_frontier.push(child.clone());
+                    }
+                }
+                frontier = next_frontier;
+            }
+        }
+        ordered.sort_by(|left, right| depth_of(&right.0).cmp(&depth_of(&left.0)));
+        let universe: Vec<&str> = if info.parent_of.is_empty() {
+            info.by_discr
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect()
+        } else {
+            info.parent_of
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect()
+        };
+        let covers_all = universe
+            .iter()
+            .all(|name| ordered.iter().any(|(have, _)| have == *name));
+        let panic_default = self.switch_default_targets_panic_abort(default);
+        if ordered.is_empty() {
+            if panic_default {
+                return Ok(());
+            }
+            let args = self.edge_args(mir_bb, default as usize)?;
+            self.graph
+                .set_goto(bb_id, self.block_id[default as usize], args);
+            return Ok(());
+        }
+        // One covered variant and an unreachable default: the value is
+        // that variant. A parent with a descendant expands `ordered`, so
+        // this goto is only the lone leaf.
+        if panic_default && covers_all && ordered.len() == 1 {
+            let args = self.edge_args(mir_bb, ordered[0].1 as usize)?;
+            self.graph
+                .set_goto(bb_id, self.block_id[ordered[0].1 as usize], args);
+            return Ok(());
+        }
+        // Omitting the last test sends every remaining value to that arm.
+        // Sound only when every other variant already has a test.
+        let elide_last = panic_default && covers_all && ordered.len() > 1;
+        let split = if elide_last {
+            ordered.len() - 1
+        } else {
+            ordered.len()
+        };
+        let tests = &ordered[..split];
+        let final_arm = if elide_last {
+            Some(ordered[split].clone())
+        } else {
+            None
+        };
+        let mut test_edges = Vec::with_capacity(tests.len());
+        for (_, bb) in tests {
+            test_edges.push(self.edge_args(mir_bb, *bb as usize)?);
+        }
+        let final_edges = match &final_arm {
+            Some((_, bb)) => Some(self.edge_args(mir_bb, *bb as usize)?),
+            None => None,
+        };
+        let default_edges = if final_arm.is_some() {
+            None
+        } else {
+            Some(self.edge_args(mir_bb, default as usize)?)
+        };
+        let mut carry = vec![discr_var.clone()];
+        let push_unique = |args: &[Variable], carry: &mut Vec<Variable>| {
+            for arg in args {
+                if !carry.iter().any(|have| have.id() == arg.id()) {
+                    carry.push(arg.clone());
+                }
+            }
+        };
+        for edges in &test_edges {
+            push_unique(edges, &mut carry);
+        }
+        if let Some(edges) = &final_edges {
+            push_unique(edges, &mut carry);
+        }
+        if let Some(edges) = &default_edges {
+            push_unique(edges, &mut carry);
+        }
+        let reorder = |fresh: &[Variable], wanted: &[Variable]| -> Vec<Variable> {
+            wanted
+                .iter()
+                .map(|arg| {
+                    let pos = carry
+                        .iter()
+                        .position(|have| have.id() == arg.id())
+                        .expect("exception-class switch carry includes the arm edge");
+                    fresh[pos].clone()
+                })
+                .collect()
+        };
+        let tests: Vec<(String, u64)> = tests.to_vec();
+        let mut block = bb_id;
+        let mut fresh: Option<Vec<Variable>> = None;
+        for (index, (variant, arm_bb)) in tests.iter().enumerate() {
+            let obj = match &fresh {
+                Some(args) => args[0].clone(),
+                None => discr_var.clone(),
+            };
+            let class_name =
+                crate::front::llbc_hints::exception_class_qualname(&info.enum_path, Some(variant));
+            let class_var = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let result = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(block).operations.push(SpaceOperation {
+                result: Some(class_var.clone()),
+                kind: crate::model::OpKind::ConstRef(
+                    crate::flowspace::model::HostObject::new_class(class_name, Vec::new()),
+                ),
+            });
+            self.graph.block_mut(block).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::IsInstance {
+                    obj,
+                    class_carrier: class_var,
+                    result_ty: ValueType::Bool,
+                },
+            });
+            let real_target = self.block_id[*arm_bb as usize];
+            let real_args = match &fresh {
+                Some(args) => reorder(args, &test_edges[index]),
+                None => test_edges[index].clone(),
+            };
+            // The first test sits on the MIR switch block. A later test
+            // sits on a cascade block. One arm reached from both would
+            // make pass 2 rewrite only the MIR link. Route that first
+            // edge through a cascade block so every predecessor agrees.
+            let first_shared = index == 0
+                && tests.len() > 1
+                && (tests.iter().skip(1).any(|(_, other)| other == arm_bb)
+                    || final_arm.as_ref().is_some_and(|(_, bb)| bb == arm_bb)
+                    || (final_arm.is_none() && *arm_bb == default));
+            let (true_target, true_args) = if first_shared {
+                let (shim, shim_args) = self.graph.create_block_with_arg_vars(real_args.len());
+                self.exception_cascade_blocks.push(shim);
+                self.graph.set_goto(shim, real_target, shim_args);
+                (shim, real_args)
+            } else {
+                (real_target, real_args)
+            };
+            let last = index + 1 == tests.len();
+            let (false_target, false_args) = if !last {
+                let (next, next_args) = self.graph.create_block_with_arg_vars(carry.len());
+                self.exception_cascade_blocks.push(next);
+                let false_args = match &fresh {
+                    Some(args) => args.clone(),
+                    None => carry.clone(),
+                };
+                fresh = Some(next_args);
+                (next, false_args)
+            } else if let Some(((_, arm), edges)) = final_arm.as_ref().zip(final_edges.as_ref()) {
+                let false_args = match &fresh {
+                    Some(args) => reorder(args, edges),
+                    None => edges.clone(),
+                };
+                (self.block_id[*arm as usize], false_args)
+            } else {
+                let edges = default_edges.as_ref().expect("live default edge");
+                let false_args = match &fresh {
+                    Some(args) => reorder(args, edges),
+                    None => edges.clone(),
+                };
+                (self.block_id[default as usize], false_args)
+            };
+            let next_fresh = fresh.clone();
+            self.graph.set_branch(
+                block,
+                result,
+                true_target,
+                true_args,
+                false_target,
+                false_args,
+            );
+            if !last {
+                block = false_target;
+                fresh = next_fresh;
+            }
+        }
+        Ok(())
     }
 
     /// Close a `SwitchInt` whose discriminant is a one-word niche `Option`

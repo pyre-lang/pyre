@@ -2242,6 +2242,7 @@ fn unicode_storage_matches_real_object_llbc() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     assert!(
         fields
@@ -2341,6 +2342,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     assert_eq!(
         fields.fields.get("Constants"),
@@ -3344,6 +3346,7 @@ fn a_shelled_variant_carries_the_inherited_discriminant_as_its_first_row() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &[],
     );
 
     assert_eq!(
@@ -8211,6 +8214,7 @@ fn type_parameter_fields_force_no_attribute_real() {
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
         &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
+        &[],
     );
     let field = |owner: &str, name: &str| {
         attrs

@@ -31318,3 +31318,6 @@ fn ascii_setitem_writes_items_block() {
         other => panic!("write base must be FieldRead block, got {other:?}"),
     }
 }
+
+#[path = "exception_class_use_tests.rs"]
+mod exception_class_use_tests;
