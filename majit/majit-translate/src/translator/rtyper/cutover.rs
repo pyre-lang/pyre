@@ -4981,6 +4981,7 @@ fn drive_lifted_subject(
             &mut constant_concretetypes,
             Some(&rtyper),
         );
+        map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
     }
     Ok((
         graph,
@@ -7145,6 +7146,54 @@ fn reconcile_projection_aliases(
     }
 }
 
+/// Point the FunctionGraph returnblock / exceptblock inputargs at the
+/// live flowspace twins `block_map` holds after simplify and rtype.
+///
+/// `rtyper.py specialize_block` calls `setconcretetype(graph.getreturnvar())`
+/// on the one graph; `FunctionGraph.getreturnvar` is `returnblock.inputargs[0]`.
+/// Pass 1 of `function_graph_to_flowspace_inner` skips those finals and
+/// then seeds `value_to_var` with `or_insert_with` while
+/// `FunctionGraph.with_return_var` installs a fresh `getreturnvar()`.
+/// `remove_identical_vars_SSA` pops returnblock (and start/except) from the
+/// entrymap, so [`reconcile_elided_phi_inputargs`] does not alias those
+/// columns. A multi-predecessor return phi also fails that helper's one
+/// shared representative rule.
+///
+/// Two-phase Phase B types the live `getreturnvar()` in place. Zip the
+/// live `block_map` columns of those finals last so publication copies
+/// that twin, not a lift-time seed.
+///
+/// Intermediate blocks stay on the Pass 1 seed: `remove_identical_vars_SSA`
+/// deletes identical phi columns, so a position zip would pair the wrong
+/// twin. Extra flowspace columns (`SSA_to_SSI` appends) have no
+/// FunctionGraph twin by construction; extra FunctionGraph columns keep
+/// the previous seed. A Constant flowspace inputarg is not a Variable twin.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn map_block_inputargs_from_flowspace(
+    legacy: &LegacyGraph,
+    block_map: &HashMap<crate::model::BlockId, BlockRef>,
+    value_to_var: &mut LegacyToTyped,
+) {
+    for block in &legacy.blocks {
+        if block.id != legacy.returnblock && block.id != legacy.exceptblock {
+            continue;
+        }
+        let Some(flow_block) = block_map.get(&block.id) else {
+            continue;
+        };
+        let flow_inputs = flow_block.borrow().inputargs.clone();
+        for (legacy_arg, flow_arg) in block.inputargs.iter().zip(flow_inputs.iter()) {
+            let Hlvalue::Variable(typed) = flow_arg else {
+                continue;
+            };
+            value_to_var.insert(legacy_arg.clone(), typed.clone());
+        }
+    }
+}
+
 /// Whether the origin FunctionDesc's `(AccessDirect, None)` cachedgraph
 /// is the subject's annotated `PyGraph` (`description.py
 /// FunctionDesc.cachedgraph` / `specialize.py default_specialize`).
@@ -7226,6 +7275,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
                         subj.value_to_var_candidates.clone(),
                         subj.constant_concretetypes.clone(),
                         subj.constant_hlvalues.clone(),
+                        subj.block_map.clone(),
                     ))
                 }
             }
@@ -7243,11 +7293,17 @@ pub(crate) fn dual_gate_outcome_from_cache(
             }
         }
     };
-    let (graph, mut value_to_var, value_to_var_candidates, mut constants, mut constant_values) =
-        match cached {
-            Ok(cached) => cached,
-            Err(reason) => return Ok(DualGateOutcome::Skip(reason)),
-        };
+    let (
+        graph,
+        mut value_to_var,
+        value_to_var_candidates,
+        mut constants,
+        mut constant_values,
+        block_map,
+    ) = match cached {
+        Ok(cached) => cached,
+        Err(reason) => return Ok(DualGateOutcome::Skip(reason)),
+    };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
     let rtyper = call_registry.session_if_started().map(|(_, rt)| rt);
@@ -7258,6 +7314,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
         &mut constants,
         rtyper.as_ref(),
     );
+    map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
     // deferred from `drive_subject`, which did not rtype in Phase A).
@@ -8655,6 +8712,139 @@ mod tests {
             .and_then(|s| s.pygraph.clone())
             .expect("subject PyGraph");
         assert!(!Rc::ptr_eq(&manufactured, &subject_pygraph));
+    }
+
+    /// SSA `Option<fn>` return phi: one Some arm and three `null_fn` None
+    /// arms, cond threaded through every split. Same predecessor shape as
+    /// production `builtin_fixed_arity_fn` (one Some + three `null_fn`).
+    fn option_fn_return_phi_match_graph() -> LegacyGraph {
+        let mut graph = LegacyGraph::new("option_fn_return_phi_match").with_return_type("i64");
+        let start = graph.startblock;
+        let (pred_some, some_args) = graph.create_block_with_arg_vars(1);
+        let some_phi = some_args[0].clone();
+        let (rest1, rest1_args) = graph.create_block_with_arg_vars(1);
+        let cond1 = rest1_args[0].clone();
+        let pred_none1 = graph.create_block();
+        let (rest2, rest2_args) = graph.create_block_with_arg_vars(1);
+        let cond2 = rest2_args[0].clone();
+        let pred_none2 = graph.create_block();
+        let pred_none3 = graph.create_block();
+
+        let cond = graph
+            .push_op_var(
+                start,
+                crate::model::OpKind::Input {
+                    name: "c".into(),
+                    ty: ValueType::Bool,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let some_fn = graph
+            .push_op_var(
+                start,
+                crate::model::OpKind::Input {
+                    name: "f".into(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn() -> i64".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(start, cond.clone());
+        graph.push_inputarg_var(start, some_fn.clone());
+        graph.set_branch(
+            start,
+            cond.clone(),
+            pred_some,
+            vec![some_fn],
+            rest1,
+            vec![cond],
+        );
+        graph.set_return(pred_some, Some(some_phi));
+        graph.set_branch(rest1, cond1.clone(), pred_none1, vec![], rest2, vec![cond1]);
+        let none1 = graph.push_null_fn_ptr_with_spelling(pred_none1, Some("fn() -> i64"));
+        graph.set_return(pred_none1, Some(none1));
+        graph.set_branch(rest2, cond2, pred_none2, vec![], pred_none3, vec![]);
+        let none2 = graph.push_null_fn_ptr_with_spelling(pred_none2, Some("fn() -> i64"));
+        graph.set_return(pred_none2, Some(none2));
+        let none3 = graph.push_null_fn_ptr_with_spelling(pred_none3, Some("fn() -> i64"));
+        graph.set_return(pred_none3, Some(none3));
+        graph
+    }
+
+    /// Two-phase Match: the returnblock inputarg is the live
+    /// `getreturnvar()` twin (`rtyper.py specialize_block`
+    /// `setconcretetype`), so `func_result_kind` is `'i'` without the
+    /// Func→Int comparison residue.
+    #[test]
+    fn two_phase_match_option_fn_return_phi_maps_returnblock_inputarg() {
+        let _lock = anchor_lock();
+        let graph = option_fn_return_phi_match_graph();
+        let path = crate::parse::CallPath {
+            segments: vec!["option_fn_return_phi_match".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
+        };
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        graphs.insert(path.clone(), graph.clone());
+        run_two_phase_prepass(&registry, &HashSet::from([path.clone()]), &graphs);
+        let outcome = dual_gate_outcome_from_cache(&graph, &registry, &graphs, &path)
+            .expect("publish reads the cache");
+        let DualGateOutcome::Match {
+            real_value_to_var, ..
+        } = outcome
+        else {
+            panic!("two-phase Option<fn> return phi must Match, got {outcome:?}");
+        };
+        assert!(
+            real_value_to_var.contains_key(&return_var),
+            "returnblock inputarg must be in real_value_to_var"
+        );
+        let live = {
+            let tp = registry.two_phase();
+            let subj = tp.subjects.get(&path).expect("prepass subject");
+            match subj.graph.borrow().getreturnvar() {
+                Hlvalue::Variable(v) => v,
+                other => panic!("getreturnvar must be a Variable, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            real_value_to_var.get(&return_var),
+            Some(&live),
+            "returnblock inputarg maps to PyGraph getreturnvar()"
+        );
+        assert_eq!(
+            kind_of_in(&real_value_to_var, &return_var),
+            ConcreteType::Signed,
+        );
+        crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
+        assert_eq!(
+            LegacyGraph::concretetype_of(&return_var),
+            ConcreteType::Signed,
+        );
+
+        let mut callcontrol = crate::codewriter::call::CallControl::new();
+        callcontrol.register_function_graph(path.clone(), graph.clone());
+        callcontrol.find_all_graphs_for_tests();
+        let mut codewriter = crate::codewriter::codewriter::CodeWriter::new();
+        codewriter.run_two_phase_prepass(&callcontrol);
+        let jitcode =
+            std::sync::Arc::new(crate::jitcode::JitCode::new("option_fn_return_phi_match"));
+        codewriter.transform_graph_to_jitcode(
+            &graph,
+            &path,
+            &mut callcontrol,
+            &crate::codewriter::jtransform::GraphTransformConfig::default(),
+            &jitcode,
+            false,
+            0,
+        );
+        assert_eq!(jitcode.calldescr().result_type, 'i');
     }
 
     /// `warmspot.py check_access_directly_sanity`: a graph
@@ -11277,6 +11467,84 @@ mod tests {
             value_to_var.get(&target),
             Some(&untyped_target),
             "same kind is insufficient: upstream unions exact phi representatives"
+        );
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_maps_returnblock_to_live_twin() {
+        let graph = LegacyGraph::new("ret_phi");
+        let ret = graph.block(graph.returnblock).inputargs[0].clone();
+        let stale = Variable::named("stale");
+        stale.set_concretetype(Some(LowLevelType::Void));
+        let live = Variable::named("live_return");
+        live.set_concretetype(Some(LowLevelType::Signed));
+        let mut value_to_var = HashMap::from([(ret.clone(), stale)]);
+        let flow_return =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(live.clone())]);
+        let mut block_map = HashMap::new();
+        block_map.insert(graph.returnblock, flow_return);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(value_to_var.get(&ret), Some(&live));
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_leaves_extra_flowspace_ssi_copies() {
+        let graph = LegacyGraph::new("ret_ssi");
+        let ret = graph.block(graph.returnblock).inputargs[0].clone();
+        let live = Variable::named("live_return");
+        let ssi_copy = Variable::named("ssi_copy");
+        let mut value_to_var = HashMap::from([(ret.clone(), Variable::named("seed"))]);
+        let flow_return = crate::flowspace::model::Block::shared(vec![
+            Hlvalue::Variable(live.clone()),
+            Hlvalue::Variable(ssi_copy),
+        ]);
+        let mut block_map = HashMap::new();
+        block_map.insert(graph.returnblock, flow_return);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(value_to_var.get(&ret), Some(&live));
+        assert_eq!(
+            value_to_var.len(),
+            1,
+            "SSA_to_SSI extra column has no FunctionGraph twin"
+        );
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_keeps_extra_legacy_column_seed() {
+        let graph = LegacyGraph::new("except_extra_legacy");
+        let etype = graph.block(graph.exceptblock).inputargs[0].clone();
+        let evalue = graph.block(graph.exceptblock).inputargs[1].clone();
+        let seed_evalue = Variable::named("seed_evalue");
+        let live = Variable::named("live_etype");
+        let mut value_to_var = HashMap::from([
+            (etype.clone(), Variable::named("seed_etype")),
+            (evalue.clone(), seed_evalue.clone()),
+        ]);
+        let flow_except =
+            crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(live.clone())]);
+        let mut block_map = HashMap::new();
+        block_map.insert(graph.exceptblock, flow_except);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(value_to_var.get(&etype), Some(&live));
+        assert_eq!(value_to_var.get(&evalue), Some(&seed_evalue));
+    }
+
+    #[test]
+    fn map_block_inputargs_from_flowspace_leaves_intermediate_phi_seed() {
+        let mut graph = LegacyGraph::new("join_phi");
+        let (join, inputs) = graph.create_block_with_arg_vars(1);
+        let phi = inputs[0].clone();
+        let seed = Variable::named("seed");
+        let live = Variable::named("live_phi");
+        let mut value_to_var = HashMap::from([(phi.clone(), seed.clone())]);
+        let flow_join = crate::flowspace::model::Block::shared(vec![Hlvalue::Variable(live)]);
+        let mut block_map = HashMap::new();
+        block_map.insert(join, flow_join);
+        map_block_inputargs_from_flowspace(&graph, &block_map, &mut value_to_var);
+        assert_eq!(
+            value_to_var.get(&phi),
+            Some(&seed),
+            "remove_identical_vars_SSA may drop columns; do not zip intermediate phis"
         );
     }
 
