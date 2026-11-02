@@ -277,11 +277,7 @@ impl<'a> CompileData<'a> {
 /// `compile.py` `class PreambleCompileData(CompileData)`.
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
-    #[allow(dead_code)]
-    pub runtime_boxes: &'a [OpRef],
     pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-    #[allow(dead_code)]
-    pub enable_opts: &'a [String],
 }
 
 impl<'a> PreambleCompileData<'a> {
@@ -293,9 +289,7 @@ impl<'a> PreambleCompileData<'a> {
     ) -> Self {
         Self {
             base: CompileData::new(trace),
-            runtime_boxes,
             call_pure_results,
-            enable_opts,
         }
     }
 }
@@ -303,11 +297,7 @@ impl<'a> PreambleCompileData<'a> {
 /// `compile.py` `class SimpleCompileData(CompileData)`.
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
-    #[allow(dead_code)]
-    pub resumestorage: Option<&'a ResumeStorage>,
     pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-    #[allow(dead_code)]
-    pub enable_opts: &'a [String],
 }
 
 impl<'a> SimpleCompileData<'a> {
@@ -319,9 +309,7 @@ impl<'a> SimpleCompileData<'a> {
     ) -> Self {
         Self {
             base: CompileData::new(trace),
-            resumestorage,
             call_pure_results,
-            enable_opts,
         }
     }
 
@@ -339,17 +327,8 @@ impl<'a> SimpleCompileData<'a> {
 
 /// `compile.py` `class BridgeCompileData(CompileData)`.
 pub struct BridgeCompileData<'a> {
-    #[allow(dead_code)]
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
-    #[allow(dead_code)]
-    pub resumestorage: Option<&'a ResumeStorage>,
-    #[allow(dead_code)]
-    pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-    #[allow(dead_code)]
-    pub inline_short_preamble: bool,
-    #[allow(dead_code)]
-    pub enable_opts: &'a [String],
 }
 
 impl<'a> BridgeCompileData<'a> {
@@ -364,10 +343,6 @@ impl<'a> BridgeCompileData<'a> {
         Self {
             base: CompileData::new(trace),
             runtime_boxes,
-            resumestorage,
-            call_pure_results,
-            inline_short_preamble,
-            enable_opts,
         }
     }
 
@@ -384,7 +359,7 @@ impl<'a> BridgeCompileData<'a> {
 }
 
 /// `compile.py` `class UnrolledLoopData(CompileData)`.
-#[allow(dead_code)]
+#[allow(dead_code)] // compile.py UnrolledLoopData; unrolled-loop compilation does not construct it yet
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
@@ -1826,18 +1801,8 @@ fn alloc_fail_index() -> u32 {
 // `guard_value_counter_slot` in majit-backend's `resume_guard_descr.rs`, which
 // this block mirrors.
 pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
-#[allow(dead_code)]
-pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;
 pub(crate) const STATUS_SHIFT: u32 = 3;
 pub(crate) const STATUS_SHIFT_MASK: u64 = !((1u64 << STATUS_SHIFT) - 1);
-#[allow(dead_code)]
-pub(crate) const STATUS_TY_NONE: u64 = 0x00;
-#[allow(dead_code)]
-pub(crate) const STATUS_TY_INT: u64 = 0x02;
-#[allow(dead_code)]
-pub(crate) const STATUS_TY_REF: u64 = 0x04;
-#[allow(dead_code)]
-pub(crate) const STATUS_TY_FLOAT: u64 = 0x06;
 
 // MetaFailDescr removed: pyre-introduced placeholder for non-resume
 // FailDescr is no longer needed.  All factories

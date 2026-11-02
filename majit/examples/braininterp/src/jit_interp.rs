@@ -43,19 +43,6 @@ pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 /// loop body from a segmented trace-limit terminator.
 pub static LAST_OPS_BEFORE: AtomicUsize = AtomicUsize::new(0);
 
-#[expect(
-    dead_code,
-    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
-)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 #[cfg(not(test))]
 const TAPE_SIZE: usize = 30000;
 #[cfg(test)]

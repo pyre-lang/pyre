@@ -318,44 +318,6 @@ pub fn emit_trace_call_ref_typed_elidable_cannot_raise(
     )
 }
 
-/// `celldict.py getdictvalue_no_unwrapping` residual: returns the
-/// raw stored value-or-cell at `slot` of the module dict `namespace_ptr`
-/// (the object, not its storage), _not_ unwrapped.  The elidable form of
-/// this — keyed on `version?` via `QuasiimmutField` — folds to a constant
-/// cell pointer; the live `cell.w_value` read is emitted separately as a
-/// `GetfieldGcR`.  Null on a non-module dict, missing slot, or after
-/// `switch_to_object_strategy`.
-#[allow(dead_code)]
-pub(crate) extern "C" fn jit_namespace_cell_lookup(
-    w_globals: PyObjectRef,
-    slot: i64,
-) -> PyObjectRef {
-    if w_globals.is_null() || slot < 0 {
-        return PY_NULL;
-    }
-    let cell =
-        unsafe { pyre_object::dictmultiobject::module_dict_cell_at(w_globals, slot as usize) };
-    cell.unwrap_or(PY_NULL)
-}
-
-#[allow(dead_code)]
-pub(crate) fn namespace_slot_lookup_values(
-    func_ptr: *const (),
-    w_globals: pyre_object::PyObjectRef,
-    slot: usize,
-) -> [Value; 3] {
-    [
-        Value::Int(func_ptr as usize as i64),
-        Value::Ref(GcRef(w_globals as usize)),
-        Value::Int(slot as i64),
-    ]
-}
-
-#[allow(dead_code)]
-pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
-    Value::Ref(GcRef(result as usize))
-}
-
 /// `typeobject.py _pure_lookup_where_with_method_cache` residual: the
 /// `@elidable` method-cache lookup keyed on `(w_type, w_name, version_tag)`,
 /// recorded as a foldable `CALL_PURE_R` so repeated same-key lookups in a

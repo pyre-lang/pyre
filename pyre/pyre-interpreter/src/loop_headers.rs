@@ -206,7 +206,7 @@ pub struct LoopHeaderInfo {
 
 /// Host `LoopHeaderInfo` is a `Box::into_raw`'d host allocation, never a GC object.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_LoopHeaderInfo: &str = "raw";
 
 /// Publish `LoopHeaderInfo` on `w_code` at the first query.

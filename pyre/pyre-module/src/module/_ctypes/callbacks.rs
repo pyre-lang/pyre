@@ -20,6 +20,8 @@ mod imp {
     }
 
     struct StoredThunk {
+        // Held for their Drop: the thunk's closure calls back with
+        // `userdata` until both are freed together.
         #[allow(dead_code)]
         thunk: CallbackThunk,
         #[allow(dead_code)]

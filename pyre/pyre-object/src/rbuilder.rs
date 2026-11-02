@@ -94,7 +94,6 @@ pub fn stringpiece_gc_type_id() -> u32 {
 // `gc_alloc_storage_box` (task #48); `current_pos`/`current_end`/`total_size` are
 // then written in place by the ctor/append/grow primitives. The layout slots are
 // load-bearing, so silence the unread-field lints.
-#[allow(dead_code)]
 #[repr(C)]
 struct StringBuilderBox {
     current_buf: i64,
@@ -137,7 +136,6 @@ const _: () = assert!(
 /// allocates it; the item size for `buf` is the STR width (1).
 // Built via an `alloc_piece` struct literal in the `ll_grow_by` grow primitive
 // and handed to `gc_alloc_storage_box` (task #48).
-#[allow(dead_code)]
 #[repr(C)]
 struct StringPieceBox {
     buf: i64,
@@ -168,7 +166,6 @@ const _: () =
 ///
 /// `current_buf` and every STRINGPIECE `buf` are ordinary GC references, so the
 /// aliasing and reuse paths below follow `rbuilder.py` directly.
-#[allow(dead_code)]
 pub mod rbuilder_runtime {
     use super::{StringBuilderBox, StringPieceBox};
     use crate::lowlevel_string::{

@@ -301,37 +301,6 @@ impl FrameView {
     fn reload(frame: *mut PyFrame) -> *mut PyFrame {
         gc_roots::reload_top_root(frame as pyre_object::PyObjectRef) as *mut PyFrame
     }
-
-    /// Same top-root read as [`Self::reload`], through a slot resolved once
-    /// for this activation. `gc_enter_roots_frame` does that once per
-    /// function; repeating `LocalKey::with` on every opcode is not part of
-    /// `PyFrame.dispatch`.
-    #[inline]
-    fn reload_entered(
-        slot: majit_gc::shadow_stack::ShadowStackSlot,
-        frame: *mut PyFrame,
-    ) -> *mut PyFrame {
-        gc_roots::reload_top_root_at(frame as pyre_object::PyObjectRef, slot) as *mut PyFrame
-    }
-}
-
-/// Pre-marker reload. `gc_enter_roots_frame` stores the root stack once;
-/// `PyFrame.dispatch` then uses that frame and does not re-enter thread
-/// local storage. The slot pointer stays in this helper so it is not live
-/// across `jit_merge_point` (`split_before_jit_merge_point`). `raw_slot`
-/// 0 means the cell is still unresolved.
-#[inline(always)]
-#[allow(dead_code)] // portal loop spells `reload_top_root` / `reload_top_root_at` directly
-fn reload_cached(raw_slot: usize, frame: *mut PyFrame) -> *mut PyFrame {
-    if raw_slot == 0 {
-        FrameView::reload(frame)
-    } else {
-        // SAFETY: `raw_slot` is the word `cache_root_stack_slot` stored for this thread.
-        FrameView::reload_entered(
-            unsafe { majit_gc::shadow_stack::slot_from_cached(raw_slot) },
-            frame,
-        )
-    }
 }
 
 /// Cell written by `cache_root_stack_slot` (`gc_enter_roots_frame`). Zero when
@@ -6712,32 +6681,6 @@ unsafe fn jit_driver_pair_from_root_area(data: *const ()) -> Option<&'static mut
     unsafe { (&mut *cell.get()).as_mut() }
 }
 
-/// `framework.shadowstack walk_stack_root` adapter — walk every
-/// pinned slot in `pyre_object::gc_roots`'s thread-local shadow
-/// stack and forward each `&mut PyObjectRef` slot to the GC's
-/// `&mut GcRef` visitor. Both types are pointer-sized:
-/// `PyObjectRef = *mut PyObject` and `GcRef` is
-/// `#[repr(transparent)]` over `usize`, so the cast is layout-safe.
-#[allow(dead_code)]
-fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_object::gc_roots::walk_shadow_stack(|slot: &mut pyre_object::PyObjectRef| {
-        // SAFETY: `PyObjectRef` and `GcRef` are both pointer-sized
-        // and trivially transmutable (one is `*mut PyObject`, the
-        // other is `#[repr(transparent)] struct GcRef(pub usize)`).
-        // Reinterpreting the slot in place lets a moving collector
-        // rewrite the address through the visitor — the rewrite is
-        // observed by subsequent `pin_root` / `shadow_stack_get`
-        // callers.
-        let gcref: &mut majit_ir::GcRef =
-            unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
-        visitor(gcref);
-        // Forward the GC-managed children of a `malloc_typed`-immortal pinned
-        // object, which the visit above skips. See `pyre_object_root_walker_area`.
-        let value = gcref.0 as pyre_object::PyObjectRef;
-        unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
-    });
-}
-
 unsafe fn pyre_object_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -6860,13 +6803,6 @@ fn visit_pyobject_root(
     let gcref: &mut majit_ir::GcRef =
         unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
     visitor(gcref);
-}
-
-#[allow(dead_code)]
-fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
 }
 
 fn w_globals_stamped_code_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -11099,19 +11035,6 @@ pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
     portal_activation_bracketed(&mut frame_root, None, None, PortalLeaveOwner::CompiledTrace)
 }
 
-/// `blackhole.py bhimpl_jit_merge_point` recursive-portal arm: `portal_ptr`
-/// after an already-open `execute_frame` enter.
-///
-/// Resume rebuilt the chain from the virtualrefs; `walker_ec_enter` recorded
-/// the enter.  Re-linking here (`install_current_frame`) stores the current
-/// top into this ancestor's `f_backref` and closes a cycle.  Blackhole does
-/// not replay the trace's `leave`, so this door still runs
-/// `ExecutionContext.leave` — `execute_frame`'s `finally` after `portal_ptr`
-/// returns.
-pub(crate) fn portal_blackhole_recursive_result(frame: &mut PyFrame) -> PyResult {
-    continue_entered_frame(frame)
-}
-
 /// Continue a frame whose `execute_frame` enter already ran.
 ///
 /// `resume.py` `rebuild_from_resumedata` restores the chain from the
@@ -12506,6 +12429,7 @@ pub(crate) fn take_forced_virtuals_for_frame(
 }
 
 /// `cpu.get_savedata_ref(deadframe)` off a raw jitframe pointer.
+#[cfg(any(feature = "cranelift", feature = "dynasm"))]
 pub(crate) fn savedata_from_jitframe(
     deadframe: *const majit_backend::jitframe::JitFrame,
 ) -> Option<majit_ir::GcRef> {
@@ -15233,8 +15157,6 @@ fn decode_fail_arg_values(raw_values: &[i64], fail_arg_types: &[Type]) -> Vec<Va
 /// What the direct reader of a guard failure decoded, for the bridge entry
 /// that follows it.
 pub(crate) struct DecodedGuardFailure {
-    #[allow(dead_code)]
-    pub typed: Vec<Value>,
     pub resume_pc: usize,
     pub num_resume_frames: usize,
     pub coords: Vec<(usize, usize, i32, i32)>,
@@ -15434,7 +15356,6 @@ pub(crate) fn decode_and_restore_guard_failure(
             .map(|f| (f.code as usize, f.py_pc, f.jitcode_index, f.jitcode_pc))
             .collect();
         Some(DecodedGuardFailure {
-            typed,
             resume_pc,
             num_resume_frames: resumed_frames.len(),
             coords,
@@ -17206,13 +17127,6 @@ mod tests {
         assert!(gc_roots::prebuilt_roots_dirty());
     }
 
-    /// Read a global by name from the frame's canonical `w_globals` object.
-    #[allow(dead_code)]
-    fn frame_global(frame: &PyFrame, name: &str) -> pyre_object::PyObjectRef {
-        unsafe { pyre_object::w_dict_getitem_str(frame.get_w_globals(), name) }
-            .unwrap_or_else(|| panic!("namespace should contain {name}"))
-    }
-
     #[test]
     fn driver_finish_setup_installs_blackhole_control_opcodes() {
         let (driver, _) = driver_pair();
@@ -17258,34 +17172,6 @@ mod tests {
         );
         assert_eq!(blackhole.op_rvmprof_code, staticdata.op_rvmprof_code as u8);
         builder.release_interp(blackhole);
-    }
-
-    #[allow(dead_code)]
-    struct TestJitParamsGuard;
-
-    impl TestJitParamsGuard {
-        #[allow(dead_code)]
-        fn low_threshold() -> Self {
-            let (driver, _) = driver_pair();
-            driver
-                .meta_interp_mut()
-                .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
-                .set_default_params();
-            driver.set_param("threshold", 2);
-            driver.set_param("function_threshold", 2);
-            Self
-        }
-    }
-
-    impl Drop for TestJitParamsGuard {
-        fn drop(&mut self) {
-            let (driver, _) = driver_pair();
-            driver
-                .meta_interp_mut()
-                .warm_state_for_driver(pyre_jit_trace::state::PyreJitState::PYPYJIT_JD_INDEX)
-                .set_default_params();
-            driver.set_param("threshold", JIT_THRESHOLD as i64);
-        }
     }
 
     fn function_code_from_module(
@@ -17773,31 +17659,6 @@ mod tests {
         crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }
 
-    /// Post-regalloc Ref-bank color of semantic slot `slot` at `py_pc`,
-    /// read from the JitCode-PC twins (local `i` is
-    /// slot `i`, operand-stack depth `d` is slot `nlocals + d`). Colors
-    /// are per-program-point (chordal coloring may coalesce
-    /// disjointly-live slots and re-color across PCs), so there is no
-    /// flat slot → color lookup; `None` when the slot carries no live
-    /// restorable entry at that PC.
-    #[allow(dead_code)] // pcdep trivia color at a Python pc
-    fn pcdep_color_for_slot(jitcode_index: i32, py_pc: usize, slot: usize) -> Option<u32> {
-        let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
-        let jit_pc = payload
-            .metadata
-            .py_floor_by_jit_pc
-            .iter()
-            .find(|&&(_, py)| py as usize == py_pc)
-            .map(|&(pc, _)| pc as usize)?;
-        payload
-            .pcdep_trivia_for_jitcode_pc(jit_pc)
-            .map(ToOwned::to_owned)
-            .or_else(|| payload.pcdep_for_jitcode_pc(jit_pc))?
-            .iter()
-            .find(|&&(b, _, s)| b == 1 && s as usize == slot)
-            .map(|&(_, c, _)| u32::from(c))
-    }
-
     /// Find the first JitCode `-live-` offset where every requested local
     /// slot and operand-stack depth carries a color AND the compiled live set
     /// contains all of those colors AND the Int and Float liveness banks are
@@ -17853,39 +17714,6 @@ mod tests {
             })
     }
 
-    #[allow(dead_code)]
-    fn compiled_trace_fixture(
-        source: &str,
-        function_name: &str,
-        live_locals: &[u32],
-        live_stack_depths: &[usize],
-        init: impl FnOnce(&mut PyFrame),
-    ) -> (pyre_interpreter::pyframe::FrameBox, *const (), usize) {
-        use pyre_interpreter::compile_exec;
-        use pyre_jit_trace::state as trace_state;
-
-        ensure_test_jit_callbacks();
-        let module = compile_exec(source).expect("test code should compile");
-        let code = function_code_from_module(&module, function_name);
-        let mut frame = PyFrame::new(code.clone());
-        init(&mut frame);
-        frame.fix_array_ptrs();
-
-        register_test_portal(&code, frame.pycode as *const ());
-        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
-            .expect("real trace-side jitcode registration must succeed");
-        let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
-            .expect("real trace-side jitcode index must exist");
-        // Both the `register_color = nlocals + depth` (stack) and the
-        // `color == slot` (locals) identities were removed: colors are
-        // per-program-point, so resolve the requested semantic slots
-        // through the per-PC `pcdep_color_slots` entries while picking
-        // the resume PC. `live_locals` are semantic local SLOT indices.
-        let (resume_pc, _, _) =
-            live_pc_with_slot_colors(jitcode_index, &code, live_locals, live_stack_depths);
-        (frame, jitcode_ptr, resume_pc)
-    }
-
     /// Stack-depth-based variant of `compiled_trace_fixture`. Locates the
     /// first Python PC where the bytecode-level forward stack analysis
     /// reports `target_depth`, independent of which Ref-bank colors land
@@ -17927,39 +17755,6 @@ mod tests {
                 )
             });
         (frame, jitcode_ptr, resume_pc)
-    }
-
-    #[allow(dead_code)]
-    fn single_local_test_state(
-        ctx: &mut majit_metainterp::TraceCtx,
-        frame: &PyFrame,
-        frame_ptr: usize,
-        jitcode_ptr: *const (),
-        resume_pc: usize,
-        local_type: majit_ir::Type,
-        local: majit_ir::OpRef,
-    ) -> pyre_jit_trace::state::TestSymState {
-        use pyre_jit_trace::state as trace_state;
-
-        let frame_ref = ctx.const_ref(frame_ptr as i64);
-        let locals_array = trace_state::frame_locals_cells_stack_array_ref(ctx, frame_ref);
-        pyre_jit_trace::state::TestSymState {
-            frame: frame_ref,
-            jitcode: jitcode_ptr,
-            nlocals: 1,
-            valuestackdepth: 1,
-            locals_cells_stack_array_ref: locals_array,
-            symbolic_local_types: vec![local_type],
-            symbolic_stack_types: vec![],
-            registers_r: vec![local],
-            concrete_stack: vec![],
-            concrete_namespace: frame.get_w_globals(),
-            vable_last_instr: ctx.const_int(resume_pc as i64 - 1),
-            vable_pycode: ctx.const_ref(frame.pycode as usize as i64),
-            vable_valuestackdepth: ctx.const_int(1),
-            vable_debugdata: ctx.const_ref(frame.debugdata as usize as i64),
-            frame_w_globals: ctx.const_ref(frame.get_w_globals() as usize as i64),
-        }
     }
 
     #[test]

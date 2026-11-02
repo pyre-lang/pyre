@@ -819,7 +819,7 @@ fn rpython_attribute_body_markers(
             let const_name = format_ident!("{}{}", prefix, fn_ident);
             quote! {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #const_name: bool = #value;
             }
         });
@@ -2542,7 +2542,6 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
         #[allow(non_upper_case_globals)]
         #vis #sig {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const _MAJIT_ELIDABLE: bool = true;
             #body_markers
             #identity
@@ -2602,7 +2601,6 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         #vis #sig {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const _MAJIT_LOOK_INSIDE: bool = true;
             #body_markers
             #block
@@ -2821,7 +2819,6 @@ fn expand_dont_look_inside_attribute(
         #[allow(non_upper_case_globals)]
         #vis #sig {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const _MAJIT_OPAQUE: bool = true;
             #body_markers
             #identity
@@ -2888,7 +2885,6 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
         #[allow(non_upper_case_globals)]
         #vis #sig {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const #marker: bool = true;
             #body_markers
             #identity
@@ -2988,12 +2984,12 @@ pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream
         #item_struct
 
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         #vis const #const_name: &'static str = #joined;
 
         impl #impl_generics #ident #ty_generics #where_clause {
             #[doc(hidden)]
-            #[allow(non_upper_case_globals, dead_code)]
+            #[allow(non_upper_case_globals)]
             pub const __MAJIT_IMMUTABLE_FIELDS: &'static str = #joined;
         }
     }
@@ -3142,7 +3138,7 @@ pub fn always_inline(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#attrs)*
             #vis #sig {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #marker: bool = true;
                 #block
             }
@@ -3160,7 +3156,7 @@ pub fn always_inline(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#attrs)*
             #vis #defaultness #sig {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #marker: bool = true;
                 #block
             }
@@ -3194,7 +3190,7 @@ pub fn always_inline_try(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#attrs)*
             #vis #sig {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #marker: bool = true;
                 #block
             }
@@ -3212,7 +3208,7 @@ pub fn always_inline_try(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#attrs)*
             #vis #defaultness #sig {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #marker: bool = true;
                 #block
             }
@@ -3276,7 +3272,7 @@ fn host_function_marker(item: TokenStream, prefix: &str, attribute: &str) -> Tok
             #(#attrs)*
             #vis #sig {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #marker: bool = true;
                 #block
             }
@@ -3294,7 +3290,7 @@ fn host_function_marker(item: TokenStream, prefix: &str, attribute: &str) -> Tok
             #(#attrs)*
             #vis #defaultness #sig {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #marker: bool = true;
                 #block
             }
@@ -3391,7 +3387,6 @@ pub fn not_in_trace(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         #vis #sig {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const _MAJIT_NOT_IN_TRACE: bool = true;
             #block
         }
@@ -3568,7 +3563,6 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_snake_case, non_upper_case_globals)]
         fn #orig_name(#(#full_params),*) #output {
             #[doc(hidden)]
-            #[allow(dead_code)]
             const _MAJIT_ELIDABLE: bool = true;
             #orig_body_markers
             #block
@@ -3663,7 +3657,7 @@ fn expand_specialize_argtype(indices: &[syn::LitInt], func: &ItemFn) -> proc_mac
         #(#attrs)*
         #vis #sig {
             #[doc(hidden)]
-            #[allow(non_upper_case_globals, dead_code)]
+            #[allow(non_upper_case_globals)]
             const #body_name: &'static str = #hint;
             #block
         }
@@ -3690,10 +3684,9 @@ fn oopspec_body_markers(
     let identity = icf_identity_tokens(fn_ident, generics);
     quote! {
         #[doc(hidden)]
-        #[allow(dead_code)]
         const _MAJIT_OOPSPEC: &str = #spec;
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         const #body_name: &'static str = #spec;
         #identity
     }
@@ -3882,7 +3875,7 @@ fn jit_llop_body_markers(fn_ident: &Ident, opname: &str) -> proc_macro2::TokenSt
     let body_name = format_ident!("_jit_llop_{}", fn_ident);
     quote! {
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         const #body_name: &'static str = #opname;
     }
 }
@@ -4073,7 +4066,7 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
         #[allow(non_upper_case_globals)]
         #unsafety fn #orig_name(#(#full_params),*) #output {
             #[doc(hidden)]
-            #[allow(non_upper_case_globals, dead_code)]
+            #[allow(non_upper_case_globals)]
             const #orig_unroll_marker: bool = true;
             #block
         }
@@ -4087,7 +4080,7 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
         #[allow(non_upper_case_globals)]
         #unsafety fn #trampoline_name(#(#full_params),*) #output {
             #[doc(hidden)]
-            #[allow(non_upper_case_globals, dead_code)]
+            #[allow(non_upper_case_globals)]
             const #trampoline_opaque_marker: bool = false;
             #trampoline_oopspec_markers
             #orig_call
@@ -4805,7 +4798,6 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let registry_names = quote! {
         /// Hidden registry of automatically discovered JIT helpers.
         #[doc(hidden)]
-        #[allow(dead_code)]
         pub const __MAJIT_DISCOVERED_HELPERS: &[&str] = &[
             #(#helper_name_lits),*
         ];
@@ -4814,7 +4806,6 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let registry_policies = quote! {
         /// Hidden registry mapping each discovered helper to its JIT attribute.
         #[doc(hidden)]
-        #[allow(dead_code)]
         pub const __MAJIT_HELPER_POLICIES: &[(&str, &str)] = &[
             #((#helper_name_lits, #helper_attr_lits)),*
         ];
@@ -4825,7 +4816,6 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         /// trace-call surface address used by `majit-codewriter`'s
         /// `getfunctionptr(graph)` parity path.
         #[doc(hidden)]
-        #[allow(dead_code)]
         pub fn __majit_helper_trace_fnaddrs() -> ::std::vec::Vec<(&'static str, i64)> {
             ::std::vec![
                 #((#helper_path_lits, #helper_addr_exprs)),*
@@ -4843,7 +4833,6 @@ pub fn jit_module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         /// 2-segment CallPath `[impl_type_joined, method]` — same shape
         /// used for `self_ty_root`-keyed methods (lib.rs).
         #[doc(hidden)]
-        #[allow(dead_code)]
         pub fn __majit_helper_impl_trace_fnaddrs()
             -> ::std::vec::Vec<(&'static str, &'static str, &'static str, i64)>
         {

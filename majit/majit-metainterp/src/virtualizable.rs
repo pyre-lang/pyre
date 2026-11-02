@@ -1629,7 +1629,8 @@ impl VableArrayInfo {
         }
     }
 
-    #[allow(dead_code)] // virtualizable.py array data pointer
+    // virtualizable.py array data pointer
+    #[cfg(test)]
     unsafe fn data_ptr(&self, obj_ptr: *const u8) -> *const u8 {
         unsafe {
             match self.storage {
@@ -1666,7 +1667,7 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 ///
 /// # Safety
 /// The caller must ensure `obj_ptr` points to a valid object.
-#[allow(dead_code)]
+#[cfg(test)]
 unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
     unsafe { info.is_token_nonnull_gcref(obj_ptr) }
 }
@@ -1698,36 +1699,6 @@ unsafe fn force_virtualizable(
 #[cfg(test)]
 unsafe fn read_array_lengths(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<usize> {
     unsafe { info.read_array_lengths_from_heap(obj_ptr) }
-}
-
-/// Read a virtualizable's array field contents from the heap.
-///
-/// The array pointer is read from the virtualizable at `array_info.field_offset`,
-/// then `length` elements are read starting at `array_info.items_offset`.
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` is valid and the array has at least `length` elements.
-#[cfg(test)]
-#[allow(dead_code)]
-unsafe fn read_virtualizable_array(
-    array_info: &VableArrayInfo,
-    obj_ptr: *const u8,
-    length: usize,
-) -> Vec<i64> {
-    unsafe {
-        let mut values = Vec::with_capacity(length);
-        for i in 0..length {
-            let array_ptr = array_info.data_ptr(obj_ptr);
-            let item_offset = array_info.items_offset + i * array_info.item_size;
-            let val = match array_info.item_type {
-                Type::Int | Type::Ref => *(array_ptr.add(item_offset) as *const i64),
-                Type::Float => f64::to_bits(*(array_ptr.add(item_offset) as *const f64)) as i64,
-                Type::Void => 0,
-            };
-            values.push(val);
-        }
-        values
-    }
 }
 
 /// symbolic.py:get_array_token → itemsize = sizeof(ARRAY.OF).

@@ -2475,16 +2475,6 @@ pub(crate) enum EntryPyPc {
     Jit(usize),
 }
 
-impl EntryPyPc {
-    #[allow(dead_code)]
-    fn audit_variant(self) -> &'static str {
-        match self {
-            Self::Py(_) => "py",
-            Self::Jit(_) => "jit",
-        }
-    }
-}
-
 impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
     fn default() -> Self {
         Self {
@@ -6293,7 +6283,6 @@ enum FinishframeLookahead {
     /// does pop them — already makes the call, so firing here would
     /// double the enter/leave marks.  `arg1_reg` / `arg2_reg` stay
     /// surfaced for the decode.
-    #[allow(dead_code)]
     RvmprofCode { arg1_reg: u8, arg2_reg: u8 },
     /// Neither match — unwinding continues with no side effect.
     NoMatch,
@@ -7934,22 +7923,6 @@ fn loopinvariant_now_known<Sym: WalkSym>(
         .call_loopinvariant_now_known(descr_key, arg0_int, result, 0);
 }
 
-#[allow(dead_code)] // codewriter.py exception-handler scan
-fn walk_body_has_exception_handler<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    code: &[u8],
-) -> bool {
-    let jitcode_index = if ctx.is_top_level {
-        ctx.session.borrow().recording_jitcode_index
-    } else {
-        ctx.inline_callee_consts
-            .map_or(-1, |consts| consts.jitcode_index)
-    };
-    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
-        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
-    })
-}
-
 /// Resolve a residual-call funcptr OpRef to the concrete function
 /// pointer integer that RPython's heapcache keys on
 /// (`heapcache.py` calls `allboxes[0].getint()`).
@@ -8130,16 +8103,6 @@ pub(crate) fn opref_is_null_const_ptr(op: OpRef) -> bool {
 enum OuterActiveBoxesEntryTwin {
     Plain,
     Trivia,
-}
-
-impl OuterActiveBoxesEntryTwin {
-    #[allow(dead_code)]
-    fn name(self) -> &'static str {
-        match self {
-            Self::Plain => "plain",
-            Self::Trivia => "trivia",
-        }
-    }
 }
 
 fn snapshot_diag_enabled() -> bool {
@@ -8677,29 +8640,6 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
         "last_instr",
         opref,
         Value::Int(last_instr_value),
-    );
-}
-
-/// Pin the merge point's own operand-stack depth before the close reads the
-/// virtualizable. The walk's frame keeps the depth of the offset the walk
-/// started at; the merge pc's depth is static (`close_loop_args_at`).
-fn sync_intermediate_merge_point_valuestackdepth(
-    ctx: &mut TraceCtx,
-    frame: usize,
-    merge_pc: usize,
-) {
-    if ctx.standard_virtualizable_box().is_none() {
-        return;
-    }
-    let Some(depth) = crate::state::merge_point_stack_depth_to_recover(frame, merge_pc) else {
-        return;
-    };
-    let opref = ctx.const_int(depth as i64);
-    crate::trace_opcode::mirror_vable_static_to_boxes(
-        ctx,
-        "valuestackdepth",
-        opref,
-        Value::Int(depth as i64),
     );
 }
 
@@ -10755,26 +10695,6 @@ impl ActiveResumeFrame {
     fn body_matches(&self, sub_body: &SubJitCodeBody) -> bool {
         let code = self.0.jitcode.code.as_slice();
         code.len() == sub_body.code.len() && code.as_ptr() == sub_body.code.as_ptr()
-    }
-
-    /// Recursive closure calls need their own operand-stack mirror even
-    /// while the wider callee-mirror experiment remains opt-in.  RPython
-    /// pushes one MIFrame per recursive call, so a conditional expression in
-    /// the callee keeps its pre-branch operands on that frame.  The legacy
-    /// collapsed sub-walk cannot resume such a kept stack after an earlier
-    /// closure-set mutation: replaying from entry sees the mutation and skips
-    /// the rest of the call.  Restrict automatic admission to handler-free
-    /// closure callees whose code identity matches the live root frame;
-    /// exception-bearing callees still use the established path until their
-    /// cross-frame handler resume is complete.
-    #[allow(dead_code)]
-    fn is_handler_free_closure(&self) -> bool {
-        let code = self.0.code_ptr;
-        if code.is_null() {
-            return false;
-        }
-        let code = unsafe { &*code };
-        !code.freevars.is_empty() && code.exceptiontable.is_empty()
     }
 }
 
@@ -14878,50 +14798,6 @@ pub(crate) fn portal_assembler_token(
     ];
     let red_types = [Type::Ref, Type::Ref];
     driver.get_or_make_portal_assembler_token_arc(&key, &greenboxes, &red_types)
-}
-
-/// Portal reds `[frame, ec]` (`interp_jit.py`). Empty when the sym has neither.
-fn portal_sym_reds<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> (Vec<OpRef>, SymRedWriteback) {
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return (Vec::new(), SymRedWriteback::default());
-    }
-    let sym = unsafe { &*sym_ptr };
-    let frame = sym.frame();
-    let ec = sym.execution_context();
-    if frame.is_none() || ec.is_none() {
-        return (Vec::new(), SymRedWriteback::default());
-    }
-    (
-        vec![frame, ec],
-        SymRedWriteback {
-            frame: true,
-            ec: true,
-        },
-    )
-}
-
-/// Header py pc stamped by a backward `goto/L` for the portal driver.
-///
-/// Peeks `seen_loop_header_jit_pc`. `backward_jump_target` failing means the
-/// stamp is a real `loop_header` op, which the explicit `jit_merge_point` arm
-/// consumes. The flag stays set.
-fn stamped_portal_header_py<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    pjc: &crate::PyJitCode,
-) -> Option<usize> {
-    let flag = ctx.trace_ctx.seen_loop_header_for_jdindex;
-    if flag < 0 || flag != python_portal_jdindex() {
-        return None;
-    }
-    let jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc?;
-    if pjc.code_ptr.is_null() {
-        return None;
-    }
-    let code = unsafe { &*pjc.code_ptr };
-    let site_py = crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, jit_pc) as usize;
-    let (instr, oparg) = pyre_interpreter::decode_instruction_at(code, site_py)?;
-    pyre_interpreter::backward_jump_target(code, site_py, instr, oparg)
 }
 
 /// `MIFrame.debug_merge_point` for a per-code opcode boundary.

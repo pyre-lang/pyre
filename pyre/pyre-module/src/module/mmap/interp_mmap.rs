@@ -1038,16 +1038,6 @@ pub unsafe fn w_mmap_dealloc(obj: pyre_object::PyObjectRef) {
     mmap_close_native(obj);
 }
 
-/// True when `obj` is an `mmap` instance.
-#[cfg(any(unix, windows))]
-#[allow(dead_code)] // rmmap.MMap type test; lowered by name from LLBC
-pub(crate) fn is_mmap(obj: pyre_object::PyObjectRef) -> bool {
-    match pyre_interpreter::typedef::r#type(obj) {
-        Some(tp) => std::ptr::eq(tp.as_ptr(), mmap_type()),
-        None => false,
-    }
-}
-
 /// `_exports` — how many buffers are currently exported from the mapping.
 /// The mapping is raw foreign memory, so unmapping it under a live view is a
 /// use-after-free rather than a stale-but-owned read; `close` and `resize`

@@ -4406,73 +4406,6 @@ fn emit_exception_text<W: Write>(
     Ok(())
 }
 
-/// `Lib/traceback.py:171-200 TracebackException._format_*` parity —
-/// walk `__cause__` (or `__context__` when `__suppress_context__` is
-/// False) chains and emit each older exception with the appropriate
-/// bridging banner before the current one.
-#[allow(dead_code)]
-fn write_chained_context<W: Write>(writer: &mut W, exc: PyObjectRef) -> std::io::Result<()> {
-    let mut seen = HashSet::new();
-    seen.insert(exc as usize);
-    write_chained_context_inner(writer, exc, &mut seen)
-}
-
-#[allow(dead_code)]
-fn write_chained_context_inner<W: Write>(
-    writer: &mut W,
-    exc: PyObjectRef,
-    seen: &mut HashSet<usize>,
-) -> std::io::Result<()> {
-    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
-        return Ok(());
-    }
-    let cause = unsafe { pyre_object::interp_exceptions::w_exception_get_cause(exc) };
-    let context = unsafe { pyre_object::interp_exceptions::w_exception_get_context(exc) };
-    let suppress = unsafe { pyre_object::interp_exceptions::w_exception_get_suppress_context(exc) };
-
-    // `traceback.py:184-191` — `__cause__` wins over `__context__`;
-    // `__suppress_context__` (set by `raise X from None`) hides
-    // `__context__` only when no explicit cause was attached.
-    let (mut older, banner) = if !cause.is_null()
-        && !unsafe { pyre_object::is_none(cause) }
-        && seen.insert(cause as usize)
-    {
-        (
-            cause,
-            "\nThe above exception was the direct cause of the following exception:\n",
-        )
-    } else if !suppress
-        && !context.is_null()
-        && !unsafe { pyre_object::is_none(context) }
-        && seen.insert(context as usize)
-    {
-        (
-            context,
-            "\nDuring handling of the above exception, another exception occurred:\n",
-        )
-    } else {
-        return Ok(());
-    };
-
-    pyre_object::with_roots!(older => write_chained_context_inner(writer, older, seen))?;
-    write_single_exception(writer, older)?;
-    writeln!(writer, "{}", banner)?;
-    Ok(())
-}
-
-/// Print one W_BaseException as `Traceback ...\n<frames>\n<header>`.
-/// Used by `write_chained_context` when recursing through chained
-/// __cause__ / __context__ predecessors.
-#[allow(dead_code)]
-fn write_single_exception<W: Write>(writer: &mut W, mut exc: PyObjectRef) -> std::io::Result<()> {
-    writeln!(writer, "Traceback (most recent call last):")?;
-    pyre_object::with_roots!(exc => write_traceback_chain_from_exc(writer, exc))?;
-    let rendered = pyre_object::with_roots!(exc => render_exc_object_wtf8(exc));
-    writer.write_all(rendered.as_bytes())?;
-    writer.write_all(b"\n")?;
-    write_exception_notes(writer, exc)
-}
-
 /// `Lib/traceback.py:_format_final_exc_line` notes block — each entry of
 /// `e.__notes__` is printed on its own line after the exception
 /// header.  Notes are stored in the exception's instance dict as a
@@ -4616,17 +4549,6 @@ fn render_rooted_exc_object_wtf8(exc_slot: usize) -> Wtf8Buf {
         rendered.push_str(&suffix);
     }
     rendered
-}
-
-#[allow(dead_code)]
-fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
-    if exc.is_null() || !unsafe { pyre_object::is_exception(exc) } {
-        return Wtf8Buf::from_string("<no exception>".to_string());
-    }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    render_rooted_exc_object_wtf8(exc_slot)
 }
 
 pub const MAX_SUGGESTION_CANDIDATES: usize = 750;

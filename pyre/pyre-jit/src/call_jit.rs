@@ -8,23 +8,6 @@ use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Once};
 
-/// Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
-#[allow(dead_code)]
-fn majit_probe_liveness_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_PROBE_LIVENESS").is_some());
-    *ENABLED
-}
-
-/// Whether `PYRE_PROBE_BH_STARTUP=1` is set, cached at first access.
-#[allow(dead_code)]
-fn pyre_probe_bh_startup_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1")
-    });
-    *ENABLED
-}
-
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_defaults, function_get_globals_obj,
@@ -209,6 +192,7 @@ fn self_recursive_dispatch(green_key: u64) -> bool {
 
 // ── JitFrame layout descriptors published to the backends ─────────
 
+#[cfg(any(feature = "cranelift", feature = "dynasm", test))]
 fn jitframe_layout_descrs() -> majit_gc::rewrite::JitFrameDescrs {
     use majit_backend::jitframe::*;
     majit_gc::rewrite::JitFrameDescrs {
@@ -1301,7 +1285,6 @@ pub extern "C" fn ll_portal_runner_shim(
 /// This is the JitFrame-aware counterpart to `jit_force_callee_frame`
 /// (which operates on PyFrame directly). When the GC rewriter wires
 /// nursery JitFrame allocation, this function replaces the force path.
-#[allow(dead_code)]
 #[majit_macros::jit_may_force]
 pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i64) -> i64 {
     use majit_backend::jitframe::JitFrame;
@@ -1325,54 +1308,6 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
     // The caller_frame is in inputs[0] which was the JitFrame's first
     // virtualizable input. For now, fall back to the existing force path.
     jit_force_self_recursive_call_raw_1(jitframe_ptr, raw_local0)
-}
-
-/// RPython: FieldDescr.offset is resolved at rtyper time. In pyre, Rust struct
-/// layout determines field offsets. This resolver maps (owner_type, field_name)
-/// to byte offsets for BhDescr::Field resolution in the blackhole.
-#[allow(dead_code)]
-fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
-    use pyre_interpreter::pyframe::PyFrame;
-    match field_name {
-        "code" | "pycode" => std::mem::offset_of!(PyFrame, pycode),
-        "locals_cells_stack_w" => std::mem::offset_of!(PyFrame, locals_cells_stack_w),
-        "valuestackdepth" => std::mem::offset_of!(PyFrame, valuestackdepth),
-        "next_instr" | "f_lasti" | "last_instr" => std::mem::offset_of!(PyFrame, last_instr),
-        "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
-        // #171 codewriter descr-bridge (blackhole side): the dotted nested
-        // `int_items.{len,block}` leaves `_handle_list_call`
-        // emits resolve to offset 0 in the codewriter assembler because
-        // `W_ListObject` is a runtime Rust type absent from its struct
-        // layouts. Resolve them to the real `IntArray` offsets so a
-        // blackholed codewriter list body addresses the typed storage, not
-        // the list header (mirrors the JIT-side bridge in
-        // `pyre-jit-trace/descr.rs make_descr_from_bh`).
-        "int_items.len" => {
-            std::mem::offset_of!(pyre_object::W_ListObject, int_items)
-                + pyre_object::INT_ARRAY_LEN_OFFSET
-        }
-        "int_items.block" => {
-            std::mem::offset_of!(pyre_object::W_ListObject, int_items)
-                + pyre_object::INT_ARRAY_BLOCK_OFFSET
-        }
-        "float_items.len" => {
-            std::mem::offset_of!(pyre_object::W_ListObject, float_items)
-                + pyre_object::FLOAT_ARRAY_LEN_OFFSET
-        }
-        "float_items.block" => {
-            std::mem::offset_of!(pyre_object::W_ListObject, float_items)
-                + pyre_object::FLOAT_ARRAY_BLOCK_OFFSET
-        }
-        _ => {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!(
-                    "[jit][blackhole] WARNING: unresolved field offset owner={:?} name={:?}",
-                    owner, field_name
-                );
-            }
-            0
-        }
-    }
 }
 
 /// C-ABI portal runner matching the `mainjitcode_calldescr` arg layout
@@ -1482,7 +1417,7 @@ pub extern "C" fn bh_portal_runner_c(
 /// jitexc.py JitException hierarchy — structural parity with RPython.
 ///
 /// `_run_forever` must exit via exactly one of these variants.
-#[allow(dead_code)] // not all variants are constructed yet
+// not all variants are constructed yet
 pub enum JitException {
     /// jitexc.py ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
     /// blackhole reached the merge point → restart the portal. The six
@@ -1668,7 +1603,7 @@ pub struct ResumedFrame {
 /// on TAGVIRTUAL/TAGCONST/TAGBOX/TAGSMALLINT; pyre's deadframe
 /// already contains typed Values, so we just box Int/Float to
 /// W_IntObject/W_FloatObject.
-#[allow(dead_code)]
+#[allow(dead_code)] // resume.py ResumeDataDirectReader.decode_ref/getvirtual_ptr; current resume path decodes elsewhere
 fn materialize_virtual(val: &majit_ir::Value) -> i64 {
     use majit_ir::Value;
     match val {
@@ -1681,7 +1616,7 @@ fn materialize_virtual(val: &majit_ir::Value) -> i64 {
 
 /// resume.py _callback_i → next_int() → write_an_int.
 /// RPython trusts type discipline — no cross-type coercion.
-#[allow(dead_code)]
+#[allow(dead_code)] // resume.py AbstractResumeDataReader._callback_i; current resume path writes typed values directly
 fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
     match val {
         majit_ir::Value::Int(v) => *v,
@@ -1691,7 +1626,7 @@ fn materialize_virtual_int(val: &majit_ir::Value) -> i64 {
 
 /// resume.py _callback_f → next_float() → write_a_float.
 /// RPython trusts type discipline — no cross-type coercion.
-#[allow(dead_code)]
+#[allow(dead_code)] // resume.py AbstractResumeDataReader._callback_f; current resume path writes typed values directly
 fn materialize_virtual_float(val: &majit_ir::Value) -> i64 {
     match val {
         majit_ir::Value::Float(v) => v.to_bits() as i64,
@@ -1886,6 +1821,7 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
 /// Unbox a Ref (PyObjectRef to boxed int) to a raw i64 value.
 /// Used by call_assembler_guard_failure's FALLBACK path when the first
 /// local is a Ref type (boxed int) instead of raw Int.
+#[cfg(any(feature = "cranelift", feature = "dynasm"))]
 fn unbox_int_for_force(raw: i64) -> i64 {
     let obj = raw as pyre_object::PyObjectRef;
     if !obj.is_null() && unsafe { is_int(obj) } {
@@ -1901,7 +1837,7 @@ fn unbox_int_for_force(raw: i64) -> i64 {
 /// unicode variants). Registered into Cranelift's guard-exit recovery
 /// path so `rebuild_state_after_failure` hands bridge-input refs a real
 /// string pointer instead of NULL (compiler.rs).
-#[allow(dead_code)]
+#[cfg(feature = "cranelift")]
 fn materialize_str_plain_for_cranelift(is_unicode: bool, chars: &[i64]) -> i64 {
     use majit_backend::Backend;
     let (driver, _) = crate::eval::driver_pair();
@@ -1925,7 +1861,7 @@ fn materialize_str_plain_for_cranelift(is_unicode: bool, chars: &[i64]) -> i64 {
 /// resume.py string_concat / slice_string and the unicode
 /// counterparts — materialize Concat / Slice string virtuals via
 /// cpu.bh_call_r(funcptr, args_i, args_r, args_f, calldescr).
-#[allow(dead_code)]
+#[cfg(feature = "cranelift")]
 fn materialize_str_call_for_cranelift(
     _is_unicode: bool,
     func: i64,
@@ -2221,6 +2157,7 @@ fn guard_driver_has_no_vable(descr_arc: &std::sync::Arc<dyn majit_ir::Descr>) ->
         .is_some_and(|has_vinfo| !has_vinfo)
 }
 
+#[cfg(any(feature = "cranelift", feature = "dynasm"))]
 fn jit_blackhole_resume_from_guard(
     descr_addr: usize,
     deadframe: *mut majit_backend::jitframe::JitFrame,
@@ -2391,93 +2328,6 @@ fn jit_blackhole_resume_from_guard(
         );
     }
     None
-}
-
-/// RAII guard registering each `Ref`-typed slot of the resume `deadframe`
-/// copy as a GC root for the duration of `blackhole_from_resumedata`.
-///
-/// `deadframe` is an off-heap copy of the guard-failure values
-/// (`raw_exit_values` over the result's exit slots).  The collector is moving,
-/// so a minor collection
-/// triggered while `blackhole_from_resumedata` lazily materializes virtuals
-/// (`getvirtual_ptr` → allocator) relocates the boxed objects and leaves the
-/// copy holding from-space pointers; `resume.rs::decode_ref` then reads
-/// a stale pointer for a box-sourced slot and the blackhole dereferences
-/// freed memory.  Resume *constants* are already forwarded by
-/// `rd_consts_root_walker_area`, but the box-sourced slots here are not.
-/// Registering each `Ref` element slot makes the root walker forward it in
-/// place.
-///
-/// Only `Ref`-typed slots are registered: `Int`/`Float` slots hold raw
-/// scalars (`decode_ref` boxes those lazily via `box_int`/`box_float`), and a
-/// scalar that happened to alias a managed address must never be treated as a
-/// root.  `deadframe_types[idx]` is parallel to `deadframe[idx]` (resume.rs
-/// `decode_ref` keys the same index), so the type gate is exact.
-#[allow(dead_code)] // resume.py decode_ref deadframe roots
-struct ResumeDeadframeRoots {
-    slots: Vec<*mut pyre_object::gc_hook::GCREF>,
-    frame_roots: Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
-}
-
-#[allow(dead_code)] // resume.py decode_ref deadframe roots
-impl ResumeDeadframeRoots {
-    fn register_pyframe_locals_slot(
-        value: i64,
-        frame_roots: &mut Vec<pyre_interpreter::pyframe::FrameLocalsRoot>,
-    ) {
-        let ptr = value as pyre_object::gc_hook::GCREF;
-        if ptr.is_null()
-            || !pyre_object::gc_hook::try_gc_owns_object(ptr)
-            || majit_gc::gc_is_nursery_object(ptr as usize)
-        {
-            return;
-        }
-        let current = pyre_object::gc_hook::try_gc_current_object_address(ptr);
-        if current.is_null() || !pyre_object::gc_hook::try_gc_owns_object(current) {
-            return;
-        }
-        let type_id = unsafe { (*majit_gc::header::header_of(current as usize)).type_id() };
-        if type_id != pyre_interpreter::pyframe::PYFRAME_GC_TYPE_ID {
-            return;
-        }
-        frame_roots.push(pyre_interpreter::pyframe::FrameLocalsRoot::new(
-            current as *mut PyFrame,
-        ));
-    }
-
-    fn register(deadframe: &mut [i64], deadframe_types: Option<&[majit_ir::Type]>) -> Self {
-        let mut slots = Vec::new();
-        let mut frame_roots = Vec::new();
-        if let Some(types) = deadframe_types {
-            for (idx, ty) in types.iter().enumerate() {
-                if !matches!(ty, majit_ir::Type::Ref) {
-                    continue;
-                }
-                let Some(cell) = deadframe.get_mut(idx) else {
-                    break;
-                };
-                // Null / `NULLREF` slots carry no object to forward.
-                if *cell == 0 {
-                    continue;
-                }
-                let slot = cell as *mut i64 as *mut pyre_object::gc_hook::GCREF;
-                if unsafe { pyre_object::gc_hook::try_gc_add_root(slot) } {
-                    slots.push(slot);
-                }
-                Self::register_pyframe_locals_slot(*cell, &mut frame_roots);
-            }
-        }
-        Self { slots, frame_roots }
-    }
-}
-
-impl Drop for ResumeDeadframeRoots {
-    fn drop(&mut self) {
-        for &slot in &self.slots {
-            pyre_object::gc_hook::try_gc_remove_root(slot);
-        }
-        self.frame_roots.clear();
-    }
 }
 
 /// RAII guard rooting a single bare `Ref`-carrying `i64` slot across an
@@ -5534,6 +5384,7 @@ fn compile_bridge_jump(
 /// the receiver derives the green key from the recovered Arc, mirroring
 /// `compile.py _trace_and_compile_from_bridge` which walks
 /// `resumedescr.rd_loop_token.loop_token_wref()` for the owning JCT.
+#[cfg(any(feature = "cranelift", feature = "dynasm"))]
 fn jit_ca_handle_guard_failure(
     deadframe: *mut majit_backend::jitframe::JitFrame,
     descr_addr: usize,
@@ -5798,7 +5649,7 @@ fn jit_ca_handle_guard_failure(
 /// through the `CA_WALK_FINISHED_FRAME` stash: `prepare_resume_from_failure`
 /// returned `ExitFrameWithExceptionRef` before the walk, or the walk
 /// finished the frame (`interpret()` raising `DoneWithThisFrame`).
-#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
 enum CaFrameCompletion {
     Returned(pyre_jit_trace::state::ConcreteValue),
     Raised(pyre_jit_trace::state::ConcreteValue),
@@ -5813,7 +5664,7 @@ enum CaFrameCompletion {
 /// counter has not fired (`AbstractResumeGuardDescr.handle_fail`'s blackhole
 /// arm). `done_compiling` clears `ST_BUSY_FLAG` and `jitcounter.tick` already
 /// reset the counter, so a later failure ticks again.
-#[allow(dead_code)]
+#[cfg(target_arch = "wasm32")]
 fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     raw_values: &[i64],

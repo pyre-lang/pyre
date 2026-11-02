@@ -8591,7 +8591,7 @@ pub(crate) fn build_hash_string_helper_graph(
 /// name during this builder. The funcptr for the `direct_call` op is
 /// derived via [`crate::translator::rtyper::rtyper::RPythonTyper::getcallable`]
 /// once the inner helper materialises.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_ll_hash_string_helper_graph(
     rtyper: &crate::translator::rtyper::rtyper::RPythonTyper,
     name: &str,

@@ -20,7 +20,7 @@ use super::cfield;
 #[derive(Clone, Copy)]
 struct CtypesErrorState {
     errno: i32,
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     last_error: u32,
 }
 
@@ -31,6 +31,7 @@ std::thread_local! {
     static CTYPES_LOCAL_ERRNO: core::cell::Cell<CtypesErrorState> = const {
         core::cell::Cell::new(CtypesErrorState {
             errno: 0,
+            #[cfg(windows)]
             last_error: 0,
         })
     };
@@ -53,13 +54,13 @@ pub(super) fn set_errno(value: i32) -> i32 {
 }
 
 /// `callproc.c _ctypes_get_errobj` space[1] — the ctypes-local last-error.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 pub(super) fn get_last_error() -> u32 {
     CTYPES_LOCAL_ERRNO.with(|e| e.get().last_error)
 }
 
 /// `callproc.c _ctypes_get_errobj` space[1] — set last-error, return the previous value.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(windows)]
 pub(super) fn set_last_error(value: u32) -> u32 {
     CTYPES_LOCAL_ERRNO.with(|e| {
         let mut state = e.get();

@@ -2815,35 +2815,9 @@ pub(crate) unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| unsafe { gc.add_root(slot) });
 }
 
-/// Batched [`wasm_gc_add_root`] for one stack-shaped root bracket.
-///
-/// # Safety
-/// Every slot must remain valid until removed with [`wasm_gc_remove_roots`].
-#[allow(dead_code)] // batched wasm_gc_add_root / gc.add_root
-pub(crate) unsafe fn wasm_gc_add_roots(slots: &[usize]) {
-    if slots.is_empty() {
-        return;
-    }
-    with_wasm_active_gc_mut(|gc| {
-        for &slot in slots {
-            unsafe { gc.add_root(slot as *mut GcRef) };
-        }
-    });
-}
-
 /// Companion to [`wasm_gc_add_root`].
 pub(crate) fn wasm_gc_remove_root(slot: *mut GcRef) {
     with_wasm_active_gc_mut(|gc| gc.remove_root(slot));
-}
-
-/// Batched [`wasm_gc_remove_root`] for one stack-shaped root bracket.
-#[allow(dead_code)] // batched wasm_gc_remove_root / gc.remove_root
-pub(crate) fn wasm_gc_remove_roots(slots: impl Iterator<Item = usize>) {
-    with_wasm_active_gc_mut(|gc| {
-        for slot in slots {
-            gc.remove_root(slot as *mut GcRef);
-        }
-    });
 }
 
 /// Host-side write-barrier trampoline for the interpreter (mapdict / list /
@@ -2967,7 +2941,6 @@ pub fn set_wasm_jitframe_tid(id: u32) {
 }
 
 // Only read on the wasm32 execute_token path and by CA callee-frame allocation.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn wasm_jitframe_tid() -> u32 {
     WASM_JITFRAME_TID.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2984,7 +2957,7 @@ fn entry_frame_bytes(token: &JitCellToken, frame_bytes: u32) -> usize {
     (frame_bytes as usize).max(from_info)
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
 fn frame_info_ptr(token: &JitCellToken) -> *const majit_backend::jitframe::JitFrameInfo {
     token
         .compiled_loop_token()
@@ -3286,10 +3259,10 @@ pub fn record_inline_trip(pending_slot: i64) {
 static EXECUTING_WASM_BACKEND: std::sync::atomic::AtomicPtr<WasmBackend> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
 struct ExecutingBackendGuard;
 
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[cfg(target_arch = "wasm32")]
 impl ExecutingBackendGuard {
     fn enter(backend: &WasmBackend) -> Self {
         EXECUTING_WASM_BACKEND.store(
@@ -3300,6 +3273,7 @@ impl ExecutingBackendGuard {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 impl Drop for ExecutingBackendGuard {
     fn drop(&mut self) {
         EXECUTING_WASM_BACKEND.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Relaxed);
@@ -3757,30 +3731,6 @@ impl WasmBackend {
             info
         })
         .unwrap_or_default()
-    }
-
-    /// Pull every reference constant out of `ops` into a per-loop `GcTable`
-    /// and replace it with a `LoadFromGcTable` of its slot
-    /// (`majit_gc::rewrite::remove_ref_constants`, rewrite.py).
-    ///
-    /// A `GcRef` baked as a code immediate is invisible to the moving
-    /// collector: the first minor collection that promotes the referenced
-    /// object out of the nursery leaves the immediate pointing into nursery
-    /// space that is later reused or zeroed by `reset`. The table slot is a
-    /// GC root the collector forwards in place, so the emitted load always
-    /// reads the object at its current address. Returns `None` for a trace
-    /// with no reference constant, leaving the module byte-identical.
-    #[allow(dead_code)] // constptr-only subset; production uses `rewrite_ops_for_gc`
-    fn intern_ref_constants(
-        inputargs: &[InputArgRc],
-        ops: Vec<Op>,
-    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
-        let next_pos = codegen::next_value_pos(inputargs, &ops);
-        let input_indices: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
-        let (ops, gcrefs) =
-            majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
-        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-        (ops, table)
     }
 
     /// Run `rewrite.py` then intern the gcref table. Replaces
@@ -5116,25 +5066,6 @@ fn terminal_bridge_unsupported(
     BackendError::Unsupported(reason.into())
 }
 
-/// Exit slots to decode out of a returned frame for `fail_descr`.
-///
-/// Its fail arguments, plus the GUARD_VALUE operand the exit spills one slot
-/// past them when the guard does not carry it as a fail argument
-/// (`codegen::counter_value_spill`). That trailing word is what
-/// `resolve_guard_value_operand` reads back through `get_value_direct` for
-/// `make_a_counter_per_value`; it is never a fail argument, so it stays out of
-/// `fail_arg_types` and out of every typed exit decode.
-#[allow(dead_code)] // codegen::counter_value_spill exit width
-pub(crate) fn exit_slot_count(fail_descr: &failguard::WasmFailDescr) -> usize {
-    let fail_args = fail_descr.fail_arg_types.len();
-    fail_descr
-        .meta_descr
-        .as_ref()
-        .and_then(|d| d.as_fail_descr())
-        .and_then(majit_backend::guard_value_counter_slot)
-        .map_or(fail_args, |slot| fail_args.max(slot + 1))
-}
-
 /// Decode through the locations saved on the descriptor, as
 /// BaseAssembler.rebuild_faillocs_from_descr does. The frontend still sees
 /// its logical resume numbering; a hole neither reads nor reserves memory.
@@ -5737,6 +5668,7 @@ impl majit_backend::Backend for WasmBackend {
         // module-global `except ... as e` stress case does exactly that).
         // Loop-bearing and CALL_ASSEMBLER traces stay eager because their
         // published label/CA targets need a live table slot immediately.
+        #[cfg(any(target_arch = "wasm32", test))]
         let defer_host_compile = !ops.iter().any(|op| {
             op.opcode == majit_ir::OpCode::Label
                 || op.opcode == majit_ir::OpCode::Jump
@@ -5836,6 +5768,7 @@ impl majit_backend::Backend for WasmBackend {
             input_types: inputargs.iter().map(|ia| ia.tp.get()).collect(),
             func_handle: std::cell::Cell::new(func_handle),
             resume_entry,
+            #[cfg(any(target_arch = "wasm32", test))]
             pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
             compiled_loop_token: token.compiled_loop_token_expect(),
             descrs_registered: std::cell::Cell::new(false),

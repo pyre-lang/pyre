@@ -716,9 +716,8 @@ fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
 /// point rather than per byte, which is what makes `"ä:\x"` take the drive
 /// branch — at byte 1 it would be a continuation byte and take none.
 ///
-/// Compiled everywhere so the tests run on every platform; only the Windows
-/// build has a caller.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Only the Windows build has a caller; the tests run on every platform.
+#[cfg(any(windows, test))]
 fn split_root(path: &rustpython_wtf8::Wtf8) -> (&rustpython_wtf8::Wtf8, &rustpython_wtf8::Wtf8) {
     use rustpython_wtf8::Wtf8;
 
@@ -1634,10 +1633,6 @@ fn create_environ() -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
     // Both halves of an entry stay rooted across the store: either allocation
     // may move what the other one already produced.
-    #[cfg_attr(
-        not(any(feature = "sandbox", feature = "host_env")),
-        expect(dead_code, reason = "no environment source is compiled in")
-    )]
     fn store(
         dict_slot: usize,
         key: impl FnOnce() -> pyre_object::PyObjectRef,

@@ -519,7 +519,7 @@ impl OptVirtualize {
     /// (optimize_new_array consults `OpCode::NewArrayClear`),
     /// so this wrapper has no behavioral effect. Kept as a structural
     /// mirror of the upstream dispatch table.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // virtualize.py OptVirtualize.optimize_NEW_ARRAY_CLEAR; dispatch does not call the wrapper yet
     fn optimize_new_array_clear(
         &self,
         op: &Op,
@@ -2906,11 +2906,6 @@ static VREF_DESCR_FORCED: std::sync::LazyLock<Arc<VRefFieldDescr>> =
 static VREF_SIZE_DESCR: std::sync::LazyLock<Arc<VRefSizeDescr>> =
     std::sync::LazyLock::new(|| Arc::new(VRefSizeDescr));
 
-#[allow(dead_code)]
-fn make_vref_field_descr(index: u32) -> DescrRef {
-    make_vref_field_descr_typed(index)
-}
-
 /// `virtualref.py` parity helper for `VirtualRefInfo::new()`:
 /// returns the same cached `DescrRef` `make_vref_field_descr` hands
 /// out, so the descrs stored on `VirtualRefInfo.descr_virtual_token`
@@ -3226,8 +3221,6 @@ mod tests {
     #[derive(Debug)]
     struct TestParentSizeDescr {
         idx: u32,
-        #[allow(dead_code)]
-        field_type: majit_ir::Type,
         all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
     }
 
@@ -3513,7 +3506,6 @@ mod tests {
             .collect();
         Arc::new(TestParentSizeDescr {
             idx,
-            field_type,
             all_fielddescrs,
         })
     }

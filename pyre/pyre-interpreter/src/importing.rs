@@ -2428,7 +2428,11 @@ fn extension_module_spec(name: &str, pathname: &Path) -> PyObjectRef {
     spec
 }
 
-#[allow(dead_code)]
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
 fn set_extension_module_spec(
     name: &str,
     pathname: &Path,

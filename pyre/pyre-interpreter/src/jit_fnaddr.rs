@@ -387,7 +387,7 @@ override_call_stub!(seq_repeat_override_call_stub, seq_repeat_override,
 /// Native targets keep the raw address: SysV and AAPCS already pass the
 /// same values in 64-bit registers.
 #[cfg(target_arch = "wasm32")]
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 #[doc(hidden)]
 pub mod word_publish {
     use std::mem::{size_of, zeroed};
@@ -1026,6 +1026,7 @@ macro_rules! publish_helpers {
         $rust_addr:ident $unsafe_addr:ident $extern_addr:ident
         $(, $A:ident)*
     ) => {
+        // Every arity gets all six publishers; each call site uses one.
         #[inline]
         #[allow(dead_code)]
         fn $p<F, $($A: ResidualSlot + WasmWord,)* R: ResidualRet + WasmWord>(

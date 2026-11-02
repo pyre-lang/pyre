@@ -52,11 +52,6 @@ fn pop_stack(stack: usize) -> i64 {
     value
 }
 
-struct PopState {
-    total: i64,
-    sel: usize,
-}
-
 pub type Bytecode = [u8];
 
 /// The subject: the helper's result is discarded.
@@ -72,6 +67,14 @@ const OP_BIND_POP: u8 = 2;
 /// the registry proves the registry was written to at all.
 const OP_ENCLOSED_BREAK: u8 = 3;
 const OP_BACK: u8 = 4;
+
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
+struct PopState {
+    total: i64,
+    sel: usize,
+}
 
 #[majit_macros::jit_interp(
     state = PopState,
@@ -144,6 +147,9 @@ fn install() -> (majit_metainterp::JitCode, Vec<u8>) {
 /// splice looks like AND what the binding arm splicing alone looks like. Here
 /// the binding arm does not exist, so the entry can only have come from the
 /// discarding one.
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
 struct DiscardOnlyState {
     total: i64,
     sel: usize,

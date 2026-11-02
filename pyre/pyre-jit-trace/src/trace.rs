@@ -616,52 +616,6 @@ fn abort_too_long_action() -> TraceAction {
     })
 }
 
-#[allow(dead_code)]
-fn midbody_post_marker_is_effect_free(code: &CodeObject, start_pc: usize) -> bool {
-    (start_pc..code.instructions.len()).all(|pc| {
-        let Some((instruction, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {
-            return false;
-        };
-        matches!(
-            instruction,
-            pyre_interpreter::Instruction::Cache
-                | pyre_interpreter::Instruction::ExtendedArg
-                | pyre_interpreter::Instruction::Resume { .. }
-                | pyre_interpreter::Instruction::Nop
-                | pyre_interpreter::Instruction::NotTaken
-                | pyre_interpreter::Instruction::LoadConst { .. }
-                | pyre_interpreter::Instruction::LoadCommonConstant { .. }
-                | pyre_interpreter::Instruction::LoadSmallInt { .. }
-                | pyre_interpreter::Instruction::LoadFast { .. }
-                | pyre_interpreter::Instruction::LoadFastBorrow { .. }
-                | pyre_interpreter::Instruction::LoadFastCheck { .. }
-                | pyre_interpreter::Instruction::LoadFastBorrowLoadFastBorrow { .. }
-                | pyre_interpreter::Instruction::LoadFastLoadFast { .. }
-                | pyre_interpreter::Instruction::StoreFast { .. }
-                | pyre_interpreter::Instruction::StoreFastLoadFast { .. }
-                | pyre_interpreter::Instruction::StoreFastStoreFast { .. }
-                | pyre_interpreter::Instruction::PopTop
-                | pyre_interpreter::Instruction::Copy { .. }
-                | pyre_interpreter::Instruction::Swap { .. }
-                | pyre_interpreter::Instruction::BinaryOp { .. }
-                | pyre_interpreter::Instruction::CompareOp { .. }
-                | pyre_interpreter::Instruction::IsOp { .. }
-                | pyre_interpreter::Instruction::JumpForward { .. }
-                | pyre_interpreter::Instruction::JumpBackward { .. }
-                | pyre_interpreter::Instruction::JumpBackwardNoInterrupt { .. }
-                | pyre_interpreter::Instruction::PopJumpIfFalse { .. }
-                | pyre_interpreter::Instruction::PopJumpIfTrue { .. }
-                | pyre_interpreter::Instruction::PopJumpIfNone { .. }
-                | pyre_interpreter::Instruction::PopJumpIfNotNone { .. }
-                | pyre_interpreter::Instruction::MatchMapping
-                | pyre_interpreter::Instruction::MatchSequence
-                | pyre_interpreter::Instruction::GetLen
-                | pyre_interpreter::Instruction::UnpackSequence { .. }
-                | pyre_interpreter::Instruction::ReturnValue
-        )
-    })
-}
-
 #[derive(Clone, Copy)]
 struct MidBodyFlushWords {
     call_py_pc: usize,

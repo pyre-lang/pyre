@@ -1264,7 +1264,6 @@ enum EffectWitness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RaiseClass {
     No,
-    #[allow(dead_code)]
     MemoryErrorOnly,
     Yes,
 }

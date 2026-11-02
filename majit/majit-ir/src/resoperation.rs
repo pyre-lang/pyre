@@ -3046,29 +3046,6 @@ impl std::fmt::Debug for DescrSlot {
     }
 }
 
-/// Guard / vector extras. Same packed storage as [`DescrSlot`]; the
-/// field stays so existing `Op { extra: ExtraSlot::new(...) }` literals
-/// still type-check. The bits live on `descr`.
-pub(crate) struct ExtraSlot;
-
-impl ExtraSlot {
-    pub(crate) fn new(_v: Option<OpKindExtra>) -> Self {
-        ExtraSlot
-    }
-}
-
-impl Clone for ExtraSlot {
-    fn clone(&self) -> Self {
-        ExtraSlot
-    }
-}
-
-impl std::fmt::Debug for ExtraSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ExtraSlot")
-    }
-}
-
 /// Packed `_forwarded` word (8 B). `Op` and `InputArg` each own one
 /// (`AbstractResOpOrInputArg._forwarded`).
 pub struct ForwardedSlot(std::cell::UnsafeCell<u64>);
@@ -3234,12 +3211,6 @@ pub struct Op {
     /// `resoperation.py AbstractResOpOrInputArg._forwarded`. Fresh
     /// identities start at `None`; [`Clone`] does not copy it.
     pub forwarded: ForwardedSlot,
-    /// `resoperation.py` subclass extras: `GuardResOp._fail_args`,
-    /// `fail_arg_types`, `rd_resume_position`, and `VectorOp` /
-    /// `VectorGuardOp` vector shape. `PlainResOp` / `ResOpWithDescr`
-    /// leave this `None` so ordinary ops do not embed those fields.
-    #[allow(dead_code)]
-    pub(crate) extra: ExtraSlot,
 }
 
 impl Clone for Op {
@@ -3264,7 +3235,6 @@ impl Clone for Op {
             args,
             descr,
             forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            extra: ExtraSlot::new(None),
         };
         op.pos().set(self.pos().get());
         op
@@ -3407,7 +3377,6 @@ impl Op {
             args,
             descr: DescrSlot::new(None),
             forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            extra: ExtraSlot::new(None),
         }
     }
 
@@ -3422,7 +3391,6 @@ impl Op {
             args,
             descr: DescrSlot::new(Some(descr)),
             forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            extra: ExtraSlot::new(None),
         }
     }
 
@@ -3560,7 +3528,6 @@ impl Op {
             args,
             descr,
             forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            extra: ExtraSlot::new(None),
         };
         newop.pos().set(self.pos().get());
         // resoperation.py GuardResOp.copy_and_change:
@@ -6207,8 +6174,7 @@ mod tests {
             opcode: $opcode:expr,
             args: $args:expr,
             descr: $descr:expr,
-            pos: $pos:expr,
-            extra: $extra:expr $(,)?
+            pos: $pos:expr $(,)?
         ) => {{
             let (__args, __arg_len) = $args;
             let mut __op = Op {
@@ -6219,7 +6185,6 @@ mod tests {
                 args: __args,
                 descr: $descr,
                 forwarded: ForwardedSlot::new(crate::forwarding::Forwarded::None),
-                extra: $extra,
             };
             __op.type_ = __op.opcode.result_type();
             __op.pos().set($pos.get());
@@ -7252,21 +7217,18 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(3)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(4)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -7284,7 +7246,6 @@ mod tests {
             args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
             descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::int_op(6)),
-            extra: ExtraSlot::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "v6 = IntAdd(v1, v2)");
@@ -7297,7 +7258,6 @@ mod tests {
             args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
             descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "SetfieldGc(v0, v1)");
@@ -7311,7 +7271,6 @@ mod tests {
             descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::NONE),
             // FAIL_ARGS applied below
-            extra: ExtraSlot::new(None),
         };
         op.setfailargs(
             vec![
@@ -7331,7 +7290,6 @@ mod tests {
             args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
             descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
         };
         let s = format!("{op}");
         assert_eq!(s, "GuardTrue(v0)");
@@ -7344,7 +7302,6 @@ mod tests {
             args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
             descr: DescrSlot::new(None),
             pos: OpPos::new(OpRef::int_op(1)),
-            extra: ExtraSlot::new(None),
         }];
         let mut constants = std::collections::HashMap::new();
         constants.insert(10_000, 42);
@@ -7361,7 +7318,6 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(1)),
-                extra: ExtraSlot::new(None),
             },
             {
                 let op = op! {
@@ -7369,7 +7325,6 @@ mod tests {
                     args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
                     descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
-                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![
@@ -7385,7 +7340,6 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-                extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -7402,7 +7356,6 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-                extra: ExtraSlot::new(None),
             };
             op.setfailargs(
                 vec![
@@ -7439,28 +7392,24 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(3)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(4)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -7489,14 +7438,12 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(1)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntGt,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(2)),
-            extra: ExtraSlot::new(None),
             },
             {
                 let op = op! {
@@ -7504,7 +7451,6 @@ mod tests {
                     args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
                     descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
-                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![
@@ -7520,7 +7466,6 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-                extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -7546,7 +7491,6 @@ mod tests {
             args: ArgSlot::new(smallvec::smallvec![]),
             descr: DescrSlot::new(Some(descr)),
             pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
         }];
         let constants: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
         let output = format_trace(&ops, &constants);
@@ -7574,21 +7518,18 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntAdd,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(2)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::IntLt,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 2), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_000)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(3)),
-            extra: ExtraSlot::new(None),
             },
             {
                 let op = op! {
@@ -7596,7 +7537,6 @@ mod tests {
                     args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 3)]),
                     descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
-                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![
@@ -7612,14 +7552,12 @@ mod tests {
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0), crate::forwarding::test_support::bound_resop_operand(Type::Int, 10_001)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::int_op(4)),
-            extra: ExtraSlot::new(None),
             },
             op! {
                 opcode: OpCode::Jump,
                 args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 4), crate::forwarding::test_support::bound_resop_operand(Type::Int, 2)]),
                 descr: DescrSlot::new(None),
                 pos: OpPos::new(OpRef::NONE),
-            extra: ExtraSlot::new(None),
             },
         ];
         let mut constants = std::collections::HashMap::new();
@@ -7649,7 +7587,6 @@ mod tests {
                     args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 0)]),
                     descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
-                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![crate::forwarding::test_support::bound_resop_operand(
@@ -7666,7 +7603,6 @@ mod tests {
                     args: ArgSlot::new(smallvec::smallvec![crate::forwarding::test_support::bound_resop_operand(Type::Int, 1)]),
                     descr: DescrSlot::new(None),
                     pos: OpPos::new(OpRef::NONE),
-                    extra: ExtraSlot::new(None),
                 };
                 op.setfailargs(
                     vec![

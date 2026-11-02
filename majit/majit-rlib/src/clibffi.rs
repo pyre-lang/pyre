@@ -626,7 +626,7 @@ pub struct AbstractFuncPtr {
     pub restype: FFI_TYPE_P,
     pub flags: INT,
     ll_cif: Box<ffi_cif>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the array `ll_cif.arg_types` points at
     ll_argtypes: Box<[FFI_TYPE_P]>,
 }
 
@@ -744,7 +744,7 @@ impl RawFuncPtr {
 
 /// `clibffi.CallbackFuncPtr`.
 pub struct CallbackFuncPtr {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // owns the cif `ll_closure` was prepared with
     inner: AbstractFuncPtr,
     ll_closure: VOIDP,
     ll_code: VOIDP,

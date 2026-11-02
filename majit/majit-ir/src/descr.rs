@@ -5812,7 +5812,6 @@ pub struct AccumInfo {
 /// (info.py). Should a future vector pass introduce a
 /// producer, the call sites should mirror RPython's `AccumInfo`
 /// handling (linked-list `prev` chain + `attach_vector_info`).
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct UnpackAtExitInfo {
     /// resume.py/32 prev — next entry in the VectorInfo linked list.

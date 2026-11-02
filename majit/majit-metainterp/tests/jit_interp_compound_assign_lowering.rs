@@ -15,6 +15,9 @@ const OP_RMW_LETIDX: u8 = 3;
 const OP_PLAIN_COMPUTEDIDX: u8 = 4;
 const OP_COMPOUND_COMPUTEDIDX: u8 = 5;
 
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
 struct CompoundAssignState {
     regs: VirtArray<i64>,
 }
@@ -104,13 +107,16 @@ mod float_control {
     const OP_FADD_ASSIGN: u8 = 1;
     const OP_FREM_ASSIGN: u8 = 2;
 
+    /// Float compound assignments supported by `opcode_for_assign_binop_f`
+    /// lower normally; remainder is deliberately unsupported and supplies
+    /// the positive control for the degraded-arm recorder.
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct FloatCompoundState {
         fregs: VirtArray<f64>,
     }
 
-    /// Float compound assignments supported by `opcode_for_assign_binop_f`
-    /// lower normally; remainder is deliberately unsupported and supplies
-    /// the positive control for the degraded-arm recorder.
     #[majit_macros::jit_interp(
     state = FloatCompoundState,
     env = Bytecode,

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Generate `JitCode` builders and the generic `__trace_*` wrapper.
 
 use proc_macro2::TokenStream;
@@ -275,9 +274,7 @@ pub fn generate_trace_fn(
         .map(|(name, _, tag)| {
             let kind = match tag {
                 super::green_type_tag::GreenTypeTag::Int => ValueKind::Int,
-                super::green_type_tag::GreenTypeTag::Ref
-                | super::green_type_tag::GreenTypeTag::Str
-                | super::green_type_tag::GreenTypeTag::Unicode => ValueKind::Ref,
+                super::green_type_tag::GreenTypeTag::Ref => ValueKind::Ref,
                 super::green_type_tag::GreenTypeTag::Float => ValueKind::Float,
             };
             (name.to_string(), kind)
@@ -479,9 +476,7 @@ pub fn generate_trace_fn(
                     __green_bits,
                 ));
             },
-            super::green_type_tag::GreenTypeTag::Ref
-            | super::green_type_tag::GreenTypeTag::Str
-            | super::green_type_tag::GreenTypeTag::Unicode => quote! {
+            super::green_type_tag::GreenTypeTag::Ref => quote! {
                 let __green_bits = #name as i64;
                 let __green_box = __ctx.const_ref(__green_bits);
                 __jitcode_args.push((
@@ -1078,62 +1073,6 @@ fn collect_matches_in_expr<'a>(expr: &'a syn::Expr, out: &mut Vec<&'a syn::ExprM
             }
         }
         _ => {}
-    }
-}
-
-fn find_match_in_stmt(stmt: &syn::Stmt) -> Option<&syn::ExprMatch> {
-    match stmt {
-        syn::Stmt::Expr(expr, _) => find_match_in_expr(expr),
-        syn::Stmt::Local(local) => {
-            if let Some(init) = &local.init {
-                find_match_in_expr(&init.expr)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn find_match_in_expr(expr: &syn::Expr) -> Option<&syn::ExprMatch> {
-    match expr {
-        syn::Expr::Match(m) => Some(m),
-        syn::Expr::While(w) => {
-            for stmt in &w.body.stmts {
-                if let Some(m) = find_match_in_stmt(stmt) {
-                    return Some(m);
-                }
-            }
-            None
-        }
-        syn::Expr::Loop(l) => {
-            for stmt in &l.body.stmts {
-                if let Some(m) = find_match_in_stmt(stmt) {
-                    return Some(m);
-                }
-            }
-            None
-        }
-        syn::Expr::Block(b) => {
-            for stmt in &b.block.stmts {
-                if let Some(m) = find_match_in_stmt(stmt) {
-                    return Some(m);
-                }
-            }
-            None
-        }
-        syn::Expr::If(i) => {
-            for stmt in &i.then_branch.stmts {
-                if let Some(m) = find_match_in_stmt(stmt) {
-                    return Some(m);
-                }
-            }
-            if let Some((_, else_expr)) = &i.else_branch {
-                return find_match_in_expr(else_expr);
-            }
-            None
-        }
-        _ => None,
     }
 }
 

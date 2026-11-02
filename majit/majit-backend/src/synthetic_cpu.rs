@@ -30,7 +30,6 @@ pub const SYNTHETIC_FNADDR_BASE: i64 = i64::MIN;
 /// Encode a pyre runtime jitcode index as a synthetic fnaddr suitable for
 /// storing in `BhDescr::JitCode.fnaddr`.
 #[inline]
-#[allow(dead_code)]
 pub fn encode_synthetic(jitcode_index: usize) -> i64 {
     debug_assert!(
         (jitcode_index as u64) <= (i64::MAX as u64),
@@ -41,7 +40,6 @@ pub fn encode_synthetic(jitcode_index: usize) -> i64 {
 
 /// Return whether `fnaddr` was produced by [`encode_synthetic`].
 #[inline]
-#[allow(dead_code)]
 pub fn is_synthetic_fnaddr(fnaddr: i64) -> bool {
     fnaddr < 0
 }
@@ -49,7 +47,6 @@ pub fn is_synthetic_fnaddr(fnaddr: i64) -> bool {
 /// Decode a synthetic fnaddr back to its jitcode index.  Returns `None` for
 /// real (non-negative) function addresses.
 #[inline]
-#[allow(dead_code)]
 pub fn decode_synthetic(fnaddr: i64) -> Option<usize> {
     if is_synthetic_fnaddr(fnaddr) {
         Some((fnaddr & i64::MAX) as usize)
@@ -70,7 +67,6 @@ pub fn decode_synthetic(fnaddr: i64) -> Option<usize> {
 /// depends on `majit-backend`, not vice versa), so the cross-crate wiring
 /// is deferred.
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct SyntheticCpu {
     /// `model.py self.tracker = CPUTotalTracker()` — synthetic
     /// backends own a private tracker so cross-test/cross-instance
@@ -80,7 +76,6 @@ pub struct SyntheticCpu {
 }
 
 impl SyntheticCpu {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         SyntheticCpu::default()
     }

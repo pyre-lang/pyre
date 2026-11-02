@@ -1,8 +1,7 @@
 use majit_ir::{GcRef, GreenKey, GreenSlotInt, OpRef, Type, Value};
 use majit_macros::jit_driver;
 use majit_metainterp::{
-    DeclarativeJitDriver, JitDriver, JitState, PendingFieldWriteLayout, TraceCtx,
-    recorder::{Snapshot, SnapshotFrame, SnapshotTagged},
+    DeclarativeJitDriver, JitDriver, JitState, PendingFieldWriteLayout,
     resume::{MaterializedValue, MaterializedVirtual, ResumeDataExt, ResumeDataVirtualAdder},
     virtualizable::VirtualizableInfo,
 };
@@ -12,31 +11,12 @@ use majit_metainterp::{
 /// `JitState::create_sym`. The caller passes the same `Type` slice
 /// that `extract_live_values` produces values for, so the sym entries
 /// match the production typed inputargs the tracer would record.
-#[allow(dead_code)]
 fn typed_inputarg_sym(types: &[Type]) -> Vec<OpRef> {
     types
         .iter()
         .enumerate()
         .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
         .collect()
-}
-
-#[allow(dead_code)]
-fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Type)]) {
-    let snapshot_id = ctx.capture_resumedata(Snapshot {
-        resume_position: -1,
-        frames: vec![SnapshotFrame {
-            jitcode_index: 0,
-            pc,
-            boxes: boxes
-                .iter()
-                .map(|(opref, tp)| SnapshotTagged::Box(*opref, *tp))
-                .collect(),
-        }],
-        vable_boxes: Vec::new(),
-        vref_boxes: Vec::new(),
-    });
-    ctx.set_last_guard_resume_position(snapshot_id);
 }
 
 #[jit_driver(greens = [pc, code], reds = [frame, stack], virtualizable = frame)]
@@ -248,14 +228,6 @@ struct MismatchedTypedState {
     acc: f64,
 }
 
-#[expect(dead_code, reason = "fixture type used by trait impl parity coverage")]
-struct TypedRestoreOnlyState {
-    frame: usize,
-    acc: f64,
-    raw_restore_calls: usize,
-    typed_restore_calls: usize,
-}
-
 impl JitState for MismatchedTypedState {
     type Meta = TestMeta;
     type Sym = Vec<OpRef>;
@@ -288,56 +260,6 @@ impl JitState for MismatchedTypedState {
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
         sym.clone()
-    }
-
-    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-        true
-    }
-}
-
-impl JitState for TypedRestoreOnlyState {
-    type Meta = TestMeta;
-    type Sym = Vec<OpRef>;
-    type Env = ();
-
-    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
-        TestMeta { header_pc }
-    }
-
-    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
-        vec![self.frame as i64, self.acc.to_bits() as i64]
-    }
-
-    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
-        vec![Value::Ref(GcRef(self.frame)), Value::Float(self.acc)]
-    }
-
-    fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        typed_inputarg_sym(&[Type::Ref, Type::Float])
-    }
-
-    fn is_compatible(&self, _meta: &Self::Meta) -> bool {
-        true
-    }
-
-    fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {
-        self.raw_restore_calls += 1;
-        self.frame = 0;
-        self.acc = -1.0;
-    }
-
-    fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
-        self.typed_restore_calls += 1;
-        self.frame = values[0].as_ref().as_usize();
-        self.acc = values[1].as_float();
-    }
-
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.clone()
-    }
-
-    fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        vec![(sym[0], Type::Ref), (sym[1], Type::Float)]
     }
 
     fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
@@ -418,34 +340,6 @@ impl JitState for VirtualizableSyncState {
     }
 }
 
-#[expect(dead_code, reason = "fixture type used by trait impl parity coverage")]
-struct NamedVirtualizableSyncState {
-    frame: usize,
-    stack: i64,
-    before_sync_calls: usize,
-    after_sync_calls: usize,
-    saw_info_on_before: bool,
-    saw_info_on_after: bool,
-}
-
-#[repr(C)]
-#[expect(
-    dead_code,
-    reason = "heap-layout fixture for auto-virtualizable parity"
-)]
-struct AutoVirtualizableFrame {
-    token: u64,
-    stackpos: i64,
-    stack_ptr: *mut u8,
-}
-
-#[expect(dead_code, reason = "fixture type used by trait impl parity coverage")]
-struct AutoVirtualizableState {
-    frame: usize,
-    stackpos: i64,
-    top: i64,
-}
-
 struct ResumeMappedState {
     frame: usize,
     stackpos: i64,
@@ -522,176 +416,6 @@ struct NestedVirtualResumeState {
     /// descr Arc identity, not just numeric `index()`.
     expected_inner_descr: Option<majit_ir::DescrRef>,
     expected_outer_descr: Option<majit_ir::DescrRef>,
-}
-
-impl JitState for NamedVirtualizableSyncState {
-    type Meta = TestMeta;
-    type Sym = Vec<OpRef>;
-    type Env = ();
-
-    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
-        TestMeta { header_pc }
-    }
-
-    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
-        vec![self.frame as i64, self.stack]
-    }
-
-    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
-        vec![Value::Ref(GcRef(self.frame)), Value::Int(self.stack)]
-    }
-
-    fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        typed_inputarg_sym(&[Type::Ref, Type::Int])
-    }
-
-    fn is_compatible(&self, _meta: &Self::Meta) -> bool {
-        true
-    }
-
-    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
-        self.frame = values[0] as usize;
-        self.stack = values[1];
-    }
-
-    fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
-        self.frame = values[0].as_ref().as_usize();
-        self.stack = values[1].as_int();
-    }
-
-    fn sync_named_virtualizable_before_jit(
-        &mut self,
-        _meta: &Self::Meta,
-        virtualizable: &str,
-        info: Option<&VirtualizableInfo>,
-    ) -> bool {
-        assert_eq!(virtualizable, "frame");
-        self.before_sync_calls += 1;
-        self.saw_info_on_before = info.is_some();
-        true
-    }
-
-    fn sync_named_virtualizable_after_jit(
-        &mut self,
-        _meta: &Self::Meta,
-        virtualizable: &str,
-        info: Option<&VirtualizableInfo>,
-    ) {
-        assert_eq!(virtualizable, "frame");
-        self.after_sync_calls += 1;
-        self.saw_info_on_after = info.is_some();
-    }
-
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.clone()
-    }
-
-    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-        true
-    }
-}
-
-impl JitState for AutoVirtualizableState {
-    type Meta = TestMeta;
-    type Sym = Vec<OpRef>;
-    type Env = ();
-
-    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
-        TestMeta { header_pc }
-    }
-
-    fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
-        vec![self.frame as i64, self.stackpos, self.top]
-    }
-
-    fn extract_live_values(&mut self, _meta: &Self::Meta) -> Vec<Value> {
-        vec![
-            Value::Ref(GcRef(self.frame)),
-            Value::Int(self.stackpos),
-            Value::Int(self.top),
-        ]
-    }
-
-    fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
-        typed_inputarg_sym(&[Type::Ref, Type::Int, Type::Int])
-    }
-
-    fn is_compatible(&self, _meta: &Self::Meta) -> bool {
-        true
-    }
-
-    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
-        self.frame = values[0] as usize;
-        self.stackpos = values[1];
-        self.top = values[2];
-    }
-
-    fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
-        self.frame = values[0].as_ref().as_usize();
-        self.stackpos = values[1].as_int();
-        self.top = values[2].as_int();
-    }
-
-    fn virtualizable_heap_ptr(
-        &mut self,
-        _meta: &Self::Meta,
-        virtualizable: &str,
-        _info: &VirtualizableInfo,
-    ) -> Option<*mut u8> {
-        assert_eq!(virtualizable, "frame");
-        Some(self.frame as *mut u8)
-    }
-
-    fn virtualizable_array_lengths(
-        &self,
-        _meta: &Self::Meta,
-        virtualizable: &str,
-        _info: &VirtualizableInfo,
-    ) -> Option<Vec<usize>> {
-        assert_eq!(virtualizable, "frame");
-        Some(vec![1])
-    }
-
-    fn import_virtualizable_boxes(
-        &mut self,
-        _meta: &Self::Meta,
-        virtualizable: &str,
-        _info: &VirtualizableInfo,
-        boxes: &[i64],
-        array_lengths: &[usize],
-    ) -> bool {
-        assert_eq!(virtualizable, "frame");
-        assert_eq!(array_lengths, &[1]);
-        self.stackpos = boxes[0];
-        self.top = boxes[1];
-        true
-    }
-
-    fn export_virtualizable_boxes(
-        &self,
-        _meta: &Self::Meta,
-        virtualizable: &str,
-        _info: &VirtualizableInfo,
-    ) -> Option<(Vec<i64>, Vec<usize>)> {
-        assert_eq!(virtualizable, "frame");
-        Some((vec![self.stackpos, self.top], vec![1]))
-    }
-
-    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.clone()
-    }
-
-    fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        vec![
-            (sym[0], Type::Ref),
-            (sym[1], Type::Int),
-            (sym[2], Type::Int),
-        ]
-    }
-
-    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-        true
-    }
 }
 
 impl JitState for ResumeMappedState {

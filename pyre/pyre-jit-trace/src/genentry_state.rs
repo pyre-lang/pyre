@@ -23,7 +23,6 @@ pub const GENENTRY_PORTAL_KEY: &str = "baseobjspace::generatorentry_portal_porta
 ///
 /// `generator.py` names the reds `gen` and `w_arg`; both are object
 /// references, so the extracted banks are two ref registers.
-#[allow(dead_code)]
 pub struct GenEntrySym {
     /// `jit_merge_point(pycode=...)` green.
     pub pycode: PyObjectRef,

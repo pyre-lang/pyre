@@ -142,7 +142,7 @@ pub struct Signature {
 /// a GC object. `rclass.py` `getgcflavor` / `classdesc.py`
 /// `ClassDesc.get_param` read `_alloc_flavor_`.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_Signature: &str = "raw";
 
 impl Signature {

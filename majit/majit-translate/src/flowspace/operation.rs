@@ -220,7 +220,6 @@ pub enum OpKind {
 /// This list matches the set of exception names literally mentioned by
 /// `operation.py`; `Exception` is the "any" fallback used by
 /// `CallOp.canraise` and `op.getitem`.
-#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BuiltinException {
     ValueError,

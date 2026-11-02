@@ -395,7 +395,6 @@ macro_rules! py_module {
         $(, extra_init: |$ns:ident| $body:block)?
         $(,)?
     ) => {
-        #[allow(dead_code)]
         pub fn init(
             ns: ::pyre_object::PyObjectRef,
         ) -> ::std::result::Result<(), $crate::PyError> {

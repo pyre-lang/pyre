@@ -2231,7 +2231,6 @@ mod tests {
     /// resulting op — required for guards that act as sharing donors
     /// (optimizer.py:691 `assert isinstance(last_descr, ResumeGuardDescr)`).
     /// Sharer guards (descrless) keep using `make_op`.
-    #[allow(dead_code)]
     fn make_guard_with_descr(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = make_op(opcode, args, pos);
         assert!(

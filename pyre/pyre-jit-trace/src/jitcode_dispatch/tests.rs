@@ -18341,7 +18341,7 @@ fn jit_force_virtual_wrong_arity_fails_loud() {
         .expect("call descr")
         .get_extra_info();
     let allboxes = vec![regs_i[0]];
-    let mut call = std::panic::AssertUnwindSafe(|| {
+    let call = std::panic::AssertUnwindSafe(|| {
         walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
     });
     #[cfg(debug_assertions)]
@@ -18420,7 +18420,7 @@ fn jit_force_virtual_missing_standard_box_fails_loud() {
         .expect("call descr")
         .get_extra_info();
     let allboxes = vec![func, vref];
-    let mut call = std::panic::AssertUnwindSafe(|| {
+    let call = std::panic::AssertUnwindSafe(|| {
         walker_do_jit_force_virtual(&mut wc, ei, &allboxes, 0, 'r', 0)
     });
     #[cfg(debug_assertions)]

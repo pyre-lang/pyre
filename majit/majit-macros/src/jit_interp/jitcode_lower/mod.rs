@@ -19,8 +19,6 @@ pub(crate) use api::{
     try_generate_jitcode_body_parts_with_caller_bindings,
     try_generate_jitcode_pc_return_body_with_caller_bindings,
 };
-#[allow(unused_imports)]
-pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};
 pub(crate) use dispatch::{is_can_enter_jit_macro, is_jit_merge_point_macro, lower_dispatch_body};
 pub(super) use helpers::helper_policy_path;
 pub(crate) use helpers::{call_is_null_ptr, classify_param_type};
@@ -1392,7 +1390,7 @@ impl LowererConfig {
                     }
                     // Opaque fields are not registered in any index map —
                     // the lowering layer must not see them as state slots.
-                    StateFieldKind::Opaque(_) => {}
+                    StateFieldKind::Opaque => {}
                     // ref(T) scalars get a separate 0-based index space;
                     // they lower to the ref register bank. Retain the
                     // struct Path `T` so a field access through the ref
@@ -2030,7 +2028,6 @@ impl Register {
     /// (0..=255). The lowerer's `Lowerer::next_reg` counter already obeys
     /// this bound; the assert traps regressions where a u16 reg leaked from
     /// outside that bound.
-    #[allow(dead_code)]
     pub(super) fn new(kind: BindingKind, index: u16) -> Self {
         assert!(
             index <= u8::MAX as u16,
@@ -2045,23 +2042,19 @@ impl Register {
 
     /// Per-bank constructor shortcut — `Register::int(0)` mirrors the
     /// RPython sugar of `Register('int', 0)`.
-    #[allow(dead_code)]
     pub(super) fn int(index: u16) -> Self {
         Self::new(BindingKind::Int, index)
     }
 
-    #[allow(dead_code)]
     pub(super) fn ref_(index: u16) -> Self {
         Self::new(BindingKind::Ref, index)
     }
 
-    #[allow(dead_code)]
     pub(super) fn float(index: u16) -> Self {
         Self::new(BindingKind::Float, index)
     }
 
     /// Convenience: build a typed `Register` from a `Binding`.
-    #[allow(dead_code)]
     pub(super) fn from_binding(b: &Binding) -> Self {
         Self::new(b.kind, b.reg)
     }
@@ -2069,17 +2062,14 @@ impl Register {
     /// Build a `Vec<Register>` of `Int` from a slice of indices. Used by
     /// emit sites whose reads list is uniformly Int (binop, guard_value,
     /// etc.).
-    #[allow(dead_code)]
     pub(super) fn ints(indices: &[u16]) -> Vec<Register> {
         indices.iter().copied().map(Self::int).collect()
     }
 
-    #[allow(dead_code)]
     pub(super) fn refs(indices: &[u16]) -> Vec<Register> {
         indices.iter().copied().map(Self::ref_).collect()
     }
 
-    #[allow(dead_code)]
     pub(super) fn floats(indices: &[u16]) -> Vec<Register> {
         indices.iter().copied().map(Self::float).collect()
     }
@@ -2096,7 +2086,6 @@ impl Register {
 // load_const, jump, ...) carry the same `Linear`/`UnconditionalJump`/etc
 // shape as several others; control flow is the orthogonal axis the walker
 // branches on.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum OpKind {
     /// `BC_LIVE` marker emitted before a guard. RPython `flatten.py:259`
@@ -2172,7 +2161,6 @@ pub(super) enum OpKind {
     Aux,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ControlFlowClass {
     /// Falls through to the next op.
@@ -2221,7 +2209,6 @@ pub(super) enum ControlFlowClass {
 /// outcome at expand time, this conditional surface retires and
 /// `LiveMarkerCondition` plus `live_marker_if` /
 /// `inferred_policy_live_condition` can be removed.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(super) struct LiveMarkerCondition {
     /// Boolean expression evaluated both in the JitCode builder body and in
@@ -2229,7 +2216,6 @@ pub(super) struct LiveMarkerCondition {
     pub(super) emit: TokenStream,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(super) struct OpMeta {
     pub(super) kind: OpKind,
@@ -2253,7 +2239,6 @@ pub(super) struct OpMeta {
     pub(super) control: ControlFlowClass,
 }
 
-#[allow(dead_code)]
 impl OpMeta {
     pub(super) fn live_marker() -> Self {
         Self::live_marker_with(Vec::new(), Vec::new())
@@ -2276,7 +2261,6 @@ impl OpMeta {
     /// itself, but parity-aware consumers (snapshot helpers that synth
     /// extra live regs around an inline call) can produce them through
     /// this constructor.
-    #[allow(dead_code)]
     pub(super) fn live_marker_with(reads: Vec<Register>, live_target_labels: Vec<Ident>) -> Self {
         Self {
             kind: OpKind::LiveMarker,

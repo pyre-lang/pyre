@@ -75,12 +75,8 @@ impl ExtraQueue {
         }
     }
 
-    #[allow(dead_code)] // optimizer.py extra-op queue front
-    pub(crate) fn front(&self) -> Option<&(usize, majit_ir::OpRc)> {
-        self.0.first()
-    }
-
-    #[allow(dead_code)] // optimizer.py extra-op queue back
+    // optimizer.py extra-op queue back
+    #[cfg(test)]
     pub(crate) fn back(&self) -> Option<&(usize, majit_ir::OpRc)> {
         self.0.last()
     }
@@ -91,11 +87,6 @@ impl ExtraQueue {
 
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, (usize, majit_ir::OpRc)> {
         self.0.iter()
-    }
-
-    #[allow(dead_code)] // optimizer.py extra-op queue len
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1863,23 +1854,6 @@ pub struct OptContext {
     /// `&self` leaf methods (e.g. `protect_speculative_operation`) can
     /// record without threading `&mut`.
     pub pending_invalid_loop: std::cell::Cell<Option<crate::optimize::InvalidLoop>>,
-}
-
-/// `heaptracker.all_fielddescrs`: `if name == 'typeptr': continue`
-/// Uses FieldDescr.is_typeptr() which checks `field_name() == "typeptr"`,
-/// matching RPython's name-based filtering.
-#[inline(always)]
-#[allow(dead_code)]
-pub(crate) fn is_typeptr_field(
-    field_idx: u32,
-    field_descrs: &[majit_ir::DescrRef],
-    _descr: &majit_ir::DescrRef,
-) -> bool {
-    field_descrs
-        .get(field_idx as usize)
-        .and_then(|d| d.as_field_descr())
-        .map(|fd| fd.is_typeptr())
-        .unwrap_or(false)
 }
 
 /// resume.py _number_boxes parity — BoxEnv for optimizer context.
@@ -3902,12 +3876,6 @@ impl OptContext {
         dst.pos().set(src.pos().get());
     }
 
-    /// Same as [`emit`]: recorder ops reuse the registered `OpRc`.
-    #[allow(dead_code)] // resoperation.py AbstractResOp emit reuse
-    pub(crate) fn emit_reusing(&mut self, op: Op) -> OpRef {
-        self.emit_impl(op)
-    }
-
     fn emit_impl(&mut self, mut op: Op) -> OpRef {
         if op.pos().get().is_none() || op.pos().get().is_constant() {
             // Tag the freshly allocated position with the producer op's
@@ -4777,8 +4745,6 @@ impl OptContext {
         struct ArgEntry {
             arg: OpRef,
             info: ForwardedInfo,
-            #[allow(dead_code)]
-            is_input: bool,
         }
         let mut arg_entries: Vec<ArgEntry> = Vec::new();
         for arg_operand in preamble_op.args_slice().iter() {
@@ -4805,11 +4771,7 @@ impl OptContext {
             if (is_input || has_replay_marker)
                 && let Some(info) = snapshot_forwarded(self, arg)
             {
-                arg_entries.push(ArgEntry {
-                    arg,
-                    info,
-                    is_input,
-                });
+                arg_entries.push(ArgEntry { arg, info });
             }
             // shortpreamble.py:391 `elif arg.get_forwarded() is None: pass`
             // is the no-info branch; falling out of `snapshot_forwarded`
@@ -6552,7 +6514,7 @@ impl OptContext {
     /// `box._forwarded` without materializing an unbounded one on first
     /// access. Returns `None` for boxes that have no IntBound forwarding.
     /// Used by exporters that take `&OptContext` and cannot mutate.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn peek_intbound(
         &self,
         opref: OpRef,

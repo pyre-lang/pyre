@@ -866,7 +866,6 @@ macro_rules! forward_two {
     };
 }
 
-#[allow(dead_code)]
 impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     fn new(sink: &'sink mut InstructionSink<'buf>) -> Self {
         Self {
@@ -1282,8 +1281,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i32_eqz,
         i32_gt_u,
         i32_lt_u,
-        i32_ne,
-        i64_div_s,
         i64_eq,
         i64_eqz,
         i64_extend32_s,
@@ -1298,7 +1295,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i64_ne,
         i32_reinterpret_f32,
         i64_reinterpret_f64,
-        i64_rem_s,
         i64_trunc_sat_f64_s,
         return_,
         select,
@@ -1309,8 +1305,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         br(label: u32),
         br_if(label: u32),
         call(function: u32),
-        f32_load(memarg: MemArg),
-        f32_store(memarg: MemArg),
         f64_load(memarg: MemArg),
         f64_store(memarg: MemArg),
         i32_load(memarg: MemArg),
@@ -1323,12 +1317,8 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         i64_store16(memarg: MemArg),
         i64_store32(memarg: MemArg),
         i64_store8(memarg: MemArg),
-        i32_load16_s(memarg: MemArg),
-        i32_load16_u(memarg: MemArg),
-        i32_load8_s(memarg: MemArg),
         i32_load8_u(memarg: MemArg),
         i32_store(memarg: MemArg),
-        i32_store16(memarg: MemArg),
         i32_store8(memarg: MemArg),
         i64_load(memarg: MemArg),
         i64_store(memarg: MemArg),
@@ -1340,7 +1330,6 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
     forward_two!(
         call_indirect(table_index: u32, type_index: u32),
         return_call_indirect(table_index: u32, type_index: u32),
-        memory_copy(dst_mem: u32, src_mem: u32),
     );
 }
 

@@ -102,7 +102,7 @@ fn portal_graph_inputvars(code: &CodeObject) -> (super::flow::Variable, super::f
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FrameInputs {
     /// No frame, no ec — test-only shadow graphs.
-    #[allow(dead_code)]
+    #[cfg(test)]
     None,
     /// Portal graph: frame + ec.
     Portal,
@@ -387,7 +387,7 @@ impl FrameState {
     ///
     /// Match identity is by `VariableId` (Python object identity in
     /// RPython); constants and other FlowValue shapes are ignored.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn mergeable_index_of(&self, var: &super::flow::Variable) -> Option<usize> {
         self.mergeable().iter().position(
             |value| matches!(value, Some(super::flow::FlowValue::Variable(v)) if v.id == var.id),
@@ -419,7 +419,7 @@ impl FrameState {
     /// runtime offset) vs `stack_base = nlocals` (the register-space
     /// offset).  Consumers that need the absolute PyFrame slot for a
     /// virtualizable access compute it separately.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn mergeable_index_to_slot(&self, merge_idx: usize) -> Option<u16> {
         let regular_len = self.locals_w.len() + self.stack.len();
         if merge_idx < regular_len {
@@ -433,7 +433,7 @@ impl FrameState {
     /// SSARepr register slot in one call.  Returns `None` if the
     /// Variable does not appear in this FrameState or appears only in
     /// the `last_exception` pair.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn variable_slot(&self, var: &super::flow::Variable) -> Option<u16> {
         self.mergeable_index_of(var)
             .and_then(|idx| self.mergeable_index_to_slot(idx))
@@ -711,6 +711,7 @@ fn entry_frame_state(code: &CodeObject, frame_inputs: FrameInputs) -> FrameState
     );
     let (frame, ec) = portal_graph_inputvars(code);
     match frame_inputs {
+        #[cfg(test)]
         FrameInputs::None => state,
         FrameInputs::Portal => state.with_portal_extras((frame.into(), Some(ec.into()))),
     }
@@ -1780,27 +1781,6 @@ fn handler_entry_has_explicit_raise_source(
                 Some((Instruction::RaiseVarargs { .. }, _))
             )
     })
-}
-
-#[allow(dead_code)]
-fn initialize_spam_block(
-    code: &CodeObject,
-    graph: &mut super::flow::FunctionGraph,
-    target: &SpamBlockRef,
-    source_state: &FrameState,
-    next_offset: usize,
-) -> FrameState {
-    if let Some(state) = target.framestate() {
-        return state;
-    }
-
-    let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-    let mut target_state = source_state.copy(&mut fresh);
-    target_state.blocklist = frame_blocks_for_offset(code, next_offset);
-    target_state.next_offset = next_offset;
-    target.block().borrow_mut().inputargs = target_state.getvariables();
-    target.set_framestate(target_state.clone());
-    target_state
 }
 
 fn make_next_block(
@@ -3300,7 +3280,7 @@ fn emit_frontend_delsubscr(
     );
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn emit_frontend_setattr(
     _graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -4035,7 +4015,7 @@ fn new_shadow_graph_with_portal_inputs(
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn new_shadow_graph(code: &CodeObject) -> super::flow::FunctionGraph {
     new_shadow_graph_with_portal_inputs(code, FrameInputs::None)
 }

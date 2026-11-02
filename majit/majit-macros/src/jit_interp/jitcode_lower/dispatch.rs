@@ -3764,8 +3764,6 @@ pub(super) fn green_schema(
             Some(GreenTypeTag::Int) => (1u8, quote::quote!(majit_ir::GreenType::Int)),
             Some(GreenTypeTag::Float) => (3u8, quote::quote!(majit_ir::GreenType::Float)),
             Some(GreenTypeTag::Ref) => (2u8, quote::quote!(majit_ir::GreenType::Ref)),
-            Some(GreenTypeTag::Str) => (2u8, quote::quote!(majit_ir::GreenType::Str)),
-            Some(GreenTypeTag::Unicode) => (2u8, quote::quote!(majit_ir::GreenType::Unicode)),
             None => match binding.kind {
                 BindingKind::Int => (1u8, quote::quote!(majit_ir::GreenType::Int)),
                 BindingKind::Ref => (2u8, quote::quote!(majit_ir::GreenType::Ref)),

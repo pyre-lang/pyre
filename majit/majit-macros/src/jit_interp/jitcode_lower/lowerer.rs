@@ -7,7 +7,6 @@ pub(super) struct Lowerer<'c> {
     /// Per-op metadata, parallel to `statements`. Populated as B.2.A.ii
     /// migrates each emit site through `emit_op`. Read by the backward
     /// walker (B.2.B). Currently sparse — only `LiveMarker` sites land.
-    #[allow(dead_code)]
     pub(super) op_metadata: Vec<OpMeta>,
     pub(super) next_reg: u16,
     pub(super) next_label: u16,
@@ -20,7 +19,6 @@ pub(super) struct Lowerer<'c> {
     /// `liveness_prebuild_tokens` output so the helper's per-marker
     /// triples land in `__prebuild_jitcode_liveness_*` alongside the
     /// outer arm's triples.
-    #[allow(dead_code)]
     pub(super) inline_liveness_prebuild: Vec<TokenStream>,
     /// A.2.3a fail-closed install gate signal. Set when
     /// `lower_pre_dispatch_stmts` encounters a pre-dispatch construct

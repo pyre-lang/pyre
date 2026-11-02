@@ -670,11 +670,11 @@ fn build_ll_inst_hash_helper_graph(
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg(test)]
 struct MissingMarker;
 
 /// RPython `_missing = object()`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) static _missing: MissingMarker = MissingMarker;
 
 /// RPython `fishllattr(inst, name, default=_missing)`.

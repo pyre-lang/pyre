@@ -4662,7 +4662,7 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_for_struct_field(
 ///   - generic ADT instantiations (`Arg<u32>`) — the registry rows for
 ///     a generic decl carry unresolved type-variable field strings, so
 ///     a seeded classdef would project bogus attr shells.
-#[allow(dead_code)] // rtyper classdef root of a pointer ADT
+// rtyper classdef root of a pointer ADT
 pub(in crate::front::mir) fn tyref_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     tyref_class_root_with(ty, llbc, no_tombstoned_leaves())
 }
@@ -9240,7 +9240,8 @@ pub(in crate::front::mir) fn json_ty_raw_store_descr(
 /// lowered against that borrow. `tyref_to_value_type` keeps `&i64` in the
 /// Ref bank and `i64` in the int bank, so recording `T` writes `__pos_0`
 /// as `Int` while the body reads `Ref`.
-#[allow(dead_code)] // Iterator::Item payload for Map::collect
+// Iterator::Item payload for Map::collect
+#[cfg(test)]
 pub(in crate::front::mir) fn map_collect_payload_value_type(
     item_ty: &TyRef,
     llbc: &Llbc,

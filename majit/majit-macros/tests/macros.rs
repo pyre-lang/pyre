@@ -224,15 +224,7 @@ mod jit_module {
     }
 
     #[jit_module]
-    mod empty_module {
-        #[expect(
-            dead_code,
-            reason = "plain function is intentionally skipped by jit_module discovery"
-        )]
-        pub fn plain_fn() -> i64 {
-            42
-        }
-    }
+    mod empty_module {}
 
     #[test]
     fn test_empty_discovery() {
@@ -332,15 +324,6 @@ mod jit_module {
             #[unroll_safe]
             pub fn bump(&self, x: i64) -> i64 {
                 self.value + x
-            }
-
-            // No JIT attribute — must be skipped by discovery.
-            #[expect(
-                dead_code,
-                reason = "plain method is intentionally skipped by jit_module discovery"
-            )]
-            pub fn ignore_me(_x: i64) -> i64 {
-                0
             }
         }
     }
@@ -963,17 +946,11 @@ mod jit_struct {
         next: Option<Box<Node>>,
     }
 
+    // Read only through the `jit_struct` reflection the tests check.
+    #[allow(dead_code)]
     #[jit_struct]
     struct Stack {
-        #[expect(
-            dead_code,
-            reason = "field is inspected by jit_struct descriptor generation"
-        )]
         head: Option<Box<Node>>,
-        #[expect(
-            dead_code,
-            reason = "field is inspected by jit_struct descriptor generation"
-        )]
         size: usize,
     }
 

@@ -174,7 +174,6 @@ struct MetaInterpStaticData {
         indexmap::IndexMap<usize, std::sync::Arc<majit_metainterp::jitcode::JitCode>>,
 }
 
-#[allow(dead_code)]
 impl MetaInterpStaticData {
     fn new() -> Self {
         Self {
@@ -3438,28 +3437,7 @@ pub struct MIFrame {
     pub(crate) close_merge_point_vsd: Option<usize>,
 }
 
-#[allow(dead_code)]
-pub(crate) fn instruction_consumes_comparison_truth(instruction: Instruction) -> bool {
-    matches!(
-        instruction,
-        Instruction::PopJumpIfFalse { .. } | Instruction::PopJumpIfTrue { .. }
-    )
-}
-
-#[allow(dead_code)]
-pub(crate) fn instruction_is_trivia_between_compare_and_branch(instruction: Instruction) -> bool {
-    matches!(
-        instruction,
-        Instruction::ExtendedArg
-            | Instruction::Resume { .. }
-            | Instruction::Nop
-            | Instruction::Cache
-            | Instruction::NotTaken
-            | Instruction::ToBool
-    )
-}
-
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) -> bool {
     // Only keep the opcode-start snapshot for bytecodes that can emit a
     // guard after mutating the logical stack/register state. A larger
@@ -3510,7 +3488,7 @@ pub(crate) fn instruction_needs_pre_opcode_snapshot(instruction: Instruction) ->
 /// Python code need GUARD_NO_EXCEPTION. Arithmetic, comparisons, and
 /// local variable access are lowered to primitive IR ops (exc=False) in
 /// RPython and protected by type-specific guards instead.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
     matches!(
         instruction,
@@ -3531,38 +3509,6 @@ pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
 
 /// Environment context — currently unused.
 pub struct PyreEnv;
-
-/// Descriptor for raw `PyObjectRef` item pointers that already address
-/// `items[0]` (no length prefix to skip). Used after an explicit
-/// `IntAdd(block, ITEMS_BLOCK_ITEMS_OFFSET)` converts a
-/// `*mut ItemsBlock` block-base pointer into the items-base pointer.
-/// `GETARRAYITEM_GC_R(ptr, i)` lands on `ptr + i * item_size`.
-///
-/// For callers that hold the block-base pointer directly (i.e.
-/// `*mut ItemsBlock` for `W_ListObject.items` / tuple backing storage,
-/// or `*mut FixedObjectArray` for `PyFrame.locals_cells_stack_w`), use
-/// [`pyobject_gcarray_descr`] instead — its `base_size` is the block's
-/// items offset, so the descriptor itself skips the length prefix.
-#[allow(dead_code)]
-pub(crate) fn pyobject_array_descr() -> DescrRef {
-    // `nolength=True` shape (descr.py:359-360): items start at offset 0,
-    // no length header — `GETARRAYITEM_GC_R(ptr, i)` lands on
-    // `ptr + i * item_size`.  Stable identity carrier
-    // `"pyre::pyobject_array_nolength"` so every `pyobject_array_descr()`
-    // call returns the same Arc per PyPy `cpu.arraydescrof(ARRAY)`
-    // singleton — `gc_cache._cache_array[LLType::Array(path_hash(...))]`
-    // canonicalizes across analyzer / runtime consumers.
-    crate::descr::make_array_descr_with_full_id(
-        0,
-        std::mem::size_of::<usize>(),
-        0,
-        None,
-        Type::Ref,
-        false,
-        Some("pyre::pyobject_array_nolength".to_string()),
-        false,
-    )
-}
 
 /// Descriptor for RPython `Ptr(GcArray(PyObjectRef))` containers —
 /// `[len][items...]` layout where the pointer addresses the length
@@ -4071,44 +4017,6 @@ pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
 // pyre-specific pre-optimization that duplicated (and mistyped) the
 // optimizer logic. It has been removed for structural parity with RPython.
 
-#[allow(dead_code)]
-pub(crate) fn try_trace_const_boxed_int(
-    ctx: &mut TraceCtx,
-    value: OpRef,
-    concrete_value: PyObjectRef,
-) -> Option<OpRef> {
-    if ctx.const_value(value) != Some(concrete_value as i64) {
-        return None;
-    }
-    unsafe {
-        if is_bool(concrete_value) {
-            return Some(ctx.const_int(if w_bool_get_value(concrete_value) {
-                1
-            } else {
-                0
-            }));
-        }
-        if is_trace_plain_int(concrete_value) {
-            return Some(ctx.const_int(w_int_get_value(concrete_value)));
-        }
-    }
-    None
-}
-
-/// pyjitpl.py:750-758: read container length.
-///
-/// RPython's `arraylen_gc` reads the GC array header — there is exactly one
-/// length per array, so RPython keeps a per-box `heapc_deps[0]` slot. pyre
-/// stores list/bytes/tuple lengths as plain struct fields, so the cached
-/// value lives in `HeapCache.heap_cache[descr] -> CacheEntry`
-/// (heapcache.py).  `opimpl_getfield_gc_i` already does that lookup,
-/// so this helper is now just a thin alias kept for source-stability
-/// with the call sites.
-#[allow(dead_code)]
-pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
-    opimpl_getfield_gc_i(ctx, obj, descr)
-}
-
 /// pyjitpl.py `opimpl_arraylen_gc`. Emits the actual
 /// `ArraylenGc` op against the GcArray header (rlist.py:251
 /// `len(l.items)` reads the array's length-prefix). Caller is the
@@ -4515,7 +4423,7 @@ fn concrete_raw_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
 /// Unbox int with proper GuardClass resume data via the frame impl's
 /// `generate_guard`. Generic over `WalkerFrameOps` so both `MIFrame` and
 /// `WalkContext` can invoke the same lowering.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn trace_unbox_int_with_resume<F: crate::walker_frame_ops::WalkerFrameOps>(
     frame: &mut F,
     obj: OpRef,
@@ -4554,7 +4462,7 @@ pub(crate) fn int_or_bool_unbox_type_descr(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::WalkerFrameOps>(
     frame: &mut F,
     obj: OpRef,
@@ -4607,65 +4515,6 @@ pub(crate) fn trace_unbox_int_with_resume_descr<F: crate::walker_frame_ops::Walk
         frame.ctx_mut().heap_cache_mut().class_now_known(obj);
     }
     crate::trace_unbox_int(frame.ctx_mut(), obj, type_addr, intval_descr)
-}
-
-#[allow(dead_code)]
-pub(crate) unsafe fn objspace_compare_ints(
-    lhs_obj: PyObjectRef,
-    rhs_obj: PyObjectRef,
-    op: ComparisonOperator,
-) -> bool {
-    unsafe {
-        let lhs = w_int_get_value(lhs_obj);
-        let rhs = w_int_get_value(rhs_obj);
-        match op {
-            ComparisonOperator::Less => lhs < rhs,
-            ComparisonOperator::LessOrEqual => lhs <= rhs,
-            ComparisonOperator::Greater => lhs > rhs,
-            ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-            ComparisonOperator::Equal => lhs == rhs,
-            ComparisonOperator::NotEqual => lhs != rhs,
-        }
-    }
-}
-
-/// baseobjspace as_float: coerce int|float → f64.
-/// Called only for int/float operands in the tracing fast path.
-/// Long operands are handled by residual fallback, not this function.
-#[allow(dead_code)]
-unsafe fn as_float_for_trace(obj: PyObjectRef) -> f64 {
-    unsafe {
-        if is_float(obj) {
-            w_float_get_value(obj)
-        } else if is_int(obj) {
-            w_int_get_value(obj) as f64
-        } else {
-            0.0 // unreachable in trace fast path — long triggers residual
-        }
-    }
-}
-
-/// Compare two numeric values as floats. Handles float_pair (int+float)
-/// via as_float coercion matching baseobjspace::float_lt/le/gt/ge/eq/ne.
-/// Long operands don't reach here — they trigger residual fallback.
-#[allow(dead_code)]
-pub(crate) unsafe fn objspace_compare_floats(
-    lhs_obj: PyObjectRef,
-    rhs_obj: PyObjectRef,
-    op: ComparisonOperator,
-) -> bool {
-    unsafe {
-        let lhs = as_float_for_trace(lhs_obj);
-        let rhs = as_float_for_trace(rhs_obj);
-        match op {
-            ComparisonOperator::Less => lhs < rhs,
-            ComparisonOperator::LessOrEqual => lhs <= rhs,
-            ComparisonOperator::Greater => lhs > rhs,
-            ComparisonOperator::GreaterOrEqual => lhs >= rhs,
-            ComparisonOperator::Equal => lhs == rhs,
-            ComparisonOperator::NotEqual => lhs != rhs,
-        }
-    }
 }
 
 /// virtualizable.py `read_boxes`: `lst = getattr(virtualizable, fieldname)`
@@ -4738,33 +4587,6 @@ fn array_load_for_cache(
         return None;
     };
     ctx.array_sanity_load(array_ptr, index_value, descr, kind)
-}
-
-/// Read from frame's locals_cells_stack_w — namespace access path.
-#[allow(dead_code)]
-pub(crate) fn trace_raw_array_getitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-) -> OpRef {
-    let descr = pyobject_array_descr();
-    let descr_idx = descr.index();
-    if let Some(cached) = ctx.heapcache_getarrayitem(array, index, descr_idx) {
-        return cached;
-    }
-    // pyjitpl.py `_do_getarrayitem_gc_any` record leg.
-    ctx.profiler()
-        .count_ops(OpCode::GetarrayitemGcR, majit_metainterp::counters::OPS);
-    ctx.profiler().count_ops(
-        OpCode::GetarrayitemGcR,
-        majit_metainterp::counters::RECORDED_OPS,
-    );
-    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr.clone());
-    if let Some(live_value) = array_load_for_cache(ctx, array, index, &descr, majit_ir::Type::Ref) {
-        ctx.set_opref_concrete(result, live_value);
-    }
-    ctx.heapcache_getarrayitem_now_known(array, index, descr_idx, result);
-    result
 }
 
 /// `pyjitpl.py` `arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)`
@@ -4911,31 +4733,6 @@ pub(crate) fn trace_mapdict_storage_setitem(
     );
     ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
     ctx.heapcache_setarrayitem(block, index, descr_idx, value);
-}
-
-/// Write to frame's locals_cells_stack_w array.
-/// Uses Gc (GC-typed) to match RPython's SETARRAYITEM_GC.
-#[allow(dead_code)]
-pub(crate) fn trace_raw_array_setitem_value(
-    ctx: &mut TraceCtx,
-    array: OpRef,
-    index: OpRef,
-    value: OpRef,
-) {
-    let descr = pyobject_array_descr();
-    let descr_idx = descr.index();
-    ctx.profiler()
-        .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
-    ctx.profiler().count_ops(
-        OpCode::SetarrayitemGc,
-        majit_metainterp::counters::RECORDED_OPS,
-    );
-    ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
-    // pyjitpl.py:980 `upd.setarrayitem(valuebox)` parity — cache
-    // stores the Box identity (`value` OpRef); cache-hit readers
-    // resolve the intrinsic value via `box_value(cached)` at hit
-    // time.
-    ctx.heapcache_setarrayitem(array, index, descr_idx, value);
 }
 
 /// `GetarrayitemGcI(block, index)` against `int_gcarray_descr` — the
@@ -5371,7 +5168,6 @@ pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
 /// num_locals + num_cells + max_stack, ...)`) — heap capacity rather
 /// than live depth. Used when the callee has a JCT but no live frame
 /// yet (e.g. a `compile_tmp_callback` target).
-#[allow(dead_code)]
 pub(crate) fn callee_layout_for_call_assembler(
     code: &pyre_interpreter::CodeObject,
 ) -> (usize, usize) {
@@ -5750,27 +5546,6 @@ pub(crate) fn flush_walk_loop_end_state_to_frame(
     resume_py_pc: usize,
 ) -> bool {
     flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, None, &[], None, true)
-}
-
-/// `flush_walk_end_state_to_frame` plus an optional in-flight FOR_ITER item
-/// delivery (#32 S2).  When `push` is `Some((item, body_pc))` and the flush at
-/// `resume_py_pc` (a FOR_ITER header) commits, the consumed `item` is pushed
-/// one slot above the flushed operand stack and `last_instr` is repositioned so
-/// `next_instr()` is `body_pc` and re-enters the FOR_ITER body — delivering the
-/// already-advanced iteration exactly once (the FOR_ITER itself is NOT re-run).
-/// `push = None` is byte-identical to the plain flush.
-#[allow(dead_code)]
-pub(crate) fn flush_walk_end_state_to_frame_with_item(
-    ctx: &TraceCtx,
-    frame: usize,
-    resume_py_pc: usize,
-    push: Option<(PyObjectRef, usize)>,
-) -> bool {
-    // This handoff is selected only for a proven FOR_ITER header.  Like the
-    // ordinary loop-end handoff above, its kept stack can legitimately carry
-    // a PUSH_NULL call sentinel from an enclosing expression; accept it when
-    // the recorded box independently proves the same concrete null.
-    flush_walk_end_state_to_frame_inner(ctx, frame, resume_py_pc, push, &[], None, true)
 }
 
 /// `flush_walk_end_state_to_frame` with the COMPLETE operand stack supplied by
@@ -7002,48 +6777,6 @@ pub(crate) fn fail_arg_opref_for_typed_value(ctx: &mut TraceCtx, value: Value) -
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn frame_callable_arg_types(nargs: usize) -> Vec<Type> {
-    let mut types = Vec::with_capacity(2 + nargs);
-    types.push(Type::Ref);
-    types.push(Type::Ref);
-    for _ in 0..nargs {
-        types.push(Type::Ref);
-    }
-    types
-}
-
-#[allow(dead_code)]
-pub(crate) fn one_arg_callee_frame_helper(
-    arg_type: Type,
-    is_self_recursive: bool,
-) -> (*const (), Vec<Type>) {
-    match (is_self_recursive, arg_type) {
-        (true, Type::Int) => (
-            crate::callbacks::get().jit_create_self_recursive_callee_frame_1_raw_int,
-            vec![Type::Ref, Type::Int],
-        ),
-        (true, _) => (
-            crate::callbacks::get().jit_create_self_recursive_callee_frame_1,
-            vec![Type::Ref, Type::Ref],
-        ),
-        (false, Type::Int) => (
-            crate::callbacks::get().jit_create_callee_frame_1_raw_int,
-            vec![Type::Ref, Type::Ref, Type::Int],
-        ),
-        (false, _) => (
-            crate::callbacks::get().jit_create_callee_frame_1,
-            vec![Type::Ref, Type::Ref, Type::Ref],
-        ),
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn fail_arg_types_for_virtualizable_state(len: usize) -> Vec<Type> {
-    let n = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    crate::virtualizable_gen::virt_live_value_types(len.saturating_sub(n))
-}
-
 /// `pyjitpl.py MIFrame.copy_constants` line-by-line port.
 ///
 /// ```python
@@ -7963,7 +7696,6 @@ impl PyreJitState {
         types
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn pypyjit_live_values_with_ec(&self, meta: &PyreMeta) -> Vec<Value> {
         let _ = meta;
         vec![
@@ -7972,13 +7704,11 @@ impl PyreJitState {
         ]
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn pypyjit_live_value_types_with_ec(meta: &PyreMeta) -> Vec<Type> {
         let _ = meta;
         vec![Type::Ref, Type::Ref]
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn pypyjit_collect_jump_args(sym: &PyreSym) -> Vec<OpRef> {
         let base = sym.vable_collect_jump_args();
         let Some((&frame, tail)) = base.split_first() else {
@@ -7994,7 +7724,6 @@ impl PyreJitState {
         args
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn pypyjit_collect_typed_jump_args(sym: &PyreSym) -> Vec<(OpRef, Type)> {
         let base = sym.vable_collect_typed_jump_args();
         let Some(&(frame, frame_tp)) = base.first() else {
@@ -8011,7 +7740,6 @@ impl PyreJitState {
         args
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn pypyjit_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
         let mut sym = PyreSym::new_uninit(OpRef::input_arg_typed(0, Type::Ref));
         sym.execution_context = OpRef::input_arg_typed(1, Type::Ref);
@@ -14078,32 +13806,6 @@ mod tests {
                 .unwrap(),
             "process-global MetaInterpStaticData callbacks disappeared on a new thread"
         );
-    }
-
-    /// Install the real `hash_w` and `hash_str` on this test thread so
-    /// object/str-keyed dicts built while running interpreted Python bucket
-    /// through the single hash path (`baseobjspace.py is_none`).  These tests
-    /// don't go through `init_jit_hooks`, which installs the hooks at boot for
-    /// the pyrex binary; the thread-local cell must be set on the test thread.
-    #[allow(dead_code)]
-    fn install_test_hash_hook() {
-        unsafe fn test_hash_w(obj: pyre_object::PyObjectRef) -> i64 {
-            match pyre_interpreter::builtins::try_hash_value(obj) {
-                Ok(h) => h,
-                Err(e) => {
-                    pyre_interpreter::baseobjspace::set_pending_dict_hash_error(e);
-                    pyre_object::dict_eq_hook::signal_hash_error(obj);
-                    0
-                }
-            }
-        }
-        unsafe fn test_hash_str(ptr: *const u8, len: usize) -> i64 {
-            pyre_interpreter::builtins::hash_str_bytes(unsafe {
-                std::slice::from_raw_parts(ptr, len)
-            })
-        }
-        pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
-        pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }
 
     /// Install a populated `PyJitCode` for `code_ref` so a subsequent

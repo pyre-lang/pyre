@@ -352,28 +352,6 @@ fn assign_json(dest: Value, rvalue: Value) -> Value {
     json!({ "Assign": [dest, rvalue] })
 }
 
-/// Locals this place names that are bound as specials, including a
-/// tuple-field or deref of one (`AddChecked` overflow bit, `*guard`).
-#[allow(dead_code)]
-fn specials_in_place(place: &Place, specials: &HashMap<usize, Special>) -> Vec<Special> {
-    let mut out = Vec::new();
-    let push = |out: &mut Vec<Special>, local: usize| {
-        if let Some(s) = specials.get(&local) {
-            out.push(*s);
-        }
-    };
-    if let Some(l) = place_local(place) {
-        push(&mut out, l);
-    }
-    if let Some((pair, _)) = tuple_field_of_local(place) {
-        push(&mut out, pair);
-    }
-    if let Some(l) = deref_of_local(place) {
-        push(&mut out, l);
-    }
-    out
-}
-
 fn specials_in_json(v: &Value, specials: &HashMap<usize, Special>) -> Vec<Special> {
     let mut out = Vec::new();
     fn walk(v: &Value, specials: &HashMap<usize, Special>, out: &mut Vec<Special>) {
@@ -2325,7 +2303,7 @@ impl CalleeEffect {
         self.leaves_above || !self.param_slots.is_empty() || self.returns_index
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn leaves_above() -> Self {
         Self {
             observes: false,
@@ -2352,23 +2330,6 @@ impl CalleeEffect {
             "ReturnsIndex"
         } else {
             "None"
-        }
-    }
-
-    #[allow(dead_code)]
-    fn join(&self, other: &Self) -> Self {
-        let mut param_slots = self.param_slots.clone();
-        for &p in &other.param_slots {
-            if !param_slots.contains(&p) {
-                param_slots.push(p);
-            }
-        }
-        param_slots.sort_unstable();
-        Self {
-            observes: self.observes || other.observes,
-            leaves_above: self.leaves_above || other.leaves_above,
-            param_slots,
-            returns_index: self.returns_index || other.returns_index,
         }
     }
 }

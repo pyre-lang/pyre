@@ -6,7 +6,6 @@
 //! The JIT's current raw-array fast path only handles object storage.
 
 #![allow(unsafe_op_in_unsafe_fn)]
-#![allow(dead_code)]
 
 use crate::object_array::{
     FloatItemsBlock, ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc,
@@ -676,12 +675,6 @@ impl W_ListObject {
             crate::gc_roots::shadow_stack_get(new_block_slot) as *mut ItemsBlock;
         dealloc_list_items_block(old_block);
         crate::gc_roots::shadow_stack_get(obj_slot)
-    }
-
-    /// RPython `_ll_list_resize_hint_really` for BytesListStrategy.
-    unsafe fn bytes_resize_capacity(obj: PyObjectRef, capacity: usize) -> PyObjectRef {
-        Self::try_bytes_resize_capacity(obj, capacity)
-            .unwrap_or_else(|| crate::object_array::items_block_alloc_failed(capacity))
     }
 
     /// [`W_ListObject::bytes_resize_capacity`] for a capacity that came from
@@ -6321,30 +6314,6 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
         let list = &mut *(roots.get(obj_slot) as *mut W_ListObject);
         list.sync_allocated(old_size);
     }
-}
-
-/// listobject.py IntegerListStrategy._safe_find_or_count
-/// Fast path for integer lists: unwrapped comparison.
-unsafe fn int_find(items: &[i64], value: i64) -> Option<usize> {
-    items.iter().position(|&v| v == value)
-}
-
-/// Python int/float cross-type equality: avoids false positives from
-/// f64 precision loss (e.g. 2**53+1 != float(2**53)).
-#[inline]
-fn int_eq_float(ival: i64, fval: f64) -> bool {
-    if !fval.is_finite() {
-        return false;
-    }
-    let ival_f = ival as f64;
-    if ival_f != fval {
-        return false;
-    }
-    const I64_UPPER_F: f64 = (1u64 << 63) as f64;
-    if !(-I64_UPPER_F..I64_UPPER_F).contains(&fval) {
-        return false;
-    }
-    fval as i64 == ival
 }
 
 /// Outcome of `W_ListObject.find_or_count` fast path. Mirrors the

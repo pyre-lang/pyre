@@ -86,7 +86,7 @@ impl Signature {
     }
 
     /// RPython `Signature.__getitem__` (argument.py).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // argument.py Signature.__getitem__; Rust callers use tuple_view today
     pub(crate) fn getitem(&self, i: usize) -> SignatureItem<'_> {
         match i {
             0 => SignatureItem::Argnames(&self.argnames),

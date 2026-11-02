@@ -2249,6 +2249,7 @@ impl DynasmBackend {
     /// the per-cpu fallback descrs installed by `DynasmBackend::new()`
     /// answer, so backend-only integration tests see distinct, non-zero
     /// pointers per result type without ever consulting per-thread state.
+    #[cfg(any(target_arch = "aarch64", test))]
     pub(crate) fn attached_descr_ptrs(&self) -> crate::guard::AttachedDescrPtrs {
         self.descr_attachments.read().descr_ptrs()
     }
@@ -3234,6 +3235,7 @@ impl Backend for DynasmBackend {
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
+        #[cfg(target_arch = "aarch64")]
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py`) is what
@@ -3297,6 +3299,7 @@ impl Backend for DynasmBackend {
             typeid_table,
             guard_gc_type_info,
             subclass_range_table,
+            #[cfg(target_arch = "aarch64")]
             attached_descrs,
             cpu_handle,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3540,6 +3543,7 @@ impl Backend for DynasmBackend {
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops);
         let guard_gc_type_info = self.collect_guard_gc_type_info();
         let subclass_range_table = self.collect_classptr_subclass_range_table(&prepared_ops);
+        #[cfg(target_arch = "aarch64")]
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         // PyPy's `setup_once` (`llsupport/assembler.py`) is what
@@ -3600,6 +3604,7 @@ impl Backend for DynasmBackend {
             typeid_table,
             guard_gc_type_info,
             subclass_range_table,
+            #[cfg(target_arch = "aarch64")]
             attached_descrs,
             cpu_handle,
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

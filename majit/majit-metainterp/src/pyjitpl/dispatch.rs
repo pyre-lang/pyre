@@ -75,11 +75,6 @@ enum GuardStampTarget {
     /// The last recorded op — correct when the guard IS the last op, which is
     /// the case for every guard the dispatcher records itself.
     LastOp,
-    /// A guard op counted back from the most recent one (`0` == the most
-    /// recent), for a guard that is no longer last (`emit_force_virtualizable`
-    /// records GETFIELD_GC / PTR_NE / COND_CALL after a promote).
-    #[allow(dead_code)]
-    GuardFromEnd(usize),
 }
 
 /// Decode a virtualizable shadow Value (RPython Box concrete) back into the
@@ -2153,9 +2148,6 @@ where
         self.frames.frames[top_idx].pc = saved_top_pc;
         match target {
             GuardStampTarget::LastOp => ctx.set_last_guard_resume_position(snapshot_id),
-            GuardStampTarget::GuardFromEnd(from_end) => {
-                ctx.set_guard_op_resume_position_from_end(from_end, snapshot_id)
-            }
         }
     }
 
@@ -5982,7 +5974,8 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// `CallDescr::arg_classes` (`majit-ir/src/descr.rs`) maps `Type` onto
 /// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
 /// class `'f'`. Teaching `Type` those classes must extend both sites.
-#[allow(dead_code)] // llmodel.py bh_call_f
+// llmodel.py bh_call_f
+#[cfg(test)]
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
     assert!(
         !func_ptr.is_null(),
@@ -6015,7 +6008,7 @@ pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]
 /// a `Float`. An empty list is the no-descr seam, so every slot is a machine
 /// word. Typed callers take the argument list and the type list from the same
 /// calldescr, so the two agree by construction.
-#[allow(dead_code)] // descr.py process arg classes
+// descr.py process arg classes
 fn arg_classes_from_types(
     args_len: usize,
     arg_types: &[Type],
@@ -6059,7 +6052,7 @@ fn arg_classes_from_types(
 /// [`call_int_function`] stays for the seams that genuinely hold no descr —
 /// `execute_varargs`'s portal runner and the CALL_ASSEMBLER family, whose
 /// entry wrapper is `extern "C" fn(..) -> i64` by construction.
-#[allow(dead_code)] // llmodel.py bh_call_i
+// llmodel.py bh_call_i
 pub fn call_int_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> i64 {
     assert!(
         !func_ptr.is_null(),
@@ -6121,7 +6114,7 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// register; only `arg_types` still records which is which.  The
 /// host-trampoline path reflects the callee's real signature and coerces each
 /// argument itself, so it takes the positional list unchanged.
-#[allow(dead_code)] // llmodel.py bh_call_v
+// llmodel.py bh_call_v
 pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) {
     assert!(
         !func_ptr.is_null(),

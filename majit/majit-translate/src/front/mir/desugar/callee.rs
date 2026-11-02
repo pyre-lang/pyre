@@ -1943,7 +1943,7 @@ pub(in crate::front::mir) fn identity_accumulator_of_arg_temp(
 /// (`AbstractStringBuilderRepr.rtype_method_build`).  Exclusive-branch
 /// identity views are several such points; sequential `build()` is valid
 /// on one `StringBuilder`.  See [`is_builder_mode_accumulator`].
-#[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
+// wired into the ctor/append/terminal arms in this change
 pub(in crate::front::mir) fn accumulator_materialization_site_count(
     cache: &ScanCache,
     body: &Unstructured,
@@ -2071,7 +2071,7 @@ pub(in crate::front::mir) fn single_def_is_str_builder_ctor(
 /// ctor, the appends, and a build point are all unambiguous.
 /// Lowering records the answer for every local once per body; emit sites
 /// read that table.
-#[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
+// wired into the ctor/append/terminal arms in this change
 pub(in crate::front::mir) fn is_builder_mode_accumulator(
     cache: &ScanCache,
     body: &Unstructured,
@@ -4200,12 +4200,6 @@ pub(in crate::front::mir) fn copy_prod_if_raw_ptr(
     }
 }
 
-pub(in crate::front::mir) fn operand_root_local(op: &Operand) -> Option<usize> {
-    match op {
-        Operand::Copy(place) | Operand::Move(place) => place_root_local(place),
-        Operand::Const(_) => None,
-    }
-}
 /// The `ptr::add` that writes `dest`, and its normal successor.
 ///
 /// [`add_dest_used_only_as_struct_field`] already requires one definition.
@@ -4374,45 +4368,6 @@ pub(in crate::front::mir) fn captured_local_reaches_field_uses(
         }
     }
     true
-}
-
-#[allow(dead_code)]
-pub(in crate::front::mir) fn result_value_is_branched_or_returned(
-    body: &Unstructured,
-    llbc: &Llbc,
-    dest: usize,
-) -> bool {
-    for bb in &body.body {
-        match bb.term_ref(llbc) {
-            Ok(TermKind::Switch { discr, .. }) => {
-                if operand_root_local(discr) == Some(dest) {
-                    return true;
-                }
-            }
-            Ok(TermKind::Return) => {}
-            Ok(TermKind::Call { call, .. }) => {
-                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
-                continue;
-            };
-            // The return slot. A later `expect` call is not an assignment.
-            if !matches!(place.kind, PlaceKind::Local(0)) {
-                continue;
-            }
-            if let Rvalue::Use(op, _) = rvalue
-                && operand_root_local(op) == Some(dest)
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 pub(in crate::front::mir) fn mir_successor_ids(llbc: &Llbc, bb: &BasicBlock) -> Vec<usize> {

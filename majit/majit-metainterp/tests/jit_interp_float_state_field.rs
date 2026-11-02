@@ -106,12 +106,15 @@ mod scalar_toplevel {
     use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD_FLOAT;
     use majit_metainterp::{Assembler, JitDriver};
 
+    const OP_NOP: u8 = 0;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct FloatToplevelState {
         a: i64,
         f: f64,
     }
-
-    const OP_NOP: u8 = 0;
 
     #[majit_macros::jit_interp(
         state = FloatToplevelState,
@@ -309,13 +312,16 @@ mod scalar_float_slot_reserve {
     use majit_metainterp::jitcode::insns::BC_LOAD_STATE_FIELD_FLOAT;
     use majit_metainterp::{Assembler, JitDriver};
 
+    const OP_NOP: u8 = 0;
+    const OP_MIX: u8 = 1;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct TwoFloatState {
         a: f64,
         b: f64,
     }
-
-    const OP_NOP: u8 = 0;
-    const OP_MIX: u8 = 1;
 
     #[majit_macros::jit_interp(
         state = TwoFloatState,

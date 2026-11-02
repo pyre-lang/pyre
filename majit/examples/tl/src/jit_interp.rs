@@ -89,20 +89,6 @@ extern "C" fn storage_roll(state: &mut TlState, r: i64) {
 
 pub type Bytecode = [u8];
 
-#[expect(
-    dead_code,
-    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
-)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 /// tl.py Stack object. `_virtualizable_ = ['stackpos', 'stack[*]']`.
 /// tl.py `Stack(size)` — `size` is the bytecode length; the caller
 /// (`interp_eval`) passes `len(code)`. See tl.py.

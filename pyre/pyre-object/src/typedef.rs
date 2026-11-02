@@ -341,12 +341,11 @@ pub struct GetSetProperty {
 /// `harvest_immutable_fields_from_llbcs` reads `_immutable_fields_<Struct>`,
 /// and `jitcode_lower` reads `__MAJIT_IMMUTABLE_FIELDS`.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _immutable_fields_GetSetProperty: &str = "fget,fset,fdel";
 
 impl GetSetProperty {
     #[doc(hidden)]
-    #[allow(dead_code)]
     pub const __MAJIT_IMMUTABLE_FIELDS: &str = "fget,fset,fdel";
 }
 

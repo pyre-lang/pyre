@@ -5192,23 +5192,6 @@ impl<'a> Lowering<'a> {
         release_declared_vable_array_address(&mut self.graph, base)
     }
 
-    #[allow(dead_code)] // virtualizable.py declared array field
-    pub(in crate::front::mir) fn var_is_declared_vable_array(&self, var: &Variable) -> bool {
-        self.graph.blocks.iter().any(|block| {
-            block.operations.iter().any(|op| {
-                op.result.as_ref() == Some(var)
-                    && matches!(
-                        &op.kind,
-                        OpKind::FieldRead { field, .. }
-                            if crate::virtualizable_decl::is_declared_array_field(
-                                field.owner_root.as_deref(),
-                                &field.name,
-                            )
-                    )
-            })
-        })
-    }
-
     /// `v[i]` / `v.len()` on a `Vec<T>`, wherever the `Vec` was reached:
     /// an inline field, a `&mut Vec` local, or a pointer already loaded
     /// from `Box<Vec<_>>`. An inline field is retargeted in place. Every

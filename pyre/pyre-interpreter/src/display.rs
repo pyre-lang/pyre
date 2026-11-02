@@ -1667,20 +1667,6 @@ pub unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate
     }
 }
 
-/// The `descr_str` overrides the builtin exception classes register on top of
-/// `W_BaseException.descr_str`, dispatched on the instance's `ExcKind` because
-/// pyre flattens PyPy's subclasses into the single `W_BaseException` struct.
-/// `None` means the instance's class inherits the base `descr_str`.
-///
-/// # Safety
-/// `obj` must be a live `W_BaseException`.
-#[allow(dead_code)]
-pub(crate) unsafe fn exception_kind_str(
-    obj: PyObjectRef,
-) -> Result<Option<String>, crate::PyError> {
-    Ok(unsafe { exception_kind_str_wtf8(obj) }?.map(|w| w.to_string_lossy().into_owned()))
-}
-
 pub(crate) unsafe fn exception_kind_str_wtf8(
     obj: PyObjectRef,
 ) -> Result<Option<Wtf8Buf>, crate::PyError> {

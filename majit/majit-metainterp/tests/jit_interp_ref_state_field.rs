@@ -9,11 +9,6 @@
 use majit_metainterp::jitcode::insns::{BC_LOAD_STATE_FIELD_REF, BC_STORE_STATE_FIELD_REF};
 use majit_metainterp::{Assembler, JitDriver};
 
-/// The heap class the ref field points at — only a type tag for `ref(Stack)`;
-/// the field's storage is a `usize` carrier.
-#[allow(dead_code)]
-struct Stack;
-
 struct RefTestState {
     a: i64,
     sel: usize,
@@ -24,16 +19,6 @@ const OP_INC_A: u8 = 1;
 const OP_TOUCH_SEL: u8 = 2;
 
 pub type Bytecode = [u8];
-
-#[allow(dead_code)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
 
 #[majit_macros::jit_interp(
     state = RefTestState,

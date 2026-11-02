@@ -42,14 +42,17 @@ fn an_inline_helper_names_its_source_function() {
     );
 }
 
-struct NamedState {
-    a: i64,
-}
-
 const OP_NOP: u8 = 0;
 const OP_INC_A: u8 = 1;
 
 pub type Bytecode = [u8];
+
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
+struct NamedState {
+    a: i64,
+}
 
 #[majit_macros::jit_interp(
     state = NamedState,

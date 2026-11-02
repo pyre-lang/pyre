@@ -28,7 +28,6 @@ struct ScalarAcc {
 struct VirtAcc {
     acc: i64,
     ticks: i64,
-    #[allow(dead_code)]
     tape: VirtArray<i64>,
 }
 

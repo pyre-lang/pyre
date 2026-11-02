@@ -402,7 +402,6 @@ fn ref_field_witness_tokens(
             impl __MajitRefField for *mut #pointee {}
             impl __MajitRefField for *const #pointee {}
             impl __MajitRefField for usize {}
-            #[allow(dead_code)]
             fn __majit_ref_field_witness(__s: &#struct_path) {
                 fn __accept<T: __MajitRefField>(_: T) {}
                 __accept(__s.#member);

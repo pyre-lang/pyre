@@ -444,7 +444,7 @@ fn overlapped_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter:
     });
     Ok(pyre_interpreter::typedef::tag_subclass_instance(
         obj,
-        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
     ))
 }
 

@@ -25584,21 +25584,6 @@ fn float_hex_repr(x: f64) -> String {
     format!("{sign}0x{digits}p{esign}{eabs}")
 }
 
-/// IEEE 754 double decomposition into (mantissa, exponent, sign).
-/// PyPy: Lib/fractions.py _decimal_to_ratio uses a similar approach.
-#[allow(dead_code)]
-fn integer_decode(v: f64) -> (u64, i16, i8) {
-    let bits = v.to_bits();
-    let sign: i8 = if bits >> 63 == 0 { 1 } else { -1 };
-    let mut exponent: i16 = ((bits >> 52) & 0x7ff) as i16;
-    let mantissa = if exponent == 0 {
-        (bits & 0xfffffffffffff) << 1
-    } else {
-        (bits & 0xfffffffffffff) | 0x10000000000000
-    };
-    exponent -= 1023 + 52;
-    (mantissa, exponent, sign)
-}
 /// boolobject.py `_make_bitwise_binop` — when both operands are bool the
 /// result is bool; a non-bool operand delegates to the int dunder, which
 /// returns an int.  `descr_rbinop` reuses `descr_binop`, so the reflected
@@ -39246,53 +39231,6 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
         root_cached_object(pyre_object::gc_roots::shadow_stack_get(descr_slot))
     });
     **slot as pyre_object::PyObjectRef
-}
-
-/// PyPy stores `fget/fset/fdel/doc/reqcls/use_closure/name` directly on
-/// the `GetSetProperty` instance fields. pyre's instance dict (mapdict)
-/// is thread-local, but `init_typeobjects` runs once globally and the
-/// `pypy/interpreter/typedef.py GetSetProperty._init` —
-/// stores fget/fset/fdel/doc/reqcls/use_closure/name directly on the
-/// descriptor instance.  Pyre matches that shape with a real W_Root
-/// struct (`pyre_object::typedef::GetSetProperty`); these
-/// helpers are thin wrappers over the typed accessors so existing
-/// call sites stay readable.
-///
-/// `cls` is stored as `reqcls` exactly like PyPy. `use_closure` is
-/// unused at runtime (pyre has no closure-passing distinction) but
-/// still kept on the struct for parity.
-#[allow(dead_code)]
-fn getset_property_init(
-    new: pyre_object::PyObjectRef,
-    fget: pyre_object::PyObjectRef,
-    fset: pyre_object::PyObjectRef,
-    fdel: pyre_object::PyObjectRef,
-    doc: pyre_object::PyObjectRef,
-    cls: pyre_object::PyObjectRef,
-    use_closure: bool,
-    name: pyre_object::PyObjectRef,
-) {
-    // The descriptor struct is allocated by `make_getset_property_full`
-    // already filled in (typedef.py:327-336 hands the fully-formed
-    // instance back to the caller); this helper survives only as the
-    // copy-for-type path that re-stamps an existing GetSetProperty
-    // with new bindings.
-    let _ = use_closure; // mirrored in the struct but unused here
-    let resolved_name = if !name.is_null() && unsafe { pyre_object::is_str(name) } {
-        name
-    } else {
-        pyre_object::w_str_new("<generic property>")
-    };
-    unsafe {
-        let descr = &mut *(new as *mut pyre_object::typedef::GetSetProperty);
-        descr.fget = fget;
-        descr.fset = fset;
-        descr.fdel = fdel;
-        descr.doc = doc;
-        descr.reqcls = cls;
-        descr.name = resolved_name;
-        descr.use_closure = use_closure;
-    }
 }
 
 /// Read the optional `reqcls` field from a getset descriptor.

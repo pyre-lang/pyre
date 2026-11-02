@@ -2412,7 +2412,6 @@ pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
 }
 
 /// Snapshot of the current guard-hook cells (test-only helper).
-#[allow(dead_code)]
 fn current_gc_guard_hooks() -> ActiveGcGuardHooks {
     ActiveGcGuardHooks {
         check_is_object: ACTIVE_CHECK_IS_OBJECT.get(),

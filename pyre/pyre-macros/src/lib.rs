@@ -286,7 +286,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     };
     let sig_fn = quote! {
-        #[allow(dead_code, non_snake_case)]
+        #[allow(non_snake_case)]
         #vis fn #sig_fn_name() -> ::std::option::Option<::pyre_interpreter::Signature> {
             #sig_body
         }
@@ -311,7 +311,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             quote! { #n }
         };
     let arity_fn = quote! {
-        #[allow(dead_code, non_snake_case)]
+        #[allow(non_snake_case)]
         #vis fn #arity_fn_name() -> u16 {
             #natural_arity
         }
@@ -325,7 +325,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let ndef = trailing_optional_positional_count(&param_required, &param_positional);
     let ndef_fn_name = format_ident!("{}_pyre_ndef", user_name);
     let ndef_fn = quote! {
-        #[allow(dead_code, non_snake_case)]
+        #[allow(non_snake_case)]
         #vis fn #ndef_fn_name() -> usize {
             #ndef
         }
@@ -339,7 +339,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let apply_kwonly_stmts = kwonly_apply_to_slot(&apply_kwonly_fn_slot, &kwonly_default_pairs);
     let apply_kwonly_fn = if kwonly_default_pairs.is_empty() {
         quote! {
-            #[allow(dead_code, non_snake_case)]
+            #[allow(non_snake_case)]
             #vis fn #apply_kwonly_fn_name(
                 function: ::pyre_object::PyObjectRef,
             ) -> ::pyre_object::PyObjectRef {
@@ -348,7 +348,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     } else {
         quote! {
-            #[allow(dead_code, non_snake_case)]
+            #[allow(non_snake_case)]
             #vis fn #apply_kwonly_fn_name(
                 function: ::pyre_object::PyObjectRef,
             ) -> ::pyre_object::PyObjectRef {
@@ -1339,7 +1339,6 @@ fn type_is_pyerror(ty: &Type) -> bool {
 }
 
 // Avoid "unused" warnings on parse_quote import in the trimmed build.
-#[allow(dead_code)]
 fn _unused() {
     let _: syn::Type = parse_quote!(i64);
 }
@@ -1896,7 +1895,6 @@ fn expand_pyre_class(
                 /// mapdict `map` / `storage`, `ob_type` the user typeptr, and
                 /// `w_class` equal to `w_subtype`. The finalizer enqueue runs
                 /// when that class has `__del__`.
-                #[allow(dead_code)]
                 pub fn allocate_instance(
                     #payload_binding: Self,
                     w_subtype: ::pyre_object::PyObjectRef,
@@ -2046,7 +2044,6 @@ fn expand_pyre_class(
             /// `ob_type` matches this class's static `PyType`.
             /// Returns `None` if `obj` is the wrong type — callers
             /// must convert that to a Python `TypeError`.
-            #[allow(dead_code)]
             #[inline]
             #[expect(
                 clippy::not_unsafe_ptr_arg_deref,
@@ -2085,7 +2082,6 @@ fn expand_pyre_class(
             /// rewrite_op_malloc` refuses (`UnsupportedMallocFlags`), so the
             /// function is `dont_look_inside` and its calls are residual
             /// (`policy.py look_inside_graph`).
-            #[allow(dead_code)]
             #[::majit_macros::dont_look_inside]
             pub fn allocate(payload: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();
@@ -2108,7 +2104,6 @@ fn expand_pyre_class(
             /// rewrite_op_malloc` refuses (`UnsupportedMallocFlags`), so the
             /// function is `dont_look_inside` and its calls are residual
             /// (`policy.py look_inside_graph`).
-            #[allow(dead_code)]
             #[::majit_macros::dont_look_inside]
             pub fn allocate_stable(payload: Self) -> ::pyre_object::PyObjectRef {
                 let _roots = ::pyre_object::gc_roots::push_roots();

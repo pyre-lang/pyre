@@ -724,7 +724,6 @@ struct PathedJitcodeIndex {
     /// lookups read `regular`; this map keeps the AccessDirect copy of
     /// `owner::f` from colliding with a Regular last segment of the same
     /// spelling.
-    #[cfg_attr(not(test), allow(dead_code))]
     access_directly: indexmap::IndexMap<String, usize>,
 }
 
@@ -793,7 +792,7 @@ pub fn pathed_runtime_jitcode_cached(
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
 /// Prefer stable graph paths at build time; this runtime helper exists for
 /// diagnostics and tests whose serialized artifact stores names only.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn named_jitcode(name: &str) -> Option<Arc<JitCode>> {
     get_jitcode_by_index(compute_named_jitcode_index(name)?)
 }

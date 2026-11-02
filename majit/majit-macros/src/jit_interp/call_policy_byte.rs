@@ -48,8 +48,6 @@
 //! - `replay_kind_for_policy` and `is_wrapped_policy` (when adding a
 //!   new `CallPolicyKind` enum variant).
 
-#![allow(dead_code)]
-
 // ── Void-return helper policy bytes ─────────────────────────────────
 
 /// `#[dont_look_inside]` void — non-elidable, may raise (`EF_CAN_RAISE`).

@@ -385,7 +385,7 @@ fn env_var(varname: &str) -> Option<String> {
 /// on a guest that has no process env. The `gc_stress` reader is the only
 /// production call; without that feature the name still travels in
 /// [`GC_ENV_NAMES`] so a host can forward it.
-#[cfg_attr(not(feature = "gc_stress"), allow(dead_code))]
+#[cfg(test)]
 fn env_is_set(varname: &str) -> bool {
     majit_ir::environ::env_is_set(varname)
 }
@@ -551,6 +551,7 @@ fn get_l2cache() -> i64 {
 /// env.py `get_L2cache_linux2_cpuinfo`: find the smallest cache-size
 /// entry across CPUs.  The label must begin immediately after a newline, and
 /// the value must be expressed in K/kilobytes, exactly like upstream.
+#[cfg(any(target_os = "linux", test))]
 fn l2cache_from_cpuinfo(data: &[u8], label: &[u8]) -> i64 {
     let mut smallest = i64::MAX;
     for (line_index, line) in data.split(|byte| *byte == b'\n').enumerate() {
@@ -596,7 +597,7 @@ fn l2cache_from_cpuinfo(data: &[u8], label: &[u8]) -> i64 {
 }
 
 /// File half of env.py `get_L2cache_linux2_cpuinfo`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn get_l2cache_linux_cpuinfo(filename: &str, label: &[u8]) -> i64 {
     std::fs::read(filename)
         .ok()
@@ -604,6 +605,7 @@ fn get_l2cache_linux_cpuinfo(filename: &str, label: &[u8]) -> i64 {
 }
 
 /// Parse the leading decimal plus K/k form used by Linux sysfs cache sizes.
+#[cfg(any(target_os = "linux", test))]
 fn parse_sysfs_cache_size(data: &[u8]) -> Option<i64> {
     let end = data.iter().position(|byte| !byte.is_ascii_digit())?;
     if end == 0 || !matches!(data.get(end), Some(b'K' | b'k')) {
@@ -620,6 +622,7 @@ fn parse_sysfs_cache_size(data: &[u8]) -> Option<i64> {
 /// `cpuN/cache/indexM`, take the smallest L2 and L3, then sum them.  Missing
 /// either level deliberately overflows the signed sentinel to a non-positive
 /// value, matching translated RPython's `sys.maxint` arithmetic and fallback.
+#[cfg(any(target_os = "linux", test))]
 fn get_l2cache_linux_system_cpu_index(sys_cpu_root: &str) -> i64 {
     let mut cpu = 0usize;
     let mut l2cache = i64::MAX;
@@ -664,7 +667,7 @@ fn get_l2cache_linux_system_cpu_index(sys_cpu_root: &str) -> i64 {
 }
 
 /// env.py `get_L2cache_linux2_sparc`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn get_l2cache_linux_sparc(sys_cpu_root: &str) -> i64 {
     let mut cpu = 0usize;
     let mut smallest = i64::MAX;
@@ -689,7 +692,7 @@ fn get_l2cache_linux_sparc(sys_cpu_root: &str) -> i64 {
 /// env.py `get_L2cache_linux2`: select the literal upstream probe by
 /// machine architecture.  Rust's architecture spellings differ slightly from
 /// `os.uname()[4]`, so include both forms where the target exists.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(target_os = "linux")]
 fn get_l2cache_linux_for(arch: &str, cpuinfo: &str, sys_cpu_root: &str) -> i64 {
     if arch.ends_with("86") || arch == "x86_64" {
         return get_l2cache_linux_cpuinfo(cpuinfo, b"cache size");
@@ -7604,7 +7607,8 @@ impl MiniMarkGC {
     /// assertions rather than `debug_assert!`s that a release build drops.
     /// `PYPY_GC_DEBUG` is the only way to arm them, and a run that sets it is
     /// asking to be aborted on a broken invariant.
-    #[allow(dead_code)] // incminimark.py `debug_check_consistency`
+    // incminimark.py `debug_check_consistency`
+    #[cfg(test)]
     fn debug_check_consistency(&self) {
         self.debug_check_consistency_at("unspecified");
     }

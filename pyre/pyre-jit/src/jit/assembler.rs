@@ -2271,19 +2271,6 @@ fn expect_vable_field_read_args(args: &[Operand]) -> (u16, u16) {
     (vable_reg, field_idx)
 }
 
-#[allow(dead_code)]
-fn expect_vable_field_write_args(args: &[Operand], value_kind: Kind) -> (u16, u16, u16) {
-    assert_eq!(
-        args.len(),
-        3,
-        "setfield_vable_* expects [vable, value, fielddescr]"
-    );
-    let vable_reg = expect_reg(&args[0], Kind::Ref);
-    let value_reg = expect_reg(&args[1], value_kind);
-    let field_idx = expect_descr_vable_static_field(&args[2]);
-    (vable_reg, value_reg, field_idx)
-}
-
 fn expect_matching_vable_array_descrs(field: &Operand, array: &Operand, opname: &str) -> u16 {
     let array_idx = expect_descr_vable_array_field(field);
     let array_descr_idx = expect_descr_vable_array(array);
@@ -2293,19 +2280,6 @@ fn expect_matching_vable_array_descrs(field: &Operand, array: &Operand, opname: 
          descrs must reference the same array field",
     );
     array_idx
-}
-
-#[allow(dead_code)]
-fn expect_vable_array_read_args(args: &[Operand]) -> (u16, u16, u16) {
-    assert_eq!(
-        args.len(),
-        4,
-        "getarrayitem_vable_* expects [vable, index, arrayfielddescr, arraydescr]"
-    );
-    let vable_reg = expect_reg(&args[0], Kind::Ref);
-    let index_reg = expect_reg(&args[1], Kind::Int);
-    let array_idx = expect_matching_vable_array_descrs(&args[2], &args[3], "getarrayitem_vable_*");
-    (vable_reg, index_reg, array_idx)
 }
 
 /// Read prefix for getarrayitem_vable_*: returns (vable_reg, array_idx)
@@ -2320,19 +2294,6 @@ fn expect_vable_array_read_prefix(args: &[Operand]) -> (u16, u16) {
     let vable_reg = expect_reg(&args[0], Kind::Ref);
     let array_idx = expect_matching_vable_array_descrs(&args[2], &args[3], "getarrayitem_vable_*");
     (vable_reg, array_idx)
-}
-
-#[allow(dead_code)]
-fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
-    assert_eq!(
-        args.len(),
-        5,
-        "setarrayitem_vable_* expects [vable, index, value, arrayfielddescr, arraydescr]"
-    );
-    let vable_reg = expect_reg(&args[0], Kind::Ref);
-    let index_reg = expect_reg(&args[1], Kind::Int);
-    let array_idx = expect_matching_vable_array_descrs(&args[3], &args[4], "setarrayitem_vable_*");
-    (vable_reg, index_reg, array_idx)
 }
 
 /// Write prefix for setarrayitem_vable_* WITHOUT dispatching on the
@@ -2489,19 +2450,6 @@ fn expect_float_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
             "expected Float register or ConstFloat routable through constant pool, got {:?}",
             other
         ),
-    }
-}
-
-#[allow(dead_code)]
-fn expect_list_regs(op: &Operand, expected: Kind) -> Vec<u8> {
-    match op {
-        Operand::ListOfKind(ListOfKind { kind, content }) if *kind == expected => content
-            .iter()
-            .map(|item| {
-                u8::try_from(expect_reg(item, expected)).expect("register index exceeds u8")
-            })
-            .collect(),
-        _ => panic!("expected ListOfKind({:?}), got {:?}", expected, op),
     }
 }
 

@@ -141,7 +141,7 @@ pub struct WasmFrameData {
     read_force: bool,
     /// Off-GC host-buffer owner. Keeps the entry JitFrame alive after
     /// `execute_token` returns. The wasm32 host-buffer path.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held for its Drop, never read
     host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
 }
 
@@ -235,14 +235,6 @@ impl WasmFrameData {
             unsafe { (*jf).jf_savedata = data_slot as usize };
         }
         self.savedata = data_slot;
-    }
-
-    #[allow(dead_code)] // wasm32 `execute_token` host-buffer path
-    pub(crate) fn take_host_frame(
-        &mut self,
-        frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
-    ) {
-        self.host_frame = Some(frame);
     }
 }
 
@@ -1436,7 +1428,7 @@ pub struct CompiledWasmLoop {
     /// backend assembler state, not metainterpreter state: the optimized trace
     /// and all per-token descriptors have already been installed exactly as
     /// in the eager path.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) pending_wasm_bytes: RefCell<Option<Vec<u8>>>,
     /// Owning `CompiledLoopToken`. `register_descrs_once` pins this loop's
     /// fail descrs on `asmmemmgr_gcreftracers` at `compile_loop`

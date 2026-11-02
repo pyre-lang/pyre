@@ -249,7 +249,7 @@ fn pin_gc_addr(addr: usize) -> Option<majit_gc::shadow_stack::OwnerRootGuard> {
         .then(|| majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(addr)))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn u16_to_opcode(v: u16) -> OpCode {
     assert!(
         (v as usize) < OPCODE_COUNT,
@@ -965,7 +965,7 @@ impl<'a> CutTrace<'a> {
     /// `ByteTraceIter` that walks the parent trace from `start` to
     /// `trace._pos`, with `_cache` / `inputargs` seeded from the cut's
     /// inputarg templates.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn get_iter(&self) -> ByteTraceIter<'_> {
         let trace = &*self.trace;
         ByteTraceIter::new_for_cut(
@@ -994,15 +994,12 @@ pub(crate) struct ByteTraceIter<'a> {
     pub _cache: Vec<Option<Operand>>,
     /// opencoder.py:259-263 `self.inputargs` — fresh iterator-local
     /// `InputArg` objects bound to the trace's inputargs.
-    #[allow(dead_code)]
     pub inputargs: Vec<majit_ir::InputArgRc>,
-    #[allow(dead_code)]
     pub start: usize,
     pub pos: usize,
     pub end: usize,
     pub _count: u32,
     pub _index: u32,
-    #[allow(dead_code)]
     pub start_index: u32,
     /// Majit-specific fresh OpRef counter (same role as
     /// `TraceIterator::_fresh` on the legacy walker).
@@ -1092,7 +1089,7 @@ impl<'a> ByteTraceIter<'a> {
     /// fresh OpRefs reuse the template's type via
     /// `OpRef::input_arg_typed`, so downstream consumers preserve the
     /// `Box.type` invariant the cut sub-trace operates under.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new_for_cut(
         trace: &'a TraceRecordBuffer,
         start: usize,
@@ -1355,7 +1352,6 @@ impl<'a> Iterator for ByteTraceIter<'a> {
 
 /// opencoder.py `Trace.get_iter()` — byte-stream form.
 impl Trace {
-    #[allow(dead_code)]
     pub(crate) fn get_byte_iter(&self) -> ByteTraceIter<'_> {
         ByteTraceIter::new(
             self,
@@ -1668,7 +1664,7 @@ impl<'a> SnapshotIterator<'a> {
     /// recorder buffer it walks.
     /// Callers pass the iterator explicitly instead so this helper
     /// stays structurally equivalent to `main_iter._untag(index)`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn get(&self, tagged: i64, main_iter: &mut ByteTraceIter<'_>) -> OpRef {
         main_iter._untag(tagged).to_opref()
     }
@@ -1678,7 +1674,7 @@ impl<'a> SnapshotIterator<'a> {
     /// only); pyre exposes the same surface so test fixtures and
     /// debug tooling can read a snapshot's frame array without
     /// re-implementing the decode loop.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn unpack_array(
         &self,
         arr: BoxArrayIter<'_>,
@@ -1777,7 +1773,7 @@ pub(crate) enum Box {
 impl Box {
     /// Convenience: `Box::ResOp(opref.raw())`.
     #[inline]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn of_op(op: majit_ir::OpRef) -> Self {
         Box::ResOp(op.raw())
     }
@@ -2523,7 +2519,6 @@ impl Trace {
     /// signed-varint encoding of `SNAPSHOT_PREV_NEEDS_PATCHING` (-3).
     /// `-3` fits in 2 bytes (RPython literally asserts the bytes
     /// `'}' '\xff'` at opencoder.py). We assert the same.
-    #[allow(dead_code)]
     pub(crate) fn snapshot_add_prev(&mut self, prev: i32) {
         debug_assert!(self._snapshot_data.len() >= 2, "snapshot_data too short");
         let n = self._snapshot_data.len();
@@ -2555,7 +2550,6 @@ impl Trace {
     /// `_snapshot_array_data`, then the top snapshot record into
     /// `_snapshot_data`, and finally patches the preceding guard's
     /// descr slot to the snapshot index.
-    #[allow(dead_code)]
     pub(crate) fn create_top_snapshot(
         &mut self,
         jitcode_index: i64,
@@ -2582,7 +2576,7 @@ impl Trace {
     /// No frame data — used when tracing starts at a guard before any
     /// frame has been entered. Writes a snapshot with jitcode_index=-1,
     /// pc=0, an empty box array, and SNAPSHOT_PREV_NONE.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn create_empty_top_snapshot(
         &mut self,
         vable_boxes: &[i64],
@@ -2607,7 +2601,6 @@ impl Trace {
     /// sentinel on the PREVIOUS snapshot (via `snapshot_add_prev`),
     /// then encodes this snapshot with `SNAPSHOT_PREV_NEEDS_PATCHING`
     /// (to be resolved on the NEXT iteration).
-    #[allow(dead_code)]
     pub(crate) fn create_snapshot(
         &mut self,
         jitcode_index: i64,
@@ -2628,7 +2621,6 @@ impl Trace {
     /// the snapshot chain rooted at `snapshot_index` and captured the
     /// vable / vref array offsets. `snapshot_index` is the byte offset
     /// returned by `capture_resumedata` / `create_top_snapshot`.
-    #[allow(dead_code)]
     pub(crate) fn get_snapshot_iter(&self, snapshot_index: usize) -> SnapshotIterator<'_> {
         SnapshotIterator::new(
             &self._snapshot_data,
@@ -2658,7 +2650,6 @@ impl Trace {
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
     )]
-    #[allow(dead_code)]
     pub(crate) fn create_top_snapshot_from_frame(
         &mut self,
         frame: &mut crate::pyjitpl::MIFrame,
@@ -2716,7 +2707,6 @@ impl Trace {
     /// (test fixtures) the fallback substitutes `Box::Const*(0)`
     /// directly into the snapshot bytes — identical encoded output but
     /// the register slot keeps its pre-call contents.
-    #[allow(dead_code)]
     pub(crate) fn create_snapshot_from_frame(
         &mut self,
         frame: &mut crate::pyjitpl::MIFrame,
@@ -2751,7 +2741,7 @@ impl Trace {
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
     )]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn capture_resumedata(
         &mut self,
         framestack: &mut [crate::pyjitpl::MIFrame],
@@ -2908,7 +2898,6 @@ impl Trace {
     /// opencoder.py `create_empty_top_snapshot(vable_boxes,
     /// vref_boxes)` — Box-taking sibling for `capture_resumedata`'s
     /// empty-framestack branch.
-    #[allow(dead_code)]
     fn create_empty_top_snapshot_from_boxes(
         &mut self,
         vable_boxes: impl ExactSizeIterator<Item = Box> + DoubleEndedIterator,
@@ -2957,7 +2946,6 @@ impl Trace {
         self._pos >= 2 && ops[self._pos - 2] == 0 && ops[self._pos - 1] == 0
     }
 
-    #[allow(dead_code)]
     pub(crate) fn patch_last_guard_descr_slot(&mut self, snapshot_index: i64) {
         debug_assert!(
             self._pos >= 2,
@@ -3193,7 +3181,7 @@ impl Trace {
     /// produce the wire-format tagged value. `descr=None` emits the
     /// 0-placeholder (guards and no-descr ops); `Some(&descr)` routes
     /// through `_encode_descr`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn record_op(
         &mut self,
         opcode: OpCode,
@@ -3228,7 +3216,7 @@ impl Trace {
     }
 
     /// opencoder.py record_op0(opnum, descr=None).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn record_op0(&mut self, opcode: OpCode, descr: Option<&majit_ir::DescrRef>) -> u32 {
         let pos = self._index;
         let old_pos = self._op_start(opcode, 0);
@@ -3237,7 +3225,6 @@ impl Trace {
     }
 
     /// opencoder.py record_op1(opnum, argbox1, descr=None).
-    #[allow(dead_code)]
     pub(crate) fn record_op1(
         &mut self,
         opcode: OpCode,
@@ -3253,7 +3240,7 @@ impl Trace {
     }
 
     /// opencoder.py record_op2(opnum, argbox1, argbox2, descr=None).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn record_op2(
         &mut self,
         opcode: OpCode,
@@ -3272,7 +3259,7 @@ impl Trace {
     }
 
     /// opencoder.py record_op3(opnum, argbox1, argbox2, argbox3, descr=None).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // opencoder.py Trace.record_op3; current recorder callers use generic record_op
     pub(crate) fn record_op3(
         &mut self,
         opcode: OpCode,
@@ -3303,6 +3290,7 @@ impl Trace {
     ///
     /// Panics when a constant OpRef is not inline-resolvable — that is a
     /// genuine invariant break.
+    #[cfg(test)]
     pub(crate) fn _encode_opref(&mut self, opref: OpRef) -> i64 {
         let b = if opref.is_constant() {
             let value = opref.inline_const_to_value().unwrap_or_else(|| {
@@ -3329,7 +3317,7 @@ impl Trace {
     /// via `OpRef::inline_const_to_value`; non-constant OpRefs route through
     /// the TAGBOX path via `Box::of_op`. Wire bytes are identical to the
     /// equivalent `record_op(&[Box])` call.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn record_op_oprefs(
         &mut self,
         opcode: OpCode,
@@ -3354,14 +3342,14 @@ impl Trace {
 
     /// Close the loop: append a JUMP op with no descr.  Mirrors
     /// `recorder::Trace::close_loop`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn close_loop_oprefs(&mut self, jump_args: &[OpRef]) -> u32 {
         self.record_op_oprefs(OpCode::Jump, jump_args, None)
     }
 
     /// Close the loop with an explicit JUMP descriptor (tentative JUMP
     /// target token recorded before compile_trace, pyjitpl.py).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn close_loop_oprefs_with_descr(
         &mut self,
         jump_args: &[OpRef],
@@ -3372,7 +3360,7 @@ impl Trace {
 
     /// Finish the trace: append a FINISH op with its FailDescr.
     /// pyjitpl.py:1637 `history.record1(rop.FINISH, ..., descr=token)`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn finish_oprefs(
         &mut self,
         finish_args: &[OpRef],
@@ -3393,7 +3381,6 @@ impl Trace {
 
     /// opencoder.py append_snapshot_data_int(i).
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn append_snapshot_data_int(&mut self, i: i64) {
         let i = self.clamp_snapshot_int(i);
         self._snapshot_data.append_varint(i);
@@ -3408,7 +3395,7 @@ impl Trace {
     /// at opencoder.py). Guard fail-arg equivalents come from
     /// the attached snapshot chain through `update_liveranges`
     /// (opencoder.py).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn get_live_ranges(&self) -> Vec<usize> {
         let mut liveranges = vec![0usize; self._index as usize];
         // opencoder.py `index = t._count` with `t._count = start` at
@@ -3485,7 +3472,7 @@ impl Trace {
     /// Result is memoized in `_deadranges = (self._count, deadranges)`
     /// and returned unchanged across calls until `_count` advances
     /// (opencoder.py, 883).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn get_dead_ranges(&mut self) -> Vec<usize> {
         // opencoder.py:873-875 cache hit path.
         if let Some((cached_count, cached)) = &self._deadranges
@@ -3868,18 +3855,8 @@ mod tests {
         OpRef::int_op(pos)
     }
 
-    #[allow(dead_code)]
-    fn fop(pos: u32) -> OpRef {
-        OpRef::float_op(pos)
-    }
-
     fn rop(pos: u32) -> OpRef {
         OpRef::ref_op(pos)
-    }
-
-    #[allow(dead_code)]
-    fn vop(pos: u32) -> OpRef {
-        OpRef::void_op(pos)
     }
 
     /// Bind a position-only `OpRef` arg to a producer-bound `Operand`,

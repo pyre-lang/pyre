@@ -19,19 +19,16 @@ use std::rc::Rc;
 use majit_charon_reader::Llbc;
 
 use crate::codewriter::call::{DeclaredFuncObj, FuncObjDeclarations};
-use crate::front::mir::{
-    self, CrateLowering, CrateLoweringState, DeclBuildError, GraphStamp, LowerError,
-};
+#[cfg(test)]
+use crate::front::mir::LowerError;
+use crate::front::mir::{self, CrateLowering, CrateLoweringState, DeclBuildError, GraphStamp};
 use crate::front::semantic::{SemanticFunction, SemanticProgram};
 use crate::model::{FunctionGraph, GraphKey, LazyGraph};
 
 /// Where a funcobj's body comes from: the LLBC that carries it and the
 /// Charon `def_id` that indexes it there (`Llbc::fn_by_id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "no funcobj records its body source yet")
-)]
+#[cfg(test)]
 pub(crate) struct GraphBodySource {
     pub llbc_index: u32,
     pub def_id: u64,
@@ -306,10 +303,7 @@ impl GraphBodyProvider {
     /// with, reproducing what the whole-program loop produced for it. Which
     /// funcobjs exist is decided when they are registered, so no membership
     /// gate runs here, and a body that does not lower answers its own error.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no funcobj records its body source yet")
-    )]
+    #[cfg(test)]
     pub(crate) fn build(&self, src: GraphBodySource) -> Result<SemanticFunction, LowerError> {
         let idx = src.llbc_index as usize;
         let krate = self

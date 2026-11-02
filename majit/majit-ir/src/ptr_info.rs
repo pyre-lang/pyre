@@ -23,16 +23,6 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 pub type VirtualFieldList = smallvec::SmallVec<[(u32, Operand); 4]>;
 pub type CachedFieldList = smallvec::SmallVec<[(u32, FieldEntry); 4]>;
 
-/// info.py `init_fields`: one list sized to the descr, not a grow
-/// chain. Kept for the remaining Vec field lists (virtualizable heap
-/// fields). Virtual/instance lists are inline and do not reserve.
-#[allow(dead_code)]
-fn reserve_assoc<T>(fields: &mut Vec<T>, n: usize) {
-    if n > fields.capacity() {
-        fields.reserve(n - fields.len());
-    }
-}
-
 fn push_assoc<V>(fields: &mut Vec<(u32, V)>, field_idx: u32, value: V, reserve_n: usize) {
     for entry in fields.iter_mut() {
         if entry.0 == field_idx {
@@ -64,14 +54,6 @@ fn push_assoc_cached(fields: &mut CachedFieldList, field_idx: u32, value: FieldE
         }
     }
     fields.push((field_idx, value));
-}
-
-#[allow(dead_code)]
-fn descr_field_len(descr: Option<&DescrRef>) -> usize {
-    descr
-        .and_then(|d| d.as_size_descr())
-        .map(|sd| sd.all_fielddescrs().len())
-        .unwrap_or(8)
 }
 
 /// info.py `reasonable_array_index(index)` — sanity gate on a

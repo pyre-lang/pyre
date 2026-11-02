@@ -51,11 +51,6 @@ use crate::host_path::{guest_path_to_host, host_path_to_guest};
 // Frame call-area offsets — must match `majit-backend-wasm/src/codegen.rs`.
 // Shared with `wasmi_host`, which mirrors the same call-area protocol.
 pub(crate) const CALL_RESULT_OFS: usize = majit_backend_wasm_host::CALL_RESULT_OFS as usize;
-// The arg count also lives at offset 2016, but the trampoline derives arity
-// (and the exact value types) from the resolved function's wasm signature
-// instead, which is authoritative on wasm32. Kept for layout documentation.
-#[allow(dead_code)]
-pub(crate) const CALL_NARGS_OFS: usize = 2016;
 
 pub(crate) const DEFAULT_MODULE: &str = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm";
 

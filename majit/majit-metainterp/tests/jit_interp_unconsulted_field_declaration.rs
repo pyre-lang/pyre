@@ -25,25 +25,28 @@ struct Cell {
     count: u32,
 }
 
-/// Never the declared type of any access base in this machine. A key naming it
-/// cannot match, whatever it claims about the field.
-#[repr(C)]
-#[allow(dead_code)]
-struct Unreached {
-    count: u32,
-}
-
-struct CellState {
-    cell: usize,
-    total: i64,
-    ticks: i64,
-}
-
 pub type Bytecode = [u8];
 
 const OP_READ: u8 = 1;
 const OP_TICK: u8 = 2;
 const OP_HALT: u8 = 3;
+
+/// Never the declared type of any access base in this machine. A key naming it
+/// cannot match, whatever it claims about the field.
+#[allow(dead_code)] // named only by the `int_fields` key below
+#[repr(C)]
+struct Unreached {
+    count: u32,
+}
+
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
+struct CellState {
+    cell: usize,
+    total: i64,
+    ticks: i64,
+}
 
 #[majit_macros::jit_interp(
     state = CellState,

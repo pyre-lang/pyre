@@ -420,11 +420,6 @@ impl RecentPureOpTable {
             .map(|(_, result)| result.to_opref())
     }
 
-    #[allow(dead_code)] // pure.py OptPure.history length
-    fn history_length(&self) -> usize {
-        self.history_length
-    }
-
     /// Drop ring entries, keep the bucket `Vec` and each ring's allocation.
     /// `pure.py OptPure.__init__` builds `_pure_operations` once; `setup`
     /// does not reallocate it.

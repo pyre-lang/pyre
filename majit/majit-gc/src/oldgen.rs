@@ -524,7 +524,6 @@ impl OldGen {
 
     /// Non-incremental compatibility entry point, expressed as prepare plus
     /// draining steps just like minimarkpage.py `mass_free`.
-    #[allow(dead_code)]
     pub fn sweep(&mut self) {
         self.sweep_prepare();
         while self.rawmalloc_sweep_pending() {

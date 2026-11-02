@@ -71,10 +71,6 @@ fn boehm_malloc_array_descr() -> DescrRef {
 fn mk_op(opcode: OpCode, args: &[Operand]) -> Op {
     Op::new(opcode, args)
 }
-#[allow(dead_code)]
-fn mk_op_descr(opcode: OpCode, args: &[Operand], descr: DescrRef) -> Op {
-    Op::with_descr(opcode, args, descr)
-}
 
 /// rewrite.py `emit_op`'s reference-constant loop, run on its own.
 ///
@@ -1069,25 +1065,6 @@ impl RewriteState {
     /// `_forwarded` chain `replace_op_with` set.
     fn get_box_replacement(&self, r: Operand) -> Operand {
         r.get_box_replacement(false)
-    }
-
-    #[allow(dead_code)]
-    fn rewrite_op(&self, op: &Op) -> Op {
-        let rewritten = op.clone();
-        // optimizer.py force_box loop parity:
-        //   for i in range(op.numargs()): op.setarg(i, ...)
-        for i in 0..rewritten.num_args() {
-            rewritten.setarg(i, self.get_box_replacement(rewritten.arg(i)));
-        }
-        if let Some(fail_args) = rewritten.fail_args_mut() {
-            for arg in fail_args.iter_mut() {
-                // Same shed as `setarg` above: a forwarding target bound to
-                // its producer stays a live-tracking operand.
-                *arg = self.get_box_replacement(arg.clone());
-            }
-        }
-        rewritten.pos().set(OpRef::NONE);
-        rewritten
     }
 
     /// rewrite.py `replace_op_with(op, newop)`: `op.set_forwarded(newop)`.

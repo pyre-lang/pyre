@@ -18,14 +18,6 @@ fn use_untranslated_heap_ordering() -> bool {
     cfg!(debug_assertions)
 }
 
-#[inline]
-#[allow(dead_code)] // heap.py descr sort before translation
-fn sort_descr_entries_untranslated<T>(entries: &mut [(u32, DescrRef, T)]) {
-    if use_untranslated_heap_ordering() {
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.repr()));
-    }
-}
-
 /// [`sort_descr_entries_untranslated`] for a caller that permutes an index
 /// list instead of the entries themselves.
 #[inline]
@@ -149,14 +141,6 @@ impl DictArgKey {
         }
     }
 }
-
-/// Cache key for a field access: (struct OpRef, field descriptor identity).
-///
-/// RPython `heap.py` keys `cached_fields` and green/quasi field caches by the
-/// descriptor object itself.  `FieldDescr.get_index()` is a different domain:
-/// it indexes `PtrInfo._fields`.
-#[allow(dead_code)]
-type FieldKey = (OpRef, usize);
 
 /// Rust representation of `heap.AbstractCachedEntry` and `CachedField`.
 ///
@@ -308,8 +292,7 @@ impl CachedField {
     }
 
     /// heap.py AbstractCachedEntry.getfield_from_cache
-    /// heap.py AbstractCachedEntry.getfield_from_cache
-    #[allow(dead_code)]
+    #[allow(dead_code)] // heap.py AbstractCachedEntry.getfield_from_cache; cache reads inline this body today
     fn getfield_from_cache(
         &self,
         struct_box: &Operand,
@@ -387,7 +370,7 @@ impl CachedField {
     }
 
     /// heap.py CachedField.put_field_back_to_info
-    #[allow(dead_code)]
+    #[allow(dead_code)] // heap.py CachedField.put_field_back_to_info; lazy-set paths inline this body today
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         // info.py opinfo.setfield(descr, struct, op, optheap, cf=self)
         // PyPy: `setfield(..., cf=cf)` calls `cf.register_info(struct, self)`
@@ -637,33 +620,6 @@ impl ArrayCachedItem {
             return Some(entry);
         }
         None
-    }
-
-    /// heap.py AbstractCachedEntry.getfield_from_cache
-    #[allow(dead_code)]
-    fn getfield_from_cache(
-        &self,
-        array_box: &Operand,
-        descr: &DescrRef,
-        ctx: &mut OptContext,
-    ) -> Option<crate::optimizeopt::info::FieldEntry> {
-        if let Some(lazy_op) = &self.lazy_set
-            && same_ptr_info(ctx, &lazy_op.arg(0), array_box)
-        {
-            let rhs = Self::_get_rhs_from_set_op(lazy_op);
-            return Some(crate::optimizeopt::info::FieldEntry::Value(rhs.clone()));
-        }
-        let array_box = ctx.resolve_operand_operand(array_box);
-        self._getfield(array_box.to_opref(), descr, ctx)
-    }
-
-    /// heap.py ArrayCachedItem.put_field_back_to_info
-    #[allow(dead_code)]
-    fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
-        let arg = ctx.resolve_operand_operand(&op.arg(2));
-        let struct_box = ctx.resolve_operand_operand(&op.arg(0));
-        self.register_info(&struct_box);
-        ctx.arrayinfo_setitem(op, self.index as usize, &arg);
     }
 
     /// heap.py AbstractCachedEntry.produce_potential_short_preamble_ops
@@ -1151,15 +1107,6 @@ impl OptHeapState {
         descr.get_ei_index()
     }
 
-    /// Same as [`field_effect_index`] for the array namespace
-    /// (`effectinfo.py add_array` writes `ei_index` onto the
-    /// array descr; `compute_bitstrings` re-stamps in-place per
-    /// `effectinfo.py descr.ei_index = …`).
-    #[allow(dead_code)]
-    fn array_effect_index(descr: &DescrRef) -> u32 {
-        descr.get_ei_index()
-    }
-
     /// heapcache.py `_escape_box`: escape a box and transitively
     /// escape all its dependencies stored in `box._heapc_deps`.
     /// Const boxes (history.py) are globally-scoped values, never
@@ -1213,17 +1160,6 @@ impl OptHeapState {
         }
     }
 
-    /// Build the field cache key from a GETFIELD or SETFIELD op.
-    ///
-    /// For GETFIELD_GC_I/R/F: args = [obj], descr = field descriptor.
-    /// For SETFIELD_GC: args = [obj, value], descr = field descriptor.
-    #[allow(dead_code)]
-    fn field_key(op: &Op) -> Option<FieldKey> {
-        let descr = op.getdescr()?;
-        let obj = op.arg(0).to_opref();
-        Some((obj, descr_ptr(&descr)))
-    }
-
     /// heap.py arrayitem_cache: constant-index array cache key.
     /// Canonicalizes array and index through get_box_replacement.
     fn arrayitem_key(op: &Op, ctx: &mut OptContext) -> Option<ArrayItemKey> {
@@ -1246,13 +1182,6 @@ impl OptHeapState {
         self.field_cache(descr).register_info(struct_box);
     }
 
-    /// heap.py: field_cache (read-only borrow variant).
-    #[allow(dead_code)]
-    fn get_cached_field(&self, descr: &DescrRef) -> Option<&CachedField> {
-        self.cached_field_pos_for_descr(descr)
-            .map(|pos| &self.cached_fields[pos].2)
-    }
-
     /// heap.py field_cache — get or create CachedField for a descr.
     fn field_cache(&mut self, descr: &DescrRef) -> &mut CachedField {
         let pos = self.ensure_cached_field(descr, None);
@@ -1271,12 +1200,6 @@ impl OptHeapState {
                 self.cached_fields.len() - 1
             }
         }
-    }
-
-    #[allow(dead_code)]
-    fn get_cached_field_mut(&mut self, descr: &DescrRef) -> Option<&mut CachedField> {
-        let pos = self.cached_field_pos_for_descr(descr)?;
-        Some(&mut self.cached_fields[pos].2)
     }
 
     /// heap.py arrayitem_submap(descr, create_if_nonexistant=True)
@@ -1311,12 +1234,6 @@ impl OptHeapState {
     fn get_cached_array_submap_mut(&mut self, descr_idx: usize) -> Option<&mut ArrayCacheSubMap> {
         let pos = self.cached_array_pos_for_index(descr_idx)?;
         Some(&mut self.cached_arrayitems[pos].2)
-    }
-
-    #[allow(dead_code)]
-    fn get_cached_array_descr(&self, descr_idx: usize) -> Option<DescrRef> {
-        self.cached_array_pos_for_index(descr_idx)
-            .map(|pos| self.cached_arrayitems[pos].1.clone())
     }
 
     fn invalidate_arrayitem_cache(&mut self, descr_idx: usize, index: i64, ctx: &mut OptContext) {
@@ -2047,13 +1964,6 @@ impl OptHeapState {
     fn call_can_invalidate(op: &Op) -> bool {
         op.with_call_descr(|cd| cd.get_extra_info().check_can_invalidate())
             .unwrap_or(true)
-    }
-
-    /// heap.py: check if a call forces virtual/virtualizable objects.
-    #[allow(dead_code)]
-    fn call_forces_virtual(op: &Op) -> bool {
-        op.with_call_descr(|cd| cd.get_extra_info().check_forces_virtual_or_virtualizable())
-            .unwrap_or(false)
     }
 
     /// heap.py: force_from_effectinfo(effectinfo)

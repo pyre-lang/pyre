@@ -4152,17 +4152,6 @@ pub fn function_call_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
     call_args(func, args)
 }
 
-/// PyPy-compatible `call_obj_args` instance method.
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn function_call_obj_args(
-    func: PyObjectRef,
-    obj: PyObjectRef,
-    args: &[PyObjectRef],
-) -> PyObjectRef {
-    call_obj_args(func, obj, args)
-}
-
 /// `function.py Function.funccall` — the Result-returning body.
 ///
 /// Fixed-arity 0..=4 builtins go through `BuiltinCodeN.fastcall_N`:

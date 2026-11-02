@@ -84,8 +84,12 @@
 //!   opaque Call targets any more — that earlier deviation is removed
 //!   by the same change that introduced this module.
 
-use crate::flowspace::model::{ConstValue, HOST_ENV, Variable};
-use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+use crate::flowspace::model::Variable;
+#[cfg(test)]
+use crate::flowspace::model::{ConstValue, HOST_ENV};
+#[cfg(test)]
+use crate::model::LinkArg;
+use crate::model::{BlockId, CallTarget, FunctionGraph, OpKind, ValueType};
 
 /// `op.type(w_value)` (`flowcontext.py exc_from_raise`).  The result
 /// is class/vtable-shaped (`SomeTypeOf` / `RootClassRepr`), which
@@ -128,7 +132,8 @@ pub(crate) fn set_raise_from_instance(graph: &mut FunctionGraph, block: BlockId,
 /// `panic!("fmt", a, b)`.  They become `simple_call.args[1..]`.
 /// `simple_call` is variadic upstream (`flowspace/operation.py
 /// SimpleCall` / `CallOp.args = [callable, *args]`).
-#[allow(dead_code)] // exercised by tests; raise-class sites call this helper
+// exercised by tests; raise-class sites call this helper
+#[cfg(test)]
 pub(crate) fn lower_exc_from_raise(
     graph: &mut FunctionGraph,
     block: BlockId,

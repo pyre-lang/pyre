@@ -36,23 +36,16 @@ use majit_translate::flowspace::model::{
 /// RPython relies on module-level `pieces = ...` with tests poking
 /// at the attributes. Rust returns a struct the caller owns so each
 /// test can build a fresh graph.
-#[allow(dead_code)] // some fields (ops) are only retained for parity
+// some fields (ops) are only retained for parity
 // with `class pieces`; downstream test-port commits
 // may start reading them.
 struct Pieces {
     // Variables.
     i0: Hlvalue,
-    i1: Hlvalue,
     i2: Hlvalue,
     i3: Hlvalue,
-    sum1: Hlvalue,
     sum2: Hlvalue,
     sum3: Hlvalue,
-    conditionres: Hlvalue,
-    // Operations.
-    conditionop: SpaceOperation,
-    addop: SpaceOperation,
-    decop: SpaceOperation,
     // Blocks.
     startblock: BlockRef,
     headerblock: BlockRef,
@@ -169,16 +162,10 @@ impl Pieces {
 
         Pieces {
             i0: Hlvalue::Variable(i0),
-            i1: Hlvalue::Variable(i1),
             i2: Hlvalue::Variable(i2),
             i3: Hlvalue::Variable(i3),
-            sum1: Hlvalue::Variable(sum1),
             sum2: Hlvalue::Variable(sum2),
             sum3: Hlvalue::Variable(sum3),
-            conditionres: Hlvalue::Variable(conditionres),
-            conditionop,
-            addop,
-            decop,
             startblock,
             headerblock,
             whileblock,

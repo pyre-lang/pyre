@@ -450,7 +450,7 @@ static FORCE_ATTRIBUTES_INTO_CLASSES: LazyLock<RwLock<ForceAttributeTables>> =
 /// Last-writer-wins on the outer key; re-registering the same qualname
 /// replaces the prior field set.  Matches PyPy where re-assignment
 /// `FORCE_ATTRIBUTES_INTO_CLASSES[cls] = {...}` overwrites.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn register_struct_fields(qualname: &str, fields: &[(String, crate::model::ValueType)]) {
     register_struct_fields_with_layout(qualname, fields, None);
 }

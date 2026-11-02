@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn niche_and_direct_tags_match_real_values() {
         #[derive(Clone, Copy)]
-        #[allow(dead_code)]
+        #[allow(dead_code)] // payloads only shape the layout under test
         enum BoolNiche {
             T(bool),
             U,
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(host_tag_value_for_variant(&bool_tag, 2), Some(3));
 
         #[derive(Clone, Copy)]
-        #[allow(dead_code)]
+        #[allow(dead_code)] // payloads only shape the layout under test
         enum CharNiche {
             A(char),
             B,
@@ -212,7 +212,7 @@ mod tests {
         // not fit in the niche. The tag is a direct `u8` and the pointer
         // sits at offset 8.
         #[derive(Clone, Copy)]
-        #[allow(dead_code)]
+        #[allow(dead_code)] // payloads only shape the layout under test
         enum RefDirect {
             A(&'static u8),
             B,
@@ -246,7 +246,7 @@ mod tests {
         assert!(unknown.is_err(), "an unknown direct tag must panic");
 
         #[derive(Clone, Copy)]
-        #[allow(dead_code)]
+        #[allow(dead_code)] // payloads only shape the layout under test
         enum DirectPay {
             A(u64),
             B(u64),
@@ -289,7 +289,7 @@ mod tests {
         // `Big` is the untagged bool. Niche variants on both sides share
         // one span, and the dead tag `niche_start + 7` is not stored.
         #[derive(Clone, Copy)]
-        #[allow(dead_code)]
+        #[allow(dead_code)] // payloads only shape the layout under test
         enum Hole {
             A,
             B,

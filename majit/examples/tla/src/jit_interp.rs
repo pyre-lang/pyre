@@ -17,20 +17,6 @@ use majit_metainterp::virt_array::VirtArray;
 
 pub type Bytecode = [u8];
 
-#[expect(
-    dead_code,
-    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
-)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 /// tla.py `self.stack = [None] * 8`.
 const STACK_SIZE: usize = 8;
 

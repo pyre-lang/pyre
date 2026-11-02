@@ -1039,15 +1039,6 @@ impl W_TextIOWrapper {
         }
     }
 
-    #[allow(dead_code)]
-    fn size_args(w_size: PyObjectRef) -> Vec<PyObjectRef> {
-        if unsafe { pyre_object::is_none(w_size) } {
-            Vec::new()
-        } else {
-            vec![w_size]
-        }
-    }
-
     fn lookup_text_codec(encoding: &str) -> Result<PyObjectRef, crate::PyError> {
         // Normal interpreter startup installs an ExecutionContext before
         // Python-visible I/O can run.  A handful of Rust-level `open()` unit

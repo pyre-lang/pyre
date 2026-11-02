@@ -706,17 +706,6 @@ fn type_var_index_at(v: &Value, binder_depth: u64) -> Option<usize> {
         .map(|index| index as usize)
 }
 
-/// Depth-0 const-generic variable index:
-/// `{"kind":{"Var":{"Bound":[0, i]}}}` or `{"kind":{"Var":{"Free": i}}}`
-/// (any space), and the array ConstantExpr `[{"Var":{"Bound":[0, i]}}, ty]`
-/// or `[{"Var":{"Free": i}}, ty]` when visited in `Space::Const` under a
-/// key other than `"regions"` (a two-element region list has the same
-/// `Var` shape).
-#[allow(dead_code)]
-fn const_var_index(v: &Value, space: Space, key: Option<&str>) -> Option<usize> {
-    const_var_index_at(v, space, key, 0)
-}
-
 fn const_var_index_at(
     v: &Value,
     space: Space,
@@ -738,12 +727,6 @@ fn const_var_index_at(
         return None;
     }
     var_index_at(arr.first()?.as_object()?.get("Var")?, binder_depth)
-}
-
-/// Index of a `Var` object: `{"Bound":[0, i]}` or `{"Free": i}`.
-#[allow(dead_code)]
-fn var_index(var: &Value) -> Option<usize> {
-    var_index_at(var, 0)
 }
 
 fn var_index_at(var: &Value, binder_depth: u64) -> Option<usize> {
