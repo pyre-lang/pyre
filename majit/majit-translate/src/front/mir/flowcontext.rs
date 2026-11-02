@@ -1,5 +1,7 @@
 //! `FlowContext` / `build_flow` (`rpython/flowspace/flowcontext.py`).
 
+use majit_charon_reader::{Llbc, ullbc::TyRef};
+
 use super::desugar::std_call::{
     AtomicClass, ParsedBorrow, Shape, ShapeElem, ShapeRoot, append_projections,
     atomic_classes_equal, dyn_index_locals_inner_first, join_atomic_class, parse_borrow_place,
@@ -1412,6 +1414,123 @@ fn atomic_shadow_is_index_slot(shadows: &[AtomicShadow], slot: usize) -> bool {
         .any(|shadow| shadow.indexes.iter().any(|index_slot| *index_slot == slot))
 }
 
+/// `exceptiontransform.py` `ExceptionTransformer.create_exception_handling`
+/// rewrites `FuncType.RESULT` to the Ok payload. A formal of the same
+/// Result-of-carrier type is already that payload at the call boundary,
+/// so `rtyper.py` `RPythonTyper.getcallable` reads the rewritten ARGS
+/// concretetypes.
+///
+/// Startblock `OpKind::Input` ops are the construction-order formals
+/// (`flowcontext.py` `init_locals_stack` / `pygraph.py` `PyGraph.__init__`);
+/// pair them with MIR locals `1..=arg_count`, skipping the optional length
+/// Input a pair-slice parameter inserts.
+pub(in crate::front::mir) fn rewrite_exception_transformed_input_ops(
+    graph: &mut crate::model::FunctionGraph,
+    locals: &majit_charon_reader::ullbc::Locals,
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+    len_shadow: &[Option<usize>],
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc: &std::collections::HashSet<String>,
+) {
+    if spec.carrier_path.is_empty() {
+        return;
+    }
+    if crate::front::result_exc::result_exc_projected_ok(output, llbc, spec).is_none() {
+        return;
+    }
+    let start = graph.startblock;
+    let input_indices: Vec<usize> = {
+        let Some(block) = graph.blocks.iter().find(|block| block.id == start) else {
+            return;
+        };
+        block
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op.kind, OpKind::Input { .. }))
+            .map(|(idx, _)| idx)
+            .collect()
+    };
+    let arg_count = locals.arg_count as usize;
+    let mut restamp = Vec::new();
+    let mut input_cursor = 0usize;
+    for i in 1..=arg_count {
+        let Some(&op_idx) = input_indices.get(input_cursor) else {
+            break;
+        };
+        input_cursor += 1;
+        if len_shadow.get(i).copied().flatten().is_some() {
+            input_cursor += 1;
+        }
+        let Some(local) = locals.locals.get(i) else {
+            continue;
+        };
+        if !crate::front::result_exc::tyref_lowers_as_result_exc(&local.ty, llbc, spec) {
+            continue;
+        }
+        let Some(ok_ty) = crate::front::result_exc::tyref_result_ok(&local.ty, llbc) else {
+            continue;
+        };
+        restamp.push((op_idx, ok_ty));
+    }
+    for (op_idx, ok_ty) in restamp {
+        let ty = tyref_to_value_type_with(&ok_ty, llbc, tombstoned, gc_struct_ids, raw_alloc);
+        let ty = input_param_value_type(ty, &ok_ty, llbc, false, false, tombstoned);
+        let class_root = exception_transformed_formal_class_root(
+            &ok_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc,
+        );
+        let Some(block) = graph.blocks.iter_mut().find(|block| block.id == start) else {
+            continue;
+        };
+        let Some(op) = block.operations.get_mut(op_idx) else {
+            continue;
+        };
+        if let OpKind::Input {
+            ty: input_ty,
+            class_root: input_root,
+            ..
+        } = &mut op.kind
+        {
+            *input_ty = ty;
+            *input_root = class_root;
+        }
+    }
+}
+
+/// Input `class_root` of the Ok payload after exception lowering
+/// (`rtyper.py` `RPythonTyper.getcallable` ARGS).
+fn exception_transformed_formal_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc: &std::collections::HashSet<String>,
+) -> Option<String> {
+    tyref_niche_option_gc_payload_spelling(ty, llbc, gc_struct_ids, raw_alloc)
+        .or_else(|| tyref_raw_ptr_to_str_family_spelling(ty, llbc))
+        .or_else(|| tyref_raw_ptr_to_classed_instance_spelling(ty, llbc))
+        .or_else(|| tyref_ref_param_class_root(ty, llbc, tombstoned, None))
+        .or_else(|| tyref_char_class_root(ty, llbc))
+        .or_else(|| tyref_fn_ptr_input_class_root(ty, llbc))
+        .or_else(|| tyref_rust_vec_item_kind(ty, llbc).map(|_| tyref_to_ast_string(ty, llbc)))
+        .or_else(|| tyref_fieldless_enum_class_root(ty, llbc))
+        .or_else(|| niche_option_storage_raw_struct_root(ty, llbc, tombstoned))
+        .or_else(|| {
+            if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
+                None
+            } else {
+                raw_address_owner_root(ty, llbc, tombstoned, gc_struct_ids, raw_alloc)
+            }
+        })
+}
+
 impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn new(
         llbc: &'a Llbc,
@@ -2378,6 +2497,20 @@ impl<'a> Lowering<'a> {
             }
         }
         None
+    }
+
+    pub(in crate::front::mir) fn rewrite_exception_transformed_formals(&mut self, output: &TyRef) {
+        rewrite_exception_transformed_input_ops(
+            &mut self.graph,
+            &self.body.locals,
+            output,
+            self.llbc,
+            self.static_addrs.error_carrier,
+            &self.len_shadow,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
     }
 
     pub(in crate::front::mir) fn lower(&mut self, order: BlockOrder) -> Result<(), LowerError> {

@@ -2481,6 +2481,8 @@ pub fn cast_instance_call(
 
 /// Same as [`cast_instance_call`] with an explicit result type.
 /// Niche-null string payloads use `ValueType::Str` rather than `Ref`.
+/// Dest-GCREF (`rerased.py` `_some_erased` / `llmemory.GCREF`) keeps the
+/// caller's `result_ty` (`Ref(Some("GCREF"))`).
 pub fn cast_instance_call_result(
     root: impl Into<String>,
     operand: crate::flowspace::model::Variable,
@@ -9616,6 +9618,11 @@ pub struct FunctionGraph {
     /// struct, so `SomeInstance.can_be_None` is true (`rnone.py`). False
     /// for a by-value ADT.
     pub return_can_be_none: bool,
+    /// `exceptiontransform.py` `ExceptionTransformer.create_exception_handling`:
+    /// `graph.exceptiontransformed = self.exc_data_ptr`. True when this
+    /// graph's declared output was `Result<T, E>` of the exception
+    /// carrier and the body was rewritten so `FuncType.RESULT` is `T`.
+    pub exceptiontransformed: bool,
     /// The declared return is a pointer to the low-level `STR` storage
     /// (`*mut Utf8Str` / rstr `rpy_string`) — the `SomeString` result a
     /// `_signature_` (`returns=types.str()`) would declare.  `return_type`
@@ -9797,6 +9804,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_type: graph.return_type.clone(),
         return_class_root: graph.return_class_root.clone(),
         return_can_be_none: graph.return_can_be_none,
+        exceptiontransformed: graph.exceptiontransformed,
         return_is_str: graph.return_is_str,
         return_container_root: graph.return_container_root.clone(),
         residual_return_type: graph.residual_return_type.clone(),
@@ -9950,6 +9958,7 @@ impl FunctionGraph {
             return_type: None,
             return_class_root: None,
             return_can_be_none: false,
+            exceptiontransformed: false,
             return_is_str: false,
             return_container_root: None,
             residual_return_type: None,

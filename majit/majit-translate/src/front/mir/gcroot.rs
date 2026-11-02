@@ -6587,14 +6587,22 @@ pub(in crate::front::mir) fn type_node_is_owner_root(
 pub(in crate::front::mir) fn type_id_is_owner_root(id: u64, llbc: &Llbc) -> bool {
     llbc.type_by_id(id).is_some_and(|td| {
         // The leaf compare keeps the full path off every other ADT local.
-        matches!(td.item_meta.template_name().last(), Some(NameSeg::Ident { ident: (leaf, _) }) if leaf == "RBigIntGcRoot")
+        let declared_leaf = OWNER_ROOT_DECLARED_PATH.rsplit("::").next();
+        matches!(td.item_meta.template_name().last(), Some(NameSeg::Ident { ident: (leaf, _) }) if Some(leaf.as_str()) == declared_leaf)
             && owner_root_type_path(td.item_meta.name_path_str())
     })
 }
 
+/// GC-transform owner-root handle (`rclass.py` `getuniqueclassdef` is
+/// for an OBJECT-rooted `GcStruct`; this handle is a word).
+pub(crate) const OWNER_ROOT_DECLARED_PATH: &str = "rbigint::gc::RBigIntGcRoot";
+
 /// The handle's declaration path, with or without its crate prefix.
-pub(in crate::front::mir) fn owner_root_type_path(path: &str) -> bool {
-    path == "rbigint::gc::RBigIntGcRoot" || path.ends_with("::rbigint::gc::RBigIntGcRoot")
+pub(crate) fn owner_root_type_path(path: &str) -> bool {
+    path == OWNER_ROOT_DECLARED_PATH
+        || path
+            .strip_suffix(OWNER_ROOT_DECLARED_PATH)
+            .is_some_and(|prefix| prefix.ends_with("::"))
 }
 
 /// Whether `RBigIntGcRoot` occurs anywhere in a type node: `&RBigIntGcRoot`,

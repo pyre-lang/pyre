@@ -3476,19 +3476,6 @@ fn split_result_shell_return(
     Ok(())
 }
 
-/// Template spellings of the explicit `Result` shell.
-///
-/// `explicit_sum_shell` records `__discriminant` at byte 0 and `__pos_0`
-/// at byte 8 on `Result` / `Result::Ok` / `Result::Err`. `fielddescrof`
-/// resolves that owner through `struct_layout_for`: a suffixed
-/// `Result<…>::Ok` key is either absent or a payload-only row from
-/// `register_ref_enum_instantiation_rows`, and a miss keeps the
-/// fallback offset 0 (the tag word). The annotator reads the receiver
-/// classdef, not this owner (`FieldRead` → `getattr`).
-const RESULT_TEMPLATE: &str = "Result";
-const RESULT_OK_TEMPLATE: &str = "Result::Ok";
-const RESULT_ERR_TEMPLATE: &str = "Result::Err";
-
 /// Split `return` edges that forward a carrier `Result` the block did
 /// not construct.
 ///
@@ -3497,6 +3484,15 @@ const RESULT_ERR_TEMPLATE: &str = "Result::Err";
 /// `Option<Result<T, carrier>>::Some.__pos_0` (or a `same_as` of one)
 /// linked at `returnblock`. That value is the shell. Tag 0 forwards
 /// `__pos_0`; tag 1 materialises the carrier and raises.
+///
+/// FieldRead owners are the instantiated `Result<{args}>` recovered by
+/// `carrier_result_spelling` (`Result<{args}>`, `Result<{args}>::Ok`,
+/// `Result<{args}>::Err`). `bookkeeper.py` `getuniqueclassdef` intern's
+/// that class object; `rclass.py` `ll_cast_to_object` / `cast_pointer`
+/// keep the concrete instance. The adapter CAST dest is the FieldRead
+/// owner (`enum_payload_getattr_ops` / the unsuffixed-owner fallback),
+/// so a template `Result::Ok` would intern-refuse
+/// (`struct_root_is_core_option_or_result_template`).
 ///
 /// An empty `carrier_path` matches nothing, so a pipeline that has not
 /// named a carrier leaves the graph alone. `ok_payloads` are values
@@ -3515,7 +3511,7 @@ fn unwrap_forwarded_carrier_returns(
     }
     let nblocks = graph.blocks.len();
     let returnblock = graph.returnblock;
-    let mut sites: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    let mut sites: Vec<(usize, usize, Vec<usize>, String)> = Vec::new();
     for bi in 0..nblocks {
         for (ei, link) in graph.blocks[bi].exits.iter().enumerate() {
             if link.target != returnblock {
@@ -3537,8 +3533,8 @@ fn unwrap_forwarded_carrier_returns(
                 // A scalar `Ok` (`space.index_w`'s `i64`) is split later
                 // by `unwrap_returned_scalar_result_shells`, which types
                 // the payload as that scalar. Splitting it here types
-                // `__pos_0` as `Ref` (`RESULT_OK_TEMPLATE`) and the CFG
-                // return stays `r` against `FUNC.RESULT=i`.
+                // `__pos_0` as `Ref` of the instantiated `Result<{args}>::Ok`
+                // and the CFG return stays `r` against `FUNC.RESULT=i`.
                 if result_spelling_ok_is_scalar(&found) {
                     continue;
                 }
@@ -3563,13 +3559,19 @@ fn unwrap_forwarded_carrier_returns(
                 positions.push(pos);
             }
             if !positions.is_empty() {
-                sites.push((bi, ei, positions));
+                let Some(result_base) = base else {
+                    return Err(format!(
+                        "{}: block {bi} exit {ei} forwards a carrier Result without a spelling",
+                        graph.name
+                    ));
+                };
+                sites.push((bi, ei, positions, result_base));
             }
         }
     }
     let split = sites.len();
-    for (bi, ei, positions) in sites {
-        split_forwarded_return(graph, bi, ei, &positions)?;
+    for (bi, ei, positions, result_base) in sites {
+        split_forwarded_return(graph, bi, ei, &positions, &result_base)?;
     }
     Ok(split)
 }
@@ -3811,11 +3813,15 @@ fn type_leaf(ty: &str) -> &str {
     base.rsplit("::").next().unwrap_or(base).trim()
 }
 
+/// Split one forwarded-shell return. `result_base` is the instantiated
+/// `Result<{args}>` `carrier_result_spelling` recovered; payload reads
+/// key `{result_base}::Ok` / `{result_base}::Err`.
 fn split_forwarded_return(
     graph: &mut FunctionGraph,
     block: usize,
     exit_index: usize,
     positions: &[usize],
+    result_base: &str,
 ) -> Result<(), String> {
     let arity = graph.blocks[block].exits[exit_index].args.len();
     if positions.is_empty() || positions.iter().any(|pos| *pos >= arity) {
@@ -3839,7 +3845,7 @@ fn split_forwarded_return(
         split_bb,
         shell_in_split,
         "__discriminant",
-        RESULT_TEMPLATE,
+        result_base,
         ValueType::Int,
     );
     let ok_link = Link::from_variables(
@@ -3867,7 +3873,7 @@ fn split_forwarded_return(
         ok_bb,
         ok_inputs[positions[0]].clone(),
         "__pos_0",
-        RESULT_OK_TEMPLATE,
+        &format!("{result_base}::Ok"),
         ValueType::Ref(None),
     );
     let mut ok_args = ok_inputs;
@@ -3882,7 +3888,7 @@ fn split_forwarded_return(
         err_bb,
         err_inputs[positions[0]].clone(),
         "__pos_0",
-        RESULT_ERR_TEMPLATE,
+        &format!("{result_base}::Err"),
         ValueType::Ref(None),
     );
     crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
@@ -18383,15 +18389,54 @@ mod static_result_shell_tests {
         let returned = return_link_values(&graph);
         assert!(!returned.iter().any(|var| *var == ctor || *var == forwarded));
         assert!(returned.contains(&payload));
-        assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
-        assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Ok".to_string()));
-        assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Err".to_string()));
+        let inst = "Result<*mut PyObject,PyError>";
+        assert!(field_read_owners(&graph, "__discriminant").contains(&inst.to_string()));
+        assert!(field_read_owners(&graph, "__pos_0").contains(&format!("{inst}::Ok")));
+        assert!(field_read_owners(&graph, "__pos_0").contains(&format!("{inst}::Err")));
         assert!(graph.blocks.iter().any(|block| {
             block
                 .exits
                 .iter()
                 .any(|link| link.target == graph.exceptblock)
         }));
+    }
+
+    /// `unwrap_forwarded_carrier_returns` already recovered
+    /// `Result<{args}>` (`carrier_result_spelling`). The payload FieldRead
+    /// owner is that instantiation's variant, the class
+    /// `getuniqueclassdef` intern's (`rclass.py` `ll_cast_to_object` /
+    /// `cast_pointer` keep the concrete instance). A template `Result::Ok`
+    /// CAST dest is refused (`struct_root_is_core_option_or_result_template`).
+    #[test]
+    fn forwarded_shell_payload_reads_use_the_instantiated_variant() {
+        let (mut graph, _payload, _ctor, _forwarded) =
+            mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
+                .expect("mixed forward lowers"),
+            2
+        );
+        let inst = "Result<*mut PyObject,PyError>";
+        let pos0 = field_read_owners(&graph, "__pos_0");
+        assert!(
+            pos0.contains(&format!("{inst}::Ok")),
+            "Ok payload owner must be the instantiated variant, got {pos0:?}"
+        );
+        assert!(
+            pos0.contains(&format!("{inst}::Err")),
+            "Err payload owner must be the instantiated variant, got {pos0:?}"
+        );
+        assert!(
+            !pos0
+                .iter()
+                .any(|owner| owner == "Result::Ok" || owner == "Result::Err"),
+            "template Result::Ok / Result::Err must not own the payload read, got {pos0:?}"
+        );
+        let disc = field_read_owners(&graph, "__discriminant");
+        assert!(
+            disc.contains(&inst.to_string()),
+            "discriminant owner must be the instantiated Result, got {disc:?}"
+        );
     }
 
     #[test]
@@ -18523,7 +18568,10 @@ mod static_result_shell_tests {
             1
         );
         assert!(!return_link_values(&graph).contains(&forwarded));
-        assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+        assert!(
+            field_read_owners(&graph, "__discriminant")
+                .contains(&"Result<*mut PyObject,PyError>".to_string())
+        );
         assert!(graph.blocks.iter().any(|block| {
             block
                 .exits

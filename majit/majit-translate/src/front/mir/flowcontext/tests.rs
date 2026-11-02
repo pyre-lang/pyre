@@ -5728,6 +5728,12 @@ fn str_family_class_roots_reject_lookalikes() {
     assert!(super::is_str_family_class_root("path::PathBuf"));
     assert!(super::is_str_family_class_root("ffi::OsString"));
     assert!(!super::is_str_family_class_root("other::PathBuf"));
+    assert!(super::is_str_family_class_root(
+        "pyre_object::unicodeobject::Utf8Str"
+    ));
+    assert!(super::is_str_family_class_root(
+        "pyre_object::bytesobject::BytesBlock"
+    ));
     assert!(!super::is_str_family_class_root("other::Utf8Str"));
     assert!(!super::is_str_family_class_root("other::Wtf8Buf"));
     assert!(!super::is_str_family_class_root("other::BytesBlock"));
@@ -7577,6 +7583,263 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
             );
         }
     });
+}
+
+/// `celldict::<Impl>::getitem_str` getattr's `getdictvalue_no_unwrapping`
+/// on `self`. The Input must name `ModuleDictStrategy` so
+/// `derive_subject_inputcells` intern's a ClassDef.
+#[test]
+fn module_dict_strategy_getitem_str_self_names_class_root() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::model::SomeValue;
+    use crate::model::OpKind;
+    use std::rc::Rc;
+
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fds: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            let p = fd.item_meta.name_path();
+            p.contains("celldict") && p.ends_with("getitem_str")
+        })
+        .collect();
+    assert!(
+        !fds.is_empty(),
+        "celldict getitem_str FunDecls in pyre-object LLBC"
+    );
+    let context = super::LowerContext::new(&llbc);
+    let registry = context.struct_field_registry();
+    let keys: Vec<_> = registry
+        .fields
+        .keys()
+        .filter(|k| k.contains("ModuleDict"))
+        .cloned()
+        .collect();
+    eprintln!("ModuleDict registry keys={keys:?}");
+    assert!(
+        registry.struct_root_rows_known("celldict::ModuleDictStrategy")
+            || keys.iter().any(|k| k.contains("ModuleDictStrategy")),
+        "harvest must register ModuleDictStrategy, keys={keys:?}"
+    );
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_struct_fields(Rc::new(registry));
+    for fd in fds {
+        let path = fd.item_meta.name_path();
+        let graph =
+            super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        let inputs: Vec<_> = graph
+            .blocks
+            .iter()
+            .find(|b| b.id == graph.startblock)
+            .expect("startblock")
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input {
+                    name,
+                    ty,
+                    class_root,
+                } => Some((name.clone(), ty.clone(), class_root.clone())),
+                _ => None,
+            })
+            .collect();
+        eprintln!("getitem_str path={path} inputs={inputs:?}");
+        let self_root = inputs.first().and_then(|(_, _, root)| root.as_deref());
+        assert!(
+            self_root.is_some_and(|root| root.contains("ModuleDictStrategy")),
+            "self Input of {path} must name ModuleDictStrategy, got {inputs:?}"
+        );
+        let cells = crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(
+            &graph,
+            Some(&bk),
+        )
+        .unwrap_or_else(|err| panic!("derive {path}: {err}"));
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!(
+                "getitem_str self must seed SomeInstance, got {:?}",
+                cells[0]
+            );
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "getitem_str self of {path} must intern ModuleDictStrategy, got {inst:?}"
+        );
+    }
+}
+
+/// `w_module_dict_get_strategy` returns `*mut ModuleDictStrategy`.
+/// `bind_classed_ref_return_annotation` intern's that classdef so
+/// `w_module_dict_getitem_str`'s `getattr("getitem_str")` resolves.
+#[test]
+fn w_module_dict_get_strategy_names_return_class_root() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let fds: Vec<_> = llbc
+        .iter_local_fns()
+        .filter(|fd| {
+            fd.item_meta
+                .name_path()
+                .ends_with("w_module_dict_get_strategy")
+        })
+        .collect();
+    assert!(
+        !fds.is_empty(),
+        "w_module_dict_get_strategy FunDecl in pyre-object LLBC"
+    );
+    let context = super::LowerContext::new(&llbc);
+    for fd in fds {
+        let path = fd.item_meta.name_path();
+        let graph =
+            super::lower_fun_decl(&context, fd).unwrap_or_else(|err| panic!("lower {path}: {err}"));
+        eprintln!(
+            "get_strategy path={path} return_type={:?} return_class_root={:?} return_can_be_none={}",
+            graph.return_type, graph.return_class_root, graph.return_can_be_none
+        );
+        assert!(
+            graph
+                .return_class_root
+                .as_deref()
+                .is_some_and(|root| root.contains("ModuleDictStrategy")),
+            "get_strategy must advertise ModuleDictStrategy, got return_type={:?} return_class_root={:?}",
+            graph.return_type,
+            graph.return_class_root
+        );
+        assert!(
+            graph.return_can_be_none,
+            "get_strategy can return a null strategy"
+        );
+    }
+}
+
+/// `ExecutionContext::clone_for_thread` stores `root_stack_slot` with
+/// `Cell::set`. That write is the field's `setfield`, not a residual
+/// `set` graph shared with `Cell<bool>::set`.
+#[test]
+fn executioncontext_clone_for_thread_cell_set_is_field_write() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let graph = crate::front::mir::lower_function(
+        llbc,
+        "pyre_interpreter::executioncontext::<Impl>::clone_for_thread",
+    )
+    .expect("lower ExecutionContext::clone_for_thread");
+    let writes_slot = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "root_stack_slot"
+            )
+        })
+    });
+    assert!(
+        writes_slot,
+        "clone_for_thread must setfield root_stack_slot, ops={:?}",
+        graph_ops(&graph)
+    );
+    assert!(
+        !calls_leaf(&graph, "set"),
+        "clone_for_thread must not residualize Cell::set, ops={:?}",
+        graph_call_leaves(&graph)
+    );
+}
+
+/// `CellFamily::set_ever_mutated` writes `ever_mutated`, not the
+/// `UnsafeCell` payload name `ever_mutated.value` (`fielddescrof`).
+#[test]
+fn cellfamily_set_ever_mutated_writes_the_cell_field() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let graph = crate::front::mir::lower_function(
+        llbc,
+        "pyre_object::nestedscope::<Impl>::set_ever_mutated",
+    )
+    .expect("lower CellFamily::set_ever_mutated");
+    let writes = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == "ever_mutated"
+            )
+        })
+    });
+    assert!(
+        writes,
+        "set_ever_mutated must setfield ever_mutated, ops={:?}",
+        graph_ops(&graph)
+    );
+    let writes_inner = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name.ends_with(".value")
+            )
+        })
+    });
+    assert!(
+        !writes_inner,
+        "Cell::set must not setfield *.value, ops={:?}",
+        graph_ops(&graph)
+    );
+}
+
+/// `descroperation::add` / `::sub` of two `PyObjectRef` is Python add
+/// (`annotator/binaryop.py`), not `lltype.direct_ptradd`
+/// (`rbuiltin.py` `rtype_direct_ptradd`). The callee is not the core
+/// pointer method.
+#[test]
+fn binary_value_from_tag_inner_add_is_not_direct_ptradd() {
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
+        return;
+    };
+    let graph = crate::front::mir::lower_function(
+        llbc,
+        "pyre_interpreter::opcode_ops::binary_value_from_tag_inner",
+    )
+    .expect("lower binary_value_from_tag_inner");
+    let calls_descrop = |leaf: &str| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some(leaf)
+                        && segments.iter().any(|seg| seg.as_str() == "descroperation")
+                }
+                _ => false,
+            })
+        })
+    };
+    assert!(
+        calls_descrop("add") && calls_descrop("sub"),
+        "add/sub arms must stay descroperation, ops={:?}",
+        graph_call_leaves(&graph)
+    );
+    let has_direct_ptradd = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+            _ => false,
+        })
+    });
+    assert!(
+        !has_direct_ptradd,
+        "Python add must not lower as direct_ptradd, ops={:?}",
+        graph_call_leaves(&graph)
+    );
+    crate::translator::rtyper::legacy_annotator::annotate(&graph);
 }
 
 #[test]

@@ -3813,12 +3813,8 @@ pub(in crate::front::mir) fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &L
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return false;
     };
-    llbc.fn_by_id(*id).is_some_and(|fd| {
-        matches!(
-            fd.item_meta.name_path_str(),
-            "core::ptr::mut_ptr::<Impl>::add" | "core::ptr::const_ptr::<Impl>::add"
-        )
-    })
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_core_ptr_add_path(fd.item_meta.name_path_str()))
 }
 
 /// The wrapping twin used only by `IntArray::base` / `FloatArray::base`.

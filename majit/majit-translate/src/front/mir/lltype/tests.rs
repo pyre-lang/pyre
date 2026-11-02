@@ -17,7 +17,6 @@ use super::{
     tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
     tyref_to_value_type, tyref_tuple_suffix, unique_unsafecell_slice_deref_field_index,
 };
-
 use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 
 use majit_charon_reader::{
@@ -10839,6 +10838,98 @@ fn by_value_integer_newtype_types_as_the_inner_integer() {
         paint_handle(gc_int, serde_json::json!([null]), 1),
         ValueType::Ref(None)
     );
+
+    // The bitflags shape is an outer tuple newtype over a transparent
+    // `InternalBitFlags`, which in turn owns the machine integer. The
+    // low-level representation follows the type layout to the bottom word;
+    // neither wrapper becomes a STRUCT/ClassDef.
+    let u32_field = serde_json::json!([{
+        "name": null,
+        "ty": {"Scalar": {"Integer": {"Unsigned": "U32"}}},
+        "attr_info": null
+    }]);
+    let nested_field = serde_json::json!([{
+        "name": null,
+        "ty": {"Adt": {"id": 10, "generics": {"types": []}}},
+        "attr_info": null
+    }]);
+    let inner = struct_decl(
+        10,
+        ident_path(&["fixture", "flags", "Internal"]),
+        u32_field,
+        true,
+    );
+    let mut outer = struct_decl(
+        11,
+        ident_path(&["fixture", "flags", "Flags"]),
+        nested_field,
+        false,
+    );
+    outer["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 4,
+            "align": 4,
+            "variant_layouts": [{"field_offsets": [0]}],
+            "repr": {"repr_algo": "Rust", "transparent": false}
+        }
+    }]);
+    let mut nested_decls = pointer_handle_decls();
+    nested_decls.extend([(10, inner), (11, outer)]);
+    let (llbc, flags_ty) = load_handle(nested_decls, serde_json::json!([null]), 11);
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert_eq!(
+        super::tyref_to_value_type(&flags_ty, &llbc),
+        ValueType::Unsigned
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(&flags_ty, &llbc, &gc_struct_ids, &raw_alloc),
+        "u32"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &flags_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_none(),
+        "nested integer newtypes are one IntegerRepr word, not an inlined STRUCT"
+    );
+    let discovered = crate::front::mir::discover_transparent_scalar_kinds(&llbc);
+    assert!(discovered.iter().any(|(name, kind)| {
+        name == "fixture::flags::Flags"
+            && *kind == majit_charon_reader::TransparentScalarKind::Unsigned
+    }));
+    llbc.register_transparent_scalar_kinds(discovered);
+    let flags_ref = TyRef::Other(serde_json::json!({
+        "Ref": [
+            "Erased",
+            {"Adt": {"id": 11, "generics": {"types": []}}},
+            "Shared"
+        ]
+    }));
+    assert_eq!(
+        super::tyref_to_value_type(&flags_ref, &llbc),
+        ValueType::Unsigned,
+        "a borrow of the layout-transparent chain is the same integer word"
+    );
+    with_fixture_lowering(&llbc, |lowering| {
+        let kind = serde_json::json!({
+            "Adt": [11, null, {"types": []}]
+        });
+        assert_eq!(
+            lowering
+                .aggregate_shape(&kind, &flags_ty, 1)
+                .expect("nested integer-newtype aggregate shape"),
+            crate::front::mir::AggregateShape::Operand {
+                index: 0,
+                transparent: true
+            }
+        );
+    });
 }
 
 /// `&self` of a one-integer tuple struct is an address. `self.0` is

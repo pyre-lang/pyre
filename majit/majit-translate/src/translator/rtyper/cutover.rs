@@ -3579,6 +3579,90 @@ fn bind_unit_return_annotation(
     }
 }
 
+/// Bind `graph.getreturnvar()` to `SomeInstance(classdef)` when the
+/// lowered body returns a pointer to a declared GC struct
+/// (`FunctionGraph::return_class_root`).
+///
+/// `annrpython.py` `RPythonAnnotator.complete` / `complete_helpers` binds
+/// `graph.getreturnvar()` through `setbinding`. `description.py`
+/// `FunctionDesc.pycall` then returns `annotator.recursivecall`'s result
+/// unchanged, so the binding has to be on the variable before that read.
+/// A classdef-less `Ref` shell (`valuetype_to_someshell`) is replaced;
+/// an already interned instance or a `SomePtr` (GCREF) is left alone.
+/// The defining op is unchanged (`__cast_instance_intrinsic` stays off
+/// an identity recast).
+fn bind_classed_ref_return_annotation(
+    legacy: &LegacyGraph,
+    graph: &crate::flowspace::model::GraphRef,
+    bookkeeper: &Rc<crate::annotator::bookkeeper::Bookkeeper>,
+) {
+    let Some(root) = legacy.return_class_root.as_deref() else {
+        return;
+    };
+    // Looked-inside aggregates leave FUNC.RESULT unstamped
+    // (`stamp_return_token` is false) so `func_result_kind` follows the
+    // CFG (`flatten.py` `make_return`). `dont_look_inside_return_class_root`
+    // still peels a Result to the Ok instance; stamping that instance onto
+    // the return var then refuses the CFG's Result / None merge
+    // (`setbinding` Integer ⊄ Instance). Residual / dont_look_inside stubs
+    // stamp `"ref"` and still bind.
+    if legacy.return_type.as_deref() != Some("ref") {
+        return;
+    }
+    if crate::annotator::bookkeeper::is_gcref_type_spelling(root) {
+        return;
+    }
+    if crate::annotator::bookkeeper::struct_root_refuses_classdef_intern(
+        root,
+        bookkeeper.struct_fields.borrow().as_deref(),
+    ) {
+        return;
+    }
+    // Only a `GcStruct` is an instance (`rclass.py` `InstanceRepr`); a
+    // `Ptr(Struct)` to a non-GC ITEM inlined in a `GcArray`
+    // (`rordereddict.py` `DICTENTRY`) annotates as `SomePtr`
+    // (`llannotation.py` `lltype_to_annotation`) and keeps its CFG binding.
+    if !bookkeeper
+        .struct_fields
+        .borrow()
+        .as_deref()
+        .is_some_and(|reg| {
+            crate::front::mir::spelling_path_is_declared_gc(&reg.gc_struct_ids, root)
+        })
+    {
+        return;
+    }
+    let Some(classdef) = bookkeeper.classdef_for_known_struct_root(root) else {
+        return;
+    };
+    stamp_return_var_if_classdef_less(
+        graph,
+        crate::annotator::model::SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+            Some(classdef),
+            legacy.return_can_be_none,
+            std::collections::BTreeMap::new(),
+        )),
+    );
+}
+
+fn stamp_return_var_if_classdef_less(
+    graph: &crate::flowspace::model::GraphRef,
+    s_val: crate::annotator::model::SomeValue,
+) {
+    let Hlvalue::Variable(ret) = graph.borrow().getreturnvar() else {
+        return;
+    };
+    let mut slot = ret.annotation.borrow_mut();
+    let stamp = match slot.as_deref() {
+        None => true,
+        Some(crate::annotator::model::SomeValue::Instance(inst)) if inst.classdef.is_none() => true,
+        _ => false,
+    };
+    if stamp {
+        *slot = Some(Rc::new(s_val));
+    }
+}
+
 fn lift_callee_to_pygraph_with_func(
     callee_graph: &LegacyGraph,
     signature: Signature,
@@ -3615,6 +3699,7 @@ fn lift_callee_to_pygraph_with_func(
     crate::translator::simplify::simplify_graph(&graph.borrow(), None);
     bind_rust_vec_return_annotation(callee_graph, &graph, nested_registry.bookkeeper().as_ref());
     bind_unit_return_annotation(callee_graph, &graph, nested_registry.bookkeeper().as_ref());
+    bind_classed_ref_return_annotation(callee_graph, &graph, nested_registry.bookkeeper());
     let pygraph = Rc::new(PyGraph {
         graph,
         func,
@@ -4025,10 +4110,9 @@ fn residual_stub_result_shell(
 /// `Integer ∪ RustVec` at a `look_inside_iff` wrapper return
 /// (`ll_vec_alloc_and_set_nonnull_r`).
 /// `None` when the token is not `ref` (and not that `Vec` header) or the
-/// graph declares neither. A leftover `"gcref"` token on a registered GC
-/// pointer (`PyObjectRef`) still intern's `SomeInstance` of
-/// `return_class_root` (`signature.py` `annotationoftype`); a real
-/// `llmemory.GCREF` return has no class root and stays `SomePtr`.
+/// graph declares neither. A `"gcref"` token is `llmemory.GCREF`
+/// `SomePtr` (`llannotation.py` `lltype_to_annotation`), including a
+/// leftover token that still carries a registered `return_class_root`.
 fn declared_return_annotation(
     registry: &CallRegistry,
     graph: &LegacyGraph,
@@ -4058,8 +4142,22 @@ fn declared_return_annotation(
         .as_deref()
         .or(graph.residual_return_type.as_deref());
     let class_root = graph.return_class_root.as_deref();
-    let registered_gc_ptr_return =
-        class_root.is_some_and(|root| !crate::annotator::bookkeeper::is_gcref_type_spelling(root));
+    // `lltype.GCREF` (`llannotation.py` `lltype_to_annotation`). A `"ref"`
+    // token plus the GCREFOpaque class root interned a ClassDef, and
+    // `pairtype(SomePtr, SomeObject).union` refused the look-inside CAST
+    // SomePtr at MethodDesc pbc_call (`get_empty_storage`). A leftover
+    // `"gcref"` token is still `llmemory.GCREF`, even when
+    // `return_class_root` names a registered instance: mixing that
+    // `SomePtr` with `SomeInstance` is `Int ∪ Ref` at mergeinputargs.
+    if class_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling)
+        || (token == Some(GCREF_RETURN_TYPE) && class_root.is_some())
+    {
+        return Some(
+            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+            ),
+        );
+    }
     if graph.return_is_str {
         let s = crate::codewriter::annotation_state::valuetype_to_someshell(
             &crate::model::ValueType::Str,
@@ -4070,7 +4168,7 @@ fn declared_return_annotation(
             s
         });
     }
-    if token != Some("ref") && !(token == Some(GCREF_RETURN_TYPE) && registered_gc_ptr_return) {
+    if token != Some("ref") {
         return None;
     }
     if let Some(spelling) = graph.return_container_root.as_deref() {
@@ -4173,6 +4271,18 @@ fn declared_return_annotation(
         }
         return None;
     }
+    if crate::annotator::bookkeeper::struct_root_is_string_family(root) {
+        return crate::codewriter::annotation_state::valuetype_to_someshell(
+            &crate::model::ValueType::Str,
+        );
+    }
+    if crate::annotator::bookkeeper::struct_root_refuses_classdef_intern(
+        root,
+        bk.struct_fields.borrow().as_deref(),
+    ) {
+        return None;
+    }
+
     let classdef = bk
         .getuniqueclassdef(&bk.intern_class_by_qualname(root))
         .ok()?;
@@ -4195,7 +4305,10 @@ pub(crate) fn raw_owner_return_root(token: &str) -> Option<&str> {
 /// Pointer/instance annotation for a `raw:<owner>` FUNC.RESULT token,
 /// and for a `Tuple<...>` whose items include at least one such token.
 ///
-/// A storage-raw owner is `SomePtr`; a flavor-raw class is a nullable
+/// A storage-raw owner is `SomePtr`. A non-GC `GcArray` ITEM
+/// (`rordereddict.py` `DICTENTRY`, `lltype.py` `Struct`) is also
+/// `SomePtr` (`llannotation.py` `lltype_to_annotation` of
+/// `Ptr(DICTENTRY)`). A flavor-raw class is a nullable
 /// `SomeInstance(classdef)` (`annotator/model.py SomeInstance`). A
 /// `Tuple<raw:Owner,i64>` carries those item annotations
 /// (`model.py SomeTuple`). `None` when the token is not a raw-pointer
@@ -4238,6 +4351,14 @@ fn raw_ptr_token_annotation(
     }
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
+    }
+    // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct` inlined in
+    // `GcArray`; `llannotation.py` `lltype_to_annotation` of
+    // `Ptr(DICTENTRY)` is SomePtr. A residual `raw:<owner>` of that
+    // ITEM uses the same projector FieldRead already uses.
+    let projected = bk.project_struct_field_type(root);
+    if matches!(projected, crate::annotator::model::SomeValue::Ptr(_)) {
+        return Some(projected);
     }
     // Flavor-raw residual `raw:<owner>` is an int-banked pointer to a
     // classed host (`history.getkind` of a raw `Ptr`). Seed
@@ -5654,6 +5775,7 @@ fn drive_lifted_subject(
     // reads this variable.
     bind_rust_vec_return_annotation(legacy, &graph, call_registry.bookkeeper().as_ref());
     bind_unit_return_annotation(legacy, &graph, call_registry.bookkeeper().as_ref());
+    bind_classed_ref_return_annotation(legacy, &graph, call_registry.bookkeeper());
     // Scope an `added_blocks` tracker over this subject's drive of the
     // shared annotator so the post-drain blocked-annotation guard
     // (`raise_if_subject_blocked` below) can see exactly the blocks
@@ -9247,7 +9369,31 @@ fn backfill_untyped_call_results(
                         panic!("backfill_untyped_call_results: bindingrepr: {e}")
                     }
                 }
-                continue;
+                let after = typed.concretetype().map(|lltype| {
+                    lowleveltype_to_concrete(&lltype).unwrap_or(ConcreteType::Unknown)
+                });
+                // A positive non-void binding is authoritative.
+                if !matches!(after, None | Some(ConcreteType::Void)) {
+                    continue;
+                }
+                // Impossible / unit on `gc_alloc_young_storage_box` is the
+                // return-slot `s_ImpossibleValue` seed sharing the Call dest
+                // through the identity GCREF CAST. The declared `Ref(None)`
+                // stamp below restores GCREF. Other wrap-Void Calls (the
+                // `__majit_wrap___new__` family) keep Void: stamping GCREF
+                // ptr_eq's an rclass instance against Opaque GCREF, and
+                // stamping OBJECTPTR lets the same wrap graph through to
+                // that ptr_eq on its inputargs.
+                let gcref_alloc = matches!(
+                    target,
+                    crate::model::CallTarget::FunctionPath { segments, .. }
+                        if segments.last().is_some_and(|leaf| {
+                            leaf.starts_with("gc_alloc_young_storage_box")
+                        })
+                );
+                if !gcref_alloc {
+                    continue;
+                }
             }
             let declared_kind = valuetype_to_concrete(result_ty);
             let closure_scalar_call = matches!(
@@ -16022,6 +16168,57 @@ mod tests {
     }
 
     #[test]
+    fn backfill_untyped_call_results_overrides_impossible_annotation_on_gcref_call() {
+        use crate::annotator::model::s_impossible_value;
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+
+        let (_registry, rtyper, _) = root_instance_rtyper_with_classdef();
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec![
+                    "gc_storage".to_string(),
+                    "gc_alloc_young_storage_box__inst_RDict".to_string(),
+                ],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(None),
+        );
+        let twin = value_to_var.get(&result).expect("twin");
+        *twin.annotation.borrow_mut() = Some(Rc::new(s_impossible_value()));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        assert_eq!(
+            twin.concretetype(),
+            Some(GCREF.clone()),
+            "Impossible/Void on gc_alloc_young_storage_box is GCREF, not a kept unit"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_keeps_impossible_on_ordinary_gcref_call() {
+        use crate::annotator::model::s_impossible_value;
+
+        let (_registry, rtyper, _) = root_instance_rtyper_with_classdef();
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["erased_gcref_call".to_string()],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(None),
+        );
+        let twin = value_to_var.get(&result).expect("twin");
+        *twin.annotation.borrow_mut() = Some(Rc::new(s_impossible_value()));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::Void,
+            "Impossible on a non-alloc Ref(None) Call stays Void; GCREF would \
+             ptr_eq an rclass instance against Opaque and panic jtransform"
+        );
+    }
+
+    #[test]
     fn backfill_untyped_call_results_stamps_gcref_for_unregistered_named_ref() {
         use crate::translator::rtyper::lltypesystem::lltype::GCREF;
         let (graph, result, value_to_var) = backfill_call_result_fixture(
@@ -19000,6 +19197,126 @@ mod tests {
         );
     }
 
+    #[test]
+    fn raw_ptr_token_gcarray_item_is_someptr() {
+        // `rordereddict.py` `DICTENTRY` is `lltype.py` `Struct` inlined
+        // in `GcArray`. A residual `raw:<owner>` of that ITEM is
+        // `llannotation.py` `lltype_to_annotation` of `Ptr(DICTENTRY)`,
+        // even when harvest also listed the ITEM as flavor-raw.
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+        use std::rc::Rc;
+
+        let entry = "rordereddict_entries::Entry";
+        let entries = "rordereddict_entries::GcEntries";
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut fields = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            entries,
+            "GcEntries",
+        ] {
+            fields
+                .fields
+                .insert(owner.to_string(), gc_entries_rows.clone());
+        }
+        let entry_rows = vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::Entry",
+            entry,
+            "Entry",
+        ] {
+            fields.fields.insert(owner.to_string(), entry_rows.clone());
+        }
+        let entry_id = majit_ir::descr::StructId::from_canonical(entry);
+        let gc_id = majit_ir::descr::StructId::from_canonical(entries);
+        for alias in [
+            "pyre_object::rordereddict_entries::Entry",
+            entry,
+            "Entry",
+        ] {
+            fields.class_identity.insert(
+                alias.to_string(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id: entry_id,
+                    spelling: entry.to_string(),
+                }),
+            );
+        }
+        for alias in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            entries,
+            "GcEntries",
+        ] {
+            fields.class_identity.insert(
+                alias.to_string(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id: gc_id,
+                    spelling: entries.to_string(),
+                }),
+            );
+        }
+        for name in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            entries,
+            "GcEntries",
+        ] {
+            fields.note_declared_gc_name(name);
+        }
+        fields
+            .gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical("Entry"));
+        registry.set_struct_fields(Rc::new(fields));
+        registry.bookkeeper().set_raw_alloc_flavor_structs(
+            std::collections::HashSet::from([
+                entry.to_string(),
+                "Entry".to_string(),
+            ]),
+        );
+
+        let shell = raw_ptr_token_annotation(&registry, Some("raw:rordereddict_entries::Entry"))
+            .expect("DICTENTRY residual raw: token declares its annotation");
+        let SomeValue::Ptr(ptr) = shell else {
+            panic!("DICTENTRY residual is SomePtr, got {shell:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("DICTENTRY SomePtr must point at a Struct");
+        };
+        assert_eq!(st._gckind, GcKind::Raw);
+        assert!(
+            st.getattr_field_type("key").is_some(),
+            "DICTENTRY STRUCT must have key"
+        );
+
+        let tuple_shell = raw_ptr_token_annotation(
+            &registry,
+            Some("Tuple<raw:rordereddict_entries::Entry,i64>"),
+        )
+        .expect("Tuple<raw:DICTENTRY,i64> carries the ITEM pointer");
+        let SomeValue::Tuple(tuple) = tuple_shell else {
+            panic!("expected SomeTuple, got {tuple_shell:?}");
+        };
+        assert!(
+            matches!(tuple.items[0], SomeValue::Ptr(_)),
+            "item 0 is the ITEM pointer, got {:?}",
+            tuple.items[0]
+        );
+    }
+
     /// `fn f(e: &E) -> i64 { e.m() }` with `E` raw and
     /// `impl E { fn m(&self) -> i64 { self.x } }`.
     ///
@@ -21253,12 +21570,11 @@ mod tests {
 
         graph.return_type = Some(GCREF_RETURN_TYPE.into());
         let leftover = declared_return_annotation(&registry, &graph)
-            .expect("a leftover gcref token on a PyObjectRef residual intern's SomeInstance");
-        let SomeValue::Instance(inst) = leftover else {
-            panic!("leftover gcref + class root is SomeInstance, got {leftover:?}");
-        };
-        assert!(inst.can_be_none);
-        assert!(inst.classdef.is_some());
+            .expect("a leftover gcref token is llmemory.GCREF");
+        assert!(
+            matches!(leftover, SomeValue::Ptr(_)),
+            "leftover gcref stays SomePtr, got {leftover:?}"
+        );
 
         graph.return_class_root = None;
         assert_eq!(
@@ -21279,6 +21595,12 @@ mod tests {
         assert!(
             matches!(gcref, SomeValue::Ptr(_)),
             "llmemory.GCREF stays SomePtr, got {gcref:?}"
+        );
+        let residual = residual_return_annotation(Some(GCREF_RETURN_TYPE), None)
+            .expect("gcref token shells as SomePtr");
+        assert!(
+            matches!(residual, SomeValue::Ptr(_)),
+            "llmemory.GCREF stays SomePtr, got {residual:?}"
         );
     }
 
@@ -21437,6 +21759,67 @@ mod tests {
             inst.classdef.is_some(),
             "GcTypedArray must keep its ClassDef, not declare List of the storage byte"
         );
+    }
+
+    #[test]
+    fn declared_return_annotation_utf8str_class_root_is_somestring() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![
+            ("hash".to_string(), "i64".to_string()),
+            ("length".to_string(), "i64".to_string()),
+        ];
+        reg.fields
+            .insert("unicodeobject::Utf8Str".to_string(), rows.clone());
+        reg.fields
+            .insert("pyre_object::unicodeobject::Utf8Str".to_string(), rows);
+        registry
+            .bookkeeper()
+            .set_struct_fields(std::rc::Rc::new(reg));
+        for root in [
+            "unicodeobject::Utf8Str",
+            "pyre_object::unicodeobject::Utf8Str",
+        ] {
+            let mut graph = LegacyGraph::new("ll_stringslice_startstop");
+            graph.return_type = Some("ref".into());
+            graph.return_class_root = Some(root.into());
+            graph.push_hint("dont_look_inside");
+            let declared = declared_return_annotation(&registry, &graph)
+                .unwrap_or_else(|| panic!("{root} residual must declare SomeString"));
+            assert!(
+                matches!(declared, SomeValue::String(_)),
+                "{root} residual is SomeString, got {declared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_return_annotation_gcref_class_root_is_someptr() {
+        use crate::annotator::model::SomeValue;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        for (return_type, return_class_root) in [
+            (Some("ref"), Some("GCREFOpaque")),
+            (Some("ref"), Some("header::GCREFOpaque")),
+            (None, Some("GCREF")),
+        ] {
+            let mut graph = LegacyGraph::new("get_empty_storage");
+            graph.return_type = return_type.map(str::to_string);
+            graph.return_class_root = return_class_root.map(str::to_string);
+            graph.push_hint("dont_look_inside");
+            let declared = declared_return_annotation(&registry, &graph).unwrap_or_else(|| {
+                panic!("GCREF residual {return_type:?}/{return_class_root:?} must declare SomePtr")
+            });
+            assert!(
+                matches!(declared, SomeValue::Ptr(_)),
+                "GCREF residual {return_type:?}/{return_class_root:?} is SomePtr, got {declared:?}"
+            );
+        }
     }
 
     #[test]

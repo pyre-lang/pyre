@@ -45,6 +45,26 @@ pub(crate) fn is_core_default_path(path: &str) -> bool {
     )
 }
 
+/// `impl Default for String` in `alloc::string`. Distinct from
+/// [`is_core_default_path`] and from the lookalike
+/// `core::default::Default::default`.
+pub(crate) fn is_alloc_string_default_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["alloc", "string", "<Impl>" | "String", "default"]
+    )
+}
+
+/// `String::new` / `alloc::string::<Impl>::new`. Empty rstr `STR`, same
+/// cell as [`is_alloc_string_default_path`]. Distinct from `String::from`.
+/// A builder-mode accumulator still uses `__majit_stringbuilder_new`.
+pub(crate) fn is_alloc_string_new_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["alloc", "string", "<Impl>" | "String", "new"]
+    )
+}
+
 /// `<(A, B, …) as Default>::default` — Charon spells the tuple impl as
 /// `core::tuple::<Impl>::default`. Distinct from [`is_core_default_path`]
 /// (scalar / thin-pointer `core::default::<Impl>::default`).
@@ -55,18 +75,30 @@ pub(crate) fn is_core_tuple_default_path(path: &str) -> bool {
     )
 }
 
+fn is_core_ptr_offset_impl_segment(seg: &str) -> bool {
+    seg == "<Impl>" || seg.starts_with("{impl")
+}
+
+fn is_core_ptr_offset_path(path: &str, leaf: &str) -> bool {
+    let parts: Vec<&str> = path.split("::").collect();
+    match parts.as_slice() {
+        [
+            "core" | "std",
+            "ptr",
+            "mut_ptr" | "const_ptr",
+            impl_seg,
+            method,
+        ] if is_core_ptr_offset_impl_segment(impl_seg) && *method == leaf => true,
+        _ => false,
+    }
+}
+
 pub(in crate::front::mir) fn is_core_ptr_add_path(path: &str) -> bool {
-    matches!(
-        path.split("::").collect::<Vec<_>>().as_slice(),
-        ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "add"]
-    )
+    is_core_ptr_offset_path(path, "add")
 }
 
 pub(in crate::front::mir) fn is_core_ptr_sub_path(path: &str) -> bool {
-    matches!(
-        path.split("::").collect::<Vec<_>>().as_slice(),
-        ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "sub"]
-    )
+    is_core_ptr_offset_path(path, "sub")
 }
 
 pub(in crate::front::mir) fn is_core_ptr_write_path(path: &str) -> bool {

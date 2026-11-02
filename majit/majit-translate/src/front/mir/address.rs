@@ -308,7 +308,7 @@ fn residual_scalar_word_descr(
     }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     if json_ty_is_copy_scalar(node, llbc) {
-        return json_ty_raw_store_descr(node, llbc, gc_struct_ids)
+        return json_ty_raw_store_descr(node, llbc)
             .filter(|(_, size, _)| *size > 0 && *size <= RAW_SCALAR_SPILL_BYTES);
     }
     let obj = node.as_object()?;
@@ -340,7 +340,7 @@ fn residual_arg_store_descr(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> Option<(ValueType, usize, bool)> {
-    json_ty_raw_store_descr(tyref_node(ty, llbc)?, llbc, gc_struct_ids)
+    json_ty_raw_store_descr(tyref_node(ty, llbc)?, llbc)
         .or_else(|| residual_scalar_word_descr(ty, llbc, gc_struct_ids))
 }
 
@@ -459,8 +459,8 @@ pub(in crate::front::mir) fn collect_cell_scalar_locals(
             if !tyref_is_primitive_scalar(&decl.ty, llbc) {
                 continue;
             }
-            let Some(cell_descr) = tyref_node(&decl.ty, llbc)
-                .and_then(|node| json_ty_raw_store_descr(node, llbc, gc_struct_ids))
+            let Some(cell_descr) =
+                tyref_node(&decl.ty, llbc).and_then(|node| json_ty_raw_store_descr(node, llbc))
             else {
                 continue;
             };

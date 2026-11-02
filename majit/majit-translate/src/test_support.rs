@@ -144,9 +144,9 @@ fn cached_lower_context(llbc: &'static Llbc) -> &'static LowerContext<'static> {
         .expect("ensure_link_baseline before reading the cached LowerContext")
 }
 
-/// Publish this artefact's own stack classification and `CodeFlags` once,
-/// then fill the cached [`LowerContext`]. Holds the write lock without
-/// restoring so the published baseline stays.
+/// Publish this artefact's own stack classification and transparent scalar
+/// layouts once, then fill the cached [`LowerContext`]. Holds the write lock
+/// without restoring so the published baseline stays.
 pub(crate) fn ensure_link_baseline(llbc: &'static Llbc) {
     let slot = context_slot_for(llbc);
     if slot.get().is_some() {

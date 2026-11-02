@@ -20238,7 +20238,7 @@ mod tests {
     /// GC struct whose first field is another GC struct
     /// (`GcStruct._first_struct`). Downcast (`cast_pointer`) is Identity;
     /// a subsequent field read is `getfield_gc_*` on the same object.
-    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC interior.
+    /// `jtransform.py rewrite_op_getsubstruct` refuses a GC getsubstruct.
     #[test]
     fn gc_first_struct_downcast_field_read_is_same_object() {
         use crate::call::{CallControl, StructFieldLayout, StructLayout};
@@ -20370,7 +20370,7 @@ mod tests {
                 &op.kind,
                 OpKind::BinOp { op, .. } if op == "add"
             )),
-            "downcast + field read must not emit an interior int_add; ops={ops:?}"
+            "downcast + field read must not emit a getsubstruct int_add; ops={ops:?}"
         );
         let w_cls = ops.iter().find(|op| {
             matches!(

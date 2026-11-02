@@ -13601,6 +13601,17 @@ impl CallControl {
     }
 }
 
+/// Template FunDecl path of a residual `leaf__inst_<types>` spelling
+/// (`residual_inst_template_leaf`). `None` when `path` is not an inst.
+fn residual_inst_template_call_path(path: &CallPath) -> Option<CallPath> {
+    let stem = crate::translator::rtyper::call_registry::residual_inst_template_leaf(
+        path.last_segment()?,
+    )?;
+    let mut segs = path.segments.clone();
+    *segs.last_mut()? = stem.to_string();
+    Some(path.with_segments(segs))
+}
+
 /// The `@jit.dont_look_inside` builder residual helpers (`rbuilder.py`
 /// `ll_append_res0` / `ll_append_res_slice`): the general residual targets the
 /// append / append_slice jit arms route through. When a native runtime helper
@@ -13798,6 +13809,17 @@ impl CallControl {
         ) else {
             if let Some(user) = user_path_behind_majit_call_target(path) {
                 return self.analyze_readwrite(&user, seen, analyzed);
+            }
+            // Residual `leaf__inst_<types>` (`residual_generic_fun_segments` /
+            // `annlowlevel.specialize`) is the specialized funcobj of the
+            // template FunDecl. `enqueue_residual_inst` does not copy a Void
+            // residual, so GraphStore has only the template. That graph is
+            // still `funcobj.graph` (`graphanalyze.py` `GraphAnalyzer.analyze`
+            // `analyze_direct_call`). Signature checking stays on the
+            // specialized call (`getcalldescr` `FUNC.ARGS`); only the
+            // read/write walk uses the template.
+            if let Some(template) = residual_inst_template_call_path(path) {
+                return self.analyze_readwrite(&template, seen, analyzed);
             }
             return ReadWriteEffects::bottom_result();
         };
@@ -26872,6 +26894,13 @@ mod tests {
             false,
         );
         graph.set_return(graph.startblock, None);
+        cc.struct_fields.fields.insert(
+            "Point".to_string(),
+            vec![
+                ("x".to_string(), "i64".to_string()),
+                ("y".to_string(), "i64".to_string()),
+            ],
+        );
         let path = CallPath::from_segments(["accessor"]);
         cc.register_function_graph(path, graph);
         cc.find_all_graphs_for_tests();
@@ -26902,6 +26931,284 @@ mod tests {
                 .as_ref()
                 .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
         );
+        // `annlowlevel.specialize` names the residual `leaf__inst_<types>`
+        // while GraphStore keeps the template (`enqueue_residual_inst`
+        // skips a Void copy). Write analysis still walks `funcobj.graph`.
+        let inst = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["accessor__inst_i64"])),
+            vec![Type::Ref],
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            inst.extra_info
+                .write_descrs_fields
+                .as_ref()
+                .is_some_and(|bs| bs.iter().any(|&b| b != 0)),
+            "residual inst spelling must inherit the template write set"
+        );
+        assert!(
+            inst.extra_info
+                ._write_descrs_fields
+                .as_ref()
+                .is_some_and(|v| !v.is_empty()),
+        );
+    }
+
+    /// Specialized residual args (`annlowlevel.specialize`) need not
+    /// match the template graph's `FUNC.ARGS`. Write analysis still
+    /// walks `funcobj.graph`; signature checking does not reuse the
+    /// template kinds (`getcalldescr`).
+    #[test]
+    fn residual_inst_write_set_survives_specialized_arg_kinds() {
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("hash_of");
+        let dict_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let key_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, dict_var.clone());
+        graph.push_inputarg_var(graph.startblock, key_var);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: dict_var.clone(),
+                field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
+                value: crate::model::LinkArg::Value(dict_var),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        cc.struct_fields.fields.insert(
+            "Point".to_string(),
+            vec![
+                ("x".to_string(), "i64".to_string()),
+                ("y".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.register_function_graph(CallPath::from_segments(["hash_of"]), graph);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["hash_of__inst_i64"])),
+            vec![Type::Ref, Type::Int],
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            descriptor
+                .extra_info
+                ._write_descrs_fields
+                .as_ref()
+                .is_some_and(|v| !v.is_empty()),
+            "specialized residual must inherit the template write set"
+        );
+    }
+
+    fn write_set_known_empty<T>(raw: &Option<Vec<T>>, bits: &Option<Vec<u8>>) -> bool {
+        match raw {
+            Some(v) => v.is_empty(),
+            None => bits
+                .as_ref()
+                .is_some_and(|b| b.iter().all(|&byte| byte == 0)),
+        }
+    }
+
+    fn summarize_store_ops(graph: &FunctionGraph) -> String {
+        let mut lines = Vec::new();
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            match &op.kind {
+                OpKind::FieldWrite { field, .. } => lines.push(format!(
+                    "FieldWrite name={} owner_root={:?} owner_id={:?}",
+                    field.name, field.owner_root, field.owner_id
+                )),
+                OpKind::ArrayWrite {
+                    array_type_id,
+                    item_ty,
+                    ..
+                } => lines.push(format!(
+                    "ArrayWrite item_ty={item_ty:?} array_type_id={array_type_id:?}"
+                )),
+                OpKind::InteriorFieldWrite {
+                    field,
+                    array_type_id,
+                    ..
+                } => lines.push(format!(
+                    "InteriorFieldWrite name={} owner_root={:?} array_type_id={array_type_id:?}",
+                    field.name, field.owner_root
+                )),
+                OpKind::RawStore {
+                    item_ty, itemsize, ..
+                } => lines.push(format!("RawStore item_ty={item_ty:?} itemsize={itemsize}")),
+                OpKind::Call { target, .. } => {
+                    lines.push(format!("Call {target:?}"));
+                }
+                OpKind::LoweredBlackholeOp { opname, .. }
+                    if opname == "gc_store_indexed" || opname.contains("store") =>
+                {
+                    lines.push(format!("LoweredBlackholeOp {opname}"));
+                }
+                _ => {}
+            }
+        }
+        lines.join("\n")
+    }
+
+    fn effectinfo_write_set_known_empty(ei: &majit_ir::descr::EffectInfo) -> bool {
+        !ei.has_random_effects()
+            && write_set_known_empty(&ei._write_descrs_fields, &ei.write_descrs_fields)
+            && write_set_known_empty(&ei._write_descrs_arrays, &ei.write_descrs_arrays)
+            && write_set_known_empty(
+                &ei._write_descrs_interiorfields,
+                &ei.write_descrs_interiorfields,
+            )
+    }
+
+    fn is_ll_dict_del_trampoline_leaf(name: &str) -> bool {
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        leaf == "ll_dict_del_trampoline"
+    }
+
+    /// `ll_dict_del` / trampoline must publish a non-empty write set
+    /// (`WriteAnalyzer.analyze_simple_operation`). An empty set lets the
+    /// walker treat the residual as rewind-safe and re-run the delete.
+    /// The residual is named `leaf__inst_<types>`
+    /// (`residual_generic_fun_segments`); analysis must still walk the
+    /// template graph.
+    #[test]
+    fn ll_dict_del_trampoline_write_set_is_not_empty() {
+        use crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let Some(llbc) = crate::test_support::load_ullbc_if_present(OBJECT_ULLBC) else {
+            return;
+        };
+        crate::test_support::with_shared_lowering(llbc, |ctx| {
+            let roots: Vec<_> = llbc
+                .iter_local_fns()
+                .filter(|fd| {
+                    let path = fd.item_meta.name_path();
+                    path.contains("rordereddict") && path.contains("ll_dict_del")
+                })
+                .collect();
+            assert!(
+                !roots.is_empty(),
+                "pyre-object LLBC must contain rordereddict ll_dict_del graphs"
+            );
+            let mut pending: Vec<u64> = roots.iter().map(|fd| fd.def_id).collect();
+            let mut seen = std::collections::HashSet::new();
+            let mut graphs: Vec<(CallPath, FunctionGraph, String)> = Vec::new();
+            let mut dump = String::new();
+            while let Some(id) = pending.pop() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                let Some(fd) = llbc.fn_by_id(id) else {
+                    continue;
+                };
+                let name_path = fd.item_meta.name_path();
+                if !name_path.contains("rordereddict") {
+                    continue;
+                }
+                let Ok(graph) = crate::front::mir::lower_fun_decl(ctx, fd) else {
+                    dump.push_str(&format!("lower-fail {name_path}\n"));
+                    continue;
+                };
+                for op in graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.operations.iter())
+                {
+                    if let OpKind::Call { target, .. } = &op.kind
+                        && let Some(callee) = target.fun_decl_id()
+                    {
+                        pending.push(callee);
+                    }
+                }
+                let path = CallPath::from_segments(name_path.split("::"));
+                dump.push_str(&format!("\n=== {name_path} ===\n"));
+                dump.push_str(&summarize_store_ops(&graph));
+                dump.push('\n');
+                graphs.push((path, graph, name_path));
+            }
+            let mut cc = CallControl::new();
+            cc.set_struct_fields(ctx.struct_field_registry());
+            for (path, graph, name_path) in &graphs {
+                cc.register_function_graph(path.clone(), graph.clone());
+                if let Some((_, rest)) = name_path.split_once("::") {
+                    cc.register_function_graph(
+                        CallPath::from_segments(rest.split("::")),
+                        graph.clone(),
+                    );
+                }
+            }
+            cc.find_all_graphs_for_tests();
+            let mut cache = AnalysisCache::default();
+            let mut checked = 0usize;
+            let mut empty_names = Vec::new();
+            for (path, graph, name_path) in &graphs {
+                if !is_ll_dict_del_trampoline_leaf(name_path) {
+                    continue;
+                }
+                let arg_types = graph_non_void_arg_types(graph, &cc.raw_alloc_flavor_structs);
+                let result_type = cc
+                    .declared_graph_result_type(graph)
+                    .unwrap_or(majit_ir::value::Type::Void);
+                let mut inst_segs = path.segments.clone();
+                if let Some(leaf) = inst_segs.last_mut() {
+                    leaf.push_str("__inst_i64");
+                }
+                let inst_path = path.with_segments(inst_segs);
+                for (label, call_path) in [("template", path), ("inst", &inst_path)] {
+                    let descriptor = cc.getcalldescr(
+                        &SpaceOperation {
+                            result: None,
+                            kind: OpKind::Call {
+                                target: CallTarget::from_call_path(call_path),
+                                args: Vec::new(),
+                                result_ty: ValueType::Void,
+                            },
+                        },
+                        arg_types.clone(),
+                        result_type,
+                        OopSpecIndex::None,
+                        None,
+                        &mut cache,
+                        None,
+                    );
+                    let ei = &descriptor.extra_info;
+                    dump.push_str(&format!(
+                        "{name_path} {label} extraeffect={:?} raw_fields={} random={}\n",
+                        ei.extraeffect,
+                        ei._write_descrs_fields
+                            .as_ref()
+                            .map(Vec::len)
+                            .unwrap_or(usize::MAX),
+                        ei.has_random_effects(),
+                    ));
+                    if effectinfo_write_set_known_empty(ei) {
+                        empty_names.push(format!("{name_path} [{label}]"));
+                    }
+                    checked += 1;
+                }
+            }
+            assert!(
+                checked > 0,
+                "must analyze at least one ll_dict_del_trampoline graph\n{dump}"
+            );
+            assert!(
+                empty_names.is_empty(),
+                "write set must not be known-empty: {empty_names:?}\n{dump}"
+            );
+        });
     }
 
     #[test]

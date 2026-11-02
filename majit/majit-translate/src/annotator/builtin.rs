@@ -236,6 +236,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "get_raw_address_of_string",
         builtin_get_raw_address_of_string,
     );
+    analyzer_for(&mut reg, "charp2str", builtin_charp2str);
+    analyzer_for(&mut reg, "charpsize2str", builtin_charpsize2str);
     analyzer_for(
         &mut reg,
         "nonmoving_raw_ptr_for_resizable_list",
@@ -1049,6 +1051,41 @@ pub fn builtin_unichr_as_utf8(
     }
     let _s_int = arg_at(args_s, 0, "builtin_unichr_as_utf8");
     crate::rlib::rutf8::out_of_range_classdef(bk)?;
+    Ok(SomeValue::String(SomeString::new(false, false)))
+}
+
+/// Translator-synthesised `rffi.charp2str(cp)`: `SomeString` with
+/// `no_nul` (`assert_str0`). The front spells a NUL-terminated CCHARP
+/// used as `&str` as `__majit_charp2str(cp)`.
+pub fn builtin_charp2str(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "charp2str() takes exactly one argument",
+        ));
+    }
+    let _s_ptr = arg_at(args_s, 0, "builtin_charp2str");
+    Ok(crate::annotator::model::s_str0())
+}
+
+/// Translator-synthesised `rffi.charpsize2str(cp, size)`: `SomeString`
+/// that may contain NULs. The front spells a window `{data, len}` used
+/// as `&str` as `__majit_charpsize2str(cp, size)`.
+pub fn builtin_charpsize2str(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "charpsize2str() takes exactly two arguments",
+        ));
+    }
+    let _s_ptr = arg_at(args_s, 0, "builtin_charpsize2str");
+    let _s_size = arg_at(args_s, 1, "builtin_charpsize2str");
     Ok(SomeValue::String(SomeString::new(false, false)))
 }
 
@@ -2506,7 +2543,10 @@ fn cast_instance_intrinsic(
             SomeValue::Ptr(_)
             | SomeValue::Address(_)
             | SomeValue::Integer(_)
-            | SomeValue::Instance(_) => Ok(payload_dest),
+            | SomeValue::Instance(_)
+            // `addr_of_mut!((*entries).items).cast()` is List of the
+            // `[T; 0]` tail (`rordereddict.py` `DICTENTRYARRAY`).
+            | SomeValue::List(_) => Ok(payload_dest),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-address operand for raw root {root:?}: {other:?}"
             ))),
@@ -2552,10 +2592,16 @@ fn cast_instance_intrinsic(
         SomeValue::Ptr(_) | SomeValue::Address(_) => true,
         // `addr_of_mut!((*entries).items).cast()` reads `[Entry; 0]`.
         // The field projects as a list of `Impossible`. The cast target
-        // is `*mut Entry`, the address of that tail.
+        // is `*mut Entry`, the address of that tail
+        // (`rordereddict.py` `DICTENTRY`, `lltype.py` `Struct`): dest is
+        // SomePtr, not a ClassDef intern (`bookkeeper.py`
+        // `getuniqueclassdef`).
         SomeValue::List(list) => {
             let item = list.listdef.read_item(None);
             if matches!(item, SomeValue::Impossible) {
+                if matches!(&projected, SomeValue::Ptr(_)) {
+                    return Ok(projected);
+                }
                 let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
                 return Ok(SomeValue::Instance(super::model::SomeInstance::new(
                     Some(classdef),
@@ -6053,7 +6099,7 @@ mod tests {
         // Instance ∪ Ptr (`llannotation.py`).
         let bk = bk();
         let s_ptr = SomeValue::Instance(SomeInstance::new(None, false, Default::default()));
-        for root in ["GCREF", "GCREFOpaque", "gc_hook::GCREFOpaque"] {
+        for root in ["GCREF", "GCREFOpaque", "header::GCREFOpaque"] {
             let s_root = bk
                 .immutablevalue(&ConstValue::byte_str(root))
                 .expect("gcref root constant");
@@ -6446,6 +6492,118 @@ mod tests {
         assert_eq!(st._gckind, GcKind::Raw);
         crate::annotator::model::union(&dest, &field)
             .expect("pointer-bag dest must union with the payload field cell");
+    }
+
+    #[test]
+    fn cast_instance_gcarray_item_list_operand_is_raw_ptr() {
+        // `addr_of_mut!((*entries).items).cast()`: List of Impossible onto
+        // the inlined Struct ITEM (`rordereddict.py` `DICTENTRY`,
+        // `lltype.py` `Struct`). Dest is SomePtr so getattr `key` is not
+        // a ClassDef `??TypeVar` Impossible.
+        use crate::flowspace::model::ConstValue;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let gc_entries_rows = vec![
+            ("length".to_string(), "usize".to_string()),
+            (
+                "items".to_string(),
+                "[rordereddict_entries::Entry<??TypeVar#0,??TypeVar#1>;0]".to_string(),
+            ),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.fields
+                .insert(owner.to_string(), gc_entries_rows.clone());
+        }
+        let entry_rows = vec![
+            ("key".to_string(), "??TypeVar#0".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "??TypeVar#1".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        for owner in [
+            "pyre_object::rordereddict_entries::Entry",
+            "rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            reg.fields.insert(owner.to_string(), entry_rows.clone());
+        }
+        let entry_id = majit_ir::descr::StructId::from_canonical("rordereddict_entries::Entry");
+        let gc_id = majit_ir::descr::StructId::from_canonical("rordereddict_entries::GcEntries");
+        for alias in [
+            "pyre_object::rordereddict_entries::Entry",
+            "rordereddict_entries::Entry",
+            "Entry",
+        ] {
+            reg.class_identity.insert(
+                alias.to_string(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id: entry_id,
+                    spelling: "rordereddict_entries::Entry".to_string(),
+                }),
+            );
+        }
+        for alias in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.class_identity.insert(
+                alias.to_string(),
+                Some(crate::front::semantic::ClassIdentity {
+                    id: gc_id,
+                    spelling: "rordereddict_entries::GcEntries".to_string(),
+                }),
+            );
+        }
+        for name in [
+            "pyre_object::rordereddict_entries::GcEntries",
+            "rordereddict_entries::GcEntries",
+            "GcEntries",
+        ] {
+            reg.note_declared_gc_name(name);
+        }
+        reg.gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical("Entry"));
+        bk.set_struct_fields(Rc::new(reg));
+
+        let s_list = SomeValue::List(
+            bk.newlist(&[SomeValue::Impossible], None)
+                .expect("list of Impossible"),
+        );
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("rordereddict_entries::Entry"))
+            .expect("cast root");
+        let dest = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("DICTENTRY items.cast dest");
+        let SomeValue::Ptr(ptr) = &dest else {
+            panic!("DICTENTRY dest must be SomePtr, got {dest:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.ll_ptrtype.TO else {
+            panic!("DICTENTRY SomePtr must point at a Struct");
+        };
+        assert_eq!(st._gckind, GcKind::Raw);
+        let s_attr = bk
+            .immutablevalue(&ConstValue::byte_str("key"))
+            .expect("key const");
+        let s_key = ptr
+            .getattr(&s_attr)
+            .unwrap_or_else(|err| panic!("Entry.key getattr: {err:?}"));
+        assert!(
+            !matches!(s_key, SomeValue::Impossible),
+            "Entry.key must not be Impossible, got {s_key:?}"
+        );
     }
 
     /// Classed scalar `PosError { pos: i64 }` that is not a
@@ -8697,6 +8855,48 @@ mod tests {
             panic!("CCHARP is a pointer");
         };
         assert_eq!(result, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
+    }
+
+    #[test]
+    fn builtin_charp2str_returns_str0() {
+        use crate::annotator::model::{SomePtr, s_str0};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_ptr = SomeValue::Ptr(SomePtr::new(*ptr_ty));
+        let result = builtin_charp2str(&bk, &[Some(s_ptr)], &no_kwds()).unwrap();
+        assert_eq!(
+            result,
+            s_str0(),
+            "charp2str annotates assert_str0 SomeString"
+        );
+    }
+
+    #[test]
+    fn builtin_charpsize2str_returns_somestring() {
+        use crate::annotator::model::{SomeInteger, SomePtr, SomeString};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_ptr = SomeValue::Ptr(SomePtr::new(*ptr_ty));
+        let s_size = SomeValue::Integer(SomeInteger::new(false, false));
+        let result = builtin_charpsize2str(&bk, &[Some(s_ptr), Some(s_size)], &no_kwds()).unwrap();
+        assert!(
+            matches!(result, SomeValue::String(SomeString { .. })),
+            "charpsize2str annotates SomeString, got {result:?}"
+        );
+        let SomeValue::String(s) = result else {
+            unreachable!();
+        };
+        assert!(!s.inner.no_nul, "charpsize2str may contain NULs");
     }
 
     #[test]

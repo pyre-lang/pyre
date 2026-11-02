@@ -5305,6 +5305,133 @@ mod tests {
     }
 
     #[test]
+    fn someptr_getattr_reads_carray_item_struct_field_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![
+                    ("f_valid".into(), LowLevelType::Bool),
+                    ("value".into(), LowLevelType::Signed),
+                ],
+            ))))),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("f_valid")));
+        let result = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect("SomePtr.getattr must read Array.OF struct field annotations");
+        assert!(matches!(result, SomeValue::Bool(_)));
+    }
+
+    #[test]
+    fn someptr_setattr_checks_carray_item_struct_field_annotation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![("value".into(), LowLevelType::Signed)],
+            ))))),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+        let result = s_ptr
+            .setattr(
+                &SomeValue::String(s_attr),
+                &SomeValue::Integer(SomeInteger::new(false, false)),
+            )
+            .expect("SomePtr.setattr must accept matching Array.OF struct field annotations");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn someptr_getattr_reads_carray_item_address_field_as_instance() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![("value".into(), LowLevelType::Address)],
+            ))))),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+        let result = s_ptr
+            .getattr(&SomeValue::String(s_attr))
+            .expect("Address item field annotates as classdef-less Instance");
+        match result {
+            SomeValue::Instance(inst) => {
+                assert!(inst.classdef.is_none());
+                assert!(inst.can_be_none);
+            }
+            other => panic!("expected classdef-less Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn someptr_setattr_accepts_instance_into_carray_item_address_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![("value".into(), LowLevelType::Address)],
+            ))))),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+        let s_value = SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let result = s_ptr
+            .setattr(&SomeValue::String(s_attr), &s_value)
+            .expect("SomePtr.setattr must accept Instance into an Address item field");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
+    fn someptr_setattr_accepts_instance_into_carray_item_ptr_field() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, OpaqueType, Ptr, PtrTarget, Struct,
+        };
+
+        let s_ptr = SomePtr::new(Ptr {
+            TO: PtrTarget::Array(Array::new(LowLevelType::Struct(Box::new(Struct::new(
+                "Entry",
+                vec![(
+                    "value".into(),
+                    LowLevelType::Ptr(Box::new(Ptr {
+                        TO: PtrTarget::Opaque(OpaqueType::gc("GCREF")),
+                    })),
+                )],
+            ))))),
+        });
+        let mut s_attr = SomeString::new(false, false);
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("value")));
+        let s_value = SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let result = s_ptr
+            .setattr(&SomeValue::String(s_attr), &s_value)
+            .expect("SomePtr.setattr must accept Instance into an Array.OF pointer field");
+        assert!(matches!(result, SomeValue::Impossible));
+    }
+
+    #[test]
     fn someptr_getattr_wraps_struct_adtmethod_as_lladtmeth() {
         use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
 
