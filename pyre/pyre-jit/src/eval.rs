@@ -6316,6 +6316,7 @@ unsafe extern "C" fn force_pyframe_vref(
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[jit][force-hook] vref-entry vref={vref:p}");
     }
+    let mut materialized = false;
     let forced = unsafe {
         vrefinfo.force_virtual(vref as majit_gc::header::GCREF, |v| {
             // `compile.py force_now(cpu, token)` — force the JIT frame
@@ -6330,6 +6331,7 @@ unsafe extern "C" fn force_pyframe_vref(
                 eprintln!("[jit][force-hook] vref token=0x{token:x}");
             }
             driver.force_virtualizable_token(token);
+            materialized = true;
         })
     };
     // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means
@@ -6352,9 +6354,13 @@ unsafe extern "C" fn force_pyframe_vref(
     // requires that propagation to have been skipped.
     let forced = forced.expect("InvalidVirtualRef: frame-chain vref forced after its frame died")
         as *mut pyre_interpreter::PyFrame;
+    // Only the `force_now` arm rebuilt the frame from resume data; an
+    // already-forced vref (`TOKEN_NONE`) or `TOKEN_TRACING_RESCALL` names a
+    // frame `virtualref.py force_virtual` leaves untouched, whose slot at
+    // `valuestackdepth` may be a store the next jitcode op counts in.
     // `vref.forced` is read after the force, so it is already the live
     // address.
-    if !forced.is_null() {
+    if materialized && !forced.is_null() {
         trim_forced_pyframe_stack(unsafe { &mut *forced });
     }
     forced
