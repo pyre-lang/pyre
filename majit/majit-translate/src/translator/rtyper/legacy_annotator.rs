@@ -184,6 +184,7 @@ fn complete_pending_blocks(
                     }
                     _ => typed_null_raw_incoming(bookkeeper, &op.kind)
                         .or_else(|| typed_null_fn_incoming(bookkeeper, &op.kind))
+                        .or_else(|| fn_ptr_annotation_incoming(bookkeeper, result, &op.kind))
                         .or_else(|| raw_ptr_annotation_incoming(result, &op.kind))
                         .or_else(|| type_someobject_incoming(&op.kind))
                         .or_else(|| option_payload_const_none_incoming(result, &op.kind))
@@ -836,6 +837,71 @@ fn typed_null_fn_incoming(bookkeeper: Option<&Rc<Bookkeeper>>, kind: &OpKind) ->
     }
 }
 
+/// A function-pointer FieldRead / Call / Input is `SomePtr(Ptr(FuncType))`
+/// (`lltype.py` `SomePtr` / `getfunctionptr`), never `SomeInteger`.
+/// `history.getkind` of `Ptr(FuncType)` stays `'int'`, so the op bank is
+/// still Int. `pairtype(SomePtr, SomePtr).union` requires equal
+/// `ll_ptrtype`; FieldRead / Call dests carry the `stamp_fn_ptr`
+/// `Ptr(FuncType)`, and Input seeds through
+/// `fn_ptr_somevalue_for_spelling_in` with this bookkeeper so a
+/// `Result<(), E>` of the exception carrier is `Void`
+/// (`fn_ptr_result_lltype` / `ann_nullptr`).
+fn fn_ptr_annotation_incoming(
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+    result: &Variable,
+    kind: &OpKind,
+) -> Option<Incoming> {
+    let bk = bookkeeper?;
+    match kind {
+        OpKind::FieldRead {
+            ty: ValueType::Int, ..
+        }
+        | OpKind::Call {
+            result_ty: ValueType::Int,
+            ..
+        } => {
+            // Dest `concretetype` is `Ptr(FuncType)` from `stamp_fn_ptr`
+            // (`operation.rs` FieldRead `field_ty` / `place_ty`; Call dest).
+            // Charon's field type is the alias-expanded `FnPtr`, so the
+            // stamp covers `BuiltinCode.func` without a name-keyed alias.
+            fn_ptr_from_dest_concretetype(result)
+        }
+        OpKind::Input {
+            ty: ValueType::Int,
+            class_root: Some(root),
+            ..
+        } => {
+            crate::annotator::bookkeeper::fn_ptr_somevalue_for_spelling_in(root, Some(bk.as_ref()))
+                .filter(somevalue_is_fn_ptr)
+                .map(|sv| Incoming::Annotation(Rc::new(sv)))
+        }
+        _ => None,
+    }
+}
+
+fn somevalue_is_fn_ptr(sv: &SomeValue) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    matches!(sv, SomeValue::Ptr(p) if matches!(p.ll_ptrtype.TO, PtrTarget::Func(_)))
+}
+
+/// Dest `concretetype` stamped `Ptr(FuncType)` (`stamp_fn_ptr`, the
+/// `stamp_raw_u8_ccharp` / `var_concretetype_is_ccharp` pattern). That
+/// `ll_ptrtype` is minted through `fn_ptr_somevalue_for_spelling_in` so
+/// it equals `fn_null_constant` of the same spelling.
+fn fn_ptr_from_dest_concretetype(result: &Variable) -> Option<Incoming> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let ct = result.concretetype()?;
+    let LowLevelType::Ptr(ptr_ty) = ct else {
+        return None;
+    };
+    if !matches!(ptr_ty.TO, PtrTarget::Func(_)) {
+        return None;
+    }
+    Some(Incoming::Annotation(Rc::new(SomeValue::Ptr(SomePtr::new(
+        *ptr_ty,
+    )))))
+}
+
 /// Typed `null_raw` (`model.rs push_null_raw_ptr_with_spelling`) is a
 /// nullable `SomeInstance` of a flavor-raw class
 /// (`builtin.rs raw_ptr_null_constant`).
@@ -959,8 +1025,10 @@ fn someptr_from_raw_malloc_type(
 
 /// `history.py` `getkind` of a raw `Ptr` is `'int'`. `resolve_types`
 /// `commit_concretetype` keeps a `Ptr(Array)` (`rffi.py` `CCHARP`) and
-/// will not replace it with the `Ref` projection of
-/// `somevalue_to_valuetype(SomePtr)`.
+/// a `Ptr(FuncType)` (`lltype.FuncType` / `getfunctionptr`) and will
+/// not replace them with the kind-only overlay (`Signed` from
+/// `somevalue_to_valuetype` of `Ptr(FuncType)`, `GcRef` from a
+/// non-function `SomePtr`).
 fn stamp_someptr_lltype(var: &Variable, sv: &SomeValue) {
     let SomeValue::Ptr(p) = sv else {
         return;
@@ -1443,6 +1511,9 @@ fn merge_integer_family_binding(
                 }
             }
         }
+        Some(existing) if matches!(existing.as_ref(), SomeValue::Ptr(_)) => {
+            union_ptr_object(var, existing.as_ref(), incoming.as_ref())
+        }
         Some(_) => merge_flat(var, somevalue_to_valuetype(&incoming), bookkeeper),
     }
 }
@@ -1497,7 +1568,37 @@ fn merge_ptr_family_binding(
                 }
             }
         }
+        Some(existing) if is_integer_family_shell(existing.as_ref()) => {
+            union_ptr_object(var, existing.as_ref(), incoming.as_ref())
+        }
         Some(_) => merge_flat(var, somevalue_to_valuetype(&incoming), bookkeeper),
+    }
+}
+
+/// `llannotation.py` `pairtype(SomePtr, SomeObject).union`.
+/// `history.getkind` of `Ptr(FuncType)` is `'int'`, so the flat
+/// discriminator is Int, but the shells still UnionError.
+fn union_ptr_object(
+    var: &Variable,
+    existing: &SomeValue,
+    incoming: &SomeValue,
+) -> Result<bool, TyperError> {
+    match crate::annotator::model::union(existing, incoming) {
+        Ok(u) if u != *existing => {
+            stamp_someptr_lltype(var, &u);
+            *var.annotation.borrow_mut() = Some(Rc::new(u));
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(_) => {
+            let current = somevalue_to_valuetype(existing);
+            let ty = somevalue_to_valuetype(incoming);
+            Err(TyperError::message(format!(
+                "UnionError: {current:?} ∪ {ty:?} at {} \
+                 (llannotation.py pairtype(SomePtr, SomeObject).union)",
+                var.name()
+            )))
+        }
     }
 }
 
@@ -3624,6 +3725,228 @@ mod tests {
             }
             other => panic!("expected constant SomePtr join, got {other:?}"),
         }
+    }
+
+    fn builtin_code_fn_spelling() -> &'static str {
+        "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>"
+    }
+
+    fn startup_fn_spelling() -> &'static str {
+        "fn(PyObjectRef, *const PyExecutionContext) -> Result<(), PyError>"
+    }
+
+    fn someptr_ll(sv: &SomeValue) -> &crate::translator::rtyper::lltypesystem::lltype::Ptr {
+        match sv {
+            SomeValue::Ptr(p) => &p.ll_ptrtype,
+            other => panic!("expected SomePtr, got {other:?}"),
+        }
+    }
+
+    fn fn_ptr_func_type(
+        sv: &SomeValue,
+    ) -> &crate::translator::rtyper::lltypesystem::lltype::FuncType {
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+        match &someptr_ll(sv).TO {
+            PtrTarget::Func(ft) => ft,
+            other => panic!("expected Ptr(FuncType), got {other:?}"),
+        }
+    }
+
+    /// Typed `null_fn` ∪ FieldRead whose dest is `Ptr(FuncType)` (`stamp_fn_ptr`).
+    #[test]
+    fn typed_null_fn_phi_fn_fieldread_is_someptr() {
+        use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
+        let spelling = builtin_code_fn_spelling();
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = FunctionGraph::new("typed_null_fn_phi_fn_fieldread");
+        let pred_null = graph.create_block();
+        let pred_field = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
+        let base = graph
+            .push_op_var(
+                pred_field,
+                OpKind::Input {
+                    name: "code".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let field_var = graph
+            .push_op_var(
+                pred_field,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("func", Some("BuiltinCode".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
+            .expect("fn spelling is SomePtr");
+        stamp_someptr_lltype(&field_var, &sv);
+        branch_start_to_preds(&mut graph, pred_null, pred_field);
+        graph.set_goto(pred_null, join, vec![null_var.clone()]);
+        graph.set_goto(pred_field, join, vec![field_var.clone()]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ fn FieldRead");
+        let phi_sv = read_binding_some(&phi).expect("phi annotated");
+        let null_sv = read_binding_some(&null_var).expect("null_fn annotated");
+        let field_sv = read_binding_some(&field_var).expect("FieldRead annotated");
+        assert!(
+            somevalue_is_fn_ptr(&phi_sv),
+            "phi is SomePtr(FuncType), got {:?}",
+            phi_sv
+        );
+        assert_eq!(
+            someptr_ll(&null_sv),
+            someptr_ll(&field_sv),
+            "null_fn and FieldRead share ll_ptrtype (`pairtype(SomePtr, SomePtr).union`)"
+        );
+        assert_eq!(someptr_ll(&phi_sv), someptr_ll(&null_sv));
+    }
+
+    /// Typed `null_fn` ∪ Call whose dest is `Ptr(FuncType)` (`stamp_fn_ptr`).
+    #[test]
+    fn typed_null_fn_phi_fn_call_is_someptr() {
+        use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
+        let spelling = builtin_code_fn_spelling();
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = FunctionGraph::new("typed_null_fn_phi_fn_call");
+        let pred_null = graph.create_block();
+        let pred_call = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
+        let call_var = graph
+            .push_op_var(
+                pred_call,
+                OpKind::Call {
+                    target: CallTarget::function_path(["gateway", "builtin_code_get"]),
+                    args: vec![],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
+            .expect("fn spelling is SomePtr");
+        stamp_someptr_lltype(&call_var, &sv);
+        branch_start_to_preds(&mut graph, pred_null, pred_call);
+        graph.set_goto(pred_null, join, vec![null_var.clone()]);
+        graph.set_goto(pred_call, join, vec![call_var.clone()]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ fn Call");
+        let phi_sv = read_binding_some(&phi).expect("phi annotated");
+        let null_sv = read_binding_some(&null_var).expect("null_fn annotated");
+        let call_sv = read_binding_some(&call_var).expect("Call annotated");
+        assert!(
+            somevalue_is_fn_ptr(&phi_sv),
+            "phi is SomePtr(FuncType), got {:?}",
+            phi_sv
+        );
+        assert_eq!(
+            someptr_ll(&null_sv),
+            someptr_ll(&call_sv),
+            "null_fn and stamped Call share ll_ptrtype"
+        );
+        assert_eq!(someptr_ll(&phi_sv), someptr_ll(&null_sv));
+    }
+
+    /// Typed `null_fn` ∪ `ConstInt(-1)` stays `UnionError`
+    /// (`pairtype(SomePtr, SomeObject).union`).
+    #[test]
+    fn typed_null_fn_phi_constint_neg1_is_union_error() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        let spelling = builtin_code_fn_spelling();
+        let bk = Rc::new(Bookkeeper::new());
+        let mut graph = FunctionGraph::new("typed_null_fn_phi_constint");
+        let pred_null = graph.create_block();
+        let pred_int = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
+        let int_var = graph
+            .push_op_var(pred_int, OpKind::ConstInt(-1), true)
+            .unwrap();
+        branch_start_to_preds(&mut graph, pred_null, pred_int);
+        graph.set_goto(pred_null, join, vec![null_var]);
+        graph.set_goto(pred_int, join, vec![int_var]);
+        graph.set_return(join, Some(phi));
+        let err = annotate_inner(&graph, Some(&bk)).expect_err("typed null_fn ∪ ConstInt(-1)");
+        assert!(
+            err.to_string().contains("UnionError"),
+            "annotate_inner error: {err}"
+        );
+    }
+
+    /// `Result<(), PyError>` with the exception carrier is `Void` on both
+    /// arms (`fn_ptr_result_lltype` / `ann_nullptr`).
+    #[test]
+    fn typed_null_fn_phi_startup_fn_fieldread_is_void_result() {
+        use crate::annotator::bookkeeper::{Bookkeeper, fn_ptr_somevalue_for_spelling_in};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let spelling = startup_fn_spelling();
+        let bk = Rc::new(Bookkeeper::new());
+        bk.set_exception_carrier("error::PyErrorObject");
+        bk.alias_exception_carrier_handle("error::PyError");
+        let mut graph = FunctionGraph::new("typed_null_fn_phi_startup");
+        let pred_null = graph.create_block();
+        let pred_field = graph.create_block();
+        let (join, phi_args) = graph.create_block_with_arg_vars(1);
+        let phi = phi_args[0].clone();
+        let null_var = graph.push_null_fn_ptr_with_spelling(pred_null, Some(spelling));
+        let base = graph
+            .push_op_var(
+                pred_field,
+                OpKind::Input {
+                    name: "def".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let field_var = graph
+            .push_op_var(
+                pred_field,
+                OpKind::FieldRead {
+                    base,
+                    field: FieldDescriptor::new("startup", Some("BuiltinModuleDef".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let sv = fn_ptr_somevalue_for_spelling_in(spelling, Some(bk.as_ref()))
+            .expect("fn spelling is SomePtr");
+        stamp_someptr_lltype(&field_var, &sv);
+        branch_start_to_preds(&mut graph, pred_null, pred_field);
+        graph.set_goto(pred_null, join, vec![null_var.clone()]);
+        graph.set_goto(pred_field, join, vec![field_var.clone()]);
+        graph.set_return(join, Some(phi.clone()));
+        annotate_inner(&graph, Some(&bk)).expect("typed null_fn ∪ startup FieldRead");
+        let phi_sv = read_binding_some(&phi).expect("phi annotated");
+        let null_sv = read_binding_some(&null_var).expect("null_fn annotated");
+        let field_sv = read_binding_some(&field_var).expect("FieldRead annotated");
+        assert_eq!(
+            fn_ptr_func_type(&null_sv).result,
+            LowLevelType::Void,
+            "carrier Result<(), E> is Void on null_fn"
+        );
+        assert_eq!(
+            fn_ptr_func_type(&field_sv).result,
+            LowLevelType::Void,
+            "carrier Result<(), E> is Void on FieldRead"
+        );
+        assert_eq!(someptr_ll(&null_sv), someptr_ll(&field_sv));
+        assert!(somevalue_is_fn_ptr(&phi_sv));
     }
 
     #[test]

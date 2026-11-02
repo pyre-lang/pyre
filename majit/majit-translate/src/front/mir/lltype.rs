@@ -6944,6 +6944,47 @@ pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llb
     }
 }
 
+/// Stamp a function-pointer dest `Ptr(FuncType)` (`lltype.FuncType` /
+/// `getfunctionptr`). The walker rebuilds `SomePtr` from this
+/// `concretetype` (`var_concretetype_is_ccharp` parallel). Mint through
+/// `func_type_from_fn_spelling` with the exception-carrier test so
+/// `Result<(), E>` is `Void` and equals `fn_null_constant` of the same
+/// spelling (`ann_nullptr`).
+pub(in crate::front::mir) fn stamp_fn_ptr(
+    var: &Variable,
+    ty: &TyRef,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) {
+    let Some(spelling) = tyref_fn_ptr_spelling(ty, llbc) else {
+        return;
+    };
+    stamp_fn_ptr_spelling(var, &spelling, error_carrier);
+}
+
+/// [`stamp_fn_ptr`] from an already-rendered `fn(inputs) -> output`
+/// spelling (`tyref_fn_ptr_spelling`).
+pub(crate) fn stamp_fn_ptr_spelling(
+    var: &Variable,
+    spelling: &str,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) {
+    use crate::annotator::bookkeeper::{
+        exception_carrier_keys_from_spec, exception_carrier_type_spelling_keys,
+        func_type_from_fn_spelling,
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+    let (carrier, handle) = exception_carrier_keys_from_spec(error_carrier);
+    let is_carrier =
+        |e: &str| exception_carrier_type_spelling_keys(e, carrier.as_deref(), handle.as_deref());
+    let Some(ft) = func_type_from_fn_spelling(spelling, &is_carrier) else {
+        return;
+    };
+    var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Func(ft),
+    }))));
+}
+
 /// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
 fn retarget_pointer_wrapper(
     wrapper: &serde_json::Value,

@@ -5906,6 +5906,8 @@ pub(crate) use self::gcroot::{
     harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
     is_shadow_stack_bracket_close, is_slice_buffer_free_call,
 };
+#[cfg(test)]
+pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
     ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,

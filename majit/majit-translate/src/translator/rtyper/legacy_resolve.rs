@@ -697,9 +697,12 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
     }
 }
 
-/// A raw `Ptr(Array)` (`CArrayPtr` / `CCHARP`) is the concretetype
-/// `direct_ptradd` scales by. A later kind-only commit (`Signed` or
-/// `GcRef`) must not replace it with the canonical scalar.
+/// A raw `Ptr(Array)` (`CArrayPtr` / `CCHARP`) or `Ptr(FuncType)`
+/// (`lltype.FuncType` / `getfunctionptr`) is the stamped concretetype.
+/// `history.getkind` of both is `'int'`. A later kind-only commit
+/// (`Signed` from `somevalue_to_valuetype` of `Ptr(FuncType)`, or
+/// `GcRef` from a non-function `SomePtr`) must not replace it with
+/// the canonical scalar.
 fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
     if var.concretetype().as_ref().is_some_and(|ty| {
         matches!(
@@ -708,6 +711,7 @@ fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
                 if matches!(
                     ptr.TO,
                     crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Array(_)
+                        | crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
                 )
         )
     }) {
@@ -950,6 +954,41 @@ mod tests {
     };
     use crate::translator::rtyper::legacy_annotator as annotate;
     use std::rc::Rc;
+
+    #[test]
+    fn resolve_types_keeps_fn_ptr_as_signed() {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+        // `history.getkind` of `Ptr(FuncType)` is `'int'`. Annotation
+        // `SomePtr(Ptr(FuncType))` projects to `Int` (`somevalue_to_valuetype`);
+        // `commit_concretetype` must keep the stamped `Ptr(Func)` the way
+        // it keeps `CCHARP`.
+        let mut graph = FunctionGraph::new("fn_ptr_keep");
+        let entry = graph.startblock;
+        let spelling = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
+        let v = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "f".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some(spelling.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(v.clone()));
+
+        let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        annotate::annotate_with_bookkeeper(&graph, Some(&bk));
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&v), ConcreteType::Signed);
+        let ct = v.concretetype().expect("fn ptr stamp kept");
+        assert!(
+            matches!(ct, LowLevelType::Ptr(ref p) if matches!(p.TO, PtrTarget::Func(_))),
+            "commit_concretetype must keep Ptr(FuncType), got {ct:?}"
+        );
+    }
 
     #[test]
     fn resolves_int_types() {
@@ -1784,9 +1823,9 @@ mod tests {
     }
 
     /// Hand-built `option_fn_from_holder` shape (fa1 §4): FieldRead `ty=Int`
-    /// Some arm + `null_fn` / ConstInt(0) None arms annotated SomePtr(FuncType)
-    /// into a return phi, `return_type = "i64"`. Skip-path CodeWriter, same
-    /// as the isolated `builtin_fixed_arity_fn` dump.
+    /// Some arm + typed `null_fn` None arms into a return phi,
+    /// `return_type = "i64"`. Skip-path CodeWriter, same as the isolated
+    /// `builtin_fixed_arity_fn` dump.
     /// Host: `legacy_resolve.rs` `mod tests`, next to `resolves_ref_field`
     /// / `resolves_raise_link_exception_pair`.
     #[test]
@@ -1794,6 +1833,7 @@ mod tests {
         use crate::codewriter::call::CallControl;
         use crate::codewriter::codewriter::CodeWriter;
         use crate::codewriter::jitcode::JitCode;
+        use crate::front::mir::stamp_fn_ptr_spelling;
         use crate::parse::CallPath;
 
         let mut graph = FunctionGraph::new("option_fn_from_holder").with_return_type("i64");
@@ -1803,6 +1843,11 @@ mod tests {
         let n2 = push_typed_input(&mut graph, start, "n2", ValueType::Bool);
         let holder = push_typed_input(&mut graph, start, "holder", ValueType::Ref(None));
 
+        // `pairtype(SomePtr, SomeObject).union` raises, so a `ConstInt(0)`
+        // None arm cannot join a SomePtr FieldRead. The front emits
+        // `Option<fn>` None as `NicheIntNull::FnPtr` → `null_fn`, and
+        // stamps a fn-typed FieldRead dest `Ptr(FuncType)` (`stamp_fn_ptr`).
+        let spelling = "fn(i64) -> i64";
         let (some_block, some_args) = graph.create_block_with_arg_vars(1);
         let field_val = graph
             .push_op_var(
@@ -1819,20 +1864,19 @@ mod tests {
                 true,
             )
             .unwrap();
+        stamp_fn_ptr_spelling(&field_val, spelling, crate::ErrorCarrierSpec::default());
         graph.set_return(some_block, Some(field_val));
 
         let none_c = graph.create_block();
-        let zero = graph
-            .push_op_var(none_c, OpKind::ConstInt(0), true)
-            .unwrap();
-        graph.set_return(none_c, Some(zero));
+        let nfn0 = graph.push_null_fn_ptr_with_spelling(none_c, Some(spelling));
+        graph.set_return(none_c, Some(nfn0));
 
         let none_fn1 = graph.create_block();
-        let nfn1 = graph.push_null_fn_ptr_with_spelling(none_fn1, Some("fn(i64) -> i64"));
+        let nfn1 = graph.push_null_fn_ptr_with_spelling(none_fn1, Some(spelling));
         graph.set_return(none_fn1, Some(nfn1));
 
         let none_fn2 = graph.create_block();
-        let nfn2 = graph.push_null_fn_ptr_with_spelling(none_fn2, Some("fn(i64) -> i64"));
+        let nfn2 = graph.push_null_fn_ptr_with_spelling(none_fn2, Some(spelling));
         graph.set_return(none_fn2, Some(nfn2));
 
         let mid1 = graph.create_block();

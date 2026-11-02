@@ -1,4 +1,6 @@
-//! `Option<fn>` return phi: `Some` is an int, `None` is a live `null_fn`.
+//! `Option<fn>` return phi: `Some` is the fn-ptr parameter as the front
+//! end spells it (`tyref_fn_ptr_input_class_root`), `None` is a live
+//! `null_fn`.
 //!
 //! T1c-1 annotates `core::ptr::null_fn` as constant `SomePtr(Ptr(FuncType))`.
 //! `follow_link` copies that shell onto the returnblock inputarg. Upstream
@@ -8,11 +10,14 @@
 //! `GcRef`, so `func_result_kind` panics `FUNC.RESULT=i but CFG return
 //! kind is r`.
 //!
-//! The graph is unfolded: return predecessors are an Int `Some` input
-//! plus two live `null_fn` `None` arms (the extra `None` is the CI
-//! shape: after `Int ∪ Ref` clears the phi, a later `SomePtr` rewrite
-//! sticks), `return_type = Some("i64")`, driven through
-//! `CodeWriter::transform_graph_to_jitcode` once. A test that
+//! The graph is unfolded: return predecessors are a spelled fn-ptr
+//! `Some` input (`class_root` from `tyref_fn_ptr_input_class_root`,
+//! `"fn() -> i64"`) plus two live `null_fn` `None` arms (the extra
+//! `None` is the CI shape: after `Int ∪ Ref` clears the phi, a later
+//! `SomePtr` rewrite sticks), `return_type = Some("i64")`, driven
+//! through `CodeWriter::transform_graph_to_jitcode` once.
+//! `pairtype(SomePtr, SomeObject).union` refuses an un-spelled Int
+//! there (`SomePtr ∪ SomeInteger` at the return phi). A test that
 //! `set_return`s the `null_fn` result Variable itself stays green
 //! without the projection fix.
 
@@ -47,7 +52,7 @@ fn option_fn_return_phi_graph() -> FunctionGraph {
             OpKind::Input {
                 name: "f".into(),
                 ty: ValueType::Int,
-                class_root: None,
+                class_root: Some("fn() -> i64".into()),
             },
             true,
         )

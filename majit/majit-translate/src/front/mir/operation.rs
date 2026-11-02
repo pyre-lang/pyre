@@ -6482,6 +6482,8 @@ impl<'a> Lowering<'a> {
                     });
                     stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
                     stamp_raw_u8_ccharp(&res, &field_ty, self.llbc);
+                    stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
+                    stamp_fn_ptr(&res, &field_ty, self.llbc, self.static_addrs.error_carrier);
                     if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
                         || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
                         || tyref_is_u8_window(&field_ty, self.llbc)
@@ -6762,6 +6764,7 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
+                    stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
                     return Ok(res);
                 }
                 // A `Field` projection whose base is a genuine Ref tuple
@@ -6877,6 +6880,7 @@ impl<'a> Lowering<'a> {
                             },
                         });
                         stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
+                        stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
                         return Ok(res);
                     }
                 }

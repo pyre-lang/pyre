@@ -7542,6 +7542,12 @@ impl<'a> Lowering<'a> {
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
         if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
             stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+            stamp_fn_ptr(
+                &result_var,
+                &call.dest.ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            );
         }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
