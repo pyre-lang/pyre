@@ -993,24 +993,45 @@ fn semlock_rebuild(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter
     semlock_instance(w_cls, raw, kind, maxvalue, name)
 }
 
+/// `interp_semaphore.py W_SemLock.acquire`: interp2app binds block/timeout
+/// by name, and unwrap_spec(block=bool) uses truth testing, not int coercion.
+#[cfg(all(any(unix, windows), feature = "host_env"))]
+fn semlock_acquire_method(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
+    let Some((&self_obj, rest)) = args.split_first() else {
+        return Err(pyre_interpreter::PyError::type_error(
+            "acquire() needs a receiver",
+        ));
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let scope = pyre_interpreter::builtins::bind_builtin_kwargs(
+        rest,
+        &["block", "timeout"],
+        &[false, false],
+        "acquire",
+    )?;
+    let bound_slot = pyre_object::gc_roots::pin_roots(&scope);
+    let w_block = roots.get(bound_slot);
+    let block = if w_block.is_null() {
+        true
+    } else {
+        pyre_interpreter::baseobjspace::is_true(w_block)?
+    };
+    let w_timeout = roots.get(bound_slot + 1);
+    let timeout = if w_timeout.is_null() || unsafe { is_none(w_timeout) } {
+        None
+    } else {
+        Some(pyre_interpreter::baseobjspace::float_w(w_timeout)?)
+    };
+    let acquired = w_semlock_acquire(roots.get(self_slot), block, timeout)?;
+    Ok(pyre_object::boolobject::w_bool_from(acquired))
+}
+
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pyre_interpreter::py_class! {
     "SemLock",
     methods: {
-        fn acquire(
-            mut self_obj: PyObjectRef,
-            blocking: Option<i64>,
-            timeout: Option<PyObjectRef>,
-        ) -> Result<bool, pyre_interpreter::PyError> {
-            let block = blocking.map(|v| v != 0).unwrap_or(true);
-            let timeout = match timeout {
-                Some(value) if unsafe { !is_none(value) } => {
-                    Some(pyre_object::with_roots!(self_obj => pyre_interpreter::baseobjspace::float_w(value))?)
-                }
-                _ => None,
-            };
-            w_semlock_acquire(self_obj, block, timeout)
-        }
         fn release(self_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             w_semlock_release(self_obj)
         }
@@ -1172,6 +1193,20 @@ pyre_interpreter::py_module! {
                     pyre_object::gc_roots::shadow_stack_get(dict_slot),
                     "SEM_VALUE_MAX",
                     pyre_object::gc_roots::shadow_stack_get(vmax_slot),
+                );
+                pyre_interpreter::__pyre_put_new!(
+                    dict_slot,
+                    "acquire",
+                    pyre_interpreter::gateway::function_set_null_positional_defaults(
+                        pyre_interpreter::make_builtin_function_with_signature(
+                            "acquire",
+                            semlock_acquire_method,
+                            pyre_interpreter::gateway::Signature::new(
+                                vec!["self", "block", "timeout"], None, None, 0, 1,
+                            ),
+                        ),
+                        2,
+                    )
                 );
                 pyre_interpreter::__pyre_put_new!(
                     dict_slot,
