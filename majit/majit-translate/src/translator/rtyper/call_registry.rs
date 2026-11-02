@@ -430,6 +430,12 @@ pub struct TwoPhaseSubject {
     >,
     pub constant_hlvalues:
         HashMap<crate::flowspace::model::Variable, crate::flowspace::model::Hlvalue>,
+    /// `function_graph_to_flowspace_inner` `block_map`: GraphStore
+    /// `BlockId` → flowspace `BlockRef`. 1:1, including the canonical
+    /// return/except blocks. Phase B uses it to copy
+    /// `transform_dead_code` / `cutoff_alwaysraising_block` onto the
+    /// GraphStore copy the comparer and codewriter read.
+    pub block_map: HashMap<crate::model::BlockId, crate::flowspace::model::BlockRef>,
 }
 
 /// Whole-program two-phase type cache, keyed by subject [`CallPath`].

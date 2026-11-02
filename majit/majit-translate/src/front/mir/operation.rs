@@ -1636,6 +1636,19 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Erase a classed GC pointer onto `llmemory.GCREF`.
+    /// `rgc.cast_instance_to_gcref` / `annlowlevel.cast_instance_to_gcref`
+    /// (`cast_opaque_ptr(GCREF, cast_instance_to_base_ptr)`).
+    pub(in crate::front::mir) fn recast_instance_to_gcref(
+        &mut self,
+        arg: &Variable,
+    ) -> (OpKind, Variable) {
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        (crate::model::cast_instance_call("GCREF", arg.clone()), res)
+    }
+
     /// Extract the `offset` operand from an `Index { offset, from_end }`
     /// projection element and resolve it to a Variable. `from_end` is
     /// ignored: backwards-from-end indexing only appears in slice patterns
@@ -1659,21 +1672,44 @@ impl<'a> Lowering<'a> {
         self.resolve_operand(mir_bb, op)
     }
 
-    /// Store into an error-carrier field (`self.0` on `PyError`) as the
-    /// inner object class, matching [`Self::cast_off_error_carrier`].
+    /// Recast a store into a transparent-handle field onto the carrier
+    /// class (`Deref::Target`). `rclass.py` `InstanceRepr.rtype_setattr`
+    /// converts through the field repr (`HighLevelOp.inputargs` /
+    /// `convertvar`); the field row is `*mut {Target}`
+    /// ([`transparent_handle_field_spelling`]). `binaryop.py`
+    /// `pairtype(SomeInstance, SomeInstance).union` raises without a
+    /// common base, so a payload-class value cannot join the carrier.
+    /// Ordinary MIR Field stores use this helper. Ctor field inits
+    /// convert through `AggregateField::narrow_root` (`ctor_ccharp_field_store`)
+    /// on every aggregate route.
     pub(in crate::front::mir) fn recast_error_carrier_field_store(
         &mut self,
         bb_id: BlockId,
         field_base_ty: &TyRef,
         value: LinkArg,
     ) -> LinkArg {
-        if !self.ty_is_error_carrier(field_base_ty) {
-            return value;
-        }
-        let Some(inner) = self.error_carrier_inner_class_root(field_base_ty) else {
+        let Some(inner) = self.transparent_handle_field_store_root(field_base_ty) else {
             return value;
         };
         self.narrow_value_to_instance_root(bb_id, value, &inner)
+    }
+
+    /// Carrier class of a transparent-handle field store, or `None`.
+    ///
+    /// [`transparent_handle_field_spelling`] is the field-row predicate;
+    /// the stored class is the `*mut {Target}` suffix.
+    pub(in crate::front::mir) fn transparent_handle_field_store_root(
+        &self,
+        handle_ty: &TyRef,
+    ) -> Option<String> {
+        let spelling = transparent_handle_field_spelling(
+            handle_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )?;
+        spelling.strip_prefix("*mut ").map(str::to_owned)
     }
 
     /// Whether `ty` is the configured exception carrier (`PyError`).
@@ -2745,10 +2781,11 @@ impl<'a> Lowering<'a> {
                 // (`lltype.py`) is pointer-to-pointer. UnaryOp Cast already
                 // calls `ptr_cast_marker` without a Charon kind gate;
                 // `ptr_cast_marker` requires a Ref source, so an int-to-ptr
-                // Scalar still falls through. A flavor-raw dest, and a dest
-                // rstr `STR` (`*mut Utf8Str` / `shadow_stack_get as *mut Utf8Str`),
-                // must reach the marker even when Charon spells the kind as
-                // something other than `RawPtr` (`*const () as *const CodeObject`).
+                // Scalar still falls through. A flavor-raw dest, a dest rstr
+                // `STR` (`*mut Utf8Str` / `shadow_stack_get as *mut Utf8Str`),
+                // and a dest GCREF (`rgc.cast_instance_to_gcref`) must reach
+                // the marker even when Charon spells the kind as something
+                // other than `RawPtr` (`*const () as *const CodeObject`).
                 let dest_flavor_raw = flavor_raw_pointer_class_root(
                     &ty,
                     self.llbc,
@@ -2785,7 +2822,8 @@ impl<'a> Lowering<'a> {
                     ),
                     ValueType::Str
                 ) || tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc);
-                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str)
+                let dest_is_gcref = tyref_is_gcref_spelling(&ty, self.llbc);
+                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw || dest_is_str || dest_is_gcref)
                     && let Some((op, res)) = self
                         .ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                         .or_else(|| {
@@ -3125,20 +3163,12 @@ impl<'a> Lowering<'a> {
                                 *arg = value.clone();
                             }
                         }
-                        for arg in arg_vars.iter_mut() {
-                            // The ctor store lands on the carrier's inner class like the FieldWrite store.
-                            let recast = self.recast_error_carrier_field_store(
-                                bb_id,
-                                dest_ty,
-                                LinkArg::Value(arg.clone()),
-                            );
-                            if let Some(value) = recast.as_variable() {
-                                *arg = value.clone();
-                            }
-                        }
-                        // `ctor_ccharp_field_store` then narrows to the declared
-                        // `PyObjectRef` class; keep the inner class as that root
-                        // so the FieldWrite store is not recast back off it.
+                        // `ctor_ccharp_field_store` narrows through
+                        // `AggregateField::narrow_root`. A configured
+                        // error-carrier dest that is not a transparent
+                        // handle still needs the inner class as that root
+                        // so the FieldWrite store is not recast onto the
+                        // declared payload class.
                         if let Some(inner) = self.error_carrier_inner_class_root(dest_ty) {
                             for field in ctor.fields.iter_mut() {
                                 field.narrow_root = Some(inner.clone());
@@ -4447,6 +4477,18 @@ impl<'a> Lowering<'a> {
     ///   `r_to.lowleveltype`. Stamp `__cast_instance_intrinsic` with
     ///   `ValueType::Str`, not
     ///   [`Self::instance_narrow_for_type`]'s default `Ref(Some(root))`.
+    /// * **dest-GCREF** — `p as *mut GCREFOpaque` from a classed GC
+    ///   pointer (`Ref(Some(root))` / registered GC class root). The
+    ///   class is the type of the value being cast
+    ///   (`annlowlevel.py` `cast_instance_to_gcref`), read off `arg`'s
+    ///   producer when the caller hint is blank. Aliasing keeps
+    ///   `SomeInstance` on a GCREF-declared result; the MethodDesc
+    ///   PBC then unions `Ptr(GCREF) ∪ Instance`. Upstream
+    ///   `rgc.cast_instance_to_gcref` / `annlowlevel.cast_instance_to_gcref`
+    ///   is an explicit op whose annotation is `lltype_to_annotation(GCREF)`
+    ///   (`SomePtr`). [`Self::recast_instance_to_gcref`] stamps
+    ///   `__cast_instance_intrinsic("GCREF")`. A GCREF→GCREF or raw/int
+    ///   source stays an alias.
     ///
     /// A `Ref` source is required: an `addr_usize as *const Struct`
     /// reinterpret is `cast_int_to_ptr` territory and must alias instead.
@@ -4492,6 +4534,60 @@ impl<'a> Lowering<'a> {
             ));
         }
         if !matches!(dest_kind, ValueType::Ref(_)) {
+            return None;
+        }
+        if tyref_is_gcref_spelling(dest_ty, self.llbc) {
+            // `annlowlevel.py` `cast_instance_to_gcref` /
+            // `rgc.cast_instance_to_gcref`: the erase is the type of the
+            // value being cast, not the caller's src hint. Recovery
+            // (`p as usize as *mut GCREFOpaque`) passes `Ref(None)` / no
+            // root; read the class off `arg`'s producer
+            // (`resolve_to_producer_op`, same walk as
+            // [`Self::address_cast_pointer`]). GCREF→GCREF and unclassed
+            // `Ref(None)` fall through to the hint and stay an alias.
+            let src_classed = {
+                let from_arg = resolve_to_producer_op(&self.graph, arg)
+                    .and_then(|(block_id, idx)| {
+                        self.graph
+                            .blocks
+                            .iter()
+                            .find(|block| block.id == block_id)
+                            .and_then(|block| block.operations.get(idx))
+                    })
+                    .and_then(|op| match &op.kind {
+                        OpKind::Call { result_ty, .. }
+                        | OpKind::UnaryOp { result_ty, .. }
+                        | OpKind::BinOp { result_ty, .. }
+                        | OpKind::Input { ty: result_ty, .. }
+                        | OpKind::FieldRead { ty: result_ty, .. }
+                        | OpKind::LoadStatic { ty: result_ty, .. } => Some(result_ty),
+                        _ => None,
+                    })
+                    .is_some_and(|ty| match ty {
+                        ValueType::Ref(Some(root)) => {
+                            !crate::annotator::bookkeeper::is_gcref_type_spelling(root)
+                        }
+                        _ => false,
+                    });
+                if from_arg {
+                    true
+                } else {
+                    match src_kind {
+                        Some(ValueType::Ref(Some(root)))
+                            if !crate::annotator::bookkeeper::is_gcref_type_spelling(root) =>
+                        {
+                            true
+                        }
+                        Some(ValueType::Ref(_)) => src_root.is_some_and(|r| {
+                            !crate::annotator::bookkeeper::is_gcref_type_spelling(r)
+                        }),
+                        _ => false,
+                    }
+                }
+            };
+            if src_classed {
+                return Some(self.recast_instance_to_gcref(arg));
+            }
             return None;
         }
         let (segments, result_ty) =
@@ -7541,6 +7637,15 @@ impl<'a> Lowering<'a> {
         // `__pos_<i>` when the resolver could not project a real
         // schema entry (tuple aggregates, deduplicated types
         // not in the LLBC's local table).
+        // `rclass.py` `InstanceRepr.rtype_setattr`:
+        // `HighLevelOp.inputargs(..., r_value)` / `convertvar` converts
+        // a field init through the field repr on every setattr,
+        // including constructor-fn-item `emit_aggregate_ctor`.
+        // A transparent-handle field row is `*mut {Deref::Target}`;
+        // `ctor_ccharp_field_store` emits `cast_instance_call` of that
+        // carrier. `typed_ref_field_narrow_root` of the declared
+        // payload would recast onto that payload class.
+        let handle_store_root = self.transparent_handle_field_store_root(dest_ty);
         let fields = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows
@@ -7566,7 +7671,9 @@ impl<'a> Lowering<'a> {
                 AggregateField {
                     name,
                     void,
-                    narrow_root: self.typed_ref_field_narrow_root(declared_ty),
+                    narrow_root: handle_store_root
+                        .clone()
+                        .or_else(|| self.typed_ref_field_narrow_root(declared_ty)),
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
                         || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),

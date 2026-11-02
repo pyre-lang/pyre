@@ -343,24 +343,6 @@ fn cutoff_block_trace_with_counts(
     }
 }
 
-/// Capture the same block identification used by `[DTRACE-CUT]` so the
-/// per-block panic isolator can name a failed cutoff without using pointers.
-pub(crate) fn cutoff_block_trace(ann: &RPythonAnnotator, block: &BlockRef) -> CutoffBlockTrace {
-    let (n, total) = {
-        let blk = block.borrow();
-        let n = blk
-            .operations
-            .iter()
-            .position(|op| match &op.result {
-                Hlvalue::Variable(v) => v.annotation.borrow().is_none(),
-                Hlvalue::Constant(_) => false,
-            })
-            .unwrap_or(blk.operations.len());
-        (n, blk.operations.len())
-    };
-    cutoff_block_trace_with_counts(ann, block, n, total)
-}
-
 /// RPython `transform.py` — `cutoff_alwaysraising_block(self, block)`.
 ///
 /// ```python

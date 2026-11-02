@@ -423,7 +423,7 @@ fn resolve_types_inner(
 /// when one `FunctionGraph` carries a second start (the `generated::*` /
 /// `eval_loop_jit` body block). An unreached returnblock or exceptblock
 /// is not live; its Unknown variables take `impossible_repr` (Void).
-fn live_block_flags(graph: &FunctionGraph) -> Vec<bool> {
+pub(crate) fn live_block_flags(graph: &FunctionGraph) -> Vec<bool> {
     let mut live = vec![false; graph.blocks.len()];
     let mut worklist: Vec<crate::model::BlockId> = vec![graph.startblock];
     worklist.extend(crate::model::secondary_entry_roots(graph));
@@ -484,6 +484,19 @@ fn concrete_from_annotation(
             // `getFrozenPBCRepr` → `SingleFrozenPBCRepr.lowleveltype = Void`.
             return Ok(ConcreteType::Void);
         }
+    }
+    // `rptr.py` `SomePtr.rtyper_makerepr` → `PtrRepr(self.ll_ptrtype)`:
+    // the concretetype of a SomePtr value IS `ll_ptrtype`.
+    // `history.py` `getkind`: a Ptr whose `TO._gckind == 'raw'` is `"int"`,
+    // else `"ref"`. Reuse `model.rs` `getkind` / `try_getkind` of
+    // `LowLevelType::Ptr` (`ptr_gckind`: Func → Raw → Signed; Gc including
+    // `llmemory.GCREF` → GcRef).
+    if let SomeValue::Ptr(p) = s {
+        return Ok(crate::model::getkind(
+            &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::from(
+                p.ll_ptrtype.clone(),
+            ),
+        ));
     }
     let vtype = somevalue_to_valuetype(s);
     Ok(valuetype_to_concrete_for_legacy(
@@ -1708,5 +1721,163 @@ mod tests {
             FunctionGraph::concretetype_of(&evalue_var),
             ConcreteType::GcRef
         );
+    }
+
+    #[test]
+    fn concrete_from_annotation_someptr_follows_ll_ptrtype_gckind() {
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, GCREF, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let gcref = match &*GCREF {
+            LowLevelType::Ptr(p) => SomeValue::Ptr(SomePtr::new((**p).clone())),
+            other => panic!("GCREF is Ptr, got {other:?}"),
+        };
+        assert_eq!(
+            concrete_from_annotation(&gcref, &HashSet::new()).unwrap(),
+            ConcreteType::GcRef
+        );
+
+        let fn_ptr = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        }));
+        assert_eq!(
+            concrete_from_annotation(&fn_ptr, &HashSet::new()).unwrap(),
+            ConcreteType::Signed
+        );
+    }
+
+    fn push_typed_input(
+        graph: &mut FunctionGraph,
+        block: crate::model::BlockId,
+        name: &str,
+        ty: ValueType,
+    ) -> crate::flowspace::model::Variable {
+        let var = graph.alloc_value_var();
+        graph.push_inputarg_var(block, var.clone());
+        graph.push_op_with_result_var(
+            block,
+            OpKind::Input {
+                name: name.to_string(),
+                ty,
+                class_root: None,
+            },
+            var.clone(),
+        );
+        var
+    }
+
+    /// Hand-built `option_fn_from_holder` shape (fa1 §4): FieldRead `ty=Int`
+    /// Some arm + `null_fn` / ConstInt(0) None arms annotated SomePtr(FuncType)
+    /// into a return phi, `return_type = "i64"`. Skip-path CodeWriter, same
+    /// as the isolated `builtin_fixed_arity_fn` dump.
+    /// Host: `legacy_resolve.rs` `mod tests`, next to `resolves_ref_field`
+    /// / `resolves_raise_link_exception_pair`.
+    #[test]
+    fn skip_raw_someptr_return_phi_is_signed_not_gcref() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::codewriter::CodeWriter;
+        use crate::codewriter::jitcode::JitCode;
+        use crate::parse::CallPath;
+
+        let mut graph = FunctionGraph::new("option_fn_from_holder").with_return_type("i64");
+        let start = graph.startblock;
+        let keep = push_typed_input(&mut graph, start, "keep", ValueType::Bool);
+        let n1 = push_typed_input(&mut graph, start, "n1", ValueType::Bool);
+        let n2 = push_typed_input(&mut graph, start, "n2", ValueType::Bool);
+        let holder = push_typed_input(&mut graph, start, "holder", ValueType::Ref(None));
+
+        let (some_block, some_args) = graph.create_block_with_arg_vars(1);
+        let field_val = graph
+            .push_op_var(
+                some_block,
+                OpKind::FieldRead {
+                    base: some_args[0].clone(),
+                    field: crate::model::FieldDescriptor::new(
+                        "func",
+                        Some("gateway::BuiltinCode".to_string()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(some_block, Some(field_val));
+
+        let none_c = graph.create_block();
+        let zero = graph
+            .push_op_var(none_c, OpKind::ConstInt(0), true)
+            .unwrap();
+        graph.set_return(none_c, Some(zero));
+
+        let none_fn1 = graph.create_block();
+        let nfn1 = graph.push_null_fn_ptr_with_spelling(none_fn1, Some("fn(i64) -> i64"));
+        graph.set_return(none_fn1, Some(nfn1));
+
+        let none_fn2 = graph.create_block();
+        let nfn2 = graph.push_null_fn_ptr_with_spelling(none_fn2, Some("fn(i64) -> i64"));
+        graph.set_return(none_fn2, Some(nfn2));
+
+        let mid1 = graph.create_block();
+        let mid2 = graph.create_block();
+        graph.set_branch(start, keep, some_block, vec![holder], mid1, vec![]);
+        graph.set_branch(mid1, n1, none_c, vec![], mid2, vec![]);
+        graph.set_branch(mid2, n2, none_fn1, vec![], none_fn2, vec![]);
+
+        let path = CallPath::from_segments(["option_fn_from_holder"]);
+        let mut callcontrol = CallControl::new();
+        callcontrol.register_function_graph(path.clone(), graph.clone());
+        let mut codewriter = CodeWriter::new();
+        codewriter.debug = false;
+        let skip = codewriter
+            .dual_gate_skip_reason(&graph, &callcontrol)
+            .expect("dual-gate should classify");
+        assert!(
+            skip.is_some(),
+            "must take the Skip path (Match already Signed via PtrRepr); got Match"
+        );
+
+        let jitcode = std::sync::Arc::new(JitCode::new("option_fn_from_holder"));
+        let transform = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            codewriter.transform_graph_to_jitcode(
+                &graph,
+                &path,
+                &mut callcontrol,
+                &crate::GraphTransformConfig::default(),
+                &jitcode,
+                false,
+                0,
+            );
+        }));
+        if let Err(payload) = transform {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            assert!(
+                !msg.contains("FUNC.RESULT"),
+                "func_result_kind panic: {msg}"
+            );
+        }
+
+        let returnvar = &graph.block(graph.returnblock).inputargs[0];
+        assert_eq!(
+            FunctionGraph::concretetype_of(returnvar),
+            ConcreteType::Signed
+        );
+        let graph_result_kind = match FunctionGraph::concretetype_of(returnvar) {
+            ConcreteType::Signed => 'i',
+            ConcreteType::GcRef => 'r',
+            ConcreteType::Float => 'f',
+            ConcreteType::Void => 'v',
+            ConcreteType::Unknown => panic!("unresolved return kind"),
+        };
+        assert_eq!(graph_result_kind, 'i');
     }
 }

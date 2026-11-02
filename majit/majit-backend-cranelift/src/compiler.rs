@@ -7716,6 +7716,57 @@ fn ref_result_from_call(
     Some(builder.inst_results(call)[0])
 }
 
+/// `callbuilder.py` `AbstractCallBuilder.emit` sequence: spill /
+/// `push_gcmap` / CALL / `pop_gcmap` / reload, gated on `can_collect`.
+/// `emit_no_collect` is the same CALL with that envelope skipped.
+/// Callers supply only `emit_raw_call`; the collecting path reloads the
+/// frame (`assembler.py` `_reload_frame_if_necessary`) before `pop_gcmap`.
+fn emit_call_with_gc_roots<R>(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    opref_vars: &IndexMap<u32, Variable>,
+    can_collect: bool,
+    call_conv: cranelift_codegen::isa::CallConv,
+    ptr_type: cranelift_codegen::ir::Type,
+    jf_ptr: CValue,
+    ref_root_slots: &[(u32, usize)],
+    defined_ref_vars: &IndexSet<u32>,
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+    per_call_gcmap: i64,
+    emit_call: impl FnOnce(&mut JITModule, &mut FunctionBuilder) -> R,
+) -> R {
+    if can_collect {
+        spill_ref_roots(
+            builder,
+            opref_vars,
+            jf_ptr,
+            ref_root_slots,
+            defined_ref_vars,
+            stale_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+        );
+        emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
+    }
+    let result = emit_call(module, builder);
+    if can_collect {
+        let new_jf_ptr = emit_reload_frame_if_necessary(module, builder, ptr_type, call_conv);
+        emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
+        reload_ref_roots(
+            builder,
+            opref_vars,
+            new_jf_ptr,
+            ref_root_slots,
+            defined_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+        );
+    }
+    result
+}
+
 fn emit_indirect_call_from_parts(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
@@ -7756,55 +7807,139 @@ fn emit_indirect_call_from_parts(
     //   emit() [can_collect]: spill + push_gcmap + CALL + pop_gcmap + reload
     //   emit_no_collect(): bare CALL only
     let can_collect = call_descr.get_extra_info().check_can_collect();
-    if can_collect {
-        spill_ref_roots(
-            builder,
-            opref_vars,
-            jf_ptr,
-            ref_root_slots,
-            defined_ref_vars,
-            stale_ref_vars,
-            demoted_failarg_slots,
-            ref_root_base_ofs,
-        );
-        emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
-    }
-    // A bakeable callee address is a host/C function (the same class
-    // `convert_to_imm` allows). Direct `call` avoids loading the
-    // address into a register for `call_indirect` on every residual.
-    let call = if let Some(addr) = lookup_const_i64(constants, func_ref).filter(|&c| c != 0) {
-        let name = format!("host_{:x}", addr as u64 as usize);
-        let func_id = module
-            .declare_function(&name, Linkage::Import, &sig)
-            .expect("residual callee import");
-        let fref = module.declare_func_in_func(func_id, builder.func);
-        builder.ins().call(fref, &args)
-    } else {
-        let sig_ref = builder.import_signature(sig);
-        let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
-        let func_ptr = if ptr_type != cl_types::I64 {
-            builder.ins().ireduce(ptr_type, func_ptr_raw)
-        } else {
-            func_ptr_raw
-        };
-        builder.ins().call_indirect(sig_ref, func_ptr, &args)
-    };
-    if can_collect {
-        // _reload_frame_if_necessary (assembler.py:405-412)
-        let new_jf_ptr = emit_reload_frame_if_necessary(module, builder, ptr_type, call_conv);
-        emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
-        reload_ref_roots(
-            builder,
-            opref_vars,
-            new_jf_ptr,
-            ref_root_slots,
-            defined_ref_vars,
-            demoted_failarg_slots,
-            ref_root_base_ofs,
-        );
-    }
+    let call = emit_call_with_gc_roots(
+        module,
+        builder,
+        opref_vars,
+        can_collect,
+        call_conv,
+        ptr_type,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        stale_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+        per_call_gcmap,
+        |module, builder| {
+            // A bakeable callee address is a host/C function (the same class
+            // `convert_to_imm` allows). Direct `call` avoids loading the
+            // address into a register for `call_indirect` on every residual.
+            if let Some(addr) = lookup_const_i64(constants, func_ref).filter(|&c| c != 0) {
+                let name = format!("host_{:x}", addr as u64 as usize);
+                let func_id = module
+                    .declare_function(&name, Linkage::Import, &sig)
+                    .expect("residual callee import");
+                let fref = module.declare_func_in_func(func_id, builder.func);
+                builder.ins().call(fref, &args)
+            } else {
+                let sig_ref = builder.import_signature(sig);
+                let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
+                let func_ptr = if ptr_type != cl_types::I64 {
+                    builder.ins().ireduce(ptr_type, func_ptr_raw)
+                } else {
+                    func_ptr_raw
+                };
+                builder.ins().call_indirect(sig_ref, func_ptr, &args)
+            }
+        },
+    );
 
     ref_result_from_call(builder, call, result_type)
+}
+
+/// x86/regalloc.py `consider_cond_call`: `assert 2 <= len(args) <= 4 + 2`
+/// — condition, function, then at most four extra register arguments.
+/// jtransform.py `_rewrite_op_cond_call` raises on more than 4 extras.
+const COND_CALL_SLOWPATH_MAX_NARGS: usize = 4;
+
+/// Eligible for `_build_cond_call_slowpath` without the `supports_floats`
+/// variant: void result, integer/ref args only, arity within the
+/// `consider_cond_call` bound.
+fn cond_call_slowpath_nargs(call_descr: &dyn CallDescr) -> Option<usize> {
+    if call_descr.result_type() != Type::Void {
+        return None;
+    }
+    let arg_types = call_descr.arg_types();
+    if arg_types.len() > COND_CALL_SLOWPATH_MAX_NARGS {
+        return None;
+    }
+    if arg_types
+        .iter()
+        .any(|tp| !matches!(*tp, Type::Int | Type::Ref))
+    {
+        return None;
+    }
+    Some(arg_types.len())
+}
+
+/// Sibling of `emit_indirect_call_from_parts` for the cond_call slow path.
+/// Shares `emit_call_with_gc_roots` (`callbuilder.py` `emit`,
+/// `_build_cond_call_slowpath` plus the caller's gcmap); the CALL is a
+/// `CallConv::PreserveAll` direct `call` of the shared stub (`cond_call` /
+/// `CondCallSlowPath.generate_body` loads the target into a register and
+/// `CALL`s the helper).
+fn emit_cond_call_slowpath_call(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    opref_vars: &IndexMap<u32, Variable>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    func_ref: OpRef,
+    arg_refs: &[OpRef],
+    call_descr: &dyn CallDescr,
+    call_conv: cranelift_codegen::isa::CallConv,
+    ptr_type: cranelift_codegen::ir::Type,
+    jf_ptr: CValue,
+    ref_root_slots: &[(u32, usize)],
+    defined_ref_vars: &IndexSet<u32>,
+    stale_ref_vars: &IndexSet<u32>,
+    demoted_failarg_slots: &IndexMap<u32, i32>,
+    ref_root_base_ofs: i32,
+    per_call_gcmap: i64,
+    stub_addr: usize,
+) {
+    let mut stub_args: Vec<CValue> = Vec::with_capacity(1 + arg_refs.len());
+    let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
+    let func_ptr = if ptr_type != cl_types::I64 {
+        builder.ins().ireduce(ptr_type, func_ptr_raw)
+    } else {
+        func_ptr_raw
+    };
+    stub_args.push(func_ptr);
+    for &arg_ref in arg_refs {
+        let raw = resolve_opref(builder, opref_vars, constants, arg_ref);
+        stub_args.push(coerce_ty(builder, raw, cl_types::I64));
+    }
+
+    let can_collect = call_descr.get_extra_info().check_can_collect();
+    emit_call_with_gc_roots(
+        module,
+        builder,
+        opref_vars,
+        can_collect,
+        call_conv,
+        ptr_type,
+        jf_ptr,
+        ref_root_slots,
+        defined_ref_vars,
+        stale_ref_vars,
+        demoted_failarg_slots,
+        ref_root_base_ofs,
+        per_call_gcmap,
+        |module, builder| {
+            let mut stub_sig = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
+            stub_sig.params.push(AbiParam::new(ptr_type));
+            for _ in arg_refs {
+                stub_sig.params.push(AbiParam::new(cl_types::I64));
+            }
+            let name = format!("host_{stub_addr:x}");
+            let func_id = module
+                .declare_function(&name, Linkage::Import, &stub_sig)
+                .expect("cond_call_slowpath import");
+            let fref = module.declare_func_in_func(func_id, builder.func);
+            let _call = builder.ins().call(fref, &stub_args);
+        },
+    );
 }
 
 /// x86/assembler.py _cmp_guard_class:
@@ -11199,6 +11334,12 @@ pub struct CraneliftBackend {
     /// Index is `usize::from(must_save_exception)`. Each guard trampoline
     /// `JMP`s here until `patch_jump_for_descr` retargets it at a bridge.
     failure_recovery: [Option<usize>; 2],
+    /// Shared `_build_cond_call_slowpath` helpers, compiled once per backend.
+    /// Indexed by integer arity `0..=4` (`x86/regalloc.py consider_cond_call`:
+    /// `assert 2 <= len(args) <= 4 + 2`). Each helper is
+    /// `CallConv::PreserveAll` so the cond_call site clobbers no registers
+    /// (`get_regs_clobbered_by_call` → `NO_CLOBBERS`).
+    cond_call_slowpath: [Option<usize>; COND_CALL_SLOWPATH_MAX_NARGS + 1],
     module: JITModule,
     func_ctx: FunctionBuilderContext,
     /// Cranelift `Context` reused across `do_compile` and
@@ -11459,6 +11600,7 @@ impl CraneliftBackend {
             cpu_tracker: Arc::new(majit_backend::CpuTotalTracker::default()),
             asm_memory_handle,
             failure_recovery: [None, None],
+            cond_call_slowpath: [None; COND_CALL_SLOWPATH_MAX_NARGS + 1],
             module,
             func_ctx,
             clif_ctx,
@@ -12082,6 +12224,75 @@ impl CraneliftBackend {
         Ok(self.module.get_finalized_function(func_id) as usize)
     }
 
+    /// `x86/assembler.py _build_cond_call_slowpath`: one shared PreserveAll
+    /// helper per integer arity, compiled once per backend. `cond_call` /
+    /// `CondCallSlowPath.generate_body` then `CALL`s this helper so the
+    /// fast path clobbers no registers.
+    fn ensure_cond_call_slowpath(&mut self, nargs: usize) -> Result<usize, BackendError> {
+        debug_assert!(nargs <= COND_CALL_SLOWPATH_MAX_NARGS);
+        if let Some(addr) = self.cond_call_slowpath[nargs] {
+            return Ok(addr);
+        }
+        let addr = self.compile_cond_call_slowpath(nargs)?;
+        self.cond_call_slowpath[nargs] = Some(addr);
+        Ok(addr)
+    }
+
+    fn ensure_all_cond_call_slowpaths(&mut self) -> Result<(), BackendError> {
+        for nargs in 0..=COND_CALL_SLOWPATH_MAX_NARGS {
+            self.ensure_cond_call_slowpath(nargs)?;
+        }
+        Ok(())
+    }
+
+    fn compile_cond_call_slowpath(&mut self, nargs: usize) -> Result<usize, BackendError> {
+        let frontend_config = self.module.target_config();
+        let ptr_type = frontend_config.pointer_type();
+        let call_conv = frontend_config.default_call_conv;
+        let mut sig = Signature::new(cranelift_codegen::isa::CallConv::PreserveAll);
+        sig.params.push(AbiParam::new(ptr_type));
+        for _ in 0..nargs {
+            sig.params.push(AbiParam::new(cl_types::I64));
+        }
+        let name = format!("cond_call_slowpath_{nargs}");
+        let func_id = self
+            .module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+        let mut func = Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+            sig,
+        );
+        {
+            let mut func_ctx = std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
+            let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            builder.seal_block(block);
+            let params = builder.block_params(block).to_vec();
+            let func_ptr = params[0];
+            let call_args = &params[1..];
+            let mut callee_sig = Signature::new(call_conv);
+            for _ in 0..nargs {
+                callee_sig.params.push(AbiParam::new(cl_types::I64));
+            }
+            let sig_ref = builder.import_signature(callee_sig);
+            builder.ins().call_indirect(sig_ref, func_ptr, call_args);
+            builder.ins().return_(&[]);
+            builder.finalize(frontend_config);
+            self.func_ctx = func_ctx;
+        }
+        let mut ctx = self.take_clif_context(func);
+        let defined = self.module.define_function(func_id, &mut ctx);
+        self.restore_clif_context(ctx);
+        defined.map_err(|e| BackendError::CompilationFailed(format!("{e}\n{e:?}")))?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+        Ok(self.module.get_finalized_function(func_id) as usize)
+    }
+
     fn do_compile(
         &mut self,
         inputargs: &[InputArgRc],
@@ -12165,6 +12376,10 @@ impl CraneliftBackend {
         let frontend_config = self.module.target_config();
         let ptr_type = frontend_config.pointer_type();
         let call_conv = self.module.target_config().default_call_conv;
+        // Addresses must exist before FunctionBuilder borrows `self.module`
+        // (`ensure_failure_recovery` is the same once-per-backend pattern).
+        self.ensure_all_cond_call_slowpaths()?;
+        let cond_call_slowpaths = self.cond_call_slowpath;
         // The body uses CallConv::Tail so it can `return_call_indirect` to
         // another body's entry — `assembler.py closing_jump` raw
         // `JMP imm(target)` parity.  A separate `trace_N_entry` wrapper
@@ -16752,6 +16967,9 @@ impl CraneliftBackend {
                 // If condition != 0, perform the call.
                 OpCode::CondCallN => {
                     let call_block = builder.create_block();
+                    // cond_call's slow path is emitted out of line (`pending_slowpaths`);
+                    // the fast path is the test and the jump.
+                    builder.set_cold_block(call_block);
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
@@ -16781,27 +16999,51 @@ impl CraneliftBackend {
                         && let Some(call_descr) = descr.as_call_descr()
                     {
                         let call_jf = builder.ins().get_pinned_reg(ptr_type);
-                        let _ = emit_indirect_call_from_parts(
-                            module,
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                            &op.getarglist()[2..]
-                                .iter()
-                                .map(|a| a.to_opref())
-                                .collect::<Vec<_>>(),
-                            call_descr,
-                            call_conv,
-                            ptr_type,
-                            call_jf,
-                            &live_ref_root_raw,
-                            &defined_ref_vars,
-                            &stale_ref_vars,
-                            &demoted_failarg_slots,
-                            ref_root_base_ofs,
-                            per_call_gcmap,
-                        );
+                        let func_ref = op.arg(1).to_opref();
+                        let arg_refs: Vec<OpRef> =
+                            op.getarglist()[2..].iter().map(|a| a.to_opref()).collect();
+                        if let Some(nargs) = cond_call_slowpath_nargs(call_descr) {
+                            let stub_addr = cond_call_slowpaths[nargs]
+                                .expect("cond_call_slowpath compiled before FunctionBuilder");
+                            emit_cond_call_slowpath_call(
+                                module,
+                                &mut builder,
+                                &opref_var_map,
+                                &constants,
+                                func_ref,
+                                &arg_refs,
+                                call_descr,
+                                call_conv,
+                                ptr_type,
+                                call_jf,
+                                &live_ref_root_raw,
+                                &defined_ref_vars,
+                                &stale_ref_vars,
+                                &demoted_failarg_slots,
+                                ref_root_base_ofs,
+                                per_call_gcmap,
+                                stub_addr,
+                            );
+                        } else {
+                            let _ = emit_indirect_call_from_parts(
+                                module,
+                                &mut builder,
+                                &opref_var_map,
+                                &constants,
+                                func_ref,
+                                &arg_refs,
+                                call_descr,
+                                call_conv,
+                                ptr_type,
+                                call_jf,
+                                &live_ref_root_raw,
+                                &defined_ref_vars,
+                                &stale_ref_vars,
+                                &demoted_failarg_slots,
+                                ref_root_base_ofs,
+                                per_call_gcmap,
+                            );
+                        }
                         jf_ptr = emit_reload_frame_if_necessary(
                             module,
                             &mut builder,
@@ -16831,6 +17073,8 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let call_block = builder.create_block();
+                    // Same out-of-line slow path as COND_CALL (`genop_cond_call_value_i`).
+                    builder.set_cold_block(call_block);
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);

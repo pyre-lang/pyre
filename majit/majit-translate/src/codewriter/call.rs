@@ -3028,6 +3028,28 @@ impl StoreCore {
         Some(std::rc::Rc::make_mut(&mut built.graph))
     }
 
+    /// [`Self::get_built_mut`] for a shared store (`&self`).
+    ///
+    /// Phase B holds `&GraphStore` (`Rc<StoreCore>`). `Rc::make_mut` on
+    /// the slot and on the graph copies a pending lift's still-shared
+    /// body (`FunctionDesc::source_graph`) so that lift keeps the uncut
+    /// graph.
+    pub(crate) fn with_built_mut<R>(
+        &self,
+        path: &CallPath,
+        f: impl FnOnce(&mut FunctionGraph) -> R,
+    ) -> Option<R> {
+        let _ = self.get(path)?;
+        self.register_declared();
+        let key = self.path_to_key.borrow().get(path)?.clone();
+        let mut graphs = self.graphs.borrow_mut();
+        let slot = graphs.get_mut(&key)?;
+        let slot = std::rc::Rc::make_mut(slot);
+        let built = slot.graph.get_mut()?.as_mut()?;
+        let graph = std::rc::Rc::make_mut(&mut built.graph);
+        Some(f(graph))
+    }
+
     /// The declaration of the funcobj `path` names when it came from the
     /// front end's declarations, read without building its graph.
     pub(crate) fn declared_funcobj(&self, path: &CallPath) -> Option<std::rc::Rc<FunctionGraph>> {

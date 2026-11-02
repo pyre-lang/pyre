@@ -755,6 +755,382 @@ fn flavor_raw_ptr_narrow_from_unit_emits_cast_instance() {
     );
 }
 
+/// `*mut RegisteredGc as *mut GCREFOpaque` is `rgc.cast_instance_to_gcref`:
+/// UnaryOp Cast RawPtr and Rvalue PtrToPtr both emit
+/// `__cast_instance_intrinsic("GCREF")`, whose result annotates
+/// `lltype_to_annotation(GCREF)` (`SomePtr`).
+#[test]
+fn classed_gc_ptr_as_gcref_emits_cast_instance_to_gcref() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::annotator::model::{SomeInstance, SomeValue};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let storage_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [storage_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let storage = type_decl_struct(0, &["fixture", "GcStorage"], vec![]);
+    let gcref = type_decl_struct(1, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_to_gcref",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_to_gcref",
+        serde_json::json!({"Cast": [
+            "PtrToPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [storage, gcref],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0), gctype_impl_row(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_gcref_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| crate::model::cast_instance_root(&op.kind) == Some("GCREF"))
+        })
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_to_gcref")
+        .expect("lower UnaryOp Cast to *mut GCREFOpaque");
+    assert!(
+        is_gcref_cast(&unary_graph),
+        "UnaryOp Cast classed GC as GCREF emits __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_to_gcref")
+        .expect("lower Rvalue PtrToPtr to *mut GCREFOpaque");
+    assert!(
+        is_gcref_cast(&rvalue_graph),
+        "Rvalue::Cast PtrToPtr classed GC as GCREF emits __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        rvalue_graph.dump()
+    );
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted =
+        function_graph_to_flowspace(&unary_graph, &registry).expect("lift classed GC as GCREF");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let start = lifted.graph.borrow().startblock.clone();
+    let n_inputs = start.borrow().inputargs.len();
+    let classdef = ClassDef::new_standalone("fixture::GcStorage", None);
+    let s_inst = SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
+    let cells: Vec<Option<SomeValue>> = (0..n_inputs).map(|_| Some(s_inst.clone())).collect();
+    ann.addpendingblock(&lifted.graph, &start, &cells);
+    ann.complete_pending_blocks()
+        .expect("classed GC as GCREF must annotate");
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    let want = crate::translator::rtyper::llannotation::lltype_to_annotation(
+        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    );
+    assert!(
+        matches!(s_ret, SomeValue::Ptr(_)),
+        "classed GC as GCREF must annotate SomePtr(GCREF), got {s_ret:?}"
+    );
+    assert_eq!(
+        s_ret, want,
+        "classed GC as GCREF must be lltype_to_annotation(GCREF)"
+    );
+}
+
+/// `p as usize as *mut GCREFOpaque` is `annlowlevel.py`
+/// `cast_instance_to_gcref`: recovery folds the int round-trip back to
+/// the classed orig, and dest-GCREF erase keys that orig's type.
+/// A sibling recovering onto the same classed dest omits the identity
+/// recast (`rclass.py` `getinstancerepr` / `source_named_instance_root`).
+#[test]
+fn classed_gc_ptr_usize_roundtrip_to_gcref_emits_cast_instance_to_gcref() {
+    use crate::model::{LinkArg, OpKind};
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let storage_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let gcref_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [storage_adt, "Mut"]});
+    let gcref_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let word_ty = usize_ty();
+    let storage = type_decl_struct(0, &["fixture", "GcStorage"], vec![]);
+    let gcref = type_decl_struct(1, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let roundtrip = |def_id: u64, name: &str, dest_ty: &serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()},
+                    {"index": 2, "name": "addr", "span": span, "ty": word_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                place(2, &word_ty),
+                                {"UnaryOp": [
+                                    {"Cast": {"Scalar": [src_ty.clone(), word_ty.clone()]}},
+                                    {"Move": place(1, &src_ty)}
+                                ]}
+                            ]}
+                        },
+                        {
+                            "span": span,
+                            "kind": {"Assign": [
+                                place(0, dest_ty),
+                                {"UnaryOp": [
+                                    {"Cast": {"PtrWithExposedProvenance": dest_ty.clone()}},
+                                    {"Move": place(2, &word_ty)}
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [storage, gcref],
+            "fun_decls": [
+                roundtrip(0, "to_gcref", &gcref_ty),
+                roundtrip(1, "to_classed", &src_ty)
+            ],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0), gctype_impl_row(1)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let input_named = |graph: &crate::model::FunctionGraph, name: &str| {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Input { name: n, .. } if n == name => op.result.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("Input {name}"))
+    };
+    let gcref_graph =
+        super::lower_function(&llbc, "to_gcref").expect("lower p as usize as *mut GCREFOpaque");
+    let orig = input_named(&gcref_graph, "p");
+    let gcref_ops: Vec<_> = gcref_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| crate::model::cast_instance_root(&op.kind) == Some("GCREF"))
+        .collect();
+    assert_eq!(
+        gcref_ops.len(),
+        1,
+        "usize round-trip onto GCREF emits one __cast_instance_intrinsic(\"GCREF\"); graph={}",
+        gcref_graph.dump()
+    );
+    let OpKind::Call { args, .. } = &gcref_ops[0].kind else {
+        panic!(
+            "__cast_instance_intrinsic(\"GCREF\") is a Call; graph={}",
+            gcref_graph.dump()
+        );
+    };
+    assert_eq!(
+        args.first().and_then(LinkArg::as_variable),
+        Some(&orig),
+        "dest-GCREF erase consumes the recovered orig, not the usize; graph={}",
+        gcref_graph.dump()
+    );
+
+    let classed_graph =
+        super::lower_function(&llbc, "to_classed").expect("lower p as usize as *mut GcStorage");
+    let roots: Vec<&str> = classed_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert!(
+        roots.iter().all(|root| !root.contains("GcStorage")),
+        "identity recast onto the same class is omitted (`rclass.py` `getinstancerepr`); graph={} roots={roots:?}",
+        classed_graph.dump()
+    );
+    assert!(
+        roots.iter().all(|root| *root != "GCREF"),
+        "classed dest is not dest-GCREF erase; graph={} roots={roots:?}",
+        classed_graph.dump()
+    );
+}
+
+/// `w_weakref_new`: `&mut x as *mut PyObjectRef as *mut GCREF` is a
+/// pointer to a GCREF cell (`rffi.CArrayPtr(GCREF)`), not `llmemory.GCREF`.
+#[test]
+fn mut_instance_ref_as_mut_gcref_does_not_emit_cast_instance_to_gcref() {
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "builtin": null, "generics": empty_g.clone()}
+        })
+    };
+    let instance_adt = adt(0);
+    let instance_ref_adt = adt(1);
+    let gcref_adt = adt(3);
+    let x_ty = instance_ref_adt.clone();
+    let tmp_ty = serde_json::json!({"RawPtr": [instance_ref_adt, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [gcref_adt, "Mut"]});
+    let instance = type_decl_struct(0, &["pyobject", "PyObject"], vec![]);
+    let instance_ref = type_decl_alias(
+        1,
+        &["pyobject", "PyObjectRef"],
+        serde_json::json!({"RawPtr": [instance_adt, "Mut"]}),
+    );
+    let gcrefopaque = type_decl_struct(2, &["majit_gc", "header", "GCREFOpaque"], vec![]);
+    let gcref = type_decl_alias(
+        3,
+        &["majit_gc", "header", "GCREF"],
+        serde_json::json!({"RawPtr": [adt(2), "Mut"]}),
+    );
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "rooted_slot_as_gcref"])),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [x_ty.clone()],
+            "output": dest_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                {"index": 1, "name": "x", "span": span, "ty": x_ty.clone()},
+                {"index": 2, "name": "tmp", "span": span, "ty": tmp_ty.clone()}
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(2, &tmp_ty),
+                            {"RawPtr": {
+                                "place": place(1, &x_ty),
+                                "kind": "Mut",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    },
+                    {
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [tmp_ty.clone(), dest_ty.clone()]}},
+                                {"Move": place(2, &tmp_ty)}
+                            ]}
+                        ]}
+                    }
+                ],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [instance, instance_ref, gcrefopaque, gcref],
+            "fun_decls": [fun],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0), gctype_impl_row(2)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "rooted_slot_as_gcref")
+        .expect("lower &mut PyObjectRef as *mut GCREF");
+    let roots: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert!(
+        roots.iter().all(|root| *root != "GCREF"),
+        "&mut x as *mut PyObjectRef as *mut GCREF must not emit __cast_instance_intrinsic(\"GCREF\"); graph={} roots={roots:?}",
+        graph.dump()
+    );
+}
+
 /// `shadow_stack_get(slot) as *mut Utf8Str`: GCREF / `PyObjectRef` recast
 /// onto rstr `STR`. UnaryOp Cast and Rvalue RawPtr both emit
 /// `__cast_instance_intrinsic` with a Utf8Str-family root and
@@ -12266,11 +12642,30 @@ pub(in crate::front::mir) fn kwargs_unerase_ptr_tys() -> (serde_json::Value, ser
 }
 
 fn kwargs_unerase_type_decls() -> Vec<serde_json::Value> {
+    let gcrefopaque_adt = serde_json::json!({
+        "Adt": {"id": 0, "generics": empty_generics()}
+    });
     vec![
         type_decl_struct(0, &["majit_gc", "header", "GCREFOpaque"], vec![]),
         type_decl_struct(1, &["fixture", "PyObject"], vec![]),
         type_decl_struct(2, &["alloc", "vec", "Vec"], vec![]),
+        // `llmemory.py` `GCREF = lltype.Ptr(GCREFOpaque)`.
+        type_decl_alias(
+            3,
+            &["majit_gc", "header", "GCREF"],
+            serde_json::json!({"RawPtr": [gcrefopaque_adt, "Mut"]}),
+        ),
     ]
+}
+
+pub(in crate::front::mir) fn type_decl_alias(
+    id: u64,
+    path: &[&str],
+    aliased: serde_json::Value,
+) -> serde_json::Value {
+    let mut decl = type_decl_struct(id, path, vec![]);
+    decl["kind"] = serde_json::json!({"Alias": aliased});
+    decl
 }
 
 fn gctype_impl_row(self_id: u64) -> serde_json::Value {

@@ -2035,12 +2035,9 @@ pub fn w_module_dict_new() -> PyObjectRef {
         dict_strategy_ref_gc_type_id(),
     );
     let strategy_ref_slot = roots.publish(&[strategy_ref as PyObjectRef]);
-    let storage = unsafe {
-        crate::gc_storage::gc_alloc_young_storage_box(
-            (*strategy).get_empty_storage(),
-            crate::celldict::module_dict_storage_gc_type_id(),
-        )
-    };
+    // `dictmultiobject.py` `W_DictMultiObject.allocate_and_init_instance`:
+    // `storage = strategy.get_empty_storage()`.
+    let storage = unsafe { DictStrategy::get_empty_storage(&*strategy) };
     let storage_slot = roots.publish(&[storage as PyObjectRef]);
     crate::lltype::malloc_typed_stable(W_ModuleDictObject {
         ob_header: PyObject {

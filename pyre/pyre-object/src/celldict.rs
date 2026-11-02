@@ -1051,16 +1051,6 @@ impl ModuleDictStrategy {
         *cache_registry = None;
     }
 
-    /// `celldict.py get_empty_storage`:
-    ///
-    /// ```python
-    /// def get_empty_storage(self):
-    ///     return self.erase({})
-    /// ```
-    pub fn get_empty_storage(&self) -> ModuleDictStorage {
-        ModuleDictStorage::default()
-    }
-
     /// `celldict.py mutated`:
     ///
     /// ```python
@@ -1354,10 +1344,16 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         crate::dictmultiobject::StrategyKind::Module
     }
 
-    /// `celldict.py get_empty_storage` — pyre owns the
-    /// `ModuleDictStorage` directly (no `rerased` indirection); return
-    /// the storage as an erased `GCREF` so the trait surface stays
-    /// strategy-agnostic.
+    /// `celldict.py get_empty_storage`:
+    ///
+    /// ```python
+    /// def get_empty_storage(self):
+    ///     return self.erase({})
+    /// ```
+    ///
+    /// Pyre owns the `ModuleDictStorage` directly (no `rerased`
+    /// indirection); return the storage as an erased `GCREF` so the
+    /// trait surface stays strategy-agnostic.
     fn get_empty_storage(&self) -> crate::gc_hook::GCREF {
         // `celldict.py get_empty_storage`: `self.erase({})` is a nursery
         // `dicttable`. A `malloc_raw` table has no MiniMark header, so

@@ -53,8 +53,8 @@ use std::rc::Rc;
 use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
-    AlwaysInline, Block, BlockRefExt, ConstValue, Constant, GraphFunc, GraphKey, GraphRef, Hlvalue,
-    Link, Variable,
+    AlwaysInline, Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, GraphFunc,
+    GraphKey, GraphRef, HOST_ENV, Hlvalue, HostObject, Link, Variable,
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::model::FunctionGraph as LegacyGraph;
@@ -321,7 +321,7 @@ pub(crate) fn dual_gate_check_with_registry(
         drive_subject(legacy_graph, call_registry, true)
     }));
     let (graph, real_value_to_var, real_constants) = match result {
-        Ok(Ok((graph, value_to_var, _, constants, _))) => (graph, value_to_var, constants),
+        Ok(Ok((graph, value_to_var, _, constants, _, _))) => (graph, value_to_var, constants),
         Ok(Err(e)) => {
             unpoison_failed_subject_callees(call_registry, &session_at_entry, lift_sources, true);
             let msg = format!("{e}");
@@ -1405,9 +1405,10 @@ fn collect_divergences_on(
         // walker keeps the boxed `Result` as `GcRef`, while the real path
         // types the extracted unit `Void`.  A `Void` value has no boxed
         // consumer — nothing reads the dropped `GcRef` slot as a pointer.
-        // `real=Void` is a positive `()` result (the `None | Some("()")`
-        // return-type arm), never the `Unknown` "real path did not type
-        // it" default, so accepting it does not admit an untyped slot.
+        // `real=Void` is a positive `()` result (the `Some("()")`
+        // declared-unit return-type arm), never the `Unknown` "real path
+        // did not type it" default, so accepting it does not admit an
+        // untyped slot.
         //
         // Scoped to `legacy=GcRef` only: a `legacy=Signed` slot the real
         // path types `Void` is NOT accepted — the legacy walker's scalar
@@ -2373,6 +2374,10 @@ fn install_source_graph(
         // root (`rlib/signature.py` `returns=types.instance(...)`), so
         // a `ref` token with `return_class_root` is `SomeInstance`
         // of that classdef rather than the classdef-less shell.
+        // A declared Void / `()` result is `s_None` through
+        // `residual_return_annotation` → `default_someshell_for_lltype`
+        // (`extfunc.py` `register_external` result `None` → `s_None`).
+        // A missing token (Unknown) falls through that helper.
         let result_shell = if is_exception_object_materializer(&semantic_key) {
             residual_stub_result_shell(
                 &semantic_key,
@@ -3078,6 +3083,8 @@ pub(crate) fn build_stub_pygraph_for_lltype(
     signature: Signature,
     return_lltype: LowLevelType,
 ) -> Option<Rc<PyGraph>> {
+    // Void is `s_None` (`llannotation.py` `lltype_to_annotation(Void)`,
+    // `extfunc.py` `register_external` result `None` → `s_None`).
     let return_someval = default_someshell_for_lltype(&return_lltype)?;
     Some(build_stub_pygraph_with_result_shell(
         name,
@@ -3221,6 +3228,15 @@ fn residual_return_annotation(
     token: Option<&str>,
     bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Option<crate::annotator::model::SomeValue> {
+    // `extfunc.py` `register_external(..., result=None)` /
+    // `signature.py` `_compute_annotation` (`NoneType` → `s_None`) /
+    // `llannotation.py` `lltype_to_annotation(Void)` = `s_None`.
+    // `"()"` is the declared-unit FUNC.RESULT token
+    // (`dont_look_inside_return_token`). `None` is unknown and falls
+    // through — an undeclared result is not typed as `s_None`.
+    if token == Some("()") {
+        return default_someshell_for_lltype(&LowLevelType::Void);
+    }
     if token == Some(GCREF_RETURN_TYPE) {
         // `llmemory.GCREF` stays `SomePtr`. A `PyObjectRef` residual uses
         // `"ref"` + `return_class_root` (`declared_return_annotation`,
@@ -3656,6 +3672,10 @@ pub(crate) fn register_unsafe_fn_stubs(
             // Charon `name_path()` spelling onto that FunctionDesc.
             continue;
         }
+        // A declared Void / `()` token is `s_None` through
+        // `residual_return_annotation` → `default_someshell_for_lltype`
+        // (`extfunc.py` `register_external` result `None` → `s_None`).
+        // A missing token (Unknown) falls through that helper.
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
             .or_else(|| {
                 function_graphs.and_then(|store| {
@@ -4225,7 +4245,9 @@ pub(crate) fn register_atomic_load_llexternals(
 /// panic the Method form would surface).
 ///
 /// The result shell comes from the per-method faithful `ValueType` the
-/// collector read off the LLBC output signature — a `Ref(None)`
+/// collector read off the LLBC output signature — `s_None` for a `()` /
+/// Void result (`extfunc.py` `register_external` result `None` →
+/// `s_None`, via [`default_someshell_for_lltype`]), a `Ref(None)`
 /// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
 /// `bigint_from`), `s_str0()` (`annotator/model.py` `SomeString`) for a
 /// str-family result (`is_str_family_class_root`: rust-heap `String`,
@@ -4256,7 +4278,11 @@ pub(crate) fn register_foreign_opaque_method_externals(
 
 /// Annotator shell for a harvested foreign-opaque residual result.
 ///
-/// `valuetype_to_someshell(Ref)` always drops the classdef
+/// A `()` / Void result is `s_None` (`extfunc.py` `register_external`
+/// result `None` → `s_None`, `llannotation.py` `lltype_to_annotation(Void)`),
+/// reused from [`default_someshell_for_lltype`]. `valuetype_to_someshell(Void)`
+/// is the bottom projector other consumers read and is not the call-result
+/// shell. `valuetype_to_someshell(Ref)` always drops the classdef
 /// (`annotation_state.rs`), which is the right shell for an opaque
 /// `BigInt` return.  A str-family result (`is_str_family_class_root`:
 /// rust-heap `String`, `Wtf8Buf`, …) is `s_str0()` (`annotator/model.py`
@@ -4274,6 +4300,12 @@ fn foreign_opaque_method_return_shell(
     registry: &CallRegistry,
     result_ty: &crate::model::ValueType,
 ) -> Option<crate::annotator::model::SomeValue> {
+    // `extfunc.py` `register_external(..., result=None)` /
+    // `signature.py` `_compute_annotation` (`NoneType` → `s_None`) /
+    // `llannotation.py` `lltype_to_annotation(Void)` = `s_None`.
+    if matches!(result_ty, crate::model::ValueType::Void) {
+        return default_someshell_for_lltype(&LowLevelType::Void);
+    }
     if let crate::model::ValueType::Ref(Some(root)) = result_ty {
         if crate::front::mir::is_str_family_class_root(root) {
             return Some(crate::annotator::model::s_str0());
@@ -4342,7 +4374,7 @@ pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
 ) -> Result<(LegacyToTyped, HashMap<Variable, LowLevelType>), TyperError> {
-    let (_graph, value_to_var, _value_to_var_candidates, constant_concretetypes, _) =
+    let (_graph, value_to_var, _value_to_var_candidates, constant_concretetypes, _, _) =
         drive_subject(legacy, call_registry, true)?;
     Ok((value_to_var, constant_concretetypes))
 }
@@ -4362,6 +4394,7 @@ type DrivenSubject = (
     LegacyToTypedCandidates,
     HashMap<Variable, LowLevelType>,
     HashMap<Variable, Hlvalue>,
+    HashMap<crate::model::BlockId, BlockRef>,
 );
 
 fn subject_with_pygraph(
@@ -4373,16 +4406,24 @@ fn subject_with_pygraph(
     LegacyToTypedCandidates,
     HashMap<Variable, LowLevelType>,
     HashMap<Variable, Hlvalue>,
+    HashMap<crate::model::BlockId, BlockRef>,
     Option<Rc<PyGraph>>,
 ) {
-    let (graph, value_to_var, value_to_var_candidates, constant_concretetypes, constant_hlvalues) =
-        driven;
+    let (
+        graph,
+        value_to_var,
+        value_to_var_candidates,
+        constant_concretetypes,
+        constant_hlvalues,
+        block_map,
+    ) = driven;
     (
         graph,
         value_to_var,
         value_to_var_candidates,
         constant_concretetypes,
         constant_hlvalues,
+        block_map,
         pygraph,
     )
 }
@@ -4398,16 +4439,7 @@ fn drive_subject(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
     do_rtype: bool,
-) -> Result<
-    (
-        crate::flowspace::model::GraphRef,
-        LegacyToTyped,
-        LegacyToTypedCandidates,
-        HashMap<Variable, LowLevelType>,
-        HashMap<Variable, Hlvalue>,
-    ),
-    TyperError,
-> {
+) -> Result<DrivenSubject, TyperError> {
     let lifted = crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace(
         legacy,
         call_registry,
@@ -4424,16 +4456,7 @@ fn drive_lifted_subject(
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
     do_rtype: bool,
     lifted: FlowspaceAdapterOutput,
-) -> Result<
-    (
-        crate::flowspace::model::GraphRef,
-        LegacyToTyped,
-        LegacyToTypedCandidates,
-        HashMap<Variable, LowLevelType>,
-        HashMap<Variable, Hlvalue>,
-    ),
-    TyperError,
-> {
+) -> Result<DrivenSubject, TyperError> {
     // RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -4454,7 +4477,7 @@ fn drive_lifted_subject(
         value_to_var_candidates,
         mut constant_concretetypes,
         mut constant_hlvalues,
-        ..
+        block_map,
     } = lifted;
 
     // Same buildflowgraph stage as the cached-callee path above. Do not wait
@@ -4632,12 +4655,15 @@ fn drive_lifted_subject(
     // dont_simplify_again=False)` (rtyper.py):
     //
     //   1. `if not dont_simplify_again: self.annotator.simplify()`
-    //      — pyre per-subject flow keeps the annotator-wide
-    //        simplification and extra-pass work skipped: the subject was
+    //      — the fused per-subject path (`do_rtype = true`) keeps the
+    //        annotator-wide simplification skipped here: the subject was
     //        lifted via the adapter and its block list is already in
     //        canonical shape.  `transform_allocate` is applied per block
     //        immediately before specialization instead (see
-    //        `specialize_block`).
+    //        `specialize_block`).  Two-phase Phase B runs
+    //        `RPythonAnnotator.simplify` once over the annotated set
+    //        (`run_annotator_simplify_isolated`) before rtype, matching
+    //        `RPythonTyper.specialize`.
     //   2. `self.exceptiondata.finish(self)` — hoisted into
     //      `CallRegistry::ensure_session` so it runs **once** at
     //      session start (idempotent — `getclassrepr` is cached on
@@ -4718,6 +4744,7 @@ fn drive_lifted_subject(
         value_to_var_candidates,
         constant_concretetypes,
         constant_hlvalues,
+        block_map,
     ))
 }
 
@@ -4965,6 +4992,7 @@ fn drive_access_direct_subject(
             lifted.value_to_var_candidates,
             lifted.constant_concretetypes,
             lifted.constant_hlvalues,
+            lifted.block_map,
         )
     } else {
         drive_lifted_subject(legacy, call_registry, false, lifted)?
@@ -5532,6 +5560,7 @@ fn run_two_phase_prepass_inner(
                 value_to_var_candidates,
                 constant_concretetypes,
                 constant_hlvalues,
+                block_map,
                 pygraph,
             ))) => {
                 call_registry.two_phase().subjects.insert(
@@ -5544,6 +5573,7 @@ fn run_two_phase_prepass_inner(
                         value_to_var_candidates,
                         constant_concretetypes,
                         constant_hlvalues,
+                        block_map,
                     },
                 );
             }
@@ -5648,7 +5678,7 @@ fn run_two_phase_prepass_inner(
     // ── Phase B — rtype-all with per-graph isolation ─────────────────
     // Writes its rtype_skipped set into the cache incrementally so partial
     // progress survives even if this call is cut short.
-    run_phase_b_rtype_isolated(call_registry, determinism_trace, &paths);
+    run_phase_b_rtype_isolated(call_registry, determinism_trace, &paths, function_graphs);
 }
 
 /// Phase B: rtype every annotated block in one whole-program pass, tolerant of
@@ -5666,6 +5696,7 @@ fn run_phase_b_rtype_isolated(
     call_registry: &CallRegistry,
     determinism_trace: bool,
     paths: &[&crate::parse::CallPath],
+    function_graphs: &crate::codewriter::call::GraphStore,
 ) {
     use crate::flowspace::model::{BlockRef, GraphKey, GraphRef};
     let Ok((annotator, rtyper)) = call_registry.ensure_session() else {
@@ -5689,120 +5720,16 @@ fn run_phase_b_rtype_isolated(
     // Exists to localise prepass nondeterminism (gh#1139).
     let mut phase_b_traced = determinism_trace.then(Vec::new);
 
-    // Upstream `RPythonTyper.specialize()` step 1 (rtyper.py):
-    // `if not dont_simplify_again: self.annotator.simplify()`. pyre's
-    // per-subject annotate-half (`drive_subject`) skips the annotator-wide
-    // simplify, so a graph's constant-folded dead arms stay structurally
-    // linked into Phase B. The annotator never followed those links — a
-    // constant exitswitch makes the mismatched-exitcase arm carry
-    // `s_ImpossibleValue` through `follow_link`, which returns before
-    // `links_followed[link] = True` (annrpython.rs:1762-1768), leaving the
-    // arm's target unannotated — but the surviving structural link reaches
-    // `specialize_block` → `insert_link_conversions` → `bindingrepr`, which
-    // then KeyErrors on the dead target's unbound inputargs.
-    //
-    // Run `transform_dead_code` (transform.py) once over the whole
-    // fully-annotated block set here: it is the simplify pass that prunes
-    // links absent from `links_followed`, folding a const switch back to a
-    // plain goto. It is a no-op on graphs whose every exit was followed, so
-    // healthy graphs are untouched. Per-block panic isolation:
-    // `cutoff_alwaysraising_block`'s consistency asserts can fire on an
-    // unrelated malformed always-raising block; isolating each block keeps
-    // one such graph from aborting dead-code removal for the rest (that
-    // graph then fails its own rtype below and Skips, unchanged).
-    {
-        use crate::flowspace::model::BlockKey;
-        use crate::translator::transform::{
-            cutoff_block_trace, fully_annotated_blocks, transform_dead_code, transform_dead_op_vars,
-        };
-        let annotated_blocks = fully_annotated_blocks(&annotator);
-
-        if determinism_trace {
-            use md5::{Digest, Md5};
-
-            let graph_names: Vec<String> = {
-                let annotated = annotator.annotated.borrow();
-                annotated_blocks
-                    .iter()
-                    .map(|block| {
-                        annotated
-                            .get(&BlockKey::of(block))
-                            .and_then(|graph| graph.as_ref())
-                            .map(|graph| graph.borrow().name.clone())
-                            .unwrap_or_else(|| "<unowned>".to_string())
-                    })
-                    .collect()
-            };
-            let mut digest = Md5::new();
-            for name in &graph_names {
-                digest.update((name.len() as u64).to_le_bytes());
-                digest.update(name.as_bytes());
-            }
-            eprintln!(
-                "[DTRACE-CUTSET] count={} md5={:x} first={:?}",
-                graph_names.len(),
-                digest.finalize(),
-                &graph_names[..graph_names.len().min(20)],
-            );
-        }
-
-        // Pass 1 — `transform_dead_code` (transform.py): prune the
-        // unfollowed const-switch dead arms. Per-block panic isolation
-        // (`cutoff_alwaysraising_block`'s consistency asserts can fire on an
-        // unrelated malformed always-raising block).
-        let mut cutoff_panics = 0usize;
-        for block in &annotated_blocks {
-            let trace = determinism_trace.then(|| cutoff_block_trace(&annotator, block));
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                transform_dead_code(&annotator, std::slice::from_ref(block));
-            }));
-            if let Err(payload) = result {
-                cutoff_panics += 1;
-                if let Some(trace) = trace {
-                    let payload = crate::annotator::model::panic_payload_text(&*payload)
-                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
-                    eprintln!("[DTRACE-CUTPANIC] {trace} payload={payload:?}");
-                }
-            }
-        }
-        if determinism_trace {
-            eprintln!("[DTRACE-CUTPANIC] total={cutoff_panics}");
-        }
-
-        // Pass 2 — `transform_dead_op_vars` (simplify.py, transform.py):
-        // drop dead ops and, crucially, dead inputargs together with their
-        // matching link args. This is the remaining half of upstream
-        // `specialize()` step-1 `simplify()` that the per-subject flow also
-        // skipped: removing a never-read merge inputarg clears the unbound
-        // operand the rtyper would otherwise `binding`-KeyError on. Grouped
-        // per owning graph and panic-isolated — the pass is whole-subgraph
-        // dataflow (its link-arity assert can fire on a malformed graph), so a
-        // single bad graph must not abort the drain for the rest; that graph
-        // then fails its own rtype below and Skips, unchanged.
-        let mut order: Vec<GraphKey> = Vec::new();
-        let mut by_graph: HashMap<GraphKey, Vec<BlockRef>> = HashMap::new();
-        {
-            let annotated = annotator.annotated.borrow();
-            for block in &annotated_blocks {
-                if let Some(Some(g)) = annotated.get(&BlockKey::of(block)) {
-                    let gk = GraphKey::of(g);
-                    by_graph
-                        .entry(gk.clone())
-                        .or_insert_with(|| {
-                            order.push(gk.clone());
-                            Vec::new()
-                        })
-                        .push(block.clone());
-                }
-            }
-        }
-        for gk in &order {
-            let group = &by_graph[gk];
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                transform_dead_op_vars(&annotator, group);
-            }));
-        }
-    }
+    // Upstream `RPythonTyper.specialize` step 1 (`rtyper.py`):
+    // `if not dont_simplify_again: self.annotator.simplify()`.
+    // `RPythonAnnotator.simplify` (`annrpython.py`) runs `transform_graph`
+    // (`transform_dead_code` → extra_passes → `transform_dead_op_vars`
+    // + `checkgraphs`) then `eliminate_empty_blocks`. A `block_subset`
+    // skips `perform_normalizations` — inheritance ids were assigned
+    // above. A `transform_graph` panic fails that graph's Phase B
+    // (`rtype_skipped`) the same way any other rtype failure does.
+    run_annotator_simplify_isolated(&annotator, call_registry, determinism_trace);
+    apply_tdc_cut_to_graphstore(call_registry, function_graphs);
 
     loop {
         // Skip-tolerant repr setup: a single unported repr (e.g. DictRepr)
@@ -5988,6 +5915,321 @@ fn run_phase_b_rtype_isolated(
     // MixLevelHelperAnnotator drain (rtyper.py:238-241) is a no-op while R4 is
     // unported — specialize_block never queues helper graphs today. When R4
     // lands, take()+finish() rtyper.annmixlevel here.
+}
+
+/// `RPythonTyper.specialize` step 1: `self.annotator.simplify()`.
+///
+/// One call over `fully_annotated_blocks`. `block_subset is not None`
+/// skips `perform_normalizations` (`annrpython.py RPythonAnnotator.simplify`).
+/// A panic is retried per owning graph and recorded in `rtype_skipped`.
+fn run_annotator_simplify_isolated(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    call_registry: &CallRegistry,
+    determinism_trace: bool,
+) {
+    use crate::translator::transform::fully_annotated_blocks;
+    let annotated_blocks = fully_annotated_blocks(annotator);
+
+    if determinism_trace {
+        use md5::{Digest, Md5};
+
+        let graph_names: Vec<String> = {
+            let annotated = annotator.annotated.borrow();
+            annotated_blocks
+                .iter()
+                .map(|block| {
+                    annotated
+                        .get(&BlockKey::of(block))
+                        .and_then(|graph| graph.as_ref())
+                        .map(|graph| graph.borrow().name.clone())
+                        .unwrap_or_else(|| "<unowned>".to_string())
+                })
+                .collect()
+        };
+        let mut digest = Md5::new();
+        for name in &graph_names {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+        }
+        eprintln!(
+            "[DTRACE-CUTSET] count={} md5={:x} first={:?}",
+            graph_names.len(),
+            digest.finalize(),
+            &graph_names[..graph_names.len().min(20)],
+        );
+    }
+
+    let whole = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        annotator.simplify(Some(&annotated_blocks), None);
+    }));
+    if whole.is_ok() {
+        return;
+    }
+
+    let mut order: Vec<GraphKey> = Vec::new();
+    let mut by_graph: HashMap<GraphKey, (GraphRef, Vec<BlockRef>)> = HashMap::new();
+    {
+        let annotated = annotator.annotated.borrow();
+        for block in &annotated_blocks {
+            if let Some(Some(g)) = annotated.get(&BlockKey::of(block)) {
+                let gk = GraphKey::of(g);
+                by_graph
+                    .entry(gk.clone())
+                    .or_insert_with(|| {
+                        order.push(gk.clone());
+                        (g.clone(), Vec::new())
+                    })
+                    .1
+                    .push(block.clone());
+            }
+        }
+    }
+    let mut simplify_fail = 0usize;
+    for gk in &order {
+        let (gref, group) = &by_graph[gk];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            annotator.simplify(Some(group), None);
+        }));
+        if let Err(payload) = result {
+            simplify_fail += 1;
+            call_registry.two_phase().rtype_skipped.insert(gk.clone());
+            if rtyper_verbose_enabled() {
+                let gname = gref.borrow().name.clone();
+                eprintln!(
+                    "[PREPASS phaseB fail] {:?} {gname}: simplify PANIC: {}",
+                    gk,
+                    unwind_panic_text(&*payload)
+                );
+            }
+        }
+    }
+    if rtyper_verbose_enabled() {
+        eprintln!("[PREPASS simplify fail] count={simplify_fail}");
+    }
+}
+
+/// Copy `transform_dead_code` / `cutoff_alwaysraising_block` from each
+/// subject's flowspace graph onto the GraphStore `FunctionGraph` the
+/// comparer and `dual_gate_publish_concretetypes` read. Correspondence
+/// is `function_graph_to_flowspace_inner` `block_map`.
+fn apply_tdc_cut_to_graphstore(
+    call_registry: &CallRegistry,
+    function_graphs: &crate::codewriter::call::GraphStore,
+) {
+    let mut seen: HashSet<crate::model::GraphKey> = HashSet::new();
+    let jobs: Vec<(
+        crate::parse::CallPath,
+        GraphRef,
+        HashMap<crate::model::BlockId, BlockRef>,
+        LegacyToTyped,
+    )> = {
+        let tp = call_registry.two_phase();
+        tp.subjects
+            .iter()
+            .filter(|(_, subject)| !tp.rtype_skipped.contains(&subject.graph_key))
+            .filter(|(_, subject)| !subject.block_map.is_empty())
+            .map(|(path, subject)| {
+                (
+                    path.clone(),
+                    subject.graph.clone(),
+                    subject.block_map.clone(),
+                    subject.value_to_var.clone(),
+                )
+            })
+            .collect()
+    };
+    let mut unmapped = 0usize;
+    for (path, flow, block_map, value_to_var) in jobs {
+        let Some(store_key) = function_graphs.key_for(&path) else {
+            continue;
+        };
+        if !seen.insert(store_key) {
+            continue;
+        }
+        function_graphs.with_built_mut(&path, |legacy| {
+            apply_transform_dead_code_cut_to_legacy(
+                legacy,
+                &flow,
+                &block_map,
+                &value_to_var,
+                &mut unmapped,
+            );
+        });
+    }
+    if rtyper_verbose_enabled() {
+        eprintln!("[PREPASS graphstore cut unmapped] total={unmapped}");
+    }
+}
+
+/// `transform.py transform_dead_code` + `cutoff_alwaysraising_block` on
+/// the GraphStore copy, via `block_map`. Then `live_block_flags` (the
+/// GraphStore `iterblocks` walk) clears blocks the cut made unreachable.
+fn apply_transform_dead_code_cut_to_legacy(
+    graph: &mut LegacyGraph,
+    flow: &GraphRef,
+    block_map: &HashMap<crate::model::BlockId, BlockRef>,
+    value_to_var: &LegacyToTyped,
+    unmapped: &mut usize,
+) {
+    let exceptblock_flow = flow.borrow().exceptblock.clone();
+    let mut flow_to_legacy: HashMap<BlockKey, crate::model::BlockId> = HashMap::new();
+    for (id, bref) in block_map {
+        flow_to_legacy.insert(BlockKey::of(bref), *id);
+    }
+    let live_before = crate::translator::rtyper::legacy_resolve::live_block_flags(graph);
+    let mut mapped: Vec<crate::model::BlockId> = block_map.keys().copied().collect();
+    mapped.sort_by_key(|id| id.0);
+    for id in mapped {
+        if id == graph.returnblock || id == graph.exceptblock {
+            continue;
+        }
+        if id.0 >= graph.blocks.len() {
+            continue;
+        }
+        let Some(flow_block) = block_map.get(&id) else {
+            continue;
+        };
+        let (remaining, is_cutoff, flow_cut_result) = {
+            let fb = flow_block.borrow();
+            let remaining: HashSet<crate::model::BlockId> = fb
+                .exits
+                .iter()
+                .filter_map(|link| {
+                    let t = link.borrow().target.clone()?;
+                    flow_to_legacy.get(&BlockKey::of(&t)).copied()
+                })
+                .collect();
+            let is_cutoff = flowspace_first_exit_is_cutoff_errlink(&fb, &exceptblock_flow);
+            // `cutoff_alwaysraising_block` keeps `block.operations[:n+1]`;
+            // the last result is the op whose annotation is
+            // `s_ImpossibleValue`.
+            let flow_cut_result = if is_cutoff {
+                match fb.operations.last().map(|op| &op.result) {
+                    Some(Hlvalue::Variable(v)) => Some(v.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            (remaining, is_cutoff, flow_cut_result)
+        };
+        if !graph.blocks[id.0].canraise() {
+            continue;
+        }
+        let cutoff_at = if is_cutoff {
+            let found = flow_cut_result.as_ref().and_then(|flow_var| {
+                graph.blocks[id.0]
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(i, op)| {
+                        let legacy = op.result.as_ref()?;
+                        let typed = value_to_var.get(legacy)?;
+                        (typed == flow_var).then_some(i)
+                    })
+            });
+            if found.is_none() {
+                *unmapped += 1;
+                if rtyper_verbose_enabled() {
+                    eprintln!(
+                        "[PREPASS graphstore cut unmapped] {} block={}",
+                        graph.name, id.0
+                    );
+                }
+                continue;
+            }
+            found
+        } else {
+            None
+        };
+        let exceptblock = graph.exceptblock;
+        let mut dropped = false;
+        graph.blocks[id.0].exits.retain(|link| {
+            let is_success = link.exitcase.is_none() && link.target != exceptblock;
+            if is_success && !remaining.contains(&link.target) {
+                dropped = true;
+                false
+            } else {
+                true
+            }
+        });
+        if dropped && is_cutoff {
+            // `cutoff_alwaysraising_block`: `del block.operations[n+1:]`.
+            // The lift does not keep the same op list, so the GraphStore
+            // cut is by result identity through `value_to_var`
+            // (`TwoPhaseSubject.value_to_var`, legacy Variable →
+            // flowspace Variable).
+            if let Some(i) = cutoff_at {
+                graph.blocks[id.0].operations.truncate(i + 1);
+            }
+            // `block.recloseblock(errlink, *block.exits)`.
+            let errlink = cutoff_assertionerror_errlink(graph);
+            let rest = std::mem::take(&mut graph.blocks[id.0].exits);
+            let mut new_exits = Vec::with_capacity(rest.len() + 1);
+            new_exits.push(errlink);
+            new_exits.extend(rest);
+            graph.recloseblock(id, new_exits);
+        }
+        // `transform_dead_code`: `if len(block.exits) == 1: exitswitch = None`.
+        if dropped && graph.blocks[id.0].exits.len() == 1 {
+            graph.blocks[id.0].exitswitch = None;
+            graph.blocks[id.0].exits[0].exitcase = None;
+        }
+    }
+    let live_after = crate::translator::rtyper::legacy_resolve::live_block_flags(graph);
+    for i in 0..graph.blocks.len() {
+        if live_before[i] && !live_after[i] {
+            let block = &mut graph.blocks[i];
+            block.dead = true;
+            block.operations.clear();
+            block.exits.clear();
+            block.exitswitch = None;
+        }
+    }
+}
+
+/// `cutoff_alwaysraising_block` errlink: first remaining exit targets
+/// `exceptblock`, `exitcase is None`, two Constant args
+/// (`c1 = Constant(AssertionError)`, `c2 = Constant(AssertionError(msg))`).
+fn flowspace_first_exit_is_cutoff_errlink(
+    block: &crate::flowspace::model::Block,
+    exceptblock: &BlockRef,
+) -> bool {
+    let Some(first) = block.exits.first() else {
+        return false;
+    };
+    let link = first.borrow();
+    let Some(target) = link.target.as_ref() else {
+        return false;
+    };
+    if !Rc::ptr_eq(target, exceptblock) {
+        return false;
+    }
+    if link.exitcase.is_some() {
+        return false;
+    }
+    if link.args.len() != 2 {
+        return false;
+    }
+    matches!(
+        (&link.args[0], &link.args[1]),
+        (Some(Hlvalue::Constant(_)), Some(Hlvalue::Constant(_)))
+    )
+}
+
+/// GraphStore lowering of `cutoff_alwaysraising_block`'s errlink:
+/// `FunctionGraph::set_raise` shape, cutoff message.
+fn cutoff_assertionerror_errlink(graph: &LegacyGraph) -> crate::model::Link {
+    let func_repr = format!("{:?}", graph.func);
+    let msg = format!("Call to {func_repr} should have raised an exception");
+    let etype = crate::model::LinkArg::from(ConstValue::builtin("AssertionError"));
+    let cls = HOST_ENV
+        .lookup_builtin("AssertionError")
+        .expect("HOST_ENV missing builtin AssertionError");
+    let instance = HostObject::new_instance(cls, vec![ConstValue::byte_str(msg)]);
+    let evalue = crate::model::LinkArg::from(ConstValue::HostObject(instance));
+    crate::model::Link::new_mixed(vec![etype, evalue], graph.exceptblock, None)
 }
 
 /// Reconnect a legacy [`crate::model::OpKind::Hint`] result to the typed
@@ -7192,7 +7434,7 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let (flow, _value_to_var, _, _, _) = drive_subject(&graph, &registry, true)
+        let (flow, _value_to_var, _, _, _, _) = drive_subject(&graph, &registry, true)
             .expect("instance-arg value helper must annotate and rtype through the builtin");
         let opnames: Vec<String> = flow
             .borrow()
@@ -7287,6 +7529,7 @@ mod tests {
                 value_to_var_candidates: HashMap::new(),
                 constant_concretetypes: HashMap::new(),
                 constant_hlvalues: HashMap::new(),
+                block_map: HashMap::new(),
             },
         );
     }
@@ -11806,7 +12049,7 @@ mod tests {
         let registry = crate::translator::rtyper::call_registry::CallRegistry::new(Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
         ));
-        let (flow_graph, _, _, _, _) =
+        let (flow_graph, _, _, _, _, _) =
             drive_subject(&graph, &registry, /* do_rtype = */ false)
                 .expect("repeat subject must annotate and transform");
         let transformed_ops: Vec<String> = flow_graph
@@ -12819,6 +13062,26 @@ mod tests {
     }
 
     #[test]
+    fn foreign_opaque_void_result_annotates_s_none() {
+        // `extfunc.py` `register_external(..., result=None)` → `s_None`.
+        use crate::annotator::model::SomeValue;
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let shell = foreign_opaque_method_return_shell(&registry, &crate::model::ValueType::Void)
+            .expect("a Void residual has a shell");
+        assert!(
+            matches!(shell, SomeValue::None_(_)),
+            "Void residual is s_None, got {shell:?}"
+        );
+        let via_ll = default_someshell_for_lltype(&LowLevelType::Void)
+            .expect("lltype_to_annotation(Void) is s_None");
+        assert!(
+            matches!(via_ll, SomeValue::None_(_)),
+            "default_someshell_for_lltype(Void) is s_None, got {via_ll:?}"
+        );
+    }
+
+    #[test]
     fn foreign_opaque_str_family_result_annotates_somestring_and_unions_with_string_new() {
         // Harvested residual `String::new` / `Default::default` on an
         // opaque rust-heap `String` keeps `Ref(Some(string::String))`
@@ -13742,7 +14005,7 @@ mod tests {
                 "{spelling} is rtyped, not an external row"
             );
             let (graph, result) = slice_to_vec_call_graph(Some(header), Some(spelling));
-            let (flow, map, _, _, _) = super::drive_subject(&graph, &registry, true)
+            let (flow, map, _, _, _, _) = super::drive_subject(&graph, &registry, true)
                 .unwrap_or_else(|err| panic!("{spelling} annotates: {err}"));
             let shell = somevalue_of(&map, &result);
             let expected = registry
@@ -13792,7 +14055,7 @@ mod tests {
             ("Vec<usize>", true, "ll_vec_copy_from_fixed_list_Unsigned"),
         ] {
             let (graph, result) = slice_to_vec_fixed_list_call_graph(unsigned, spelling);
-            let (flow, map, _, _, _) = super::drive_subject(&graph, &registry, true)
+            let (flow, map, _, _, _, _) = super::drive_subject(&graph, &registry, true)
                 .unwrap_or_else(|err| panic!("{spelling} fixed list rtypes: {err}"));
             let names = direct_call_names(&flow);
             assert!(
@@ -13818,7 +14081,7 @@ mod tests {
         ] {
             let (graph, _result) = slice_to_vec_ptr_len_call_graph(&item, spelling);
             match super::drive_subject(&graph, &registry, true) {
-                Ok((flow, _, _, _, _)) => panic!(
+                Ok((flow, _, _, _, _, _)) => panic!(
                     "{spelling} (ptr, len) must not rtype, got {:?}",
                     direct_call_names(&flow)
                 ),

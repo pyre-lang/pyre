@@ -4842,11 +4842,13 @@ pub struct FlowspaceAdapterOutput {
     /// simplify.py::remove_identical_vars_SSA's phi renaming. Type equality
     /// alone is not evidence that two incoming constants are equal.
     pub constant_hlvalues: HashMap<Variable, Hlvalue>,
-    /// `BlockId → flowspace::BlockRef` mapping. Includes the canonical
+    /// `BlockId → flowspace::BlockRef` mapping built by
+    /// `function_graph_to_flowspace_inner`. Includes the canonical
     /// `returnblock` and `exceptblock` (mapped to the
     /// `FunctionGraph::with_return_var`-allocated final blocks) so any
-    /// legacy Link targeting them resolves correctly.
-    #[cfg(test)]
+    /// legacy Link targeting them resolves correctly. Phase B copies
+    /// `transform_dead_code` / `cutoff_alwaysraising_block` onto the
+    /// GraphStore graph through this 1:1 map.
     pub block_map: HashMap<BlockId, BlockRef>,
 }
 
@@ -6876,7 +6878,6 @@ fn function_graph_to_flowspace_inner(
         value_to_var_candidates,
         constant_concretetypes,
         constant_hlvalues,
-        #[cfg(test)]
         block_map,
     })
 }

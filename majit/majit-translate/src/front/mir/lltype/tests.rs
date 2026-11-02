@@ -3,13 +3,13 @@ use super::{
     is_rstr_str_layout_declaration, is_str_family_class_root, json_ty_is_thin_pointer_element,
     json_ty_scalar_element_spelling, no_tombstoned_leaves, raw_field_address_value_type,
     shaped_array_parts, type_decl_is_closure_env, tyref_array_suffix,
-    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_ptr_to_int_cast_origin,
-    tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_ptr_pointee_is_vec,
-    tyref_ref_param_class_root, tyref_shaped_tuple_root, tyref_to_attr_value_type_for_struct_field,
-    tyref_to_value_type, tyref_tuple_suffix,
+    tyref_fn_ptr_input_class_root, tyref_is_closure_env, tyref_is_gcref_spelling,
+    tyref_is_ptr_to_int_cast_origin, tyref_is_raw_byte_ptr, tyref_positional_aggregate_root,
+    tyref_ptr_pointee_is_vec, tyref_ref_param_class_root, tyref_shaped_tuple_root,
+    tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
-use crate::model::{FunctionGraph, OpKind, ValueType};
+use crate::model::{FunctionGraph, LinkArg, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
@@ -18,8 +18,8 @@ use majit_charon_reader::{
 
 use crate::front::mir::tests::{
     adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, call_leafs,
-    code_struct, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span, fixture_ty, graph_ops,
-    i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
+    code_struct, empty_generics, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span,
+    fixture_ty, graph_ops, i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
     kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
     mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
     option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node, result_enum,
@@ -5454,6 +5454,242 @@ fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
     );
 }
 
+/// `rclass.py` `InstanceRepr.new_instance` / `setfield`: a transparent-handle
+/// Ctor stores the carrier word the field row names. A payload-class
+/// (`PyObject`) cast cannot join the carrier (`binaryop.py`
+/// `pairtype(SomeInstance, SomeInstance).union`).
+#[test]
+fn transparent_handle_ctor_recasts_payload_to_carrier_before_field_store() {
+    let decls = pointer_handle_decls();
+    let handle_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": window_empty_generics()}
+    });
+    let object_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 1, "generics": window_empty_generics()}},
+            "Mut"
+        ]
+    });
+    let carrier_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 2, "generics": window_empty_generics()}},
+            "Mut"
+        ]
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ctor_handle_from_object_cast"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [carrier_ptr.clone()],
+            "output": handle_adt.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &handle_adt),
+                window_local(1, &carrier_ptr),
+                window_local(2, &object_ptr)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &object_ptr),
+                            {"Cast": [
+                                "PtrToPtr",
+                                {"Move": window_place(
+                                    serde_json::json!({"Local": 1}),
+                                    &carrier_ptr
+                                )},
+                                object_ptr.clone()
+                            ]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &handle_adt),
+                            {"Aggregate": [
+                                {"Adt": [
+                                    {"id": 3, "generics": window_empty_generics()},
+                                    0,
+                                    null
+                                ]},
+                                [{"Move": window_place(
+                                    serde_json::json!({"Local": 2}),
+                                    &object_ptr
+                                )}]
+                            ]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let trait_impls =
+        with_fixture_gctype_impls(&decls, serde_json::json!([pyerror_deref_impl(23, 2)]));
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(decls),
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": trait_impls
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "ctor_handle_from_object_cast")
+        .expect("lower transparent-handle Ctor of a PyObject-cast payload");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let write = ops.iter().find_map(|op| match &op.kind {
+        OpKind::FieldWrite {
+            field,
+            value: LinkArg::Value(value),
+            ..
+        } if field.name == "__pos_0" => Some((op, value.clone())),
+        _ => None,
+    });
+    let Some((_, stored)) = write else {
+        panic!(
+            "transparent-handle Ctor must FieldWrite __pos_0; graph={}",
+            graph.dump()
+        );
+    };
+    assert_pos0_consumes_carrier_recast(&ops, &stored, &graph);
+}
+
+/// `rclass.py` `InstanceRepr.rtype_setattr` / `HighLevelOp.inputargs`
+/// / `convertvar`: the same handle built through a constructor fn item
+/// (`src: "AdtConstructor"` → `constructor_fn_item_shape` →
+/// `emit_aggregate_value` → `emit_aggregate_ctor`) converts onto the
+/// carrier before the `__pos_0` FieldWrite.
+#[test]
+fn transparent_handle_ctor_fn_item_recasts_payload_to_carrier_before_field_store() {
+    let decls = pointer_handle_decls();
+    let handle_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": window_empty_generics()}
+    });
+    let object_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 1, "generics": window_empty_generics()}},
+            "Mut"
+        ]
+    });
+    let ctor_fn = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "PyError"], true),
+        "src": "AdtConstructor",
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [object_ptr.clone()],
+            "output": handle_adt.clone()
+        },
+        "body": "Opaque"
+    });
+    let trait_impls =
+        with_fixture_gctype_impls(&decls, serde_json::json!([pyerror_deref_impl(23, 2)]));
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(decls),
+            "fun_decls": [ctor_fn],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": trait_impls
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let handle_ty = serde_json::from_value::<TyRef>(handle_adt).expect("handle TyRef parses");
+    let fd = llbc
+        .fn_by_id(0)
+        .expect("AdtConstructor FunDecl is in the fixture");
+    with_fixture_lowering(&llbc, |lowering| {
+        let shape = lowering
+            .constructor_fn_item_shape(fd, &handle_ty)
+            .expect("constructor_fn_item_shape of the handle");
+        let mut graph = FunctionGraph::new("ctor_handle_fn_item");
+        let block = graph.startblock;
+        let payload = graph.alloc_value_var();
+        crate::front::mir::emit_aggregate_value(&mut graph, block, &shape, &[payload.clone()])
+            .expect("emit constructor-fn-item aggregate");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let write = ops.iter().find_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field,
+                value: LinkArg::Value(value),
+                ..
+            } if field.name == "__pos_0" => Some((op, value.clone())),
+            _ => None,
+        });
+        let Some((_, stored)) = write else {
+            panic!(
+                "constructor-fn-item handle Ctor must FieldWrite __pos_0; graph={}",
+                graph.dump()
+            );
+        };
+        assert_pos0_consumes_carrier_recast(&ops, &stored, &graph);
+        let recast = ops
+            .iter()
+            .find(|op| {
+                op.result.as_ref() == Some(&stored)
+                    && crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject")
+            })
+            .expect("carrier recast feeding __pos_0");
+        let OpKind::Call { args, .. } = &recast.kind else {
+            panic!("carrier recast is a Call; graph={}", graph.dump());
+        };
+        assert_eq!(
+            args.first(),
+            Some(&LinkArg::Value(payload)),
+            "fn-item FieldWrite must consume a recast of the raw operand, not a payload-class recast; graph={}",
+            graph.dump()
+        );
+    });
+}
+
+fn assert_pos0_consumes_carrier_recast(
+    ops: &[&crate::model::SpaceOperation],
+    stored: &crate::flowspace::model::Variable,
+    graph: &FunctionGraph,
+) {
+    let recast_before_store = ops.iter().any(|op| {
+        op.result.as_ref() == Some(stored)
+            && crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject")
+    });
+    assert!(
+        recast_before_store,
+        "Ctor field store must consume a carrier recast; graph={}",
+        graph.dump()
+    );
+    let carrier_casts = ops
+        .iter()
+        .filter(|op| crate::model::cast_instance_root(&op.kind) == Some("PyErrorObject"))
+        .count();
+    assert_eq!(
+        carrier_casts,
+        1,
+        "one carrier recast feeds the FieldWrite; graph={}",
+        graph.dump()
+    );
+}
+
 fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {
     let mut decl = serde_json::json!({
         "def_id": def_id,
@@ -9152,5 +9388,79 @@ fn registered_gc_ptr_gcrefopaque_has_no_class_root() {
             &empty,
         ),
         None
+    );
+}
+
+/// `llmemory.py` `GCREF = lltype.Ptr(GCREFOpaque)`: exactly one pointer
+/// onto `GCREFOpaque`. A pointer to a GCREF cell is a different type.
+#[test]
+fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
+    let llbc = kwargs_unerase_cast_llbc(true);
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let empty = std::collections::HashSet::<String>::new();
+    let empty_g = empty_generics();
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Adt": {"id": id, "builtin": null, "generics": empty_g.clone()}
+        })
+    };
+    let ty = |v: serde_json::Value| {
+        serde_json::from_value::<TyRef>(serde_json::json!({ "Value": [0, v] }))
+            .expect("fixture TyRef")
+    };
+    let token = |ty: &TyRef| {
+        dont_look_inside_return_token(ty, &llbc, crate::ErrorCarrierSpec::default(), &gc, &empty)
+    };
+    let gcref_alias = ty(adt(3));
+    let mut_gcrefopaque = ty(serde_json::json!({"RawPtr": [adt(0), "Mut"]}));
+    let ref_gcrefopaque = ty(serde_json::json!({"Ref": ["Erased", adt(0), "Mut"]}));
+    let mut_gcref = ty(serde_json::json!({"RawPtr": [adt(3), "Mut"]}));
+    let ref_gcref = ty(serde_json::json!({"Ref": ["Erased", adt(3), "Mut"]}));
+    let mut_mut_gcrefopaque = ty(serde_json::json!({
+        "RawPtr": [{"RawPtr": [adt(0), "Mut"]}, "Mut"]
+    }));
+
+    assert!(
+        tyref_is_gcref_spelling(&gcref_alias, &llbc),
+        "bare GCREF alias"
+    );
+    assert_eq!(token(&gcref_alias).as_deref(), Some("gcref"));
+    assert!(
+        tyref_is_gcref_spelling(&mut_gcrefopaque, &llbc),
+        "*mut GCREFOpaque"
+    );
+    assert_eq!(token(&mut_gcrefopaque).as_deref(), Some("gcref"));
+    assert!(
+        tyref_is_gcref_spelling(&ref_gcrefopaque, &llbc),
+        "&GCREFOpaque"
+    );
+    assert_eq!(token(&ref_gcrefopaque).as_deref(), Some("gcref"));
+
+    assert!(
+        !tyref_is_gcref_spelling(&mut_gcref, &llbc),
+        "*mut GCREF is a pointer to a GCREF cell"
+    );
+    let mut_gcref_token = token(&mut_gcref);
+    assert_ne!(mut_gcref_token.as_deref(), Some("gcref"));
+    assert!(
+        !tyref_is_gcref_spelling(&ref_gcref, &llbc),
+        "&GCREF is a borrow of a GCREF cell"
+    );
+    assert!(
+        !tyref_is_gcref_spelling(&mut_mut_gcrefopaque, &llbc),
+        "*mut *mut GCREFOpaque is two pointer levels"
+    );
+    let mut_mut_token = token(&mut_mut_gcrefopaque);
+    assert_ne!(mut_mut_token.as_deref(), Some("gcref"));
+    // Slot-pointer residual token (`dont_look_inside_return_token`).
+    assert_eq!(
+        mut_gcref_token.as_deref(),
+        Some("ref"),
+        "*mut GCREF slot token"
+    );
+    assert_eq!(
+        mut_mut_token.as_deref(),
+        Some("ref"),
+        "*mut *mut GCREFOpaque slot token"
     );
 }
