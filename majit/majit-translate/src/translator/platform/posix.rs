@@ -20,7 +20,7 @@ pub(super) fn posix_libs(libraries: &[String]) -> Vec<OsString> {
 
 /// `BasePosix._libdirs`.
 pub(super) fn posix_libdirs(library_dirs: &[PathBuf]) -> Vec<OsString> {
-    debug_assert!(
+    assert!(
         library_dirs.iter().all(|dir| !dir.as_os_str().is_empty()),
         "empty library dir"
     );
@@ -32,7 +32,7 @@ pub(super) fn posix_libdirs(library_dirs: &[PathBuf]) -> Vec<OsString> {
 
 /// `BasePosix._includedirs`.
 pub(super) fn posix_includedirs(include_dirs: &[PathBuf]) -> Vec<OsString> {
-    debug_assert!(
+    assert!(
         include_dirs.iter().all(|dir| !dir.as_os_str().is_empty()),
         "empty include dir"
     );

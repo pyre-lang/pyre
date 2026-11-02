@@ -2463,6 +2463,29 @@ pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
     registry.get(opname).copied()
 }
 
+/// `op_int_floordiv` / `op_int_mod` / `op_uint_floordiv` / `op_uint_mod`
+/// / `op_llong_floordiv` / `op_llong_mod` / `op_ullong_floordiv` /
+/// `op_ullong_mod`: a zero divisor raises `ZeroDivisionError` out of
+/// the operation. Constfold (`get_op_impl`) still refuses to fold.
+fn op_int_div_result(opname: &str, args: &[ConstValue]) -> Option<Result<ConstValue, OpimplError>> {
+    let zero = match opname {
+        "int_floordiv" | "int_mod" | "llong_floordiv" | "llong_mod" => {
+            matches!(args, [ConstValue::Int(_), ConstValue::Int(0)])
+        }
+        "uint_floordiv" | "uint_mod" | "ullong_floordiv" | "ullong_mod" => {
+            matches!(args, [ConstValue::UInt(_), ConstValue::UInt(0)])
+        }
+        _ => return None,
+    };
+    if zero {
+        Some(Err(OpimplError {
+            message: "ZeroDivisionError: integer division or modulo by zero".into(),
+        }))
+    } else {
+        None
+    }
+}
+
 /// `LLOp.fold` as `LLFrame.getoperationhandler` invokes it: the opimpl
 /// body runs and its exception escapes. `Ok(None)` means there is no
 /// `op_*` entry (not yet ported). `Err` is the exception the body
@@ -2474,6 +2497,9 @@ pub fn eval_op_impl(opname: &str, args: &[ConstValue]) -> Result<Option<ConstVal
     }
     if opname == "float_truediv" {
         return op_float_truediv_result(args).map(Some);
+    }
+    if let Some(result) = op_int_div_result(opname, args) {
+        return result.map(Some);
     }
     match get_op_impl(opname) {
         None => Ok(None),
@@ -3203,5 +3229,28 @@ mod tests {
         assert_eq!(f_uadd(&[u128c(u128::MAX), u128c(1)]), Some(u128c(0)));
         assert!(lllong_op_impl("lllong_add").is_some());
         assert!(lllong_op_impl("int_add").is_none());
+    }
+
+    #[test]
+    fn eval_op_impl_integer_div_zero_raises_zero_division() {
+        for (op, args) in [
+            ("int_floordiv", [i(7), i(0)]),
+            ("int_mod", [i(7), i(0)]),
+            ("uint_floordiv", [u(7), u(0)]),
+            ("uint_mod", [u(7), u(0)]),
+        ] {
+            let err = eval_op_impl(op, &args).expect_err(op);
+            assert!(
+                err.message.starts_with("ZeroDivisionError"),
+                "{op}: {}",
+                err.message
+            );
+        }
+        // `op_int_floordiv` is C-truncating: -7 / 2 == -3.
+        assert_eq!(
+            eval_op_impl("int_floordiv", &[i(-7), i(2)]).unwrap(),
+            Some(i(-3))
+        );
+        assert_eq!(get_op_impl("int_floordiv").unwrap()(&[i(7), i(0)]), None);
     }
 }

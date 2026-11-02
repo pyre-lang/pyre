@@ -2019,6 +2019,7 @@ dependencies = [
 name = "majit-config"
 version = "0.0.2"
 dependencies = [
+ "libc",
  "parking_lot",
 ]
 

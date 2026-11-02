@@ -32,8 +32,9 @@
 //!    `CARGO_MANIFEST_DIR`). Analog of upstream `MAINDIR` /
 //!    `CACHE_DIR` (`translationoption.py`): `MAINDIR =
 //!    dirname(dirname(__file__))` is the `rpython/` package dir.
-//!    `cache_dir()` is `os.path.realpath` of that join: canonicalize the
-//!    longest existing ancestor, then append remaining components.
+//!    `cache_dir()` is `os.path.realpath` of that join (`posixpath.realpath`
+//!    / `posixpath._joinrealpath` on unix, `ntpath.realpath` stand-in
+//!    elsewhere).
 //! 4. **`ArbitraryOption` payload tests** (`instrumentctl`) avoid
 //!    upstream's Python-dict storage — the Rust port's
 //!    `OptionValue::Arbitrary(Rc<dyn Any>)` preserves the dynamic-type
@@ -47,6 +48,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::config::{
     ArbitraryOption, BoolOption, Child, ChoiceOption, Config, ConfigError, DependencyEdge,
@@ -83,31 +85,51 @@ pub const IS_64_BITS: bool = usize::BITS == 64;
 /// aarch64 Linux per upstream's hand-maintained list.
 pub const SUPPORT__THREAD: bool = cfg!(target_os = "linux") && !cfg!(target_arch = "aarch64");
 
-/// `_stdlib_platform.machine()` (`translationoption.MACHINE`).
+/// `platform.machine()` (`translationoption.MACHINE`), read at runtime.
 ///
-/// `platform.machine()` is `uname -m` on posix (`arm64` on Darwin
-/// aarch64, `aarch64` on Linux aarch64, `x86_64` on posix x86_64) and
-/// `PROCESSOR_ARCHITECTURE` on Windows (`AMD64` / `ARM64` / `x86`).
-/// majit-config has no `libc` dependency, so the spelling is the
-/// `(target_os, target_arch)` table for those values.
-pub const fn machine() -> &'static str {
-    if cfg!(all(windows, target_arch = "x86_64")) {
-        "AMD64"
-    } else if cfg!(all(windows, target_arch = "aarch64")) {
-        "ARM64"
-    } else if cfg!(all(windows, target_arch = "x86")) {
-        "x86"
-    } else if cfg!(all(windows, target_arch = "arm")) {
-        "ARM"
-    } else if cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
-        "arm64"
-    } else {
-        std::env::consts::ARCH
+/// `platform.machine()` is `os.uname().machine` on posix and, on
+/// Windows, `os.environ['PROCESSOR_ARCHITEW6432']` if set and
+/// non-empty else `os.environ['PROCESSOR_ARCHITECTURE']`. Unknown
+/// (including a failed `uname`) yields `''`.
+pub fn machine() -> &'static str {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(machine_uncached_impl).as_str()
+}
+
+/// `os.uname().machine` via `libc::uname`.
+#[cfg(unix)]
+fn machine_uncached_impl() -> String {
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+    if unsafe { libc::uname(uts.as_mut_ptr()) } != 0 {
+        return String::new();
+    }
+    let uts = unsafe { uts.assume_init() };
+    let end = uts
+        .machine
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(uts.machine.len());
+    let raw = unsafe { std::slice::from_raw_parts(uts.machine.as_ptr().cast::<u8>(), end) };
+    String::from_utf8_lossy(raw).into_owned()
+}
+
+/// `os.environ['PROCESSOR_ARCHITEW6432']` if set and non-empty, else
+/// `os.environ['PROCESSOR_ARCHITECTURE']`.
+#[cfg(windows)]
+fn machine_uncached_impl() -> String {
+    match std::env::var("PROCESSOR_ARCHITEW6432") {
+        Ok(v) if !v.is_empty() => v,
+        _ => std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default(),
     }
 }
 
+#[cfg(not(any(unix, windows)))]
+fn machine_uncached_impl() -> String {
+    std::env::consts::ARCH.to_string()
+}
+
 /// `MACHINE` (`translationoption.py`): `_stdlib_platform.machine()`.
-pub const MACHINE: &str = machine();
+pub static MACHINE: LazyLock<&'static str> = LazyLock::new(machine);
 
 /// `MAINDIR` (`translationoption.py`): `os.path.dirname(os.path.dirname(__file__))`,
 /// the `rpython/` package dir. Analog is the `majit/` directory, parent of
@@ -119,8 +141,11 @@ pub fn maindir() -> PathBuf {
         .to_path_buf()
 }
 
-/// `os.path.realpath`: canonicalize the longest existing ancestor, then
-/// append remaining components (`translationoption.CACHE_DIR`).
+/// `os.path.realpath` (`translationoption.CACHE_DIR`).
+///
+/// On unix this is `posixpath.realpath(filename, strict=False)` via
+/// `posixpath._joinrealpath`. On other targets it stands in for
+/// `ntpath.realpath`.
 pub fn realpath(path: &Path) -> PathBuf {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -129,7 +154,95 @@ pub fn realpath(path: &Path) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     };
-    let mut ancestor = path.clone();
+    #[cfg(unix)]
+    {
+        _joinrealpath(PathBuf::new(), &path, &mut HashMap::new()).0
+    }
+    #[cfg(not(unix))]
+    {
+        nt_realpath(&path)
+    }
+}
+
+/// `posixpath._joinrealpath`. `strict=False`: a symlink loop returns
+/// the path joined with the rest unresolved; a missing component is
+/// joined as-is.
+#[cfg(unix)]
+fn _joinrealpath(
+    mut path: PathBuf,
+    rest: &Path,
+    seen: &mut HashMap<PathBuf, std::option::Option<PathBuf>>,
+) -> (PathBuf, bool) {
+    use std::path::Component;
+
+    let mut parts: Vec<Component<'_>> = rest.components().collect();
+    if rest.is_absolute() {
+        path = PathBuf::from("/");
+        parts.retain(|c| !matches!(c, Component::RootDir | Component::Prefix(_)));
+    }
+
+    let mut index = 0;
+    while index < parts.len() {
+        let name = parts[index];
+        index += 1;
+        match name {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => continue,
+            Component::ParentDir => {
+                path.pop();
+                continue;
+            }
+            Component::Normal(name) => {
+                let newpath = path.join(name);
+                let is_link = std::fs::symlink_metadata(&newpath)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                if !is_link {
+                    path = newpath;
+                    continue;
+                }
+                match seen.get(&newpath).cloned() {
+                    Some(Some(resolved)) => {
+                        path = resolved;
+                        continue;
+                    }
+                    Some(None) => {
+                        let mut unresolved = newpath;
+                        for remaining in &parts[index..] {
+                            unresolved.push(remaining.as_os_str());
+                        }
+                        return (unresolved, false);
+                    }
+                    None => {}
+                }
+                seen.insert(newpath.clone(), None);
+                match std::fs::read_link(&newpath) {
+                    Ok(target) => {
+                        let (resolved, ok) = _joinrealpath(path, &target, seen);
+                        if !ok {
+                            let mut unresolved = resolved;
+                            for remaining in &parts[index..] {
+                                unresolved.push(remaining.as_os_str());
+                            }
+                            return (unresolved, false);
+                        }
+                        seen.insert(newpath, Some(resolved.clone()));
+                        path = resolved;
+                    }
+                    Err(_) => {
+                        path = newpath;
+                    }
+                }
+            }
+        }
+    }
+    (path, true)
+}
+
+/// Stands in for `ntpath.realpath`: canonicalize the longest existing
+/// ancestor, then append remaining components.
+#[cfg(not(unix))]
+fn nt_realpath(path: &Path) -> PathBuf {
+    let mut ancestor = path.to_path_buf();
     let mut missing = Vec::new();
     loop {
         if let Ok(canonical) = ancestor.canonicalize() {
@@ -146,10 +259,10 @@ pub fn realpath(path: &Path) -> PathBuf {
                     Some(parent) if parent.as_os_str() != ancestor.as_os_str() => {
                         ancestor = parent.to_path_buf();
                     }
-                    _ => return path,
+                    _ => return path.to_path_buf(),
                 }
             }
-            None => return path,
+            None => return path.to_path_buf(),
         }
     }
 }
@@ -158,7 +271,7 @@ pub fn realpath(path: &Path) -> PathBuf {
 ///
 /// `os.path.realpath(os.path.join(MAINDIR, '_cache', MACHINE))`.
 pub fn cache_dir() -> PathBuf {
-    realpath(&maindir().join("_cache").join(MACHINE))
+    realpath(&maindir().join("_cache").join(*MACHINE))
 }
 
 /// Upstream `:39-42 PLATFORMS = ['host', 'arm']`. Kept as a module
@@ -1112,12 +1225,13 @@ mod tests {
 
     #[test]
     fn cache_dir_ends_with_cache_machine_under_maindir() {
-        let expected = maindir().join("_cache").join(MACHINE);
+        let expected = maindir().join("_cache").join(*MACHINE);
         let dir = cache_dir();
         assert_eq!(dir, realpath(&expected));
         assert!(
-            dir.ends_with(std::path::Path::new("_cache").join(MACHINE)),
-            "cache_dir() must end with _cache/{MACHINE} under maindir(), got {}",
+            dir.ends_with(std::path::Path::new("_cache").join(*MACHINE)),
+            "cache_dir() must end with _cache/{} under maindir(), got {}",
+            *MACHINE,
             dir.display()
         );
         let main = maindir();
@@ -1132,21 +1246,30 @@ mod tests {
 
     #[test]
     fn machine_uses_platform_machine_spelling() {
-        assert_eq!(MACHINE, machine());
+        assert_eq!(*MACHINE, machine());
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert_eq!(MACHINE, "arm64");
+        assert_eq!(machine(), "arm64");
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        assert_eq!(MACHINE, "aarch64");
+        assert_eq!(machine(), "aarch64");
         #[cfg(all(unix, not(target_os = "macos"), target_arch = "x86_64"))]
-        assert_eq!(MACHINE, "x86_64");
+        assert_eq!(machine(), "x86_64");
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        assert_eq!(MACHINE, "x86_64");
+        assert_eq!(machine(), "x86_64");
         #[cfg(all(windows, target_arch = "x86_64"))]
-        assert_eq!(MACHINE, "AMD64");
+        assert_eq!(machine(), "AMD64");
         #[cfg(all(windows, target_arch = "aarch64"))]
-        assert_eq!(MACHINE, "ARM64");
+        assert_eq!(machine(), "ARM64");
         #[cfg(all(windows, target_arch = "x86"))]
-        assert_eq!(MACHINE, "x86");
+        assert_eq!(machine(), "x86");
+        #[cfg(unix)]
+        {
+            if let Ok(output) = std::process::Command::new("uname").arg("-m").output() {
+                if output.status.success() {
+                    let uname_m = String::from_utf8_lossy(&output.stdout);
+                    assert_eq!(machine(), uname_m.trim());
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1167,6 +1290,37 @@ mod tests {
         let got = realpath(&missing_leaf);
         let expected = real_parent.canonicalize().unwrap().join("missing-leaf");
         assert_eq!(got, expected);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn realpath_posixpath_nonstrict_dangling_dotdot_and_loop() {
+        let root = std::env::temp_dir().join(format!(
+            "majit-posix-realpath-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = root.canonicalize().unwrap();
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink("target_missing", &link).unwrap();
+        assert_eq!(
+            realpath(&root.join("link").join("sub")),
+            canonical.join("target_missing").join("sub")
+        );
+
+        assert_eq!(
+            realpath(&root.join("a").join("..").join("b")),
+            canonical.join("b")
+        );
+
+        std::os::unix::fs::symlink("y", &root.join("x")).unwrap();
+        std::os::unix::fs::symlink("x", &root.join("y")).unwrap();
+        let looped = realpath(&root.join("x"));
+        assert_eq!(looped, canonical.join("x"));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

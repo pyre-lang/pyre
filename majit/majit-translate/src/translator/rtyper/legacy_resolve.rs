@@ -485,6 +485,30 @@ fn concrete_from_annotation(
             return Ok(ConcreteType::Void);
         }
     }
+    // `rtyper.py` `setconcretetype` writes `v.concretetype =
+    // repr.lowleveltype`. `rptr.py` `PtrRepr.lowleveltype` is the `Ptr`
+    // itself; `history.getkind` of that `Ptr` is `'int'` when
+    // `TO._gckind == 'raw'` (`FuncType`, raw Struct/Array/Opaque) and
+    // `'ref'` when the pointee is GC. Applied here rather than in
+    // `somevalue_to_valuetype` so a raw `SomePtr` is not flattened to
+    // `ValueType::Int` (`valuetype_to_someshell` would re-shell that as
+    // `SomeInteger` and drop the pointer type across annotator fixpoint
+    // rounds — the same reason `SomeSingleFloat` is not collapsed to
+    // `Int` there). `SomeValue::PBC` stays on the arm above.
+    if let SomeValue::Ptr(p) = s {
+        let ll = crate::translator::rtyper::lltypesystem::lltype::LowLevelType::from(
+            p.ll_ptrtype.clone(),
+        );
+        match crate::model::try_getkind(&ll, true, true, true) {
+            Ok(kind @ (ConcreteType::Signed | ConcreteType::GcRef)) => return Ok(kind),
+            _ => {
+                // Interior pointers live on `SomeValue::InteriorPtr`. A
+                // `Ptr` whose gckind `try_getkind` cannot classify keeps
+                // the `SomePtr` → `Ref(None)` → `GcRef` fallback so the
+                // annotation lattice is untouched.
+            }
+        }
+    }
     let vtype = somevalue_to_valuetype(s);
     Ok(valuetype_to_concrete_for_legacy(
         &vtype,
@@ -931,6 +955,36 @@ mod tests {
         annotate::annotate(&graph);
         resolve_types(&graph, &HashSet::new());
         assert_eq!(FunctionGraph::concretetype_of(&v_var), ConcreteType::Signed);
+    }
+
+    #[test]
+    fn someptr_of_functype_is_signed_and_gc_struct_is_gcref() {
+        // `concrete_from_annotation` of `SomePtr`: `history.getkind` of
+        // `Ptr(FuncType)` is `'int'` (`TO._gckind == 'raw'`); a GC
+        // struct pointee is `'ref'`.
+        use crate::annotator::model::SomePtr;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let fn_ptr = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            }),
+        }));
+        assert_eq!(
+            concrete_from_annotation(&fn_ptr, &HashSet::new()).expect("FuncType SomePtr"),
+            ConcreteType::Signed
+        );
+
+        let gc_ptr = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("GcS", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        assert_eq!(
+            concrete_from_annotation(&gc_ptr, &HashSet::new()).expect("GC struct SomePtr"),
+            ConcreteType::GcRef
+        );
     }
 
     #[test]
