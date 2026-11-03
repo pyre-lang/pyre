@@ -673,6 +673,37 @@ mod tests {
     }
 
     #[test]
+    fn generalize_key_str_cell_rejects_strkey_instance() {
+        use super::super::classdesc::ClassDef;
+        use super::super::model::SomeInstance;
+
+        let dd = DictDef::new(
+            None,
+            SomeValue::String(SomeString::default()),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        dd.generalize_key(&SomeValue::String(SomeString::default()))
+            .expect("SomeString inserts into a STR key cell");
+        let leftover = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("celldict::StrKey", None)),
+            false,
+            Default::default(),
+        ));
+        dd.generalize_key(&leftover)
+            .expect_err("Instance(StrKey) still UnionError; generalize_key is unchanged");
+        let leftover_bytes = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("dictmultiobject::BytesKey", None)),
+            false,
+            Default::default(),
+        ));
+        dd.generalize_key(&leftover_bytes)
+            .expect_err("Instance(BytesKey) still UnionError; generalize_key is unchanged");
+    }
+
+    #[test]
     fn generalize_key_on_plain_dict_does_not_trip_rdict_stub() {
         // upstream dictdef.py generalize — custom_eq_hash=false path skips
         // emulate_rdict_calls entirely. Same widening on a plain dict

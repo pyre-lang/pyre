@@ -2363,14 +2363,29 @@ impl<'l> CrateLowering<'l> {
 
     /// Lower one clause specialization. `None` when its body does not
     /// substitute or lower; either is recorded in `skipped`.
+    ///
+    /// A `dont_look_inside` copy whose body does not lower still keeps
+    /// the header `declare_spec` stamped from `substituted_signature`
+    /// (`policy.py` `look_inside_graph` residualizes; the body is not
+    /// a jitcode subject).
     fn lower_spec(
         &self,
         req: crate::front::clause_spec::SpecRequest,
     ) -> Option<crate::front::semantic::SemanticFunction> {
         let mut spec = self.declare_spec(req)?;
-        let graph = self.build_spec_body(&spec.body)?;
-        spec.header.residualize_unresolved_trait_const(&graph);
-        let graph = spec.header.graph_stamp().apply(graph);
+        let built = if spec.dont_look_inside {
+            self.build_spec_body_recording(&spec.body, false)
+        } else {
+            self.build_spec_body(&spec.body)
+        };
+        let graph = match built {
+            Some(graph) => {
+                spec.header.residualize_unresolved_trait_const(&graph);
+                spec.header.graph_stamp().apply(graph)
+            }
+            None if spec.dont_look_inside => self.spec_header_graph(&spec),
+            None => return None,
+        };
         Some(spec.into_semantic(crate::model::LazyGraph::built(graph)))
     }
 
@@ -2452,7 +2467,6 @@ impl<'l> CrateLowering<'l> {
 
     /// The header graph of the declared clause specialization `spec`: its
     /// startblock over the substituted locals and its header fields.
-    #[cfg(any(test, feature = "mir-frontend"))]
     pub(crate) fn spec_header_graph(&self, spec: &DeclaredSpec) -> crate::model::FunctionGraph {
         let fd = self
             .llbc
@@ -2505,6 +2519,14 @@ impl<'l> CrateLowering<'l> {
     /// Lower the substituted body of a declared clause specialization.
     /// `None`, recorded in `skipped`, when it does not lower.
     pub(crate) fn build_spec_body(&self, spec: &SpecBody) -> Option<crate::model::FunctionGraph> {
+        self.build_spec_body_recording(spec, true)
+    }
+
+    fn build_spec_body_recording(
+        &self,
+        spec: &SpecBody,
+        record_skip: bool,
+    ) -> Option<crate::model::FunctionGraph> {
         let CrateLoweringState {
             struct_field_attrs,
             struct_fields,
@@ -2552,9 +2574,11 @@ impl<'l> CrateLowering<'l> {
         ) {
             Ok(g) => g,
             Err(e) => {
-                skipped
-                    .borrow_mut()
-                    .push((spec.name.clone(), e.to_string()));
+                if record_skip {
+                    skipped
+                        .borrow_mut()
+                        .push((spec.name.clone(), e.to_string()));
+                }
                 return None;
             }
         };

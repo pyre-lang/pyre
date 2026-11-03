@@ -15472,6 +15472,300 @@ fn generic_unspecialized_template_is_not_a_subject() {
     );
 }
 
+/// `specialize.py` `specialize_argtype` / `FunctionDesc.cachedgraph`: an
+/// `__inst_` copy of a generic `dont_look_inside` `fn<T>(T, u32) -> *mut T`
+/// is annotated with the substituted output. Unbound `*mut T` stays
+/// `None` on the template.
+#[test]
+fn specialize_argtype_inst_of_generic_dont_look_inside_star_mut_t_gets_substituted_return_token() {
+    let llbc = specialize_argtype_inst_return_token_llbc();
+    let program = super::build_semantic_program_from_llbc(&llbc)
+        .expect("build specialize_argtype inst return-token fixture");
+    let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let by_leaf = |needle: &str| {
+        program
+            .functions
+            .iter()
+            .find(|f| f.name.rsplit("::").next() == Some(needle))
+    };
+    let inst_gc = program.functions.iter().find(|f| {
+        f.name
+            .rsplit("::")
+            .next()
+            .is_some_and(|leaf| leaf.starts_with("alloc_box__inst_") && leaf.contains("GcBox"))
+    });
+    let inst_raw = program.functions.iter().find(|f| {
+        f.name.rsplit("::").next().is_some_and(|leaf| {
+            leaf.starts_with("alloc_box__inst_") && leaf.contains("RawFlavorStruct")
+        })
+    });
+    let generic = by_leaf("alloc_box");
+    let raw_nongeneric = by_leaf("raw_ptr").expect(&format!(
+        "non-generic dont_look_inside *mut RawFlavorStruct is a subject; names={names:?}"
+    ));
+    if let Some(generic) = generic {
+        assert!(
+            generic.return_class_root.is_none() && generic.graph().return_class_root.is_none(),
+            "generic *mut T has no class root; token={:?} root={:?}; names={names:?}",
+            generic.return_type,
+            generic.return_class_root
+        );
+    }
+    let inst_gc = inst_gc.expect(&format!(
+        "GcBox instantiation is an __inst_ subject; names={names:?}"
+    ));
+    assert_eq!(
+        inst_gc.return_type.as_deref(),
+        Some("ref"),
+        "substituted *mut GcBox is ref; names={names:?}"
+    );
+    assert_eq!(inst_gc.graph().return_type.as_deref(), Some("ref"));
+    let gc_root = inst_gc
+        .return_class_root
+        .as_deref()
+        .or(inst_gc.graph().return_class_root.as_deref());
+    assert!(
+        gc_root.is_some_and(|root| root.contains("GcBox")),
+        "GcBox class root, got {gc_root:?}; names={names:?}"
+    );
+    let inst_raw = inst_raw.expect(&format!(
+        "RawFlavorStruct instantiation is an __inst_ subject; names={names:?}"
+    ));
+    assert_eq!(
+        inst_raw.return_type, raw_nongeneric.return_type,
+        "raw-flavor inst token matches the non-generic dont_look_inside; names={names:?}"
+    );
+    assert!(
+        inst_raw
+            .return_type
+            .as_deref()
+            .is_some_and(|t| t.starts_with("raw:") && t.contains("RawFlavorStruct")),
+        "raw-flavor residual token, got {:?}; names={names:?}",
+        inst_raw.return_type
+    );
+}
+
+fn specialize_argtype_inst_return_token_llbc() -> Llbc {
+    let t = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let unit = serde_json::json!({
+        "Adt": {
+            "builtin": "Tuple",
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }
+    });
+    let gc_adt = interior_adt(0);
+    let raw_adt = interior_adt(1);
+    let star_mut_t = interior_raw_mut(t.clone());
+    let star_mut_raw = interior_raw_mut(raw_adt.clone());
+    let look_inside_false = |def_id: u64, leaf: &str| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": interior_meta(
+                &["fixture", &format!("_jit_look_inside_{leaf}")],
+                true
+            ),
+            "global_kind": "NamedConst",
+            "ty": {"Scalar": "Bool"},
+            "value": [{"Bool": false}, {"Scalar": "Bool"}]
+        })
+    };
+    let flavor_raw = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "_alloc_flavor_RawFlavorStruct"], true),
+        "global_kind": "NamedConst",
+        "value": {"Value": [1, [{"Str": "raw"}, {"Ref": [
+            "Erased",
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            "Shared"
+        ]}]]}
+    });
+    let call_generics = |ty: serde_json::Value| {
+        serde_json::json!({
+            "regions": [],
+            "types": [ty],
+            "const_generics": [],
+            "trait_refs": []
+        })
+    };
+    let return_from_make_ptr = |arg_count: u64,
+                                locals: Vec<serde_json::Value>,
+                                dest_ty: &serde_json::Value,
+                                type_arg: serde_json::Value| {
+        serde_json::json!({
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {"arg_count": arg_count, "locals": locals},
+                "body": [
+                    interior_bb(
+                        vec![],
+                        serde_json::json!({
+                            "span": interior_span(),
+                            "kind": {
+                                "Call": {
+                                    "call": {
+                                        "func": {
+                                            "Regular": {
+                                                "kind": {"Fun": 4},
+                                                "generics": call_generics(type_arg)
+                                            }
+                                        },
+                                        "args": [],
+                                        "dest": interior_place(0, dest_ty)
+                                    },
+                                    "target": 1,
+                                    "on_unwind": 2
+                                }
+                            }
+                        }),
+                    ),
+                    interior_bb(vec![], interior_return()),
+                    interior_bb(vec![], interior_unwind()),
+                ]
+            }
+        })
+    };
+    let caller = |def_id: u64, name: &str, type_arg: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": interior_meta(&["fixture", name], true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": unit.clone()},
+            "body": {
+                "Unstructured": {
+                    "span": interior_span(),
+                    "locals": {
+                        "arg_count": 0,
+                        "locals": [interior_local(0, None, &unit)]
+                    },
+                    "body": [
+                        interior_bb(
+                            vec![],
+                            serde_json::json!({
+                                "span": interior_span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": 0},
+                                                    "generics": call_generics(type_arg)
+                                                }
+                                            },
+                                            "args": [],
+                                            "dest": interior_place(0, &unit)
+                                        },
+                                        "target": 1,
+                                        "on_unwind": 2
+                                    }
+                                }
+                            }),
+                        ),
+                        interior_bb(vec![], interior_return()),
+                        interior_bb(vec![], interior_unwind()),
+                    ]
+                }
+            }
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                interior_struct(0, &["fixture", "GcBox"], &[("n", interior_i64())], 8, &[0], false),
+                interior_struct(1, &["fixture", "RawFlavorStruct"], &[("n", interior_i64())], 8, &[0], false),
+            ],
+            "fun_decls": [
+                serde_json::json!({
+                    "def_id": 0,
+                    "item_meta": interior_meta(&["fixture", "alloc_box"], true),
+                    "generics": {
+                        "regions": [],
+                        "types": [{"index": 0, "name": "T"}],
+                        "const_generics": [],
+                        "trait_clauses": []
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [t.clone(), u32_ty.clone()],
+                        "output": star_mut_t.clone()
+                    },
+                    "body": return_from_make_ptr(
+                        2,
+                        vec![
+                            interior_local(0, None, &star_mut_t),
+                            interior_local(1, Some("value"), &t),
+                            interior_local(2, Some("tid"), &u32_ty),
+                        ],
+                        &star_mut_t,
+                        t.clone(),
+                    )
+                }),
+                caller(1, "call_gc", gc_adt),
+                caller(2, "call_raw", raw_adt.clone()),
+                serde_json::json!({
+                    "def_id": 3,
+                    "item_meta": interior_meta(&["fixture", "raw_ptr"], true),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": star_mut_raw.clone()
+                    },
+                    "body": return_from_make_ptr(
+                        0,
+                        vec![interior_local(0, None, &star_mut_raw)],
+                        &star_mut_raw,
+                        raw_adt.clone(),
+                    )
+                }),
+                serde_json::json!({
+                    "def_id": 4,
+                    "item_meta": interior_meta(&["core", "ptr", "null_mut"], false),
+                    "generics": {
+                        "regions": [],
+                        "types": [{"index": 0, "name": "T"}],
+                        "const_generics": [],
+                        "trait_clauses": []
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": star_mut_t.clone()
+                    },
+                    "body": "Opaque"
+                }),
+            ],
+            "global_decls": [
+                look_inside_false(0, "alloc_box"),
+                look_inside_false(1, "raw_ptr"),
+                flavor_raw,
+            ],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": interior_meta(&["majit_gc", "header", "GcType"], false)
+            }],
+            "trait_impls": [{
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "types": [{"Value": [0, {"Adt": {
+                            "id": 0,
+                            "generics": {
+                                "regions": [],
+                                "types": [],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }}]}]
+                    }
+                }
+            }]
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("specialize_argtype inst fixture parses")
+}
+
 /// `opt.map_or(default, f)` on `Option<&OwnedFd>`: Discriminant `is_`
 /// operands share the payload `Ptr(Struct)` lltype (`rnone.py`
 /// `rtype_is_None`). Overlay paint is int-bank SomePtr, so there is no

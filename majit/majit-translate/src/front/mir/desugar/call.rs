@@ -8897,11 +8897,13 @@ impl<'a> Lowering<'a> {
 
     /// Residual call path for a generic `dont_look_inside` helper.
     ///
-    /// `enqueue_spec` refuses that body, so the unspecialized template
-    /// path would bind every instantiation to one funcptr.
-    /// `annlowlevel.specialize` / `getfunctionptr(graph)` give each
-    /// specialized graph its own address; name the residual the same way
-    /// from the call site's type arguments, without building a graph.
+    /// `enqueue_spec` refuses that body so the call is not named
+    /// `leaf__spec_<hash>`. `annlowlevel.specialize` / `getfunctionptr`
+    /// give each specialized graph its own address; name the residual
+    /// `leaf__inst_<types>` from the call site's type arguments, and
+    /// enqueue the `SpecRequest` `declare_spec` stamps from
+    /// `substituted_signature` (`dont_look_inside_return_token` of the
+    /// substituted output).
     pub(in crate::front::mir) fn residual_generic_fun_segments(
         &self,
         fd: &FunDecl,
@@ -8936,7 +8938,76 @@ impl<'a> Lowering<'a> {
             "{leaf}{}",
             majit_ir::helper_fnaddr::residual_inst_suffix(&name_refs)
         );
+        self.enqueue_residual_inst(fd, generics, leaf.clone());
         Some(spec_segments(self.llbc, fd, &leaf))
+    }
+
+    /// `FunctionDesc.cachedgraph` for a residual `leaf__inst_*` copy.
+    /// `declare_spec` stamps `dont_look_inside_return_token` of the
+    /// substituted output. An opaque FunDecl has no body to copy.
+    ///
+    /// A copy whose substituted output is still unrooted `ref` (the
+    /// generic `*mut T` token) is not a distinct residual type:
+    /// `annlowlevel.specialize` still names the call `leaf__inst_*`,
+    /// and `materialize_residual_inst` keeps the template stub. A
+    /// GraphStore header stamped `ref` with a Void call result fails
+    /// `getcalldescr` (`FUNC.RESULT != RESULT`).
+    fn enqueue_residual_inst(&self, fd: &FunDecl, generics: &serde_json::Value, leaf: String) {
+        let Some(spec) = self.spec else {
+            return;
+        };
+        if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
+            return;
+        }
+        let Some((types, const_generics)) =
+            crate::front::clause_spec::concrete_type_args(generics, self.llbc)
+        else {
+            return;
+        };
+        let signature = crate::front::clause_spec::substituted_signature(
+            &fd.signature,
+            self.llbc,
+            &types,
+            &const_generics,
+        );
+        let carrier = self.static_addrs.error_carrier;
+        let class_root = dont_look_inside_return_class_root(
+            &signature.output,
+            self.llbc,
+            carrier,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        let container_root = dont_look_inside_return_container_root(
+            &signature.output,
+            self.llbc,
+            carrier,
+            self.gc_struct_ids,
+        );
+        let token = dont_look_inside_return_token(
+            &signature.output,
+            self.llbc,
+            carrier,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        if class_root.is_none()
+            && container_root.is_none()
+            && !token.as_deref().is_some_and(|t| t.starts_with("raw:"))
+        {
+            return;
+        }
+        let trait_refs =
+            crate::front::clause_spec::concrete_trait_refs_or_empty(generics, self.llbc)
+                .unwrap_or_default();
+        spec.borrow_mut()
+            .enqueue(crate::front::clause_spec::SpecRequest {
+                fn_id: fd.def_id,
+                leaf,
+                trait_refs,
+                types,
+                const_generics,
+            });
     }
 
     /// Impl method named by a `TraitImpl` trait ref, specialized when that

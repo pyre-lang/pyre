@@ -968,20 +968,29 @@ impl CallRegistry {
         }
         if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
             let stripped_key = key.with_segments(stripped);
-            if let Some(entry) = self.materialize_residual_inst(&stripped_key) {
-                return Some(entry);
-            }
-            if let Some(getdesc) = self.getdesc.borrow().clone()
-                && let Some(entry) = getdesc(&stripped_key)
-            {
+            if let Some(entry) = self.describe_or_materialize_residual_inst(&stripped_key) {
                 return Some(entry);
             }
         }
-        if let Some(entry) = self.materialize_residual_inst(key) {
+        self.describe_or_materialize_residual_inst(key)
+    }
+
+    /// A declared `leaf__inst_*` funcobj (`FunctionDesc.cachedgraph`)
+    /// wins over cloning the template stub (`annlowlevel.specialize` /
+    /// `getfunctionptr`). `getdesc` is the exact path
+    /// `describe_declared_funcobj` registered; a miss still copies the
+    /// template so an inst key that GraphStore does not carry keeps a
+    /// distinct callable.
+    fn describe_or_materialize_residual_inst(
+        &self,
+        key: &FunctionPathKey,
+    ) -> Option<Rc<FunctionEntry>> {
+        if let Some(getdesc) = self.getdesc.borrow().clone()
+            && let Some(entry) = getdesc(key)
+        {
             return Some(entry);
         }
-        let getdesc = self.getdesc.borrow().clone()?;
-        getdesc(key)
+        self.materialize_residual_inst(key)
     }
 
     /// Bind a generic `dont_look_inside` residual instantiation to its

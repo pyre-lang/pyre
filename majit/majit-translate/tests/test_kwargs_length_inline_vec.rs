@@ -221,6 +221,64 @@ fn gc_alloc_young_storage_box_gets_one_residual_per_storage_shape() {
     );
 }
 
+/// `specialize.py` `specialize_argtype`: each `__inst_` copy of
+/// `gc_alloc_young_storage_box` (`dont_look_inside`, `*mut T`) carries
+/// the residual token of the substituted output. The generic template
+/// stays `None`.
+#[test]
+fn gc_alloc_young_storage_box_inst_gets_substituted_return_token() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        HostStaticAddrs::default(),
+        &[
+            "kwargsdict",
+            "dictmultiobject",
+            "gc_storage",
+            "identitydict",
+        ],
+        &["get_empty_storage", "gc_alloc_young_storage_box"],
+    )
+    .expect("lower get_empty_storage callers and young-box residual");
+
+    let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+    let generic = program
+        .functions
+        .iter()
+        .find(|f| f.name.rsplit("::").next() == Some("gc_alloc_young_storage_box"));
+    if let Some(generic) = generic {
+        assert!(
+            generic.return_class_root.is_none() && generic.graph().return_class_root.is_none(),
+            "generic *mut T has no class root; token={:?} root={:?}; names={names:?}",
+            generic.return_type,
+            generic.return_class_root
+        );
+    }
+    let inst_rdict = program.functions.iter().find(|f| {
+        f.name.rsplit("::").next().is_some_and(|leaf| {
+            leaf.starts_with("gc_alloc_young_storage_box__inst_") && leaf.contains("RDict")
+        })
+    });
+    let inst_rdict = inst_rdict.expect(&format!(
+        "RDict instantiation is an __inst_ subject; names={names:?}"
+    ));
+    assert_eq!(
+        inst_rdict.return_type.as_deref(),
+        Some("ref"),
+        "substituted *mut RDict is ref; names={names:?}"
+    );
+    let root = inst_rdict
+        .return_class_root
+        .as_deref()
+        .or(inst_rdict.graph().return_class_root.as_deref());
+    assert!(
+        root.is_some_and(|root| root.contains("RDict")),
+        "RDict class root, got {root:?}; names={names:?}"
+    );
+}
+
 fn is_core_tuple_default_call(target: &CallTarget) -> bool {
     match target {
         CallTarget::FunctionPath { segments, .. } => {

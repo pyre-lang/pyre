@@ -38,7 +38,7 @@ use super::model::{
 use super::policy::Specializer;
 use super::signature::ParamType;
 use crate::flowspace::argument::{CallShape, Signature};
-use crate::flowspace::model::{ConstValue, Constant, HostObject, host_getattr};
+use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable, host_getattr};
 use crate::flowspace::pygraph::PyGraph;
 use crate::tool::algo::unionfind::SharedUnionFindInfo;
 
@@ -1433,11 +1433,17 @@ impl std::fmt::Debug for SourceGraph {
 /// Analogue of `translator.buildflowgraph` for a lifted LLBC body:
 /// `copygraph` (`flowspace/model.py`) with a new name.
 pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph> {
-    let mut copied =
-        crate::flowspace::model::copygraph(&template.graph.borrow(), false, &HashMap::new(), false);
+    let template_graph = template.graph.borrow();
+    let (mut copied, varmap) = crate::flowspace::model::copygraph_with_varmap(
+        &template_graph,
+        false,
+        &HashMap::new(),
+        false,
+    );
     if let Some(name) = alt_name {
         copied.name = name.to_string();
     }
+    restore_signature_stub_annotations(&template_graph, &varmap);
     Rc::new(PyGraph {
         graph: Rc::new(RefCell::new(copied)),
         func: template.func.clone(),
@@ -1445,6 +1451,60 @@ pub(crate) fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> 
         defaults: RefCell::new(template.defaults.borrow().clone()),
         access_directly: std::cell::Cell::new(template.access_directly.get()),
     })
+}
+
+/// `copygraph` copyvar (`model.py`) keeps `concretetype` and drops
+/// `annotation` so a lifted body re-flows for a new `cachedgraph` key.
+/// A residual signature stub (`extfunc.py` `register_external`, the
+/// `dont_look_inside` unique graph `install_source_graph` prefills)
+/// has no operations; its return Variable is
+/// `ExtRegistryEntry.compute_result_annotation`. `specialize_argtype`
+/// still `cachedgraph`s per argument type (`func_with_new_name` copies
+/// `_annspecialcase_`). Dropping that annotation makes the specialized
+/// copy's result `s_ImpossibleValue` / Void.
+///
+/// Restore only the result shell (startblock→returnblock link args
+/// and `getreturnvar`). The unique stub's startblock inputargs are
+/// bound by later `complete()` of that graph; copying them onto a
+/// new key merges the unique callers into the specialized ones
+/// (`unionof` String ∪ Instance(StrKey)).
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity; matches copygraph_with_varmap"
+)]
+fn restore_signature_stub_annotations(
+    template: &crate::flowspace::model::FunctionGraph,
+    varmap: &HashMap<Variable, Variable>,
+) {
+    if !template.startblock.borrow().operations.is_empty() {
+        return;
+    }
+    let restore_one = |src: &Variable| {
+        let Some(dst) = varmap.get(src) else {
+            return;
+        };
+        if let Some(ann) = src.annotation.borrow().as_ref() {
+            *dst.annotation.borrow_mut() = Some(ann.clone());
+        }
+    };
+    {
+        let start = template.startblock.borrow();
+        for link in &start.exits {
+            for arg in &link.borrow().args {
+                if let Some(Hlvalue::Variable(v)) = arg {
+                    restore_one(v);
+                }
+            }
+        }
+    }
+    {
+        let ret = template.returnblock.borrow();
+        for arg in &ret.inputargs {
+            if let Hlvalue::Variable(v) = arg {
+                restore_one(v);
+            }
+        }
+    }
 }
 
 /// Result of [`FunctionDesc::specialize`].
@@ -3346,6 +3406,83 @@ mod tests {
             "isconstant__call_location_g1_b2_i3"
         );
         assert_eq!(fd.cache.borrow().len(), 3);
+    }
+
+    /// `specialize_argtype` `cachedgraph` clones the unique residual stub.
+    /// `copygraph` copyvar would drop `compute_result_annotation`; the
+    /// signature stub has no body to re-flow, so the declared result stays.
+    #[test]
+    fn cachedgraph_keeps_signature_stub_return_annotation_per_key() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link, Variable,
+        };
+
+        let fd = FunctionDesc::new(bk(), None, "alloc_box", int_sig(&["value"]), None, None);
+        let startblock = Block::shared(vec![Hlvalue::Variable(Variable::named("value"))]);
+        let func = GraphFunc::new(
+            "alloc_box",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        let mut graph_inner = FunctionGraph::new("alloc_box", startblock.clone());
+        graph_inner.func = Some(func.clone());
+        let return_var = Variable::named("__unsafe_stub_result");
+        *return_var.annotation.borrow_mut() =
+            Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::default())));
+        let link = std::rc::Rc::new(std::cell::RefCell::new(Link::new(
+            vec![Hlvalue::Variable(return_var)],
+            Some(graph_inner.returnblock.clone()),
+            None,
+        )));
+        startblock.closeblock(vec![link]);
+        let stub = std::rc::Rc::new(PyGraph {
+            graph: std::rc::Rc::new(std::cell::RefCell::new(graph_inner)),
+            func,
+            signature: std::cell::RefCell::new(int_sig(&["value"])),
+            defaults: std::cell::RefCell::new(Some(Vec::new())),
+            access_directly: std::cell::Cell::new(false),
+        });
+        fd.cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, stub.clone());
+        {
+            let g = stub.graph.borrow();
+            if let Hlvalue::Variable(v) = &g.startblock.borrow().inputargs[0] {
+                *v.annotation.borrow_mut() =
+                    Some(std::rc::Rc::new(SomeValue::Integer(SomeInteger::default())));
+            }
+        }
+
+        let cloned = fd
+            .cachedgraph(
+                GraphCacheKey::Tuple(vec![GraphCacheKey::String("GcBox".into())]),
+                None,
+                None,
+            )
+            .expect("clone of residual signature stub");
+        let link_ann = {
+            let g = cloned.graph.borrow();
+            let start = g.startblock.borrow();
+            let link = start.exits[0].borrow();
+            match &link.args[0] {
+                Some(Hlvalue::Variable(v)) => v.annotation.borrow().clone(),
+                _ => None,
+            }
+        };
+        assert!(
+            matches!(link_ann.as_deref(), Some(SomeValue::Integer(_))),
+            "specialize_argtype copy keeps the stub result shell, got {link_ann:?}"
+        );
+        let input_ann = {
+            let g = cloned.graph.borrow();
+            match &g.startblock.borrow().inputargs[0] {
+                Hlvalue::Variable(v) => v.annotation.borrow().clone(),
+                _ => None,
+            }
+        };
+        assert!(
+            input_ann.is_none(),
+            "specialize_argtype copy re-binds inputs, got {input_ann:?}"
+        );
     }
 
     #[test]
