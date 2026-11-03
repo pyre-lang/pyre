@@ -9312,11 +9312,18 @@ pub(in crate::front::mir) fn int_cast_size_and_sign(
     Some((size, unsigned))
 }
 
-/// Intern leaf equality for a pair of class-root spellings
-/// (`pyframe::PyFrame` and `PyFrame` name one class).
+/// Two class-root spellings name one class when they are equal, or when one of them is the bare leaf spelling
+/// (no `::` before any generic suffix) of the other (`PyFrame` / `pyframe::PyFrame`). Two qualified spellings with
+/// the same leaf (`a::Foo` / `b::Foo`) are distinct classes (`rclass.py` `InstanceRepr.convert_from_to`).
 fn instance_roots_match(left: &str, right: &str) -> bool {
-    left == right
-        || majit_ir::descr::class_root_leaf(left) == majit_ir::descr::class_root_leaf(right)
+    if left == right {
+        return true;
+    }
+    let qualified = |root: &str| root[..root.find('<').unwrap_or(root.len())].contains("::");
+    if qualified(left) && qualified(right) {
+        return false;
+    }
+    majit_ir::descr::class_root_leaf(left) == majit_ir::descr::class_root_leaf(right)
 }
 
 /// The operation `jtransform.py _int_to_int_cast` rewrites an integer

@@ -2861,15 +2861,14 @@ fn raw_alloc_ptr_somevalue() -> SomeValue {
 /// `rffi.cast(CArrayPtr(T), p)` (`rffi.py` `cast`) emits the 2-arg
 /// form with `PtrT` a `ConstValue::LowLevelType` of that array
 /// pointer. `getkind` of a raw `Ptr` is Signed (`history.py`
-/// `TYPE.TO._gckind == 'raw'`). The 1-arg `Int → Ref` lowering still
-/// has no concrete Ptr and keeps the Gc-Opaque placeholder; a gc
-/// opaque would kind as GcRef.
+/// `TYPE.TO._gckind == 'raw'`). The 1-arg `Int → Ref` lowering has no
+/// destination type and is the GC reference word, `llmemory.GCREF`.
 fn lltype_cast_int_to_ptr(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, OpaqueType, Ptr, SomePtr};
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType, SomePtr};
     if args_s.len() == 2 {
         let s_ptrt = arg_at(args_s, 0, "lltype.cast_int_to_ptr");
         if !s_ptrt.is_constant() {
@@ -2889,10 +2888,10 @@ fn lltype_cast_int_to_ptr(
         };
         return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
     }
-    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
-    let placeholder_ptr = Ptr::from_container_type(LowLevelType::Opaque(Box::new(opaque)))
-        .expect("Opaque container yields a valid Ptr");
-    Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
+    let LowLevelType::Ptr(ptr_ty) = (*GCREF).clone() else {
+        unreachable!("GCREF is a pointer");
+    };
+    Ok(SomeValue::Ptr(SomePtr::new(*ptr_ty)))
 }
 
 /// `ForceCastEntry.compute_result_annotation` (`ll2ctypes.py`):

@@ -41,6 +41,8 @@ fn instance_roots_match_equates_leaf_and_qualified_spellings() {
         "pyframe::PyFrame",
         "pyobject::PyObject"
     ));
+    assert!(!instance_roots_match("a::Foo", "b::Foo"));
+    assert!(!instance_roots_match("a::Foo<i64>", "b::Foo<i64>"));
 }
 
 #[test]

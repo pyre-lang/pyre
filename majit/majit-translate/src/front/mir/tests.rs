@@ -12691,6 +12691,14 @@ fn gctype_trait_decl() -> serde_json::Value {
     })
 }
 
+fn deref_trait_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": item_meta_json(&["core", "ops", "deref", "Deref"], "", false),
+        "methods": []
+    })
+}
+
 pub(in crate::front::mir) fn kwargs_unerase_cast_llbc(src_is_gcref: bool) -> Llbc {
     let (gcref_ptr, dest_ptr) = kwargs_unerase_ptr_tys();
     let src_ty = if src_is_gcref {
@@ -23972,6 +23980,104 @@ fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
             .iter()
             .any(|segments| *segments == ["Wtf8CodePoints", "next"]),
         "RPython's direct decoder must not be replaced by Wtf8 iteration"
+    );
+}
+
+/// `PyError(ptr)` is one pointer operand. The ctor store narrows it
+/// once, to the carrier's inner class (`PyErrorObject`), in
+/// `ctor_ccharp_field_store` (`rtyper.py` `LowLevelOpList.convertvar`
+/// converts once).
+#[test]
+fn pyerror_ptr_ctor_emits_one_cast_instance() {
+    let py_ptr = interior_raw_mut(interior_adt(0));
+    let pyerror_ty = interior_adt(2);
+    let caller = interior_caller(
+        "wrap",
+        1,
+        vec![py_ptr.clone()],
+        pyerror_ty.clone(),
+        vec![
+            interior_local(0, None, &pyerror_ty),
+            interior_local(1, Some("p"), &py_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &pyerror_ty),
+                serde_json::json!({
+                    "Aggregate": [
+                        {"Adt": [2, null, null]},
+                        [{"Move": interior_place(1, &py_ptr)}]
+                    ]
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let pyerror = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "error", "PyError"], true),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": py_ptr,
+            "attr_info": null
+        }]},
+        "layout": interior_layout(8, &[0], true)
+    });
+    let deref_impl = serde_json::json!({
+        "impl_trait": {
+            "id": 1,
+            "generics": {"types": [{
+                "Value": [2, {
+                    "Adt": {"id": 2, "generics": empty_generics()}
+                }]
+            }]}
+        },
+        "types": [{
+            "kind": {"TraitType": [1, 0]},
+            "skip_binder": {"value": {
+                "Value": [1, {
+                    "Adt": {"id": 1, "generics": empty_generics()}
+                }]
+            }}
+        }]
+    });
+    let llbc = llbc_with_types_traits(
+        "fixture",
+        vec![
+            interior_struct(0, &["fixture", "PyObject"], &[], 0, &[], false),
+            interior_struct(1, &["fixture", "PyErrorObject"], &[], 0, &[], false),
+            pyerror,
+        ],
+        vec![caller],
+        vec![gctype_trait_decl(), deref_trait_decl()],
+        vec![gctype_impl_row(0), gctype_impl_row(1), deref_impl],
+    );
+    let graph = super::lower_function_with_static_addrs(
+        &llbc,
+        "wrap",
+        crate::HostStaticAddrs {
+            error_carrier: crate::ErrorCarrierSpec {
+                carrier_path: "fixture::error::PyError",
+                carrier_class: "",
+                carrier_wrappers: &[],
+                to_exc_object: None,
+                from_exc_object: None,
+            },
+            ..Default::default()
+        },
+    )
+    .expect("lower PyError(ptr) ctor");
+    let roots: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        roots,
+        ["PyErrorObject"],
+        "PyError(ptr) emits one __cast_instance_intrinsic to the inner class; graph={}",
+        graph.dump()
     );
 }
 
