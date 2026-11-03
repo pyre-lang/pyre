@@ -50,7 +50,7 @@ fn fn_ptr_family_names_the_wrapper_set_only_for_a_safe_pointer() {
 #[ignore]
 fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let wrapper = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))

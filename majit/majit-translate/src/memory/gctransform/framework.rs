@@ -1436,7 +1436,7 @@ mod tests {
         use majit_charon_reader::ullbc::strip_cleanup_blocks;
 
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-        let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-object LLBC");
+        let llbc = crate::test_support::load_ullbc(path);
         let cg = build(&llbc);
         for fd in llbc.iter_fun_decls() {
             let Some(body) = fd.unstructured() else {

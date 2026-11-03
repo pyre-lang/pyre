@@ -1157,17 +1157,16 @@ mod tests {
         use crate::front::mir::{
             build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
         };
-        use majit_charon_reader::Llbc;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/pyre-object.ullbc"
         );
-        let llbc = Llbc::load(path).expect("pyre-object.ullbc");
+        let llbc = crate::test_support::load_ullbc(path);
         let graph = lower_function(&llbc, "kind_of_canonical_exc_class")
             .expect("lower kind_of_canonical_exc_class");
         assert_kind_of_canonical_diverts(&graph);
 
-        let llbc = Llbc::load(path).expect("pyre-object.ullbc");
+        let llbc = crate::test_support::load_ullbc(path);
         let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[llbc],
             crate::HostStaticAddrs::default(),

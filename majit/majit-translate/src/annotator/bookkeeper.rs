@@ -8086,7 +8086,6 @@ mod tests {
     #[ignore]
     fn real_llbc_pyframe_locals_array_projects_typed_instance_items() {
         use crate::annotator::model::SomeValue;
-        use majit_charon_reader::Llbc;
 
         let interpreter_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -8096,8 +8095,8 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/llbc/pyre-object.ullbc"
         );
-        let interpreter = Llbc::load(interpreter_path).expect("load real interpreter LLBC");
-        let object = Llbc::load(object_path).expect("load real object LLBC");
+        let interpreter = crate::test_support::load_ullbc(interpreter_path);
+        let object = crate::test_support::load_ullbc(object_path);
         let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[object, interpreter],
             crate::HostStaticAddrs::default(),
@@ -8151,13 +8150,11 @@ mod tests {
     fn real_merged_llbc_memoryview_closure_tuple_projects_instance_item() {
         use crate::annotator::model::SomeValue;
         use crate::translator::rtyper::rmodel::Repr;
-        use majit_charon_reader::Llbc;
 
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/llbc/");
-        let object = Llbc::load(format!("{root}pyre-object.ullbc")).expect("load real object LLBC");
-        let interpreter = Llbc::load(format!("{root}pyre-interpreter.ullbc"))
-            .expect("load real interpreter LLBC");
-        let jit = Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load real jit LLBC");
+        let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+        let interpreter =
+            crate::test_support::load_ullbc(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+        let jit = crate::test_support::load_ullbc(crate::runtime_names::artifacts::JIT_ULLBC);
         let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
             &[object, interpreter, jit],
             crate::HostStaticAddrs::default(),

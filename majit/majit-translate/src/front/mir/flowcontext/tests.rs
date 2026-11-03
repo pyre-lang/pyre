@@ -147,7 +147,7 @@ fn unknown_array_items_offset_stops_direct_arrayitems() {
 fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let name_path = "pyre_object::rordereddict_entries::entries_item_ptr";
     let fd = llbc
         .iter_local_fns()
@@ -2076,7 +2076,7 @@ fn random_genrand32_fixed_array_keeps_concrete_identity() {
     use crate::model::{OpKind, ValueType};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::genrand32"))
@@ -2126,7 +2126,7 @@ fn rbigint_gc_root_unsafecell_calls_are_word_identity() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for name in [
         "majit_rlib::rbigint::gc::<Impl>::new",
         "majit_rlib::rbigint::gc::<Impl>::set",
@@ -2453,7 +2453,7 @@ fn cell_get_of_a_struct_field_is_that_fields_value_read() {
 #[test]
 fn live_rbigint_clone_result_is_rbigint_instance() {
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
@@ -2487,7 +2487,7 @@ fn a_kept_handle_roots_the_producer_value_with_the_real_new() {
     use crate::model::{CallTarget, LinkArg, OpKind};
 
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::_int_bitwise_and")
@@ -2545,7 +2545,7 @@ fn live_rbigint_returns_the_rooted_value() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "majit_rlib::rbigint::gc::live_rbigint")
@@ -2626,7 +2626,7 @@ fn gcref_address_cast_store_keeps_gcref_pointer() {
     use crate::model::OpKind;
 
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -2800,11 +2800,9 @@ fn graph_has_live_assertion_branch(graph: &crate::model::FunctionGraph) -> bool 
 fn random_rnd_keeps_regular_call_to_core_body() {
     // `_random` lives in `pyre-module`, so its graphs are in that artefact.
     let path = crate::runtime_names::artifacts::MODULE_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load pyre-module LLBC");
+    };
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path() == "pyre_module::module::_random::<Impl>::rnd")
@@ -2837,7 +2835,7 @@ fn random_wrapper_narrows_nullable_self_to_w_random() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
@@ -5245,15 +5243,14 @@ fn dict_strategy_ref_imp_layout_is_dyn_fat() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
     );
-    if !std::path::Path::new(path).is_file() {
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    };
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
-        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
     );
     let spelling = ["dictmultiobject::DictStrategyRef", "DictStrategyRef"]
         .iter()
@@ -5300,7 +5297,7 @@ fn range_contains_real_body_carries_le_lt() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let ctx = super::LowerContext::new(&llbc);
 
     let mut bounds_contains = None;
@@ -6119,11 +6116,9 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    };
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -7503,7 +7498,7 @@ fn pointer_to_usize_cast_keeps_rpython_signed_then_unsigned_sequence() {
 #[test]
 fn look_inside_iff_vec_trampoline_records_rust_vec_root() {
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let context = super::LowerContext::new(&llbc);
     let opaque = super::dont_look_inside_set_of(&llbc);
     for (name, root) in [
@@ -8253,11 +8248,9 @@ fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
 fn result_as_ref_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller = super::lower_function(&llbc, "unicode_translate_error_str")
         .expect("lower unicode_translate_error_str");
     let as_ref_calls = caller
@@ -8322,11 +8315,9 @@ fn result_as_ref_keeps_regular_call_to_core_body() {
 #[test]
 fn combine_starstarargs_keeps_regular_call_to_core_expect() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller = super::lower_function(&llbc, "combine_starstarargs_wrapped")
         .expect("lower combine_starstarargs_wrapped");
     assert_eq!(
@@ -8388,11 +8379,9 @@ fn combine_starstarargs_keeps_regular_call_to_core_expect() {
 #[test]
 fn complex_add_keeps_regular_call_to_core_unwrap() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller = super::lower_function(&llbc, "complex_add").expect("lower complex_add");
     assert_eq!(
         core_impl_call_count(&caller, "unwrap", "option"),
@@ -8424,11 +8413,9 @@ fn complex_add_keeps_regular_call_to_core_unwrap() {
 #[test]
 fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller = super::lower_function(&llbc, "unicode_translate_error_str")
         .expect("lower unicode_translate_error_str");
     assert_eq!(
@@ -8459,11 +8446,9 @@ fn unicode_translate_error_str_keeps_regular_call_to_core_result_expect() {
 #[test]
 fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load object LLBC");
+    };
     let caller =
         super::lower_function(&llbc, "range_list_length").expect("lower range_list_length");
     assert_eq!(
@@ -8496,11 +8481,9 @@ fn range_list_length_keeps_regular_call_to_core_result_unwrap() {
 fn result_map_err_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller = super::lower_function(&llbc, "read_code_units").expect("lower read_code_units");
     let map_err_calls = caller
         .blocks
@@ -8583,11 +8566,9 @@ fn result_map_err_keeps_regular_call_to_core_body() {
 fn result_map_err_unit_ok_caller_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller =
         super::lower_function(&llbc, "dict_store_checked").expect("lower dict_store_checked");
     let map_err_calls = caller
@@ -9424,7 +9405,7 @@ fn root_bracket_erasure_erases_free_pins_indexed_by_len_after_open() {
 fn saturating_sub_wrapper_diamond_real() {
     use crate::model::OpKind;
     let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
-    let llbc = Llbc::load(path).expect("load object LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let context = super::LowerContext::new(&llbc);
     let mut saw = 0usize;
     for fd in llbc.iter_fun_decls() {
@@ -9478,7 +9459,7 @@ fn opcode_impl_receiver_keeps_pyframe_input_root() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::pop_value")
         .expect("lower eval::<Impl>::pop_value");
     let receiver = graph
@@ -9577,7 +9558,7 @@ fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let mut owners = std::collections::BTreeSet::new();
     let mut to_bool_override = false;
     let mut to_bool_default = false;
@@ -9598,7 +9579,7 @@ fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
         }
     }
     let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        std::slice::from_ref(&llbc),
+        std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
         &[],
         &["to_bool"],
@@ -9959,7 +9940,7 @@ fn mut_ref_cell_signature_skips_a_residual_callee() {
 fn option_of_one_word_item_vec_keeps_the_enum_tag() {
     use crate::model::OpKind;
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let context = super::LowerContext::new(&llbc);
     let fd = llbc
         .iter_local_fns()
@@ -9991,7 +9972,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
         .iter_local_fns()
         .find(|fd| {
@@ -10054,7 +10035,7 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let fd = llbc
             .iter_local_fns()
             .find(|fd| {
@@ -10104,11 +10085,7 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
 fn slice_get_rangefrom_preserves_constant_bound_rtype() {
     use crate::translator::rtyper::call_registry::CallRegistry;
     use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
-    let llbc = Llbc::load(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/llbc/pyre-module.ullbc"
-    ))
-    .expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::MODULE_ULLBC);
     let graph = super::lower_function(
         &llbc,
         "pyre_module::module::unicodedata::interp_ucd::ucd_method_args",
@@ -10474,12 +10451,12 @@ fn pyerror_exc_object_registry_retains_instance_ref() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
-        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
     );
     let (owner, ty) = fields
         .fields
@@ -10525,9 +10502,9 @@ fn mini_buffer_params_preregisters_tuple_payload_row() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        std::slice::from_ref(&llbc),
+        std::slice::from_ref(llbc),
         crate::HostStaticAddrs::default(),
         &["module::_cffi_backend::cbuffer"],
         &["mini_buffer_params", "call_once"],

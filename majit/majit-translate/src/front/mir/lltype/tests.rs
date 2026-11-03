@@ -430,10 +430,9 @@ fn str_family_dict_key_newtype_constructs_as_str() {
 #[test]
 fn function_new_impl_reload_emits_cast_instance_str() {
     let interp = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(interp).exists() {
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(interp) else {
         return;
-    }
-    let llbc = Llbc::load(interp).expect("load pyre-interpreter LLBC");
+    };
     let graph =
         crate::front::mir::lower_function(&llbc, "pyre_interpreter::function::function_new_impl")
             .expect("lower function_new_impl");
@@ -2178,12 +2177,12 @@ fn unicode_storage_matches_real_object_llbc() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
-        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
     );
     assert!(
         fields
@@ -2277,12 +2276,12 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
     use crate::model::{CallTarget, OpKind, ValueType};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
-        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
     );
     assert_eq!(
         fields.fields.get("Constants"),
@@ -7131,11 +7130,9 @@ fn result_integer_instantiations_paint_distinct_class_roots() {
 fn option_map_or_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let caller = super::lower_function(&llbc, "get_or_create_extra_locals")
         .expect("lower get_or_create_extra_locals");
     let map_or_calls = caller
@@ -7225,11 +7222,9 @@ fn option_map_or_keeps_regular_call_to_core_body() {
 fn option_map_family_keeps_regular_call_to_core_body() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    if !std::path::Path::new(path).is_file() {
-        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+    let Some(llbc) = crate::test_support::load_ullbc_if_present(path) else {
         return;
-    }
-    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    };
     let ctx = super::LowerContext::new(&llbc);
     let leaves = [
         "map",
@@ -8058,12 +8053,12 @@ fn cross_llbc_crate_root_leaf_is_tombstoned_when_crates_differ() {
 #[ignore]
 fn type_parameter_fields_force_no_attribute_real() {
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let (_, _, _, _, _, attrs, _, _) = super::derive_program_metadata(
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
-        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc)),
     );
     let field = |owner: &str, name: &str| {
         attrs
@@ -9029,7 +9024,7 @@ fn fundecl_module_is_the_crate_qualified_defining_module() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-module.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let module_of = |name: &str| {
         let fd = llbc
             .iter_local_fns()
@@ -9347,7 +9342,7 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-object.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
         &llbc,
@@ -9384,7 +9379,7 @@ fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
         &llbc,
@@ -9423,7 +9418,7 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
         &llbc,

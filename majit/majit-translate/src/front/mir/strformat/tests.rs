@@ -670,7 +670,7 @@ fn real_stack_underflow_fmt_chain_collapses_to_str_concat() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph =
         super::lower_function(&llbc, "stack_underflow_error").expect("lower stack_underflow_error");
     let ops: Vec<_> = graph
@@ -742,7 +742,7 @@ fn arguments_from_str_nonconst_alias_real_constructor_args() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "constructor_args").expect("lower constructor_args");
 
     let residual = graph
@@ -779,7 +779,7 @@ fn iter_next_fold_real_call_function_impl_result() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "call_function_impl_result")
         .expect("lower call_function_impl_result");
 
@@ -844,7 +844,7 @@ fn iter_next_fold_real_identity_null_niche() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for function in [
         "pyre_interpreter::call::call_builtin_code_positional",
         "pyre_interpreter::runtime_ops::build_map_from_refs",
@@ -890,7 +890,7 @@ fn deque_index_reads_its_owner_without_a_fnonce_adapter() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let function = "pyre_interpreter::module::_collections::deque_index";
     let graph =
         super::lower_function(&llbc, function).unwrap_or_else(|e| panic!("lower {function}: {e}"));
@@ -935,7 +935,7 @@ fn memoryview_derivations_are_concrete_graphs() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for function in [
         "pyre_interpreter::builtins::w_memoryview_copy_derived",
         "pyre_interpreter::builtins::w_memoryview_readonly_derived",
@@ -980,7 +980,7 @@ fn memoryview_derivations_are_concrete_graphs() {
 fn pypyjitdriver_named_const_is_a_marker_receiver_constant() {
     use crate::model::{CallTarget, OpKind};
 
-    let llbc = Llbc::load(crate::runtime_names::artifacts::JIT_ULLBC).expect("load pyre-jit LLBC");
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::JIT_ULLBC);
     let graph = super::lower_function(&llbc, "eval_loop_jit").expect("lower eval_loop_jit");
     let driver_path = ["pyre_jit", "eval", "pypyjitdriver"];
 
@@ -1057,7 +1057,7 @@ fn bigint_i64_try_from_real_declines_u32_result() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "char_arg").expect("lower char_arg");
 
     let calls: Vec<&[String]> = graph
@@ -1096,15 +1096,17 @@ fn bigint_i64_try_from_real_declines_u32_result() {
 fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
     use crate::model::{CallTarget, OpKind};
 
-    for (relpath, fname) in [
-        ("/../../target/llbc/pyre-interpreter.ullbc", "index_c_int_w"),
+    for (path, fname) in [
         (
-            "/../../target/llbc/pyre-object.ullbc",
+            crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+            "index_c_int_w",
+        ),
+        (
+            crate::runtime_names::artifacts::OBJECT_ULLBC,
             "int_or_float_encode_int",
         ),
     ] {
-        let path = format!("{}{relpath}", env!("CARGO_MANIFEST_DIR"));
-        let llbc = Llbc::load(path).unwrap_or_else(|e| panic!("load {fname} LLBC: {e}"));
+        let llbc = crate::test_support::load_ullbc(path);
         let graph =
             super::lower_function(&llbc, fname).unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
         assert!(
@@ -1147,11 +1149,7 @@ fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
 fn w_range_iter_i128_try_from_lowers_to_checked_result() {
     use crate::model::{CallTarget, OpKind};
 
-    let path = format!(
-        "{}/../../target/llbc/pyre-object.ullbc",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let llbc = Llbc::load(path).unwrap_or_else(|e| panic!("load w_range_iter LLBC: {e}"));
+    let llbc = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
     let graph = super::lower_function(&llbc, "w_range_iter")
         .unwrap_or_else(|e| panic!("lower w_range_iter: {e:?}"));
     assert!(
@@ -1254,7 +1252,7 @@ fn decode_packed_format_pieces_handles_long_literal_marker() {
 fn fmt_collapse_long_literal_real_space_int() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for fname in ["space_int", "space_index"] {
         let graph =
             super::lower_function(&llbc, fname).unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
@@ -1299,7 +1297,7 @@ fn fmt_collapse_long_literal_real_space_int() {
 fn vec_index_mut_fill_user_function_args_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "fill_user_function_args")
         .expect("lower fill_user_function_args");
     let residual = graph
@@ -1345,7 +1343,7 @@ fn vec_index_mut_fill_user_function_args_real() {
 fn saturating_sub_generic_alias_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
         .expect("lower generic_alias_class_getitem");
     let residual = graph
@@ -1397,7 +1395,7 @@ fn saturating_sub_generic_alias_real() {
 fn set_ref_set_locals_w_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
     let value_input_root = graph
         .blocks
@@ -1477,7 +1475,7 @@ fn set_ref_set_locals_w_real() {
 fn we_are_jitted_lookup_in_type_where_real() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph =
         super::lower_function(&llbc, "lookup_in_type_where").expect("lower lookup_in_type_where");
     let we_are_jitted_residual = graph
@@ -1535,7 +1533,7 @@ fn we_are_jitted_lookup_in_type_where_real() {
 fn call_intrinsic_1_debug_enum_fmt_real() {
     use crate::model::{CallTarget, ExitSwitch, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "call_intrinsic_1").expect("lower call_intrinsic_1");
     let new_debug_residual = graph
         .blocks
@@ -1707,7 +1705,7 @@ fn fieldless_enum_ne_fold_real_getattr_str_impl() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::getattr_str_impl")
         .expect("lower getattr_str_impl");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
@@ -1741,7 +1739,7 @@ fn str_ne_fold_real_super_getattribute() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(
         &llbc,
         "pyre_interpreter::baseobjspace::super_getattribute_str",
@@ -1791,7 +1789,7 @@ fn string_ref_eq_fold_real_is_w() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph =
         super::lower_function(&llbc, "pyre_interpreter::baseobjspace::is_w").expect("lower is_w");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
@@ -1822,7 +1820,7 @@ fn niche_ptr_cmp_nonnull_ne_try_dispatch_binary_special() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(
         &llbc,
         "pyre_interpreter::objspace::descroperation::try_dispatch_binary_special",
@@ -1863,7 +1861,7 @@ fn niche_ptr_cmp_option_ne_try_hash_value() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "pyre_interpreter::builtins::try_hash_value")
         .expect("lower try_hash_value");
     let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
@@ -1896,7 +1894,7 @@ fn niche_ptr_cmp_option_ref_stays_shutdown_module_private_name() {
     use crate::model::{CallTarget, OpKind};
 
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(
         &llbc,
         "pyre_interpreter::shutdown::shutdown_module_private_name",
@@ -1934,7 +1932,7 @@ fn niche_ptr_cmp_option_ref_stays_shutdown_module_private_name() {
 fn jit_constancy_probes_return_non_constant() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
-    let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for probe in ["isconstant", "isvirtual"] {
         let graph =
             super::lower_function(&llbc, probe).unwrap_or_else(|e| panic!("lower {probe}: {e}"));
@@ -1972,7 +1970,7 @@ fn py_repr_wtf8_lifts_owned_wtf8buf_appends() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
     // Prove every append/build receiver is rooted at a builder ctor.
     // Start from every phi as a candidate and remove any phi fed by a
@@ -2115,8 +2113,8 @@ fn py_repr_wtf8_lifts_owned_wtf8buf_appends() {
 fn bind_kwargs_indexes_lower_to_array_reads() {
     use crate::model::{CallTarget, OpKind};
     let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-    let llbc = Llbc::load(path).expect("load real LLBC");
-    let hints = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+    let llbc = crate::test_support::load_ullbc(path);
+    let hints = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
     assert!(
         hints
             .get("gateway::<Impl>::find_argname")
@@ -2245,7 +2243,7 @@ fn pypy_list_item_roots_have_no_residual_vec_index() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let residual_vec_indexes = |fname: &str| {
         let graph = super::lower_function(&llbc, fname)
             .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
@@ -2303,7 +2301,7 @@ fn pypy_buffer_ranges_lower_to_getslice() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for fname in ["read_bytes", "parse_length_prefixed_protocols"] {
         let graph = super::lower_function(&llbc, fname)
             .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
@@ -2331,7 +2329,7 @@ fn check_len_result_uint_format_template_collapses() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     let graph = super::lower_function(&llbc, "_check_len_result").expect("lower _check_len_result");
     assert!(
         !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -2370,7 +2368,7 @@ fn deque_mutation_marker_uses_pypy_lock_identity_fields() {
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/llbc/pyre-interpreter.ullbc"
     );
-    let llbc = Llbc::load(path).expect("load real LLBC");
+    let llbc = crate::test_support::load_ullbc(path);
     for name in [
         "pyre_interpreter::module::_collections::modified",
         // `checklock`'s comparison half — the graph that carries the

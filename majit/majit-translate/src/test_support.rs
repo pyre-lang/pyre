@@ -5,8 +5,127 @@
 //! helper private to one `mod tests` cannot provide.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use majit_charon_reader::Llbc;
+
+use crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs;
+use crate::front::mir::LowerContext;
+use crate::runtime_names::artifacts;
 
 static STRUCT_REGISTRY_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// One parsed artefact per test process. Keyed by path *suffix*, not by
+/// `&'static str` pointer identity: each `concat!` site is a distinct
+/// static, and matching those pointers would re-parse the same file.
+/// Mirrors `tests/common/mod.rs` `llbc_slot`, plus jit and corpus.
+fn llbc_slot(path: &str) -> &'static OnceLock<Llbc> {
+    static INTERPRETER: OnceLock<Llbc> = OnceLock::new();
+    static OBJECT: OnceLock<Llbc> = OnceLock::new();
+    static MODULE: OnceLock<Llbc> = OnceLock::new();
+    static JIT: OnceLock<Llbc> = OnceLock::new();
+    static RLIB: OnceLock<Llbc> = OnceLock::new();
+    static CORPUS: OnceLock<Llbc> = OnceLock::new();
+    // `*.layouts.ullbc` sidecars share a crate stem; they are not these
+    // artefacts (`layout.rs` `layouts_ullbc_filename`).
+    if path.contains("layouts") {
+        panic!("load_ullbc only knows the production artefacts, got {path}");
+    }
+    if path.ends_with("pyre-interpreter.ullbc") {
+        &INTERPRETER
+    } else if path.ends_with("pyre-object.ullbc") {
+        &OBJECT
+    } else if path.ends_with("pyre-module.ullbc") {
+        &MODULE
+    } else if path.ends_with("pyre-jit.ullbc") {
+        &JIT
+    } else if path.ends_with("majit-rlib.ullbc") {
+        &RLIB
+    } else if path.ends_with("corpus.ullbc") {
+        &CORPUS
+    } else {
+        panic!("load_ullbc only knows the production artefacts, got {path}");
+    }
+}
+
+fn context_slot(path: &str) -> &'static OnceLock<LowerContext<'static>> {
+    static INTERPRETER: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static OBJECT: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static MODULE: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static JIT: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static RLIB: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static CORPUS: OnceLock<LowerContext<'static>> = OnceLock::new();
+    if path.contains("layouts") {
+        panic!("lower_context_for only knows the production artefacts, got {path}");
+    }
+    if path.ends_with("pyre-interpreter.ullbc") {
+        &INTERPRETER
+    } else if path.ends_with("pyre-object.ullbc") {
+        &OBJECT
+    } else if path.ends_with("pyre-module.ullbc") {
+        &MODULE
+    } else if path.ends_with("pyre-jit.ullbc") {
+        &JIT
+    } else if path.ends_with("majit-rlib.ullbc") {
+        &RLIB
+    } else if path.ends_with("corpus.ullbc") {
+        &CORPUS
+    } else {
+        panic!("lower_context_for only knows the production artefacts, got {path}");
+    }
+}
+
+/// Parse `path` once per test binary and share the artefact.
+pub(crate) fn load_ullbc(path: &'static str) -> &'static Llbc {
+    llbc_slot(path)
+        .get_or_init(|| Llbc::load(path).unwrap_or_else(|err| panic!("load {path}: {err}")))
+}
+
+/// `None` when the artefact has not been extracted, so the caller can skip.
+pub(crate) fn load_ullbc_if_present(path: &'static str) -> Option<&'static Llbc> {
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run `python3 scripts/extract-llbc.py`");
+        return None;
+    }
+    Some(load_ullbc(path))
+}
+
+/// Derive [`LowerContext`] once per artefact in this test binary.
+///
+/// Mirrors `tests/common/mod.rs` `lower_context_for`. `LowerContext` is
+/// `Sync` so tests can park it in `OnceLock` (`front::mir::LowerContext`).
+pub(crate) fn lower_context_for(llbc: &'static Llbc) -> &'static LowerContext<'static> {
+    for path in [
+        artifacts::INTERPRETER_ULLBC,
+        artifacts::OBJECT_ULLBC,
+        artifacts::MODULE_ULLBC,
+        artifacts::JIT_ULLBC,
+        artifacts::MAJIT_RLIB_ULLBC,
+        artifacts::CHARON_CORPUS_ULLBC,
+    ] {
+        if let Some(loaded) = llbc_slot(path).get()
+            && std::ptr::eq(llbc, loaded)
+        {
+            return context_slot(path).get_or_init(|| {
+                if path.ends_with("pyre-interpreter.ullbc") || path.ends_with("pyre-module.ullbc") {
+                    LowerContext::new_with_dependency_raw_flavors(
+                        llbc,
+                        &harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(load_ullbc(
+                            artifacts::OBJECT_ULLBC,
+                        ))),
+                    )
+                } else {
+                    LowerContext::new(llbc)
+                }
+            });
+        }
+    }
+    panic!("lower_context_for: llbc is not a production artefact from load_ullbc")
+}
+
+pub(crate) fn corpus_ullbc() -> &'static Llbc {
+    load_ullbc(artifacts::CHARON_CORPUS_ULLBC)
+}
 
 /// Publish `table` into the process-global name → `StructId` map and hold
 /// every other registering test out until the returned guard drops.

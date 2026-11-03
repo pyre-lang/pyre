@@ -2111,21 +2111,16 @@ mod tests {
     #[ignore]
     fn four_from_size_align_callers_have_no_residual() {
         use crate::front::mir::lower_function;
-        use majit_charon_reader::Llbc;
 
-        let object = Llbc::load(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/llbc/pyre-object.ullbc"
-        ))
-        .expect("load pyre-object.ullbc");
-        let rlib = Llbc::load(crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC)
-            .expect("load majit-rlib.ullbc");
+        let object = crate::test_support::load_ullbc(crate::runtime_names::artifacts::OBJECT_ULLBC);
+        let rlib =
+            crate::test_support::load_ullbc(crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC);
 
         for (llbc, name) in [
-            (&object, "bh_alloc_lowlevel_string"),
-            (&object, "alloc_raw_utf8_payload"),
-            (&object, "try_items_block_layout"),
-            (&rlib, "try_typed_items_block_layout"),
+            (object, "bh_alloc_lowlevel_string"),
+            (object, "alloc_raw_utf8_payload"),
+            (object, "try_items_block_layout"),
+            (rlib, "try_typed_items_block_layout"),
         ] {
             let graph =
                 lower_function(llbc, name).unwrap_or_else(|err| panic!("lower {name}: {err}"));
