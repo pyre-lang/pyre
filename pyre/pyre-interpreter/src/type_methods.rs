@@ -3466,7 +3466,7 @@ enum IntOrLong<'a> {
 /// leading `-` (e.g. `-0x2a`); `_format_int_or_long` strips them again with
 /// `skip_leading`.
 #[majit_macros::jit_elidable]
-fn int_to_base(base: u32, value: i64) -> String {
+fn _int_to_base(base: u32, value: i64) -> String {
     if base == 10 {
         return value.to_string();
     }
@@ -3600,7 +3600,7 @@ fn format_int_or_long_kind(
         IntOrLong::Int(v) => {
             // An i64 has at most 20 decimal digits, below the minimum
             // `int_max_str_digits` limit 640, so it can never trip.
-            let result = int_to_base(radix, v);
+            let result = _int_to_base(radix, v);
             let mut skip_leading: usize = match p.ty {
                 'b' | 'o' | 'x' | 'X' => 2,
                 _ => 0,
