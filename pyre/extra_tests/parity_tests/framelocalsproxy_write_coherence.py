@@ -20,6 +20,12 @@
 # test_generators never retains `gi_frame` / `sys._getframe()` across ordinary
 # `next`/`for` exhaustion and then reads `f_locals`. `frame_is_finished` leaves
 # those locals in place, so a captured frame still reports them.
+#
+# finished_generator_retained_frame_f_generator:
+# test_frame.test_f_generator never retains `gi_frame` across ordinary
+# `next`/`for` exhaustion or `close()` and then reads `f_generator`.
+# `frame_is_finished` drops the backlink, so a captured frame reports None
+# while `g` is still alive.
 
 """A write through the running frame's ``f_locals`` must be visible to a later
 read of the same local, including after the loop around the write is compiled.
@@ -339,6 +345,75 @@ def check_exhausted_generator_retained_frame_locals():
     return True
 
 
+def check_finished_generator_retained_frame_f_generator():
+    # Ordinary completion (`frame_is_finished` with prompt_finalization false)
+    # and close() both drop `frame.f_generator_wref`. Capture `g.gi_frame`
+    # before start, then print `f.f_generator is g` (True while live) and
+    # `f.f_generator` after finish / close (None), with `g` still alive so a
+    # weakref death is not the cause.
+    def gen():
+        yield 1
+
+    def show(label, value):
+        print(f"{label}: {value}")
+        return value
+
+    g = gen()
+    f = g.gi_frame
+    if not show("before_start", f.f_generator is g):
+        return False
+
+    g = gen()
+    f = g.gi_frame
+    try:
+        next(g)
+        next(g)
+    except StopIteration:
+        pass
+    if g.gi_frame is not None:
+        print(f"next exhaustion left gi_frame={g.gi_frame!r}")
+        return False
+    if show("next_exhaust", f.f_generator) is not None:
+        return False
+
+    g = gen()
+    f = g.gi_frame
+    for _ in g:
+        pass
+    if g.gi_frame is not None:
+        print(f"for exhaustion left gi_frame={g.gi_frame!r}")
+        return False
+    if show("for_exhaust", f.f_generator) is not None:
+        return False
+
+    g = gen()
+    f = g.gi_frame
+    next(g)
+    g.close()
+    if g.gi_frame is not None:
+        print(f"close left gi_frame={g.gi_frame!r}")
+        return False
+    if show("close", f.f_generator) is not None:
+        return False
+
+    def consume():
+        g = gen()
+        f = g.gi_frame
+        try:
+            next(g)
+            next(g)
+        except StopIteration:
+            pass
+        return g.gi_frame, f.f_generator
+
+    for _ in range(2000):
+        gi, fg = consume()
+        if gi is not None or fg is not None:
+            print(f"hot consume: gi_frame={gi!r} f_generator={fg!r}")
+            return False
+    return True
+
+
 results = [
     check("write_through_proxy", write_through_proxy(ROUNDS)),
     check("store_then_read_proxy", store_then_read_proxy(ROUNDS)),
@@ -351,6 +426,7 @@ results = [
     check_unstarted_coroutine_celltype_f_locals(),
     check_unstarted_asyncgen_celltype_f_locals(),
     check_exhausted_generator_retained_frame_locals(),
+    check_finished_generator_retained_frame_f_generator(),
 ]
 
 def framelocalsproxy_gc_roots():

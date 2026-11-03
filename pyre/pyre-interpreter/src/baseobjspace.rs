@@ -23122,9 +23122,10 @@ pub unsafe fn generator_frame_is_finished(
         frame.clear_references();
     }
     frame.f_backref = std::ptr::null_mut();
-    // PyPy's `GeneratorOrCoroutine.frame_is_finished` (`generator.py`) leaves
-    // `PyFrame.f_generator_wref` alone, but 3.15 `frame.f_generator` answers
-    // None once the generator finished (measured on python3.15t: a retained
+    // PyPy's `GeneratorOrCoroutine.frame_is_finished` (`generator.py`)
+    // leaves `PyFrame.f_generator_wref` alone, but 3.15 `frame.f_generator`
+    // answers None once the generator finished (parity case
+    // `check_finished_generator_retained_frame_f_generator`: a retained
     // `gi_frame` reports `f_generator is None` after exhaustion and after
     // `close()`), so completion drops the weak backlink and
     // `PyFrame.get_generator` returns None.
