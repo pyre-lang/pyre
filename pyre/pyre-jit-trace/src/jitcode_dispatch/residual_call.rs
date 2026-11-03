@@ -9108,20 +9108,18 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
 pub(crate) enum OperatorTailResidual {
     /// The tail raised: `GUARD_EXCEPTION` recorded, the frame unwinds.
     Raised((DispatchOutcome, usize)),
-    /// The tail returned: the `CallR` result, already written to `dst`
+    /// The tail returned: the call result, already written to `dst`
     /// and followed by `GUARD_NO_EXCEPTION`.
     Returned(OpRef),
-    /// Nothing was recorded; the caller latches the tail instead.
-    NotRun,
 }
 
-/// Record `CallR` of the tail's helper ([`crate::operator_continuation::OperatorTail::tail_call`])
-/// on `(value, receiver)` for a tail that has a receiver.
-///
-/// `pyjitpl.py handle_possible_exception` decides `GUARD_EXCEPTION` vs
+/// Record the tail's helper ([`crate::operator_continuation::OperatorTail::tail_call`])
+/// on `(value, receiver)` through [`finish_dispatch_residual_call`]
+/// (`pyjitpl.py do_residual_call`), then `GUARD_NOT_FORCED` for a may-force
+/// call and `handle_possible_exception`'s `GUARD_EXCEPTION` /
 /// `GUARD_NO_EXCEPTION`. Users: `descroperation.py binop_impl` (BinopLast,
 /// raises the unsupported-operand TypeError) and `typeobject.py descr_call`
-/// (TypeCallNew, runs `__init__`).
+/// (TypeCallNew, runs `__init__`, so its descr has `EffectInfo::MOST_GENERAL`).
 pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -9140,73 +9138,53 @@ pub(crate) fn record_operator_tail_residual<Sym: WalkSym>(
         _ => None,
     };
     let funcptr = ctx.trace_ctx.const_int(tail.tail_call().0);
+    // `call.py getcalldescr`: an initializer is an arbitrary Python call,
+    // so the TypeCallNew tail gets the most general effects (it may force
+    // frames, write any field and invalidate quasi-immutables). The
+    // BinopLast tail only raises the unsupported-operand TypeError.
+    let ei = match tail {
+        crate::operator_continuation::OperatorTail::TypeCallNew => {
+            majit_ir::EffectInfo::MOST_GENERAL
+        }
+        _ => majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CanRaise, OopSpecIndex::None),
+    };
     let descr = majit_metainterp::make_call_descr_with_effect(
         &[Type::Ref, Type::Ref],
         Type::Ref,
-        majit_ir::EffectInfo::new(majit_ir::ExtraEffect::CanRaise, OopSpecIndex::None),
+        ei.clone(),
     );
-    let allboxes = [funcptr, value, receiver];
-    // `dispatch_residual_call_iRd_kind` sets this before the post-call
-    // `handle_possible_exception` guards so a later `?` still resumes past
-    // the executed call (`helper_capability_gap_resume_pc`).
-    ctx.live_after_jit_pc = op.next_pc;
-    record_operator_tail_call(ctx, op, dst, dst_bank, &allboxes, descr)
-}
-
-/// Slice-taking half of [`record_operator_tail_residual`]: the
-/// record hook and `try_execute_residual_call_via_executor_inner` both
-/// need `allboxes`, and a local `[OpRef; 3]` cannot be borrowed by both.
-fn record_operator_tail_call<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    dst: usize,
-    dst_bank: char,
-    allboxes: &[OpRef],
-    descr: DescrRef,
-) -> Result<OperatorTailResidual, DispatchError> {
     let call_descr = descr
         .as_call_descr()
         .expect("make_call_descr_with_effect returns a CallDescr");
-    let descr_for_record = descr.clone();
-    let mut recorded = OpRef::NONE;
-    let mut ran = false;
-    let resid_exec = {
-        let mut record_call = |ctx: &mut WalkContext<'_, '_, Sym>, result: Option<Value>| {
-            let rec = ctx.trace_ctx.record_op_with_descr_value(
-                OpCode::CallR,
-                allboxes,
-                descr_for_record.clone(),
-                result,
-            );
-            ran = true;
-            recorded = rec;
-            Ok(rec)
-        };
-        match try_execute_residual_call_via_executor_inner(
-            ctx,
-            OpCode::CallR,
-            allboxes,
-            call_descr,
-            op.pc,
-            Some((op.next_pc, dst_bank, dst)),
-            None,
-            false,
-            Some(&mut record_call),
-        ) {
-            Ok(exec) => exec,
-            Err(_) => return Ok(OperatorTailResidual::NotRun),
-        }
-    };
-    let executed_ok = match resid_exec {
-        ResidualExecOutcome::Executed(result) => Some(result.is_err()),
-        ResidualExecOutcome::Declined(_) => None,
-    };
-    if executed_ok.is_none() || !ran {
-        return Ok(OperatorTailResidual::NotRun);
-    }
+    let allboxes = [funcptr, value, receiver];
+    let (call_opcode, can_raise, emit_guard_not_forced) =
+        select_residual_call_opcode(&ei, dst_bank, "record_operator_tail_residual");
+    // `do_residual_call`: preparation, the concrete call, then
+    // `vrefs_after_residual_call`, then `direct_call_may_force`.
+    let recorded_residual = finish_dispatch_residual_call(
+        ctx,
+        op.pc,
+        op.next_pc,
+        "record_operator_tail_residual",
+        call_opcode,
+        can_raise,
+        emit_guard_not_forced,
+        funcptr,
+        &allboxes,
+        call_descr,
+        descr.clone(),
+        &ei,
+        dst,
+        dst_bank,
+        &[value, receiver],
+        false,
+    )?;
     ctx.live_after_jit_pc = op.next_pc;
-    write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, recorded)?;
-    if executed_ok == Some(true) {
+    if emit_guard_not_forced {
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    }
+    if recorded_residual.raised {
         walker_record_guard_exception(ctx, op.pc)?;
         let exc = ctx
             .last_exc_value()
@@ -9217,16 +9195,18 @@ fn record_operator_tail_call<Sym: WalkSym>(
             op.next_pc,
         )));
     }
-    ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    walker_capture_snapshot_for_last_guard_scoped(
-        ctx,
-        op.pc,
-        GuardCaptureScope {
-            residual_call_catch_resume: true,
-            ..GuardCaptureScope::default()
-        },
-    )?;
-    Ok(OperatorTailResidual::Returned(recorded))
+    if recorded_residual.can_raise {
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+        walker_capture_snapshot_for_last_guard_scoped(
+            ctx,
+            op.pc,
+            GuardCaptureScope {
+                residual_call_catch_resume: true,
+                ..GuardCaptureScope::default()
+            },
+        )?;
+    }
+    Ok(OperatorTailResidual::Returned(recorded_residual.recorded))
 }
 
 pub(crate) fn residual_call_helper_kind_in_body(

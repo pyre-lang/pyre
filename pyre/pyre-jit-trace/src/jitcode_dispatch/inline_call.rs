@@ -12667,41 +12667,34 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         (value, concrete_for_shadow)
                     } else {
                         // Keep check failed: record `bh_type_call_new_tail` as a
-                        // residual `CallR` so `descr_call`'s `__init__` runs in
-                        // the trace (`pyjitpl.py do_residual_call` /
-                        // `handle_possible_exception`). The helper re-runs the
-                        // post-`__new__` checks at run time, so the call needs
-                        // no guard on the decision.
-                        let residual = match format_receiver {
-                            Some(w_call_box) => {
-                                super::residual_call::record_operator_tail_residual(
-                                    ctx,
-                                    op,
-                                    dst,
-                                    dst_bank,
-                                    crate::operator_continuation::OperatorTail::TypeCallNew,
-                                    value,
-                                    w_call_box,
-                                )?
-                            }
-                            None => super::residual_call::OperatorTailResidual::NotRun,
+                        // may-force residual call (`pyjitpl.py do_residual_call` /
+                        // `handle_possible_exception`) so `descr_call`'s `__init__`
+                        // runs in the trace. The helper re-runs the post-`__new__`
+                        // checks at run time.
+                        let Some(w_call_box) = format_receiver else {
+                            return abort_operator_tail_after_return(
+                                ctx,
+                                op.pc,
+                                operator_tail_caller.as_ref(),
+                                crate::operator_continuation::OperatorTail::TypeCallNew,
+                                value,
+                                format_receiver,
+                            );
                         };
-                        match residual {
+                        match super::residual_call::record_operator_tail_residual(
+                            ctx,
+                            op,
+                            dst,
+                            dst_bank,
+                            crate::operator_continuation::OperatorTail::TypeCallNew,
+                            value,
+                            w_call_box,
+                        )? {
                             super::residual_call::OperatorTailResidual::Raised(raised) => {
                                 return Ok(Some(raised));
                             }
                             super::residual_call::OperatorTailResidual::Returned(result) => {
                                 (result, concrete_from_recorded_opref(ctx, result))
-                            }
-                            super::residual_call::OperatorTailResidual::NotRun => {
-                                return abort_operator_tail_after_return(
-                                    ctx,
-                                    op.pc,
-                                    operator_tail_caller.as_ref(),
-                                    crate::operator_continuation::OperatorTail::TypeCallNew,
-                                    value,
-                                    format_receiver,
-                                );
                             }
                         }
                     }
@@ -12784,8 +12777,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 super::residual_call::OperatorTailResidual::Raised(raised) => {
                                     return Ok(Some(raised));
                                 }
-                                super::residual_call::OperatorTailResidual::Returned(_)
-                                | super::residual_call::OperatorTailResidual::NotRun => {
+                                super::residual_call::OperatorTailResidual::Returned(_) => {
                                     return abort_operator_tail_after_return(
                                         ctx,
                                         op.pc,
@@ -13201,13 +13193,15 @@ fn try_walker_inline_type_call_python_new<Sym: WalkSym>(
     let new_func_pin = residual_call::owner_root_if_gc(w_func as usize);
     let mut arg_pins = residual_call::PinnedConcretes::new(&arg_concretes);
     let mut callee_arg_pins = residual_call::PinnedConcretes::new(&callee_arg_concretes);
-    arg_pins.refresh(&mut arg_concretes);
-    callee_arg_pins.refresh(&mut callee_arg_concretes);
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let type_const = ctx
         .trace_ctx
         .const_ref(pinned_obj(&type_pin, w_type) as i64);
+    // `const_ref` may append to the constant pool; reload the argument
+    // words after it so the tuple below is built from current addresses.
+    arg_pins.refresh(&mut arg_concretes);
+    callee_arg_pins.refresh(&mut callee_arg_concretes);
     let mut w_call_items = vec![type_const];
     w_call_items.extend_from_slice(&r_args[2..]);
     // The tuple is built from words reloaded after the pins

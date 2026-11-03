@@ -288,9 +288,11 @@ class Token(metaclass=Unsubclassable):
     MISSING = Token_MISSING
 
     def __new__(cls, *args, **kwargs):
-        # [3.15-spec] token_tp_new: RuntimeError, and Token keeps object's
-        # tp_init, so `Token.__init__(t)` is a no-op. lib_pypy constructs
-        # Token from ContextVar.set via __init__.
+        # [3.15-spec] token_tp_new raises RuntimeError, and PyContextToken_Type
+        # (Python/context.c at v3.15.0) has no tp_init, so `Token.__init__(t)`
+        # is object.__init__: measured on 3.15.0 it returns None and leaves
+        # `t.var` unchanged. lib_pypy `Token.__init__` takes
+        # (context, var, old_value) and is what ContextVar.set calls.
         if kwargs.get("_token_new") is not _TOKEN_NEW:
             raise RuntimeError("Tokens can only be created by ContextVars")
         self = object.__new__(cls)
