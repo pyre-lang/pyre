@@ -458,6 +458,15 @@ mod tests {
     }
 
     #[test]
+    fn scoped_nonmovingbuffer_holds_an_owner_root() {
+        let the_str = crate::lltypesystem::rstr::alloc_immortal_str(b"xyz");
+        let buf = scoped_nonmovingbuffer::new(the_str).unwrap();
+        assert_eq!(buf.llobj(), the_str);
+        drop(buf);
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(the_str, 3) };
+    }
+
+    #[test]
     fn alloc_buffer_large_count_uses_raw_storage() {
         let allocated_size = 8;
         let needed_size = 5;

@@ -452,9 +452,9 @@ pub fn read(fd: i32, count: i64) -> Result<Result<majit_ir::GcRef, i32>, crate::
 ///
 /// `llobj` is `llstr(data)` (`Ptr(STR)`). `count = len(data)` then
 /// `with rffi.scoped_nonmovingbuffer(data) as buf: c_write(fd, buf, count)`.
-/// The caller keeps the STR reachable for the call: the owning object is
-/// on `gc_roots`, or the STR is old-gen. The outer `Err` is an escaping
-/// `rffi.py mallocfn` `MemoryError`; the inner is `handle_posix_error`.
+/// The guard keeps the STR in an owner-root slot until `c_write` returns.
+/// The outer `Err` is an escaping `rffi.py mallocfn` `MemoryError`; the
+/// inner is `handle_posix_error`.
 #[cfg(unix)]
 #[majit_macros::replace_os_function("write")]
 pub fn write(

@@ -230,7 +230,6 @@ const CURSES_NAMES: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(pyre_minimal_curses)");
-    println!("cargo:rerun-if-changed=src/module/_minimal_curses/fficurses.c");
     majit_eci::build::compile_crate_ecis(&majit_eci::ExternalCompilationInfo::default());
     if curses_probe_enabled() {
         configure_minimal_curses();
@@ -272,11 +271,10 @@ fn record_failure(eci: &majit_eci::ExternalCompilationInfo, detail: &[u8]) {
     let _ = fs::write(out_dir().join("curses_probe_last_stderr.txt"), buf);
 }
 
-/// `fficurses.py` prefix includes: `ncurses/curses.h` plus
-/// `-DPYRE_CURSES_INCLUDE_NCURSES_PREFIX`, or `curses.h` / `term.h`.
-fn apply_ncurses_prefix(compile_extra: &mut Vec<String>, ncurses_prefix: bool) -> Vec<String> {
+/// `fficurses.py` prefix includes: `ncurses/curses.h`/`ncurses/term.h` or
+/// `curses.h`/`term.h`.
+fn apply_ncurses_prefix(ncurses_prefix: bool) -> Vec<String> {
     if ncurses_prefix {
-        compile_extra.push("-DPYRE_CURSES_INCLUDE_NCURSES_PREFIX".to_string());
         vec!["ncurses/curses.h".into(), "ncurses/term.h".into()]
     } else {
         vec!["curses.h".into(), "term.h".into()]
@@ -380,7 +378,7 @@ fn candidate_from_flags(
             link_extra.push(arg.to_string());
         }
     }
-    let includes = apply_ncurses_prefix(&mut compile_extra, ncurses_prefix);
+    let includes = apply_ncurses_prefix(ncurses_prefix);
     Some(majit_eci::ExternalCompilationInfo {
         include_dirs,
         compile_extra,
@@ -410,11 +408,9 @@ fn cflags_ldflags_grid() -> Vec<majit_eci::ExternalCompilationInfo> {
     let mut out = Vec::new();
     for (include_dirs, ncurses_prefix) in cflags {
         for (libraries, library_dirs) in &ldflags {
-            let mut compile_extra = Vec::new();
-            let includes = apply_ncurses_prefix(&mut compile_extra, ncurses_prefix);
+            let includes = apply_ncurses_prefix(ncurses_prefix);
             out.push(majit_eci::ExternalCompilationInfo {
                 include_dirs: include_dirs.clone(),
-                compile_extra,
                 library_dirs: library_dirs.clone(),
                 libraries: libraries.clone(),
                 includes,
@@ -442,7 +438,7 @@ fn accept(eci: &majit_eci::ExternalCompilationInfo) -> bool {
         return false;
     }
     if !compile_wrapper(eci) {
-        record_failure(eci, b"fficurses.c failed to compile\n");
+        record_failure(eci, b"fficurses wrapper failed to compile\n");
         return false;
     }
     majit_eci::build::link_eci(eci);
@@ -461,7 +457,7 @@ fn run_probe(eci: &majit_eci::ExternalCompilationInfo) -> Result<String, Vec<u8>
     let dir = out_dir();
     let src = dir.join("curses_const_probe.c");
     let bin = dir.join("curses_const_probe");
-    fs::write(&src, probe_source()).map_err(|err| err.to_string().into_bytes())?;
+    fs::write(&src, probe_source(eci)).map_err(|err| err.to_string().into_bytes())?;
     let mut cmd = cc::Build::new().get_compiler().to_command();
     cmd.arg("-o").arg(&bin);
     for dir in &eci.include_dirs {
@@ -497,17 +493,15 @@ fn run_probe(eci: &majit_eci::ExternalCompilationInfo) -> Result<String, Vec<u8>
     Ok(String::from_utf8_lossy(&ran.stdout).into_owned())
 }
 
-fn probe_source() -> String {
-    let mut src = String::from(
-        "#include <stdio.h>\n\
-         #if defined(PYRE_CURSES_INCLUDE_NCURSES_PREFIX)\n\
-         #include <ncurses/curses.h>\n\
-         #include <ncurses/term.h>\n\
-         #else\n\
-         #include <curses.h>\n\
-         #include <term.h>\n\
-         #endif\n\
-         int main(void) {\n\
+fn probe_source(eci: &majit_eci::ExternalCompilationInfo) -> String {
+    let mut src = String::from("#include <stdio.h>\n");
+    for h in &eci.includes {
+        src.push_str("#include <");
+        src.push_str(h);
+        src.push_str(">\n");
+    }
+    src.push_str(
+        "int main(void) {\n\
              void *volatile kept = 0;\n\
              kept = (void *)setupterm;\n\
              kept = (void *)tigetstr;\n\
@@ -632,18 +626,52 @@ fn parse_const_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), value.to_string()))
 }
 
+/// `fficurses.py` `post_include_bits` prototypes, without `RPY_EXTERN`.
+const FFICURSES_DECLS: &str = "\
+int rpy_curses_setupterm(char *, int, int *);
+char *rpy_curses_tigetstr(char *);
+char *rpy_curses_tparm(char *, int, int, int, int, int, int, int, int, int);";
+
+/// `fficurses.py` `separate_module_sources` wrapper bodies, without `RPY_EXTERN`.
+const FFICURSES_WRAPPERS: &str = "\
+int rpy_curses_setupterm(char *t, int fd, int *errret) {
+    return setupterm(t, fd, errret);
+}
+
+char *rpy_curses_tigetstr(char *capname) {
+    char *res = tigetstr(capname);
+    if (res == (char *)-1)
+        res = NULL;
+    return res;
+}
+
+char *rpy_curses_tparm(char *str, int x0, int x1, int x2, int x3,
+                       int x4, int x5, int x6, int x7, int x8) {
+    return tparm(str, x0, x1, x2, x3, x4, x5, x6, x7, x8);
+}
+";
+
 fn compile_wrapper(eci: &majit_eci::ExternalCompilationInfo) -> bool {
+    let include_lines = eci
+        .includes
+        .iter()
+        .map(|incl| format!("#include <{incl}>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // `copy_without('includes')`: `term.h` defines lower-case macros such as
+    // `lines`, so its includes stay in this one source.
+    let mut eci = eci.clone();
+    eci.includes.clear();
     let ints = out_dir().join("curses_ints.c");
     let Some(ints) = ints.to_str() else {
         return false;
     };
-    let files = majit_eci::ExternalCompilationInfo {
-        separate_module_files: vec![
-            "src/module/_minimal_curses/fficurses.c".into(),
-            ints.to_string(),
-        ],
+    let extra = majit_eci::ExternalCompilationInfo {
+        post_include_bits: vec![FFICURSES_DECLS.into()],
+        separate_module_sources: vec![format!("\n{include_lines}\n{FFICURSES_WRAPPERS}")],
+        separate_module_files: vec![ints.to_string()],
         ..majit_eci::ExternalCompilationInfo::default()
     };
-    let eci = eci.merge(&[&files]);
+    let eci = eci.merge(&[&extra]);
     majit_eci::build::compile_eci(&eci, "pyre_minimal_curses").is_ok()
 }

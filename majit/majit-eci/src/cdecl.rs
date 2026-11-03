@@ -46,6 +46,88 @@ pub enum Resolved {
     LocalStruct(String),
 }
 
+/// Peel `Type::Paren`/`Type::Group` and follow `Resolved::Alias` to the type
+/// the name stands for, with the module path that name lives in.
+fn resolve_target(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
+) -> Result<(Type, Vec<String>), String> {
+    let mut current = ty.clone();
+    let mut module_path = module_path.to_vec();
+    let mut hops = 0;
+    loop {
+        current = match current {
+            Type::Paren(paren) => *paren.elem,
+            Type::Group(group) => *group.elem,
+            Type::Path(type_path) if type_path.qself.is_none() => {
+                match resolve(&type_path.path, &module_path) {
+                    Some(Resolved::Alias(target, alias_module)) => {
+                        hops += 1;
+                        if hops > 64 {
+                            return Err("alias cycle".into());
+                        }
+                        module_path = alias_module;
+                        target
+                    }
+                    _ => return Ok((Type::Path(type_path), module_path)),
+                }
+            }
+            other => return Ok((other, module_path)),
+        };
+    }
+}
+
+/// `FuncType.__init__`: function arguments can only be primitive or pointer.
+pub fn functype_arg(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
+) -> Result<String, String> {
+    functype_slot(
+        ty,
+        module_path,
+        resolve,
+        "function arguments can only be primitive or pointer",
+    )
+}
+
+/// `FuncType.__init__`: function result can only be primitive or pointer.
+pub fn functype_result(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
+) -> Result<String, String> {
+    functype_slot(
+        ty,
+        module_path,
+        resolve,
+        "function result can only be primitive or pointer",
+    )
+}
+
+fn functype_slot(
+    ty: &Type,
+    module_path: &[String],
+    resolve: &dyn Fn(&syn::Path, &[String]) -> Option<Resolved>,
+    container_msg: &str,
+) -> Result<String, String> {
+    let (target, target_module) = resolve_target(ty, module_path, resolve)?;
+    match &target {
+        Type::Array(_) => return Err(container_msg.into()),
+        Type::Path(type_path) if type_path.qself.is_none() => {
+            if matches!(
+                resolve(&type_path.path, &target_module),
+                Some(Resolved::LocalStruct(_))
+            ) {
+                return Err(container_msg.into());
+            }
+        }
+        _ => {}
+    }
+    gettype(ty, module_path, resolve)
+}
+
 /// `LowLevelDatabase.gettype` type template for `ty`. `@` marks the declarator.
 pub fn gettype(
     ty: &syn::Type,
@@ -55,7 +137,17 @@ pub fn gettype(
     match ty {
         Type::Tuple(tuple) if tuple.elems.is_empty() => Ok("void @".into()),
         Type::Ptr(ptr) => {
-            let inner = gettype(&ptr.elem, module_path, resolve)?;
+            // `database.py gettype` on a `Ptr`: the node of the resolved
+            // target `T.TO` decides; `FixedSizeArrayDefNode.getptrtype`
+            // returns a pointer to the item.
+            let (elem, elem_module) = resolve_target(&ptr.elem, module_path, resolve)?;
+            let inner = match &elem {
+                Type::Array(arr) => {
+                    fixed_array_length(arr, ty)?;
+                    gettype(&arr.elem, &elem_module, resolve)?
+                }
+                _ => gettype(&ptr.elem, module_path, resolve)?,
+            };
             if ptr.const_token.is_some() {
                 if !inner.contains('*') && !inner.contains('(') {
                     Ok(format!("const {}", inner.replace('@', "*@")))
@@ -75,14 +167,14 @@ pub fn gettype(
             }
             let result = match &bare.output {
                 syn::ReturnType::Default => "void @".to_string(),
-                syn::ReturnType::Type(_, out) => gettype(out, module_path, resolve)?,
+                syn::ReturnType::Type(_, out) => functype_result(out, module_path, resolve)?,
             };
             let params = if bare.inputs.is_empty() {
                 "void".to_string()
             } else {
                 let mut parts = Vec::new();
                 for input in &bare.inputs {
-                    let t = gettype(&input.ty, module_path, resolve)?;
+                    let t = functype_arg(&input.ty, module_path, resolve)?;
                     parts.push(cdecl(&t, ""));
                 }
                 parts.join(", ")
@@ -138,10 +230,44 @@ pub fn gettype(
         }
         Type::Paren(paren) => gettype(&paren.elem, module_path, resolve),
         Type::Group(group) => gettype(&group.elem, module_path, resolve),
+        // `FixedSizeArrayDefNode.fulltypename`
+        Type::Array(arr) => {
+            let n = fixed_array_length(arr, ty)?;
+            Ok(gettype(&arr.elem, module_path, resolve)?.replace('@', &format!("(@)[{n}]")))
+        }
         _ => Err(format!(
             "unsupported type for generate_macro_wrapper: {}",
             tokens(ty)
         )),
+    }
+}
+
+fn unwrap_expr(expr: &syn::Expr) -> &syn::Expr {
+    let mut e = expr;
+    loop {
+        match e {
+            syn::Expr::Paren(paren) => e = &paren.expr,
+            syn::Expr::Group(group) => e = &group.expr,
+            other => return other,
+        }
+    }
+}
+
+fn fixed_array_length(arr: &syn::TypeArray, ty: &Type) -> Result<usize, String> {
+    let unsupported = || {
+        format!(
+            "unsupported array length for generate_macro_wrapper: {}",
+            tokens(ty)
+        )
+    };
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(n),
+        ..
+    }) = unwrap_expr(&arr.len)
+    {
+        n.base10_parse::<usize>().map_err(|_| unsupported())
+    } else {
+        Err(unsupported())
     }
 }
 

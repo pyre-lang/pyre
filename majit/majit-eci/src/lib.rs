@@ -357,5 +357,94 @@ mod tests {
             cdecl::gettype(&syn::parse_str("Foo").unwrap(), none, &resolve_foo).unwrap(),
             "struct Foo @"
         );
+        let array4 =
+            cdecl::gettype(&syn::parse_str("[i32; 4]").unwrap(), none, &resolve_extern).unwrap();
+        assert_eq!(array4, "int (@)[4]");
+        assert_eq!(cdecl::cdecl(&array4, "x"), "int x[4]");
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*mut [u8; 16]").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "unsigned char *@"
+        );
+        assert_eq!(
+            cdecl::gettype(
+                &syn::parse_str("*const [i32; 2]").unwrap(),
+                none,
+                &resolve_extern
+            )
+            .unwrap(),
+            "const int *@"
+        );
+        let array_n = cdecl::gettype(&syn::parse_str("[i32; N]").unwrap(), none, &resolve_extern);
+        assert!(
+            array_n
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.starts_with("unsupported array length")),
+            "{array_n:?}"
+        );
+        let resolve_a_foo = |path: &syn::Path, _: &[String]| -> Option<cdecl::Resolved> {
+            if path.segments.len() != 1 {
+                return None;
+            }
+            match path.segments[0].ident.to_string().as_str() {
+                "A" => Some(cdecl::Resolved::Alias(
+                    syn::parse_str("[i32; 4]").unwrap(),
+                    vec![],
+                )),
+                "Foo" => Some(cdecl::Resolved::LocalStruct("Foo".into())),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            cdecl::gettype(&syn::parse_str("*mut A").unwrap(), none, &resolve_a_foo).unwrap(),
+            "int *@"
+        );
+        assert_eq!(
+            cdecl::gettype(&syn::parse_str("*const A").unwrap(), none, &resolve_a_foo).unwrap(),
+            "const int *@"
+        );
+        let result_arr =
+            cdecl::functype_result(&syn::parse_str("[i32; 4]").unwrap(), none, &resolve_a_foo);
+        assert!(
+            result_arr
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.starts_with("function result can only be primitive or pointer")),
+            "{result_arr:?}"
+        );
+        let result_a = cdecl::functype_result(&syn::parse_str("A").unwrap(), none, &resolve_a_foo);
+        assert!(
+            result_a
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.starts_with("function result can only be primitive or pointer")),
+            "{result_a:?}"
+        );
+        assert_eq!(
+            cdecl::functype_arg(&syn::parse_str("Foo").unwrap(), none, &resolve_a_foo),
+            Err("function arguments can only be primitive or pointer".into())
+        );
+        assert_eq!(
+            cdecl::functype_arg(&syn::parse_str("*mut Foo").unwrap(), none, &resolve_a_foo)
+                .unwrap(),
+            "struct Foo *@"
+        );
+        assert_eq!(
+            cdecl::functype_result(&syn::parse_str("()").unwrap(), none, &resolve_a_foo).unwrap(),
+            "void @"
+        );
+        assert!(
+            cdecl::gettype(
+                &syn::parse_str("extern \"C\" fn([i32; 4])").unwrap(),
+                none,
+                &resolve_a_foo
+            )
+            .is_err()
+        );
     }
 }

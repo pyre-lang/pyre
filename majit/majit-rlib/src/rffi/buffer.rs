@@ -214,7 +214,8 @@ pub fn get_nonmovingbuffer_ll_final_null(
 /// `rffi.free_nonmovingbuffer_ll` (`jit.dont_look_inside`).
 ///
 /// `\x05` → `rgc.unpin(llobj)`. `\x06` → `lltype.free(buf)`. `\x04` is a
-/// no-op. Then `keepalive_until_here(llobj)`.
+/// no-op. `keepalive_until_here(llobj)` is the caller's root, see the
+/// scoped guards.
 ///
 /// # Safety
 /// `(buf, llobj, flag)` came from [`get_nonmovingbuffer_ll`] or
@@ -227,7 +228,8 @@ pub unsafe fn free_nonmovingbuffer_ll(buf: CCHARP, llobj: majit_ir::GcRef, flag:
     if flag == FLAG_RAW_COPY {
         unsafe { raw_free(buf.cast()) };
     }
-    let _keepalive = llobj;
+    // keepalive_until_here(llobj): the caller's root holds llobj until this returns; the
+    // scoped guards keep it in their owner-root slot.
 }
 
 fn mallocfn(count: usize) -> Result<Vec<u8>, MemoryError> {
@@ -361,7 +363,8 @@ pub unsafe fn keep_buffer_alive_until_here(
     gc_buf: majit_ir::GcRef,
     case_num: isize,
 ) {
-    let _keepalive = gc_buf;
+    // keepalive_until_here(gc_buf): the caller's root holds gc_buf until this returns; the
+    // scoped guards keep it in their owner-root slot.
     if case_num == CASE_PINNED {
         majit_gc::unpin(gc_buf);
     }
@@ -586,28 +589,44 @@ impl Drop for scoped_str2charp {
 
 /// `scoped_nonmovingbuffer`. [`Drop`] calls [`free_nonmovingbuffer_ll`].
 ///
-/// `llobj` is `llstr(data)`. While the scope lives the STR must stay
-/// reachable: the caller keeps the owning object rooted (`gc_roots`) or
-/// the STR is old-gen.
+/// `llobj` (`llstr(data)`) lives in a fixed owner-root slot for the
+/// guard's lifetime, as in [`scoped_alloc_buffer`], so the STR stays
+/// reachable until `__exit__` ([`Drop`]) has run `free_nonmovingbuffer_ll`.
 #[derive(Debug)]
 pub struct scoped_nonmovingbuffer {
     pub buf: CCHARP,
-    pub llobj: majit_ir::GcRef,
+    slot: usize,
     pub flag: u8,
+    /// `slot` indexes the acquiring thread's owner-root vector, the way a
+    /// shadow-stack slot belongs to the frame's own thread. Without this
+    /// marker the guard is auto-`Send`, and dropping it on another thread
+    /// would release that thread's slot.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl scoped_nonmovingbuffer {
     pub fn new(llobj: majit_ir::GcRef) -> Result<Self, MemoryError> {
         let (buf, llobj, flag) = get_nonmovingbuffer_ll(llobj)?;
-        Ok(Self { buf, llobj, flag })
+        let slot = majit_gc::shadow_stack::acquire_owner_root(llobj);
+        Ok(Self {
+            buf,
+            slot,
+            flag,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    pub fn llobj(&self) -> majit_ir::GcRef {
+        majit_gc::shadow_stack::get_owner_root(self.slot)
     }
 }
 
 impl Drop for scoped_nonmovingbuffer {
     fn drop(&mut self) {
-        unsafe { free_nonmovingbuffer_ll(self.buf, self.llobj, self.flag) };
+        let llobj = majit_gc::shadow_stack::get_owner_root(self.slot);
+        unsafe { free_nonmovingbuffer_ll(self.buf, llobj, self.flag) };
+        majit_gc::shadow_stack::release_owner_root(self.slot);
         self.flag = FLAG_INSIDE_NONMOVABLE;
-        self.llobj = majit_ir::GcRef::NULL;
         self.buf = core::ptr::null_mut();
     }
 }
@@ -615,35 +634,52 @@ impl Drop for scoped_nonmovingbuffer {
 /// `scoped_view_charp`. Same as [`scoped_nonmovingbuffer`], but the buffer is
 /// NUL-terminated (`get_nonmovingbuffer_ll_final_null`).
 ///
-/// `llobj` is `llstr(data)`. While the scope lives the STR must stay
-/// reachable: the caller keeps the owning object rooted (`gc_roots`) or
-/// the STR is old-gen.
+/// `llobj` (`llstr(data)`) lives in a fixed owner-root slot for the
+/// guard's lifetime, as in [`scoped_alloc_buffer`], so the STR stays
+/// reachable until `__exit__` ([`Drop`]) has run `free_nonmovingbuffer_ll`.
 #[derive(Debug)]
 pub struct scoped_view_charp {
     pub buf: CCHARP,
-    pub llobj: majit_ir::GcRef,
+    slot: usize,
     pub flag: u8,
+    /// `slot` indexes the acquiring thread's owner-root vector, the way a
+    /// shadow-stack slot belongs to the frame's own thread. Without this
+    /// marker the guard is auto-`Send`, and dropping it on another thread
+    /// would release that thread's slot.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl scoped_view_charp {
     pub fn new(llobj: majit_ir::GcRef) -> Result<Self, MemoryError> {
         let (buf, llobj, flag) = get_nonmovingbuffer_ll_final_null(llobj)?;
-        Ok(Self { buf, llobj, flag })
+        let slot = majit_gc::shadow_stack::acquire_owner_root(llobj);
+        Ok(Self {
+            buf,
+            slot,
+            flag,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    pub fn llobj(&self) -> majit_ir::GcRef {
+        majit_gc::shadow_stack::get_owner_root(self.slot)
     }
 }
 
 impl Drop for scoped_view_charp {
     fn drop(&mut self) {
-        unsafe { free_nonmovingbuffer_ll(self.buf, self.llobj, self.flag) };
+        let llobj = majit_gc::shadow_stack::get_owner_root(self.slot);
+        unsafe { free_nonmovingbuffer_ll(self.buf, llobj, self.flag) };
+        majit_gc::shadow_stack::release_owner_root(self.slot);
         self.flag = FLAG_INSIDE_NONMOVABLE;
-        self.llobj = majit_ir::GcRef::NULL;
         self.buf = core::ptr::null_mut();
     }
 }
 
-/// `scoped_alloc_buffer`. `__enter__` is [`Self::new`]; [`Self::str`] is
-/// `str_from_buffer` of the original `raw` / `gc_buf` / `case_num`; [`Drop`]
-/// is `__exit__` (`keep_buffer_alive_until_here` of those originals).
+/// `scoped_alloc_buffer`. `__enter__` is [`Self::new`]. [`Self::str`] reads
+/// the slot's current GcRef and calls [`str_from_buffer`]; the guard stays
+/// alive. [`Drop`] is `__exit__` and runs [`keep_buffer_alive_until_here`]
+/// when the guard goes out of scope.
 ///
 /// Host-side, by-value guard whose `gc_buf` STR lives in a fixed owner-root
 /// slot for the guard's lifetime.
@@ -698,13 +734,13 @@ impl scoped_alloc_buffer {
 
     /// `scoped_alloc_buffer.str`.
     ///
-    /// Calls [`str_from_buffer`] with the slot's current GcRef. [`Drop`] then
-    /// runs [`keep_buffer_alive_until_here`] with the original `raw` / `gc_buf`
-    /// / `case_num` and releases the slot.
+    /// Reads the slot's current GcRef and calls [`str_from_buffer`]. The
+    /// guard stays alive; [`Drop`] is `__exit__` and runs
+    /// [`keep_buffer_alive_until_here`] when the guard goes out of scope.
     ///
     /// The returned STR is unrooted: the caller must root it (or copy out of
     /// it) before its next allocation.
-    pub fn str(self, length: usize) -> Result<majit_ir::GcRef, MemoryError> {
+    pub fn str(&self, length: usize) -> Result<majit_ir::GcRef, MemoryError> {
         let gc_buf = majit_gc::shadow_stack::get_owner_root(self.slot);
         unsafe { str_from_buffer(self.raw, gc_buf, self.case_num, self.size, length) }
     }

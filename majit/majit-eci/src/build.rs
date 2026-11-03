@@ -110,11 +110,13 @@ fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
         // BasePosix._linkfiles hands each file to the linker as is. Cargo links only libraries:
-        // archives and shared libraries go in verbatim, an object is archived first and linked whole.
+        // archives and shared libraries go in verbatim; anything else is an object, archived
+        // first and linked whole.
         let kind = match ext.as_str() {
             "a" | "lib" => "static:+verbatim",
             "so" | "dylib" | "tbd" => "dylib:+verbatim",
-            "o" | "obj" => {
+            _ if file_name_lower.contains(".so.") => "dylib:+verbatim",
+            _ => {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
                 let sanitized: String = stem
                     .chars()
@@ -144,10 +146,6 @@ fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
                 // while an ordinary archive member is only pulled on demand.
                 println!("cargo:rustc-link-lib=static:+whole-archive={name}");
                 continue;
-            }
-            _ if file_name_lower.contains(".so.") => "dylib:+verbatim",
-            _ => {
-                panic!("{file}: link_files entry is not an archive, shared library or object file")
             }
         };
         if let Some(parent) = path.parent() {
@@ -302,23 +300,26 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                 .args
                 .iter()
                 .map(|ty| {
-                    crate::cdecl::gettype(ty, &item.module_path, &resolve).unwrap_or_else(|msg| {
+                    crate::cdecl::functype_arg(ty, &item.module_path, &resolve).unwrap_or_else(
+                        |msg| {
+                            panic!(
+                                "{}: llexternal `{}`: {msg}",
+                                item.file_path.display(),
+                                item.head.name
+                            )
+                        },
+                    )
+                })
+                .collect();
+            let result =
+                crate::cdecl::functype_result(&item.head.result, &item.module_path, &resolve)
+                    .unwrap_or_else(|msg| {
                         panic!(
                             "{}: llexternal `{}`: {msg}",
                             item.file_path.display(),
                             item.head.name
                         )
-                    })
-                })
-                .collect();
-            let result = crate::cdecl::gettype(&item.head.result, &item.module_path, &resolve)
-                .unwrap_or_else(|msg| {
-                    panic!(
-                        "{}: llexternal `{}`: {msg}",
-                        item.file_path.display(),
-                        item.head.name
-                    )
-                });
+                    });
             crate::generate_macro_wrapper(&item.head.c_name, &macro_name, &args, &result)
         };
         let wrapper = ExternalCompilationInfo {
@@ -536,14 +537,22 @@ fn resolve_segs(
 /// `cur + [seg]` through the glob `use`s of `cur`: the first local glob
 /// target `g` with `g + [seg]` a module gives `Local(g + [seg])`; failing
 /// that, the first extern glob target `p` gives `Extern(p + [seg])`.
+/// A local glob target is searched like a qualified path: its child modules,
+/// its `use` bindings, then its own globs; `visited` keeps each module to one
+/// search.
 fn glob_child_module(
     collected: &CrateItems,
     cur: &[String],
     seg: &str,
     active: &mut Vec<usize>,
+    visited: &mut Vec<Vec<String>>,
 ) -> Option<ModuleTarget> {
     // An extern crate's exports are not visible to the scanner, so a local glob
     // that defines the name wins over an extern glob.
+    if visited.iter().any(|m| m.as_slice() == cur) {
+        return None;
+    }
+    visited.push(cur.to_vec());
     let mut extern_glob = None;
     for (i, u) in collected.uses.iter().enumerate() {
         if u.binding.is_some() || u.module_path.as_slice() != cur {
@@ -559,26 +568,58 @@ fn glob_child_module(
             )
         }) {
             Some(ModuleTarget::Local(g)) => {
-                let mut nested = g;
+                let mut nested = g.clone();
                 nested.push(seg.to_string());
                 if is_module(collected, &nested) {
                     return Some(ModuleTarget::Local(nested));
                 }
+                if let Some(idx) = find_binding_use(collected, &g, seg, active) {
+                    match binding_module(collected, &g, idx, active) {
+                        Some(ModuleTarget::Local(m)) => {
+                            return Some(ModuleTarget::Local(m));
+                        }
+                        Some(ModuleTarget::Extern(p)) => {
+                            if extern_glob.is_none() {
+                                extern_glob = Some(p);
+                            }
+                        }
+                        None => {}
+                    }
+                } else if let Some(found) = glob_child_module(collected, &g, seg, active, visited) {
+                    match found {
+                        ModuleTarget::Local(m) => return Some(ModuleTarget::Local(m)),
+                        ModuleTarget::Extern(p) => {
+                            if extern_glob.is_none() {
+                                extern_glob = Some(p);
+                            }
+                        }
+                    }
+                }
             }
-            Some(ModuleTarget::Extern(p)) => {
+            Some(ModuleTarget::Extern(mut p)) => {
                 if extern_glob.is_none() {
+                    p.push(seg.to_string());
                     extern_glob = Some(p);
                 }
             }
             None => {}
         }
     }
-    if let Some(mut p) = extern_glob {
-        p.push(seg.to_string());
-        Some(ModuleTarget::Extern(p))
-    } else {
-        None
-    }
+    extern_glob.map(ModuleTarget::Extern)
+}
+
+fn binding_module(
+    collected: &CrateItems,
+    module: &[String],
+    idx: usize,
+    active: &mut Vec<usize>,
+) -> Option<ModuleTarget> {
+    with_active_use(active, idx, |active| {
+        let u = &collected.uses[idx];
+        let target = u.target.clone();
+        let leading = u.leading_colon;
+        resolve_module(collected, &target, leading, module, active)
+    })
 }
 
 fn walk_module_seg(
@@ -594,21 +635,16 @@ fn walk_module_seg(
         return Some(ModuleTarget::Local(child));
     }
     if let Some(idx) = find_binding_use(collected, cur, seg, active) {
-        return with_active_use(active, idx, |active| {
-            let u = &collected.uses[idx];
-            let target = u.target.clone();
-            let leading = u.leading_colon;
-            let module = u.module_path.clone();
-            match resolve_module(collected, &target, leading, &module, active) {
-                Some(ModuleTarget::Extern(mut p)) => {
-                    p.extend(after.iter().cloned());
-                    Some(ModuleTarget::Extern(p))
-                }
-                other => other,
+        return match binding_module(collected, cur, idx, active) {
+            Some(ModuleTarget::Extern(mut p)) => {
+                p.extend(after.iter().cloned());
+                Some(ModuleTarget::Extern(p))
             }
-        });
+            other => other,
+        };
     }
-    match glob_child_module(collected, cur, seg, active) {
+    let mut visited = Vec::new();
+    match glob_child_module(collected, cur, seg, active, &mut visited) {
         Some(ModuleTarget::Extern(mut p)) => {
             p.extend(after.iter().cloned());
             Some(ModuleTarget::Extern(p))
@@ -655,15 +691,18 @@ fn resolve_module(
                     let leading = collected.uses[idx].leading_colon;
                     resolve_module(collected, &spliced, leading, module, active)
                 });
-            } else if let Some(ModuleTarget::Local(m)) =
-                glob_child_module(collected, module, x, active)
-            {
-                (m, &segs[1..])
             } else {
-                // A first segment not found locally names an extern crate; an
-                // extern glob must not capture it (`use libc::*;` must not turn
-                // `std::ptr` into `libc::std::ptr`).
-                return Some(ModuleTarget::Extern(segs.to_vec()));
+                let mut visited = Vec::new();
+                if let Some(ModuleTarget::Local(m)) =
+                    glob_child_module(collected, module, x, active, &mut visited)
+                {
+                    (m, &segs[1..])
+                } else {
+                    // A first segment not found locally names an extern crate; an
+                    // extern glob must not capture it (`use libc::*;` must not turn
+                    // `std::ptr` into `libc::std::ptr`).
+                    return Some(ModuleTarget::Extern(segs.to_vec()));
+                }
             }
         }
     };
@@ -771,6 +810,10 @@ fn eci_libname(module_path: &[String], const_name: &str) -> String {
             out.push('_');
         }
     }
+    out.push_str(&format!(
+        "_{:016x}",
+        fnv1a64(format!("{}::{}", module_path.join("::"), const_name).as_bytes())
+    ));
     out
 }
 

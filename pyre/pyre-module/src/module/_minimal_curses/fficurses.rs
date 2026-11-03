@@ -1,8 +1,8 @@
 //! `fficurses.py` — `setupterm`, `rpy_curses_tigetstr`, `rpy_curses_tparm`.
 //!
-//! `term.h` renames ordinary identifiers, so the bodies live in
-//! `fficurses.c`. `guess_eci` picks the libraries; this ECI stays empty
-//! and does not emit a second `#[link]`.
+//! `term.h` renames ordinary identifiers, so the bodies are the
+//! `separate_module_sources` the build script compiles. `guess_eci` picks
+//! the libraries; this ECI stays empty and does not emit a second `#[link]`.
 
 use majit_rlib::rffi::{CCHARP, INT};
 
