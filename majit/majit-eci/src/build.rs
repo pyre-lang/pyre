@@ -28,7 +28,9 @@ fn cdir() -> PathBuf {
 
 /// ll2ctypes `compile_shared_lib` for one ECI: `convert_sources_to_files` then
 /// `cc::Build`. Does not print link directives except what `cc` prints on
-/// success.
+/// success. Link directives (`library_dirs`, `libraries`, `link_files`, the C++
+/// runtime for `use_cpp_linker`) come from `link_eci` or `compile_crate_ecis`;
+/// a direct caller pairs this with `link_eci`.
 pub fn compile_eci(eci: &ExternalCompilationInfo, libname: &str) -> Result<(), cc::Error> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -78,6 +80,15 @@ pub fn link_eci(eci: &ExternalCompilationInfo) {
     }
 }
 
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
     for dir in &eci.library_dirs {
         println!("cargo:rustc-link-search=native={dir}");
@@ -89,24 +100,24 @@ fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
     }
     for file in &eci.link_files {
         let path = Path::new(file);
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext == "a" || ext == "lib" {
-            if let Some(parent) = path.parent() {
-                println!("cargo:rustc-link-search=native={}", parent.display());
-            }
-            if let Some(name) = path.file_name() {
-                println!(
-                    "cargo:rustc-link-lib=static:+verbatim={}",
-                    name.to_string_lossy()
-                );
-            }
-        } else {
-            // `_linkfiles` hands object files to the linker directly; Cargo links
-            // only libraries, so the object is archived first.
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
-            let name = format!(
-                "eci_linkfile_{}",
-                stem.chars()
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let file_name_lower = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        // BasePosix._linkfiles hands each file to the linker as is. Cargo links only libraries:
+        // archives and shared libraries go in verbatim, an object is archived first and linked whole.
+        let kind = match ext.as_str() {
+            "a" | "lib" => "static:+verbatim",
+            "so" | "dylib" | "tbd" => "dylib:+verbatim",
+            "o" | "obj" => {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("obj");
+                let sanitized: String = stem
+                    .chars()
                     .map(|c| {
                         if c.is_ascii_alphanumeric() {
                             c.to_ascii_lowercase()
@@ -114,13 +125,36 @@ fn print_eci_link_directives(eci: &ExternalCompilationInfo) {
                             '_'
                         }
                     })
-                    .collect::<String>()
-            );
-            cc::Build::new()
-                .object(path)
-                .cargo_warnings(false)
-                .try_compile(&name)
-                .unwrap_or_else(|err| panic!("{file}: {err}"));
+                    .collect();
+                let name = format!(
+                    "eci_linkfile_{:016x}_{}",
+                    fnv1a64(file.as_bytes()),
+                    sanitized
+                );
+                cc::Build::new()
+                    .object(path)
+                    .cargo_metadata(false)
+                    .cargo_warnings(false)
+                    .try_compile(&name)
+                    .unwrap_or_else(|err| panic!("{file}: {err}"));
+                let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+                println!("cargo:rustc-link-search=native={out_dir}");
+                // +whole-archive because a direct object joins the link even when
+                // nothing references it (a constructor or a registration record),
+                // while an ordinary archive member is only pulled on demand.
+                println!("cargo:rustc-link-lib=static:+whole-archive={name}");
+                continue;
+            }
+            _ if file_name_lower.contains(".so.") => "dylib:+verbatim",
+            _ => {
+                panic!("{file}: link_files entry is not an archive, shared library or object file")
+            }
+        };
+        if let Some(parent) = path.parent() {
+            println!("cargo:rustc-link-search=native={}", parent.display());
+        }
+        if let Some(name) = path.file_name() {
+            println!("cargo:rustc-link-lib={kind}={}", name.to_string_lossy());
         }
     }
     if eci.use_cpp_linker {
@@ -241,7 +275,7 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
         let source = {
             let resolve =
                 |path: &syn::Path, module_path: &[String]| -> Option<crate::cdecl::Resolved> {
-                    match resolve_path(collected, path, module_path, 0) {
+                    match resolve_path(collected, path, module_path) {
                         Some(Target::Local(m, n)) => {
                             if let Some(alias) = collected
                                 .aliases
@@ -300,7 +334,7 @@ fn merge_macro_wrappers(collected: &mut CrateItems) {
                         item.head.name
                     );
                 };
-                match resolve_path(collected, path, &item.module_path, 0) {
+                match resolve_path(collected, path, &item.module_path) {
                     Some(Target::Local(m, n)) => {
                         match collected
                             .ecis
@@ -413,40 +447,57 @@ fn find_binding_use(
     collected: &CrateItems,
     module: &[String],
     name: &str,
-    skip: Option<usize>,
+    active: &[usize],
 ) -> Option<usize> {
     collected.uses.iter().enumerate().position(|(i, u)| {
-        skip != Some(i) && u.module_path.as_slice() == module && u.binding.as_deref() == Some(name)
+        !active.contains(&i)
+            && u.module_path.as_slice() == module
+            && u.binding.as_deref() == Some(name)
     })
 }
 
-fn resolve_path(
-    collected: &CrateItems,
-    path: &syn::Path,
-    module: &[String],
-    depth: usize,
-) -> Option<Target> {
+fn with_active_use<R>(
+    active: &mut Vec<usize>,
+    use_idx: usize,
+    f: impl FnOnce(&mut Vec<usize>) -> Option<R>,
+) -> Option<R> {
+    if active.contains(&use_idx) {
+        return None;
+    }
+    active.push(use_idx);
+    let result = f(active);
+    active.pop();
+    result
+}
+
+fn resolve_path(collected: &CrateItems, path: &syn::Path, module: &[String]) -> Option<Target> {
     let segs: Vec<String> = path
         .segments
         .iter()
         .map(|s| unraw_ident(&s.ident))
         .collect();
+    let mut active = Vec::new();
     resolve_segs(
         collected,
         &segs,
         path.leading_colon.is_some(),
         module,
-        depth,
-        None,
+        &mut active,
     )
 }
 
-fn resolve_use_target(collected: &CrateItems, use_idx: usize, depth: usize) -> Option<Target> {
-    let u = &collected.uses[use_idx];
-    let segs = u.target.clone();
-    let leading = u.leading_colon;
-    let module = u.module_path.clone();
-    resolve_segs(collected, &segs, leading, &module, depth, Some(use_idx))
+fn resolve_use_target(
+    collected: &CrateItems,
+    use_idx: usize,
+    active: &mut Vec<usize>,
+) -> Option<Target> {
+    with_active_use(active, use_idx, |active| {
+        let u = &collected.uses[use_idx];
+        let segs = u.target.clone();
+        let leading = u.leading_colon;
+        let module = u.module_path.clone();
+        resolve_segs(collected, &segs, leading, &module, active)
+    })
 }
 
 fn resolve_segs(
@@ -454,12 +505,8 @@ fn resolve_segs(
     segs: &[String],
     leading_colon: bool,
     module: &[String],
-    depth: usize,
-    skip_use: Option<usize>,
+    active: &mut Vec<usize>,
 ) -> Option<Target> {
-    if depth > 32 {
-        return None;
-    }
     if segs.is_empty() {
         return None;
     }
@@ -467,7 +514,7 @@ fn resolve_segs(
         return Some(Target::Extern(segs.to_vec()));
     }
     if segs.len() == 1 && !matches!(segs[0].as_str(), "crate" | "self" | "super") {
-        return lookup_name(collected, module, &segs[0], depth, skip_use);
+        return lookup_name(collected, module, &segs[0], active);
     }
     let last = &segs[segs.len() - 1];
     match resolve_module(
@@ -475,10 +522,9 @@ fn resolve_segs(
         &segs[..segs.len() - 1],
         leading_colon,
         module,
-        depth,
-        skip_use,
+        active,
     ) {
-        Some(ModuleTarget::Local(m)) => lookup_name(collected, &m, last, depth, skip_use),
+        Some(ModuleTarget::Local(m)) => lookup_name(collected, &m, last, active),
         Some(ModuleTarget::Extern(mut p)) => {
             p.push(last.clone());
             Some(Target::Extern(p))
@@ -487,38 +533,87 @@ fn resolve_segs(
     }
 }
 
+/// `cur + [seg]` through the glob `use`s of `cur`: the first local glob
+/// target `g` with `g + [seg]` a module gives `Local(g + [seg])`; failing
+/// that, the first extern glob target `p` gives `Extern(p + [seg])`.
+fn glob_child_module(
+    collected: &CrateItems,
+    cur: &[String],
+    seg: &str,
+    active: &mut Vec<usize>,
+) -> Option<ModuleTarget> {
+    // An extern crate's exports are not visible to the scanner, so a local glob
+    // that defines the name wins over an extern glob.
+    let mut extern_glob = None;
+    for (i, u) in collected.uses.iter().enumerate() {
+        if u.binding.is_some() || u.module_path.as_slice() != cur {
+            continue;
+        }
+        match with_active_use(active, i, |active| {
+            resolve_module(
+                collected,
+                &u.target,
+                u.leading_colon,
+                &u.module_path,
+                active,
+            )
+        }) {
+            Some(ModuleTarget::Local(g)) => {
+                let mut nested = g;
+                nested.push(seg.to_string());
+                if is_module(collected, &nested) {
+                    return Some(ModuleTarget::Local(nested));
+                }
+            }
+            Some(ModuleTarget::Extern(p)) => {
+                if extern_glob.is_none() {
+                    extern_glob = Some(p);
+                }
+            }
+            None => {}
+        }
+    }
+    if let Some(mut p) = extern_glob {
+        p.push(seg.to_string());
+        Some(ModuleTarget::Extern(p))
+    } else {
+        None
+    }
+}
+
 fn walk_module_seg(
     collected: &CrateItems,
     cur: &[String],
     seg: &str,
     after: &[String],
-    depth: usize,
-    skip_use: Option<usize>,
+    active: &mut Vec<usize>,
 ) -> Option<ModuleTarget> {
     let mut child = cur.to_vec();
     child.push(seg.to_string());
     if is_module(collected, &child) {
         return Some(ModuleTarget::Local(child));
     }
-    if let Some(idx) = find_binding_use(collected, cur, seg, skip_use) {
-        match resolve_use_target(collected, idx, depth + 1) {
-            Some(Target::Local(m, n)) => {
-                let mut p = m;
-                p.push(n);
-                if is_module(collected, &p) {
-                    Some(ModuleTarget::Local(p))
-                } else {
-                    None
+    if let Some(idx) = find_binding_use(collected, cur, seg, active) {
+        return with_active_use(active, idx, |active| {
+            let u = &collected.uses[idx];
+            let target = u.target.clone();
+            let leading = u.leading_colon;
+            let module = u.module_path.clone();
+            match resolve_module(collected, &target, leading, &module, active) {
+                Some(ModuleTarget::Extern(mut p)) => {
+                    p.extend(after.iter().cloned());
+                    Some(ModuleTarget::Extern(p))
                 }
+                other => other,
             }
-            Some(Target::Extern(mut p)) => {
-                p.extend(after.iter().cloned());
-                Some(ModuleTarget::Extern(p))
-            }
-            None => None,
+        });
+    }
+    match glob_child_module(collected, cur, seg, active) {
+        Some(ModuleTarget::Extern(mut p)) => {
+            p.extend(after.iter().cloned());
+            Some(ModuleTarget::Extern(p))
         }
-    } else {
-        None
+        other => other,
     }
 }
 
@@ -527,12 +622,8 @@ fn resolve_module(
     segs: &[String],
     leading_colon: bool,
     module: &[String],
-    depth: usize,
-    skip_use: Option<usize>,
+    active: &mut Vec<usize>,
 ) -> Option<ModuleTarget> {
-    if depth > 32 {
-        return None;
-    }
     if leading_colon {
         return Some(ModuleTarget::Extern(segs.to_vec()));
     }
@@ -549,7 +640,7 @@ fn resolve_module(
                 cur.pop();
                 i += 1;
             }
-            return walk_module_rest(collected, cur, &segs[i..], depth, skip_use);
+            return walk_module_rest(collected, cur, &segs[i..], active);
         }
         _ => {
             let x = &segs[0];
@@ -557,29 +648,37 @@ fn resolve_module(
             child.push(x.clone());
             if is_module(collected, &child) {
                 (child, &segs[1..])
-            } else if let Some(idx) = find_binding_use(collected, module, x, skip_use) {
-                let mut spliced = collected.uses[idx].target.clone();
-                spliced.extend(segs[1..].iter().cloned());
-                let leading = collected.uses[idx].leading_colon;
-                return resolve_module(collected, &spliced, leading, module, depth + 1, Some(idx));
+            } else if let Some(idx) = find_binding_use(collected, module, x, active) {
+                return with_active_use(active, idx, |active| {
+                    let mut spliced = collected.uses[idx].target.clone();
+                    spliced.extend(segs[1..].iter().cloned());
+                    let leading = collected.uses[idx].leading_colon;
+                    resolve_module(collected, &spliced, leading, module, active)
+                });
+            } else if let Some(ModuleTarget::Local(m)) =
+                glob_child_module(collected, module, x, active)
+            {
+                (m, &segs[1..])
             } else {
+                // A first segment not found locally names an extern crate; an
+                // extern glob must not capture it (`use libc::*;` must not turn
+                // `std::ptr` into `libc::std::ptr`).
                 return Some(ModuleTarget::Extern(segs.to_vec()));
             }
         }
     };
-    walk_module_rest(collected, cur, rest, depth, skip_use)
+    walk_module_rest(collected, cur, rest, active)
 }
 
 fn walk_module_rest(
     collected: &CrateItems,
     mut cur: Vec<String>,
     rest: &[String],
-    depth: usize,
-    skip_use: Option<usize>,
+    active: &mut Vec<usize>,
 ) -> Option<ModuleTarget> {
     for i in 0..rest.len() {
         let after = &rest[i + 1..];
-        match walk_module_seg(collected, &cur, &rest[i], after, depth, skip_use)? {
+        match walk_module_seg(collected, &cur, &rest[i], after, active)? {
             ModuleTarget::Local(next) => cur = next,
             ModuleTarget::Extern(p) => return Some(ModuleTarget::Extern(p)),
         }
@@ -591,40 +690,70 @@ fn lookup_name(
     collected: &CrateItems,
     module: &[String],
     name: &str,
-    depth: usize,
-    skip_use: Option<usize>,
+    active: &mut Vec<usize>,
 ) -> Option<Target> {
-    if depth > 32 {
+    let mut visited = Vec::new();
+    let mut extern_glob = None;
+    lookup_name_in(
+        collected,
+        module,
+        name,
+        active,
+        &mut visited,
+        &mut extern_glob,
+    )
+    .or_else(|| {
+        // An extern crate's exports are not visible to the scanner, so a local glob
+        // that defines the name wins over an extern glob.
+        extern_glob.map(|mut p| {
+            p.push(name.to_string());
+            Target::Extern(p)
+        })
+    })
+}
+
+/// Definite resolutions only: a definition in `module`, a `use` binding, or a
+/// local glob target that resolves the name (recursively). The first extern glob
+/// target met anywhere in the walk is recorded in `extern_glob`; it is consulted
+/// by `lookup_name` only after the whole local search fails. `visited` holds the
+/// modules already searched for this name, so each module is searched once.
+fn lookup_name_in(
+    collected: &CrateItems,
+    module: &[String],
+    name: &str,
+    active: &mut Vec<usize>,
+    visited: &mut Vec<Vec<String>>,
+    extern_glob: &mut Option<Vec<String>>,
+) -> Option<Target> {
+    if visited.iter().any(|m| m.as_slice() == module) {
         return None;
     }
+    visited.push(module.to_vec());
     if defines_name(collected, module, name) {
         return Some(Target::Local(module.to_vec(), name.to_string()));
     }
-    if let Some(idx) = find_binding_use(collected, module, name, skip_use) {
-        return resolve_use_target(collected, idx, depth + 1);
+    if let Some(idx) = find_binding_use(collected, module, name, active) {
+        return resolve_use_target(collected, idx, active);
     }
     for (i, u) in collected.uses.iter().enumerate() {
         if u.binding.is_some() || u.module_path.as_slice() != module {
             continue;
         }
-        match resolve_module(
-            collected,
-            &u.target,
-            u.leading_colon,
-            module,
-            depth + 1,
-            Some(i),
-        ) {
-            Some(ModuleTarget::Local(m)) => {
-                if let Some(t) = lookup_name(collected, &m, name, depth + 1, None) {
-                    return Some(t);
+        if let Some(t) = with_active_use(active, i, |active| {
+            match resolve_module(collected, &u.target, u.leading_colon, module, active) {
+                Some(ModuleTarget::Local(m)) => {
+                    lookup_name_in(collected, &m, name, active, visited, extern_glob)
                 }
+                Some(ModuleTarget::Extern(p)) => {
+                    if extern_glob.is_none() {
+                        *extern_glob = Some(p);
+                    }
+                    None
+                }
+                None => None,
             }
-            Some(ModuleTarget::Extern(mut p)) => {
-                p.push(name.to_string());
-                return Some(Target::Extern(p));
-            }
-            None => {}
+        }) {
+            return Some(t);
         }
     }
     None
