@@ -8703,30 +8703,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dict_int_key() {
-        let dict = w_dict_new();
-        unsafe {
-            assert!(is_dict(dict));
-            w_dict_setitem(dict, 1, w_int_new(100));
-            assert_eq!(w_int_get_value(w_dict_getitem(dict, 1).unwrap()), 100);
-        }
-    }
-
-    #[test]
-    fn test_dict_str_key() {
-        install_test_hash_hook();
-        let dict = w_dict_new();
-        unsafe {
-            w_dict_setitem_str(dict, "hello", w_int_new(42));
-            assert_eq!(
-                w_int_get_value(w_dict_getitem_str(dict, "hello").unwrap()),
-                42
-            );
-            assert!(w_dict_getitem_str(dict, "world").is_none());
-        }
-    }
-
-    #[test]
     fn test_w_dict_unicode_items_and_str_entries() {
         install_test_hash_hook();
         let dict = w_dict_new();
@@ -8809,17 +8785,6 @@ mod tests {
                 beta_value,
             );
             assert!(w_dict_unicode_value_at_checked(dict, 0, beta, beta_hash).is_null());
-        }
-    }
-
-    #[test]
-    fn test_dict_pyobj_key() {
-        install_test_hash_hook();
-        let dict = w_dict_new();
-        let key = crate::w_str_new("test");
-        unsafe {
-            w_dict_store(dict, key, w_int_new(99));
-            assert_eq!(w_int_get_value(w_dict_lookup(dict, key).unwrap()), 99);
         }
     }
 

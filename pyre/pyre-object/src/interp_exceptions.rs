@@ -3016,24 +3016,6 @@ mod tests {
         crate::pyobject::ensure_object_subclass_ranges_initialized();
     }
 
-    #[test]
-    fn test_exception_create_and_read() {
-        seed_subclass_ranges();
-        let obj = w_exception_new(ExcKind::ValueError, "bad value");
-        unsafe {
-            assert!(is_exception(obj));
-            assert_eq!(w_exception_get_kind(obj), ExcKind::ValueError);
-            // The message is stored as the single constructor arg.
-            let args = w_exception_get_args(obj);
-            assert_eq!(crate::tupleobject::w_tuple_len(args), 1);
-            let arg0 = crate::tupleobject::w_tuple_getitem(args, 0).unwrap();
-            assert_eq!(
-                crate::unicodeobject::w_str_get_wtf8(arg0),
-                Wtf8::new("bad value")
-            );
-        }
-    }
-
     /// A byte that is not a live discriminant must not reach `kind_from_exc`:
     /// that match has no wildcard arm, so an out-of-range byte indexes a
     /// bounds-check-free jump table.

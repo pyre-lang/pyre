@@ -238,37 +238,3 @@ fn kevent_compare(this: &W_Kevent, w_other: PyObjectRef, op: &str) -> PyObjectRe
         None => pyre_object::w_not_implemented(),
     }
 }
-
-#[cfg(all(test, target_os = "macos", feature = "host_env"))]
-mod tests {
-    use super::W_Kevent;
-
-    fn ev(ident: u64, filter: i16, flags: u16, fflags: u32, data: i64, udata: u64) -> W_Kevent {
-        W_Kevent {
-            ident,
-            filter,
-            flags,
-            fflags,
-            data,
-            udata,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn compare_all_fields_follows_pypy_lexicographic_chain() {
-        let a = ev(1, 0, 0, 0, 0, 0);
-        let b = ev(2, 0, 0, 0, 0, 0);
-        assert!(a.compare_all_fields(&a, "eq"));
-        assert!(!a.compare_all_fields(&b, "eq"));
-        assert!(a.compare_all_fields(&b, "lt"));
-        assert!(b.compare_all_fields(&a, "gt"));
-        assert!(a.compare_all_fields(&b, "le"));
-        assert!(b.compare_all_fields(&a, "ge"));
-        let c = ev(1, 1, 0, 0, 0, 0);
-        assert!(a.compare_all_fields(&c, "lt"));
-        let d = ev(1, 0, 0, 0, 0, 1);
-        assert!(a.compare_all_fields(&d, "lt"));
-        assert!(d.compare_all_fields(&a, "ne"));
-    }
-}

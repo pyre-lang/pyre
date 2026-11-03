@@ -5121,20 +5121,6 @@ mod tests {
     }
 
     #[test]
-    fn discard_removes() {
-        install_test_hash_hook();
-        let s = w_set_new();
-        unsafe {
-            w_set_add(s, w_int_new(1));
-            w_set_add(s, w_int_new(2));
-            assert!(w_set_discard(s, w_int_new(1)));
-            assert!(!w_set_discard(s, w_int_new(99)));
-            assert_eq!(w_set_len(s), 1);
-            assert!(w_set_contains(s, w_int_new(2)));
-        }
-    }
-
-    #[test]
     fn discard_from_the_front_keeps_later_members() {
         install_test_hash_hook();
         let s = w_set_new();

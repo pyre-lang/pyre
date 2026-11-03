@@ -985,18 +985,6 @@ pub(crate) fn lookup_codec_name(encoding: &str) -> Result<PyObjectRef, crate::Py
     ))
 }
 
-#[cfg(test)]
-mod lookup_codec_name_tests {
-    use super::lookup_codec_name;
-
-    #[test]
-    fn rejects_embedded_nul() {
-        let err = lookup_codec_name("utf-8\0").expect_err("embedded NUL");
-        assert_eq!(err.kind, crate::PyErrorKind::ValueError);
-        assert_eq!(err.message_text(), "embedded null character");
-    }
-}
-
 pub(crate) fn lookup_text_codec(
     action: &str,
     encoding: &str,

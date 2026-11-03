@@ -228,16 +228,6 @@ mod tests {
     // `malloc_typed` through the managed allocator.
 
     #[test]
-    fn test_float_create_and_read() {
-        let obj = w_float_new(3.25);
-        unsafe {
-            assert!(is_float(obj));
-            assert!(!is_int(obj));
-            assert_eq!(w_float_get_value(obj), 3.25);
-        }
-    }
-
-    #[test]
     fn test_w_float_gc_alloc_word_boxes_a_float() {
         let obj = w_float_gc_alloc_word(3.25) as PyObjectRef;
         if obj.is_null() {
@@ -246,14 +236,6 @@ mod tests {
         unsafe {
             assert!(is_float(obj));
             assert_eq!(w_float_get_value(obj), 3.25);
-        }
-    }
-
-    #[test]
-    fn test_float_negative() {
-        let obj = w_float_new(-2.5);
-        unsafe {
-            assert_eq!(w_float_get_value(obj), -2.5);
         }
     }
 

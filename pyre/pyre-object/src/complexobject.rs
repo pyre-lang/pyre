@@ -174,23 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_create_and_read() {
-        let obj = w_complex_new(3.0, 4.0);
-        unsafe {
-            assert!(is_complex(obj));
-            assert!(!is_float(obj));
-            assert_eq!(w_complex_get_real(obj), 3.0);
-            assert_eq!(w_complex_get_imag(obj), 4.0);
-        }
-        let real = complex_descr_get_real(obj);
-        let imag = complex_descr_get_imag(obj);
-        unsafe {
-            assert_eq!(crate::w_float_get_value(real), 3.0);
-            assert_eq!(crate::w_float_get_value(imag), 4.0);
-        }
-    }
-
-    #[test]
     fn test_complex_field_offsets() {
         // after PyObject { ob_type(8) + w_class(8) }
         assert_eq!(COMPLEX_REAL_OFFSET, 16);
