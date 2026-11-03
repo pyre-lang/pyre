@@ -4220,6 +4220,16 @@ extern "C" fn gc_alloc_typed_nursery_shim(type_id: u64, size: u64) -> u64 {
     })
 }
 
+/// Nursery-full edge of an inlined `New` / `NewWithVtable` bump.
+///
+/// The caller has already published the jitframe gcmap. `alloc_nursery_typed`
+/// runs the minor collection `malloc_cond`'s slow path runs, then bumps again.
+extern "C" fn gc_alloc_typed_nursery_collecting_shim(type_id: u64, size: u64) -> u64 {
+    oom_signal_if_zero(with_cranelift_gc_required(|gc| {
+        gc.alloc_nursery_typed(type_id as u32, size as usize).0 as u64
+    }))
+}
+
 extern "C" fn gc_alloc_varsize_shim(
     base_size: u64,
     item_size: u64,
@@ -11229,6 +11239,11 @@ pub struct CraneliftBackend {
     /// `materialize_loop` error after `write_pending_failure_recoveries`.
     #[cfg(test)]
     fail_after_pending_trampolines: bool,
+    /// Leave `New` / `NewWithVtable` in the stream so tests can compile the
+    /// residual lowering the GC rewrite would otherwise replace with
+    /// `CallMallocNursery`.
+    #[cfg(test)]
+    skip_gc_rewrite: bool,
 }
 
 impl Default for CraneliftBackend {
@@ -11444,6 +11459,8 @@ impl CraneliftBackend {
             last_body_clif: String::new(),
             #[cfg(test)]
             fail_after_pending_trampolines: false,
+            #[cfg(test)]
+            skip_gc_rewrite: false,
         }
     }
 
@@ -11713,6 +11730,10 @@ impl CraneliftBackend {
         // rewrite.py assemble_loop mutates the same ResOperation objects.
         normalize_ops_for_codegen_simple(inputargs, ops);
         inject_builtin_string_descrs(ops);
+        #[cfg(test)]
+        if self.skip_gc_rewrite {
+            return (ops.to_vec(), vec![]);
+        }
         {
             let rewriter = self.gc_rewriter();
             // `RewriteState::const_int` emits fresh `ConstInt`s inline.
@@ -14105,6 +14126,8 @@ impl CraneliftBackend {
                     | OpCode::CallMallocNursery
                     | OpCode::CallMallocNurseryVarsize
                     | OpCode::CallMallocNurseryVarsizeFrame
+                    | OpCode::New
+                    | OpCode::NewWithVtable
                     | OpCode::NewArray
                     | OpCode::NewArrayClear
                     | OpCode::Newstr
@@ -19289,35 +19312,154 @@ impl CraneliftBackend {
                         && vtable_offset.is_some();
                     let vtable_off_i32 = vtable_offset.unwrap_or(0) as i32;
                     if cranelift_gc_active() {
-                        let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-                        let result = emit_collecting_gc_call(
-                            module,
-                            &mut builder,
-                            &opref_var_map,
-                            ptr_type,
-                            call_conv,
-                            cur_jf,
-                            &live_ref_root_raw,
-                            &defined_ref_vars,
-                            &stale_ref_vars,
-                            &demoted_failarg_slots,
-                            ref_root_base_ofs,
-                            per_call_gcmap,
-                            gc_alloc_typed_nursery_shim as *const () as usize,
-                            &[type_id_val, size_val],
-                            Some(cl_types::I64),
-                        )
-                        .expect("GC allocation helper must return a value");
-                        // assembler.py:405-412 _reload_frame_if_necessary:
-                        // GC may have moved the jitframe during allocation.
-                        // Reload jf_ptr so subsequent spill/reload use the correct address.
-                        jf_ptr = emit_reload_frame_if_necessary(
-                            module,
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                        );
-                        builder.ins().set_pinned_reg(jf_ptr);
+                        // `nursery.alloc` + `init_nursery_object`. The size
+                        // descr is the payload; the header is added here, then
+                        // rounded the way `Nursery::alloc` rounds. A bump that
+                        // fits does not collect and does not move live
+                        // pointers, so the fast edge is the compare, the
+                        // store of `nursery_free`, and the tid word.
+                        // `CallMallocNursery` already emits that edge. Objects
+                        // at or above `gc.max_nursery_object_size()`, and a
+                        // bump that does not fit, stay on a helper.
+                        let payload = size.max(0) as usize;
+                        let total = GcHeader::SIZE
+                            .saturating_add(payload)
+                            .max(GcHeader::MIN_NURSERY_OBJ_SIZE);
+                        let align = majit_gc::header::MEMORY_ALIGNMENT;
+                        let total = (total + align - 1) & !(align - 1);
+                        let inline_addrs = gc_nursery_addrs.filter(|&(nf, nt)| nf != 0 && nt != 0);
+                        // `framework.py malloc_fast` is annotated
+                        // `s_False, s_False, s_False` (no destructor, no
+                        // old-style finalizer, no weakref). The bump stores
+                        // only the header type id, so it is taken only for
+                        // `MiniMarkGC::type_alloc_is_plain` — the same
+                        // predicate wasm `nursery_alloc_params` already
+                        // filters with.
+                        let is_plain =
+                            with_cranelift_gc(|gc| gc.type_alloc_is_plain(type_id as u32))
+                                .unwrap_or(false);
+                        let result = if is_plain
+                            && gc_max_nursery_object_size.is_some_and(|max| total < max)
+                            && let Some((nf_addr, nt_addr)) = inline_addrs
+                        {
+                            let flags = MemFlagsData::trusted();
+                            let total_val = builder.ins().iconst(cl_types::I64, total as i64);
+                            let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
+                            let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
+                            let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
+                            let new_free = builder.ins().iadd(free, total_val);
+                            let top = builder.ins().load(ptr_type, flags, nt_ptr, 0);
+                            let fits =
+                                builder
+                                    .ins()
+                                    .icmp(IntCC::UnsignedLessThanOrEqual, new_free, top);
+                            let live_refs: Vec<(u32, usize)> = ref_root_slots
+                                .iter()
+                                .filter(|(var_idx, _)| defined_ref_vars.contains(var_idx))
+                                .copied()
+                                .collect();
+                            let fast_block = builder.create_block();
+                            let slow_block = builder.create_block();
+                            let merge_block = builder.create_block();
+                            builder.append_block_param(merge_block, ptr_type);
+                            builder.append_block_param(merge_block, ptr_type);
+                            for _ in &live_refs {
+                                builder.append_block_param(merge_block, cl_types::I64);
+                            }
+                            builder.ins().brif(fits, fast_block, &[], slow_block, &[]);
+
+                            builder.switch_to_block(fast_block);
+                            builder.seal_block(fast_block);
+                            builder.ins().store(flags, new_free, nf_ptr, 0);
+                            builder.ins().store(flags, type_id_val, free, 0);
+                            let fast_obj = builder.ins().iadd_imm_s(free, GcHeader::SIZE as i64);
+                            let mut fast_args: Vec<BlockArg> =
+                                vec![BlockArg::from(fast_obj), BlockArg::from(jf_ptr)];
+                            for &(var_idx, _) in &live_refs {
+                                fast_args.push(BlockArg::from(
+                                    builder.use_var(var(&opref_var_map, var_idx)),
+                                ));
+                            }
+                            builder.ins().jump(merge_block, &fast_args);
+
+                            builder.switch_to_block(slow_block);
+                            builder.seal_block(slow_block);
+                            builder.set_cold_block(slow_block);
+                            spill_ref_roots(
+                                &mut builder,
+                                &opref_var_map,
+                                jf_ptr,
+                                &live_ref_root_raw,
+                                &defined_ref_vars,
+                                &stale_ref_vars,
+                                &demoted_failarg_slots,
+                                ref_root_base_ofs,
+                            );
+                            emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                            let slow_obj = emit_host_call(
+                                module,
+                                &mut builder,
+                                ptr_type,
+                                call_conv,
+                                gc_alloc_typed_nursery_collecting_shim as *const () as usize,
+                                &[type_id_val, size_val],
+                                Some(cl_types::I64),
+                            )
+                            .expect("GC allocation helper must return a value");
+                            let jf_ptr_slow = emit_reload_frame_if_necessary(
+                                module,
+                                &mut builder,
+                                ptr_type,
+                                call_conv,
+                            );
+                            emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
+                            reload_ref_roots(
+                                &mut builder,
+                                &opref_var_map,
+                                jf_ptr_slow,
+                                &live_ref_root_raw,
+                                &defined_ref_vars,
+                                &demoted_failarg_slots,
+                                ref_root_base_ofs,
+                            );
+                            let mut slow_args: Vec<BlockArg> =
+                                vec![BlockArg::from(slow_obj), BlockArg::from(jf_ptr_slow)];
+                            for &(var_idx, _) in &live_refs {
+                                slow_args.push(BlockArg::from(
+                                    builder.use_var(var(&opref_var_map, var_idx)),
+                                ));
+                            }
+                            builder.ins().jump(merge_block, &slow_args);
+
+                            builder.switch_to_block(merge_block);
+                            builder.seal_block(merge_block);
+                            let params = builder.block_params(merge_block).to_vec();
+                            let result = params[0];
+                            jf_ptr = params[1];
+                            builder.ins().set_pinned_reg(jf_ptr);
+                            for (i, &(var_idx, _)) in live_refs.iter().enumerate() {
+                                builder.def_var(var(&opref_var_map, var_idx), params[2 + i]);
+                            }
+                            emit_memory_error_check(
+                                &mut builder,
+                                ptr_type,
+                                result,
+                                propagate_exception_descr_ptr,
+                                preamble_phase,
+                            );
+                            result
+                        } else {
+                            emit_host_call(
+                                module,
+                                &mut builder,
+                                ptr_type,
+                                call_conv,
+                                gc_alloc_typed_nursery_shim as *const () as usize,
+                                &[type_id_val, size_val],
+                                Some(cl_types::I64),
+                            )
+                            .expect("GC allocation helper must return a value")
+                        };
                         if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
                             builder.ins().store(
@@ -33489,6 +33631,79 @@ mod tests {
         assert!(
             tid_store_address_op(&clif, 0, "load"),
             "fast path must zero the header word at nursery free:\n{clif}"
+        );
+    }
+
+    static NEW_BUMP_DESTRUCTOR_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn new_bump_counting_destructor(_obj_addr: usize) {
+        NEW_BUMP_DESTRUCTOR_RUNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Residual `New` after a preamble `CallMallocNursery` reads `jf_ptr` in
+    /// the bump (`fast_args`, `spill_ref_roots`, `emit_push_gcmap`). The
+    /// LABEL's `br_table` loader is a second predecessor, so the preamble
+    /// merge's `jf_ptr` does not dominate. Refresh it the way
+    /// `CallMallocNursery` does (`needs_jf_ptr` / `get_pinned_reg`).
+    #[test]
+    fn new_after_preamble_malloc_refreshes_jf_ptr() {
+        let mut backend = make_gc_backend();
+        backend.skip_gc_rewrite = true;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32)], 0),
+            mk_op(OpCode::Label, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(OpCode::New, &[], 1, make_size_descr(16, 0)),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(1517);
+        backend
+            .compile_loop(&inputargs, &ops, &token)
+            .expect("New after preamble CallMallocNursery must dominate jf_ptr");
+        let frame = backend.execute_token(&token, &[]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 0);
+    }
+
+    /// `framework.py malloc_fast` is annotated `s_False, s_False, s_False`
+    /// (no destructor / no old-style finalizer / no weakref).
+    /// `MiniMarkGC::type_alloc_is_plain` is that predicate; wasm
+    /// `nursery_alloc_params` already filters with it. The cranelift bump
+    /// only writes the header type id, so a non-plain type must stay on
+    /// the helper that runs `finish_nursery_object`.
+    #[test]
+    fn new_inline_bump_is_plain_types_only() {
+        NEW_BUMP_DESTRUCTOR_RUNS.store(0, Ordering::SeqCst);
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        let dtor_tid =
+            gc.register_type(TypeInfo::with_destructor(16, new_bump_counting_destructor));
+        let mut backend = backend_with_gc(gc);
+        backend.skip_gc_rewrite = true;
+        let inputargs = vec![];
+        let ops = vec![
+            mk_op_with_descr(OpCode::New, &[], 0, make_size_descr(16, dtor_tid)),
+            // Finish keeps New live; unused mallocs are `has_no_side_effect`.
+            mk_op(OpCode::Finish, &[OpRef::ref_op(0)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(1518);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let clif = backend.last_body_clif.clone();
+        assert!(
+            !tid_store_address_op(&clif, dtor_tid as i64, "load"),
+            "non-plain New must not take the header-only bump:\n{clif}"
+        );
+        // Drop the deadframe so the object is unrooted for the minor.
+        drop(backend.execute_token(&token, &[]));
+        with_cranelift_gc(|gc| gc.collect_nursery());
+        assert_eq!(
+            NEW_BUMP_DESTRUCTOR_RUNS.load(Ordering::SeqCst),
+            1,
+            "finish_nursery_object must queue the destructor"
         );
     }
 
