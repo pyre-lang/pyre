@@ -536,12 +536,56 @@ pub struct FrameManager<L: FrameLayout> {
     _layout: PhantomData<L>,
 }
 
+/// `BindingsIterItems` — lazy walk of occupied frame slots.
+///
+/// Pyre keeps `Lifetime` in [`LifetimeManager`] rather than on the box's
+/// `_forwarded`, so the iterator holds the manager as the `get_lifetime`
+/// lookup.
+pub struct BindingsIterItems<'a, L: FrameLayout, R> {
+    fm: &'a FrameManager<L>,
+    longevity: &'a LifetimeManager<R, L::Loc>,
+    index: usize,
+}
+
+impl<'a, L: FrameLayout, R> Iterator for BindingsIterItems<'a, L, R>
+where
+    R: Copy + Eq + Hash + 'static,
+    L::Loc: Copy + 'static,
+{
+    type Item = (Operand, L::Loc);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let index = self.index;
+            if index >= self.fm.current_frame_depth {
+                return None;
+            }
+            let Some(box_) = self.fm.boxes_in_frame[index].clone() else {
+                self.index = index + 1;
+                continue;
+            };
+            self.index = index + L::frame_size(box_.type_());
+            let lifetime = self.longevity.get(&box_).expect("lifetime is not None");
+            let loc = lifetime.current_frame_loc.get().expect("loc is not None");
+            // Translated RPython drops `assert` (`simplify.py remove_assertion_errors`).
+            debug_assert_eq!(L::get_loc_index(&loc), index);
+            return Some((box_, loc));
+        }
+    }
+}
+
 impl<L: FrameLayout> FrameManager<L> {
     /// `FrameManager.__init__` plus the arch subclass `__init__(base_ofs)`.
     pub fn new(base_ofs: i32) -> Self {
+        Self::with_start_free_depth(base_ofs, 0)
+    }
+
+    /// `FrameManager.__init__(start_free_depth)` plus the arch `base_ofs`.
+    /// `_find_frame_location` still searches from index 0.
+    pub fn with_start_free_depth(base_ofs: i32, start_free_depth: usize) -> Self {
         FrameManager {
-            current_frame_depth: 0,
-            boxes_in_frame: Vec::new(),
+            current_frame_depth: start_free_depth,
+            boxes_in_frame: vec![None; start_free_depth],
             base_ofs,
             _layout: PhantomData,
         }
@@ -608,9 +652,9 @@ impl<L: FrameLayout> FrameManager<L> {
         let newloc = match newloc {
             Some(loc) => loc,
             None => {
-                // regalloc.py FrameManager.get_new_loc odd size-2 index
+                // FrameManager.get_new_loc odd size-2 index
                 let mut index = self.get_frame_depth();
-                if size == 2 && index & 1 == 1 {
+                let loc = if size == 2 && index & 1 == 1 {
                     if index > 0 && self.boxes_in_frame[index - 1].is_none() {
                         index -= 1;
                     } else {
@@ -626,10 +670,22 @@ impl<L: FrameLayout> FrameManager<L> {
                     let loc = L::frame_pos(index, tp, self.base_ofs);
                     self._increase_frame_depth(size);
                     loc
+                };
+                #[cfg(debug_assertions)]
+                {
+                    let testindex = L::get_loc_index(&loc);
+                    debug_assert_eq!(testindex, index);
+                    for i in testindex..testindex + size {
+                        debug_assert!(self.boxes_in_frame[i].is_none());
+                    }
                 }
+                loc
             }
         };
+        debug_assert!(self.boxes_in_frame[L::get_loc_index(&newloc)].is_none());
         self.bind(v, newloc, tp, longevity);
+        #[cfg(debug_assertions)]
+        self._check_invariants(longevity);
         newloc
     }
 
@@ -679,6 +735,10 @@ impl<L: FrameLayout> FrameManager<L> {
             self._increase_frame_depth(pos + size - self.current_frame_depth);
         }
         debug_assert!(self.boxes_in_frame[pos].is_none());
+        debug_assert!(
+            !self.boxes_in_frame.iter().any(|b| b.as_ref() == Some(v)),
+            "FrameManager.bind: box already in frame"
+        );
         for index in pos..pos + size {
             self.boxes_in_frame[index] = Some(v.clone());
         }
@@ -686,10 +746,32 @@ impl<L: FrameLayout> FrameManager<L> {
         lifetime.current_frame_loc.set(Some(loc));
     }
 
-    /// regalloc.py FrameManager.finish_binding
-    pub fn finish_binding(&self) {
+    /// `FrameManager.bindings_iteritems`
+    pub fn bindings_iteritems<'a, R: Copy + Eq + Hash + 'static>(
+        &'a self,
+        longevity: &'a LifetimeManager<R, L::Loc>,
+    ) -> BindingsIterItems<'a, L, R>
+    where
+        L::Loc: Copy + 'static,
+    {
+        BindingsIterItems {
+            fm: self,
+            longevity,
+            index: 0,
+        }
+    }
+
+    /// `FrameManager.finish_binding`
+    pub fn finish_binding<R: Copy + Eq + Hash + 'static>(
+        &self,
+        longevity: &LifetimeManager<R, L::Loc>,
+    ) where
+        L::Loc: Copy + 'static,
+    {
         #[cfg(debug_assertions)]
-        self._check_invariants();
+        self._check_invariants(longevity);
+        #[cfg(not(debug_assertions))]
+        let _ = longevity;
     }
 
     /// regalloc.py FrameManager.mark_as_free
@@ -706,7 +788,14 @@ impl<L: FrameLayout> FrameManager<L> {
             None => return, // not in frame
         };
         let lifetime = longevity.get(v).unwrap();
-        debug_assert!(lifetime.current_frame_loc.get().is_some());
+        debug_assert_eq!(
+            lifetime
+                .current_frame_loc
+                .get()
+                .map(|cur| L::get_loc_index(&cur)),
+            Some(L::get_loc_index(&loc)),
+            "FrameManager.mark_as_free: current_frame_loc is loc"
+        );
         lifetime.current_frame_loc.set(None);
         let pos = L::get_loc_index(&loc);
         let size = L::frame_size(tp);
@@ -714,6 +803,8 @@ impl<L: FrameLayout> FrameManager<L> {
         for index in pos..pos + size {
             self.boxes_in_frame[index] = None;
         }
+        #[cfg(debug_assertions)]
+        self._check_invariants(longevity);
     }
 
     /// regalloc.py FrameManager.add_frame_pos_hint
@@ -725,7 +816,12 @@ impl<L: FrameLayout> FrameManager<L> {
     ) where
         L::Loc: Copy + 'static,
     {
-        if let Some(lifetime) = longevity.get(v) {
+        let lifetime = longevity.get(v);
+        debug_assert!(
+            lifetime.is_some(),
+            "add_frame_pos_hint: box has no Lifetime"
+        );
+        if let Some(lifetime) = lifetime {
             lifetime.hint_frame_pos.set(L::get_loc_index(&loc) as i32);
         }
     }
@@ -745,9 +841,25 @@ impl<L: FrameLayout> FrameManager<L> {
             .unwrap_or(-1)
     }
 
-    /// regalloc.py FrameManager._check_invariants
-    fn _check_invariants(&self) {
+    /// `FrameManager._check_invariants`
+    #[cfg(debug_assertions)]
+    fn _check_invariants<R: Copy + Eq + Hash + 'static>(
+        &self,
+        longevity: &LifetimeManager<R, L::Loc>,
+    ) where
+        L::Loc: Copy + 'static,
+    {
         debug_assert_eq!(self.boxes_in_frame.len(), self.current_frame_depth);
+        let mut all = vec![false; self.get_frame_depth()];
+        for (b, loc) in self.bindings_iteritems(longevity) {
+            let size = L::frame_size(b.type_());
+            let pos = L::get_loc_index(&loc);
+            for i in pos..pos + size {
+                debug_assert!(!all[i]);
+                all[i] = true;
+                debug_assert!(self.boxes_in_frame[i].as_ref() == Some(&b));
+            }
+        }
     }
 }
 
@@ -912,5 +1024,72 @@ mod tests {
         let lt = longevity.get(&i1).unwrap();
         assert_eq!(lt.last_usage.get(), -1);
         assert_eq!(lt.definition_pos.get(), -1);
+    }
+
+    #[test]
+    fn with_start_free_depth_preallocates_free_slots_and_allocates_from_zero() {
+        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let (_ia, v) = ia_pair(Type::Int, 0);
+        longevity.set(&v, Lifetime::new(0, 10));
+
+        let mut fm = FrameManager::<TestFrameLayout>::with_start_free_depth(0, 3);
+        assert_eq!(fm.get_frame_depth(), 3);
+        assert_eq!(fm.boxes_in_frame.len(), 3);
+        assert!(fm.boxes_in_frame.iter().all(|slot| slot.is_none()));
+
+        let loc = fm.get_new_loc(&v, Type::Int, &mut longevity);
+        assert_eq!(loc.position, 0);
+        assert_eq!(TestFrameLayout::get_loc_index(&loc), 0);
+    }
+
+    #[test]
+    fn bindings_iteritems_yields_each_bound_box_once_with_its_index() {
+        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let (_ia0, v0) = ia_pair(Type::Int, 0);
+        let (_ia1, v1) = ia_pair(Type::Int, 1);
+        let (_ia2, v2) = ia_pair(Type::Int, 2);
+        longevity.set(&v0, Lifetime::new(0, 10));
+        longevity.set(&v1, Lifetime::new(1, 10));
+        longevity.set(&v2, Lifetime::new(2, 10));
+
+        let mut fm = FrameManager::<TestFrameLayout>::new(0);
+        let loc0 = fm.get_new_loc(&v0, Type::Int, &mut longevity);
+        let loc1 = fm.get_new_loc(&v1, Type::Int, &mut longevity);
+        let loc2 = fm.get_new_loc(&v2, Type::Int, &mut longevity);
+
+        let items: Vec<_> = fm.bindings_iteritems(&longevity).collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, v0);
+        assert_eq!(TestFrameLayout::get_loc_index(&items[0].1), loc0.position);
+        assert_eq!(items[1].0, v1);
+        assert_eq!(TestFrameLayout::get_loc_index(&items[1].1), loc1.position);
+        assert_eq!(items[2].0, v2);
+        assert_eq!(TestFrameLayout::get_loc_index(&items[2].1), loc2.position);
+        fm.finish_binding(&longevity);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "FrameManager.bind: box already in frame")]
+    fn bind_same_box_twice_panics_in_debug() {
+        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let (_ia0, v0) = ia_pair(Type::Int, 0);
+        longevity.set(&v0, Lifetime::new(0, 10));
+
+        let mut fm = FrameManager::<TestFrameLayout>::new(0);
+        let _loc0 = fm.get_new_loc(&v0, Type::Int, &mut longevity);
+        let loc1 = TestFrameLayout::frame_pos(1, Type::Int, 0);
+        fm.bind(&v0, loc1, Type::Int, &mut longevity);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "add_frame_pos_hint: box has no Lifetime")]
+    fn add_frame_pos_hint_without_lifetime_panics_in_debug() {
+        let mut longevity = LifetimeManager::<(), TestFrameLoc>::new();
+        let (_ia0, v0) = ia_pair(Type::Int, 0);
+        let fm = FrameManager::<TestFrameLayout>::new(0);
+        let loc = TestFrameLayout::frame_pos(0, Type::Int, 0);
+        fm.add_frame_pos_hint(&v0, loc, &mut longevity);
     }
 }

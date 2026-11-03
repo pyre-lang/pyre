@@ -7,7 +7,6 @@
 use crate::regalloc::{LifetimeManager, SAVE_ALL_REGS, SAVE_DEFAULT_REGS, SAVE_GCREF_REGS};
 use crate::regloc::{EAX, ECX, EDX, RegLoc};
 use crate::x86::callbuilder::{ARGUMENTS_GPR, ARGUMENTS_XMM};
-use indexmap::IndexMap;
 #[cfg(test)]
 use majit_ir::OpRef;
 use majit_ir::operand::Operand;
@@ -18,11 +17,6 @@ pub struct RegisterHints {
     save_around_call_regs_gpr: Vec<RegLoc>,
     all_regs_gpr: Vec<RegLoc>,
     all_regs_xmm: Vec<RegLoc>,
-    /// Rust adaptation: RPython's `ConstInt.value` is embedded on the
-    /// Box object; pyre's `OpRef` is a flat `u32` so constant values
-    /// are looked up through this map.  Structural equivalent of
-    /// `isinstance(arg, ConstInt) and arg.value`.
-    constants: IndexMap<u32, i64>,
 }
 
 impl RegisterHints {
@@ -31,28 +25,21 @@ impl RegisterHints {
         _save_around_call_regs_xmm: Vec<RegLoc>,
         all_regs_gpr: Vec<RegLoc>,
         all_regs_xmm: Vec<RegLoc>,
-        constants: IndexMap<u32, i64>,
     ) -> Self {
         RegisterHints {
             save_around_call_regs_gpr,
             all_regs_gpr,
             all_regs_xmm,
-            constants,
         }
     }
 
-    /// Rust equivalent of `isinstance(arg, ConstInt) and arg.value`
-    /// — returns the const int value if available.
+    /// `isinstance(arg, ConstInt) and arg.value` — the ConstInt payload
+    /// is on the operand (`ConstInt.getint`).
     fn get_const_int(&self, arg: &Operand) -> Option<i64> {
         if !arg.is_constant() {
             return None;
         }
-        arg.const_int().or_else(|| {
-            let opref = arg.to_opref();
-            opref
-                .inline_const_bits()
-                .or_else(|| self.constants.get(&opref.raw()).copied())
-        })
+        arg.const_int()
     }
 
     /// reghint.py `add_hints` — main entry called from
@@ -484,7 +471,7 @@ mod tests {
         let ops: Vec<OpRc> = vec![OpRc::new(call), OpRc::new(finish)];
         rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
-        RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
+        RegisterHints::new(vec![], vec![], vec![], vec![]).add_hints(
             &mut longevity,
             &inputargs,
             &ops,
@@ -510,7 +497,7 @@ mod tests {
         let ops: Vec<OpRc> = vec![OpRc::new(sub), OpRc::new(finish)];
         rebind_trace_arg_boxes(&inputargs, &ops);
         let mut longevity = compute_vars_longevity(&inputargs, &ops);
-        RegisterHints::new(vec![], vec![], vec![], vec![], IndexMap::new()).add_hints(
+        RegisterHints::new(vec![], vec![], vec![], vec![]).add_hints(
             &mut longevity,
             &inputargs,
             &ops,

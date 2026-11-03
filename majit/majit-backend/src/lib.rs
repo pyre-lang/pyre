@@ -11,7 +11,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Type, Value};
+use majit_ir::{Descr, FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Type, Value};
 
 thread_local! {
     static NULL_MEM_ACCESS: Cell<bool> = const { Cell::new(false) };
@@ -2815,15 +2815,6 @@ pub trait Backend: Send {
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
-
-    /// Register the typed constant pool (`OpRef` → `Const`) consumed by
-    /// the next `compile_loop` / `compile_bridge` call.  `Const` carries
-    /// both value and `Type` (history.py:220/261/307
-    /// ConstInt/ConstFloat/ConstPtr `.type` parity).
-    ///
-    /// Default is a no-op — only backends that honour constants at emit
-    /// time override.
-    fn set_constants_pool(&mut self, _constants: majit_ir::ConstMap<Const>) {}
 
     /// Force the next `compile_loop` / `compile_bridge` call to stamp
     /// this trace id on exits.

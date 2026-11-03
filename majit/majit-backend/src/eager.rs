@@ -26,7 +26,7 @@
 //! use std::sync::Arc;
 //! use majit_backend::{Backend, JitCellToken};
 //! use majit_backend::eager::CompiledIr;
-//! use majit_ir::{ConstMap, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+//! use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 //! use majit_ir::operand::Operand;
 //! use majit_ir::descr::make_finish_descr;
 //!
@@ -42,8 +42,7 @@
 //!         make_finish_descr(0, vec![Type::Int])));
 //!     // SAFETY: well-formed integer-only IR, configured CPU and fresh token.
 //!     let mut compiled = unsafe {
-//!         CompiledIr::compile(cpu, fresh_token, &[x],
-//!             &[add, finish], ConstMap::default())
+//!         CompiledIr::compile(cpu, fresh_token, &[x], &[add, finish])
 //!     }.expect("backend supports integer addition");
 //!     // SAFETY: no pointers, allocation, or runtime calls in this IR.
 //!     let exit = unsafe { compiled.execute(&[Value::Int(41)]) }.unwrap();
@@ -55,7 +54,7 @@
 use std::sync::Arc;
 
 use majit_ir::forwarding::ForwardingHost;
-use majit_ir::{Const, ConstMap, InputArgRc, OpRc, Type, Value};
+use majit_ir::{InputArgRc, OpRc, Type, Value};
 
 use crate::{AsmInfo, Backend, BackendError, JitCellToken, RawExecResult};
 
@@ -91,9 +90,6 @@ impl<'backend> CompiledIr<'backend> {
     /// a request to execute an interpreter. A failed attempt consumes the token:
     /// use a fresh token for retries, as backend compilation can partially fill it.
     ///
-    /// `constants` replaces the backend's pending constant pool for this
-    /// submission and is cleared after either success or failure.
-    ///
     /// # Safety
     ///
     /// The IR must satisfy the selected backend's `compile_loop` contract:
@@ -107,7 +103,6 @@ impl<'backend> CompiledIr<'backend> {
         token: Arc<JitCellToken>,
         inputargs: &[InputArgRc],
         operations: &[OpRc],
-        constants: ConstMap<Const>,
     ) -> Result<Self, BackendError> {
         if token.compiled.get().is_some() || token.inputarg_types.get().is_some() {
             return Err(BackendError::CompilationFailed(
@@ -127,9 +122,7 @@ impl<'backend> CompiledIr<'backend> {
         for op in operations {
             op.clear_forwarded();
         }
-        backend.set_constants_pool(constants);
         let result = backend.compile_loop(inputargs, operations, &token);
-        backend.set_constants_pool(ConstMap::default());
         let asm_info = result?;
         // compile.py record_loop_or_bridge: clt.loop_token_wref = wref.
         // Concrete backends attach ResumeDescr.rd_loop_token during assembly;

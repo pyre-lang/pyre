@@ -571,23 +571,6 @@ pub struct Optimizer {
     pub(crate) trace_inputarg_boxes: Vec<majit_ir::InputArgRc>,
 }
 
-/// Lower a typed-`Value` constants pool into the dense
-/// `IndexMap<u32, Const>` shape consumed by pyre-side guard metadata
-/// builders and the backend's `set_constants_pool` boundary.
-///
-/// history.py/261/307 `ConstInt/ConstFloat/ConstPtr` are the only
-/// constant classes — `Value::Void` panics rather than fabricate a
-/// nonexistent `ConstVoid`.
-pub(crate) fn lower_typed_constants_to_const_pool(
-    constants: &majit_ir::ConstMap<majit_ir::Value>,
-) -> majit_ir::ConstMap<majit_ir::Const> {
-    let mut pool = majit_ir::ConstMap::default();
-    for (&k, v) in constants {
-        pool.insert(k, v.to_const());
-    }
-    pool
-}
-
 /// RPython unroll.py: import_state virtual info for Phase 2.
 /// Tells OptVirtualize that an inputarg is a virtual object.
 #[derive(Clone, Debug)]

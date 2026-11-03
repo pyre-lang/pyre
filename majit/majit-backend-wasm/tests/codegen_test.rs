@@ -792,11 +792,10 @@ fn fold_same_as_replacements(ops: Vec<Op>) -> Vec<Op> {
 
 fn rewrite_ops_for_gc(
     ops: Vec<Op>,
-    constants: &indexmap::IndexMap<u32, i64>,
     nursery: Option<&codegen::NurseryAllocParams>,
     alloc: &codegen::AllocHelpers,
     wb: &codegen::WriteBarrierHelpers,
-) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+) -> Vec<Op> {
     let ops = fold_same_as_replacements(ops);
     let mut rewriter = gc_rewriter();
     rewriter.malloc_zero_filled = false;
@@ -827,8 +826,8 @@ fn rewrite_ops_for_gc(
         rewriter.nursery_free_addr = 0;
         rewriter.nursery_top_addr = 0;
     }
-    let (ops, constants, _table) = rewrite_ops_for_gc_with(&rewriter, ops, constants);
-    (ops, constants)
+    let (ops, _table) = rewrite_ops_for_gc_with(&rewriter, ops);
+    ops
 }
 
 fn ops_need_gc_rewrite(ops: &[Op]) -> bool {
@@ -853,25 +852,14 @@ fn rewrite_module_inputs(mut inputs: codegen::ModuleBuildInputs) -> codegen::Mod
             .any(|region| ops_need_gc_rewrite(&region.ops))
     {
         let nursery = inputs.nursery.clone();
-        let (ops, constants) = rewrite_ops_for_gc(
-            inputs.ops,
-            &inputs.constants,
-            nursery.as_ref(),
-            &inputs.alloc,
-            &inputs.wb,
-        );
-        inputs.ops = ops;
-        inputs.constants = constants;
+        inputs.ops = rewrite_ops_for_gc(inputs.ops, nursery.as_ref(), &inputs.alloc, &inputs.wb);
         for region in &mut inputs.inlined_bridges {
-            let (ops, constants) = rewrite_ops_for_gc(
+            region.ops = rewrite_ops_for_gc(
                 std::mem::take(&mut region.ops),
-                &region.constants,
                 nursery.as_ref(),
                 &inputs.alloc,
                 &inputs.wb,
             );
-            region.ops = ops;
-            region.constants = constants;
         }
         let value_slots = codegen::frame_value_slots(&inputs.inputargs, &inputs.ops)
             .max(inputs.frame.value_slots);
@@ -892,10 +880,7 @@ fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
 
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 
-fn rewrite_frontend_ops(
-    inputargs: &[InputArgRc],
-    ops: Vec<Op>,
-) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+fn rewrite_frontend_ops(inputargs: &[InputArgRc], ops: Vec<Op>) -> Vec<Op> {
     rewrite_frontend_ops_with_gc(inputargs, ops, majit_gc::collector::MiniMarkGC::new())
 }
 
@@ -906,7 +891,7 @@ fn rewrite_frontend_ops_with_gc(
     inputargs: &[InputArgRc],
     mut ops: Vec<Op>,
     mut gc: majit_gc::collector::MiniMarkGC,
-) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+) -> Vec<Op> {
     let num_inputs = inputargs.len() as u32;
     for (op_idx, op) in ops.iter().enumerate() {
         if op.result_type() != Type::Void && op.pos().get().is_none() {
@@ -920,9 +905,8 @@ fn rewrite_frontend_ops_with_gc(
     let mut backend = majit_backend_wasm::WasmBackend::new();
     gc.register_type(majit_gc::TypeInfo::simple(16));
     backend.set_gc_allocator(Box::new(gc));
-    let (ops, constants, _table) =
-        majit_backend_wasm::rewrite_ops_for_gc(ops, &indexmap::IndexMap::new());
-    (ops, constants)
+    let (ops, _table) = majit_backend_wasm::rewrite_ops_for_gc(ops);
+    ops
 }
 
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
@@ -940,14 +924,12 @@ fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
 fn build_module(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
     vtable_offset: Option<usize>,
     gc_info: &codegen::GuardGcTypeInfo,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     build_module_with_frame(
         inputargs,
         ops,
-        constants,
         vtable_offset,
         gc_info,
         codegen::FrameGeometry::fixed(),
@@ -957,7 +939,6 @@ fn build_module(
 fn build_module_with_frame(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
     vtable_offset: Option<usize>,
     gc_info: &codegen::GuardGcTypeInfo,
     frame: codegen::FrameGeometry,
@@ -965,7 +946,6 @@ fn build_module_with_frame(
     build_module_with_ca(
         inputargs,
         ops,
-        constants,
         vtable_offset,
         gc_info,
         frame,
@@ -977,7 +957,6 @@ fn build_module_with_frame(
 fn build_module_with_ca(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
     vtable_offset: Option<usize>,
     gc_info: &codegen::GuardGcTypeInfo,
     frame: codegen::FrameGeometry,
@@ -987,7 +966,6 @@ fn build_module_with_ca(
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset,
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: gc_info.clone(),
@@ -1020,12 +998,10 @@ fn build_module_with_ca(
 fn build_module_default(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     build_module(
         inputargs,
         ops,
-        constants,
         Some(0),
         &codegen::GuardGcTypeInfo::default(),
     )
@@ -1114,7 +1090,7 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(900))]),
     ];
 
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
@@ -1140,7 +1116,7 @@ fn same_as_reuses_its_source_local() {
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
@@ -1167,7 +1143,7 @@ fn same_as_does_not_alias_a_mutable_label_local() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(
         emitted_local_count(&bytes),
@@ -1198,7 +1174,7 @@ fn same_as_before_label_defines_a_fresh_label_arg() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 }
 
@@ -1221,7 +1197,6 @@ fn unbound_read_without_a_producer_declines() {
         inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -1249,37 +1224,8 @@ fn unbound_read_without_a_producer_declines() {
         Err(error) => error,
     };
     assert!(
-        error
-            .to_string()
-            .contains("read with no producing op and no"),
+        error.to_string().contains("read with no producing op"),
         "unexpected decline: {error}"
-    );
-}
-
-#[test]
-fn unbound_pool_float_operand_declares_an_f64_local() {
-    let folded_float = OpRef::float_op(7);
-    let ops = vec![Op::new(OpCode::Finish, &[rb(folded_float)])];
-    let constants = indexmap::IndexMap::from([(folded_float.raw(), 3.5_f64.to_bits() as i64)]);
-
-    let (bytes, _) = build_module_default(&[], &ops, &constants);
-    validate_wasm(&bytes);
-    let local_types = wasmparser::Parser::new(0)
-        .parse_all(&bytes)
-        .find_map(|payload| match payload.unwrap() {
-            wasmparser::Payload::CodeSectionEntry(body) => Some(
-                body.get_locals_reader()
-                    .unwrap()
-                    .into_iter()
-                    .map(|local| local.unwrap().1)
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .expect("generated module must contain its trace function");
-    assert!(
-        local_types.contains(&wasmparser::ValType::F64),
-        "the producer-less Float operand must declare an f64 local"
     );
 }
 
@@ -1300,7 +1246,7 @@ fn label_livein_inputarg_is_defined_at_the_label() {
         make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[live_in]),
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(live_in)]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -1324,55 +1270,9 @@ fn label_livein_inputarg_ref_is_defined_at_the_label() {
         make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[live_in]),
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(live_in)]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
-}
-
-/// A LABEL live-in that is only a constants-map entry must still be seeded
-/// in the prologue. Treating every LABEL arg as defined skipped that store,
-/// so the local read as the zero wasm initializes it to.
-#[test]
-fn label_livein_pool_const_is_seeded_in_prologue() {
-    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let live_in = OpRef::input_arg_int(101);
-    let ops = vec![
-        Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
-        make_op(
-            OpCode::IntAdd,
-            &[OpRef::input_arg_int(0), live_in],
-            OpRef::int_op(1),
-        ),
-        make_guard(OpCode::GuardTrue, &[OpRef::int_op(1)], &[live_in]),
-        Op::new(OpCode::Jump, &[rb(OpRef::int_op(1)), rb(live_in)]),
-    ];
-    let mut constants = indexmap::IndexMap::new();
-    constants.insert(live_in.raw(), 0x1111_2222_3333_4444);
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
-    validate_wasm(&bytes);
-    assert_eq!(guards.len(), 1);
-    const SEED: i64 = 0x1111_2222_3333_4444u64 as i64;
-    let mut saw_seed = false;
-    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
-        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
-            let mut operators = body.get_operators_reader().unwrap();
-            let mut pending = false;
-            while !operators.eof() {
-                match operators.read().unwrap() {
-                    wasmparser::Operator::I64Const { value } if value == SEED => pending = true,
-                    wasmparser::Operator::LocalSet { .. } if pending => {
-                        saw_seed = true;
-                        break;
-                    }
-                    _ => pending = false,
-                }
-            }
-        }
-    }
-    assert!(
-        saw_seed,
-        "prologue must materialize the LABEL live-in from the constants map"
-    );
 }
 
 /// Count the direct `wasm_jit_write_barrier` table calls by their unique table
@@ -1413,7 +1313,6 @@ fn build_module_with_write_barrier_target(
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -1456,7 +1355,6 @@ fn build_module_with_gc_table(
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -1517,7 +1415,6 @@ fn module_with_collecting_calls(call_count: usize) -> Vec<u8> {
         inputargs: vec![InputArg::from_type_rc(Type::Ref, 0)],
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -1681,7 +1578,6 @@ fn guard_exit_module(guard_count: usize, ref_fail: bool, exit_table_base: u32) -
         inputargs: vec![input],
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -1931,7 +1827,7 @@ fn execute_ovf_trace_with_guard(
         guard,
         finish,
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
 
     let engine = Engine::default();
     let module = Module::new(&engine, &bytes).expect("generated trace should compile");
@@ -1992,7 +1888,7 @@ fn execute_ovf_trace_const(opcode: OpCode, a: i64, c: i64, const_first: bool) ->
         [OpRef::input_arg_int(0), OpRef::const_int(c)]
     };
     let ops = vec![make_op(opcode, &args, OpRef::int_op(1)), guard, finish];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
 
     let engine = Engine::default();
     let module = Module::new(&engine, &bytes).expect("generated trace should compile");
@@ -2112,7 +2008,7 @@ fn test_int_mul_ovf_fuses_its_adjacent_overflow_guard() {
         guard,
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     let (mut widened, mut i32_result_blocks) = (0usize, 0usize);
@@ -2199,7 +2095,7 @@ fn test_int_mul_ovf_emits_signed32_fast_path_and_full_width_fallback() {
         guard,
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     let mut extend32_s = 0;
@@ -2242,11 +2138,7 @@ fn test_guard_fail_args_spill_in_their_own_failure_arms() {
         rb(OpRef::input_arg_int(0)),
     ]);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
-    let (bytes, guards) = build_module_default(
-        &inputargs,
-        &[first_guard, second_guard, finish],
-        &indexmap::IndexMap::new(),
-    );
+    let (bytes, guards) = build_module_default(&inputargs, &[first_guard, second_guard, finish]);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3);
 
@@ -2304,11 +2196,7 @@ fn test_fused_integer_guard_true_uses_inverse_comparison_directly() {
         &[OpRef::input_arg_int(0)],
     );
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
-    let (bytes, _) = build_module_default(
-        &inputargs,
-        &[compare, guard, finish],
-        &indexmap::IndexMap::new(),
-    );
+    let (bytes, _) = build_module_default(&inputargs, &[compare, guard, finish]);
     validate_wasm(&bytes);
 
     let mut ge_s = 0;
@@ -2351,7 +2239,6 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -2437,8 +2324,7 @@ fn test_empty_trace() {
         op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
         op
     }];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(guards[0].is_finish);
@@ -2607,7 +2493,6 @@ fn inline_region_inputs(
         inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges,
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -2653,7 +2538,6 @@ fn inlined_bridge_without_owner_loop_label_declines() {
             ops: vec![Op::new(OpCode::Finish, &[])],
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
     );
 
@@ -2789,9 +2673,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
                 ops: region_ops,
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: indexmap::IndexMap::new(),
             }],
-            constants: indexmap::IndexMap::new(),
             vtable_offset: Some(0),
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -2920,7 +2802,6 @@ fn call_assembler_accepts_float_and_void_result_locals() {
             inputargs,
             ops,
             inlined_bridges: Vec::new(),
-            constants: indexmap::IndexMap::new(),
             vtable_offset: Some(0),
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3002,7 +2883,6 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
         inputargs,
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3101,7 +2981,6 @@ fn entry_prologue_does_not_null_unmarked_home_padding() {
         inputargs,
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3186,7 +3065,6 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
             inputargs,
             ops,
             inlined_bridges: Vec::new(),
-            constants: indexmap::IndexMap::new(),
             vtable_offset: Some(0),
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3341,31 +3219,25 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
     // its first input arg share an id with the owner's loop-invariant
     // `int_op(2)`; `base = 40` clears every owner id.
     fn build(base: u32) -> Vec<u8> {
-        let region_pool = indexmap::IndexMap::from([(base + 3, 0x5a5a_007)]);
-        let first = build_with(base, region_pool.clone(), indexmap::IndexMap::new())
-            .expect("a loop-closing region merges into its owner");
+        let first = build_with(base).expect("a loop-closing region merges into its owner");
         // A region is RETAINED for the next re-emission, and `reemit_loop`
         // rebases the same retained copy every time, so the rebase must leave
         // it untouched. Building twice is what catches a rebase that wrote
         // through to the region it read.
-        let second = build_with(base, region_pool, indexmap::IndexMap::new())
-            .expect("a retained region rebases identically on re-emission");
+        let second =
+            build_with(base).expect("a retained region rebases identically on re-emission");
         assert_eq!(first, second, "rebasing mutated the retained region");
         first
     }
 
-    fn build_with(
-        base: u32,
-        region_constants: indexmap::IndexMap<u32, i64>,
-        owner_constants: indexmap::IndexMap<u32, i64>,
-    ) -> Result<Vec<u8>, majit_backend::BackendError> {
+    fn build_with(base: u32) -> Result<Vec<u8>, majit_backend::BackendError> {
         let inputargs = vec![
             InputArg::from_type_rc(Type::Int, 0),
             InputArg::from_type_rc(Type::Int, 1),
         ];
-        // `int_op(base + 3)` has no producing op: it is a folded value that
-        // only the region's own constant pool binds, so the merge has to move
-        // its pool key by the same offset it moves the read by.
+        // Folded `const_int` is not a value id (`value_box_raw`), so rebase
+        // leaves it unchanged. The merge must still emit the same bits
+        // regardless of where the region numbered its SSA locals.
         let region_ops = vec![
             make_op(
                 OpCode::IntAdd,
@@ -3374,7 +3246,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             ),
             make_op(
                 OpCode::IntAdd,
-                &[OpRef::int_op(base + 2), OpRef::int_op(base + 3)],
+                &[OpRef::int_op(base + 2), OpRef::const_int(0x5a5a_007)],
                 OpRef::int_op(base + 4),
             ),
             Op::new(
@@ -3400,9 +3272,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
                 ops: region_ops,
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: region_constants,
             }],
-            constants: owner_constants,
             vtable_offset: Some(0),
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3433,28 +3303,6 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
     validate_wasm(&colliding);
     validate_wasm(&disjoint);
     assert_eq!(colliding, disjoint);
-
-    // A key the owner pool carries inside the window the region is rebased
-    // into names one of the REGION's ids once the merge is done, not the
-    // owner value it was recorded for. Left in place it answers a read the
-    // region's own pool declines, so the module builds on unrelated bits
-    // instead of declining. Dropping the region's seed must therefore reach
-    // the decline even though the owner pool has an entry at that position.
-    let stale = build_with(
-        2,
-        indexmap::IndexMap::new(),
-        indexmap::IndexMap::from([(12, 0x1234)]),
-    );
-    let error = match stale {
-        Ok(_) => panic!("a stale owner key inside the region window answered the region's read"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("read with no producing op and no"),
-        "unexpected decline: {error}"
-    );
 }
 
 #[test]
@@ -3468,7 +3316,6 @@ fn test_int_add_loop() {
 
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         Op::new(
@@ -3498,7 +3345,7 @@ fn test_int_add_loop() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
     ];
 
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1); // one guard
     assert!(!guards[0].is_finish);
@@ -3514,7 +3361,6 @@ fn label_int_phi_without_a_producer_still_compiles() {
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
         Op::new(
             OpCode::Label,
@@ -3553,7 +3399,7 @@ fn label_int_phi_without_a_producer_still_compiles() {
             ],
         ),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 }
 
@@ -3565,7 +3411,6 @@ fn label_ref_phi_without_a_producer_declines() {
         InputArg::from_type_rc(Type::Int, 0),
         InputArg::from_type_rc(Type::Ref, 1),
     ];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
         Op::new(
             OpCode::Label,
@@ -3592,7 +3437,6 @@ fn label_ref_phi_without_a_producer_declines() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants,
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3633,7 +3477,6 @@ fn compute_home_gcmap_simple_loop_is_valid() {
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
         Op::new(
             OpCode::Label,
@@ -3668,7 +3511,6 @@ fn compute_home_gcmap_simple_loop_is_valid() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3704,7 +3546,6 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
         Op::new(
             OpCode::Label,
@@ -3740,7 +3581,6 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants,
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3816,7 +3656,6 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3889,7 +3728,6 @@ fn reemit_nulls_grown_label_homes_and_builds() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3921,8 +3759,7 @@ fn reemit_nulls_grown_label_homes_and_builds() {
 /// A peeled loop's start LABEL can still name an import_state source
 /// (`InputArgRef(128)` on attr_delete) after every real use was rewritten
 /// to the folded constant. That argument is the phi destination, not a
-/// read of a never-written local. A later producer past 128 used to make
-/// `unbound_pool_const_seeds` decline the whole module.
+/// read of a never-written local.
 #[test]
 fn label_arg_import_hole_is_not_an_unbound_read() {
     let inputargs = vec![
@@ -3930,7 +3767,6 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
         InputArg::from_type_rc(Type::Int, 1),
     ];
     let const_1 = OpRef::const_int(1);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
         Op::new(
             OpCode::Label,
@@ -3953,7 +3789,6 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -3985,7 +3820,6 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
 #[test]
 fn unbound_non_label_read_of_import_hole_is_declined() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![make_op(
         OpCode::IntAdd,
         &[OpRef::input_arg_int(0), OpRef::input_arg_ref(128)],
@@ -3995,7 +3829,6 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -4023,27 +3856,22 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
     };
     let msg = err.to_string();
     assert!(
-        msg.contains("InputArgRef(128)") && msg.contains("read with no producing op and no"),
+        msg.contains("InputArgRef(128)") && msg.contains("read with no producing op"),
         "expected unbound 128 decline, got {msg}"
     );
 }
 
 #[test]
 fn test_folded_producer_value_seeds_unbound_local() {
-    // The producer at pos 99 is not in the compiled stream. Its `_resint`
-    // still holds the folded constant (`history.py IntFrontendOp`). Flattening
-    // to `IntOp(99)` without a pool entry used to decline the module.
-    let producer = OpRc::new(Op::new(OpCode::IntAdd, &[]));
-    producer.pos().set(OpRef::int_op(99));
-    let folded = Operand::from_bound_op(&producer);
-    folded.set_forwarded_const(majit_ir::Const::Int(7));
+    // Folded constants travel as Const operands (`history.py` `ConstInt.value`).
+    // A leftover producer position is an SSA local; the optimizer mints Const.
+    let folded = rb(OpRef::const_int(7));
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let add = Op::new(OpCode::IntAdd, &[folded, rb(OpRef::input_arg_int(0))]);
     add.pos().set(OpRef::int_op(1));
     let ops = vec![add, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(
         execute_simple_trace(&bytes, &[5]),
@@ -4066,7 +3894,7 @@ fn test_folded_producer_ref_is_interned() {
     same.pos().set(OpRef::ref_op(1));
     let ops = vec![same, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))])];
     // `compile_loop` rewrite intern runs this pass first; a leftover
-    // `_resref` must become LoadFromGcTable before unbound-seed.
+    // `_resref` must become LoadFromGcTable.
     let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, 2);
     assert_eq!(gcrefs, vec![majit_ir::GcRef(0x1000)]);
     let load = ops
@@ -4078,8 +3906,7 @@ fn test_folded_producer_ref_is_interned() {
         Some(majit_ir::Value::Int(0)),
         "LoadFromGcTable must use table index 0, ops={ops:?}"
     );
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 }
 
@@ -4114,8 +3941,7 @@ fn test_stray_label_inputarg_is_seeded() {
             ],
         ),
     ];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 }
 
@@ -4150,12 +3976,10 @@ fn test_external_jump_leftover_inputarg_declines() {
         ),
         jump,
     ];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
-        constants,
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -4218,12 +4042,10 @@ fn test_stray_failarg_ref_declines() {
             &[rb(OpRef::input_arg_ref(0)), rb(OpRef::input_arg_ref(1))],
         ),
     ];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
-        constants,
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -4460,8 +4282,10 @@ fn test_force_arm_lookup_stays_on_the_emitting_table() {
 
 #[test]
 fn test_inputarg_observation_is_not_a_folded_scalar() {
-    // An InputArg's get_value() is the sample seen while tracing. Seeding
+    // An InputArg's get_value() is the sample seen while tracing. Baking
     // that sample would freeze the first loop counter into later iterations.
+    // A body read of a box that is not a token input and not a LABEL
+    // parameter is unbound (`LLFrame.lookup`).
     let ia = InputArg::new_int_rc(99);
     ia.set_value(majit_ir::Value::Int(7));
     let add = Op::new(
@@ -4478,12 +4302,10 @@ fn test_inputarg_observation_is_not_a_folded_scalar() {
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
     ];
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
-        constants,
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -4559,8 +4381,7 @@ fn test_float_ops() {
         },
     ];
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -4570,7 +4391,6 @@ fn test_call_generates_import() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     let func_ptr = OpRef::const_int(42); // fake func_ptr
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         make_op(
@@ -4585,7 +4405,7 @@ fn test_call_generates_import() {
         },
     ];
 
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
@@ -4727,7 +4547,6 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         inputargs,
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -4769,7 +4588,6 @@ fn parameter_entry_bridge_inputs(
         inputargs,
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -4896,7 +4714,6 @@ fn attached_frame_entry_bridge_enters_with_jf_descr_clear() {
         inputargs,
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -5052,7 +4869,6 @@ fn building_a_module_does_not_stamp_the_guard_cell_on_its_descr() {
         inputargs,
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -5093,7 +4909,7 @@ fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
         void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5118,7 +4934,7 @@ fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5148,8 +4964,8 @@ fn an_allocation_is_followed_by_a_memory_error_check() {
         new_op,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, _guards) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     let mut seq: Vec<String> = Vec::new();
@@ -5201,8 +5017,8 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
     );
     set.setdescr(descr);
     let ops = vec![get, set, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(3))])];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, _guards) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     // The entry loader reads every input from its frame slot, a Ref one
@@ -5220,8 +5036,8 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
         counts
     };
     let finish_only = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))])];
-    let (finish_only, finish_constants) = rewrite_frontend_ops(&inputargs, finish_only);
-    let (entry_bytes, _guards) = build_module_default(&inputargs, &finish_only, &finish_constants);
+    let finish_only = rewrite_frontend_ops(&inputargs, finish_only);
+    let (entry_bytes, _guards) = build_module_default(&inputargs, &finish_only);
     validate_wasm(&entry_bytes);
     let entry = count_widths(&entry_bytes);
     let all = count_widths(&bytes);
@@ -5259,8 +5075,8 @@ fn test_true_void_family_does_not_shift_new_call_type() {
         new_op,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
     ];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5308,8 +5124,8 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
         new_op,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
     ];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5345,7 +5161,7 @@ fn test_true_void_float_arg_call_lowers_in_module() {
         void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5367,7 +5183,7 @@ fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
         void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], 8),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5403,7 +5219,6 @@ fn test_frame_reload_is_emitted_only_when_a_reload_helper_is_published() {
         build_module_with_ca(
             &inputargs,
             &ops,
-            &indexmap::IndexMap::new(),
             Some(0),
             &codegen::GuardGcTypeInfo::default(),
             codegen::FrameGeometry::fixed(),
@@ -5444,7 +5259,7 @@ fn test_true_void_type_index_accounts_for_trampoline_type() {
         void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -5514,8 +5329,7 @@ fn test_guard_types() {
         ),
     ];
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 7);
 }
@@ -5532,12 +5346,10 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         guard,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let constants = indexmap::IndexMap::new();
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset: None,
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -5608,8 +5420,7 @@ fn test_exception_guards() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
     let expected = majit_backend_wasm::jit_exc_type_addr() as i32;
@@ -5636,7 +5447,6 @@ fn test_guard_gc_type_uses_immediate_typeid() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     // Inline-Const carrying the immediate typeid 0x42
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
@@ -5648,7 +5458,7 @@ fn test_guard_gc_type_uses_immediate_typeid() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -5699,14 +5509,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
         Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))]),
     ];
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module(
-        &inputargs,
-        &ops,
-        &constants,
-        Some(0),
-        &enabled_guard_gc_type_info(),
-    );
+    let (bytes, guards) = build_module(&inputargs, &ops, Some(0), &enabled_guard_gc_type_info());
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 }
@@ -5726,7 +5529,6 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     // integer (read with `op.getarg(1).getint()`, rewrite.py). Use the
     // inline ConstInt factory so the variant tag matches the backend reader.
     let class_constant = OpRef::const_int(0xCAFE);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
@@ -5744,12 +5546,12 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
     info.subclass_ranges.insert(0xCAFE, (10, 20));
 
     // gcremovetypeptr branch: vtable_offset = None.
-    let (bytes, guards) = build_module(&inputargs, &ops, &constants, None, &info);
+    let (bytes, guards) = build_module(&inputargs, &ops, None, &info);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
 
     // vtable-load branch: vtable_offset = Some(...).
-    let (bytes2, _) = build_module(&inputargs, &ops, &constants, Some(8), &info);
+    let (bytes2, _) = build_module(&inputargs, &ops, Some(8), &info);
     validate_wasm(&bytes2);
 }
 
@@ -5802,8 +5604,7 @@ fn test_sameas_and_conversions() {
         },
     ];
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 }
 
@@ -5842,8 +5643,7 @@ fn test_overflow_ops() {
         },
     ];
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 3); // 2 GuardNoOverflow + 1 Finish
 }
@@ -5858,7 +5658,6 @@ fn test_single_label_peeled_loop_validates() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)]; // i
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         // preamble (unrolled first iteration): i + 1 -> v1
@@ -5887,7 +5686,7 @@ fn test_single_label_peeled_loop_validates() {
     // Must be classified as single-label peeled (exercises the dispatch wrapper).
     assert!(codegen::is_single_label_peeled(&ops));
 
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(!guards[0].is_finish);
@@ -5899,7 +5698,6 @@ fn test_single_label_peeled_loop_validates() {
 #[test]
 fn peeled_loop_dispatch_key_enters_the_label_not_the_preamble() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
         make_op(
             OpCode::IntAdd,
@@ -5911,7 +5709,7 @@ fn peeled_loop_dispatch_key_enters_the_label_not_the_preamble() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]),
     ];
     assert!(codegen::is_single_label_peeled(&ops));
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     let frame = codegen::FrameGeometry::fixed();
@@ -5970,7 +5768,6 @@ fn wide_label_dispatch_key_preserves_every_argument() {
     let (bytes, _) = build_module_with_frame(
         &inputargs,
         &ops,
-        &indexmap::IndexMap::new(),
         Some(0),
         &codegen::GuardGcTypeInfo::default(),
         frame,
@@ -6004,7 +5801,7 @@ fn vec_guard_true_compiles() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
     assert_eq!(execute_simple_trace(&bytes, &[3]), 3);
@@ -6025,7 +5822,7 @@ fn vec_guard_false_direct_polarity() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::const_int(10))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
     assert_eq!(execute_simple_trace(&bytes, &[0]), 10);
@@ -6051,7 +5848,7 @@ fn vec_guard_false_fused_comparison_polarity() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::const_int(10))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
     assert_eq!(execute_simple_trace(&bytes, &[3]), 20);
@@ -6098,7 +5895,6 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -6213,7 +6009,6 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
         inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -6332,7 +6127,6 @@ fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
     let (bytes, guards) = build_module_with_frame(
         &inputargs,
         &ops,
-        &indexmap::IndexMap::new(),
         Some(0),
         &codegen::GuardGcTypeInfo::default(),
         frame,
@@ -6353,7 +6147,6 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)]; // i
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         // preamble (unrolled first iteration): i + 1 -> v1
@@ -6386,7 +6179,7 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
     assert!(!codegen::is_single_label_peeled(&ops));
     assert!(codegen::is_resumable_peeled(&ops));
 
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     assert!(!guards[0].is_finish);
@@ -6404,7 +6197,6 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     let ops = vec![
         make_op(
@@ -6434,7 +6226,7 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
          accepting it the rest of these assertions prove nothing"
     );
 
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     let (types, functions, exports) = module_shape(&bytes);
@@ -6492,7 +6284,6 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
 fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let const_1 = OpRef::const_int(1);
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
     // No LABEL of its own, so the terminal JUMP closes into a separate module.
     let ops = vec![
@@ -6504,8 +6295,8 @@ fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]),
     ];
 
-    let (narrow_bytes, _) = build_external_jump_module(&inputargs, &ops, &constants, 7, 3, 0);
-    let (wide_bytes, _) = build_external_jump_module(&inputargs, &ops, &constants, 7, 3, 8);
+    let (narrow_bytes, _) = build_external_jump_module(&inputargs, &ops, 7, 3, 0);
+    let (wide_bytes, _) = build_external_jump_module(&inputargs, &ops, 7, 3, 8);
     validate_wasm(&narrow_bytes);
     validate_wasm(&wide_bytes);
 
@@ -6553,9 +6344,8 @@ fn a_jump_wider_than_sixteen_args_uses_the_wide_entry() {
         .collect();
     let jump_args: Vec<_> = (0..n).map(|i| rb(OpRef::input_arg_int(i as u32))).collect();
     let ops = vec![Op::new(OpCode::Jump, &jump_args)];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
-    let (wide_bytes, _) = build_external_jump_module(&inputargs, &ops, &constants, 7, 3, 8);
+    let (wide_bytes, _) = build_external_jump_module(&inputargs, &ops, 7, 3, 8);
     validate_wasm(&wide_bytes);
     let (wide_stores, wide_call) = external_jump_tail(&wide_bytes);
     assert_eq!(
@@ -6587,7 +6377,6 @@ fn cross_geometry_jump_delivers_label_args() {
     assert_ne!(ga.home_slot_base, gb.home_slot_base);
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let bridge_ops = vec![Op::new(OpCode::Jump, &[rb(OpRef::input_arg_int(0))])];
     let descr = majit_ir::make_loop_target_descr(1, false);
     let label = Op::new(OpCode::Label, &[rb(OpRef::int_op(1))]);
@@ -6613,7 +6402,6 @@ fn cross_geometry_jump_delivers_label_args() {
     let (bridge_bytes, _) = build_framed_module(
         &inputargs,
         &bridge_ops,
-        &constants,
         ga,
         codegen::CaParams {
             realloc_fn_ptr: 9,
@@ -6646,7 +6434,6 @@ fn cross_geometry_jump_delivers_label_args() {
     let (target_bytes, _) = build_framed_module(
         &inputargs,
         &target_ops,
-        &constants,
         gb,
         codegen::CaParams::default(),
         0,
@@ -6655,8 +6442,7 @@ fn cross_geometry_jump_delivers_label_args() {
     );
     validate_wasm(&target_bytes);
 
-    let (run_bytes, _) =
-        build_framed_module(&inputargs, &bridge_ops, &constants, ga, jump_ca, 4, 1, 0);
+    let (run_bytes, _) = build_framed_module(&inputargs, &bridge_ops, ga, jump_ca, 4, 1, 0);
     validate_wasm(&run_bytes);
     let engine = Engine::default();
     let bridge_module = Module::new(&engine, &run_bytes).unwrap();
@@ -6771,7 +6557,6 @@ fn attached_bridge_does_not_leave_jf_descr_for_guard_not_forced() {
         inputargs: inputargs.clone(),
         ops: loop_ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -6803,7 +6588,6 @@ fn attached_bridge_does_not_leave_jf_descr_for_guard_not_forced() {
     let (bridge_bytes, _) = build_framed_module(
         &inputargs,
         &bridge_ops,
-        &indexmap::IndexMap::new(),
         frame,
         codegen::CaParams::default(),
         LOOP_SLOT,
@@ -6923,7 +6707,6 @@ fn attached_bridge_does_not_write_jf_descr() {
         inputargs: inputargs.clone(),
         ops: loop_ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -6955,7 +6738,6 @@ fn attached_bridge_does_not_write_jf_descr() {
     let (bridge_bytes, _) = build_framed_module(
         &inputargs,
         &bridge_ops,
-        &indexmap::IndexMap::new(),
         frame,
         codegen::CaParams::default(),
         DUMMY_SLOT,
@@ -7048,7 +6830,6 @@ fn attached_bridge_does_not_write_jf_descr() {
 fn build_framed_module(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
     frame: codegen::FrameGeometry,
     ca: codegen::CaParams,
     external_jump_slot: u32,
@@ -7059,7 +6840,6 @@ fn build_framed_module(
         inputargs: inputargs.to_vec(),
         ops: ops.to_vec(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -7120,7 +6900,6 @@ fn i32_consts(bytes: &[u8]) -> Vec<i32> {
 fn build_external_jump_module(
     inputargs: &[InputArgRc],
     ops: &[Op],
-    constants: &indexmap::IndexMap<u32, i64>,
     external_jump_slot: u32,
     external_jump_key: u32,
     external_jump_wide_slot: u32,
@@ -7129,7 +6908,6 @@ fn build_external_jump_module(
         inputargs: inputargs.to_vec(),
         ops: ops.to_vec(),
         inlined_bridges: Vec::new(),
-        constants: constants.clone(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -7194,7 +6972,6 @@ fn test_non_last_label_backedge_validates() {
     // targets the earlier entry label.  The LABEL/JUMP descr identity, not
     // source position, is the loop target and determines the parallel move.
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let wide_descr = majit_ir::make_loop_target_descr(10, false);
     let narrow_descr = majit_ir::make_loop_target_descr(11, false);
 
@@ -7237,7 +7014,7 @@ fn test_non_last_label_backedge_validates() {
     // keeps the wrapper's structured control flow well-formed here.
     assert!(codegen::is_resumable_peeled(&ops));
     assert_eq!(codegen::resumable_label_count(&ops), 1);
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 }
 
@@ -7368,7 +7145,6 @@ fn build_owner_with_region_closing_at(
             ops: region_ops,
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
     );
     codegen::build_wasm_module(&inputs).map(|(bytes, _, _, _)| bytes)
@@ -7552,7 +7328,6 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
             ops: region_ops,
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
     );
     let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
@@ -7601,18 +7376,11 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
     finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
 
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, vec![new_op, new_array_op, finish]);
+    let ops = rewrite_frontend_ops(&inputargs, vec![new_op, new_array_op, finish]);
     let call_r_targets: Vec<i64> = ops
         .iter()
         .filter(|op| op.opcode == OpCode::CallR)
-        .filter_map(|op| {
-            op.arg(0).to_opref().inline_const_bits().or_else(|| {
-                let r = op.arg(0).to_opref();
-                r.is_constant()
-                    .then(|| constants.get(&r.raw()).copied())
-                    .flatten()
-            })
-        })
+        .filter_map(|op| op.arg(0).to_opref().inline_const_bits())
         .collect();
     let fixed_oldgen = majit_backend_wasm::wasm_malloc_big_fixedsize_oldgen as *const () as i64;
     let array_oldgen = majit_backend_wasm::wasm_malloc_array_nonstandard_oldgen as *const () as i64;
@@ -7627,7 +7395,6 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
     );
 
     let mut inputs = inline_region_inputs(&inputargs, ops, vec![]);
-    inputs.constants = constants;
     inputs.frame = codegen::FrameGeometry::compact(8, 4, 0);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
@@ -8145,7 +7912,6 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
             ops: region_ops,
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
     );
     let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
@@ -8264,7 +8030,6 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 ops: region_a,
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
                 external_jump: None,
@@ -8275,7 +8040,6 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 ops: region_b,
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: indexmap::IndexMap::new(),
             },
         ],
     );
@@ -8428,7 +8192,6 @@ fn preamble_region_inputs() -> codegen::ModuleBuildInputs {
             ops: region_ops,
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
     )
 }
@@ -8609,7 +8372,6 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 ops: region_b,
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: indexmap::IndexMap::new(),
             },
             codegen::InlinedBridge {
                 external_jump: None,
@@ -8620,7 +8382,6 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 ops: region_a,
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: indexmap::IndexMap::new(),
             },
         ],
     );
@@ -8713,7 +8474,6 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
             ],
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
     );
 
@@ -8896,9 +8656,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
             ops: region_ops,
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -9096,9 +8854,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
             ops: region_ops,
             gc_table_base: 0,
             gc_const_keys: Vec::new(),
-            constants: indexmap::IndexMap::new(),
         }],
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -9260,8 +9016,7 @@ fn guard_value_parks_its_operand_past_every_exits_fail_args() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     assert_eq!(
         guards[0].counter_value_spill, None,
         "the GUARD_TRUE is not a GUARD_VALUE"
@@ -9389,7 +9144,6 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         let (bytes, guards) = build_module_with_frame(
             &inputargs,
             &ops,
-            &indexmap::IndexMap::new(),
             Some(0),
             &codegen::GuardGcTypeInfo::default(),
             frame,
@@ -9509,9 +9263,8 @@ fn a_counterless_trace_reserves_the_slot_a_bridge_may_need() {
     ));
     with_counter.push(Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]));
 
-    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (_, counterless_guards) = build_module_default(&inputargs, &counterless, &constants);
-    let (_, counter_guards) = build_module_default(&inputargs, &with_counter, &constants);
+    let (_, counterless_guards) = build_module_default(&inputargs, &counterless);
+    let (_, counter_guards) = build_module_default(&inputargs, &with_counter);
     assert!(
         counterless_guards
             .iter()
@@ -9563,7 +9316,6 @@ fn build_module_with_barrier_helpers(
         inputargs: inputargs.to_vec(),
         ops: ops.to_vec(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -9835,8 +9587,8 @@ fn array_get_bytes(item_size: usize, index: OpRef) -> Vec<u8> {
         InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     bytes
 }
@@ -9880,10 +9632,8 @@ fn array_addr_uses_get_scale_instead_of_multiply() {
             InputArg::from_type_rc(Type::Int, 1),
         ];
         let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
-        let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+        let ops = rewrite_frontend_ops(&inputargs, ops);
         let inputs = inline_region_inputs(&inputargs, ops, vec![]);
-        let mut inputs = inputs;
-        inputs.constants = constants;
         match codegen::build_wasm_module(&inputs) {
             Err(majit_backend::BackendError::Unsupported(msg)) => {
                 assert!(
@@ -9958,8 +9708,8 @@ fn interior_field_ops_compile() {
         get,
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
     ];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, guards) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     let (mul, shl) = count_i64_scale_ops(&bytes);
@@ -10061,7 +9811,7 @@ fn cond_call_value_tests_its_value_and_calls_arg_one() {
         EffectInfo::default(),
     )));
     let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let (mut eqz, mut ifs) = (0, 0);
     count_operators(&bytes, |op| match op {
@@ -10089,7 +9839,7 @@ fn guard_nonnull_class_also_tests_for_null() {
             ),
             Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]),
         ];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         let (mut eqz, mut ors) = (0, 0);
         count_operators(&bytes, |op| match op {
@@ -10139,7 +9889,7 @@ fn call_release_gil_takes_its_callee_from_arg_one() {
         EffectInfo::default(),
     )));
     let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let mut callee_consts = Vec::new();
     let mut call_indirects = 0;
@@ -10177,8 +9927,8 @@ fn raw_load_f_loads_a_double() {
     );
     load.setdescr(descr);
     let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))])];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let mut f64_loads = 0;
     count_operators(&bytes, |op| {
@@ -10204,8 +9954,8 @@ fn raw_load_const_offset_uses_memarg_displacement() {
     );
     load.setdescr(descr);
     let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
+    let ops = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let mut adds = 0;
     let mut displaced = 0;
@@ -10245,7 +9995,7 @@ fn int_between_is_two_signed_comparisons() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let (mut le_s, mut lt_s, mut ands) = (0, 0, 0);
     count_operators(&bytes, |op| match op {
@@ -10271,7 +10021,7 @@ fn float_mod_uses_a_guest_side_typed_helper() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     assert!(has_table_import(&bytes));
@@ -10298,7 +10048,7 @@ fn check_memory_error_keeps_the_non_null_path_compiled() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let mut null_tests = 0;
     count_operators(&bytes, |op| {
@@ -10333,7 +10083,7 @@ fn same_as_and_load_effective_address_do_not_decline() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(
         execute_simple_trace(&bytes, &[4096, 5]),
@@ -10403,7 +10153,7 @@ fn int_signext_accepts_a_runtime_width() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     for (value, width, expected) in [
@@ -10436,7 +10186,7 @@ fn singlefloat_casts_round_trip_through_wasm_f32() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
 
     let input = 1.234_567_890_123_f64;
@@ -10483,7 +10233,7 @@ fn gc_rewrite_bare_load_store_execute_with_dynamic_offset() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(execute_simple_trace(&bytes, &[4096, 12, -123]), -123);
 }
@@ -10518,7 +10268,7 @@ fn gc_store_halfword_at_negative_offset_uses_store16() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let mut store16 = 0;
     count_operators(&bytes, |op| {
@@ -10563,7 +10313,7 @@ fn gc_rewrite_indexed_load_store_execute() {
         ),
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(execute_simple_trace(&bytes, &[4096, 3, -456]), -456);
 }
@@ -10614,7 +10364,7 @@ fn zero_array_uses_memory_fill_for_the_rewriter_range() {
         load,
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(
         execute_simple_trace(&bytes, &[4096, 0x1122_3344_5566_7788]),
@@ -10668,7 +10418,6 @@ fn cond_call_reload_sits_on_the_arm_that_called() {
     let (bytes, _) = build_module_with_frame(
         &inputargs,
         &ops,
-        &indexmap::IndexMap::new(),
         Some(0),
         &codegen::GuardGcTypeInfo::default(),
         frame,
@@ -10730,7 +10479,7 @@ fn cond_call_n_emits_predicate_and_direct_call() {
         call,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     let (mut eqz, mut ifs) = (0, 0);
     count_operators(&bytes, |op| match op {
@@ -10777,7 +10526,7 @@ fn cond_call_n_i32_arg_keeps_trampoline() {
             call,
             Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
         ];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -10824,7 +10573,7 @@ fn cond_call_value_i32_result_keeps_trampoline() {
                 EffectInfo::default(),
             )));
             let ops = vec![call, Op::new(OpCode::Finish, &[rb(result)])];
-            let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+            let (bytes, _) = build_module_default(&inputargs, &ops);
             validate_wasm(&bytes);
             assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
             let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -10855,7 +10604,6 @@ fn cond_call_without_call_descr_is_unsupported() {
         inputargs: inputargs.clone(),
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -10917,7 +10665,7 @@ fn descr_proven_cond_call_n_uses_direct_table_call() {
         call,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
     ];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     let (calls, drops) = indirect_call_types_and_drop_count(&bytes);
@@ -10959,7 +10707,7 @@ fn descr_proven_cond_call_value_uses_direct_table_call() {
         EffectInfo::default(),
     )));
     let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     let (calls, drops) = indirect_call_types_and_drop_count(&bytes);
@@ -10990,7 +10738,7 @@ fn debug_and_record_metadata_opcodes_compile_instead_of_declining() {
             make_op(opcode, &[OpRef::input_arg_int(0)], OpRef::NONE),
             Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
         ];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
     }
 }
@@ -11027,11 +10775,7 @@ fn fused_cond_call_n_consumes_the_comparison_i32() {
         EffectInfo::default(),
     )));
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
-    let (bytes, _) = build_module_default(
-        &inputargs,
-        &[compare, call, finish],
-        &indexmap::IndexMap::new(),
-    );
+    let (bytes, _) = build_module_default(&inputargs, &[compare, call, finish]);
     validate_wasm(&bytes);
 
     let mut i64_eqz = 0;
@@ -11086,11 +10830,7 @@ fn fused_cond_call_value_consumes_the_comparison_i32() {
         EffectInfo::default(),
     )));
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]);
-    let (bytes, _) = build_module_default(
-        &inputargs,
-        &[compare, call, finish],
-        &indexmap::IndexMap::new(),
-    );
+    let (bytes, _) = build_module_default(&inputargs, &[compare, call, finish]);
     validate_wasm(&bytes);
 
     let mut seq: Vec<String> = Vec::new();
@@ -11129,11 +10869,7 @@ fn fused_guard_isnull_uses_the_comparison_directly() {
         &[OpRef::input_arg_int(0)],
     );
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
-    let (bytes, _) = build_module_default(
-        &inputargs,
-        &[compare, guard, finish],
-        &indexmap::IndexMap::new(),
-    );
+    let (bytes, _) = build_module_default(&inputargs, &[compare, guard, finish]);
     validate_wasm(&bytes);
     let mut i64_eq = 0;
     let mut i64_extend = 0;
@@ -11219,7 +10955,6 @@ fn cond_call_materializes_a_condition_reused_as_an_argument_or_callee() {
                 InputArg::from_type_rc(Type::Int, 1),
             ],
             &[compare, call, Op::new(OpCode::Finish, &[])],
-            &indexmap::IndexMap::new(),
         );
         validate_wasm(&bytes);
         let mut widens = 0;
@@ -11399,7 +11134,6 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
         inputargs: vec![InputArg::from_type_rc(Type::Int, 0)],
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -11985,7 +11719,7 @@ fn inline_new_nulls_gc_field_when_a_guard_splits_the_store() {
 fn consecutive_new_ops_share_one_nursery_bump() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let frontend = vec![plain_new(1, 53), plain_new(2, 53), finish_int_arg0()];
-    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let rewritten = rewrite_frontend_ops(&inputargs, frontend.clone());
     let (mallocs, npis) = count_rewritten_malloc_nursery(&rewritten);
     assert_eq!(mallocs, 1, "gen_malloc_nursery merges consecutive New ops");
     assert_eq!(npis, 1);
@@ -12038,10 +11772,8 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
 
     let owner_ia = vec![InputArg::from_type_rc(Type::Int, 0)];
     let region_ia = vec![InputArg::from_type_rc(Type::Int, 10)];
-    let (owner_ops, owner_consts) =
-        rewrite_frontend_ops(&owner_ia, vec![label, plain_new(2, 53), guard, jump]);
-    let (region_ops, region_consts) =
-        rewrite_frontend_ops(&region_ia, vec![plain_new(11, 53), region_finish]);
+    let owner_ops = rewrite_frontend_ops(&owner_ia, vec![label, plain_new(2, 53), guard, jump]);
+    let region_ops = rewrite_frontend_ops(&region_ia, vec![plain_new(11, 53), region_finish]);
     let (owner_mallocs, _) = count_rewritten_malloc_nursery(&owner_ops);
     let (region_mallocs, _) = count_rewritten_malloc_nursery(&region_ops);
     assert_eq!(owner_mallocs, 1, "owner rewritten on its own");
@@ -12056,7 +11788,6 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
     );
     inputs.inputargs = owner_ia;
     inputs.ops = owner_ops;
-    inputs.constants = owner_consts;
     inputs.inlined_bridges = vec![codegen::InlinedBridge {
         external_jump: None,
         source_fail_index: 0,
@@ -12066,7 +11797,6 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
         ops: region_ops,
         gc_table_base: 0,
         gc_const_keys: Vec::new(),
-        constants: region_consts,
     }];
     let inputs = rewrite_module_inputs(inputs);
     let (bytes, _, _, _) =
@@ -12095,7 +11825,7 @@ fn collecting_op_between_news_keeps_separate_nursery_bumps() {
     )));
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let frontend = vec![plain_new(1, 53), call, plain_new(2, 53), finish_int_arg0()];
-    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let rewritten = rewrite_frontend_ops(&inputargs, frontend.clone());
     let (mallocs, _) = count_rewritten_malloc_nursery(&rewritten);
     assert_eq!(
         mallocs, 2,
@@ -12127,7 +11857,7 @@ fn runtime_newarray_flushes_the_nursery_batch() {
         plain_new(3, 53),
         finish_int_arg0(),
     ];
-    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let rewritten = rewrite_frontend_ops(&inputargs, frontend.clone());
     let (mallocs, _) = count_rewritten_malloc_nursery(&rewritten);
     let call_r = rewritten
         .iter()
@@ -12157,7 +11887,7 @@ fn newstr_without_a_descr_injects_the_builtin_layout() {
     let newstr = make_op(OpCode::Newstr, &[OpRef::const_int(3)], OpRef::ref_op(1));
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let frontend = vec![newstr, finish_int_arg0()];
-    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let rewritten = rewrite_frontend_ops(&inputargs, frontend.clone());
     assert!(
         rewritten.iter().all(|op| op.opcode != OpCode::Newstr),
         "the compile path injects str_descr and the rewrite consumes Newstr"
@@ -12526,7 +12256,6 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
         ],
         ops: vec![new_op.clone(), store.clone(), finish.clone()],
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -12887,7 +12616,7 @@ fn call_r_lowers_as_one_word_i64_result() {
     );
     with_table_sig(42, Some(encoded), || {
         let (inputargs, ops) = call_r_two_refs();
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -12912,7 +12641,7 @@ fn test_oracle_i64_call_lowers_in_module_without_vouch() {
     );
     with_table_sig(42, Some(encoded), || {
         let (inputargs, ops) = call_i_two_ints();
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -12931,7 +12660,7 @@ fn test_oracle_i32_call_keeps_trampoline() {
     );
     with_table_sig(42, Some(encoded), || {
         let (inputargs, ops) = call_i_two_ints();
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -12961,7 +12690,7 @@ fn test_oracle_f32_int_bits_call_indirect() {
             op
         };
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -12990,7 +12719,7 @@ fn test_oracle_singlefloat_result_returns_f32_bits() {
         op
     };
     let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -13033,7 +12762,7 @@ fn test_oracle_singlefloat_arg_passes_f32_bits() {
         op
     };
     let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (bytes, _) = build_module_default(&inputargs, &ops);
     validate_wasm(&bytes);
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -13076,7 +12805,7 @@ fn test_oracle_f32_float_keeps_trampoline() {
             op
         };
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::float_op(1))])];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -13106,7 +12835,7 @@ fn test_oracle_f64_param_on_int_descr_keeps_trampoline() {
             op
         };
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -13146,7 +12875,7 @@ fn test_trampolined_narrow_signed_int_sign_extends() {
             op
         };
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         assert_eq!(
@@ -13191,7 +12920,7 @@ fn test_cond_call_value_mismatch_uses_trampoline() {
             op
         };
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         assert_eq!(
@@ -13236,7 +12965,7 @@ fn residual_trampoline_accepts_a_full_call_area() {
             EffectInfo::default(),
         )));
         let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-        let (bytes, _) = build_module_default(&[], &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&[], &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
     });
@@ -13246,7 +12975,7 @@ fn residual_trampoline_accepts_a_full_call_area() {
 fn test_oracle_unknown_follows_descr_not_vouch_list() {
     with_table_sig(42, None, || {
         let (inputargs, ops) = call_i_two_ints();
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     });
@@ -13269,7 +12998,7 @@ fn test_calln_void_direct_when_table_matches_descr() {
     // result_size 0 + void table: direct void call, nothing to drop.
     with_table_sig(42, Some(true_void), || {
         let ops = vec![call_n(0), finish()];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
         let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
@@ -13284,7 +13013,7 @@ fn test_calln_void_direct_when_table_matches_descr() {
     // result_size 8 + i64 table: direct word call, dummy result dropped.
     with_table_sig(42, Some(void_word), || {
         let ops = vec![call_n(8), finish()];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
         let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
@@ -13302,7 +13031,7 @@ fn test_calln_void_direct_when_table_matches_descr() {
     // Mismatched table types stay on jit_call. The descr alone names the type.
     with_table_sig(42, Some(true_void), || {
         let ops = vec![call_n(8), finish()];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -13310,7 +13039,7 @@ fn test_calln_void_direct_when_table_matches_descr() {
     });
     with_table_sig(42, Some(void_word), || {
         let ops = vec![call_n(0), finish()];
-        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        let (bytes, _) = build_module_default(&inputargs, &ops);
         validate_wasm(&bytes);
         assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
         let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
@@ -13392,7 +13121,6 @@ fn bridge_with_a_larger_frame_reallocates_and_returns_its_exit_values() {
         inputargs: inputargs.clone(),
         ops: ops.clone(),
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -13547,7 +13275,6 @@ fn geometry_without_a_tail_keeps_identity_fail_locations() {
     let (_bytes, guards) = build_module_with_frame(
         &inputargs,
         &[guard],
-        &indexmap::IndexMap::new(),
         Some(0),
         &codegen::GuardGcTypeInfo::default(),
         frame,
@@ -13608,7 +13335,6 @@ fn tail_fail_args_decode_through_the_deadframe() {
         inputargs: inputargs.clone(),
         ops: vec![guard],
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -13769,7 +13495,6 @@ fn realloc_zero_takes_the_memory_error_exit() {
         inputargs,
         ops: vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])],
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -13888,7 +13613,6 @@ fn nursery_entry_frame_moves_and_the_host_decodes_ref_and_int() {
         inputargs: inputargs.clone(),
         ops: vec![malloc, guard],
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),

@@ -2510,21 +2510,14 @@ pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
 
 /// Same GC rewrite `compile_loop` / `compile_bridge` run before `build_wasm_module`.
 #[doc(hidden)]
-pub fn rewrite_ops_for_gc(
-    ops: Vec<Op>,
-    constants: &indexmap::IndexMap<u32, i64>,
-) -> (
-    Vec<Op>,
-    indexmap::IndexMap<u32, i64>,
-    Option<Arc<majit_gc::GcTable>>,
-) {
+pub fn rewrite_ops_for_gc(ops: Vec<Op>) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
     let mut rewriter = gc_rewriter();
     rewriter.call_assembler_callee_locs = Some(Box::new(|ltd| {
         ltd.token_handle_any()
             .and_then(|any| any.downcast_ref::<std::sync::Arc<JitCellToken>>())
             .and_then(|tok| ca_locs_from_token(tok))
     }));
-    rewrite_ops_for_gc_with(&rewriter, ops, constants)
+    rewrite_ops_for_gc_with(&rewriter, ops)
 }
 
 /// [`rewrite_ops_for_gc`] with an explicit rewriter (tests that need
@@ -2533,12 +2526,7 @@ pub fn rewrite_ops_for_gc(
 pub fn rewrite_ops_for_gc_with(
     rewriter: &majit_gc::rewrite::GcRewriterImpl,
     ops: Vec<Op>,
-    constants: &indexmap::IndexMap<u32, i64>,
-) -> (
-    Vec<Op>,
-    indexmap::IndexMap<u32, i64>,
-    Option<Arc<majit_gc::GcTable>>,
-) {
+) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
     use majit_gc::GcRewriter;
     // rewrite.py `gen_malloc_str` parity: inject str_descr/unicode_descr for
     // NEWSTR/NEWUNICODE. The STRLEN/STRGETITEM/STRHASH arms read the length
@@ -2547,17 +2535,12 @@ pub fn rewrite_ops_for_gc_with(
     // `rewrite_ops` inject at the same point.
     codegen::inject_builtin_string_descrs(&ops);
     let boxed: Vec<majit_ir::OpRc> = ops.into_iter().map(majit_ir::OpRc::new).collect();
-    let mut const_map = majit_ir::ConstMap::default();
-    for (&k, &v) in constants {
-        const_map.insert(k, majit_ir::Const::from_raw_i64(v, majit_ir::Type::Int));
-    }
-    let (rewritten, gcrefs) = rewriter.rewrite_for_gc_with_constants(&boxed, &const_map);
-    // `resolve_constant` only reads the pool, so the caller's i64 map is
-    // the map the next pass should see.
-    let out_constants = constants.clone();
+    // `RewriteState::const_int` emits fresh `ConstInt`s inline.
+    // ZeroArray scales are `st.const_int`.
+    let (rewritten, gcrefs) = rewriter.rewrite_for_gc_with_constants(&boxed);
     let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
     let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-    (ops, out_constants, table)
+    (ops, table)
 }
 
 /// `GcTable::compile_key` list, slot order. Empty when this compile has no table.
@@ -2947,8 +2930,6 @@ pub struct WasmBackend {
     trace_counter: u64,
     /// One-shot header PC the metainterp publishes before `compile_loop`.
     next_header_pc: u64,
-    /// Optimizer constant pool (constant-namespace OpRef → i64 value).
-    constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
     /// Byte offset of the class word beside the type word; see
@@ -3611,18 +3592,16 @@ pub fn set_force_ca_terminal_decline(selector: u64) {
     FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);
 }
 
-/// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
-/// without a value in the constants pool. `set_constants_pool` runs before
-/// `assemble`, so every legitimate legacy const is already present; an arg
-/// landing here means the optimizer producer failed to seed it. RPython
-/// `ConstInt.value` (history.py) is always present, so never register a
-/// placeholder `0` — that would emit the constant as zero. Panic at the parity
-/// hole, matching the dynasm/cranelift backends.
+/// A Const operand reached the wasm backend without inline bits. Constants
+/// travel as `ConstInt` / `ConstFloat` / `ConstPtr` (`history.py` `ConstInt.value`);
+/// a Const with no payload is a producer bug. Never emit a placeholder `0` —
+/// that would bake the constant as zero. Panic at the hole, matching the
+/// dynasm/cranelift backends.
 fn missing_legacy_const(arg: majit_ir::OpRef) -> ! {
     panic!(
-        "wasm collect_constants_from_ops: legacy pool-indexed const OpRef \
-         (raw={}) is absent from the constants pool — the optimizer producer \
-         must seed it (or mint an inline Const) instead of registering 0.",
+        "wasm collect_constants_from_ops: Const OpRef (raw={}) has no inline \
+         payload — the optimizer producer must mint an inline Const instead of \
+         registering 0.",
         arg.raw()
     );
 }
@@ -3641,7 +3620,6 @@ impl WasmBackend {
             asm_memory_blocks: std::cell::RefCell::new(Vec::new()),
             trace_counter: 0,
             next_header_pc: 0,
-            constants: indexmap::IndexMap::new(),
             vtable_offset: None,
             w_class_offset: None,
             gc_box: None,
@@ -3655,8 +3633,8 @@ impl WasmBackend {
         self.vtable_offset
     }
 
-    // `set_constants_pool`, `set_next_trace_id`, and `set_next_header_pc`
-    // are provided via the `Backend` trait impl below.
+    // `set_next_trace_id` and `set_next_header_pc` are provided via the
+    // `Backend` trait impl below.
 
     /// llmodel.py:53-54: store gc_ll_descr on the cpu instance.
     ///
@@ -3808,9 +3786,7 @@ impl WasmBackend {
     /// Run `rewrite.py` then intern the gcref table. Replaces
     /// [`Self::intern_ref_constants`] on the production compile path.
     fn rewrite_ops_for_gc(&mut self, ops: Vec<Op>) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
-        let (ops, new_constants, table) = crate::rewrite_ops_for_gc(ops, &self.constants);
-        self.constants = new_constants;
-        (ops, table)
+        crate::rewrite_ops_for_gc(ops)
     }
     /// `x86/assembler.py` `gcreftracers.append(tracer)` — keep the
     /// per-loop table alive for as long as the compiled trace that bakes its
@@ -3844,30 +3820,22 @@ impl WasmBackend {
 
     /// Validate that every constant OpRef appearing as an arg is resolvable.
     ///
-    /// Inline-Const variants (`ConstInt`/`ConstFloat`/
-    /// `ConstPtr`) carry `.value` on the OpRef itself (history.py:
-    /// 227/268/314), so they need no `self.constants` side-table entry and
-    /// are skipped. A legacy idx-keyed `ConstInt(u32)` / `ConstFloat(u32)` /
-    /// `ConstPtr(u32)` must have been seeded by `set_constants_pool`; one that
-    /// is missing is a producer gap and panics rather than defaulting to 0.
-    fn collect_constants_from_ops(&mut self, ops: &[Op]) {
+    /// Inline-Const variants (`ConstInt`/`ConstFloat`/`ConstPtr`) carry
+    /// `.value` on the OpRef itself (`history.py` `ConstInt.value`). A Const
+    /// with no inline bits is a producer gap and panics rather than defaulting
+    /// to 0.
+    fn collect_constants_from_ops(&self, ops: &[Op]) {
         for op in ops {
             for arg in op.getarglist().iter() {
                 let arg = arg.to_opref();
-                if arg.is_constant()
-                    && arg.inline_const_bits().is_none()
-                    && !self.constants.contains_key(&arg.raw())
-                {
+                if arg.is_constant() && arg.inline_const_bits().is_none() {
                     missing_legacy_const(arg);
                 }
             }
             if let Some(fail_args) = op.getfailargs() {
                 for arg in fail_args.iter() {
                     let arg = arg.to_opref();
-                    if arg.is_constant()
-                        && arg.inline_const_bits().is_none()
-                        && !self.constants.contains_key(&arg.raw())
-                    {
+                    if arg.is_constant() && arg.inline_const_bits().is_none() {
                         missing_legacy_const(arg);
                     }
                 }
@@ -4310,15 +4278,6 @@ impl WasmBackend {
         for region in &candidate.inlined_bridges {
             merged_ops.extend(region.ops.iter().cloned());
         }
-        // `candidate.constants` keeps the pool of the compile that recorded
-        // these ops -- the owner's. The pool is keyed by value position, and
-        // the merge rebases every region off the owner's ids, so a region's
-        // own entries reach the build through `InlinedBridge::constants` and
-        // are replayed at the rebase offset. Assigning the merging bridge's
-        // pool here instead would leave the owner's window described by
-        // another trace's keys: an owner-only folded value loses its entry,
-        // and one the bridge happens to number the same way is seeded with the
-        // wrong bits.
         candidate.classptr_to_typeid = self.collect_classptr_typeid_table(&merged_ops);
         candidate.guard_gc_type_info = self.collect_guard_gc_type_info(&merged_ops);
         candidate.nursery = nursery_alloc_params(&merged_ops);
@@ -5651,7 +5610,6 @@ impl majit_backend::Backend for WasmBackend {
             // produced them; their LoadFromGcTable immediates share this base.
             ops: ops_owned.clone(),
             inlined_bridges: Vec::new(),
-            constants: self.constants.clone(),
             vtable_offset: self.vtable_offset,
             classptr_to_typeid: typeid_table,
             guard_gc_type_info,
@@ -5977,13 +5935,6 @@ impl majit_backend::Backend for WasmBackend {
             code_addr: 0,
             code_size,
         })
-    }
-
-    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
-        self.constants.clear();
-        for (&k, c) in constants.iter() {
-            self.constants.insert(k, c.as_raw_i64());
-        }
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
@@ -6649,7 +6600,6 @@ impl majit_backend::Backend for WasmBackend {
                             ops: ops_owned.clone(),
                             gc_table_base,
                             gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
-                            constants: self.constants.clone(),
                         };
                         if self.install_inline_region(&owner, region) {
                             self.trace_counter += 1;
@@ -6755,7 +6705,6 @@ impl majit_backend::Backend for WasmBackend {
                 ops: ops_owned.clone(),
                 gc_table_base,
                 gc_const_keys: gc_const_keys_of(gc_table.as_deref()),
-                constants: self.constants.clone(),
             };
             // The owner's size prices this merge alone.
             let owner_module_bytes =
@@ -6775,7 +6724,6 @@ impl majit_backend::Backend for WasmBackend {
             inputargs: inputargs.iter().cloned().collect(),
             ops: ops_owned.clone(),
             inlined_bridges: Vec::new(),
-            constants: self.constants.clone(),
             vtable_offset: self.vtable_offset,
             classptr_to_typeid: typeid_table,
             guard_gc_type_info,
@@ -7690,7 +7638,6 @@ mod tests {
                 ops: Vec::new(),
                 gc_table_base: 0,
                 gc_const_keys: Vec::new(),
-                constants: indexmap::IndexMap::new(),
             },
             remap: None,
             retry_on_sibling: false,
@@ -8783,7 +8730,6 @@ mod tests {
             inputargs,
             ops,
             inlined_bridges: Vec::new(),
-            constants: indexmap::IndexMap::new(),
             vtable_offset: Some(0),
             classptr_to_typeid: HashMap::new(),
             guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
@@ -8963,8 +8909,7 @@ mod tests {
             "runtime-length NewArray without a nursery must take the CallR slow path: {:?}",
             prepared.iter().map(|op| op.opcode).collect::<Vec<_>>()
         );
-        let mut inputs = test_module_inputs(inputargs, prepared);
-        inputs.constants = backend.constants.clone();
+        let inputs = test_module_inputs(inputargs, prepared);
         let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("slow-path module");
         let names = wasm_import_names(&bytes);
         assert!(

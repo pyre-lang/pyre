@@ -916,7 +916,6 @@ fn prepare_retrace_snapshot(
 
 fn snapshot_map_from_trace_snapshots(
     trace_snapshots: &[crate::recorder::Snapshot],
-    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
     inputargs: &[majit_ir::InputArgRc],
 ) -> (
     SnapshotBoxes,
@@ -925,7 +924,6 @@ fn snapshot_map_from_trace_snapshots(
     SnapshotBoxes,
     SnapshotFramePcs,
 ) {
-    let _ = constants; // legacy idx-Const pool no longer populated here; see SnapshotTagged::Const arm
     // Recorder snapshot ids below come directly from `enumerate`, so all five
     // maps are dense and have the final length in hand. RPython's opencoder
     // also appends its snapshot payloads to flat buffers; repeatedly growing a
@@ -990,7 +988,6 @@ fn snapshot_map_from_trace_snapshots(
 
 fn snapshot_maps_from_ctx(
     ctx: &mut TraceCtx,
-    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -999,10 +996,10 @@ fn snapshot_maps_from_ctx(
     SnapshotFramePcs,
 ) {
     if ctx.recorder.has_byte_buffer() {
-        return snapshot_map_from_byte_recorder(&ctx.recorder, constants);
+        return snapshot_map_from_byte_recorder(&ctx.recorder);
     }
     let inputargs = ctx.recorder.inputargs().to_vec();
-    snapshot_map_from_trace_snapshots(ctx.snapshots(), constants, &inputargs)
+    snapshot_map_from_trace_snapshots(ctx.snapshots(), &inputargs)
 }
 
 /// `ResumeDataLoopMemo.number` source for an optimizer that walks the
@@ -1039,7 +1036,6 @@ fn recorder_self_feed(
 
 fn snapshot_map_from_byte_recorder(
     recorder: &crate::recorder::Trace,
-    constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) -> (
     SnapshotBoxes,
     SnapshotFrameSizes,
@@ -1047,7 +1043,6 @@ fn snapshot_map_from_byte_recorder(
     SnapshotBoxes,
     SnapshotFramePcs,
 ) {
-    let _ = constants;
     let n = recorder.snapshot_offset_count();
     let mut box_map = Vec::with_capacity(n);
     let mut size_map = SnapshotFrameSizes::with_capacity(n, 0);
@@ -1148,9 +1143,8 @@ mod byte_snapshot_map_tests {
             });
         }
         let decoded = rec.decode_captured_snapshots().unwrap();
-        let actual = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
-        let expected =
-            snapshot_map_from_trace_snapshots(&decoded, &mut Default::default(), rec.inputargs());
+        let actual = snapshot_map_from_byte_recorder(&rec);
+        let expected = snapshot_map_from_trace_snapshots(&decoded, rec.inputargs());
         let values_at = |maps: &SnapshotBoxes, idx: usize| {
             maps.get(idx).and_then(|entry| {
                 entry
@@ -1272,7 +1266,7 @@ mod byte_snapshot_map_tests {
         byte_ctx.store_final_boxes_in_guard(&byte_guard, None, Vec::new());
 
         let mut list_ctx = OptContext::with_inputarg_types(8, &[Type::Int]);
-        let maps = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
+        let maps = snapshot_map_from_byte_recorder(&rec);
         list_ctx.snapshot_boxes = translate_trace_iter_box_map(maps.0, &cache);
         list_ctx.snapshot_frame_sizes = maps.1;
         list_ctx.snapshot_vable_boxes = translate_trace_iter_box_map(maps.2, &cache);
@@ -1367,8 +1361,7 @@ mod byte_snapshot_map_tests {
         );
 
         let decoded = rec.decode_captured_snapshots().expect("byte snapshots");
-        let maps =
-            snapshot_map_from_trace_snapshots(&decoded, &mut Default::default(), rec.inputargs());
+        let maps = snapshot_map_from_trace_snapshots(&decoded, rec.inputargs());
         let ops = rec.materialize_ops();
         let guards: Vec<_> = ops.iter().filter(|op| op.opcode.is_guard()).collect();
         assert_eq!(guards.len(), 3);
@@ -8519,7 +8512,6 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         inputargs: &mut Vec<InputArgRc>,
         ops: &mut Vec<majit_ir::OpRc>,
-        constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
     ) {
         let Some(vinfo) = self.virtualizable_info() else {
@@ -8583,7 +8575,6 @@ impl<M: Clone> MetaInterp<M> {
             &array_lengths,
             entry_prefix_len,
             index_of_vable,
-            constants,
         );
         // compile.py `patch_new_loop_to_load_virtualizable_fields`
         // does not change LABEL/JUMP *arity*. `emit_op` still rewrites
@@ -9390,13 +9381,9 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vref_map,
             mut snapshot_frame_pcs,
         ) = if let Some(ref rec) = snapshot_recorder {
-            snapshot_map_from_byte_recorder(rec, &mut constants)
+            snapshot_map_from_byte_recorder(rec)
         } else {
-            snapshot_map_from_trace_snapshots(
-                trace_snapshots,
-                &mut constants,
-                preamble_data.base.inputargs(),
-            )
+            snapshot_map_from_trace_snapshots(trace_snapshots, preamble_data.base.inputargs())
         };
         unroll_opt.snapshot_recorder = snapshot_recorder
             .as_ref()
@@ -10075,7 +10062,6 @@ impl<M: Clone> MetaInterp<M> {
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
-            &mut constants,
             driver_descriptor.as_ref(),
         );
         if crate::majit_log_enabled() {
@@ -10085,9 +10071,6 @@ impl<M: Clone> MetaInterp<M> {
                 inputargs.len()
             );
         }
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants_pool(compiled_constants_typed);
         // resume.py concat_strings parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -10695,18 +10678,13 @@ impl<M: Clone> MetaInterp<M> {
                 SnapshotFramePcs::new(),
             )
         } else {
-            snapshot_maps_from_ctx(ctx, &mut constants)
+            snapshot_maps_from_ctx(ctx)
         };
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut snapshot_boxes,
             &mut snapshot_vable_boxes,
             &mut snapshot_vref_boxes,
         ]);
-        // Lower the typed `Value` pool to the dense `IndexMap<u32, Const>`
-        // shape the bridge compilation helpers consume.
-        let bridge_constants =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-
         // pyjitpl.py `compile_trace` `finally: history.cut(cut_at)`. The Vec-recorder
         // path still cuts here (ops were copied). The byte path keeps the
         // JUMP on the buffer until `get_iter()` in compile_bridge.
@@ -10773,7 +10751,7 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_ops,
                 &bridge_inputargs,
                 finish_args,
-                bridge_constants,
+                constants,
                 snapshot_boxes,
                 snapshot_frame_sizes,
                 snapshot_vable_boxes,
@@ -10814,7 +10792,7 @@ impl<M: Clone> MetaInterp<M> {
                 &bridge_ops,
                 &bridge_inputargs,
                 finish_args,
-                bridge_constants,
+                constants,
                 snapshot_boxes,
                 snapshot_frame_sizes,
                 snapshot_vable_boxes,
@@ -11255,7 +11233,7 @@ impl<M: Clone> MetaInterp<M> {
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs);
+        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &trace.inputargs);
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut retrace_snapshot_boxes,
             &mut retrace_snapshot_vable_boxes,
@@ -11455,7 +11433,6 @@ impl<M: Clone> MetaInterp<M> {
                 loop_jitcell_token,
                 inputargs,
                 combined_ops,
-                constants,
                 &mut unroll_opt,
                 num_combined_ops,
                 quasi_immutable_deps,
@@ -11482,12 +11459,8 @@ impl<M: Clone> MetaInterp<M> {
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut combined_ops,
-            &mut constants,
             driver_descriptor.as_ref(),
         );
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants_pool(compiled_constants_typed);
         // resume.py concat_strings parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -11673,7 +11646,6 @@ impl<M: Clone> MetaInterp<M> {
         loop_jitcell_token: Arc<JitCellToken>,
         inputargs: Vec<InputArgRc>,
         combined_ops: Vec<majit_ir::OpRc>,
-        constants: majit_ir::ConstMap<majit_ir::Value>,
         unroll_opt: &mut crate::optimizeopt::unroll::UnrollOptimizer,
         num_combined_ops: usize,
         quasi_immutable_deps: Vec<std::sync::Arc<dyn majit_ir::QuasiImmutHandle>>,
@@ -11735,9 +11707,6 @@ impl<M: Clone> MetaInterp<M> {
         );
         let bridge_trace_id = self.alloc_trace_id();
 
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants_pool(compiled_constants_typed);
         self.backend
             .set_callinfocollection(self.callinfocollection.clone());
         self.backend.set_next_trace_id(bridge_trace_id);
@@ -12276,7 +12245,7 @@ impl<M: Clone> MetaInterp<M> {
         let snapshot_maps = if number_from_recorder {
             Default::default()
         } else {
-            snapshot_maps_from_ctx(&mut ctx, &mut constants)
+            snapshot_maps_from_ctx(&mut ctx)
         };
         let mut recorder = ctx.recorder;
         // `snapshot_recorder` stays put until the optimizer has numbered
@@ -12556,13 +12525,9 @@ impl<M: Clone> MetaInterp<M> {
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut optimized_ops,
-            &mut constants,
             driver_descriptor.as_ref(),
         );
 
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants_pool(compiled_constants_typed);
         // resume.py concat_strings parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -12767,7 +12732,7 @@ impl<M: Clone> MetaInterp<M> {
         let snapshot_maps = if number_from_recorder {
             Default::default()
         } else {
-            snapshot_maps_from_ctx(&mut ctx, &mut constants)
+            snapshot_maps_from_ctx(&mut ctx)
         };
         let mut recorder = ctx.recorder;
         let (mut trace, snapshot_recorder) = if number_from_recorder {
@@ -12988,12 +12953,8 @@ impl<M: Clone> MetaInterp<M> {
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
-            &mut constants,
             driver_descriptor.as_ref(),
         );
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
-        self.backend.set_constants_pool(compiled_constants_typed);
         // resume.py concat_strings parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -15097,7 +15058,7 @@ impl<M: Clone> MetaInterp<M> {
         bridge_ops: &[T],
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
-        bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
+        bridge_constants: majit_ir::ConstMap<majit_ir::Value>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -15228,13 +15189,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
-        // history.py:220 box.type parity: promote the legacy `i64` pool
-        // to a typed `Value` map for the optimizer's intrinsic Const
-        // class identity.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
-            .iter()
-            .map(|(&k, c)| (k, c.to_value()))
-            .collect();
+        let mut constants = bridge_constants;
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
         // see `opref_type` in `optimizer.rs` (priority-0 variant-tag read).
@@ -15355,13 +15310,10 @@ impl<M: Clone> MetaInterp<M> {
         self.patch_new_loop_to_load_virtualizable_fields(
             &mut entry_inputargs,
             &mut optimized_ops,
-            &mut constants,
             driver_descriptor.as_ref(),
         );
         let num_optimized_ops = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -15395,7 +15347,6 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
 
-        self.backend.set_constants_pool(compiled_constants_typed);
         // resume.py concat_strings parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -15629,7 +15580,7 @@ impl<M: Clone> MetaInterp<M> {
         bridge_ops: Vec<majit_ir::OpRc>,
         bridge_inputargs: &[majit_ir::InputArgRc],
         jump_args: &[OpRef],
-        bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
+        bridge_constants: majit_ir::ConstMap<majit_ir::Value>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
         snapshot_vable_boxes: SnapshotBoxes,
@@ -15919,12 +15870,7 @@ impl<M: Clone> MetaInterp<M> {
 
         let mut optimizer = self.make_optimizer();
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
-        // history.py:220 box.type parity: promote the legacy `i64` pool
-        // to a typed `Value` map.
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = bridge_constants
-            .iter()
-            .map(|(&k, c)| (k, c.to_value()))
-            .collect();
+        let mut constants = bridge_constants;
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
@@ -16108,8 +16054,6 @@ impl<M: Clone> MetaInterp<M> {
         let _live_ops = self.publish_live_ops(&optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
-        let compiled_constants_typed =
-            crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         let bridge_trace_id = self.alloc_trace_id();
 
         if crate::majit_log_enabled() {
@@ -16126,7 +16070,6 @@ impl<M: Clone> MetaInterp<M> {
         // LABEL slots are rebuilt from `vable_label_arg_recipes` in
         // `OptUnroll::jump_to_existing_trace` (`unroll.py` send_extra JUMP).
 
-        self.backend.set_constants_pool(compiled_constants_typed);
         // resume.py concat_strings parity — VStr/VUni Concat/Slice guard-exit
         // materialization needs the staticdata.callinfocollection to
         // resolve OS_STR_CONCAT / OS_UNI_CONCAT / OS_STR_SLICE /
@@ -31777,13 +31720,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(
-            &mut meta,
-            &green_key,
-            &inputargs,
-            ops,
-            majit_ir::ConstMap::default(),
-        );
+        attach_procedure_to_interp_entry(&mut meta, &green_key, &inputargs, ops);
 
         let fail_descr = descr.as_fail_descr().expect("resume guard");
         let old_token = meta
@@ -31907,9 +31844,7 @@ mod tests {
         green_key: &majit_ir::GreenKey,
         inputargs: &[InputArgRc],
         ops: Vec<Op>,
-        constants_typed: majit_ir::ConstMap<majit_ir::Const>,
     ) {
-        meta.backend.set_constants_pool(constants_typed);
         let hash = green_key.get_uhash();
         let mut token = JitCellToken::new((hash + 1000) as i64);
         token.outermost_jitdriver_index = meta.active_jitdriver_sd;
@@ -31990,13 +31925,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        attach_procedure_to_interp_entry(
-            &mut meta,
-            &green_key,
-            &inputargs,
-            ops,
-            majit_ir::ConstMap::default(),
-        );
+        attach_procedure_to_interp_entry(&mut meta, &green_key, &inputargs, ops);
 
         let source_token = meta
             .get_procedure_token(green_key.get_uhash())
@@ -34694,12 +34623,7 @@ mod tests {
         // Install a simple compiled loop with a guard
         let green_key = gk(50);
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
-        // Backend test-fixture quirk (NOT RPython parity): both constants
-        // are paired with `constants.insert(100|101, ...)` below; the
-        // backend HashMap keys the function-pointer / value literals by
-        // raw OpRef value. RPython expresses these as Const* boxes.
-        let _const_one = OpRef::int_op(100);
-        let const_zero = OpRef::int_op(101);
+        let const_zero = OpRef::const_int(0);
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             bound_operand(OpRef::input_arg_int(0)),
@@ -34731,10 +34655,7 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
-        constants.insert(100, majit_ir::Const::Int(1));
-        constants.insert(101, majit_ir::Const::Int(0));
-        attach_procedure_to_interp_entry(&mut meta, &green_key, &inputargs, ops, constants);
+        attach_procedure_to_interp_entry(&mut meta, &green_key, &inputargs, ops);
 
         // The bridge hook is set. We verify the hook mechanism is correctly wired.
         if let Some(ref hook) = meta.hooks.on_compile_bridge {

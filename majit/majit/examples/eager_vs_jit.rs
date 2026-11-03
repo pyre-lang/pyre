@@ -16,7 +16,7 @@ use majit::backend::{Backend, JitCellToken, RawExecResult};
 use majit::eager::CompiledIr;
 use majit::ir::descr::make_finish_descr;
 use majit::ir::operand::Operand;
-use majit::ir::{ConstMap, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit::ir::{InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use majit_backend_dynasm::runner::DynasmBackend;
 
 const SAMPLES: usize = 7;
@@ -94,16 +94,8 @@ fn main() {
     let (inputs, ops) = add_ir();
     let start = Instant::now();
     // SAFETY: integer-only, well-formed IR, initialized CPU, fresh token.
-    let mut compiled = unsafe {
-        CompiledIr::compile(
-            &mut cpu,
-            Arc::clone(&token),
-            &inputs,
-            &ops,
-            ConstMap::default(),
-        )
-    }
-    .expect("eager compile");
+    let mut compiled = unsafe { CompiledIr::compile(&mut cpu, Arc::clone(&token), &inputs, &ops) }
+        .expect("eager compile");
     let compile_ns = start.elapsed().as_secs_f64() * 1e9;
 
     let start = Instant::now();

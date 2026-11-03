@@ -176,7 +176,6 @@ impl<'a> RegAlloc<'a> {
             &args,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         (loc, argloc)
@@ -282,7 +281,7 @@ impl<'a> RegAlloc<'a> {
         asm: &mut dyn RegAllocAssembler,
     ) {
         let loc2 = if rhs.is_constant() {
-            self.rm.convert_to_imm(rhs, &self.constants)
+            self.rm.convert_to_imm(rhs)
         } else {
             self.make_sure_var_in_reg(rhs, Type::Int, &[], Some(ECX), false)
         };
@@ -294,7 +293,6 @@ impl<'a> RegAlloc<'a> {
             &args,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc1, loc2], Some(loc1), asm);
@@ -316,7 +314,6 @@ impl<'a> RegAlloc<'a> {
             &[],
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc], Some(loc), asm);
@@ -538,7 +535,6 @@ impl<'a> RegAlloc<'a> {
             self.xrm.save_around_call_regs.clone(),
             self.rm.all_regs.clone(),
             self.xrm.all_regs.clone(),
-            self.constants.clone(),
         );
         hints.add_hints(&mut self.longevity, self.inputargs, self.operations);
     }
@@ -645,7 +641,6 @@ impl<'a> RegAlloc<'a> {
                 need_lower_byte,
                 &mut self.longevity,
                 &mut self.fm,
-                &self.constants,
                 &mut self.pending_moves,
             )
         } else {
@@ -657,7 +652,6 @@ impl<'a> RegAlloc<'a> {
                 need_lower_byte,
                 &mut self.longevity,
                 &mut self.fm,
-                &self.constants,
                 &mut self.pending_moves,
             )
         }
@@ -1334,14 +1328,9 @@ impl<'a> RegAlloc<'a> {
     ) {
         // x86/regalloc.py `_consider_float_op`: `addsd/mulsd` is two-operand,
         // so the result has to land on the lhs (`force_result_in_reg`).
-        let loc1 = self.xrm.loc(
-            rhs,
-            Type::Float,
-            false,
-            &mut self.longevity,
-            &mut self.fm,
-            &self.constants,
-        );
+        let loc1 = self
+            .xrm
+            .loc(rhs, Type::Float, false, &mut self.longevity, &mut self.fm);
         let args = [lhs.clone(), rhs.clone()];
         let loc0 = self.xrm.force_result_in_reg(
             dst,
@@ -1350,7 +1339,6 @@ impl<'a> RegAlloc<'a> {
             &args,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc0, loc1], Some(loc0), asm);
@@ -1370,7 +1358,6 @@ impl<'a> RegAlloc<'a> {
             &[],
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc], Some(loc), asm);
@@ -1420,7 +1407,6 @@ impl<'a> RegAlloc<'a> {
             &[],
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc], Some(loc), asm);
@@ -2088,7 +2074,6 @@ impl<'a> RegAlloc<'a> {
             false,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
         );
         self.rm
             .possibly_free_var(length_box, &mut self.longevity, &mut self.fm, Type::Int);
@@ -2312,7 +2297,6 @@ impl<'a> RegAlloc<'a> {
             &forbidden,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         let res_reg = match resloc {

@@ -1,6 +1,8 @@
 #![cfg_attr(test, allow(unused_variables))]
 
 use indexmap::{IndexMap, IndexSet};
+#[cfg(test)]
+use majit_ir::Const;
 /// GC rewriter — transforms high-level allocation and store operations
 /// into GC-aware lower-level IR before code generation.
 ///
@@ -17,7 +19,7 @@ use majit_ir::descr::{DescrRef, FieldDescr, LoopTokenDescr, SizeDescr};
 use majit_ir::forwarding::{Forwarded, ForwardingHost};
 use majit_ir::operand::Operand;
 use majit_ir::resoperation::{Op, OpCode, OpRc, OpRef};
-use majit_ir::{Const, ConstMap, GcRef, Value};
+use majit_ir::{GcRef, Value};
 use std::borrow::Cow;
 
 use crate::{GcRewriter, WriteBarrierDescr};
@@ -635,7 +637,7 @@ struct PendingZero {
 
 /// Per-rewrite mutable state (not stored on the struct so that
 /// `rewrite_for_gc` can take `&self`).
-struct RewriteState<'a> {
+struct RewriteState {
     /// Output operation list. `Rc`-carried so `emit` can hand back a
     /// BOUND result box — downstream references to a newly emitted op
     /// live-track its producer instead of fabricating position-only
@@ -644,10 +646,6 @@ struct RewriteState<'a> {
     /// Next position index for emitted result ops that do not have an
     /// explicit source position to preserve.
     next_pos: u32,
-    /// Constant pool (from optimizer) — maps OpRef key → typed `Const`
-    /// value. Each box variant carries its own type (`Const::get_type`).
-    /// Borrowed: `resolve_constant` only reads it.
-    constants: &'a ConstMap<Const>,
 
     // ── Nursery batching ──
     /// The index in `out` of the current CALL_MALLOC_NURSERY op, if any.
@@ -708,15 +706,6 @@ struct RewriteState<'a> {
     /// presence matches upstream and the consumer can be wired without
     /// re-introducing the field.
     _constant_additions: FxIndexMap<OpRef, (Operand, i64)>,
-    /// Reserved next constant index in the passed-in constant namespace.
-    /// Current GC-rewrite parity emits fresh `ConstInt` values inline
-    /// (`history.py:227`) instead of allocating pool entries, so this is
-    /// initialized in `with_constants` but has no writer until a backend
-    /// egress path needs pooled constants again.
-    #[allow(dead_code)]
-    // rewrite.py constant-pool cursor; history.py ConstInt is emitted inline
-    next_const_idx: u32,
-
     /// rewrite.py `_changed_op` / `_changed_op_to`.
     ///
     /// When `remove_tested_failarg` rewrites an upcoming guard's failargs
@@ -743,26 +732,11 @@ struct RewriteState<'a> {
     gcrefs_recently_loaded: FxIndexMap<u32, Operand>,
 }
 
-impl<'a> RewriteState<'a> {
-    fn with_constants(
-        hint: usize,
-        next_pos: u32,
-        constants: &'a ConstMap<Const>,
-    ) -> RewriteState<'a> {
-        // P3 category E — `constants` is an index-keyed constant pool
-        // (raw u32 key), not a Box-identity dict.  Bit-helpers replace
-        // the `OpRef::from_raw(k).is_constant()` round-trip that would
-        // land on the to-be-retired `OpRef::Untyped` variant.
-        let next_const_idx = constants
-            .keys()
-            .filter(|&&k| OpRef::raw_is_constant(k))
-            .map(|&k| OpRef::raw_const_index(k))
-            .max()
-            .map_or(0, |m| m + 1);
+impl RewriteState {
+    fn new(hint: usize, next_pos: u32) -> RewriteState {
         RewriteState {
             out: Vec::with_capacity(hint + hint / 4),
             next_pos,
-            constants,
             pending_malloc_idx: None,
             pending_malloc_total: 0,
             previous_size: 0,
@@ -773,7 +747,6 @@ impl<'a> RewriteState<'a> {
             initialized_indices: IndexMap::default(),
             _delayed_zero_setfields: IndexMap::default(),
             _constant_additions: IndexMap::default(),
-            next_const_idx,
             _changed_op: None,
             _changed_op_to: None,
             gcrefs_output_list: Vec::new(),
@@ -784,25 +757,13 @@ impl<'a> RewriteState<'a> {
 
     /// Resolve a constant value from the box (RPython parity: caller
     /// passes the Box; `isinstance(box, ConstInt) and box.getint()`).
-    /// history.py/268/314 — inline-Const variants carry their value
-    /// directly; legacy pool-indexed variants look up via the snapshot.
+    /// rewrite.py gates these reads on `isinstance(arg, ConstInt)` →
+    /// `getint()`. ConstFloat/ConstPtr have no `getint`, so a Float/Ptr
+    /// constant is rejected outright. ConstInt carries its value inline.
     fn resolve_constant(&self, b: &Operand) -> Option<i64> {
-        // rewrite.py:548/590/1013 gate these reads on `isinstance(arg,
-        // ConstInt)` → `getint()`. ConstFloat/ConstPtr have
-        // no `getint` (history.py/314), so a Float/Ptr constant is
-        // rejected outright. ConstInt carries its value inline
-        // (history.py). A non-Const box that the backend proved
-        // constant resolves through the index-keyed `constants` snapshot
-        // by raw OpRef key; production pools are keyed in the constant
-        // namespace (CONST_BIT set) so a genuine box position never
-        // collides and stays unresolved.
         match b.const_value() {
             Some(Value::Int(v)) => Some(v),
-            Some(_) => None,
-            None => self
-                .constants
-                .get(&b.to_opref().raw())
-                .map(|c| c.as_raw_i64()),
+            _ => None,
         }
     }
 
@@ -1286,7 +1247,7 @@ impl GcRewriterImpl {
         op: &Op,
         i: usize,
         ops: &[OpRc],
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> bool {
         if !op.opcode.is_comparison() {
             // rewrite.py:436 fallback: int_xxx_ovf + guard_{,no_}overflow
@@ -1323,7 +1284,7 @@ impl GcRewriterImpl {
     /// guard points at that SAME_AS_I instead of the boolean. The rewritten
     /// guard is remembered in `st._changed_op` / `st._changed_op_to` so the
     /// main loop substitutes it on the next iteration.
-    fn remove_tested_failarg(&self, op: &OpRc, st: &mut RewriteState<'_>) {
+    fn remove_tested_failarg(&self, op: &OpRc, st: &mut RewriteState) {
         // rewrite.py:452-453: no-op for non-GUARD_{TRUE,FALSE} (e.g. COND_CALL
         // is merge-eligible via could_merge_with_next_guard but does not
         // carry failargs in the RPython sense).
@@ -1367,7 +1328,7 @@ impl GcRewriterImpl {
     // NEW / NEW_WITH_VTABLE  → CALL_MALLOC_NURSERY + tid init
     // ────────────────────────────────────────────────────────
 
-    fn handle_new(&self, op: &OpRc, st: &mut RewriteState<'_>) {
+    fn handle_new(&self, op: &OpRc, st: &mut RewriteState) {
         let descr_arc = op.getdescr().expect("NEW must have a SizeDescr");
         let descr = descr_arc
             .as_size_descr()
@@ -1534,7 +1495,7 @@ impl GcRewriterImpl {
     /// SETFIELD_GC overwrites it first.  Early-returns when the
     /// allocator already zero-fills payload bytes
     /// (`self.malloc_zero_filled`, rewrite.py:499-500).
-    fn clear_gc_fields(&self, descr: &dyn SizeDescr, result: Operand, st: &mut RewriteState<'_>) {
+    fn clear_gc_fields(&self, descr: &dyn SizeDescr, result: Operand, st: &mut RewriteState) {
         if self.malloc_zero_filled {
             return;
         }
@@ -1569,13 +1530,7 @@ impl GcRewriterImpl {
     /// (`gen_malloc_array` / `gen_malloc_str` / `gen_malloc_unicode`)
     /// is ported below and emits CALL_R + CHECK_MEMORY_ERROR like
     /// rewrite.py:768-846.
-    fn handle_new_array(
-        &self,
-        descr_ref: DescrRef,
-        op: &OpRc,
-        st: &mut RewriteState<'_>,
-        kind: i64,
-    ) {
+    fn handle_new_array(&self, descr_ref: DescrRef, op: &OpRc, st: &mut RewriteState, kind: i64) {
         let descr = descr_ref
             .as_array_descr()
             .expect("handle_new_array descr must be ArrayDescr");
@@ -1739,7 +1694,7 @@ impl GcRewriterImpl {
         result: Operand,
         v_length: Operand,
         opnum: OpCode,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         if self.malloc_zero_filled {
             return;
@@ -1783,7 +1738,7 @@ impl GcRewriterImpl {
         ad_itemsize: i64,
         v_arr: Operand,
         v_length: Operand,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         // rewrite.py:589 assert v_length is not None.
         if v_length.is_none() {
@@ -1852,7 +1807,7 @@ impl GcRewriterImpl {
         kind: i64,
         v_length: Operand,
         result_pos: OpRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Option<Operand> {
         let ad = arraydescr
             .as_array_descr()
@@ -1906,7 +1861,7 @@ impl GcRewriterImpl {
         args: &[Operand],
         result_pos: OpRef,
         calldescr: DescrRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Operand {
         st.emitting_an_operation_that_can_collect();
         let call_op = mk_op(OpCode::CallR, args);
@@ -1925,7 +1880,7 @@ impl GcRewriterImpl {
         arraydescr: DescrRef,
         v_num_elem: Operand,
         result_pos: OpRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Operand {
         // rewrite.py `gen_boehm_malloc_array` when `malloc_fn_ptr` is published.
         if boehm_malloc_fn().is_some() {
@@ -2061,7 +2016,7 @@ impl GcRewriterImpl {
         type_id: u32,
         non_moving: bool,
         result_pos: OpRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Operand {
         // rewrite.py `gen_malloc_fixedsize` Boehm arm: `CALL_R(malloc_fn_ptr, size)`.
         if let Some(addr) = boehm_malloc_fn() {
@@ -2115,7 +2070,7 @@ impl GcRewriterImpl {
         &self,
         v_num_elem: Operand,
         result_pos: OpRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Operand {
         let fn_ref = st.const_int(self.malloc_str_fn);
         let type_id = self
@@ -2141,7 +2096,7 @@ impl GcRewriterImpl {
         &self,
         v_num_elem: Operand,
         result_pos: OpRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Operand {
         let fn_ref = st.const_int(self.malloc_unicode_fn);
         let type_id = self
@@ -2177,7 +2132,7 @@ impl GcRewriterImpl {
     /// basesize is additionally offset by `-1` to skip the STR
     /// `extra_item_after_alloc` null terminator (rewrite.py:1051-1053;
     /// rstr.py:1226 `extra_item_after_alloc=True`).
-    fn rewrite_copy_str_content(&self, op: &Op, st: &mut RewriteState<'_>) {
+    fn rewrite_copy_str_content(&self, op: &Op, st: &mut RewriteState) {
         // rewrite.py:1046-1048 — pull memcpy_fn / memcpy_descr off the
         // gc_ll_descr instance fields (gc.py:39-43).
         let memcpy_fn = self.memcpy_fn;
@@ -2270,7 +2225,7 @@ impl GcRewriterImpl {
         v_index: Operand,
         base: i64,
         itemscale: i64,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Operand {
         if self.supports_load_effective_address {
             // rewrite.py:1083-1088 — single LEA op.
@@ -2313,7 +2268,7 @@ impl GcRewriterImpl {
     /// caller is expected to follow up with `emit_maybe_forwarded` so
     /// the lowered GC_STORE (forwarded by `transform_to_gc_load`) lands
     /// after the WB.
-    fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState<'_>) {
+    fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
         let obj = st.get_box_replacement(op.arg(0));
         if st.wb_already_applied(&obj) {
             return;
@@ -2362,7 +2317,7 @@ impl GcRewriterImpl {
     }
 
     /// rewrite.py `gen_write_barrier`.
-    fn gen_write_barrier(&self, v_base: Operand, st: &mut RewriteState<'_>) {
+    fn gen_write_barrier(&self, v_base: Operand, st: &mut RewriteState) {
         let wb_op = mk_op(OpCode::CondCallGcWb, std::slice::from_ref(&v_base));
         st.emit(wb_op);
         st.remember_wb(&v_base);
@@ -2380,7 +2335,7 @@ impl GcRewriterImpl {
     /// no-op. With a real collector, production backends set the flag to
     /// false (in their `gc_rewriter`), activating the delayed-zero
     /// tracking.
-    fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState<'_>) {
+    fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
         let Some(descr) = op.getdescr() else { return };
         let Some(fd) = descr.as_field_descr() else {
             return;
@@ -2404,10 +2359,11 @@ impl GcRewriterImpl {
     /// if not isinstance(array_box, ConstPtr) and index_box.is_constant():
     ///     self.remember_setarrayitem_occurred(array_box, index_box.getint())
     /// ```
-    fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState<'_>) {
+    fn consider_setarrayitem_gc(&self, op: &Op, st: &mut RewriteState) {
         let array_ref = st.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
-        if st.resolve_constant(&array_ref).is_some() {
+        // `isinstance(array_box, ConstPtr)` — a const Ref operand, not ConstInt.
+        if array_ref.is_constant() && array_ref.type_() == Type::Ref {
             return;
         }
         let Some(idx_val) = st.resolve_constant(&index_ref) else {
@@ -2422,7 +2378,7 @@ impl GcRewriterImpl {
     /// GC_STORE_INDEXED inside transform_to_gc_load (rewrite.py)
     /// and then `self.emit_op(op)` follows the forwarding. We do the
     /// equivalent in the caller by invoking handle_setarrayitem after WB.
-    fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState<'_>) {
+    fn handle_write_barrier_setarrayitem(&self, op: &Op, st: &mut RewriteState) {
         let val = st.get_box_replacement(op.arg(0));
         // rewrite.py:938-942
         if !st.wb_already_applied(&val) {
@@ -2449,7 +2405,7 @@ impl GcRewriterImpl {
     /// the original op to the lowered form (the emission happens later
     /// in the main loop via `emit_maybe_forwarded` for RAW and via the
     /// SETARRAYITEM_GC write-barrier arm for GC).
-    fn handle_setarrayitem(&self, op: &OpRc, st: &mut RewriteState<'_>) {
+    fn handle_setarrayitem(&self, op: &OpRc, st: &mut RewriteState) {
         let descr = op.getdescr().expect("SETARRAYITEM needs ArrayDescr");
         let ad = descr
             .as_array_descr()
@@ -2496,7 +2452,7 @@ impl GcRewriterImpl {
         itemsize: i64,
         factor: i64,
         offset: i64,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         // rewrite.py:142-143
         let (index, offset) = st._try_use_older_box(&index, factor, offset);
@@ -2545,7 +2501,7 @@ impl GcRewriterImpl {
         index_box: Operand,
         factor: i64,
         offset: i64,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> (i64, i64, Option<Operand>) {
         let (factor, offset, scaled) = self.cpu_simplify_scale(&index_box, factor, offset, st);
         let index_opt = match scaled {
@@ -2573,7 +2529,7 @@ impl GcRewriterImpl {
         index_box: &Operand,
         factor: i64,
         offset: i64,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> (i64, i64, ScaledIndex) {
         // rewrite.py:1118-1122 — ConstInt path.
         if let Some(index_val) = st.resolve_constant(index_box) {
@@ -2601,7 +2557,7 @@ impl GcRewriterImpl {
     /// rewrite.py `handle_getarrayitem`.
     /// Lowers GETARRAYITEM_{GC,RAW}_{I,R,F}, including the PURE variants,
     /// into GC_LOAD / GC_LOAD_INDEXED through `emit_gc_load_or_indexed`.
-    fn handle_getarrayitem(&self, op: &OpRc, st: &mut RewriteState<'_>) {
+    fn handle_getarrayitem(&self, op: &OpRc, st: &mut RewriteState) {
         let descr = op.getdescr().expect("GETARRAYITEM needs ArrayDescr");
         let ad = descr
             .as_array_descr()
@@ -2640,7 +2596,7 @@ impl GcRewriterImpl {
         factor: i64,
         offset: i64,
         sign: bool,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         // rewrite.py:186-187
         let (index, offset) = st._try_use_older_box(&index, factor, offset);
@@ -2691,7 +2647,7 @@ impl GcRewriterImpl {
         ptr: Operand,
         value: Operand,
         fd: &dyn FieldDescr,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         self.emit_setfield_raw(ptr, value, fd.offset() as i64, fd.field_size() as i64, st);
     }
@@ -2715,7 +2671,7 @@ impl GcRewriterImpl {
         value: Operand,
         ofs: i64,
         size: i64,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         // rewrite.py `consider_setfield_gc`: a store at this offset
         // cancels the delayed NULL `clear_gc_fields` recorded.
@@ -2741,7 +2697,7 @@ impl GcRewriterImpl {
     /// skips the rest of the main-loop body.  All other arms forward
     /// the op and return `false`, delegating emission to the main loop
     /// via `emit_maybe_forwarded` (or the write-barrier arms).
-    fn transform_to_gc_load(&self, op: &OpRc, st: &mut RewriteState<'_>) -> bool {
+    fn transform_to_gc_load(&self, op: &OpRc, st: &mut RewriteState) -> bool {
         const NOT_SIGNED: bool = false;
         let opnum = op.opcode;
 
@@ -3066,12 +3022,7 @@ impl GcRewriterImpl {
     // rewrite.py gen_write_barrier_array
     // ────────────────────────────────────────────────────────
 
-    fn gen_write_barrier_array(
-        &self,
-        v_base: Operand,
-        v_index: Operand,
-        st: &mut RewriteState<'_>,
-    ) {
+    fn gen_write_barrier_array(&self, v_base: Operand, v_index: Operand, st: &mut RewriteState) {
         // rewrite.py:956-957 reads `self.gc_ll_descr.write_barrier_descr`
         // unguarded: this is only reached from the barrier section, which
         // `rewrite.py:393` already gated on the descriptor being set.
@@ -3120,7 +3071,7 @@ impl GcRewriterImpl {
         &self,
         size: usize,
         result_pos: OpRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) -> Option<Operand> {
         let size = round_up(size);
 
@@ -3200,7 +3151,7 @@ impl GcRewriterImpl {
     /// separate header clear. That is sound for the same reason it is
     /// upstream: `gc.py malloc_nursery_slowpath` answers a size that
     /// passed `can_use_nursery` with a young object whose flags are clear.
-    fn gen_initialize_tid(&self, obj: Operand, tid: u32, st: &mut RewriteState<'_>) {
+    fn gen_initialize_tid(&self, obj: Operand, tid: u32, st: &mut RewriteState) {
         let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
             return;
         };
@@ -3216,7 +3167,7 @@ impl GcRewriterImpl {
 
     /// [`Self::gen_initialize_tid`] storing only the type-id half of
     /// `HDR.tid`, so flags the slow-path allocator set survive.
-    fn gen_initialize_tid_keep_flags(&self, obj: Operand, tid: u32, st: &mut RewriteState<'_>) {
+    fn gen_initialize_tid_keep_flags(&self, obj: Operand, tid: u32, st: &mut RewriteState) {
         let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
             return;
         };
@@ -3242,7 +3193,7 @@ impl GcRewriterImpl {
         obj: Operand,
         vtable: usize,
         vtable_fd_ref: &DescrRef,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         let vtable_fd = vtable_fd_ref
             .as_field_descr()
@@ -3256,7 +3207,7 @@ impl GcRewriterImpl {
         obj: Operand,
         w_class: i64,
         w_class_fd: &dyn FieldDescr,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         let w_class_ref = Operand::const_from_value(Value::Ref(GcRef(w_class as usize)));
         self.emit_setfield(obj, w_class_ref, w_class_fd, st);
@@ -3274,7 +3225,7 @@ impl GcRewriterImpl {
         obj: Operand,
         length: Operand,
         len_descr: &dyn FieldDescr,
-        st: &mut RewriteState<'_>,
+        st: &mut RewriteState,
     ) {
         self.emit_setfield(obj, length, len_descr, st);
     }
@@ -3287,7 +3238,7 @@ impl GcRewriterImpl {
     ///
     /// Dispatched from the `CallAssembler{I,R,F,N}` arm of `rewrite_loop`
     /// (rewrite.py:413-416 parity).
-    fn handle_call_assembler(&self, op: &OpRc, st: &mut RewriteState<'_>) {
+    fn handle_call_assembler(&self, op: &OpRc, st: &mut RewriteState) {
         let descrs = self.jitframe_info.as_ref().unwrap();
         let lookup = self.call_assembler_callee_locs.as_ref().unwrap();
 
@@ -3558,7 +3509,7 @@ impl GcRewriterImpl {
     /// One pass of `GcRewriterAssembler.rewrite` over a single segment.
     /// The caller supplies a fresh `RewriteState`; only `next_pos` and
     /// `gcrefs_output_list` are carried across segments.
-    fn rewrite_ops_with_state(&self, ops: &[OpRc], st: &mut RewriteState<'_>) {
+    fn rewrite_ops_with_state(&self, ops: &[OpRc], st: &mut RewriteState) {
         for (i, orig_op) in ops.iter().enumerate() {
             // rewrite.py `if op is self._changed_op: op = self._changed_op_to`.
             let op_rc: OpRc = match (&st._changed_op, &st._changed_op_to) {
@@ -3805,12 +3756,12 @@ impl GcRewriterImpl {
 
 impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc(&self, ops: &[OpRc]) -> Vec<OpRc> {
-        let (rewritten, gcrefs) = self.rewrite_for_gc_with_constants(ops, &ConstMap::default());
+        let (rewritten, gcrefs) = self.rewrite_for_gc_with_constants(ops);
         // This wrapper drops the gc_table output list. A non-null ConstPtr
         // operand is rewritten to LoadFromGcTable, which needs that list to
-        // build the table; callers carrying one must use the
-        // constants-returning form. Fail fast rather than emit IR whose
-        // table is silently discarded.
+        // build the table; callers carrying one must use
+        // `rewrite_for_gc_with_constants`. Fail fast rather than emit IR
+        // whose table is silently discarded.
         assert!(
             gcrefs.is_empty(),
             "rewrite_for_gc discards gc_table refs; use rewrite_for_gc_with_constants"
@@ -3818,13 +3769,9 @@ impl GcRewriter for GcRewriterImpl {
         rewritten
     }
 
-    fn rewrite_for_gc_with_constants(
-        &self,
-        ops: &[OpRc],
-        constants: &ConstMap<Const>,
-    ) -> (Vec<OpRc>, Vec<GcRef>) {
+    fn rewrite_for_gc_with_constants(&self, ops: &[OpRc]) -> (Vec<OpRc>, Vec<GcRef>) {
         let (mut parts, gcrefs) = self
-            .rewrite_for_gc_segments(std::slice::from_ref(&ops), constants)
+            .rewrite_for_gc_segments(std::slice::from_ref(&ops))
             .expect("GcRewriterImpl segmented rewrite");
         (parts.pop().unwrap_or_default(), gcrefs)
     }
@@ -3832,7 +3779,6 @@ impl GcRewriter for GcRewriterImpl {
     fn rewrite_for_gc_segments(
         &self,
         segments: &[&[OpRc]],
-        constants: &ConstMap<Const>,
     ) -> Option<(Vec<Vec<OpRc>>, Vec<GcRef>)> {
         // `GcRewriterAssembler.rewrite` runs once per assemble_bridge, so
         // each segment starts from a fresh RewriteState. The result-position
@@ -3849,7 +3795,7 @@ impl GcRewriter for GcRewriterImpl {
         let mut gcrefs = Vec::new();
         let mut outs = Vec::with_capacity(views.len());
         for ops in views {
-            let mut st = RewriteState::with_constants(ops.len(), next_pos, constants);
+            let mut st = RewriteState::new(ops.len(), next_pos);
             st.gcrefs_output_list = std::mem::take(&mut gcrefs);
             self.rewrite_ops_with_state(ops, &mut st);
             next_pos = st.next_pos;
@@ -3941,16 +3887,9 @@ mod tests {
             GcRewriter::rewrite_for_gc(self, &boxed)
         }
 
-        fn rewrite_ops_with_constants(
-            &self,
-            ops: &[Op],
-            constants: &ConstMap<Const>,
-        ) -> (Vec<OpRc>, ConstMap<Const>, Vec<GcRef>) {
+        fn rewrite_ops_with_constants(&self, ops: &[Op]) -> (Vec<OpRc>, Vec<GcRef>) {
             let boxed: Vec<OpRc> = ops.iter().cloned().map(OpRc::new).collect();
-            let (out, gcrefs) = self.rewrite_for_gc_with_constants(&boxed, constants);
-            // The rewrite only reads the pool. Hand the caller's map back
-            // so existing assertions keep their tuple shape.
-            (out, constants.clone(), gcrefs)
+            self.rewrite_for_gc_with_constants(&boxed)
         }
     }
 
@@ -4347,8 +4286,7 @@ mod tests {
         let rw = make_rewriter();
         let ops = vec![Op::with_descr(OpCode::New, &[], size_descr(32, 7))];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Expect: CallMallocNursery, GcStore (tid)
         assert_eq!(result.len(), 2);
@@ -4375,15 +4313,6 @@ mod tests {
             .inline_const_bits()
             .expect("inline ConstInt");
         assert_eq!(store_size, std::mem::size_of::<usize>() as i64);
-
-        for (_key, c) in &constants {
-            assert_eq!(
-                c.get_type(),
-                Type::Int,
-                "GC rewriter must return the RPython ConstInt.type equivalent \
-                 for each constant it mints"
-            );
-        }
     }
 
     /// A `non_moving` descr takes the `malloc_big_fixedsize` helper even at a
@@ -4402,8 +4331,7 @@ mod tests {
             non_moving_size_descr(payload_size, type_id),
         )];
 
-        let (result, _constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(
             result
@@ -4443,9 +4371,7 @@ mod tests {
     fn test_non_moving_new_array_declines_nursery_at_small_length() {
         let rw = make_rewriter();
         let num_elem = 3;
-        let len_ref = OpRef::int_op(10_000);
-        let mut constants: ConstMap<Const> = ConstMap::default();
-        constants.insert(10_000, Const::Int(num_elem));
+        let len_ref = OpRef::const_int(num_elem);
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
             &[ro(len_ref)],
@@ -4454,7 +4380,7 @@ mod tests {
         new_array.pos().set(OpRef::ref_op(0));
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
-        let (result, _constants, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(
             result
@@ -4497,8 +4423,7 @@ mod tests {
             headerless_size_descr(payload_size, 78),
         )];
 
-        let (result, _constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         let malloc = result
             .iter()
@@ -4525,8 +4450,7 @@ mod tests {
             headerless_size_descr(payload_size, type_id),
         )];
 
-        let (result, _constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallR);
@@ -4626,17 +4550,15 @@ mod tests {
     #[test]
     fn test_new_array_const_oversize_uses_malloc_array_helper() {
         let rw = make_rewriter(); // max_nursery_size = 4096
-        let len_ref = OpRef::int_op(10_000);
+        let len_ref = OpRef::const_int(512);
         // array_descr_ref: base_size=8, item_size=8 →
         //   total = 8 + 8*512 = 4104; gen_malloc_nursery sees
         //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
-        let mut constants: ConstMap<Const> = ConstMap::default();
-        constants.insert(10_000, Const::Int(512));
         let new_array = Op::with_descr(OpCode::NewArray, &[ro(len_ref)], array_descr_ref());
         new_array.pos().set(OpRef::ref_op(0));
         let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(
             !result
@@ -4856,7 +4778,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Allocation header stores only (CallMallocNursery + tid GcStore) + Jump.
         // No delayed-zero NULL-pointer stores must be emitted because
@@ -4888,7 +4810,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Collect the NULL-pointer stores emitted by the pending-zero flush.
         let mut seen_offsets: Vec<i64> = result
@@ -4937,7 +4859,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         let null_offsets: Vec<i64> = result
             .iter()
@@ -4971,7 +4893,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(
             result
@@ -5020,7 +4942,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         let null_offsets: Vec<i64> = result
             .iter()
@@ -5097,8 +5019,7 @@ mod tests {
             Op::with_descr(OpCode::New, &[], size_descr(32, 2)),
         ];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(result.iter().any(|o| o.opcode == OpCode::CallMallocNursery));
         assert!(
@@ -5468,14 +5389,14 @@ mod tests {
         let seg1: Vec<OpRc> = vec![OpRc::new(new_op.clone())];
         let seg2: Vec<OpRc> = vec![OpRc::new(store.clone())];
         let (parts, _gcrefs) = rw
-            .rewrite_for_gc_segments(&[&seg1, &seg2], &ConstMap::default())
+            .rewrite_for_gc_segments(&[&seg1, &seg2])
             .expect("segmented rewrite");
         assert!(
             parts[1].iter().any(|op| op.opcode == OpCode::CondCallGcWb),
             "segment 2 must barrier a store into an object allocated in segment 1"
         );
         let combined = vec![OpRc::new(new_op), OpRc::new(store)];
-        let (flat, _) = rw.rewrite_for_gc_with_constants(&combined, &ConstMap::default());
+        let (flat, _) = rw.rewrite_for_gc_with_constants(&combined);
         assert!(
             !flat.iter().any(|op| op.opcode == OpCode::CondCallGcWb),
             "one trace elides the barrier because wb_applied survives the allocation"
@@ -5512,8 +5433,7 @@ mod tests {
             vtable_descr(48, 3, 0xDEAD),
         )];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // CallMallocNursery + GcStore(tid) + GcStore(vtable)
         assert_eq!(result.len(), 3);
@@ -5554,8 +5474,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _constants, gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert_eq!(gcrefs, vec![GcRef(w_class as usize)]);
         assert!(
@@ -5591,8 +5510,7 @@ mod tests {
             size_descr_with_w_class(48, 3, 0, Some(w_class), vec![w_class_field_descr_at(8)]),
         )];
 
-        let (result, _constants, gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert_eq!(gcrefs, vec![GcRef(w_class as usize)]);
         assert_eq!(
@@ -5625,8 +5543,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _constants, gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert_eq!(gcrefs, vec![GcRef(w_class as usize)]);
         let w_class_stores: Vec<_> = result
@@ -5657,8 +5574,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
 
-        let (result, _constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(
             result.iter().any(|o| {
@@ -5940,7 +5856,7 @@ mod tests {
         guard.store_final_boxes(vec![ro(OpRef::int_op(2))]);
         let ops = vec![int_eq, guard, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         let same = result
             .iter()
@@ -5967,7 +5883,7 @@ mod tests {
         guard.store_final_boxes(vec![ro(OpRef::int_op(10)), ro(OpRef::int_op(11))]);
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
 
-        let (result, consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert!(
             result.iter().all(|o| o.opcode != OpCode::GuardAlwaysFails),
@@ -6026,21 +5942,12 @@ mod tests {
 
     // ── Pending zero flush tests ──
 
-    /// Helper: build a constants map mapping `key` → `value` for tests
-    /// that need the rewriter's resolve_constant to find a length.
-    fn const_pool(entries: &[(u32, i64)]) -> ConstMap<Const> {
-        entries.iter().map(|&(k, v)| (k, Const::Int(v))).collect()
-    }
-
     #[test]
     fn test_pending_zero_fully_initialized() {
         // NEW_ARRAY_CLEAR(3) + SET[0] + SET[1] + SET[2] → ZERO_ARRAY emitted
         // with length=0 (RPython rewrite.py:754 "may be ConstInt(0)").
         // rewrite.py consider_setarrayitem_gc requires the index
-        // to be `ConstInt` (`index_box.is_constant()` / `getint()`); the
-        // pyre equivalent is an entry in the constant pool. OpRefs 10/11/12
-        // hold the literal indices 0/1/2 so `resolve_constant` returns the
-        // item number.
+        // to be `ConstInt` (`index_box.is_constant()` / `getint()`).
         //
         // malloc_zero_filled=false exercises the `clear_varsize_gc_fields`
         // path (rewrite.py:521) that actually emits ZERO_ARRAY.
@@ -6048,11 +5955,10 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[ro(OpRef::int_op(3))],
+            &[ro(OpRef::const_int(3))],
             array_descr_int(),
         );
         new_array.pos().set(OpRef::ref_op(0));
-        let constants = const_pool(&[(3, 3), (10, 0), (11, 1), (12, 2)]);
 
         let ops = vec![
             new_array,
@@ -6060,7 +5966,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(10)),
+                    ro(OpRef::const_int(0)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6069,7 +5975,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(11)),
+                    ro(OpRef::const_int(1)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6078,7 +5984,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(12)),
+                    ro(OpRef::const_int(2)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6086,7 +5992,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, _out_consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // All indices were SET, so the in-place ZERO_ARRAY is rewritten
         // to byte_length 0 — backend treats it as a no-op.
@@ -6107,6 +6013,62 @@ mod tests {
     }
 
     #[test]
+    fn test_pending_zero_constptr_array_is_not_a_write() {
+        // `consider_setarrayitem_gc`: `not isinstance(array_box, ConstPtr)`.
+        // A ConstPtr array with a ConstInt index is not a pending-zero write,
+        // so the NEW_ARRAY_CLEAR ZERO_ARRAY is not trimmed.
+        let _const_ptr_table = const_ptr_table_test_guard();
+        let mut rw = make_rewriter();
+        rw.malloc_zero_filled = false;
+        let new_array = Op::with_descr(
+            OpCode::NewArrayClear,
+            &[ro(OpRef::const_int(3))],
+            array_descr_int(),
+        );
+        new_array.pos().set(OpRef::ref_op(0));
+        let const_array = OpRef::const_ptr(majit_ir::GcRef(0xABCD));
+        let ops = vec![
+            new_array,
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    ro(const_array),
+                    ro(OpRef::const_int(0)),
+                    ro(OpRef::int_op(100)),
+                ],
+                array_descr_int(),
+            ),
+            Op::new(OpCode::Finish, &[]),
+        ];
+
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
+
+        let zeros: Vec<_> = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::ZeroArray)
+            .collect();
+        assert_eq!(zeros.len(), 1, "ZERO_ARRAY stays in place per parity");
+        assert_eq!(
+            zeros[0]
+                .arg(1)
+                .to_opref()
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            0,
+            "byte start must stay 0: ConstPtr SETARRAYITEM is not a pending-zero write"
+        );
+        assert_eq!(
+            zeros[0]
+                .arg(2)
+                .to_opref()
+                .inline_const_bits()
+                .expect("inline ConstInt"),
+            12,
+            "byte length must stay 3 items × 4: ConstPtr SETARRAYITEM is not a pending-zero write"
+        );
+    }
+
+    #[test]
     fn test_pending_zero_partially_initialized() {
         // NEW_ARRAY_CLEAR(4) + SET[0] + SET[1] → ZERO_ARRAY trimmed to
         // start=2 items, length=2 items → byte_start=8, byte_len=8.
@@ -6115,11 +6077,10 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[ro(OpRef::int_op(4))],
+            &[ro(OpRef::const_int(4))],
             array_descr_int(),
         );
         new_array.pos().set(OpRef::ref_op(0));
-        let constants = const_pool(&[(4, 4), (10, 0), (11, 1)]);
 
         let ops = vec![
             new_array,
@@ -6127,7 +6088,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(10)),
+                    ro(OpRef::const_int(0)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6136,7 +6097,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(11)),
+                    ro(OpRef::const_int(1)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6144,7 +6105,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, _out_consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         let zeros: Vec<_> = result
             .iter()
@@ -6198,11 +6159,10 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[ro(OpRef::int_op(3))],
+            &[ro(OpRef::const_int(3))],
             array_descr_int(),
         );
         new_array.pos().set(OpRef::ref_op(0));
-        let constants = const_pool(&[(3, 3)]);
 
         let ops = vec![
             new_array,
@@ -6210,7 +6170,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, _out_consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // The ZERO_ARRAY should appear before the guard.
         let zero_idx = result.iter().position(|o| o.opcode == OpCode::ZeroArray);
@@ -6256,11 +6216,10 @@ mod tests {
         rw.malloc_zero_filled = false;
         let new_array = Op::with_descr(
             OpCode::NewArrayClear,
-            &[ro(OpRef::int_op(5))],
+            &[ro(OpRef::const_int(5))],
             array_descr_int(),
         );
         new_array.pos().set(OpRef::ref_op(0));
-        let constants = const_pool(&[(5, 5), (10, 0), (12, 2), (14, 4)]);
 
         let ops = vec![
             new_array,
@@ -6268,7 +6227,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(10)),
+                    ro(OpRef::const_int(0)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6277,7 +6236,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(12)),
+                    ro(OpRef::const_int(2)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6286,7 +6245,7 @@ mod tests {
                 OpCode::SetarrayitemGc,
                 &[
                     ro(OpRef::ref_op(0)),
-                    ro(OpRef::int_op(14)),
+                    ro(OpRef::const_int(4)),
                     ro(OpRef::int_op(100)),
                 ],
                 array_descr_int(),
@@ -6294,7 +6253,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
-        let (result, _out_consts, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         let zeros: Vec<_> = result
             .iter()
@@ -6487,9 +6446,7 @@ mod tests {
         // not yet ported in pyre).
         for &num_elem in &[10_i64, 200_i64] {
             let rw = make_rewriter_with_cards();
-            let len_ref = OpRef::int_op(10_000);
-            let mut constants: ConstMap<Const> = ConstMap::default();
-            constants.insert(10_000, Const::Int(num_elem));
+            let len_ref = OpRef::const_int(num_elem);
             let new_array =
                 Op::with_descr(OpCode::NewArrayClear, &[ro(len_ref)], array_descr_ref());
             new_array.pos().set(OpRef::ref_op(0));
@@ -6506,7 +6463,7 @@ mod tests {
                 ),
                 Op::new(OpCode::Finish, &[]),
             ];
-            let (result, _, _gcrefs) = rw.rewrite_ops_with_constants(&ops, &constants);
+            let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
             let wb = result
                 .iter()
                 .filter(|o| o.opcode == OpCode::CondCallGcWb)
@@ -6693,8 +6650,7 @@ mod tests {
             str_array_descr(),
         )];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         assert_eq!(
             result.len(),
@@ -6765,8 +6721,7 @@ mod tests {
             unicode_array_descr(),
         )];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Expect: LEA, LEA, INT_LSHIFT(i_len, 2), CALL_N
         assert_eq!(result.len(), 4);
@@ -6822,8 +6777,7 @@ mod tests {
             str_array_descr(),
         )];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Expect (itemscale=0 so no INT_LSHIFT):
         //   i2b = int_add(p0, i0)
@@ -6884,8 +6838,7 @@ mod tests {
             unicode_array_descr(),
         )];
 
-        let (result, constants, _gcrefs) =
-            rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, _gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Expect (itemscale=2):
         //   i0s = int_lshift(i0, 2)
@@ -7019,7 +6972,7 @@ mod tests {
             &[Operand::const_from_value(Value::Ref(r))],
         )];
 
-        let (result, _consts, gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // The reference constant is collected at index 0.
         assert_eq!(gcrefs, vec![r]);
@@ -7048,7 +7001,7 @@ mod tests {
             ),
         ];
 
-        let (result, _consts, gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Same ref ⇒ one gcref entry (dedup) and one LoadFromGcTable (block CSE).
         assert_eq!(gcrefs, vec![r]);
@@ -7086,7 +7039,7 @@ mod tests {
             ),
         ];
 
-        let (result, _consts, gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Distinct refs occupy distinct, stable indices.
         assert_eq!(gcrefs, vec![r0, r1]);
@@ -7111,7 +7064,7 @@ mod tests {
             &[Operand::const_from_value(Value::Ref(null))],
         )];
 
-        let (result, _consts, gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // rewrite.py `bool(arg.value)` — a null ConstPtr stays inline.
         assert!(
@@ -7140,7 +7093,7 @@ mod tests {
             ),
         ];
 
-        let (result, _consts, gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // Dedup persists across the block boundary (one gcref) ...
         assert_eq!(gcrefs, vec![r]);
@@ -7162,7 +7115,7 @@ mod tests {
             &[Operand::const_from_value(Value::Ref(r))],
         )];
 
-        let (result, _consts, gcrefs) = rw.rewrite_ops_with_constants(&ops, &ConstMap::default());
+        let (result, gcrefs) = rw.rewrite_ops_with_constants(&ops);
 
         // rewrite.py:105 `keep` — JIT_DEBUG keeps its constants inline.
         assert!(gcrefs.is_empty(), "JIT_DEBUG keeps its constants inline");

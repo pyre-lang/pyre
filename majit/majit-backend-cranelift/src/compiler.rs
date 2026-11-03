@@ -1092,12 +1092,11 @@ fn build_vec_float_oprefs(ops: &[OpRc], num_inputs: usize) -> IndexSet<u32> {
 fn resolve_opref_vec_int(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     vec_oprefs: &IndexSet<u32>,
     vec_float_oprefs: &IndexSet<u32>,
     opref: OpRef,
 ) -> CValue {
-    if let Some(c) = lookup_const_i64(constants, opref) {
+    if let Some(c) = lookup_const_i64(opref) {
         let scalar = builder.ins().iconst(cl_types::I64, c);
         return builder.ins().splat(cl_types::I64X2, scalar);
     }
@@ -1122,12 +1121,11 @@ fn resolve_opref_vec_int(
 fn resolve_opref_vec_float(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     vec_oprefs: &IndexSet<u32>,
     vec_float_oprefs: &IndexSet<u32>,
     opref: OpRef,
 ) -> CValue {
-    if let Some(c) = lookup_const_i64(constants, opref) {
+    if let Some(c) = lookup_const_i64(opref) {
         let scalar_i = builder.ins().iconst(cl_types::I64, c);
         let scalar_f = builder
             .ins()
@@ -4691,7 +4689,7 @@ extern "C" fn gc_jit_remember_young_pointer_from_array_shim(obj: u64) {
 thread_local! {
     static DECLARED_VARS_DEBUG: std::cell::RefCell<Option<indexmap::IndexSet<u32>>> = const { std::cell::RefCell::new(None) };
     /// Op-result variable positions: ops that define a result via def_var.
-    /// When an OpRef collides (in both constants map and op-result set),
+    /// When an OpRef is both an op-result and a Const-shaped encoding,
     /// the variable takes precedence over the constant.
     static OP_RESULT_VARS: std::cell::RefCell<Option<indexmap::IndexSet<u32>>> = const { std::cell::RefCell::new(None) };
     /// `assembler.py` `genop_load_from_gc_table` base for this compile.
@@ -4793,16 +4791,11 @@ fn opref_is_op_result_var(opref: OpRef) -> bool {
     })
 }
 
-/// Inline-first immediate lookup. Replaces `constants.get(&opref.raw()).copied()`
-/// at backend reader sites for arguments that may be inline-Const variants
-/// (history.py/268/314). For non-Const or legacy pool-indexed Const
-/// OpRefs, falls through to the pool snapshot.
+/// Immediate bits of an inline Const operand (`ConstInt.getint` /
+/// `convert_to_imm`). Non-Const operands return `None`.
 #[inline]
-fn lookup_const_i64(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> Option<i64> {
-    if let Some(v) = opref.inline_const_bits() {
-        return Some(v);
-    }
-    constants.get(&opref.raw()).copied()
+fn lookup_const_i64(opref: OpRef) -> Option<i64> {
+    opref.inline_const_bits()
 }
 
 /// Constant tid from the `gen_initialize_tid` / `gen_initialize_tid_keep_flags`
@@ -4811,36 +4804,24 @@ fn lookup_const_i64(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -> O
 /// Width is one machine word (`gen_initialize_tid`) or the type-id half
 /// (`gen_initialize_tid_keep_flags`); the fast path writes the tid as an
 /// I64 at `free` so the flags half is zero either way.
-fn following_nursery_tid(
-    malloc: &Op,
-    next: &Op,
-    constants: &indexmap::IndexMap<u32, i64>,
-) -> Option<i64> {
+fn following_nursery_tid(malloc: &Op, next: &Op) -> Option<i64> {
     if next.opcode != OpCode::GcStore || next.num_args() < 4 {
         return None;
     }
     if next.arg(0).to_opref() != malloc.pos().get() {
         return None;
     }
-    let offset = lookup_const_i64(constants, next.arg(1).to_opref())?;
+    let offset = lookup_const_i64(next.arg(1).to_opref())?;
     if offset != -(GcHeader::SIZE as i64) {
         return None;
     }
-    let width = lookup_const_i64(constants, next.arg(3).to_opref())?;
+    let width = lookup_const_i64(next.arg(3).to_opref())?;
     let word = std::mem::size_of::<usize>() as i64;
     let type_id_bytes = (TYPE_ID_BITS / 8) as i64;
     if width != word && width != type_id_bytes {
         return None;
     }
-    lookup_const_i64(constants, next.arg(2).to_opref())
-}
-
-fn missing_legacy_constant(opref: OpRef, where_: &str) -> ! {
-    panic!(
-        "{where_}: legacy constant {:?} has no constants-pool entry; \
-         OpRef::const_index() is a pool index, not the constant value",
-        opref
-    )
+    lookup_const_i64(next.arg(2).to_opref())
 }
 
 /// Resolve a non-Const operand that is expected to be bound to a declared
@@ -4894,7 +4875,6 @@ fn guard_constptr_immediate(opref: OpRef) {
 fn resolve_opref(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     opref: OpRef,
 ) -> CValue {
     // RPython parity (`llgraph/runner.py:1124, 1177`): both op args and
@@ -4916,18 +4896,14 @@ fn resolve_opref(
     // never fires for op-args; the guard is the shared `convert_to_imm`
     // parity check (null / non-moving ConstPtrs are baked directly).
     guard_constptr_immediate(opref);
-    // RPython boxes/inputargs are distinct from Consts even when pyre's
-    // compact OpRef numbering collides with an entry in the constant pool.
-    // Once an OpRef has a declared variable, the variable is authoritative.
+    // Boxes/inputargs are distinct from Consts. Once an OpRef has a
+    // declared variable, the variable is authoritative.
     let is_op_result = opref_is_op_result_var(opref);
     if is_op_result {
         return builder.use_var(var(opref_vars, opref.raw()));
     }
-    if let Some(c) = lookup_const_i64(constants, opref) {
+    if let Some(c) = lookup_const_i64(opref) {
         return builder.ins().iconst(cl_types::I64, c);
-    }
-    if opref.is_constant() {
-        missing_legacy_constant(opref, "resolve_opref");
     }
     // Every Box reaching codegen MUST be bound — an inputarg, a label arg, a
     // constant, or a previous op result (regalloc.py invariant). Pyre's
@@ -4940,11 +4916,10 @@ fn resolve_opref(
 fn resolve_binop(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     op: &Op,
 ) -> (CValue, CValue) {
-    let a = resolve_opref(builder, opref_vars, constants, op.arg(0).to_opref());
-    let b = resolve_opref(builder, opref_vars, constants, op.arg(1).to_opref());
+    let a = resolve_opref(builder, opref_vars, op.arg(0).to_opref());
+    let b = resolve_opref(builder, opref_vars, op.arg(1).to_opref());
     (a, b)
 }
 
@@ -5344,7 +5319,6 @@ mod longevity_last_usage_tests {
 fn emit_icmp(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     cc: IntCC,
     op: &Op,
     vi: u32,
@@ -5352,7 +5326,7 @@ fn emit_icmp(
     op_idx: usize,
     guard_success_cc: &mut Option<GuardSuccessCc>,
 ) {
-    let (a, b) = resolve_binop(builder, opref_vars, constants, op);
+    let (a, b) = resolve_binop(builder, opref_vars, op);
     // `assembler.py` `flush_cc`: a condition still pending here was
     // published by an earlier op and never consumed.
     debug_assert!(
@@ -5406,12 +5380,11 @@ fn brif_fail_first(
 fn emit_fcmp(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     cc: FloatCC,
     op: &Op,
     vi: u32,
 ) {
-    let (a, b) = resolve_binop(builder, opref_vars, constants, op);
+    let (a, b) = resolve_binop(builder, opref_vars, op);
     let fa = coerce_ty(builder, a, cl_types::F64);
     let fb = coerce_ty(builder, b, cl_types::F64);
     let cmp = builder.ins().fcmp(cc, fa, fb);
@@ -5534,10 +5507,9 @@ fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
 ///
 /// `is_rewriter_immediate_arg` mirrors the GC-rewriter convention
 /// used by `resolve_rewriter_immediate_i64`: a handful of opcodes
-/// encode numeric immediates (allocation sizes, scale factors) by
-/// stuffing the raw value directly into the OpRef field instead of
-/// going via the constant pool. Those args are NOT real OpRef
-/// references and must be skipped by the validator.
+/// encode numeric immediates (allocation sizes, scale factors) as
+/// Const operands (`RewriteState::const_int`). Those args are not
+/// live boxes and must be skipped by the validator.
 fn is_rewriter_immediate_arg(opcode: majit_ir::OpCode, arg_idx: usize) -> bool {
     use majit_ir::OpCode;
     match opcode {
@@ -5577,11 +5549,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
     )
 }
 
-fn validate_oprefs_for_compile(
-    inputargs: &[InputArgRc],
-    ops: &[OpRc],
-    constants: &majit_ir::ConstMap<majit_ir::Const>,
-) -> Result<(), BackendError> {
+fn validate_oprefs_for_compile(inputargs: &[InputArgRc], ops: &[OpRc]) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
     // RPython rewrite.py:397 + regalloc invariant: at the current op,
     // every dereferenced argument MUST be currently live (bound by an
@@ -5615,7 +5583,6 @@ fn validate_oprefs_for_compile(
             let bound = arg.is_none()
                 || arg.is_constant()
                 || arg.to_opref().inline_const_bits().is_some()
-                || constants.contains_key(&arg.to_opref().raw())
                 || is_rewriter_immediate_arg(op.opcode, 0)
                 || seen.contains(&arg.to_opref().raw());
             if !bound {
@@ -6471,7 +6438,6 @@ fn inject_builtin_string_descrs(ops: &[OpRc]) {
 fn resolve_opref_or_imm(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     known_values: &IndexSet<u32>,
     opref: OpRef,
 ) -> CValue {
@@ -6480,19 +6446,12 @@ fn resolve_opref_or_imm(
     }
     // x86/regalloc.py:58-61: refuse baking a movable non-null ConstPtr.
     guard_constptr_immediate(opref);
-    // Inline-Const fast path: history.py/268/314 — value lives on
-    // the Box, not in a side pool.
+    // Const operands carry their value inline (`ConstInt.getint`).
     if let Some(c) = opref.inline_const_bits() {
         return builder.ins().iconst(cl_types::I64, c);
     }
     if known_values.contains(&opref.raw()) || opref_is_op_result_var(opref) {
         return builder.use_var(var(opref_vars, opref.raw()));
-    }
-    if let Some(&c) = constants.get(&opref.raw()) {
-        return builder.ins().iconst(cl_types::I64, c);
-    }
-    if opref.is_constant() {
-        missing_legacy_constant(opref, "resolve_opref_or_imm");
     }
     use_declared_var_or_panic(builder, opref_vars, opref, "resolve_opref_or_imm")
 }
@@ -6514,7 +6473,6 @@ fn bridge_entry_indices(fail_arg_refs: &[OpRef]) -> Vec<usize> {
 fn resolve_failarg_opref(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
@@ -6560,7 +6518,7 @@ fn resolve_failarg_opref(
             .ins()
             .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, root_offset);
     }
-    resolve_opref(builder, opref_vars, constants, opref)
+    resolve_opref(builder, opref_vars, opref)
 }
 
 /// Resolve a local JUMP argument that is still a block parameter at its
@@ -6576,7 +6534,6 @@ fn resolve_failarg_opref(
 fn resolve_local_jump_arg(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     ptr_type: cl_types::Type,
     cached_jf_ptr: &mut Option<CValue>,
     demoted_failarg_slots: &IndexMap<u32, i32>,
@@ -6591,17 +6548,15 @@ fn resolve_local_jump_arg(
             .ins()
             .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, offset);
     }
-    resolve_opref(builder, opref_vars, constants, opref)
+    resolve_opref(builder, opref_vars, opref)
 }
 
 fn resolve_constant_i64(
-    constants: &indexmap::IndexMap<u32, i64>,
     known_values: &IndexSet<u32>,
     opcode: OpCode,
     opref: OpRef,
     what: &str,
 ) -> Result<i64, BackendError> {
-    // Inline-Const fast path: history.py/268/314.
     if let Some(c) = opref.inline_const_bits() {
         return Ok(c);
     }
@@ -6611,23 +6566,8 @@ fn resolve_constant_i64(
             &format!("{what} must be a compile-time constant"),
         ));
     }
-    if let Some(&c) = constants.get(&opref.raw()) {
-        return Ok(c);
-    }
-    if opref.is_constant() {
-        return Err(unsupported_semantics(
-            opcode,
-            &format!(
-                "{what}: legacy constant {:?} has no constants-pool entry; \
-                 OpRef::const_index() is a pool index, not the constant value",
-                opref
-            ),
-        ));
-    }
-    // Not a constant and not a bound operand. RPython regalloc `loc()` would
-    // KeyError (regalloc.py:611-622/95-103) — never bake the box's slot index
-    // as an immediate. Route to the recoverable unsupported-semantics path
-    // (InvalidLoop / blackhole) rather than miscompiling a position as a value.
+    // Not a constant and not a bound operand. regalloc `loc()` would
+    // KeyError — never bake the box's slot index as an immediate.
     Err(unsupported_semantics(
         opcode,
         &format!(
@@ -6639,7 +6579,6 @@ fn resolve_constant_i64(
 }
 
 fn resolve_rewriter_immediate_i64(
-    constants: &indexmap::IndexMap<u32, i64>,
     opcode: OpCode,
     opref: OpRef,
     what: &str,
@@ -6647,22 +6586,8 @@ fn resolve_rewriter_immediate_i64(
     if let Some(c) = opref.inline_const_bits() {
         return Ok(c);
     }
-    if let Some(&c) = constants.get(&opref.raw()) {
-        return Ok(c);
-    }
-    if opref.is_constant() {
-        return Err(unsupported_semantics(
-            opcode,
-            &format!(
-                "{what}: legacy constant {:?} has no constants-pool entry; \
-                 OpRef::const_index() is a pool index, not the constant value",
-                opref
-            ),
-        ));
-    }
-    // Not a constant and not a bound operand. RPython regalloc `loc()` would
-    // KeyError (regalloc.py:611-622/95-103) — never bake the box's slot index
-    // as an immediate. Route to the recoverable unsupported-semantics path.
+    // Not a constant and not a bound operand. regalloc `loc()` would
+    // KeyError — never bake the box's slot index as an immediate.
     Err(unsupported_semantics(
         opcode,
         &format!(
@@ -6842,33 +6767,31 @@ fn emit_store_to_addr(
 fn emit_dynamic_offset_addr(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     known_values: &IndexSet<u32>,
     base_arg: OpRef,
     offset_arg: OpRef,
 ) -> CValue {
-    let base = resolve_opref(builder, opref_vars, constants, base_arg);
+    let base = resolve_opref(builder, opref_vars, base_arg);
     // A zero offset addresses the base itself. `emit_scaled_index_addr`
     // already skips its own `base_offset == 0`; this path emitted
     // `iadd base, 0` instead, which every load of a fixed address carries —
     // the back-edge poll in each compiled loop among them.
-    if offset_arg.is_none() || lookup_const_i64(constants, offset_arg) == Some(0) {
+    if offset_arg.is_none() || lookup_const_i64(offset_arg) == Some(0) {
         return base;
     }
-    let offset = resolve_opref_or_imm(builder, opref_vars, constants, known_values, offset_arg);
+    let offset = resolve_opref_or_imm(builder, opref_vars, known_values, offset_arg);
     builder.ins().iadd(base, offset)
 }
 
 fn emit_scaled_index_addr(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     base_arg: OpRef,
     index_arg: OpRef,
     scale: i64,
 ) -> CValue {
-    let base = resolve_opref(builder, opref_vars, constants, base_arg);
-    let index = resolve_opref(builder, opref_vars, constants, index_arg);
+    let base = resolve_opref(builder, opref_vars, base_arg);
+    let index = resolve_opref(builder, opref_vars, index_arg);
     // `assembler.py` `_genop_gc_load_indexed` builds `addr_add(base, index,
     // offset, get_scale(itemsize))` — AddressLoc scale 0/1/2/3 for
     // itemsize 1/2/4/8. `_imul_const_scaled` only runs when the size is
@@ -6964,7 +6887,6 @@ fn spill_guard_fail_args(
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
     jf_ptr: CValue,
-    constants: &indexmap::IndexMap<u32, i64>,
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
     demoted_failarg_slots: &IndexMap<u32, i32>,
@@ -6992,16 +6914,12 @@ fn spill_guard_fail_args(
         {
             continue;
         }
-        let raw = if !arg_ref.is_constant()
-            && arg_ref.raw() == call_result
-            && !constants.contains_key(&arg_ref.raw())
-        {
+        let raw = if !arg_ref.is_constant() && arg_ref.raw() == call_result {
             builder.ins().iconst(cl_types::I64, 0)
         } else {
             resolve_failarg_opref(
                 builder,
                 opref_vars,
-                constants,
                 jf_ptr,
                 ref_root_slots,
                 stale_ref_vars,
@@ -7264,11 +7182,7 @@ fn allocate_gcmap(live_bit_positions: &[usize]) -> i64 {
 /// so the binding is kept here instead. A slot is rebound on every publish, so
 /// the newest writer owns it; a Const fail-arg carries its value inline
 /// (history.py:227/268/314) and binds nothing.
-fn bind_published_dense_refs(
-    dense_ref_bindings: &mut IndexMap<usize, Operand>,
-    info: &GuardInfo,
-    constants: &IndexMap<u32, i64>,
-) {
+fn bind_published_dense_refs(dense_ref_bindings: &mut IndexMap<usize, Operand>, info: &GuardInfo) {
     for (index, arg_box) in info.fail_arg_boxes.iter().enumerate() {
         // An arg read from its call spill slot is not published here, so
         // this publish neither binds nor unbinds anything for it.
@@ -7286,11 +7200,7 @@ fn bind_published_dense_refs(
         // frame location replaces the location's previous occupant.  The raw
         // dense store does the same even when the new value is Int or Float,
         // so an earlier Ref binding must not survive that store.
-        if !info.failarg_ref_slots.contains(&slot)
-            || arg_ref.is_none()
-            || arg_ref.is_constant()
-            || constants.contains_key(&arg_ref.raw())
-        {
+        if !info.failarg_ref_slots.contains(&slot) || arg_ref.is_none() || arg_ref.is_constant() {
             dense_ref_bindings.swap_remove(&slot);
             continue;
         }
@@ -7680,7 +7590,7 @@ fn emit_collecting_gc_call(
         return_type,
     );
 
-    // _reload_frame_if_necessary (assembler.py:405-412)
+    // _reload_frame_if_necessary (assembler.py)
     let new_jf_ptr = emit_reload_frame_if_necessary(module, builder, ptr_type, call_conv);
     emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
     reload_ref_roots(
@@ -7771,7 +7681,6 @@ fn emit_indirect_call_from_parts(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     func_ref: OpRef,
     arg_refs: &[OpRef],
     call_descr: &dyn CallDescr,
@@ -7795,7 +7704,7 @@ fn emit_indirect_call_from_parts(
 
     let mut args: Vec<CValue> = Vec::with_capacity(arg_refs.len());
     for (i, &arg_ref) in arg_refs.iter().enumerate() {
-        let raw = resolve_opref(builder, opref_vars, constants, arg_ref);
+        let raw = resolve_opref(builder, opref_vars, arg_ref);
         if i < arg_types.len() && arg_types[i] == Type::Float {
             args.push(coerce_ty(builder, raw, cl_types::F64));
         } else {
@@ -7825,7 +7734,7 @@ fn emit_indirect_call_from_parts(
             // A bakeable callee address is a host/C function (the same class
             // `convert_to_imm` allows). Direct `call` avoids loading the
             // address into a register for `call_indirect` on every residual.
-            if let Some(addr) = lookup_const_i64(constants, func_ref).filter(|&c| c != 0) {
+            if let Some(addr) = lookup_const_i64(func_ref).filter(|&c| c != 0) {
                 let name = format!("host_{:x}", addr as u64 as usize);
                 let func_id = module
                     .declare_function(&name, Linkage::Import, &sig)
@@ -7834,7 +7743,7 @@ fn emit_indirect_call_from_parts(
                 builder.ins().call(fref, &args)
             } else {
                 let sig_ref = builder.import_signature(sig);
-                let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
+                let func_ptr_raw = resolve_opref(builder, opref_vars, func_ref);
                 let func_ptr = if ptr_type != cl_types::I64 {
                     builder.ins().ireduce(ptr_type, func_ptr_raw)
                 } else {
@@ -7883,7 +7792,6 @@ fn emit_cond_call_slowpath_call(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     func_ref: OpRef,
     arg_refs: &[OpRef],
     call_descr: &dyn CallDescr,
@@ -7899,7 +7807,7 @@ fn emit_cond_call_slowpath_call(
     stub_addr: usize,
 ) {
     let mut stub_args: Vec<CValue> = Vec::with_capacity(1 + arg_refs.len());
-    let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
+    let func_ptr_raw = resolve_opref(builder, opref_vars, func_ref);
     let func_ptr = if ptr_type != cl_types::I64 {
         builder.ins().ireduce(ptr_type, func_ptr_raw)
     } else {
@@ -7907,7 +7815,7 @@ fn emit_cond_call_slowpath_call(
     };
     stub_args.push(func_ptr);
     for &arg_ref in arg_refs {
-        let raw = resolve_opref(builder, opref_vars, constants, arg_ref);
+        let raw = resolve_opref(builder, opref_vars, arg_ref);
         stub_args.push(coerce_ty(builder, raw, cl_types::I64));
     }
 
@@ -8960,10 +8868,9 @@ fn record_entry_resident_failargs(
 fn reduce_accum_to_scalar(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     accum: &AccumInfo,
 ) -> CValue {
-    let vec_val = resolve_opref(builder, opref_vars, constants, accum.location);
+    let vec_val = resolve_opref(builder, opref_vars, accum.location);
     let val_type = builder.func.dfg.value_type(vec_val);
     if val_type == cl_types::F64X2 {
         // _accum_reduce_sum (vector_ext.py): HADDPD
@@ -9088,7 +8995,6 @@ fn emit_guard_exit(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     jf_ptr: CValue,
     info: &mut GuardInfo,
     ref_root_slots: &[(u32, usize)],
@@ -9176,7 +9082,6 @@ fn emit_guard_exit(
             module,
             builder,
             opref_vars,
-            constants,
             shared_jf,
             info,
             &skip_store,
@@ -9199,7 +9104,6 @@ fn emit_guard_exit(
         module,
         builder,
         opref_vars,
-        constants,
         jf_ptr,
         info,
         &skip_store,
@@ -9263,7 +9167,6 @@ fn emit_failarg_stores(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
-    constants: &indexmap::IndexMap<u32, i64>,
     jf_ptr: CValue,
     info: &GuardInfo,
     skip_store: &[bool],
@@ -9305,7 +9208,7 @@ fn emit_failarg_stores(
             // resume.py:28 + vector_ext.py:130: accum_info.location = vector SSA
             // resume.py + vector_ext.py:132: accum_info.getoriginal() → scalar
             // type info only
-            let reduced = reduce_accum_to_scalar(builder, opref_vars, constants, accum);
+            let reduced = reduce_accum_to_scalar(builder, opref_vars, accum);
             pairs.push((offset, reduced));
         } else if skip_store.get(slot).copied().unwrap_or(false) {
             // Already at the frame home `rd_locs` names. Copying it into
@@ -9318,7 +9221,6 @@ fn emit_failarg_stores(
             let val = resolve_failarg_opref(
                 builder,
                 opref_vars,
-                constants,
                 jf_ptr,
                 ref_root_slots,
                 stale_ref_vars,
@@ -9336,7 +9238,6 @@ fn emit_failarg_stores(
         let val = resolve_failarg_opref(
             builder,
             opref_vars,
-            constants,
             jf_ptr,
             ref_root_slots,
             stale_ref_vars,
@@ -9444,12 +9345,10 @@ fn opcode_excluded_from_merge(opcode: OpCode) -> bool {
         || opcode.is_call_release_gil()
 }
 
-/// Whether `(constants, ops)` can be retained for a later merged recompile
+/// Whether `ops` can be retained for a later merged recompile
 /// (`assembler.py patch_jump_for_descr`).
 ///
 /// Exclusions, any one of which keeps today's separate functions:
-/// - `constants_nonempty`: the codegen pool `CraneliftBackend::constants`
-///   (`set_constants` / `set_constants_pool`) held a value for this compile
 /// - `GUARD_EXCEPTION` / `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2`
 ///   (`merge_excluded_guard`). `GUARD_NO_EXCEPTION` stays eligible.
 /// - any `CALL_MAY_FORCE_*` (`OpCode::is_call_may_force`),
@@ -9457,10 +9356,7 @@ fn opcode_excluded_from_merge(opcode: OpCode) -> bool {
 ///   `CALL_RELEASE_GIL_*` (`OpCode::is_call_release_gil`)
 /// - any vector opcode (`opcode_is_vector`: `is_vec_producing_opcode` and
 ///   the other `Vec*` opcodes the emitter matches)
-fn merge_source_eligible(constants_nonempty: bool, ops: &[OpRc]) -> bool {
-    if constants_nonempty {
-        return false;
-    }
+fn merge_source_eligible(ops: &[OpRc]) -> bool {
     ops.iter().all(|op| !opcode_excluded_from_merge(op.opcode))
 }
 
@@ -11347,12 +11243,6 @@ pub struct CraneliftBackend {
     /// the CFG/domtree/regalloc scratch should live across functions
     /// instead of being allocated per `define_function`.
     clif_ctx: Context,
-    /// Constant pool keyed by OpRef raw index. Each `Const` carries its
-    /// own value and type (`rewrite.py:930` `v.type`), so codegen reads
-    /// the raw `i64` via `as_raw_i64()` and the GC rewriter reads the
-    /// `v.type == 'r'` discriminant via `get_type()` — no separate
-    /// type side-table.
-    constants: majit_ir::ConstMap<majit_ir::Const>,
     /// compile.py: self.metainterp_sd.callinfocollection — used by
     /// recovery_layout building for VStr/VUni Concat/Slice func ptr
     /// lookups (resume.py concat_strings).
@@ -11405,18 +11295,6 @@ impl Default for CraneliftBackend {
 }
 
 impl CraneliftBackend {
-    /// Legacy test-only entry point.  Production code passes the typed
-    /// pool through `Backend::set_constants_pool`; this raw-`i64`
-    /// helper is retained for in-crate tests that construct
-    /// `IndexMap<u32, i64>` literals by hand. Each raw value is wrapped
-    /// as a `ConstInt` — the only constant kind these fixtures build.
-    pub fn set_constants(&mut self, constants: indexmap::IndexMap<u32, i64>) {
-        self.constants = constants
-            .iter()
-            .map(|(&k, &v)| (k, majit_ir::Const::Int(v)))
-            .collect();
-    }
-
     /// llmodel.py read_int_at_mem(gcref, ofs, size, sign).
     ///
     /// TODO: RPython's `llop.raw_load(STYPE, gcref, ofs)`
@@ -11604,7 +11482,6 @@ impl CraneliftBackend {
             module,
             func_ctx,
             clif_ctx,
-            constants: majit_ir::ConstMap::default(),
             callinfocollection: None,
             func_counter: 0,
             trace_counter: 1,
@@ -11738,10 +11615,9 @@ impl CraneliftBackend {
     /// dynasm backend so backend-agnostic consumers can call it uniformly.
     pub fn set_new_via_gc(&mut self, _enabled: bool) {}
 
-    // `set_constants_pool`, `set_next_trace_id`, `set_next_header_pc`
-    // are provided via the `Backend` trait impl below so
-    // `compile_tmp_callback` and other backend-agnostic consumers can
-    // reach them through `&mut dyn Backend`.
+    // `set_next_trace_id`, `set_next_header_pc` are provided via the
+    // `Backend` trait impl below so `compile_tmp_callback` and other
+    // backend-agnostic consumers can reach them through `&mut dyn Backend`.
 
     /// Built unconditionally, for the reasons spelled out on the dynasm
     /// backend's `gc_rewriter`: `x86/regalloc.py:187` calls
@@ -11900,10 +11776,10 @@ impl CraneliftBackend {
         inject_builtin_string_descrs(ops);
         {
             let rewriter = self.gc_rewriter();
-            // `RewriteState::const_int` emits fresh `ConstInt`s inline, so
-            // the borrowed pool is not extended. The rewriter emits `OpRc`
-            // producers whose consumers' args point at them.
-            rewriter.rewrite_for_gc_with_constants(ops, &self.constants)
+            // `RewriteState::const_int` emits fresh `ConstInt`s inline.
+            // The rewriter emits `OpRc` producers whose consumers' args
+            // point at them.
+            rewriter.rewrite_for_gc_with_constants(ops)
         }
     }
 
@@ -11932,8 +11808,7 @@ impl CraneliftBackend {
         }
         parts.push(&ops[cursor..]);
         let rewriter = self.gc_rewriter();
-        let Some((rewritten, gcrefs)) = rewriter.rewrite_for_gc_segments(&parts, &self.constants)
-        else {
+        let Some((rewritten, gcrefs)) = rewriter.rewrite_for_gc_segments(&parts) else {
             return Err(BackendError::CompilationFailed(
                 "gc rewriter has no segmented rewrite".into(),
             ));
@@ -12349,7 +12224,7 @@ impl CraneliftBackend {
         // back to the blackhole resume path. This pre-pass replaces
         // the silent `iconst(0)` fallback that previously turned
         // undefined OpRefs into runtime SIGSEGVs.
-        validate_oprefs_for_compile(inputargs, ops, &self.constants)?;
+        validate_oprefs_for_compile(inputargs, ops)?;
         // A merged recompile keeps the loop's trace id and does not consume
         // the one-shot `next_trace_id` / `next_header_pc` the bridge compile
         // already took.
@@ -12469,13 +12344,6 @@ impl CraneliftBackend {
         let mut guard_infos: Vec<GuardInfo> = Vec::new();
         let mut max_output_slots: usize = 0;
         let attached_descrs = self.attached_descr_ptrs();
-        // Guard fail-arg resolution emits `iconst` from constant values,
-        // so it reads the raw `i64` projection of the pool.
-        let constants_i64: indexmap::IndexMap<u32, i64> = self
-            .constants
-            .iter()
-            .map(|(&k, c)| (k, c.as_raw_i64()))
-            .collect();
         let num_inputs = inputargs.len();
         let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
@@ -12708,7 +12576,6 @@ impl CraneliftBackend {
             &mut guard_infos,
             &mut max_output_slots,
             trace_id,
-            &constants_i64,
             attached_descrs,
             merge.is_some(),
             &fail_arg_homes,
@@ -12902,17 +12769,8 @@ impl CraneliftBackend {
         // attached descr pointer at compile time so the OpCode::CheckMemoryError
         // emitter can stamp it into `jf_descr` instead of unconditionally
         // trapping (`_build_propagate_exception_path` parity, x86/aarch64
-        // assembler.py:328-345 / :559-577).  Snapshot taken before
-        // `std::mem::take(&mut self.constants)` so `&self` is available.
+        // assembler.py).
         let propagate_exception_descr_ptr = self.attached_descr_ptrs().propagate_exception_descr;
-
-        // Take constants out of self to avoid borrow conflicts with func_ctx.
-        // SSA emission reads raw `i64` values (`iconst`), so project the
-        // typed pool to its `as_raw_i64()` view for the rest of codegen.
-        let constants: indexmap::IndexMap<u32, i64> = std::mem::take(&mut self.constants)
-            .iter()
-            .map(|(&k, c)| (k, c.as_raw_i64()))
-            .collect();
 
         // Recursive tracing/bridge compilation can re-enter backend compilation
         // before an outer compile has restored its frontend context. Mirror the
@@ -13367,10 +13225,7 @@ impl CraneliftBackend {
                 if arg.is_constant() {
                     continue;
                 }
-                if !arg.is_none()
-                    && !declared_vars.contains(&arg.to_opref().raw())
-                    && !constants.contains_key(&arg.to_opref().raw())
-                {
+                if !arg.is_none() && !declared_vars.contains(&arg.to_opref().raw()) {
                     declared_vars.insert(arg.to_opref().raw());
                     if debug_declares {
                         eprintln!(
@@ -14027,12 +13882,7 @@ impl CraneliftBackend {
                                     is_demoted_failarg(&demoted_failarg_slots, raw);
                                 if !already_demoted {
                                     let opref = label_args[i].to_opref();
-                                    let v = resolve_opref(
-                                        &mut builder,
-                                        &opref_var_map,
-                                        &constants,
-                                        opref,
-                                    );
+                                    let v = resolve_opref(&mut builder, &opref_var_map, opref);
                                     let v = coerce_ty(&mut builder, v, cl_types::I64);
                                     builder.ins().store(MemFlagsData::new(), v, cur_jf, ofs);
                                 }
@@ -14049,8 +13899,7 @@ impl CraneliftBackend {
                             let label_args = ops[op_idx].getarglist();
                             for &(i, raw, home_ofs) in positions {
                                 let opref = label_args[i].to_opref();
-                                let v =
-                                    resolve_opref(&mut builder, &opref_var_map, &constants, opref);
+                                let v = resolve_opref(&mut builder, &opref_var_map, opref);
                                 let v = coerce_ty(&mut builder, v, cl_types::I64);
                                 builder
                                     .ins()
@@ -14083,7 +13932,6 @@ impl CraneliftBackend {
                                 let value = resolve_local_jump_arg(
                                     &mut builder,
                                     &opref_var_map,
-                                    &constants,
                                     ptr_type,
                                     &mut seed_jf_ptr,
                                     &demoted_failarg_slots,
@@ -14110,7 +13958,6 @@ impl CraneliftBackend {
                                 resolve_local_jump_arg(
                                     &mut builder,
                                     &opref_var_map,
-                                    &constants,
                                     ptr_type,
                                     &mut fallthrough_jf_ptr,
                                     &demoted_failarg_slots,
@@ -14230,13 +14077,9 @@ impl CraneliftBackend {
                         }
                         let param = builder.block_params(*label_block)[param_idx];
                         param_idx += 1;
-                        // Inline-Const (history.py/268/314) and legacy
-                        // idx-Const args carry value, not a body-namespace
-                        // slot — skip def_var/sync.
-                        if !arg_ref.is_none()
-                            && !arg_ref.is_constant()
-                            && !constants.contains_key(&arg_ref.to_opref().raw())
-                        {
+                        // Const args (`Const.is_constant`) carry value, not a
+                        // body-namespace slot — skip def_var/sync.
+                        if !arg_ref.is_none() && !arg_ref.is_constant() {
                             let raw = arg_ref.to_opref().raw();
                             builder.def_var(var(&opref_var_map, raw), param);
                             if is_demoted_failarg(&demoted_failarg_slots, raw) {
@@ -14426,17 +14269,17 @@ impl CraneliftBackend {
             match op.opcode {
                 // ── Integer arithmetic ──
                 OpCode::IntAdd => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().iadd(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntSub => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().isub(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntMul => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().imul(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
@@ -14449,106 +14292,81 @@ impl CraneliftBackend {
                 // For mul we use a widening approach: sign-extend to i128
                 // then check if the result fits in i64.
                 OpCode::IntAddOvf => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let (r, of) = builder.ins().sadd_overflow(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                     last_ovf_flag = Some(of);
                 }
                 OpCode::IntSubOvf => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let (r, of) = builder.ins().ssub_overflow(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                     last_ovf_flag = Some(of);
                 }
                 OpCode::IntMulOvf => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let (r, of) = builder.ins().smul_overflow(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                     last_ovf_flag = Some(of);
                 }
                 OpCode::IntAnd => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().band(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntOr => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().bor(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntXor => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().bxor(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntLshift => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().ishl(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntRshift => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().sshr(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::UintRshift => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let r = builder.ins().ushr(a, b);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
 
                 // ── Unary integer ──
                 OpCode::IntNeg => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let r = builder.ins().ineg(a);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntInvert => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let r = builder.ins().bnot(a);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntIsZero => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::Equal, a, zero);
                     let r = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntIsTrue => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
                     let r = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::IntForceGeZero => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, zero);
                     let r = builder.ins().select(cmp, zero, a);
@@ -14556,24 +14374,9 @@ impl CraneliftBackend {
                 }
                 OpCode::IntBetween => {
                     // int_between(a, b, c) => a <= b < c
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let b = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
-                    let c = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
+                    let c = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
                     let cmp1 = builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b);
                     let cmp2 = builder.ins().icmp(IntCC::SignedLessThan, b, c);
                     let both = builder.ins().band(cmp1, cmp2);
@@ -14585,7 +14388,6 @@ impl CraneliftBackend {
                 OpCode::IntLt => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::SignedLessThan,
                     op,
                     vi,
@@ -14596,7 +14398,6 @@ impl CraneliftBackend {
                 OpCode::IntLe => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::SignedLessThanOrEqual,
                     op,
                     vi,
@@ -14607,7 +14408,6 @@ impl CraneliftBackend {
                 OpCode::IntEq => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::Equal,
                     op,
                     vi,
@@ -14618,7 +14418,6 @@ impl CraneliftBackend {
                 OpCode::IntNe => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::NotEqual,
                     op,
                     vi,
@@ -14629,7 +14428,6 @@ impl CraneliftBackend {
                 OpCode::IntGt => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::SignedGreaterThan,
                     op,
                     vi,
@@ -14640,7 +14438,6 @@ impl CraneliftBackend {
                 OpCode::IntGe => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::SignedGreaterThanOrEqual,
                     op,
                     vi,
@@ -14651,7 +14448,6 @@ impl CraneliftBackend {
                 OpCode::UintLt => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::UnsignedLessThan,
                     op,
                     vi,
@@ -14662,7 +14458,6 @@ impl CraneliftBackend {
                 OpCode::UintLe => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::UnsignedLessThanOrEqual,
                     op,
                     vi,
@@ -14673,7 +14468,6 @@ impl CraneliftBackend {
                 OpCode::UintGt => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::UnsignedGreaterThan,
                     op,
                     vi,
@@ -14684,7 +14478,6 @@ impl CraneliftBackend {
                 OpCode::UintGe => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::UnsignedGreaterThanOrEqual,
                     op,
                     vi,
@@ -14697,7 +14490,6 @@ impl CraneliftBackend {
                 OpCode::PtrEq | OpCode::InstancePtrEq => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::Equal,
                     op,
                     vi,
@@ -14708,7 +14500,6 @@ impl CraneliftBackend {
                 OpCode::PtrNe | OpCode::InstancePtrNe => emit_icmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     IntCC::NotEqual,
                     op,
                     vi,
@@ -14718,50 +14509,26 @@ impl CraneliftBackend {
                 ),
 
                 // ── Float comparisons ──
-                OpCode::FloatLt => emit_fcmp(
-                    &mut builder,
-                    &opref_var_map,
-                    &constants,
-                    FloatCC::LessThan,
-                    op,
-                    vi,
-                ),
+                OpCode::FloatLt => {
+                    emit_fcmp(&mut builder, &opref_var_map, FloatCC::LessThan, op, vi)
+                }
                 OpCode::FloatLe => emit_fcmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     FloatCC::LessThanOrEqual,
                     op,
                     vi,
                 ),
-                OpCode::FloatEq => emit_fcmp(
-                    &mut builder,
-                    &opref_var_map,
-                    &constants,
-                    FloatCC::Equal,
-                    op,
-                    vi,
-                ),
-                OpCode::FloatNe => emit_fcmp(
-                    &mut builder,
-                    &opref_var_map,
-                    &constants,
-                    FloatCC::NotEqual,
-                    op,
-                    vi,
-                ),
-                OpCode::FloatGt => emit_fcmp(
-                    &mut builder,
-                    &opref_var_map,
-                    &constants,
-                    FloatCC::GreaterThan,
-                    op,
-                    vi,
-                ),
+                OpCode::FloatEq => emit_fcmp(&mut builder, &opref_var_map, FloatCC::Equal, op, vi),
+                OpCode::FloatNe => {
+                    emit_fcmp(&mut builder, &opref_var_map, FloatCC::NotEqual, op, vi)
+                }
+                OpCode::FloatGt => {
+                    emit_fcmp(&mut builder, &opref_var_map, FloatCC::GreaterThan, op, vi)
+                }
                 OpCode::FloatGe => emit_fcmp(
                     &mut builder,
                     &opref_var_map,
-                    &constants,
                     FloatCC::GreaterThanOrEqual,
                     op,
                     vi,
@@ -14777,9 +14544,7 @@ impl CraneliftBackend {
                         {
                             record_gc_table_var(vi, table_index);
                         }
-                        resolve_opref(&mut builder, &opref_var_map, &constants, src)
-                    } else if let Some(&c) = constants.get(&vi) {
-                        builder.ins().iconst(cl_types::I64, c)
+                        resolve_opref(&mut builder, &opref_var_map, src)
                     } else {
                         builder.ins().iconst(cl_types::I64, 0)
                     };
@@ -14803,12 +14568,7 @@ impl CraneliftBackend {
                 // ptr(-17) -> cast_ptr_to_int == -17` expects strict
                 // identity through the compiled trace.
                 OpCode::CastPtrToInt | OpCode::CastIntToPtr => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     builder.def_var(var(&opref_var_map, vi), a);
                 }
 
@@ -14847,12 +14607,8 @@ impl CraneliftBackend {
                         }
                         implement_guard(&mut builder, pending, exit_block, cont_block);
                     } else {
-                        let cond = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let cond =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let fail_on_zero =
                             matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardNonnull);
                         brif_fail_first(&mut builder, cond, fail_on_zero, exit_block, cont_block);
@@ -14865,7 +14621,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -14887,7 +14642,7 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -14910,7 +14665,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -14938,11 +14692,10 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let (obj, expected_class) =
-                        resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (obj, expected_class) = resolve_binop(&mut builder, &opref_var_map, op);
                     // x86/assembler.py:1887 assert isinstance(loc_classptr, ImmedLoc)
-                    // — pre-fetch the classptr immediate from the constant pool.
-                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1).to_opref());
+                    // — classptr is a Const (`ConstInt.getint`).
+                    let expected_classptr_imm = lookup_const_i64(op.arg(1).to_opref());
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -14973,7 +14726,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -14995,9 +14747,8 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let (obj, expected_class) =
-                        resolve_binop(&mut builder, &opref_var_map, &constants, op);
-                    let expected_classptr_imm = lookup_const_i64(&constants, op.arg(1).to_opref());
+                    let (obj, expected_class) = resolve_binop(&mut builder, &opref_var_map, op);
+                    let expected_classptr_imm = lookup_const_i64(op.arg(1).to_opref());
                     let zero = builder.ins().iconst(ptr_type, 0);
                     let exit_block = builder.create_block();
                     mark_exit_cold(
@@ -15038,7 +14789,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15094,7 +14844,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15123,12 +14872,8 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let expected_type = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let expected_type =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // Inline: load pos_exception (exc type)
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     let exc_type = builder.ins().load(
@@ -15161,7 +14906,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15233,7 +14977,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15281,7 +15024,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15340,7 +15082,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15407,7 +15148,6 @@ impl CraneliftBackend {
                         let raw = resolve_failarg_opref(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             cur_jf,
                             &ref_root_slots,
                             &stale_ref_vars,
@@ -15484,7 +15224,6 @@ impl CraneliftBackend {
                             module,
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             cur_jf,
                             info,
                             &ref_root_slots,
@@ -15509,12 +15248,7 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let cond = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let cond = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -15535,7 +15269,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15563,7 +15296,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15590,18 +15322,9 @@ impl CraneliftBackend {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let obj_ptr = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let expected_tid = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let obj_ptr = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let expected_tid =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
 
                     // Load header word from obj_ptr - GcHeader::SIZE
                     let hdr_addr = builder.ins().iadd_imm_s(obj_ptr, -(GcHeader::SIZE as i64));
@@ -15636,7 +15359,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15689,12 +15411,8 @@ impl CraneliftBackend {
                          installed a TYPE_INFO layout)"
                     );
 
-                    let loc_object = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let loc_object =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // assembler.py MOV32 loc_typeid, mem(loc_object, 0).
                     // majit's GC header sits at `obj - GcHeader::SIZE`
                     // (see the GuardGcType arm above); the typeid occupies
@@ -15762,7 +15480,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15820,19 +15537,13 @@ impl CraneliftBackend {
                          installed a TYPE_INFO / rclass.CLASSTYPE layout)"
                     );
 
-                    let loc_object = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let loc_object =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // assembler.py:1971 vtable_ptr = loc_check_against_class
                     //   .getint(): the bounds are resolved at codegen time,
-                    //   so arg1 must be an immediate class pointer. Inline-Const
-                    //   carries the value on the OpRef (history.py:227); fall
-                    //   through to the legacy pool snapshot for idx-Const.
-                    let loc_check_against_class =
-                        lookup_const_i64(&constants, op.arg(1).to_opref()).unwrap_or_else(|| {
+                    //   so arg1 must be an immediate class pointer.
+                    let loc_check_against_class = lookup_const_i64(op.arg(1).to_opref())
+                        .unwrap_or_else(|| {
                             panic!(
                                 "x86/assembler.py:1971 vtable_ptr = \
                                  loc_check_against_class.getint(): \
@@ -15937,7 +15648,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -15993,18 +15703,9 @@ impl CraneliftBackend {
                     // x86/assembler.py _restore_exception:
                     //   MOV [pos_exc_value], excvalloc
                     //   MOV [pos_exception], exctploc
-                    let exc_type = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let value = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let exc_type =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let value = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
                     let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
                     builder
@@ -16019,12 +15720,7 @@ impl CraneliftBackend {
                     // — emit `is_null?` branch into the propagate path (a tail
                     // that mirrors `_build_propagate_exception_path`,
                     // x86/assembler.py / aarch64/assembler.py).
-                    let ptr_val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let ptr_val = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     emit_memory_error_check(
                         &mut builder,
                         ptr_type,
@@ -16060,12 +15756,7 @@ impl CraneliftBackend {
                     // is an inline sqrt, not a residual call.
                     if call_descr.get_extra_info().oopspecindex == majit_ir::OopSpecIndex::MathSqrt
                     {
-                        let a = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let a = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         let fa = coerce_ty(&mut builder, a, cl_types::F64);
                         let fr = builder.ins().sqrt(fa);
                         let want = var_types.get(&vi).copied().unwrap_or(cl_types::F64);
@@ -16078,7 +15769,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         &op.getarglist()[1..]
                             .iter()
@@ -16208,25 +15898,20 @@ impl CraneliftBackend {
                             ptr_type,
                             call_conv,
                             cur_jf,
-                            &constants,
                             &ref_root_slots,
                             &stale_ref_vars,
                             &demoted_failarg_slots,
                             ref_root_base_ofs,
                         );
-                        bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
+                        bind_published_dense_refs(&mut dense_ref_bindings, info);
                     }
 
                     // rewrite.py gen_malloc_frame parity:
                     // Allocate callee jitframe from nursery (heap), not stack.
                     // The callee's prologue pushes jf_ptr onto shadow stack,
                     // so GC tracks it during callee execution. After return,
-                    let args_ptr = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let args_ptr =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let args_data_ptr = builder
                         .ins()
                         .iadd_imm_s(args_ptr, JF_FRAME_ITEM0_OFS as i64);
@@ -16698,13 +16383,12 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         cur_jf,
-                        &constants,
                         &ref_root_slots,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
-                    bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
+                    bind_published_dense_refs(&mut dense_ref_bindings, info);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
                     // x86/assembler.py: self._genop_call(op, arglocs, result_loc)
@@ -16717,7 +16401,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         &op.getarglist()[1..]
                             .iter()
@@ -16791,13 +16474,12 @@ impl CraneliftBackend {
                         ptr_type,
                         call_conv,
                         cur_jf,
-                        &constants,
                         &ref_root_slots,
                         &stale_ref_vars,
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                     );
-                    bind_published_dense_refs(&mut dense_ref_bindings, info, &constants);
+                    bind_published_dense_refs(&mut dense_ref_bindings, info);
                     let call_jf = builder.ins().get_pinned_reg(ptr_type);
 
                     let descr = op
@@ -16855,14 +16537,10 @@ impl CraneliftBackend {
                     // `backend-dynasm/x86/assembler.rs`.
                     // `op.arg(0)` is the `save_err` constant
                     // `write_real_errno` / `read_real_errno` act on.
-                    let save_err = lookup_const_i64(&constants, op.arg(0).to_opref())
+                    let save_err = lookup_const_i64(op.arg(0).to_opref())
                         .expect("call_release_gil save_err must be a constant");
-                    let func_ptr_raw = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let func_ptr_raw =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let func_ptr_val = if ptr_type != cl_types::I64 {
                         builder.ins().ireduce(ptr_type, func_ptr_raw)
                     } else {
@@ -16871,12 +16549,7 @@ impl CraneliftBackend {
 
                     let mut args: Vec<CValue> = Vec::with_capacity(op.num_args() - 2);
                     for (i, arg_ref) in op.getarglist()[2..].iter().enumerate() {
-                        let raw = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            arg_ref.to_opref(),
-                        );
+                        let raw = resolve_opref(&mut builder, &opref_var_map, arg_ref.to_opref());
                         if i < arg_types.len() && arg_types[i] == Type::Float {
                             args.push(coerce_ty(&mut builder, raw, cl_types::F64));
                         } else {
@@ -16973,12 +16646,8 @@ impl CraneliftBackend {
                         let take = builder.ins().icmp(pending.cc, pending.lhs, pending.rhs);
                         builder.ins().brif(take, call_block, &[], cont_block, &[]);
                     } else {
-                        let cond = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let cond =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         builder.ins().brif(cond, call_block, &[], cont_block, &[]);
                     }
 
@@ -16999,7 +16668,6 @@ impl CraneliftBackend {
                                 module,
                                 &mut builder,
                                 &opref_var_map,
-                                &constants,
                                 func_ref,
                                 &arg_refs,
                                 call_descr,
@@ -17019,7 +16687,6 @@ impl CraneliftBackend {
                                 module,
                                 &mut builder,
                                 &opref_var_map,
-                                &constants,
                                 func_ref,
                                 &arg_refs,
                                 call_descr,
@@ -17056,12 +16723,7 @@ impl CraneliftBackend {
                 // op fills a lazily-computed cache, so a non-zero value is the
                 // already-computed answer and the call is what fills it.
                 OpCode::CondCallValueI | OpCode::CondCallValueR => {
-                    let cond = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let cond = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let call_block = builder.create_block();
                     // Same out-of-line slow path as COND_CALL (`genop_cond_call_value_i`).
                     builder.set_cold_block(call_block);
@@ -17096,7 +16758,6 @@ impl CraneliftBackend {
                             module,
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             op.arg(1).to_opref(),
                             &op.getarglist()[2..]
                                 .iter()
@@ -17142,7 +16803,6 @@ impl CraneliftBackend {
                     let size = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(0).to_opref(),
                     );
@@ -17357,17 +17017,12 @@ impl CraneliftBackend {
                         let (nf_addr, nt_addr) =
                             gc_nursery_addrs.ok_or_else(|| missing_gc_runtime(op.opcode))?;
                         let flags = MemFlagsData::trusted();
-                        // history.py ConstInt.value inline — read directly
-                        // from `OpRef::ConstInt(v)`, fall through to the
-                        // legacy pool for `OpRef::ConstInt(idx)` arms.
-                        let size_val =
-                            op.arg(0).to_opref().inline_const_bits().unwrap_or_else(|| {
-                                constants
-                                    .get(&op.arg(0).to_opref().raw())
-                                    .copied()
-                                    .unwrap_or(op.arg(0).to_opref().raw() as i64)
-                            });
-                        let size_total = builder.ins().iconst(cl_types::I64, size_val);
+                        let size_total = resolve_opref_or_imm(
+                            &mut builder,
+                            &opref_var_map,
+                            &known_values,
+                            op.arg(0).to_opref(),
+                        );
                         let nf_ptr = builder.ins().iconst(ptr_type, nf_addr as i64);
                         let nt_ptr = builder.ins().iconst(ptr_type, nt_addr as i64);
                         let free = builder.ins().load(ptr_type, flags, nf_ptr, 0);
@@ -17405,8 +17060,7 @@ impl CraneliftBackend {
                         // Heap MemFlags match `GcStore` so the write aliases
                         // the later header stamp; `trusted()` does not.
                         if op_idx + 1 < ops.len()
-                            && let Some(tid) =
-                                following_nursery_tid(&ops[op_idx], &ops[op_idx + 1], &constants)
+                            && let Some(tid) = following_nursery_tid(&ops[op_idx], &ops[op_idx + 1])
                         {
                             let tid_val = builder.ins().iconst(cl_types::I64, tid);
                             builder
@@ -17541,7 +17195,6 @@ impl CraneliftBackend {
                     let length = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(2).to_opref(),
                     );
@@ -17698,7 +17351,6 @@ impl CraneliftBackend {
                     let size_total = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(0).to_opref(),
                     );
@@ -17850,12 +17502,7 @@ impl CraneliftBackend {
                     if !cranelift_gc_active() {
                         return Err(missing_gc_runtime(op.opcode));
                     }
-                    let obj = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let obj = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
                     // Load flag byte from object header.
@@ -17939,12 +17586,8 @@ impl CraneliftBackend {
                         // opassembler.py:994-1015: inline card bit setting.
                         builder.switch_to_block(card_mark_block);
                         builder.seal_block(card_mark_block);
-                        let index = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let index =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         let shift_plus_3 = (wb_card_shift + 3) as i64;
                         let shifted = builder.ins().ushr_imm_u(index, shift_plus_3);
                         let byteofs_val = builder.ins().bnot(shifted);
@@ -17989,7 +17632,6 @@ impl CraneliftBackend {
                 // ── Generic GC/raw memory loads ──
                 OpCode::GcLoadI | OpCode::GcLoadR | OpCode::GcLoadF => {
                     let item_size = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(2).to_opref(),
@@ -18004,7 +17646,6 @@ impl CraneliftBackend {
                     let addr = emit_dynamic_offset_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
@@ -18022,21 +17663,18 @@ impl CraneliftBackend {
                 }
                 OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
                     let scale = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(2).to_opref(),
                         "GC_LOAD_INDEXED scale",
                     )?;
                     let base_offset = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(3).to_opref(),
                         "GC_LOAD_INDEXED base offset",
                     )?;
                     let item_size = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(4).to_opref(),
@@ -18051,7 +17689,6 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         scale,
@@ -18075,7 +17712,6 @@ impl CraneliftBackend {
                     let addr = emit_dynamic_offset_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
@@ -18124,14 +17760,13 @@ impl CraneliftBackend {
                     // 4-arg form: GC_STORE(base, ConstInt(offset), value, ConstInt(size))
                     if op.num_args() >= 4 {
                         let item_size = resolve_constant_i64(
-                            &constants,
                             &known_values,
                             op.opcode,
                             op.arg(3).to_opref(),
                             "GC_STORE itemsize",
                         )?;
                         if std::env::var_os("MAJIT_CL_GCSTORE_LOG").is_some() {
-                            let offset_dbg = lookup_const_i64(&constants, op.arg(1).to_opref());
+                            let offset_dbg = lookup_const_i64(op.arg(1).to_opref());
                             eprintln!(
                                 "[cl-gcstore] op_idx={} base={:?} offset_arg={:?} offset={:?} value_arg={:?} size={}",
                                 op_idx,
@@ -18154,7 +17789,6 @@ impl CraneliftBackend {
                         let addr = emit_dynamic_offset_addr(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &known_values,
                             op.arg(0).to_opref(),
                             op.arg(1).to_opref(),
@@ -18162,7 +17796,6 @@ impl CraneliftBackend {
                         let value = resolve_opref_or_imm(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &known_values,
                             op.arg(2).to_opref(),
                         );
@@ -18184,21 +17817,18 @@ impl CraneliftBackend {
                 }
                 OpCode::GcStoreIndexed => {
                     let scale = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(3).to_opref(),
                         "GC_STORE_INDEXED scale",
                     )?;
                     let base_offset = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(4).to_opref(),
                         "GC_STORE_INDEXED base offset",
                     )?;
                     let item_size = resolve_constant_i64(
-                        &constants,
                         &known_values,
                         op.opcode,
                         op.arg(5).to_opref(),
@@ -18216,7 +17846,6 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         scale,
@@ -18224,7 +17853,6 @@ impl CraneliftBackend {
                     let value = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(2).to_opref(),
                     );
@@ -18254,12 +17882,7 @@ impl CraneliftBackend {
                         .as_field_descr()
                         .expect("getfield descriptor must be a FieldDescr");
 
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let offset = fd.offset() as i32;
                     let acquire = fd.load_is_acquire()
                         && matches!(
@@ -18319,18 +17942,8 @@ impl CraneliftBackend {
                         .as_field_descr()
                         .expect("setfield descriptor must be a FieldDescr");
 
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     emit_store_to_addr(
                         &mut builder,
                         base,
@@ -18363,7 +17976,6 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
@@ -18391,16 +18003,10 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("setarrayitem descriptor must be an ArrayDescr");
 
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
@@ -18432,7 +18038,6 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
@@ -18462,17 +18067,11 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
                     );
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
                     emit_store_to_addr(
                         &mut builder,
                         addr,
@@ -18492,17 +18091,11 @@ impl CraneliftBackend {
                     let addr = emit_dynamic_offset_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                     );
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
                     emit_store_to_addr(
                         &mut builder,
                         addr,
@@ -18523,12 +18116,7 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("arraylen descriptor must be an ArrayDescr");
 
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     if let Some(ld) = ad.len_descr() {
                         let r = emit_load_from_addr(
                             &mut builder,
@@ -18557,12 +18145,7 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("strlen/unicodelen descriptor must be an ArrayDescr");
 
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     if let Some(ld) = ad.len_descr() {
                         let r = emit_load_from_addr(
                             &mut builder,
@@ -18592,12 +18175,7 @@ impl CraneliftBackend {
                         .as_field_descr()
                         .expect("strhash/unicodehash descriptor must be a FieldDescr");
                     assert_eq!(fd.field_size(), std::mem::size_of::<usize>());
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let hash = emit_load_from_addr(
                         &mut builder,
                         base,
@@ -18635,7 +18213,6 @@ impl CraneliftBackend {
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         itemsize,
@@ -18669,16 +18246,10 @@ impl CraneliftBackend {
                         ad.base_size() as i64
                     };
 
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         itemsize,
@@ -18714,7 +18285,6 @@ impl CraneliftBackend {
                     let src_addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(0).to_opref(),
                         op.arg(2).to_opref(),
                         itemsize,
@@ -18727,7 +18297,6 @@ impl CraneliftBackend {
                     let dst_addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         op.arg(1).to_opref(),
                         op.arg(3).to_opref(),
                         itemsize,
@@ -18740,7 +18309,6 @@ impl CraneliftBackend {
                     let length = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(4).to_opref(),
                     );
@@ -18773,13 +18341,11 @@ impl CraneliftBackend {
                         .as_array_descr()
                         .expect("zero_array descriptor must be an ArrayDescr");
                     let scale_start = resolve_rewriter_immediate_i64(
-                        &constants,
                         op.opcode,
                         op.arg(3).to_opref(),
                         "ZERO_ARRAY scale_start",
                     )?;
                     let scale_size = resolve_rewriter_immediate_i64(
-                        &constants,
                         op.opcode,
                         op.arg(4).to_opref(),
                         "ZERO_ARRAY scale_size",
@@ -18787,8 +18353,8 @@ impl CraneliftBackend {
                     // emit_op_zero_array: ConstInt size 0 emits nothing, and a
                     // short constant range is stores. A runtime start/size, or
                     // a range past that ceiling, stays on zero_memory_shim.
-                    let start_const = lookup_const_i64(&constants, op.arg(1).to_opref());
-                    let size_const = lookup_const_i64(&constants, op.arg(2).to_opref());
+                    let start_const = lookup_const_i64(op.arg(1).to_opref());
+                    let size_const = lookup_const_i64(op.arg(2).to_opref());
                     let byte_len_const = size_const.and_then(|sz| sz.checked_mul(scale_size));
                     let start_byte_const = start_const.and_then(|st| st.checked_mul(scale_start));
                     let byte_off_const =
@@ -18796,12 +18362,8 @@ impl CraneliftBackend {
                     let inlined = match (byte_off_const, byte_len_const, start_byte_const) {
                         (_, Some(0), _) => true,
                         (Some(off), Some(len), Some(start_b)) if len > 0 => {
-                            let base = resolve_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                op.arg(0).to_opref(),
-                            );
+                            let base =
+                                resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                             emit_inline_zero_array(
                                 &mut builder,
                                 base,
@@ -18816,12 +18378,7 @@ impl CraneliftBackend {
                     if inlined {
                         continue;
                     }
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // regalloc.py `consider_zero_array`: startindex
                     // (arg 1) and length (arg 2) flow through
                     // `make_sure_var_in_reg` — they may be runtime boxes, not
@@ -18829,18 +18386,8 @@ impl CraneliftBackend {
                     // asserted `ConstInt` by the rewriter. Resolve start/size
                     // as boxes-or-consts; baking them as immediates would
                     // miscompile a register operand.
-                    let start = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
-                    let size = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
+                    let start = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
+                    let size = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
 
                     let start_bytes = match scale_start {
                         0 => builder.ins().iconst(cl_types::I64, 0),
@@ -18874,18 +18421,8 @@ impl CraneliftBackend {
                 // ── Nursery pointer increment ──
                 // args[0] = base ptr, args[1] = byte offset
                 OpCode::NurseryPtrIncrement => {
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let offset = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let offset = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let r = builder.ins().iadd(base, offset);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
@@ -18967,7 +18504,6 @@ impl CraneliftBackend {
                                         let v = resolve_failarg_opref(
                                             &mut builder,
                                             &opref_var_map,
-                                            &constants,
                                             cur_jf,
                                             &ref_root_slots,
                                             &stale_ref_vars,
@@ -18993,7 +18529,6 @@ impl CraneliftBackend {
                                 resolve_local_jump_arg(
                                     &mut builder,
                                     &opref_var_map,
-                                    &constants,
                                     ptr_type,
                                     &mut jump_jf_ptr,
                                     &demoted_failarg_slots,
@@ -19014,7 +18549,6 @@ impl CraneliftBackend {
                             module,
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             cur_jf,
                             info,
                             &ref_root_slots,
@@ -19038,7 +18572,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -19060,7 +18593,7 @@ impl CraneliftBackend {
                 // variable is float-typed, else as boxed I64; `coerce_ty`
                 // reconciles each boundary with a `bitcast` only when needed.
                 OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fb = coerce_ty(&mut builder, b, cl_types::F64);
                     let fr = match op.opcode {
@@ -19075,7 +18608,7 @@ impl CraneliftBackend {
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::FloatFloorDiv => {
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fb = coerce_ty(&mut builder, b, cl_types::F64);
                     let fdiv = builder.ins().fdiv(fa, fb);
@@ -19091,7 +18624,7 @@ impl CraneliftBackend {
                     // raises EDOM on a NaN result from non-NaN operands.  This
                     // op is the raw remainder; it cannot collect, so it needs
                     // neither a gcmap nor a frame reload.
-                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, &constants, op);
+                    let (a, b) = resolve_binop(&mut builder, &opref_var_map, op);
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fb = coerce_ty(&mut builder, b, cl_types::F64);
                     let callee = builder
@@ -19114,12 +18647,7 @@ impl CraneliftBackend {
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::FloatNeg => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fr = builder.ins().fneg(fa);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
@@ -19127,12 +18655,7 @@ impl CraneliftBackend {
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::FloatAbs => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let fr = builder.ins().fabs(fa);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
@@ -19142,23 +18665,13 @@ impl CraneliftBackend {
 
                 // ── Casts ──
                 OpCode::CastFloatToInt => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fa = coerce_ty(&mut builder, a, cl_types::F64);
                     let r = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(&opref_var_map, vi), r);
                 }
                 OpCode::CastIntToFloat => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fr = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let r = coerce_ty(&mut builder, fr, want);
@@ -19168,12 +18681,7 @@ impl CraneliftBackend {
                     // Bit reinterpretation: float<->longlong shares storage, so
                     // coerce the operand to the result variable's carrier type
                     // (an actual `bitcast` when one side is F64 and the other I64).
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let want = var_types.get(&vi).copied().unwrap_or(cl_types::I64);
                     let r = coerce_ty(&mut builder, a, want);
                     builder.def_var(var(&opref_var_map, vi), r);
@@ -19213,12 +18721,7 @@ impl CraneliftBackend {
                 // materializes it by returning the underlying object reference.
                 // args[0] = the real object, args[1] = vref_id
                 OpCode::VirtualRefI | OpCode::VirtualRefR => {
-                    let obj = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let obj = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     builder.def_var(var(&opref_var_map, vi), obj);
                 }
 
@@ -19226,12 +18729,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardTrue => {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let cond = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -19251,7 +18749,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -19270,12 +18767,7 @@ impl CraneliftBackend {
                 OpCode::VecGuardFalse => {
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
-                    let cond = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let cond = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let exit_block = builder.create_block();
                     mark_exit_cold(
                         &mut builder,
@@ -19295,7 +18787,6 @@ impl CraneliftBackend {
                         module,
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         cur_jf,
                         info,
                         &ref_root_slots,
@@ -19325,7 +18816,6 @@ impl CraneliftBackend {
                         let a = resolve_opref_vec_int(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
@@ -19333,7 +18823,6 @@ impl CraneliftBackend {
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(1).to_opref(),
@@ -19349,18 +18838,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let a = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
-                        let b = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                        let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         let result = match op.opcode {
                             OpCode::VecIntAdd => builder.ins().iadd(a, b),
                             OpCode::VecIntSub => builder.ins().isub(a, b),
@@ -19383,7 +18862,6 @@ impl CraneliftBackend {
                         let a = resolve_opref_vec_float(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
@@ -19391,7 +18869,6 @@ impl CraneliftBackend {
                         let b = resolve_opref_vec_float(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(1).to_opref(),
@@ -19405,18 +18882,8 @@ impl CraneliftBackend {
                         };
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let a = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
-                        let b = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                        let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                         let fb = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), b);
                         let fresult = match op.opcode {
@@ -19439,7 +18906,6 @@ impl CraneliftBackend {
                         let a = resolve_opref_vec_float(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
@@ -19447,12 +18913,7 @@ impl CraneliftBackend {
                         let result = builder.ins().fneg(a);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let a = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                         let fresult = builder.ins().fneg(fa);
                         let result =
@@ -19468,7 +18929,6 @@ impl CraneliftBackend {
                         let a = resolve_opref_vec_float(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
@@ -19476,12 +18936,7 @@ impl CraneliftBackend {
                         let result = builder.ins().fabs(a);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let a = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                         let fresult = builder.ins().fabs(fa);
                         let result =
@@ -19498,7 +18953,6 @@ impl CraneliftBackend {
                         let a = resolve_opref_vec_int(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
@@ -19506,7 +18960,6 @@ impl CraneliftBackend {
                         let b = resolve_opref_vec_int(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(1).to_opref(),
@@ -19519,18 +18972,8 @@ impl CraneliftBackend {
                                 .bitcast(cl_types::F64X2, MemFlagsData::new(), xored);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let a = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
-                        let b = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                        let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         let result = builder.ins().bxor(a, b);
                         builder.def_var(var(&opref_var_map, vi), result);
                     }
@@ -19539,18 +18982,8 @@ impl CraneliftBackend {
                 // ── Vector comparison/test operations ──
                 // These always produce scalar results (I64), not vectors.
                 OpCode::VecFloatEq => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let b = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::Equal, fa, fb);
@@ -19559,18 +18992,8 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecFloatNe => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let b = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                     let fb = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), b);
                     let cmp = builder.ins().fcmp(FloatCC::NotEqual, fa, fb);
@@ -19579,12 +19002,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntIsTrue => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, zero);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
@@ -19592,36 +19010,16 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecIntEq => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let b = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let cmp = builder.ins().icmp(IntCC::Equal, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
 
                 OpCode::VecIntNe => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let b = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let cmp = builder.ins().icmp(IntCC::NotEqual, a, b);
                     let result = builder.ins().uextend(cl_types::I64, cmp);
                     builder.def_var(var(&opref_var_map, vi), result);
@@ -19629,36 +19027,21 @@ impl CraneliftBackend {
 
                 OpCode::VecIntSignext => {
                     // Sign-extend a narrower integer value to i64
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     builder.def_var(var(&opref_var_map, vi), a); // already i64
                 }
 
                 // ── Vector cast operations ──
                 // These operate on scalar elements, not full vectors.
                 OpCode::VecCastFloatToInt => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                     let result = builder.ins().fcvt_to_sint(cl_types::I64, fa);
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
 
                 OpCode::VecCastIntToFloat => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fresult = builder.ins().fcvt_from_sint(cl_types::F64, a);
                     let result = builder
                         .ins()
@@ -19667,12 +19050,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastFloatToSinglefloat => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let fa = builder.ins().bitcast(cl_types::F64, MemFlagsData::new(), a);
                     let f32val = builder.ins().fdemote(cl_types::F32, fa);
                     let result = builder
@@ -19683,12 +19061,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::VecCastSinglefloatToFloat => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let a_trunc = builder.ins().ireduce(cl_types::I32, a);
                     let f32val = builder
                         .ins()
@@ -19730,28 +19103,18 @@ impl CraneliftBackend {
                         let vec_val = resolve_opref_vec_int(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
                         );
-                        let scalar = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
-                        let lane =
-                            lookup_const_i64(&constants, op.arg(2).to_opref()).unwrap_or(0) as u8;
+                        let scalar =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
+                        let lane = lookup_const_i64(op.arg(2).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar, lane);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let scalar = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let scalar =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         builder.def_var(var(&opref_var_map, vi), scalar);
                     }
                 }
@@ -19763,32 +19126,22 @@ impl CraneliftBackend {
                         let vec_val = resolve_opref_vec_float(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
                         );
-                        let scalar_i = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let scalar_i =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         let scalar_f =
                             builder
                                 .ins()
                                 .bitcast(cl_types::F64, MemFlagsData::new(), scalar_i);
-                        let lane =
-                            lookup_const_i64(&constants, op.arg(2).to_opref()).unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(op.arg(2).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().insertlane(vec_val, scalar_f, lane);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let scalar = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(1).to_opref(),
-                        );
+                        let scalar =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                         builder.def_var(var(&opref_var_map, vi), scalar);
                     }
                 }
@@ -19799,22 +19152,16 @@ impl CraneliftBackend {
                         let vec_val = resolve_opref_vec_int(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
                         );
-                        let lane =
-                            lookup_const_i64(&constants, op.arg(1).to_opref()).unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(op.arg(1).to_opref()).unwrap_or(0) as u8;
                         let result = builder.ins().extractlane(vec_val, lane);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let vec_val = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let vec_val =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         builder.def_var(var(&opref_var_map, vi), vec_val);
                     }
                 }
@@ -19825,13 +19172,11 @@ impl CraneliftBackend {
                         let vec_val = resolve_opref_vec_float(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             &vec_oprefs,
                             &vec_float_oprefs,
                             op.arg(0).to_opref(),
                         );
-                        let lane =
-                            lookup_const_i64(&constants, op.arg(1).to_opref()).unwrap_or(0) as u8;
+                        let lane = lookup_const_i64(op.arg(1).to_opref()).unwrap_or(0) as u8;
                         let scalar_f = builder.ins().extractlane(vec_val, lane);
                         let result =
                             builder
@@ -19839,12 +19184,8 @@ impl CraneliftBackend {
                                 .bitcast(cl_types::I64, MemFlagsData::new(), scalar_f);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let vec_val = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let vec_val =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         builder.def_var(var(&opref_var_map, vi), vec_val);
                     }
                 }
@@ -19852,21 +19193,13 @@ impl CraneliftBackend {
                 OpCode::VecExpandI => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar to all lanes
-                        let scalar = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let scalar =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let result = builder.ins().splat(cl_types::I64X2, scalar);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let scalar = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let scalar =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         builder.def_var(var(&opref_var_map, vi), scalar);
                     }
                 }
@@ -19874,12 +19207,8 @@ impl CraneliftBackend {
                 OpCode::VecExpandF => {
                     if USE_NATIVE_SIMD {
                         // Broadcast scalar f64 to all lanes
-                        let scalar_i = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let scalar_i =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let scalar_f =
                             builder
                                 .ins()
@@ -19887,12 +19216,8 @@ impl CraneliftBackend {
                         let result = builder.ins().splat(cl_types::F64X2, scalar_f);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let scalar = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let scalar =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         builder.def_var(var(&opref_var_map, vi), scalar);
                     }
                 }
@@ -19901,19 +19226,10 @@ impl CraneliftBackend {
                 OpCode::VecLoadI | OpCode::VecLoadF => {
                     if USE_NATIVE_SIMD {
                         // Load 128 bits (2x i64 or 2x f64) from memory
-                        let base = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let base =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 1 {
-                            resolve_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                op.arg(1).to_opref(),
-                            )
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -19929,19 +19245,10 @@ impl CraneliftBackend {
                                 .load(load_type, MemFlagsData::trusted(), addr, 0);
                         builder.def_var(var(&opref_var_map, vi), result);
                     } else {
-                        let base = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let base =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 1 {
-                            resolve_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                op.arg(1).to_opref(),
-                            )
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -19957,19 +19264,10 @@ impl CraneliftBackend {
                 OpCode::VecStore => {
                     if USE_NATIVE_SIMD {
                         // Store 128 bits to memory
-                        let base = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let base =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 2 {
-                            resolve_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                op.arg(1).to_opref(),
-                            )
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
@@ -19977,36 +19275,21 @@ impl CraneliftBackend {
                         let value = if vec_oprefs.contains(&value_ref.to_opref().raw()) {
                             builder.use_var(var(&opref_var_map, value_ref.to_opref().raw()))
                         } else {
-                            resolve_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                value_ref.to_opref(),
-                            )
+                            resolve_opref(&mut builder, &opref_var_map, value_ref.to_opref())
                         };
                         let addr = builder.ins().iadd(base, offset_val);
                         builder.ins().store(MemFlagsData::trusted(), value, addr, 0);
                     } else {
-                        let base = resolve_opref(
-                            &mut builder,
-                            &opref_var_map,
-                            &constants,
-                            op.arg(0).to_opref(),
-                        );
+                        let base =
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                         let offset_val = if op.num_args() > 2 {
-                            resolve_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                op.arg(1).to_opref(),
-                            )
+                            resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref())
                         } else {
                             builder.ins().iconst(cl_types::I64, 0)
                         };
                         let value = resolve_opref(
                             &mut builder,
                             &opref_var_map,
-                            &constants,
                             op.arg(op.num_args() - 1).to_opref(),
                         );
                         let addr = builder.ins().iadd(base, offset_val);
@@ -20124,7 +19407,6 @@ impl CraneliftBackend {
                     let length = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
-                        &constants,
                         &known_values,
                         op.arg(0).to_opref(),
                     );
@@ -20162,19 +19444,10 @@ impl CraneliftBackend {
 
                 // ── Integer sign extension ──
                 OpCode::IntSignext => {
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // support.py `int_signext`: the second operand is a byte count.
-                    let num_bytes = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let num_bytes =
+                        resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let eight = builder.ins().iconst(cl_types::I64, 8);
                     let width_bits = builder.ins().imul(num_bytes, eight);
                     let sixty_four = builder.ins().iconst(cl_types::I64, 64);
@@ -20186,30 +19459,15 @@ impl CraneliftBackend {
 
                 // ── Unsigned multiply high ──
                 OpCode::UintMulHigh => {
-                    let a = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let b = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let a = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let b = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let result = builder.ins().umulhi(a, b);
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
 
                 // ── Float ↔ SingleFloat casts ──
                 OpCode::CastFloatToSinglefloat => {
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // f64 → f32 → zero-extend to i64 (singlefloat is Int-typed)
                     let f64_val = coerce_ty(&mut builder, val, cl_types::F64);
                     let f32_val = builder.ins().fdemote(cl_types::F32, f64_val);
@@ -20222,12 +19480,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::CastSinglefloatToFloat => {
-                    let val = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let val = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     // i64 (lower 32 bits = f32) → f32 → f64 → i64
                     let i32_val = builder.ins().ireduce(cl_types::I32, val);
                     let f32_val =
@@ -20242,18 +19495,8 @@ impl CraneliftBackend {
 
                 // ── Raw array item read (ref-typed) ──
                 OpCode::GetarrayitemRawR => {
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let index = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let index = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
                     let scale = builder.ins().iconst(cl_types::I64, 8);
                     let offset = builder.ins().imul(index, scale);
                     let addr = builder.ins().iadd(base, offset);
@@ -20268,12 +19511,7 @@ impl CraneliftBackend {
                 OpCode::ThreadlocalrefGet => {
                     // Load from a thread-local slot via runtime callback.
                     // arg(0) = offset (in bytes) into the TLS area.
-                    let offset = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let offset = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let result = emit_host_call(
                         module,
                         &mut builder,
@@ -20297,7 +19535,7 @@ impl CraneliftBackend {
                 // `assembler.py` `reserve_gcref_table`). The slot value
                 // is GC-forwarded in place by the gc_table root walker.
                 OpCode::LoadFromGcTable => {
-                    let table_index = lookup_const_i64(&constants, op.arg(0).to_opref())
+                    let table_index = lookup_const_i64(op.arg(0).to_opref())
                         .expect("LoadFromGcTable index is ConstInt")
                         as u32;
                     record_gc_table_var(vi, table_index);
@@ -20309,30 +19547,10 @@ impl CraneliftBackend {
                 // resoperation.py:1052-1054 — `[v_gcptr, v_index, c_baseofs,
                 // c_shift]`, `res = arg0 + (arg1 << arg3) + arg2`.
                 OpCode::LoadEffectiveAddress => {
-                    let base = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
-                    let index = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(1).to_opref(),
-                    );
-                    let baseofs = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(2).to_opref(),
-                    );
-                    let shift = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(3).to_opref(),
-                    );
+                    let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
+                    let index = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
+                    let baseofs = resolve_opref(&mut builder, &opref_var_map, op.arg(2).to_opref());
+                    let shift = resolve_opref(&mut builder, &opref_var_map, op.arg(3).to_opref());
                     let shifted_index = builder.ins().ishl(index, shift);
                     let addr = builder.ins().iadd(base, shifted_index);
                     let result = builder.ins().iadd(addr, baseofs);
@@ -20357,12 +19575,7 @@ impl CraneliftBackend {
                     if !cranelift_gc_active() {
                         return Err(missing_gc_runtime(op.opcode));
                     }
-                    let len = resolve_opref(
-                        &mut builder,
-                        &opref_var_map,
-                        &constants,
-                        op.arg(0).to_opref(),
-                    );
+                    let len = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
@@ -21527,7 +20740,6 @@ fn collect_guards(
     guard_infos: &mut Vec<GuardInfo>,
     max_output_slots: &mut usize,
     trace_id: u64,
-    _constants: &indexmap::IndexMap<u32, i64>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
     preserve_descrs: bool,
     homes: &FailArgHomes<'_>,
@@ -21712,9 +20924,8 @@ fn collect_guards(
                         continue;
                     }
                     // regalloc.py:1206 — guard fail_args must never be Const.
-                    // history.py/268/314 inline-Const carries the value on
-                    // the OpRef itself; legacy idx-Const lives in `constants`.
-                    // Both are reported by `is_constant()`.
+                    // `Const.is_constant()` — inline Const carries the value
+                    // on the OpRef itself.
                     debug_assert!(
                         is_finish || is_external_jump || !arg_ref.is_constant(),
                         "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={arg_ref:?})"
@@ -22502,13 +21713,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
-        // Read the pool before `do_compile` takes it (`set_constants` /
-        // `set_constants_pool`), and snapshot the ops before it too: the
-        // normalize and GC rewrite passes forward operands of the caller's
-        // `OpRc`s to positions they mint, which a merged recompile, rewriting
-        // the retained ops again, would never define.
-        let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
-            .then(|| retained_merge_source(inputargs, ops));
+        // Snapshot the ops before `do_compile`: the normalize and GC rewrite
+        // passes forward operands of the caller's `OpRc`s to positions they
+        // mint, which a merged recompile, rewriting the retained ops again,
+        // would never define.
+        let merge_source =
+            merge_source_eligible(ops).then(|| retained_merge_source(inputargs, ops));
         let mut compiled = self.do_compile(inputargs, ops, Some(flag_ptr), false, None, None)?;
         compiled.merge_source = merge_source.and_then(|source| {
             finish_merge_source(source, compiled.trace_id, compiled.gc_table.as_deref())
@@ -22576,10 +21786,6 @@ impl majit_backend::Backend for CraneliftBackend {
 
         token.set_compiled(Box::new(compiled));
         Ok(info)
-    }
-
-    fn set_constants_pool(&mut self, constants: majit_ir::ConstMap<majit_ir::Const>) {
-        self.constants = constants;
     }
 
     fn set_next_trace_id(&mut self, trace_id: u64) {
@@ -22671,8 +21877,8 @@ impl majit_backend::Backend for CraneliftBackend {
             ));
         }
         // Snapshot before `do_compile`, like the loop path above.
-        let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
-            .then(|| retained_merge_source(inputargs, ops));
+        let merge_source =
+            merge_source_eligible(ops).then(|| retained_merge_source(inputargs, ops));
         let bridge_source_slots = live_bridge_source_slots(fail_descr.rd_locs(), inputargs.len());
         let compiled = self.do_compile(
             inputargs,
@@ -24941,24 +24147,20 @@ mod tests {
         let inputargs = vec![InputArg::new_int_rc(0)];
         // resoperation.py `InputArgInt.type = 'i'` parity: Label /
         // IntAdd / Jump args that reference the inputarg slot are
-        // `InputArgInt` boxes, not `IntOp` results. The op-position
-        // raw-keyed `constants` IndexMap (positions 100/101 below) is a
-        // TODO mirroring `make_constant`'s op-position
-        // inline-constant path; that part of the fixture is left alone.
+        // `InputArgInt` boxes, not `IntOp` results.
         let ia0 = OpRef::input_arg_int(0);
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(1i64)], 1),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1_000_000i64)],
+                2,
+            ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[3].setfailargs(smallvec::smallvec![rb(ia0)]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        constants.insert(101, 1_000_000i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0);
         let info = backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -25185,8 +24387,6 @@ mod tests {
             guard,
             mk_op(OpCode::Jump, &[carried], OpRef::NONE.raw()),
         ];
-        let constants = indexmap::IndexMap::new();
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1700);
         backend
@@ -25238,7 +24438,6 @@ mod tests {
             guard,
             mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), label),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
 
         let token = JitCellToken::new(1710);
         backend
@@ -25311,7 +24510,9 @@ mod tests {
         let ops = vec![
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef::int_op(100)],
+                &[OpRef::const_int(
+                    noop_may_force as *const () as usize as i64,
+                )],
                 OpRef::NONE.raw(),
                 may_force_no_collect,
             ),
@@ -25320,13 +24521,18 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 4),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(101), OpRef::ref_op(4)],
+                &[
+                    OpRef::const_int(probe_loop_top_slot0 as *const () as usize as i64),
+                    OpRef::ref_op(4),
+                ],
                 OpRef::NONE.raw(),
                 make_call_descr(vec![Type::Ref], Type::Void),
             ),
             mk_op_with_descr(
                 OpCode::CallMayForceN,
-                &[OpRef::int_op(100)],
+                &[OpRef::const_int(
+                    noop_may_force as *const () as usize as i64,
+                )],
                 OpRef::NONE.raw(),
                 may_force,
             ),
@@ -25340,10 +24546,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, noop_may_force as *const () as usize as i64);
-        constants.insert(101, probe_loop_top_slot0 as *const () as usize as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1720);
         backend
@@ -25461,8 +24663,6 @@ mod tests {
             guard,
             mk_op_with_descr(OpCode::Jump, &[carried], OpRef::NONE.raw(), loop_descr),
         ];
-        let constants = indexmap::IndexMap::new();
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1701);
         backend
@@ -25903,20 +25103,20 @@ mod tests {
             // i > 0
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 2,
             ),
             guard,
             // i - 1
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 3,
             ),
             // s + 10
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(1), OpRef::int_op(102)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(10)],
                 4,
             ),
             mk_op_with_descr(
@@ -25926,11 +25126,6 @@ mod tests {
                 loop_descr.clone(),
             ),
         ];
-        let mut loop_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        loop_constants.insert(100, 0);
-        loop_constants.insert(101, 1);
-        loop_constants.insert(102, 10);
-        backend.set_constants(loop_constants);
 
         let token = JitCellToken::new(1_500_291);
         backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
@@ -25952,10 +25147,10 @@ mod tests {
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(1), OpRef::int_op(110)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(100)],
                 2,
             ),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::int_op(111)], 3),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(2), OpRef::const_int(500)], 3),
             bridge_guard,
             mk_op_with_descr(
                 OpCode::Jump,
@@ -25964,15 +25159,10 @@ mod tests {
                 loop_descr,
             ),
         ];
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(110, 100);
-        bridge_constants.insert(111, 500);
-        backend.set_constants(bridge_constants);
         backend
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         // 30 -> 130 -> 230 -> 330 -> 430 -> 530, where the region's own guard
         // fails and publishes its fail args.
         let frame = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
@@ -25987,12 +25177,9 @@ mod tests {
             get_latest_descr_from_deadframe(&frame).expect("region guard should produce a descr");
         let finish = vec![mk_op(
             OpCode::Finish,
-            &[OpRef::int_op(120)],
+            &[OpRef::const_int(999)],
             OpRef::NONE.raw(),
         )];
-        let mut finish_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        finish_constants.insert(120, 999);
-        backend.set_constants(finish_constants);
         backend
             .compile_bridge(
                 region_descr,
@@ -26001,7 +25188,6 @@ mod tests {
                 &token,
             )
             .unwrap();
-        backend.set_constants(indexmap::IndexMap::new());
         let again = backend.execute_token(&token, &[Value::Int(3), Value::Int(0)]);
         assert_eq!(
             backend.get_int_value(&again, 0),
@@ -26031,12 +25217,12 @@ mod tests {
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
-            mk_op(OpCode::IntGt, &[i, OpRef::int_op(100)], 2),
+            mk_op(OpCode::IntGt, &[i, OpRef::const_int(0)], 2),
             exit,
-            mk_op(OpCode::IntEq, &[i, OpRef::int_op(101)], 3),
+            mk_op(OpCode::IntEq, &[i, OpRef::const_int(2)], 3),
             side,
-            mk_op(OpCode::IntSub, &[i, OpRef::int_op(102)], 4),
-            mk_op(OpCode::IntAdd, &[s, OpRef::int_op(103)], 5),
+            mk_op(OpCode::IntSub, &[i, OpRef::const_int(1)], 4),
+            mk_op(OpCode::IntAdd, &[s, OpRef::const_int(10)], 5),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4), OpRef::int_op(5)],
@@ -26044,12 +25230,6 @@ mod tests {
                 loop_descr.clone(),
             ),
         ];
-        let mut loop_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        loop_constants.insert(100, 0);
-        loop_constants.insert(101, 2);
-        loop_constants.insert(102, 1);
-        loop_constants.insert(103, 10);
-        backend.set_constants(loop_constants);
         let token = JitCellToken::new(1_500_294);
         backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
 
@@ -26079,13 +25259,10 @@ mod tests {
             .expect("exit guard should produce a descr");
         let closing = vec![mk_op_with_descr(
             OpCode::Jump,
-            &[OpRef::int_op(110), s],
+            &[OpRef::const_int(4), s],
             OpRef::NONE.raw(),
             loop_descr,
         )];
-        let mut closing_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        closing_constants.insert(110, 4);
-        backend.set_constants(closing_constants);
         backend
             .compile_bridge(exit_descr, &inputargs, &closing, &token)
             .unwrap();
@@ -26104,7 +25281,6 @@ mod tests {
             "each patch_jump_for_descr leaves the other guard's patch in place"
         );
 
-        backend.set_constants(indexmap::IndexMap::new());
         // The Finish bridge returns s unchanged. If the sibling was dropped,
         // this entry would deopt at the side guard instead.
         let frame = backend.execute_token(&token, &[Value::Int(2), Value::Int(7)]);
@@ -26471,7 +25647,11 @@ mod tests {
             rb(carried),
             rb(OpRef::input_arg_int(1)),
         ]);
-        let bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef::int_op(103)], OpRef::NONE.raw());
+        let bridge_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
         bridge_guard.setfailargs(smallvec::smallvec![rb(carried), rb(next)]);
         let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let root_ops = vec![
@@ -26482,7 +25662,11 @@ mod tests {
                 OpRef::NONE.raw(),
                 start_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::const_int(1), OpRef::const_int(2)],
+                3,
+            ),
             mk_op_with_descr(
                 OpCode::Label,
                 &[carried, OpRef::input_arg_int(1)],
@@ -26491,13 +25675,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(1), OpRef::int_op(102)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(0)],
                 more.raw(),
             ),
             exit_guard,
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(1), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(1), OpRef::const_int(1)],
                 next.raw(),
             ),
             bridge_guard,
@@ -26508,13 +25692,6 @@ mod tests {
                 start_descr,
             ),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 1);
-        root_constants.insert(101, 2);
-        root_constants.insert(102, 0);
-        root_constants.insert(103, 1);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1706);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -26528,13 +25705,10 @@ mod tests {
 
         let bridge_inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let bridge_increment = 100;
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, bridge_increment);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(bridge_increment)],
                 2,
             ),
             mk_op_with_descr(
@@ -26548,7 +25722,6 @@ mod tests {
             .compile_bridge(guard_descr, &bridge_inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame =
             backend.execute_token(&token, &[Value::Int(initial_carried), Value::Int(counter)]);
         // Each of the two bridge trips adds 100 before the counter reaches zero.
@@ -26614,7 +25787,7 @@ mod tests {
         wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
         let guard = Op::new(
             OpCode::GuardValue,
-            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+            &[rb(OpRef::int_op(1)), rb(OpRef::const_int(999i64))],
         );
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![Type::Int]);
@@ -26622,23 +25795,15 @@ mod tests {
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
             // The promoted value the guard compares; not a fail arg.
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(7i64)], 1),
             // The GUARD_VALUE's only fail arg.
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(100i64)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(5i64)], 3),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(1i64)], 4),
             OpRc::new(wide),
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 7i64);
-        constants.insert(101, 100i64);
-        constants.insert(102, 999i64);
-        constants.insert(103, 5i64);
-        constants.insert(104, 1i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0xc0de);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -26705,29 +25870,21 @@ mod tests {
         wide.setfailargs(vec![rb(OpRef::int_op(2)), rb(OpRef::int_op(3))].into());
         let guard = Op::new(
             OpCode::GuardValue,
-            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+            &[rb(OpRef::int_op(1)), rb(OpRef::const_int(999i64))],
         );
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![Type::Int]);
         guard.setfailargs(vec![rb(OpRef::int_op(2))].into());
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(101)], 2),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(103)], 3),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(104)], 4),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(7i64)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(100i64)], 2),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(5i64)], 3),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(1i64)], 4),
             OpRc::new(wide),
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 7i64);
-        constants.insert(101, 100i64);
-        constants.insert(102, 999i64);
-        constants.insert(103, 5i64);
-        constants.insert(104, 1i64);
-        backend.set_constants(constants);
 
         let token = Arc::new(JitCellToken::new(0xc0df));
         token
@@ -26779,7 +25936,7 @@ mod tests {
         let ia0 = OpRef::input_arg_int(0);
         let guard = Op::new(
             OpCode::GuardValue,
-            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+            &[rb(OpRef::int_op(1)), rb(OpRef::const_int(999i64))],
         );
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![
@@ -26807,14 +25964,10 @@ mod tests {
         );
         let ops = [
             mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::const_int(7i64)], 1),
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 7i64);
-        constants.insert(102, 999i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0xc0df);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -26862,7 +26015,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ia0 = OpRef::input_arg_int(0);
-        let guard = Op::new(OpCode::GuardValue, &[rb(ia0), rb(OpRef::int_op(102))]);
+        let guard = Op::new(OpCode::GuardValue, &[rb(ia0), rb(OpRef::const_int(999i64))]);
         guard.pos().set(OpRef::NONE);
         guard.set_fail_arg_types(vec![
             Type::Ref,
@@ -26892,9 +26045,6 @@ mod tests {
             OpRc::new(guard),
             mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(102, 999i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(0xc0e0);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -27612,21 +26762,24 @@ mod tests {
         assert_eq!(backend.get_int_value(&reached, 0), 1);
     }
 
-    /// A JUMP at a loop compiled with a constants pool has no merge source, so
-    /// it stays a dispatch out of L. L's own bridge still publishes a merge.
+    /// A JUMP to a loop that has no merge source stays a dispatch out of L.
+    /// L's own bridge still publishes a merge. T is merge-ineligible because
+    /// it contains `GuardNotForced` (`opcode_excluded_from_merge`); the
+    /// guard is 0-arg and succeeds when `jf_descr` is 0, so the asserted
+    /// IntAdd/Finish result is unchanged.
     #[test]
     fn jump_to_loop_without_merge_source_stays_external() {
         let mut backend = CraneliftBackend::new();
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(50, 7);
-        backend.set_constants(constants);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
         let n = OpRef::input_arg_int(0);
         let label_t = make_label_descr(1_500_430);
+        let t_guard = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        t_guard.setfailargs(smallvec::smallvec![]);
         let ops_t = vec![
             mk_op_with_descr(OpCode::Label, &[n], OpRef::NONE.raw(), label_t.clone()),
-            mk_op(OpCode::IntAdd, &[n, OpRef::int_op(50)], 1),
+            t_guard,
+            mk_op(OpCode::IntAdd, &[n, OpRef::const_int(7)], 1),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         let token_t = Arc::new(JitCellToken::new(1_500_430));
@@ -28463,7 +27616,6 @@ mod tests {
         ];
         let token = JitCellToken::new(9205);
         token.record_target_token(label.clone());
-        backend.set_constants(indexmap::IndexMap::new());
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
         let locs = exit_descr.as_fail_descr().unwrap().rd_locs();
         assert!(
@@ -29217,7 +28369,7 @@ mod tests {
     fn guard_exception_still_refuses_merge() {
         let noexc = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         assert!(!guard_shape_refuses_merge(&noexc));
-        assert!(merge_source_eligible(false, &[noexc]));
+        assert!(merge_source_eligible(&[noexc]));
 
         let exc = mk_op(
             OpCode::GuardException,
@@ -29225,11 +28377,11 @@ mod tests {
             OpRef::NONE.raw(),
         );
         assert!(guard_shape_refuses_merge(&exc));
-        assert!(!merge_source_eligible(false, &[exc]));
+        assert!(!merge_source_eligible(&[exc]));
 
         let forced = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         assert!(guard_shape_refuses_merge(&forced));
-        assert!(!merge_source_eligible(false, &[forced]));
+        assert!(!merge_source_eligible(&[forced]));
     }
 
     /// A retained reference constant is bound to its `GcTable` slot when the
@@ -29547,23 +28699,18 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntEq,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0i64)],
                 1,
             ),
             mk_op(OpCode::GuardFalse, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 2,
             ),
             mk_op(OpCode::Jump, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
         ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0i64);
-        constants.insert(101, 1i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(7);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29752,10 +28899,14 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 3,
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(101)], 4),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::int_op(3), OpRef::const_int(0i64)],
+                4,
+            ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::Jump,
@@ -29767,11 +28918,6 @@ mod tests {
             rb(OpRef::input_arg_int(0)),
             rb(OpRef::input_arg_int(1)),
         ]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        constants.insert(101, 0i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(9);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29845,7 +28991,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(add_two as *const () as i64),
                     OpRef::input_arg_int(0),
                     OpRef::input_arg_int(1),
                 ],
@@ -29854,10 +29000,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, add_two as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(20);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29885,7 +29027,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallPureI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(multiply as *const () as i64),
                     OpRef::input_arg_int(0),
                     OpRef::input_arg_int(1),
                 ],
@@ -29894,10 +29036,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, multiply as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(21);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29928,7 +29066,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(increment_counter as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -29938,10 +29079,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, increment_counter as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(22);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -29970,7 +29107,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallF,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(add_doubles as *const () as i64),
                     OpRef::input_arg_float(0),
                     OpRef::input_arg_float(1),
                 ],
@@ -29979,10 +29116,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, add_doubles as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(23);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30006,20 +29139,22 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(add_one as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 1,
                 descr,
             ),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(100i64)],
+                2,
+            ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[3].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, add_one as *const () as i64);
-        constants.insert(101, 100i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(24);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30056,34 +29191,32 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(log_char as *const () as i64),
+                    OpRef::const_int(32),
+                ],
                 OpRef::NONE.raw(),
                 call_void.clone(),
             ),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(102), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(log_num as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 call_void,
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 1,
             ),
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(104)], 2),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::const_int(3)], 2),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[5].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, log_char as *const () as i64);
-        constants.insert(101, 32);
-        constants.insert(102, log_num as *const () as i64);
-        constants.insert(103, 1);
-        constants.insert(104, 3);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(24_001);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30107,24 +29240,22 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::const_int(0x1111)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0x1111);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(25);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30155,24 +29286,22 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::const_int(0x1111)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0x1111);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(26);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30202,7 +29331,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30213,10 +29345,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(27);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30253,7 +29381,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30264,10 +29395,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(27_001);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30300,13 +29427,16 @@ mod tests {
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
-        let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
+        let guard = mk_op(OpCode::GuardException, &[OpRef::const_int(0x3333)], 3);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr.clone(),
             ),
@@ -30314,7 +29444,10 @@ mod tests {
             mk_op(OpCode::SaveException, &[], 2),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::int_op(103)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::const_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30326,12 +29459,6 @@ mod tests {
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        constants.insert(101, 0x3333);
-        constants.insert(103, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(28);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30379,7 +29506,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::input_arg_int(0)],
+                &[
+                    OpRef::const_int(maybe_raise_test_exception as *const () as i64),
+                    OpRef::input_arg_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -30390,10 +29520,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_raise_test_exception as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(29);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30516,7 +29642,7 @@ mod tests {
                 OpCode::CondCallN,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(set_value as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 OpRef::NONE.raw(),
@@ -30528,10 +29654,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, set_value as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(40);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30569,7 +29691,7 @@ mod tests {
                 OpCode::CondCallN,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(set_value2 as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 OpRef::NONE.raw(),
@@ -30581,10 +29703,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, set_value2 as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(41);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30623,7 +29741,7 @@ mod tests {
                 OpCode::CondCallValueI,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(compute as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 2,
@@ -30631,10 +29749,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, compute as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(42);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30668,7 +29782,7 @@ mod tests {
                 OpCode::CondCallValueI,
                 &[
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(compute2 as *const () as i64),
                     OpRef::input_arg_int(1),
                 ],
                 2,
@@ -30676,10 +29790,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, compute2 as *const () as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(43);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30722,7 +29832,7 @@ mod tests {
                     OpCode::CondCallValueR,
                     &[
                         OpRef::input_arg_ref(0),
-                        OpRef::int_op(100),
+                        OpRef::const_int(fill_cache as *const () as i64),
                         OpRef::input_arg_ref(1),
                     ],
                     2,
@@ -30730,10 +29840,6 @@ mod tests {
                 ),
                 mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
             ];
-
-            let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-            constants.insert(100, fill_cache as *const () as i64);
-            backend.set_constants(constants);
 
             let token = JitCellToken::new(70012);
             backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30758,17 +29864,13 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntSub,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 1,
             ),
             mk_op(OpCode::GuardNonnull, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(44);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30817,7 +29919,7 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardValue,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(42i64)],
                 OpRef::NONE.raw(),
             ),
             mk_op(
@@ -30828,9 +29930,6 @@ mod tests {
         ];
 
         // Test: value matches -> guard passes, reaches Finish
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 42i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(47);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -30841,9 +29940,6 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), 42);
 
         // Test: value doesn't match -> guard fails
-        let mut constants2: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants2.insert(100, 42i64);
-        backend.set_constants(constants2);
 
         let token2 = JitCellToken::new(48);
         backend.compile_loop(&inputargs, &ops, &token2).unwrap();
@@ -31480,7 +30576,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::GuardNonnullClass,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[
+                    OpRef::input_arg_ref(0),
+                    OpRef::const_int(0xCAFE_BABEu64 as i64),
+                ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
@@ -31489,10 +30588,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0xCAFE_BABEu64 as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(76_002);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -31881,18 +30976,13 @@ mod tests {
                 OpCode::GcLoadI,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
+                    OpRef::const_int(4),
+                    OpRef::const_int(-4),
                 ],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, -4);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(94);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -31922,20 +31012,14 @@ mod tests {
                 &[
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
+                    OpRef::const_int(8),
+                    OpRef::const_int(16),
+                    OpRef::const_int(8),
                 ],
                 2,
             ),
             mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 8);
-        constants.insert(101, 16);
-        constants.insert(102, 8);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(95);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -31962,9 +31046,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(8),
                     OpRef::input_arg_ref(1),
-                    OpRef::int_op(101),
+                    OpRef::const_int(8),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -31974,11 +31058,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 8);
-        constants.insert(101, 8);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(96);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32016,9 +31095,9 @@ mod tests {
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
                     OpRef::input_arg_int(2),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
+                    OpRef::const_int(4),
+                    OpRef::const_int(8),
+                    OpRef::const_int(4),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -32027,20 +31106,14 @@ mod tests {
                 &[
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
+                    OpRef::const_int(4),
+                    OpRef::const_int(8),
+                    OpRef::const_int(4),
                 ],
                 3,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, 8);
-        constants.insert(102, 4);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(97);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32069,16 +31142,12 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::RawLoadI,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(0)],
                 1,
                 ad,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(98);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32106,7 +31175,7 @@ mod tests {
                 OpCode::RawStore,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
+                    OpRef::const_int(2),
                     OpRef::input_arg_float(1),
                 ],
                 OpRef::NONE.raw(),
@@ -32114,16 +31183,12 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::RawLoadF,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(2)],
                 2,
                 ad,
             ),
             mk_op(OpCode::Finish, &[OpRef::float_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 2);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(99);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32169,18 +31234,13 @@ mod tests {
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
                     OpRef::input_arg_int(2),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
+                    OpRef::const_int(2),
+                    OpRef::const_int(8),
                 ],
                 3,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 2);
-        constants.insert(101, 8);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(100);
         let _ = backend.compile_loop(&inputargs, &ops, &token);
@@ -32294,13 +31354,13 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0i64)],
                 1,
             ),
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntMul,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(2i64)],
                 2,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
@@ -32310,11 +31370,6 @@ mod tests {
         // guard's fail args, recovered through the faildescr's locations
         // (`runner_test.py` `operations[3].setfailargs(inputargs[:])`).
         ops[2].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0i64); // guard: x > 0
-        constants.insert(101, 2i64); // x * 2
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(200);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32331,15 +31386,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(100i64)],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, 100i64);
-        backend.set_constants(bridge_constants);
 
         // compile.py:569 / compile.py:593: bridge attaches to the actual
         // FailDescr the running machine code holds, not a synthetic with
@@ -32433,13 +31484,13 @@ mod tests {
                 &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
                 2,
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(100)], 3),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::int_op(2), OpRef::const_int(1000i64)],
+                3,
+            ),
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, 1000i64);
-        backend.set_constants(bridge_constants);
 
         // compile.py:569: bridge attaches to the actual FailDescr.
         let real_fail_descr = std::sync::Arc::clone(
@@ -32562,10 +31613,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(4),
+                    OpRef::const_int(8),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32576,13 +31627,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, 8);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1002);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32625,8 +31669,8 @@ mod tests {
                     OpRef::input_arg_ref(0),
                     OpRef::input_arg_int(1),
                     OpRef::input_arg_int(2),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
+                    OpRef::const_int(4),
+                    OpRef::const_int(4),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32637,11 +31681,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 4);
-        constants.insert(101, 4);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1003);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32676,10 +31715,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(0),
+                    OpRef::const_int(0),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32690,12 +31729,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1102);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32717,10 +31750,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(8),
+                    OpRef::const_int(24),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32731,12 +31764,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 8);
-        constants.insert(101, 24);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1103);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32762,10 +31789,10 @@ mod tests {
                 OpCode::ZeroArray,
                 &[
                     OpRef::input_arg_ref(0),
-                    OpRef::int_op(100),
-                    OpRef::int_op(101),
-                    OpRef::int_op(102),
-                    OpRef::int_op(103),
+                    OpRef::const_int(0),
+                    OpRef::const_int(20),
+                    OpRef::const_int(1),
+                    OpRef::const_int(1),
                 ],
                 OpRef::NONE.raw(),
                 ad,
@@ -32776,12 +31803,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        constants.insert(101, 20);
-        constants.insert(102, 1);
-        constants.insert(103, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1104);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32840,7 +31861,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceN,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_void as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -32854,13 +31875,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_void as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_400);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32931,7 +31945,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceN,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_void as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -32945,13 +31959,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_void as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_404);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -32998,7 +32005,9 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -33010,13 +32019,7 @@ mod tests {
             mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
 
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
         let mut backend = CraneliftBackend::new();
-        backend.set_constants(constants);
         let token = JitCellToken::new(1_500_410);
         let err = backend.compile_loop(&inputargs, &ops, &token).unwrap_err();
         let msg = format!("{err:?}");
@@ -33050,7 +32053,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceI,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_int as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -33060,10 +32063,6 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, maybe_force_and_return_int as *const () as usize as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_401);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -33106,7 +32105,7 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMayForceF,
                 &[
-                    OpRef::int_op(100),
+                    OpRef::const_int(maybe_force_and_return_float as *const () as usize as i64),
                     OpRef::ref_op(2),
                     OpRef::input_arg_int(1),
                 ],
@@ -33116,13 +32115,6 @@ mod tests {
             guard_op,
             mk_op(OpCode::Finish, &[OpRef::float_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_float as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_402);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -33152,14 +32144,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(2)],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut callee_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        callee_constants.insert(100, 2);
-        backend.set_constants(callee_constants);
 
         let callee_token = Arc::new(JitCellToken::new(1_500_200));
         backend
@@ -33177,7 +32166,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
 
         let caller_token = JitCellToken::new(1_500_201);
         backend
@@ -33192,23 +32180,21 @@ mod tests {
     fn test_call_assembler_redirect_after_caller_compiled() {
         let mut backend = make_call_assembler_backend();
 
+        let callee_ops = |addend: i64| {
+            vec![
+                mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+                mk_op(
+                    OpCode::IntAdd,
+                    &[OpRef::input_arg_int(0), OpRef::const_int(addend)],
+                    1,
+                ),
+                mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+            ]
+        };
         let callee_inputargs = vec![InputArg::new_int_rc(0)];
-        let callee_ops = vec![
-            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
-            mk_op(
-                OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
-                1,
-            ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
-        ];
-        let mut callee_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        callee_constants.insert(100, 1);
-        backend.set_constants(callee_constants);
-
         let callee_token = Arc::new(JitCellToken::new(1_500_610));
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, callee_token.as_ref())
+            .compile_loop(&callee_inputargs, &callee_ops(1), callee_token.as_ref())
             .unwrap();
 
         let caller_inputargs = vec![InputArg::new_int_rc(0)];
@@ -33222,7 +32208,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
         let caller_token = JitCellToken::new(1_500_611);
         backend
             .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
@@ -33232,12 +32217,9 @@ mod tests {
             1
         );
 
-        let mut repl_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        repl_constants.insert(100, 100);
-        backend.set_constants(repl_constants);
         let replacement = JitCellToken::new(1_500_612);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &replacement)
+            .compile_loop(&callee_inputargs, &callee_ops(100), &replacement)
             .unwrap();
         let overlay = callee_token.ll_function_addr();
         backend
@@ -33249,12 +32231,9 @@ mod tests {
             100
         );
 
-        let mut second_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        second_constants.insert(100, 7);
-        backend.set_constants(second_constants);
         let second = JitCellToken::new(1_500_613);
         backend
-            .compile_loop(&callee_inputargs, &callee_ops, &second)
+            .compile_loop(&callee_inputargs, &callee_ops(7), &second)
             .unwrap();
         backend
             .redirect_call_assembler(callee_token.as_ref(), &second)
@@ -33282,14 +32261,11 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(addend)],
                 1,
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, addend);
-        backend.set_constants(constants);
         token.record_target_token(label.clone());
         backend.compile_loop(&inputargs, &ops, token).unwrap();
     }
@@ -33336,7 +32312,6 @@ mod tests {
                 old_label.clone(),
             ),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
         backend
             .compile_loop(&[InputArg::new_int_rc(0)], &jumper_ops, &jumper)
             .unwrap();
@@ -33386,7 +32361,6 @@ mod tests {
             ),
             mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
-        backend.set_constants(indexmap::IndexMap::new());
         let caller = JitCellToken::new(1_500_636);
         backend
             .compile_loop(&[InputArg::new_int_rc(0)], &caller_ops, &caller)
@@ -33463,7 +32437,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
@@ -33474,10 +32448,6 @@ mod tests {
             ),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_261);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -33485,14 +32455,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -33506,7 +32473,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33526,6 +32492,8 @@ mod tests {
         let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        let gnf = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
+        gnf.setfailargs(smallvec::smallvec![]);
         let root_ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -33533,9 +32501,10 @@ mod tests {
                 OpRef::NONE.raw(),
                 loop_descr.clone(),
             ),
+            gnf,
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
@@ -33545,10 +32514,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
 
         let token = Arc::new(JitCellToken::new(1_500_361));
         loop_descr
@@ -33561,13 +32526,10 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -33586,7 +32548,6 @@ mod tests {
             "baked closing JUMP must not reload ll_loop_code:\n{clif}"
         );
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33631,13 +32592,10 @@ mod tests {
         assert_eq!(backend.get_int_value(&failed, 0), 5);
         assert_eq!(backend.get_int_value(&failed, 1), 0);
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(100, 1);
-        backend.set_constants(bridge_constants);
         let bridge_inputs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let bridge_ops = vec![mk_op_with_descr(
             OpCode::Jump,
-            &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+            &[OpRef::input_arg_int(0), OpRef::const_int(1)],
             OpRef::NONE.raw(),
             head,
         )];
@@ -33645,7 +32603,6 @@ mod tests {
             .compile_bridge(guard_descr, &bridge_inputs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr))]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33729,7 +32686,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 3,
             ),
             guard,
@@ -33753,9 +32710,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
         let token = JitCellToken::new(1_500_372);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -33780,7 +32734,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(
             &token,
             &[Value::Int(0), Value::Int(7), Value::Ref(GcRef(0x1234))],
@@ -33809,7 +32762,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
@@ -33820,10 +32773,6 @@ mod tests {
             ),
         ];
 
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
-
         let token = JitCellToken::new(1_500_258);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
@@ -33831,18 +32780,14 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        bridge_constants.insert(102, 1);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 2,
             ),
             mk_op(OpCode::Label, &[OpRef::int_op(2)], OpRef::NONE.raw()),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::int_op(102)], 3),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::const_int(1)], 3),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(3)],
@@ -33854,7 +32799,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -33896,14 +32840,10 @@ mod tests {
                 3,
                 int_field.clone(),
             ),
-            mk_op(OpCode::IntGt, &[OpRef::ref_op(3), OpRef::int_op(100)], 4),
+            mk_op(OpCode::IntGt, &[OpRef::ref_op(3), OpRef::const_int(0)], 4),
             guard,
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1_500_264);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -33919,9 +32859,6 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(101, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -33935,7 +32872,7 @@ mod tests {
             mk_op_with_descr(OpCode::NewWithVtable, &[], 3, int_size.clone()),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(3), OpRef::int_op(101)],
+                &[OpRef::ref_op(3), OpRef::const_int(5)],
                 OpRef::NONE.raw(),
                 int_field.clone(),
             ),
@@ -33954,7 +32891,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(
             &token,
             &[Value::Ref(GcRef(0)), Value::Int(77), Value::Ref(old_ref)],
@@ -33982,13 +32918,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
                 2,
             ),
             mk_op_with_descr(
@@ -33999,17 +32935,12 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(3)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 body_descr.clone(),
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(2)], OpRef::NONE.raw()),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1_500_267);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -34018,14 +32949,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(102, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(102)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34039,7 +32967,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -34065,13 +32992,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
                 2,
             ),
             mk_op_with_descr(
@@ -34082,11 +33009,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(3)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(102)], 4),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::const_int(20)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4)],
@@ -34095,18 +33022,12 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(5)],
+                &[OpRef::int_op(4)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        root_constants.insert(102, 20);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1_500_271);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -34115,14 +33036,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(103, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34136,7 +33054,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let descr = backend.get_latest_descr(&frame);
         assert!(descr.is_finish());
@@ -34176,13 +33093,13 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntGt,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(0)],
                 1,
             ),
             guard,
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(101)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(10)],
                 2,
             ),
             mk_op_with_descr(
@@ -34193,11 +33110,11 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(3)],
+                &[OpRef::int_op(2)],
                 OpRef::NONE.raw(),
                 middle_descr.clone(),
             ),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(3), OpRef::int_op(102)], 4),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(2), OpRef::const_int(20)], 4),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(4)],
@@ -34206,18 +33123,12 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(5)],
+                &[OpRef::int_op(4)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(5)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        root_constants.insert(102, 20);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1_500_283);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -34226,14 +33137,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(103, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34247,7 +33155,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(0)]);
         let is_finish = backend.get_latest_descr(&frame).is_finish();
         let value = backend.get_int_value(&frame, 0);
@@ -34288,7 +33195,7 @@ mod tests {
             // first LABEL.  A loader re-entry must skip it.
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(200)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1000)],
                 1,
             ),
             mk_op_with_descr(
@@ -34297,9 +33204,9 @@ mod tests {
                 OpRef::NONE.raw(),
                 start_descr.clone(),
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(100)], 2),
+            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::const_int(0)], 2),
             guard,
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::int_op(101)], 3),
+            mk_op(OpCode::IntAdd, &[OpRef::int_op(1), OpRef::const_int(10)], 3),
             mk_op_with_descr(
                 OpCode::Jump,
                 &[OpRef::int_op(3)],
@@ -34308,18 +33215,12 @@ mod tests {
             ),
             mk_op_with_descr(
                 OpCode::Label,
-                &[OpRef::int_op(4)],
+                &[OpRef::int_op(3)],
                 OpRef::NONE.raw(),
                 final_descr,
             ),
-            mk_op(OpCode::Finish, &[OpRef::int_op(4)], OpRef::NONE.raw()),
+            mk_op(OpCode::Finish, &[OpRef::int_op(3)], OpRef::NONE.raw()),
         ];
-
-        let mut root_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        root_constants.insert(200, 1000);
-        root_constants.insert(100, 0);
-        root_constants.insert(101, 10);
-        backend.set_constants(root_constants);
 
         let token = JitCellToken::new(1_500_292);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
@@ -34328,14 +33229,11 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
 
-        let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        bridge_constants.insert(103, 5);
-        backend.set_constants(bridge_constants);
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(103)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(5)],
                 1,
             ),
             mk_op_with_descr(
@@ -34349,7 +33247,6 @@ mod tests {
             .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token)
             .unwrap();
 
-        backend.set_constants(indexmap::IndexMap::new());
         let frame = backend.execute_token(&token, &[Value::Int(-1000)]);
         let is_finish = backend.get_latest_descr(&frame).is_finish();
         let value = backend.get_int_value(&frame, 0);
@@ -34447,7 +33344,7 @@ mod tests {
             ),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
                 3,
             ),
             mk_op_with_descr(
@@ -34473,9 +33370,6 @@ mod tests {
                 start_descr,
             ),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1_500_362);
         backend
@@ -34549,27 +33443,17 @@ mod tests {
     #[test]
     fn test_gc_alloc_and_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
-        // Constants: 10000=32(size), 10001=-8(tid_ofs), 10002=7(tid),
-        // 10003=8(word), 10004=0(vtable_ofs), 10005=0xDEAD(vtable)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 7_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 0_i64);
-        consts.insert(10005, 0xDEAD_i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(7_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34577,9 +33461,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10004),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(0xDEAD_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34612,27 +33496,21 @@ mod tests {
     #[test]
     fn varsize_frame_fast_path_clears_recycled_has_shadow() {
         let mut backend = make_gc_backend();
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 32_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 7_i64);
-        consts.insert(10003, (TYPE_ID_BITS / 8) as i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
             mk_op(
                 OpCode::CallMallocNurseryVarsizeFrame,
-                &[OpRef::int_op(10000)],
+                &[OpRef::const_int(32_i64)],
                 0,
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(7_i64),
+                    OpRef::const_int((TYPE_ID_BITS / 8) as i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34674,40 +33552,32 @@ mod tests {
         let mut backend = make_gc_backend();
         // Constants: 10000=56(total_size), 10001=-8(tid_ofs), 10002=1(tid1),
         // 10003=8(word), 10004=24(incr), 10005=2(tid2)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 56_i64);
-        consts.insert(10001, -8_i64);
-        consts.insert(10002, 1_i64);
-        consts.insert(10003, 8_i64);
-        consts.insert(10004, 24_i64);
-        consts.insert(10005, 2_i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![];
         let ops = vec![
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(56_i64)], 0),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(0),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(1_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
             mk_op(
                 OpCode::NurseryPtrIncrement,
-                &[OpRef::ref_op(0), OpRef::int_op(10004)],
+                &[OpRef::ref_op(0), OpRef::const_int(24_i64)],
                 1,
             ),
             mk_op(
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10005),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(-8_i64),
+                    OpRef::const_int(2_i64),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34747,25 +33617,18 @@ mod tests {
 
     #[test]
     fn following_nursery_tid_reads_pool_and_inline_consts() {
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(10001, -8);
-        constants.insert(10002, 7);
-        constants.insert(10003, 8);
         let malloc = mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0);
-        let pooled = mk_op(
+        let header = mk_op(
             OpCode::GcStore,
             &[
                 OpRef::ref_op(0),
-                OpRef::int_op(10001),
-                OpRef::int_op(10002),
-                OpRef::int_op(10003),
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(7),
+                OpRef::const_int(std::mem::size_of::<usize>() as i64),
             ],
             OpRef::NONE.raw(),
         );
-        assert_eq!(
-            super::following_nursery_tid(&malloc, &pooled, &constants),
-            Some(7)
-        );
+        assert_eq!(super::following_nursery_tid(&malloc, &header), Some(7));
 
         let inline = mk_op(
             OpCode::GcStore,
@@ -34777,10 +33640,7 @@ mod tests {
             ],
             OpRef::NONE.raw(),
         );
-        assert_eq!(
-            super::following_nursery_tid(&malloc, &inline, &constants),
-            Some(9)
-        );
+        assert_eq!(super::following_nursery_tid(&malloc, &inline), Some(9));
 
         let keep_flags = mk_op(
             OpCode::GcStore,
@@ -34792,25 +33652,19 @@ mod tests {
             ],
             OpRef::NONE.raw(),
         );
-        assert_eq!(
-            super::following_nursery_tid(&malloc, &keep_flags, &constants),
-            Some(11)
-        );
+        assert_eq!(super::following_nursery_tid(&malloc, &keep_flags), Some(11));
 
         let wrong_base = mk_op(
             OpCode::GcStore,
             &[
                 OpRef::ref_op(1),
-                OpRef::int_op(10001),
-                OpRef::int_op(10002),
-                OpRef::int_op(10003),
+                OpRef::const_int(-(GcHeader::SIZE as i64)),
+                OpRef::const_int(7),
+                OpRef::const_int(std::mem::size_of::<usize>() as i64),
             ],
             OpRef::NONE.raw(),
         );
-        assert_eq!(
-            super::following_nursery_tid(&malloc, &wrong_base, &constants),
-            None
-        );
+        assert_eq!(super::following_nursery_tid(&malloc, &wrong_base), None);
     }
 
     fn tid_store_address_op(clif: &str, tid: i64, addr_prefix: &str) -> bool {
@@ -34892,12 +33746,6 @@ mod tests {
     fn test_gc_varsize_alloc_and_length_init_with_configured_runtime() {
         let mut backend = make_gc_backend();
         // Constants: 10000=0(len_ofs), 10001=8(size), 10002=0(kind), 10003=8(itemsize)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, 0_i64);
-        consts.insert(10001, 8_i64);
-        consts.insert(10002, 0_i64); // FLAG_ARRAY
-        consts.insert(10003, 8_i64); // itemsize
-        backend.set_constants(consts);
 
         let ad = make_array_descr(16, 8, Type::Int, Some(0));
         let inputargs = vec![InputArg::new_int_rc(0)];
@@ -34907,8 +33755,8 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallMallocNurseryVarsize,
                 &[
-                    OpRef::int_op(10002),
-                    OpRef::int_op(10003),
+                    OpRef::const_int(0_i64),
+                    OpRef::const_int(8_i64),
                     OpRef::input_arg_int(0),
                 ],
                 1,
@@ -34918,9 +33766,9 @@ mod tests {
                 OpCode::GcStore,
                 &[
                     OpRef::ref_op(1),
-                    OpRef::int_op(10000),
+                    OpRef::const_int(0_i64),
                     OpRef::input_arg_int(0),
-                    OpRef::int_op(10001),
+                    OpRef::const_int(8_i64),
                 ],
                 OpRef::NONE.raw(),
             ),
@@ -34962,11 +33810,6 @@ mod tests {
         let array_tid = gc.register_type(TypeInfo::varsize(8, 8, 0, false, Vec::new()));
         assert_eq!(array_tid, 7);
         let mut backend = backend_with_gc(gc);
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, gc_malloc_array_helper as *const () as i64);
-        consts.insert(10001, 8_i64);
-        consts.insert(10002, 7_i64);
-        backend.set_constants(consts);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
@@ -34974,9 +33817,9 @@ mod tests {
             mk_op_with_descr(
                 OpCode::CallR,
                 &[
-                    OpRef::int_op(10000),
-                    OpRef::int_op(10001),
-                    OpRef::int_op(10002),
+                    OpRef::const_int(gc_malloc_array_helper as *const () as i64),
+                    OpRef::const_int(8_i64),
+                    OpRef::const_int(7_i64),
                     OpRef::input_arg_int(0),
                 ],
                 1,
@@ -35080,10 +33923,7 @@ mod tests {
         //   p2 = call_malloc_nursery(size)  # this overflows
         //   guard_nonnull(p2, descr=faildescr) [p0, p1, p2]
         //   finish(p2, descr=finaldescr)
-        let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        consts.insert(10000, alloc_size as i64);
-        backend.set_constants(consts);
-        let size_arg = OpRef::int_op(10000);
+        let size_arg = OpRef::const_int(alloc_size as i64);
         let inputargs = vec![];
         let guard = mk_op(OpCode::GuardNonnull, &[OpRef::ref_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
@@ -35143,21 +33983,21 @@ mod tests {
         let inputargs = vec![];
         let ops = vec![
             mk_op(OpCode::Label, &[], OpRef::NONE.raw()),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 0),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 0),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(0), OpRef::int_op(100)],
+                &[OpRef::ref_op(0), OpRef::const_int(111)],
                 OpRef::NONE.raw(),
                 fd.clone(),
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(32)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(32)], 1),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(1), OpRef::int_op(101)],
+                &[OpRef::ref_op(1), OpRef::const_int(222)],
                 OpRef::NONE.raw(),
                 fd,
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(24)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(24)], 2),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::ref_op(0), OpRef::ref_op(1), OpRef::ref_op(2)],
@@ -35166,10 +34006,6 @@ mod tests {
         ];
 
         let token = JitCellToken::new(15_051);
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 111);
-        constants.insert(101, 222);
-        backend.set_constants(constants);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[]);
@@ -35215,10 +34051,10 @@ mod tests {
         let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 1),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 1),
             mk_op_with_descr(
                 OpCode::SetfieldGc,
-                &[OpRef::ref_op(1), OpRef::int_op(100)],
+                &[OpRef::ref_op(1), OpRef::const_int(777)],
                 OpRef::NONE.raw(),
                 int_fd,
             ),
@@ -35228,17 +34064,13 @@ mod tests {
                 OpRef::NONE.raw(),
                 ref_fd,
             ),
-            mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(24)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(24)], 2),
             mk_op(
                 OpCode::Finish,
                 &[OpRef::input_arg_ref(0)],
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 777);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(15_052);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35270,33 +34102,23 @@ mod tests {
             OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
-            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(OpCode::Newstr, &[OpRef::const_int(3)]),
             op(
                 OpCode::Strsetitem,
-                &[str0, OpRef::int_op(101), OpRef::int_op(200)],
+                &[str0, OpRef::const_int(0), OpRef::const_int(b'a' as i64)],
             ),
             op(
                 OpCode::Strsetitem,
-                &[str0, OpRef::int_op(102), OpRef::int_op(201)],
+                &[str0, OpRef::const_int(1), OpRef::const_int(b'b' as i64)],
             ),
             op(
                 OpCode::Strsetitem,
-                &[str0, OpRef::int_op(103), OpRef::int_op(202)],
+                &[str0, OpRef::const_int(2), OpRef::const_int(b'c' as i64)],
             ),
-            op(OpCode::Strgetitem, &[str0, OpRef::int_op(102)]),
+            op(OpCode::Strgetitem, &[str0, OpRef::const_int(1)]),
             op(OpCode::Strlen, &[str0]),
             op(OpCode::Finish, &[OpRef::int_op(4), OpRef::int_op(5)]),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 3);
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        constants.insert(103, 2);
-        constants.insert(200, b'a' as i64);
-        constants.insert(201, b'b' as i64);
-        constants.insert(202, b'c' as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1512);
         backend.compile_loop(&[], &ops, &token).unwrap();
@@ -35322,37 +34144,29 @@ mod tests {
             OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
-            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(OpCode::Newstr, &[OpRef::const_int(2)]),
             op(
                 OpCode::Strsetitem,
-                &[src, OpRef::int_op(101), OpRef::int_op(200)],
+                &[src, OpRef::const_int(0), OpRef::const_int(b'x' as i64)],
             ),
             op(
                 OpCode::Strsetitem,
-                &[src, OpRef::int_op(102), OpRef::int_op(201)],
+                &[src, OpRef::const_int(1), OpRef::const_int(b'y' as i64)],
             ),
-            op(OpCode::Newstr, &[OpRef::int_op(100)]),
+            op(OpCode::Newstr, &[OpRef::const_int(2)]),
             op(
                 OpCode::Copystrcontent,
                 &[
                     src,
                     dst,
-                    OpRef::int_op(101),
-                    OpRef::int_op(101),
-                    OpRef::int_op(100),
+                    OpRef::const_int(0),
+                    OpRef::const_int(0),
+                    OpRef::const_int(2),
                 ],
             ),
-            op(OpCode::Strgetitem, &[dst, OpRef::int_op(102)]),
+            op(OpCode::Strgetitem, &[dst, OpRef::const_int(1)]),
             op(OpCode::Finish, &[OpRef::int_op(5)]),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 2);
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        constants.insert(200, b'x' as i64);
-        constants.insert(201, b'y' as i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1513);
         backend.compile_loop(&[], &ops, &token).unwrap();
@@ -35376,21 +34190,15 @@ mod tests {
             OpRc::new(Op::new(oc, &bx))
         };
         let ops = vec![
-            op(OpCode::Newunicode, &[OpRef::int_op(100)]),
+            op(OpCode::Newunicode, &[OpRef::const_int(1)]),
             op(
                 OpCode::Unicodesetitem,
-                &[buf, OpRef::int_op(101), OpRef::int_op(200)],
+                &[buf, OpRef::const_int(0), OpRef::const_int(0x2603)],
             ),
-            op(OpCode::Unicodegetitem, &[buf, OpRef::int_op(101)]),
+            op(OpCode::Unicodegetitem, &[buf, OpRef::const_int(0)]),
             op(OpCode::Unicodelen, &[buf]),
             op(OpCode::Finish, &[OpRef::int_op(2), OpRef::int_op(3)]),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1);
-        constants.insert(101, 0);
-        constants.insert(200, 0x2603);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1514);
         backend.compile_loop(&[], &ops, &token).unwrap();
@@ -35415,17 +34223,13 @@ mod tests {
             op(OpCode::Strlen, &[OpRef::input_arg_ref(0)]),
             op(
                 OpCode::Strgetitem,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(1)],
             ),
             op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1515);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35461,17 +34265,13 @@ mod tests {
             op(OpCode::Unicodelen, &[OpRef::input_arg_ref(0)]),
             op(
                 OpCode::Unicodegetitem,
-                &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_ref(0), OpRef::const_int(0)],
             ),
             op(
                 OpCode::Finish,
                 &[OpRef::int_op(2), OpRef::int_op(3), OpRef::int_op(4)],
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1516);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35514,7 +34314,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallI,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(collect_nursery_via_runtime as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
                 1,
                 descr,
             ),
@@ -35525,15 +34328,8 @@ mod tests {
             ),
         ];
 
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            collect_nursery_via_runtime as *const () as usize as i64,
-        );
         // Vestigial runtime_id arg ignored by the trampoline since the
         // active GC is now routed through `CRANELIFT_ACTIVE_GC` directly.
-        constants.insert(101, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1506);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35577,7 +34373,10 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CallN,
-                &[OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(collect_nursery_via_runtime_void as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -35587,14 +34386,6 @@ mod tests {
                 OpRef::NONE.raw(),
             ),
         ];
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            collect_nursery_via_runtime_void as *const () as usize as i64,
-        );
-        constants.insert(101, 0);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1508);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -35631,7 +34422,11 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
                 OpCode::CondCallN,
-                &[OpRef::int_op(102), OpRef::int_op(100), OpRef::int_op(101)],
+                &[
+                    OpRef::const_int(1),
+                    OpRef::const_int(collect_nursery_via_runtime_void as *const () as usize as i64),
+                    OpRef::const_int(0),
+                ],
                 OpRef::NONE.raw(),
                 descr,
             ),
@@ -35642,15 +34437,7 @@ mod tests {
             ),
         ];
 
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            collect_nursery_via_runtime_void as *const () as usize as i64,
-        );
         // Vestigial runtime_id arg, see comment on the previous test.
-        constants.insert(101, 0);
-        constants.insert(102, 1);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(1507);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -36010,20 +34797,19 @@ mod tests {
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(1i64)],
                 1,
             ), // i = i + 1
             OpRc::new(guard_inv), // guard_not_invalidated
-            mk_op(OpCode::IntLt, &[OpRef::int_op(1), OpRef::int_op(101)], 2), // i < 1000000
+            mk_op(
+                OpCode::IntLt,
+                &[OpRef::int_op(1), OpRef::const_int(1_000_000i64)],
+                2,
+            ), // i < 1000000
             mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::int_op(1)], OpRef::NONE.raw()),
         ];
         ops[4].setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
-
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 1i64);
-        constants.insert(101, 1_000_000i64);
-        backend.set_constants(constants);
 
         let token = JitCellToken::new(102);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
@@ -36708,19 +35494,19 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 1),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::int_op(100), OpRef::ref_op(1), OpRef::const_int(0)],
+                &[
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
+                    OpRef::ref_op(1),
+                    OpRef::const_int(0),
+                ],
                 2,
                 descr,
             ),
             gnf2,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
         backend
             .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token)
             .unwrap();
@@ -36786,19 +35572,19 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 1),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::int_op(100), OpRef::ref_op(1), OpRef::const_int(0)],
+                &[
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
+                    OpRef::ref_op(1),
+                    OpRef::const_int(0),
+                ],
                 2,
                 descr,
             ),
             gnf2,
             mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
         backend
             .compile_bridge(guard_descr, &[InputArg::new_ref_rc(0)], &bridge_ops, &token)
             .unwrap();
@@ -37070,7 +35856,13 @@ mod tests {
             mk_op(OpCode::ForceToken, &[], 3),
             mk_op_with_descr(
                 OpCode::CallMayForceI,
-                &[OpRef::int_op(100), OpRef::ref_op(3), OpRef::const_int(0)],
+                &[
+                    OpRef::const_int(
+                        maybe_force_and_return_int_isolated as *const () as usize as i64,
+                    ),
+                    OpRef::ref_op(3),
+                    OpRef::const_int(0),
+                ],
                 4,
                 descr,
             ),
@@ -37078,12 +35870,6 @@ mod tests {
             mk_op(OpCode::IntAdd, &[i2, OpRef::const_int(1)], 5),
             mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
         ];
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(
-            100,
-            maybe_force_and_return_int_isolated as *const () as usize as i64,
-        );
-        backend.set_constants(constants);
         backend
             .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token)
             .unwrap();
@@ -37486,20 +36272,20 @@ mod tests {
     #[test]
     fn test_all_opcodes_covered_in_backend() {
         let mut backend = CraneliftBackend::new();
-        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-        constants.insert(100, 42i64);
-        constants.insert(101, 7i64);
-        backend.set_constants(constants);
 
         let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
                 OpCode::IntAdd,
-                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                &[OpRef::input_arg_int(0), OpRef::const_int(42i64)],
                 1,
             ),
-            mk_op(OpCode::IntGt, &[OpRef::int_op(1), OpRef::int_op(101)], 2),
+            mk_op(
+                OpCode::IntGt,
+                &[OpRef::int_op(1), OpRef::const_int(7i64)],
+                2,
+            ),
             {
                 let g = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
                 g.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);

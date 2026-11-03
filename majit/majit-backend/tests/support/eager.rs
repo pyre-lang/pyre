@@ -7,7 +7,7 @@ use majit_backend::eager::{ArgumentError, CompiledIr};
 use majit_backend::{Backend, BackendError, JitCellToken};
 use majit_ir::descr::make_finish_descr;
 use majit_ir::operand::Operand;
-use majit_ir::{ConstMap, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
 
 fn token() -> Arc<JitCellToken> {
     static NEXT: AtomicU64 = AtomicU64::new(1_000_000);
@@ -61,16 +61,8 @@ fn compiles_before_first_execution_and_reuses_code_for_new_inputs() {
     ];
     let inputs = vec![x.clone(), y.clone()];
     let token = token();
-    let mut code = unsafe {
-        CompiledIr::compile(
-            &mut *backend,
-            token.clone(),
-            &inputs,
-            &operations,
-            ConstMap::default(),
-        )
-    }
-    .unwrap();
+    let mut code =
+        unsafe { CompiledIr::compile(&mut *backend, token.clone(), &inputs, &operations) }.unwrap();
     assert_eq!(
         tracker.total_compiled_loops.load(Ordering::Relaxed),
         before + 1
@@ -111,7 +103,7 @@ fn compiles_before_first_execution_and_reuses_code_for_new_inputs() {
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     drop(frame);
     assert!(matches!(
-        unsafe { CompiledIr::compile(&mut *backend, token, &[], &[], ConstMap::default()) },
+        unsafe { CompiledIr::compile(&mut *backend, token, &[], &[]) },
         Err(BackendError::CompilationFailed(_))
     ));
 }
@@ -145,7 +137,6 @@ fn guard_failure_is_returned_without_fallback_or_recompilation() {
             compiled_token.clone(),
             &[x.clone()],
             &operations,
-            ConstMap::default(),
         )
     }
     .unwrap();
@@ -187,31 +178,16 @@ fn mixed_types_and_void_results_preserve_the_backend_contract() {
     // argument list without requiring a backend-specific multi-return ABI.
     for (arg, value) in args.iter().zip(values) {
         let operations = vec![finish(std::slice::from_ref(arg), vec![value.get_type()])];
-        let mut code = unsafe {
-            CompiledIr::compile(
-                &mut *backend,
-                token(),
-                &inputs,
-                &operations,
-                ConstMap::default(),
-            )
-        }
-        .unwrap();
+        let mut code =
+            unsafe { CompiledIr::compile(&mut *backend, token(), &inputs, &operations) }.unwrap();
         let result = unsafe { code.execute(&values) }.unwrap();
         assert!(result.is_finish);
         assert_eq!(result.typed_outputs, vec![value]);
     }
 
-    let mut code = unsafe {
-        CompiledIr::compile(
-            &mut *backend,
-            token(),
-            &[],
-            &[finish(&[], vec![])],
-            ConstMap::default(),
-        )
-    }
-    .unwrap();
+    let mut code =
+        unsafe { CompiledIr::compile(&mut *backend, token(), &[], &[finish(&[], vec![])]) }
+            .unwrap();
     let result = unsafe { code.execute(&[]) }.unwrap();
     assert!(result.is_finish);
     assert!(result.typed_outputs.is_empty());
@@ -224,8 +200,7 @@ fn empty_submission_does_not_reach_codegen() {
         .cpu_tracker()
         .total_compiled_loops
         .load(Ordering::Relaxed);
-    let result =
-        unsafe { CompiledIr::compile(&mut *backend, token(), &[], &[], ConstMap::default()) };
+    let result = unsafe { CompiledIr::compile(&mut *backend, token(), &[], &[]) };
     assert!(matches!(result, Err(BackendError::CompilationFailed(_))));
     drop(result);
     assert_eq!(
@@ -268,16 +243,8 @@ fn host_function_runs_only_on_explicit_execution() {
         call.clone(),
         finish(&[Operand::from_bound_op(&call)], vec![Type::Int]),
     ];
-    let mut code = unsafe {
-        CompiledIr::compile(
-            &mut *backend,
-            token(),
-            &[x.clone()],
-            &operations,
-            ConstMap::default(),
-        )
-    }
-    .unwrap();
+    let mut code =
+        unsafe { CompiledIr::compile(&mut *backend, token(), &[x.clone()], &operations) }.unwrap();
     assert_eq!(
         CALLS.load(Ordering::Relaxed),
         0,

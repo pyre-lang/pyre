@@ -88,9 +88,9 @@ pub(crate) const STR_RETURN_TYPE: &str = "str";
 /// the `specialize_legacy_graph` callback channel.
 ///
 /// `getkind` itself panics on the `NotImplementedError` cases
-/// (longlonglong / longfloat / non-pointer aggregates / InteriorPtr
-/// on a Variable's concretetype) — the upstream `history.py:62,70
-/// raise NotImplementedError` shape.  Pyre's legacy specialize
+/// (longlonglong / too-large LongFloat / non-pointer aggregates /
+/// InteriorPtr on a Variable's concretetype) — the upstream
+/// `history.py getkind` `NotImplementedError` shape.  Pyre's legacy specialize
 /// callers want those failures routed through `Result<…, TyperError>`
 /// instead so a single unported rtype path doesn't unwind the whole
 /// `transform_graph_to_jitcode` driver; this wrapper catches the
@@ -9959,12 +9959,25 @@ mod tests {
         let cases = [
             ("SignedLongLongLong", LowLevelType::SignedLongLongLong),
             ("UnsignedLongLongLong", LowLevelType::UnsignedLongLongLong),
-            ("LongFloat", LowLevelType::LongFloat),
         ];
         for (name, ty) in cases {
             let msg = format!("case {name}: has no history.getkind mapping");
             let err = lowleveltype_to_concrete(&ty).expect_err(&msg);
             assert!(err.is_missing_rtype_operation(), "case {name}");
+        }
+    }
+
+    #[test]
+    fn lowleveltype_to_concrete_longfloat_follows_target_signed_size() {
+        if crate::model::try_getkind(&LowLevelType::LongFloat, true, true, true).is_ok() {
+            assert_eq!(
+                lowleveltype_to_concrete(&LowLevelType::LongFloat).expect("supported lltype"),
+                ConcreteType::Signed,
+            );
+        } else {
+            let err = lowleveltype_to_concrete(&LowLevelType::LongFloat)
+                .expect_err("LongFloat wider than Signed has no history.getkind mapping");
+            assert!(err.is_missing_rtype_operation());
         }
     }
 

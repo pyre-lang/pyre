@@ -8530,6 +8530,11 @@ fn longlong_wider_than_signed(signed_size: usize) -> bool {
     8 > signed_size
 }
 
+/// `rffi.sizeof(LongFloat) > rffi.sizeof(lltype.Signed)`.
+fn longfloat_wider_than_signed(longfloat_size: usize, signed_size: usize) -> bool {
+    longfloat_size > signed_size
+}
+
 /// `rpython/jit/metainterp/history.py getkind(TYPE, ...)`.
 ///
 /// Direct line-by-line port — the canonical
@@ -8578,6 +8583,7 @@ pub fn try_getkind(
     supports_longlong: bool,
     supports_singlefloats: bool,
 ) -> Result<ConcreteType, GetkindError> {
+    use crate::translator::rtyper::lltypesystem::llmemory::sizeof_longfloat;
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     match ty {
         // `if TYPE is lltype.Void: return "void"`
@@ -8642,11 +8648,24 @@ pub fn try_getkind(
                 Ok(ConcreteType::Signed)
             }
         }
-        // 16-byte primitives, and `LongFloat`, which the longlong arm
-        // excludes. `supports_longlong` only rescues a width of 8.
-        LowLevelType::SignedLongLongLong
-        | LowLevelType::UnsignedLongLongLong
-        | LowLevelType::LongFloat => Err(GetkindError::TooLarge),
+        // `history.py getkind`: LongFloat is TooLarge when
+        // sizeof(LongFloat) > sizeof(Signed), otherwise `"int"`.
+        // The longlong `'float'` rescue never applies
+        // (`TYPE is not lltype.LongFloat`).
+        LowLevelType::LongFloat => {
+            if longfloat_wider_than_signed(
+                sizeof_longfloat() as usize,
+                crate::layout::target_signed_size(),
+            ) {
+                Err(GetkindError::TooLarge)
+            } else {
+                Ok(ConcreteType::Signed)
+            }
+        }
+        // 16-byte primitives. `supports_longlong` only rescues a width of 8.
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => {
+            Err(GetkindError::TooLarge)
+        }
         // `elif isinstance(TYPE, lltype.Ptr):
         //      if TYPE.TO._gckind == 'raw': return "int"
         //      else: return "ref"`
@@ -11345,6 +11364,31 @@ mod tests {
     fn longlong_wider_than_signed_compares_against_signed_size() {
         assert!(!longlong_wider_than_signed(8));
         assert!(longlong_wider_than_signed(4));
+    }
+
+    #[test]
+    fn longfloat_wider_than_signed_compares_sizes() {
+        assert!(!longfloat_wider_than_signed(8, 8));
+        assert!(longfloat_wider_than_signed(16, 8));
+        assert!(longfloat_wider_than_signed(8, 4));
+    }
+
+    #[test]
+    fn try_getkind_longfloat_follows_sizeof_vs_signed() {
+        use crate::translator::rtyper::lltypesystem::llmemory::sizeof_longfloat;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let expected = if longfloat_wider_than_signed(
+            sizeof_longfloat() as usize,
+            crate::layout::target_signed_size(),
+        ) {
+            Err(GetkindError::TooLarge)
+        } else {
+            Ok(ConcreteType::Signed)
+        };
+        assert_eq!(
+            try_getkind(&LowLevelType::LongFloat, true, true, true),
+            expected
+        );
     }
 
     /// `merge_from`'s contract is that every set flag in `other` wins and that

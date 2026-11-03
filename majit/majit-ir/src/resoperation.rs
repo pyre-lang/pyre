@@ -363,9 +363,8 @@ impl OpRef {
         OpRef::VoidOp(pos)
     }
 
-    /// Lower a Const OpRef variant to its raw `i64` payload, matching the
-    /// wire shape of the `set_constants(HashMap<u32, i64>)` backend
-    /// boundary. Returns `None` for non-Const OpRefs.
+    /// Lower a Const OpRef variant to its raw `i64` payload. Returns
+    /// `None` for non-Const OpRefs.
     ///
     /// Backends use this as a guard before any `.raw()` call on a
     /// constant: Const variants carry the value directly

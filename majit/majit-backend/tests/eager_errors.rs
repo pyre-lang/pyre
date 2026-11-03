@@ -4,20 +4,16 @@ use std::sync::Arc;
 
 use majit_backend::eager::CompiledIr;
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
-use majit_ir::{Const, ConstMap, DescrRef, FailDescr, GcRef, InputArgRc, Op, OpCode, OpRc, Value};
+use majit_ir::{DescrRef, FailDescr, GcRef, InputArgRc, Op, OpCode, OpRc, Value};
 
 #[derive(Default)]
 struct RejectingBackend {
-    constants: ConstMap<Const>,
     compilations: usize,
 }
 
 impl Backend for RejectingBackend {
     fn backend_name(&self) -> &'static str {
         "rejecting-test-backend"
-    }
-    fn set_constants_pool(&mut self, constants: ConstMap<Const>) {
-        self.constants = constants;
     }
     fn setup_once(&mut self) {
         panic!("eager compilation must not redo runtime setup");
@@ -50,11 +46,6 @@ impl Backend for RejectingBackend {
         _: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
         self.compilations += 1;
-        assert_eq!(
-            self.constants.len(),
-            1,
-            "submission's pool must reach the backend"
-        );
         Err(BackendError::Unsupported(
             "deliberate compile decline".into(),
         ))
@@ -95,28 +86,19 @@ impl Backend for RejectingBackend {
 }
 
 #[test]
-fn backend_decline_propagates_and_pending_constants_are_cleared() {
+fn backend_decline_propagates() {
     let mut backend = RejectingBackend::default();
     let finish = OpRc::new(Op::with_descr(
         OpCode::Finish,
         &[],
         majit_ir::descr::make_finish_descr(0, vec![]),
     ));
-    let mut constants = ConstMap::default();
-    constants.insert(0, Const::Int(42));
     let result = unsafe {
-        CompiledIr::compile(
-            &mut backend,
-            Arc::new(JitCellToken::new(1)),
-            &[],
-            &[finish],
-            constants,
-        )
+        CompiledIr::compile(&mut backend, Arc::new(JitCellToken::new(1)), &[], &[finish])
     };
     assert!(
         matches!(result, Err(BackendError::Unsupported(ref message)) if message == "deliberate compile decline")
     );
     drop(result);
     assert_eq!(backend.compilations, 1);
-    assert!(backend.constants.is_empty());
 }

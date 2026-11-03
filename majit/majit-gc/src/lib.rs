@@ -27,7 +27,7 @@ fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
 /// 4. Stack maps for compiled code
 ///
 /// Reference: rpython/memory/gc/incminimark.py, rpython/jit/backend/llsupport/gc.py
-use majit_ir::{Const, ConstMap, GcRef, OpRc};
+use majit_ir::{GcRef, OpRc};
 pub use nursery_clock::HostNurseryClock;
 pub use trace::{
     ClassTypeLayout, CustomDataLayout, TypeEntry, TypeEntryTail, TypeInfo, TypeInfoLayout,
@@ -2257,24 +2257,13 @@ pub trait GcRewriter: Send {
     /// objects `rewrite.py GcRewriterAssembler.rewrite` appends to
     /// `self.newops` — no `Op` clone at the backend boundary.
     fn rewrite_for_gc(&self, ops: &[OpRc]) -> Vec<OpRc>;
-    /// Rewrite with access to the constant pool.
-    /// Returns (rewritten ops, gc_table gcrefs). Each `Const` box carries
-    /// its own type via `Const::get_type`. The gcrefs list is the per-loop
-    /// reference-constant list collected by `remove_constptr`
+    /// Rewrite and collect the gc_table gcrefs. The gcrefs list is the
+    /// per-loop reference-constant list collected by `remove_constptr`
     /// (`GcRewriterAssembler.rewrite`'s `gcrefs_output_list`); the backend
     /// builds a `GcTable` from it and bakes its base address into the
-    /// `LoadFromGcTable` loads. The caller's pool is not returned: the
-    /// rewrite only reads it.
-    ///
-    /// The pool is borrowed. `GcRewriterAssembler.rewrite` does not copy
-    /// one, and `resolve_constant` only reads it, so the caller's map is
-    /// left in place.
-    fn rewrite_for_gc_with_constants(
-        &self,
-        ops: &[OpRc],
-        constants: &ConstMap<Const>,
-    ) -> (Vec<OpRc>, Vec<GcRef>) {
-        let _ = constants;
+    /// `LoadFromGcTable` loads. Scalar constants travel as `ConstInt`
+    /// operands (`rewrite.py` `isinstance(arg, ConstInt)` → `getint()`).
+    fn rewrite_for_gc_with_constants(&self, ops: &[OpRc]) -> (Vec<OpRc>, Vec<GcRef>) {
         (self.rewrite_for_gc(ops), Vec::new())
     }
 
@@ -2284,9 +2273,8 @@ pub trait GcRewriter: Send {
     fn rewrite_for_gc_segments(
         &self,
         segments: &[&[OpRc]],
-        constants: &ConstMap<Const>,
     ) -> Option<(Vec<Vec<OpRc>>, Vec<GcRef>)> {
-        let _ = (segments, constants);
+        let _ = segments;
         None
     }
 }

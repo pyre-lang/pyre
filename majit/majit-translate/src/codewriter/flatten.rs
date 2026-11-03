@@ -1660,11 +1660,16 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }
         // `history.py getkind`: SingleFloat is stored in an int when
-        // supported; LongFloat is too large.
+        // supported; LongFloat is too large only when
+        // sizeof(LongFloat) > sizeof(Signed).
         ConstValue::SingleFloat(_) => 'i',
         ConstValue::Float(_) => 'f',
         ConstValue::LongFloat(_) => {
-            panic!("getkind: type LongFloat is too large")
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            match crate::model::try_getkind(&LowLevelType::LongFloat, true, true, true) {
+                Ok(_) => 'i',
+                Err(_) => panic!("getkind: type LongFloat is too large"),
+            }
         }
         ConstValue::UniChar(_) => 'i',
         ConstValue::None
@@ -1773,15 +1778,24 @@ mod tests {
     }
 
     #[test]
-    fn constvalue_kind_singlefloat_is_int_and_longfloat_is_too_large() {
+    fn constvalue_kind_singlefloat_is_int_and_longfloat_follows_getkind() {
+        use crate::translator::rtyper::lltypesystem::llmemory::sizeof_longfloat;
         assert_eq!(
             constvalue_kind(&ConstValue::SingleFloat(1f32.to_bits())),
             'i'
         );
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            constvalue_kind(&ConstValue::LongFloat(1.0f64.to_bits()))
-        }));
-        assert!(panicked.is_err(), "LongFloat is too large for getkind");
+        let wider = sizeof_longfloat() as usize > crate::layout::target_signed_size();
+        if wider {
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                constvalue_kind(&ConstValue::LongFloat(1.0f64.to_bits()))
+            }));
+            assert!(panicked.is_err(), "LongFloat is too large for getkind");
+        } else {
+            assert_eq!(
+                constvalue_kind(&ConstValue::LongFloat(1.0f64.to_bits())),
+                'i'
+            );
+        }
     }
 
     #[test]

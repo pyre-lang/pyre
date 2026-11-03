@@ -8,7 +8,11 @@
 //! ports of `jtransform.py` / backend code can refer to the same module
 //! and symbol names.
 //!
-//! `is_64_bit` / `supports_longlong` follow the target's `Signed` width.
+//! `is_64_bit` / `supports_longlong` / `is_longlong` follow the translation
+//! target's `Signed` width (`layout::target_signed_size`); the float-storage
+//! carriers follow the Signed width of the compile target (pointer width,
+//! except wasm32 whose `Signed` is 8), so both pick upstream's 64-bit branch
+//! on wasm32.
 
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
@@ -20,72 +24,72 @@ pub fn supports_longlong() -> bool {
     !is_64_bit()
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 #[allow(non_camel_case_types)]
 pub type r_float_storage = f64;
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 #[allow(non_camel_case_types)]
 pub type r_float_storage = i64;
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub const FLOATSTORAGE: LowLevelType = LowLevelType::Float;
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub const FLOATSTORAGE: LowLevelType = LowLevelType::SignedLongLong;
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub const ZEROF: r_float_storage = 0.0;
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub const ZEROF: r_float_storage = 0;
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub fn getfloatstorage(x: f64) -> r_float_storage {
     x
 }
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub fn getfloatstorage(x: f64) -> r_float_storage {
     x.to_bits() as i64
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub fn getrealfloat(x: r_float_storage) -> f64 {
     x
 }
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub fn getrealfloat(x: r_float_storage) -> f64 {
     f64::from_bits(x as u64)
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub fn gethash(x: r_float_storage) -> i64 {
     compute_hash_float(x)
 }
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub fn gethash(xll: r_float_storage) -> i64 {
     signed_intmask(xll.wrapping_sub(xll >> 32))
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub fn gethash_fast(x: r_float_storage) -> i64 {
     x.to_bits() as i64
 }
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub fn gethash_fast(x: r_float_storage) -> i64 {
     gethash(x)
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 pub fn extract_bits(x: r_float_storage) -> i64 {
     x.to_bits() as i64
 }
 
-#[cfg(not(target_pointer_width = "64"))]
+#[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
 pub fn extract_bits(x: r_float_storage) -> i64 {
     x
 }
@@ -117,16 +121,12 @@ pub fn singlefloat2int_for_word(bits: u32, word: usize) -> i64 {
 }
 
 pub fn singlefloat2int(x: f32) -> i64 {
-    // Runtime-on-target: `cfg!(target_pointer_width)` is the Signed width.
-    let word = if cfg!(target_pointer_width = "32") {
-        4
-    } else {
-        8
-    };
-    singlefloat2int_for_word(x.to_bits(), word)
+    // assembler.rs builds translator constants for the target;
+    // rffi.cast(lltype.Signed, ...) sign-extends at the Signed width.
+    singlefloat2int_for_word(x.to_bits(), crate::layout::target_signed_size())
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 fn compute_hash_float(f: f64) -> i64 {
     if !f.is_finite() {
         if f.is_infinite() {
@@ -154,17 +154,17 @@ fn compute_hash_float(f: f64) -> i64 {
 }
 
 fn signed_intmask(x: i64) -> i64 {
-    #[cfg(target_pointer_width = "64")]
+    #[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
     {
         x
     }
-    #[cfg(not(target_pointer_width = "64"))]
+    #[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
     {
         x as i32 as i64
     }
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
 fn frexp(f: f64) -> (f64, i32) {
     debug_assert!(f.is_finite());
     debug_assert_ne!(f, 0.0);
@@ -190,7 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg(target_pointer_width = "64")]
+    #[cfg(any(target_pointer_width = "64", target_arch = "wasm32"))]
     fn platform_constants_match_longlong_py_branch() {
         assert!(is_64_bit());
         assert!(!supports_longlong());
@@ -200,7 +200,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_pointer_width = "64"))]
+    #[cfg(not(any(target_pointer_width = "64", target_arch = "wasm32")))]
     fn platform_constants_match_longlong_py_branch() {
         assert!(!is_64_bit());
         assert!(supports_longlong());
@@ -237,17 +237,22 @@ mod tests {
         assert_eq!(value, 1.5_f32);
         assert_eq!(singlefloat2int(value), 0x3fc00000);
         let high = singlefloat2int(int2singlefloat(0x8000_0000));
-        if cfg!(target_pointer_width = "32") {
+        if crate::layout::target_signed_size() == 4 {
             assert_eq!(high, -2147483648);
         } else {
             assert_eq!(high, 0x8000_0000);
         }
         let bits = (-1.0f32).to_bits();
         assert_eq!(singlefloat2int_for_word(bits, 4), -1_082_130_432);
-        #[cfg(target_pointer_width = "64")]
-        {
+        if crate::layout::target_signed_size() == 8 {
             assert_eq!(singlefloat2int(-1.0), 3_212_836_864);
-            assert_eq!(singlefloat2int_for_word(bits, 8), 3_212_836_864);
         }
+        assert_eq!(singlefloat2int_for_word(bits, 8), 3_212_836_864);
+    }
+
+    #[test]
+    fn singlefloat2int_for_word_wasm32_signed_is_eight() {
+        assert_eq!(singlefloat2int_for_word(0x8000_0000, 8), 0x8000_0000);
+        assert_eq!(singlefloat2int_for_word(0x8000_0000, 4), -2147483648);
     }
 }

@@ -673,7 +673,6 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     vable_array_lengths: &[usize],
     entry_prefix_len: usize,
     index_of_virtualizable: usize,
-    _constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     // `compile.py:425-461` redirects each stripped entry inputarg at its own
     // `_forwarded` slot — `box.set_forwarded(extra_ops[-1])` — and `emit_op`
@@ -1235,10 +1234,6 @@ pub fn compile_tmp_callback(
     //
     // `compile.py` `cpu.compile_loop(inputargs, operations, jitcell_token,
     // log=False)`.
-    // Inline-Const carries each Const value directly on its OpRef
-    // variant (history.py:227/268/314), so the backend pool is left
-    // empty for `compile_tmp_callback`.
-    backend.set_constants_pool(majit_ir::ConstMap::default());
     // compile.py `cpu.compile_loop(inputargs, operations, jitcell_token)`
     // — the same boxes, after forget_optimization_info.
     backend.compile_loop(&inputargs, &operations, &jitcell_token)?;
@@ -1507,17 +1502,8 @@ mod tests {
             OpRc::new(op)
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
-        patch_new_loop_to_load_virtualizable_fields(
-            &mut ops,
-            &mut inputargs,
-            &vinfo,
-            &[],
-            1,
-            0,
-            &mut constants,
-        );
+        patch_new_loop_to_load_virtualizable_fields(&mut ops, &mut inputargs, &vinfo, &[], 1, 0);
 
         assert_eq!(
             inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
@@ -1588,18 +1574,8 @@ mod tests {
                 .map(majit_ir::operand::Operand::from_bound_inputarg)
                 .collect::<Vec<_>>(),
         )];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
-        patch_new_loop_to_load_virtualizable_fields(
-            &mut ops,
-            &mut inputargs,
-            &vinfo,
-            &[2],
-            1,
-            0,
-            &mut constants,
-        );
+        patch_new_loop_to_load_virtualizable_fields(&mut ops, &mut inputargs, &vinfo, &[2], 1, 0);
 
         assert_eq!(
             inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
@@ -1665,17 +1641,8 @@ mod tests {
                 reminted,
             ],
         ))];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
-        patch_new_loop_to_load_virtualizable_fields(
-            &mut ops,
-            &mut inputargs,
-            &vinfo,
-            &[1],
-            1,
-            0,
-            &mut constants,
-        );
+        patch_new_loop_to_load_virtualizable_fields(&mut ops, &mut inputargs, &vinfo, &[1], 1, 0);
 
         assert_eq!(
             inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
@@ -1732,18 +1699,9 @@ mod tests {
                 .map(majit_ir::operand::Operand::from_bound_inputarg)
                 .collect::<Vec<_>>(),
         )];
-        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
 
-        patch_new_loop_to_load_virtualizable_fields(
-            &mut ops,
-            &mut inputargs,
-            &vinfo,
-            &[2],
-            2,
-            1,
-            &mut constants,
-        );
+        patch_new_loop_to_load_virtualizable_fields(&mut ops, &mut inputargs, &vinfo, &[2], 2, 1);
 
         // The scalar at slot 0 survives the truncation alongside the
         // virtualizable; only the two array elements are reconstructed.

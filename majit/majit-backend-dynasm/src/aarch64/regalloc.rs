@@ -401,7 +401,6 @@ impl<'a> RegAlloc<'a> {
                 need_lower_byte,
                 &mut self.longevity,
                 &mut self.fm,
-                &self.constants,
                 &mut self.pending_moves,
             )
         } else {
@@ -413,7 +412,6 @@ impl<'a> RegAlloc<'a> {
                 need_lower_byte,
                 &mut self.longevity,
                 &mut self.fm,
-                &self.constants,
                 &mut self.pending_moves,
             )
         }
@@ -868,7 +866,7 @@ impl<'a> RegAlloc<'a> {
         debug_assert!(v.is_constant() && self.tp(v) != Type::Float);
         let tmp = self.fresh_temp_var();
         let reg = self.force_allocate_reg(&tmp, Type::Int, forbidden, None, false);
-        let imm = self.rm.convert_to_imm(v, &self.constants);
+        let imm = self.rm.convert_to_imm(v);
         self.rm.spill_moves.push((imm, Loc::Reg(reg)));
         self.rm.temp_boxes.push(tmp);
         Loc::Reg(reg)
@@ -1143,7 +1141,6 @@ impl<'a> RegAlloc<'a> {
             &[],
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc], Some(loc), asm);
@@ -1163,7 +1160,6 @@ impl<'a> RegAlloc<'a> {
             &[],
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         self.perform(i, [loc], Some(loc), asm);
@@ -1808,7 +1804,6 @@ impl<'a> RegAlloc<'a> {
             false,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
         );
         self.rm
             .possibly_free_var(length_box, &mut self.longevity, &mut self.fm, Type::Int);
@@ -2082,7 +2077,6 @@ impl<'a> RegAlloc<'a> {
             &forbidden,
             &mut self.longevity,
             &mut self.fm,
-            &self.constants,
             &mut self.pending_moves,
         );
         let res_reg = match resloc {

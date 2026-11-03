@@ -1091,8 +1091,7 @@ impl UnrollOptimizer {
             // allocates a fresh const operand per call from `const_pool`
             // (`history.py` ConstInt(value) per-call-site parity).
             // opt_p1's entry path seeds `const_pool` from the shared
-            // `constants` map (`optimizer.rs`'s
-            // `lower_typed_constants_to_const_pool`).
+            // `constants` map.
             // unroll.py `optimize_preamble` has no
             // SpeculativeError catch — Phase 1 corresponds to the
             // preamble, whose gcrefs are concrete runtime values

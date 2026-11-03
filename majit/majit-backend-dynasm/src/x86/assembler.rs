@@ -654,7 +654,6 @@ mod tests {
             arena,
             0,
             0,
-            Default::default(),
             None,
             None,
             Default::default(),
@@ -1206,14 +1205,12 @@ pub(crate) fn build_cond_call_slowpaths(
 ) -> (Vec<codebuf::ArenaExecutableBuffer>, [usize; 4]) {
     let inputargs: Vec<InputArgRc> = Vec::new();
     let operations: Vec<OpRc> = Vec::new();
-    let constants: majit_ir::ConstMap<majit_ir::Const> = Default::default();
     let classptr_to_typeid: IndexMap<i64, u32> = IndexMap::new();
     let classptr_to_subclass_range: IndexMap<i64, (i64, i64)> = IndexMap::new();
     let mut asm = Assembler386::new(
         Arc::clone(arena),
         0,
         0,
-        constants,
         None,
         None,
         classptr_to_typeid,
@@ -2066,10 +2063,6 @@ pub struct Assembler386<'a> {
     /// [`OpTypeIndex::NO_POS`] for unset slots and Void/None ops.
     /// Mirrors `OpTypeIndex::op_pos`.
     op_pos: majit_ir::PosIndex,
-    /// Constants: OpRef index (>= 10000) → typed `Const` value. The box
-    /// variant carries its own type (`Const::get_type`), so no separate
-    /// constant-type map is needed.
-    constants: majit_ir::ConstMap<majit_ir::Const>,
     /// Next available frame slot index.
     next_slot: usize,
     /// Condition code from the most recent CMP/TEST instruction,
@@ -2373,7 +2366,6 @@ impl<'a> Assembler386<'a> {
         asm_memory_manager: Arc<AsmMemoryManager>,
         trace_id: u64,
         header_pc: u64,
-        constants: majit_ir::ConstMap<majit_ir::Const>,
         vtable_offset: Option<usize>,
         subclassrange_min_offset: Option<usize>,
         classptr_to_typeid: IndexMap<i64, u32>,
@@ -2417,7 +2409,6 @@ impl<'a> Assembler386<'a> {
             operations,
             inputarg_pos,
             op_pos,
-            constants,
             next_slot: 0,
             guard_success_cc: None,
             target_tokens_currently_compiling: IndexMap::new(),
@@ -2590,27 +2581,21 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Resolve an OpRef to either a frame slot offset or an immediate constant.
-    /// Cranelift resolve_opref parity: check constants map FIRST
-    /// (regardless of CONST_BIT), then fall back to slot mapping.
     fn resolve_opref(&self, opref: OpRef) -> ResolvedArg {
-        // Op results take precedence over constants (Cranelift parity).
+        // Op results take precedence over constants.
         if let Some(&slot) = self.opref_to_slot.get(&opref) {
             return ResolvedArg::Slot(Self::slot_offset(slot));
         }
-        // history.py/268/314 — inline-Const variants carry value inline.
-        if let Some(val) = opref
-            .inline_const_bits()
-            .or_else(|| self.constants.get(&opref.raw()).map(|c| c.as_raw_i64()))
-        {
+        // `ConstXxx.value` — inline-Const variants carry value inline.
+        if let Some(val) = opref.inline_const_bits() {
             return ResolvedArg::Const(val);
         }
-        // history.py/268/314 — Const always carries a value, so a
-        // constant OpRef with no resolvable value is an invariant break,
-        // not a `#0`.
+        // `Const` always carries a value, so a constant OpRef with no
+        // resolvable value is an invariant break, not a `#0`.
         if opref.is_constant() {
             panic!(
-                "resolve_opref: legacy constant {opref:?} missing from constants pool — \
-                 Const always carries a value (history.py:227/268/314)"
+                "resolve_opref: constant {opref:?} has no inline Const payload — \
+                 Const always carries a value (`ConstInt.value`)"
             );
         }
         // regalloc.py:102 `FrameManager.loc(must_exist=True)` raises KeyError
@@ -3560,14 +3545,7 @@ impl<'a> Assembler386<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        // RegAlloc keeps the raw `i64` value map; project it from the
-        // typed pool at this boundary (each Const carries its own type).
-        let ra_constants: indexmap::IndexMap<u32, i64> = self
-            .constants
-            .iter()
-            .map(|(&k, c)| (k, c.as_raw_i64()))
-            .collect();
-        let mut ra = RegAlloc::new(ra_constants, inputargs, ops);
+        let mut ra = RegAlloc::new(inputargs, ops);
         let is_bridge = self.bridge_input_locs.is_some();
         if let Some(ref arglocs) = self.bridge_input_locs {
             ra.prepare_bridge(arglocs);
@@ -7902,10 +7880,10 @@ impl<'a> Assembler386<'a> {
     fn genop_call_malloc_nursery(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0).to_opref();
         let total_size = size_ref.inline_const_bits().unwrap_or_else(|| {
-            self.constants
-                .get(&size_ref.raw())
-                .map(|c| c.as_raw_i64())
-                .unwrap_or(size_ref.raw() as i64)
+            panic!(
+                "CallMallocNursery size must be a ConstInt (`malloc_cond`); \
+                 got {size_ref:?}"
+            )
         });
         debug_assert!(
             total_size & (WORD as i64 - 1) == 0,
@@ -8234,10 +8212,7 @@ impl<'a> Assembler386<'a> {
     fn genop_call_malloc_nursery_headerless(&mut self, op: &Op, result_loc: Option<&Loc>) {
         let size_ref = op.arg(0).to_opref();
         let size = size_ref.inline_const_bits().unwrap_or_else(|| {
-            self.constants
-                .get(&size_ref.raw())
-                .map(|c| c.as_raw_i64())
-                .unwrap_or(size_ref.raw() as i64)
+            panic!("CallMallocNurseryHeaderless size must be a ConstInt; got {size_ref:?}")
         });
         let (nf_addr, nt_addr) = crate::runner::dynasm_headerless_nursery_addrs();
         let nf = nf_addr as i64;

@@ -18,8 +18,8 @@ operation is unchanged; backend compilation errors propagate to the caller.
    by the embedding needs no second setup. `CompiledIr` never installs a different
    collector, reattaches descriptors, or calls setup/teardown behind the caller.
 2. Supply a fresh `Arc<JitCellToken>` from the embedding's existing unique token
-   namespace, input arguments in call order, backend-ready operations, and a
-   `ConstMap`. `unsafe CompiledIr::compile(...)` compiles immediately. A caller
+   namespace, input arguments in call order, and backend-ready operations.
+   `unsafe CompiledIr::compile(...)` compiles immediately. A caller
    supplying raw machine-level IR is responsible for its validity; the API is
    not a verifier for untrusted IR.
 3. Reuse `unsafe compiled.execute(&values)` for different inputs. Arity and types
@@ -37,10 +37,9 @@ operation is unchanged; backend compilation errors propagate to the caller.
    is released with that backend's `clear_gc_allocator`; dropping the
    backend value does not do it.
 
-The submission replaces the pending backend constant pool and clears it after
-success or error. Do not interleave a partially staged lower-level compilation
-with this API. A backend may partially populate a token before returning an
-error; retry with a fresh token, not the failed token.
+Do not interleave a partially staged lower-level compilation with this API.
+A backend may partially populate a token before returning an error; retry
+with a fresh token, not the failed token.
 
 Standalone embeddings can share the metainterpreter's descriptor factory:
 

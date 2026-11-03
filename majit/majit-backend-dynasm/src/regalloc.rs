@@ -194,52 +194,42 @@ type DataBlockWrapperPtr = std::ptr::NonNull<majit_backend::MachineDataBlockWrap
 #[cfg(target_arch = "wasm32")]
 type DataBlockWrapperPtr = std::convert::Infallible;
 
-/// Resolve a constant `OpRef` to its `i64` bit pattern.
+/// Resolve a constant `Operand` to its `i64` bit pattern.
 ///
 /// Every caller is an operand slot that RPython reads with `.getint()` —
-/// a GC_LOAD offset (aarch64/regalloc.py:535), a GC_LOAD_INDEXED scale
-/// (:566), an itemsize (:568). Upstream can spell those as bare `getint()`
-/// calls because the rewrite pass guarantees the slot holds a `ConstInt`
-/// before the backend ever sees the op (rewrite.py:199-205 builds every one
-/// of them out of `ConstInt(...)`).
+/// a GC_LOAD offset, a GC_LOAD_INDEXED scale, an itemsize. Upstream can
+/// spell those as bare `getint()` calls because the rewrite pass guarantees
+/// the slot holds a `ConstInt` before the backend ever sees the op
+/// (`rewrite_assembler` / `transform_to_gc_load` builds every one of them
+/// out of `ConstInt(...)`).
 ///
-/// Inline-Const variants (history.py/268/314 `ConstXxx.value`) carry the
-/// value directly. The legacy pool-indexed variants must be present in the
-/// optimizer's `constants` snapshot. Either way the backend must never
-/// silently substitute `0`, which would miscompile the constant as zero, so
-/// this panics at the parity hole instead — matching the Cranelift backend's
-/// `missing_legacy_constant`.
+/// Inline-Const variants (`ConstXxx.value`) carry the value directly. The
+/// backend must never silently substitute `0`, which would miscompile the
+/// constant as zero, so this panics at the parity hole instead.
 ///
-/// The two failures it separates are different bugs and want different fixes:
-/// a *constant-namespace* raw that is missing means the producer never seeded
-/// the pool, while a *body* OpRef arriving at all means the slot was filled
-/// with a runtime value — an op that should have been lowered upstream of the
-/// backend and was not. `#[track_caller]` reports which slot, because the
-/// `consider_*` body is the only thing that identifies the op.
+/// A *body* OpRef arriving at all means the slot was filled with a runtime
+/// value — an op that should have been lowered upstream of the backend and
+/// was not. `#[track_caller]` reports which slot, because the `consider_*`
+/// body is the only thing that identifies the op.
 #[track_caller]
-fn const_bits_or_panic(v: &Operand, constants: &indexmap::IndexMap<u32, i64>, where_: &str) -> i64 {
-    let v = v.to_opref();
-    if let Some(bits) = v.inline_const_bits() {
+fn const_bits_or_panic(v: &Operand, where_: &str) -> i64 {
+    let opref = v.to_opref();
+    if let Some(bits) = opref.inline_const_bits() {
         return bits;
     }
     let caller = std::panic::Location::caller();
-    let raw = v.raw();
-    constants.get(&raw).copied().unwrap_or_else(|| {
-        let diagnosis = if OpRef::raw_is_constant(raw) {
-            "legacy pool-indexed const absent from the constants snapshot — the \
-             optimizer producer must seed it (or mint an inline Const) instead of \
-             the backend baking 0; RPython ConstInt.value (history.py:227) is \
-             always present"
-        } else {
-            "a BODY OpRef, not a constant at all — this operand slot is one \
-             RPython reads with `.getint()`, so a runtime value reaching it means \
-             the op was never lowered. Upstream guarantees the slot by rewriting \
-             before assembly (aarch64/regalloc.py:188 -> gc.py:109-112), e.g. \
-             RAW_LOAD_I becomes GC_LOAD_INDEXED_I with ConstInt scale/offset/size \
-             (rewrite.py:228-232)"
-        };
-        panic!("dynasm {where_} at {caller}: {v:?} (raw={raw}) is {diagnosis}.")
-    })
+    let raw = opref.raw();
+    let diagnosis = if OpRef::raw_is_constant(raw) {
+        "a pool-indexed const with no inline Const payload — constants travel \
+         as Const operands (`ConstInt.value`); the backend must not bake 0"
+    } else {
+        "a BODY OpRef, not a constant at all — this operand slot is one \
+         RPython reads with `.getint()`, so a runtime value reaching it means \
+         the op was never lowered. Upstream guarantees the slot by rewriting \
+         before assembly (`rewrite_assembler` -> `transform_to_gc_load`), e.g. \
+         RAW_LOAD_I becomes GC_LOAD_INDEXED_I with ConstInt scale/offset/size"
+    };
+    panic!("dynasm {where_} at {caller}: {opref:?} (raw={raw}) is {diagnosis}.")
 }
 
 /// `X86XMMRegisterManager.convert_to_imm` / `VFPRegisterManager.convert_to_imm`:
@@ -694,14 +684,13 @@ impl RegisterManager {
         must_exist: bool,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
-        constants: &indexmap::IndexMap<u32, i64>,
     ) -> Loc {
         if v.is_constant() {
             // `RegisterManager.loc`: a Const is always `convert_to_imm`, so
             // the GPR manager's movable-`ConstPtr` check runs here too, and
             // the XMM / VFP manager with `datablockwrapper` set yields a
             // `ConstFloatLoc`.
-            return self.convert_to_imm(v, constants);
+            return self.convert_to_imm(v);
         }
         if let Some(reg) = self.reg_bindings_get(v, longevity) {
             return Loc::Reg(reg);
@@ -709,22 +698,9 @@ impl RegisterManager {
         if self.box_currently_in_frame_reg.as_ref() == Some(v) {
             return Loc::Reg(self.frame_reg);
         }
-        // regalloc.py:622 → frame_manager.loc(box, must_exist)
+        // `RegisterManager.loc` → `frame_manager.loc(box, must_exist)`
         if let Some(frame_loc) = fm.get(v, longevity) {
             return Loc::Frame(frame_loc);
-        }
-        // Fallback: check constants map. The optimizer may leave constants
-        // as plain OpRefs (without CONST_BIT) when they originate from
-        // short preamble or constant folding.
-        let opref = v.to_opref();
-        if let Some(val) = opref
-            .inline_const_bits()
-            .or_else(|| constants.get(&opref.raw()).copied())
-        {
-            if tp == Type::Float || self.is_float_constant(v) {
-                return self.float_const_loc(val as u64);
-            }
-            return Loc::immed(val);
         }
         if must_exist {
             panic!("RegisterManager.loc: box {:?} not found", v);
@@ -738,13 +714,12 @@ impl RegisterManager {
         v: &Operand,
         forbidden_vars: &[Operand],
         selected_reg: Option<RegLoc>,
-        constants: &indexmap::IndexMap<u32, i64>,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         _pending_moves: &mut Vec<(Loc, Loc)>,
     ) -> Loc {
         debug_assert!(v.is_constant());
-        let immloc = self.convert_to_imm(v, constants);
+        let immloc = self.convert_to_imm(v);
         if let Some(selected) = selected_reg {
             if self.free_regs.contains(&selected) {
                 self.spill_moves.push((immloc, Loc::Reg(selected)));
@@ -768,7 +743,6 @@ impl RegisterManager {
         need_lower_byte: bool,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
-        constants: &indexmap::IndexMap<u32, i64>,
         pending_moves: &mut Vec<(Loc, Loc)>,
     ) -> Loc {
         if v.is_constant() {
@@ -776,13 +750,12 @@ impl RegisterManager {
                 v,
                 forbidden_vars,
                 selected_reg,
-                constants,
                 longevity,
                 fm,
                 pending_moves,
             );
         }
-        let prev_loc = self.loc(v, tp, true, longevity, fm, constants);
+        let prev_loc = self.loc(v, tp, true, longevity, fm);
         if matches!(prev_loc, Loc::Reg(r) if r == self.frame_reg) && selected_reg.is_none() {
             return prev_loc;
         }
@@ -822,21 +795,20 @@ impl RegisterManager {
         forbidden_vars: &[Operand],
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
-        constants: &indexmap::IndexMap<u32, i64>,
         _pending_moves: &mut Vec<(Loc, Loc)>,
     ) -> Loc {
         if v.is_constant() {
             let result_loc =
                 self.force_allocate_reg(result_v, forbidden_vars, None, false, longevity, fm);
-            let imm = self.convert_to_imm(v, constants);
+            let imm = self.convert_to_imm(v);
             self.spill_moves.push((imm, Loc::Reg(result_loc)));
             return Loc::Reg(result_loc);
         }
         let v_keeps_living = longevity.get(v).unwrap().last_usage.get() > self.position;
-        // regalloc.py:685 — two cases where we allocate a new register
+        // `force_result_in_reg` — two cases where we allocate a new register
         let not_in_reg = !self.reg_bindings_contains(v, longevity);
         if not_in_reg || (v_keeps_living && !self.free_regs.is_empty()) {
-            let v_loc = self.loc(v, tp, false, longevity, fm, constants);
+            let v_loc = self.loc(v, tp, false, longevity, fm);
             let result_loc =
                 self.force_allocate_reg(result_v, forbidden_vars, None, false, longevity, fm);
             let new_loc = Loc::Reg(result_loc);
@@ -1015,9 +987,9 @@ impl RegisterManager {
     /// `ConstFloatLoc`. A `MemoryError` from `open_malloc` is kept in
     /// `pool_error` and surfaced by `walk_operations`. The GPR manager
     /// returns `imm`.
-    pub fn convert_to_imm(&mut self, v: &Operand, constants: &indexmap::IndexMap<u32, i64>) -> Loc {
+    pub fn convert_to_imm(&mut self, v: &Operand) -> Loc {
         debug_assert!(v.is_constant());
-        let val = const_bits_or_panic(v, constants, "convert_to_imm");
+        let val = const_bits_or_panic(v, "convert_to_imm");
         if self.datablockwrapper.is_some() {
             return self.float_const_loc(val as u64);
         }
@@ -1152,8 +1124,6 @@ pub struct RegAlloc<'a> {
     pub xrm: RegisterManager,
     /// Frame manager — x86/regalloc.py X86FrameManager
     pub fm: FrameManager,
-    /// Constants map (OpRef const_index → i64 value).
-    pub constants: indexmap::IndexMap<u32, i64>,
     /// Pending register moves to be emitted by the assembler.
     /// Each entry is (source_loc, dest_loc).
     pub pending_moves: Vec<(Loc, Loc)>,
@@ -1198,11 +1168,7 @@ pub(crate) fn is_math_sqrt_call(op: &Op) -> bool {
 
 impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:170
-    pub fn new(
-        constants: indexmap::IndexMap<u32, i64>,
-        inputargs: &'a [InputArgRc],
-        operations: &'a [OpRc],
-    ) -> Self {
+    pub fn new(inputargs: &'a [InputArgRc], operations: &'a [OpRc]) -> Self {
         // We create with empty longevity/managers; they get initialized in _prepare.
         let longevity = LifetimeManager::new();
         let rm = Self::make_gpr_manager();
@@ -1215,7 +1181,6 @@ impl<'a> RegAlloc<'a> {
             rm,
             xrm,
             fm,
-            constants,
             pending_moves: Vec::new(),
             inputargs,
             operations,
@@ -1401,7 +1366,7 @@ impl<'a> RegAlloc<'a> {
             self.possibly_free_var(&box_, iarg.tp.get());
         }
         // x86/regalloc.py:322
-        self.fm.finish_binding();
+        self.fm.finish_binding(&self.longevity);
     }
 
     // ── Location dispatch (type-based routing to rm or xrm) ──
@@ -1417,23 +1382,11 @@ impl<'a> RegAlloc<'a> {
 
     pub(crate) fn loc_with_mode(&mut self, v: &Operand, tp: Type, must_exist: bool) -> Loc {
         if tp == Type::Float {
-            self.xrm.loc(
-                v,
-                tp,
-                must_exist,
-                &mut self.longevity,
-                &mut self.fm,
-                &self.constants,
-            )
+            self.xrm
+                .loc(v, tp, must_exist, &mut self.longevity, &mut self.fm)
         } else {
-            self.rm.loc(
-                v,
-                tp,
-                must_exist,
-                &mut self.longevity,
-                &mut self.fm,
-                &self.constants,
-            )
+            self.rm
+                .loc(v, tp, must_exist, &mut self.longevity, &mut self.fm)
         }
     }
 
@@ -1706,15 +1659,10 @@ impl<'a> RegAlloc<'a> {
         v.type_()
     }
 
-    /// Extract the integer value of a constant OpRef (like RPython's getint()).
-    ///
-    /// The constants map is keyed by `OpRef.0` (raw value, WITH the
-    /// CONST_BIT tag preserved) — see `convert_to_imm` at regalloc.rs
-    /// line 1475 and the fail-args handling at line 2079. This helper
-    /// must use the same key convention.
+    /// Extract the integer value of a constant OpRef (`ConstInt.getint`).
     #[track_caller]
     pub(crate) fn const_value(&self, v: &Operand) -> i64 {
-        const_bits_or_panic(v, &self.constants, "const_value")
+        const_bits_or_panic(v, "const_value")
     }
 
     // ── walk_operations + consider_* ──
@@ -1926,7 +1874,6 @@ impl<'a> RegAlloc<'a> {
                 v,
                 forbidden,
                 Some(selected),
-                &self.constants,
                 &mut self.longevity,
                 &mut self.fm,
                 &mut self.pending_moves,
@@ -1937,7 +1884,7 @@ impl<'a> RegAlloc<'a> {
             self.force_allocate_reg(&tmp, Type::Float, forbidden, Some(reg), false)
         } else {
             let reg = self.force_allocate_reg(&tmp, Type::Float, forbidden, None, false);
-            let imm = self.xrm.convert_to_imm(v, &self.constants);
+            let imm = self.xrm.convert_to_imm(v);
             self.xrm.spill_moves.push((imm, Loc::Reg(reg)));
             reg
         };
@@ -2336,7 +2283,7 @@ mod tests {
         let ops = vec![malloc, finish];
 
         let ops = rcs(&inputargs, ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let unrelated = all_core_regs()
             .into_iter()
@@ -2413,7 +2360,7 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
 
         let ops = rcs(&inputargs, vec![zero, finish]);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
         let leas: Vec<usize> = emitted
@@ -2482,7 +2429,7 @@ mod tests {
         finish.set_fail_arg_types(vec![]);
 
         let ops = rcs(&inputargs, vec![add1, add2, finish]);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
         for index in [0, 1] {
@@ -2522,11 +2469,9 @@ mod tests {
         finish.setfailargs(vec![].into());
         finish.set_fail_arg_types(vec![]);
 
-        let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-
         let ops = vec![add, is_true, guard, finish];
         let ops = rcs(&inputargs, ops);
-        let mut ra = RegAlloc::new(constants, &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
         let Some(faillocs) = guard_faillocs(&emitted, 2) else {
@@ -2573,7 +2518,7 @@ mod tests {
         ops.push(finish);
 
         let ops = rcs(&inputargs, ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         walk(&mut ra);
     }
@@ -2628,7 +2573,7 @@ mod tests {
         let ops = vec![malloc, finish];
 
         let ops = rcs(&inputargs, ops);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let emitted = walk(&mut ra);
         let lengthloc = perform_arglocs(&emitted, 0)
@@ -2663,7 +2608,7 @@ mod tests {
                 finish,
             ],
         );
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
         let (arg_loc, fail_loc) = output
@@ -2706,7 +2651,7 @@ mod tests {
                 make_op(OpCode::Finish, 2, &[i1]),
             ],
         );
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_bridge(&[Loc::Reg(EBP)]);
         assert_eq!(
             ra.rm.box_currently_in_frame_reg,
@@ -2751,7 +2696,7 @@ mod tests {
         let finish = Op::new(OpCode::Finish, &[rb(p2)]);
         finish.pos().set(OpRef::void_op(2));
         let ops = rcs(&inputargs, vec![same, call, finish]);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
         let arglocs = perform_arglocs(&output, 1).expect("CALL_ASSEMBLER perform");
@@ -2772,7 +2717,7 @@ mod tests {
         let finish = Op::new(OpCode::Finish, &[rb(p0)]);
         finish.pos().set(OpRef::void_op(1));
         let ops = rcs(&inputargs, vec![check, finish]);
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
         let arglocs = output
@@ -2816,7 +2761,7 @@ mod tests {
         guard.setfailargs(vec![token].into());
         let inputargs = vec![];
         let ops = vec![force_rc, OpRc::new(guard)];
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let output = walk(&mut ra);
         // FORCE_TOKEN produces a Ref in a register, with no pre-existing
@@ -2927,7 +2872,7 @@ mod tests {
         let manager = majit_backend::AsmMemoryManager::new_isolated(std::sync::Arc::clone(&stats));
         let mut wrapper = majit_backend::MachineDataBlockWrapper::new(manager);
         let _writing = majit_backend::AssemblerWriting::enter();
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let mut asm = MockAsm::default();
         ra.walk_operations_with_datablockwrapper(&mut wrapper, &mut asm)
@@ -2952,7 +2897,7 @@ mod tests {
         // `X86XMMRegisterManager.convert_to_imm`, so the assembler mov
         // source is `ConstFloatLoc` rather than `ImmedFloat`.
         let (inputargs, ops) = same_as_float_trace();
-        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        let mut ra = RegAlloc::new(&inputargs, &ops);
         ra.prepare_loop();
         let mut asm = MockAsm::default();
         ra.walk_operations_with_datablockwrapper(&mut wrapper, &mut asm)
@@ -2994,7 +2939,7 @@ mod tests {
             let _clear = ClearCeiling;
             majit_gc::arm_process_memory_ceiling(1);
             let _writing = majit_backend::AssemblerWriting::enter();
-            let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+            let mut ra = RegAlloc::new(&inputargs, &ops);
             ra.prepare_loop();
             ra.walk_operations_with_datablockwrapper(&mut wrapper, &mut MockAsm::default())
         });
