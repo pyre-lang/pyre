@@ -15,6 +15,11 @@
 # the tracer runs for real, against the frame the tracer is stepping a copy of, so it is
 # the tracer's handling of that call -- not the proxy -- that decides which value comes
 # back. pins the PEP 667 f_locals proxy as a LIVE view, which pypy3 does not have -- its
+#
+# exhausted_generator_retained_frame_locals:
+# test_generators never retains `gi_frame` / `sys._getframe()` across ordinary
+# `next`/`for` exhaustion and then reads `f_locals`. `frame_is_finished` leaves
+# those locals in place, so a captured frame still reports them.
 
 """A write through the running frame's ``f_locals`` must be visible to a later
 read of the same local, including after the loop around the write is compiled.
@@ -270,6 +275,70 @@ def check_unstarted_asyncgen_celltype_f_locals():
     return True
 
 
+def check_exhausted_generator_retained_frame_locals():
+    # Ordinary exhaustion (`frame_is_finished` with prompt_finalization false)
+    # leaves a retained frame's locals in place. Capture `g.gi_frame` and a
+    # frame taken inside via `sys._getframe()` before `next` / `for` finish
+    # the generator, then print sorted `f.f_locals` items.
+    want = [("x", 123), ("y", 456)]
+
+    def gen():
+        x = 123
+        y = 456
+        yield sys._getframe()
+
+    def show(label, frame):
+        items = sorted(frame.f_locals.items())
+        print(f"{label}: {items}")
+        return items
+
+    g = gen()
+    inner = next(g)
+    retained = g.gi_frame
+    try:
+        next(g)
+    except StopIteration:
+        pass
+    if g.gi_frame is not None:
+        print(f"next exhaustion left gi_frame={g.gi_frame!r}")
+        return False
+    if show("next_gi_frame", retained) != want:
+        return False
+    if show("next_getframe", inner) != want:
+        return False
+
+    g = gen()
+    inner = None
+    retained = None
+    for frame in g:
+        inner = frame
+        retained = g.gi_frame
+    if g.gi_frame is not None:
+        print(f"for exhaustion left gi_frame={g.gi_frame!r}")
+        return False
+    if show("for_gi_frame", retained) != want:
+        return False
+    if show("for_getframe", inner) != want:
+        return False
+
+    def consume():
+        g = gen()
+        inner = next(g)
+        retained = g.gi_frame
+        try:
+            next(g)
+        except StopIteration:
+            pass
+        return sorted(retained.f_locals.items()), sorted(inner.f_locals.items())
+
+    for _ in range(2000):
+        got_retained, got_inner = consume()
+        if got_retained != want or got_inner != want:
+            print(f"hot consume: retained={got_retained!r} inner={got_inner!r}")
+            return False
+    return True
+
+
 results = [
     check("write_through_proxy", write_through_proxy(ROUNDS)),
     check("store_then_read_proxy", store_then_read_proxy(ROUNDS)),
@@ -281,6 +350,7 @@ results = [
     check_unstarted_generator_throw(),
     check_unstarted_coroutine_celltype_f_locals(),
     check_unstarted_asyncgen_celltype_f_locals(),
+    check_exhausted_generator_retained_frame_locals(),
 ]
 
 def framelocalsproxy_gc_roots():

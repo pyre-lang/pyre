@@ -790,10 +790,12 @@ fn generator_resume_foriter_item_is_reread_from_the_live_box_after_the_finished_
 }
 
 #[test]
-fn generator_resume_finished_arm_does_not_bind_const_null() {
-    // `_send_ex` on a finished frame walks `bh_send_ex_tail` so the FOR_ITER
-    // dest is the residual result. A WalkContext with no snapshot_sym cannot
-    // start that drain; the arm must refuse rather than bake ConstPtr NULL.
+fn generator_resume_finished_arm_descends_frame_is_finished() {
+    // `_send_ex` on a finished frame descends `generator_frame_is_finished`
+    // then binds a null FOR_ITER dest. This unit WalkContext has no
+    // `snapshot_sym`, so `run_codewriter_helper_inline_call` cannot start;
+    // the arm must propagate that descent error and leave the dest
+    // register unchanged rather than residualizing `bh_send_ex_tail`.
     use pyre_interpreter::compile_exec;
 
     fbw_foriter_inflight_clear();
@@ -801,12 +803,16 @@ fn generator_resume_finished_arm_does_not_bind_const_null() {
     let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
     frame.set_frame_finished_execution(true);
     let frame_ptr = (&mut *frame) as *mut pyre_interpreter::PyFrame;
+    let pycode = frame.pycode as pyre_object::PyObjectRef;
+    let gen_obj =
+        pyre_object::generator::w_generator_new(frame_ptr as pyre_object::gc_hook::GCREF, pycode);
 
     let mut tc = fresh_trace_ctx();
     let item = OpRef::input_arg_ref(0);
     tc.set_opref_concrete(item, Value::Ref(majit_ir::GcRef(0x9C_0000_2000)));
     let frame_box = dummy_ptr_eq_box(&mut tc);
-    let iter_op = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let iter_op = OpRef::const_ptr(majit_ir::GcRef(gen_obj as usize));
+    tc.set_opref_concrete(iter_op, Value::Ref(majit_ir::GcRef(gen_obj as usize)));
     let caller_parent = send_ex_continuation_parent_frame(iter_op).expect("tail installs");
     let op = DecodedOp {
         key: "fixture/r",
@@ -831,6 +837,7 @@ fn generator_resume_finished_arm_does_not_bind_const_null() {
             let _roots = pyre_object::gc_roots::push_roots();
             let frame_root = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(frame_ptr as pyre_object::PyObjectRef);
+            let _ = pyre_object::gc_roots::pin_root(gen_obj);
             let err = bind_generator_resume_foriter_item(
                 wc,
                 &op,
@@ -842,22 +849,23 @@ fn generator_resume_finished_arm_does_not_bind_const_null() {
                 iter_op,
                 caller_parent,
             )
-            .expect_err("finished arm without a snapshot_sym must refuse");
+            .expect_err("finished arm without a snapshot_sym must propagate the descent error");
             assert!(
                 matches!(
                     err,
-                    DispatchError::LoopBearingCalleeInlineUnsupported { pc: 0, .. }
+                    DispatchError::GuardResumeCoordinateUnavailable { pc: 0 }
+                        | DispatchError::LoopBearingCalleeInlineUnsupported { pc: 0, .. }
                 ),
-                "finished arm must not bake ConstPtr NULL, got {err:?}",
+                "finished arm must not residualize bh_send_ex_tail, got {err:?}",
             );
             assert_eq!(
                 wc.registers_r.get(0),
                 Some(item),
-                "FOR_ITER dest must stay the body result when the tail walk declines",
+                "FOR_ITER dest must stay the body result when the descent declines",
             );
         },
     );
-    std::hint::black_box(&frame);
+    std::hint::black_box((&frame, gen_obj));
 }
 
 fn dummy_operator_tail_caller() -> InlineParentFrame {

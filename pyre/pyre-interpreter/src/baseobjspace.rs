@@ -23084,9 +23084,17 @@ pub(crate) fn property_descr_delete_impl(args: &[PyObjectRef]) -> PyResult {
 // - throw(t,v) → send_ex(None, OperationError(t,v))
 // - close()    → throw(GeneratorExit) then check result
 
-/// generator.py `frame_is_finished` plus Python 3.14's eager frame
-/// clearing on `close()`.  Dropping the generator's frame edge releases all
-/// suspended locals; an escaped `gi_frame` remains a valid, cleared frame.
+/// generator.py `GeneratorOrCoroutine.frame_is_finished` drops `self.frame`
+/// and calls `rgc.may_ignore_finalizer(self)`.  Every path here still marks
+/// the generator exhausted, sets `frame_finished_execution`, cuts
+/// `f_backref` / `f_generator_wref`, and nulls the generator's frame slot.
+/// `clear_references` runs only when `prompt_finalization` is true
+/// (`close()`, `frame.clear()`, throw-closing), so locals drop and
+/// `generator_close_finalizer_boundary` can run `__del__` before close
+/// returns.  Normal exhaustion (`prompt_finalization` false: unpack
+/// completion, RETURN through `genentry_raise_returned` when not closing,
+/// `bh_send_ex_tail`) leaves the frame's locals intact; an escaped
+/// `gi_frame` remains a valid frame that still reports those locals.
 ///
 /// Ordinary completion leaves finalization on the collector's own schedule.
 /// An explicit close first asks whether the graph behind the references being
@@ -23105,11 +23113,14 @@ pub unsafe fn generator_frame_is_finished(
     unsafe { w_generator_set_exhausted(gen_obj) };
     frame.set_frame_finished_execution(true);
     frame.w_yielding_from = PY_NULL;
-    // Internal generator completion clears the owned frame directly.  Public
-    // `frame.clear()` instead calls the generator finalizer first; routing
-    // completion through it would report a normally closed coroutine as
-    // never awaited.
-    frame.clear_references();
+    // Internal generator completion severs the owned frame directly.  Public
+    // `frame.clear()` calls the generator finalizer first; routing completion
+    // through it would report a normally closed coroutine as never awaited.
+    // Prompt-finalization is the path that drops locals so `__del__` can run
+    // before `close()` returns.
+    if prompt_finalization {
+        frame.clear_references();
+    }
     frame.f_backref = std::ptr::null_mut();
     frame.f_generator_wref = PY_NULL;
     unsafe { w_generator_set_frame(gen_obj, std::ptr::null_mut()) };
