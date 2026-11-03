@@ -6385,6 +6385,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 crate::front::result_exc::rewire_overflow_combinator_sites(
                     &mut lo.graph,
                     &lo.toint_combinator_sites,
+                    &lo.toint_call_results,
                 )
             };
             let carrier = if lo.carrier_combinator_sites.is_empty() {
