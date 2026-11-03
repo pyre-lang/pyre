@@ -7506,17 +7506,21 @@ pub(crate) fn fuse_toint_map_err_sites(
 }
 
 /// How the OverflowError handler names the `map_err` closure env.
-/// Construction stays in the `map_err` block (`flowcontext.py`
+/// Every op on the forwarding path is replayed (`flowcontext.py`
 /// `BlockRecorder.append` / `FlowContext.do_op`); the handler rebuilds a
 /// copy (`unsimplify.py` `split_block.get_new_name`).
 enum EnvAtHandler {
     FnItem,
     PassThrough(LinkArg),
-    Rebuild {
-        ops: Vec<SpaceOperation>,
-        extras: Vec<(Variable, LinkArg)>,
-        env_var: Variable,
-    },
+    Rebuild { env_var: Variable },
+}
+
+/// OverflowError handler: replay the pure path `P`, thread extras, then
+/// call the mapper with the remapped env.
+struct ToIntMapErrPlan {
+    ops: Vec<SpaceOperation>,
+    extras: Vec<(Variable, LinkArg)>,
+    env: EnvAtHandler,
 }
 
 fn decline_toint_map_err(graph: &FunctionGraph, msg: &str) -> bool {
@@ -7582,85 +7586,153 @@ fn is_pure_env_const_kind(kind: &OpKind) -> bool {
 
 /// Closure-env ops `|_| overflow(w_secs)` lowers to: a niladic aggregate
 /// ctor, field writes on that fresh object, `same_as` / `cast_pointer` /
-/// `__cast_instance_intrinsic`, and constants. A call, a write to a
-/// non-fresh object, or a raising op is refused.
+/// `__cast_instance_intrinsic` of a fresh object, and constants. A call,
+/// a write to a non-fresh object, or a raising op is refused.
 fn env_slice_op_is_pure_construction(kind: &OpKind, fresh: &[Variable]) -> bool {
     if is_pure_env_const_kind(kind) {
         return true;
     }
+    let in_fresh = |var: &Variable| fresh.iter().any(|seen| seen == var);
+    if let Some(operand) = env_identity_operand(kind) {
+        return in_fresh(operand);
+    }
     if is_recast_narrow(kind) {
-        return true;
+        // Recast of a constant: no Variable operand.
+        return op_operand_vars(kind).is_empty();
     }
     match kind {
-        OpKind::UnaryOp { op, .. } if op == "same_as" || op == "cast_pointer" => true,
         OpKind::Call {
             target: CallTarget::SyntheticTransparentCtor { .. },
             args,
             ..
         } if args.is_empty() => true,
-        OpKind::FieldWrite { base, .. } if fresh.iter().any(|var| var == base) => true,
+        OpKind::FieldWrite { base, .. } if in_fresh(base) => true,
         _ => false,
     }
 }
 
-/// Backward slice of `env_var` over `ops[0..map_err_idx]`: the defining
-/// op, every op in that prefix that defines a slice operand, and field
-/// writes whose base is already in the slice.
-fn env_construction_slice(
-    ops: &[SpaceOperation],
-    map_err_idx: usize,
-    env_var: &Variable,
-) -> Option<Vec<usize>> {
-    if !ops
-        .iter()
-        .take(map_err_idx)
-        .any(|op| op.result.as_ref() == Some(env_var))
-    {
-        return None;
-    }
-    let mut needed = vec![env_var.clone()];
-    let mut in_slice = vec![false; map_err_idx];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for idx in 0..map_err_idx {
-            if in_slice[idx] {
-                continue;
-            }
-            let op = &ops[idx];
-            let defines_needed = op
-                .result
-                .as_ref()
-                .is_some_and(|result| needed.iter().any(|var| var == result));
-            let writes_needed = matches!(
-                &op.kind,
-                OpKind::FieldWrite { base, .. } if needed.iter().any(|var| var == base)
-            );
-            if !defines_needed && !writes_needed {
-                continue;
-            }
-            in_slice[idx] = true;
-            changed = true;
-            for var in op_operand_vars(&op.kind) {
-                if !needed.iter().any(|seen| seen == &var) {
-                    needed.push(var);
-                }
-            }
+/// Operand of `same_as` / `cast_pointer` / `__cast_instance_intrinsic`.
+fn env_identity_operand(kind: &OpKind) -> Option<&Variable> {
+    match kind {
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" || op == "cast_pointer" => {
+            Some(operand)
         }
+        OpKind::Call { args, .. } if is_recast_narrow(kind) => {
+            args.first().and_then(LinkArg::as_variable)
+        }
+        _ => None,
     }
-    Some((0..map_err_idx).filter(|&idx| in_slice[idx]).collect())
 }
 
-fn resolve_env_external(
+fn is_single_exit_goto(graph: &FunctionGraph, block: usize) -> bool {
+    let body = &graph.blocks[block];
+    body.exitswitch.is_none() && body.exits.len() == 1 && body.exits[0].exitcase.is_none()
+}
+
+fn is_origin_recast(origin: &CarrierOrigin, block: usize, idx: usize) -> bool {
+    origin
+        .recasts
+        .iter()
+        .any(|&(recast_block, recast_idx)| recast_block == block && recast_idx == idx)
+}
+
+fn toint_carrier_vars(
     graph: &FunctionGraph,
-    u: usize,
-    var: &Variable,
     origin: &CarrierOrigin,
+    recv: &Variable,
+) -> Vec<Variable> {
+    let mut vars = vec![origin.r.clone(), recv.clone()];
+    for hop in &origin.hops {
+        push_unique_var(&mut vars, hop.tracked.clone());
+    }
+    for &(block, idx) in &origin.recasts {
+        let Some(op) = graph.blocks.get(block).and_then(|b| b.operations.get(idx)) else {
+            continue;
+        };
+        if let Some(result) = op.result.clone() {
+            push_unique_var(&mut vars, result);
+        }
+        if let OpKind::Call { args, .. } = &op.kind
+            && let Some(src) = args.first().and_then(LinkArg::as_variable)
+        {
+            push_unique_var(&mut vars, src.clone());
+        }
+    }
+    vars
+}
+
+/// Ops strictly between `jit_bigint_toint` and `map_err` on the unique
+/// single-exit goto chain `find_carrier_origin` walked. Carrier recasts
+/// are the Result forwarding that fusion erases, not path effects
+/// (`unsimplify.py` `split_block` keeps the raising op).
+fn collect_toint_forward_path(
+    graph: &FunctionGraph,
+    origin: &CarrierOrigin,
+    u: usize,
+    map_err_idx: usize,
+) -> Result<Vec<(usize, SpaceOperation)>, String> {
+    let name = graph.name.clone();
+    let decline = || format!("{name}: toint map_err path is not a unique single-exit goto chain");
+    let mut path = Vec::new();
+    let push_ops =
+        |path: &mut Vec<(usize, SpaceOperation)>, block: usize, from: usize, to: usize| {
+            for idx in from..to {
+                if is_origin_recast(origin, block, idx) {
+                    continue;
+                }
+                path.push((block, graph.blocks[block].operations[idx].clone()));
+            }
+        };
+    if origin.a == u {
+        if !is_single_exit_goto(graph, u) || origin.call_idx >= map_err_idx {
+            return Err(decline());
+        }
+        push_ops(&mut path, u, origin.call_idx + 1, map_err_idx);
+        return Ok(path);
+    }
+    if !is_single_exit_goto(graph, origin.a) {
+        return Err(decline());
+    }
+    let hops: Vec<usize> = origin.hops.iter().map(|hop| hop.block).collect();
+    if hops.is_empty() || hops.last() != Some(&u) {
+        return Err(decline());
+    }
+    let mut prev = origin.a;
+    for &hop in &hops {
+        if !is_single_exit_goto(graph, hop) || graph.blocks[prev].exits[0].target.0 != hop {
+            return Err(decline());
+        }
+        prev = hop;
+    }
+    push_ops(
+        &mut path,
+        origin.a,
+        origin.call_idx + 1,
+        graph.blocks[origin.a].operations.len(),
+    );
+    for &hop in &hops {
+        if hop == u {
+            continue;
+        }
+        push_ops(&mut path, hop, 0, graph.blocks[hop].operations.len());
+    }
+    push_ops(&mut path, u, 0, map_err_idx);
+    Ok(path)
+}
+
+fn resolve_path_external(
+    graph: &FunctionGraph,
+    origin: &CarrierOrigin,
+    block: usize,
+    var: &Variable,
 ) -> Option<LinkArg> {
-    if !graph.blocks[u].inputargs.iter().any(|input| input == var) {
+    if defined_before(graph, origin.a, var, origin.call_idx) {
+        return Some(LinkArg::Value(var.clone()));
+    }
+    if block == origin.a {
         return None;
     }
-    match back_sub_arg_to(graph, u, LinkArg::Value(var.clone()), origin.a) {
+    match back_sub_arg_to(graph, block, LinkArg::Value(var.clone()), origin.a) {
         Some(c @ LinkArg::Const(_)) => Some(c),
         Some(LinkArg::Value(at_a)) if defined_before(graph, origin.a, &at_a, origin.call_idx) => {
             Some(LinkArg::Value(at_a))
@@ -7669,84 +7741,133 @@ fn resolve_env_external(
     }
 }
 
-fn plan_toint_map_err_env(
+fn env_at_handler_from_var(
+    graph: &FunctionGraph,
+    origin: &CarrierOrigin,
+    u: usize,
+    env_var: &Variable,
+    fresh: &[Variable],
+) -> Result<EnvAtHandler, String> {
+    let name = graph.name.clone();
+    let missing = format!("{name}: toint map_err closure env is not live at jit_bigint_toint");
+    if fresh.iter().any(|var| var == env_var) {
+        return Ok(EnvAtHandler::Rebuild {
+            env_var: env_var.clone(),
+        });
+    }
+    if defined_before(graph, origin.a, env_var, origin.call_idx) {
+        return Ok(EnvAtHandler::PassThrough(LinkArg::Value(env_var.clone())));
+    }
+    let mut block = u;
+    let mut var = env_var.clone();
+    for _ in 0..=graph.blocks.len() {
+        if fresh.iter().any(|seen| seen == &var) {
+            return Ok(EnvAtHandler::Rebuild { env_var: var });
+        }
+        if block == origin.a {
+            if defined_before(graph, origin.a, &var, origin.call_idx) {
+                return Ok(EnvAtHandler::PassThrough(LinkArg::Value(var)));
+            }
+            return Err(missing.clone());
+        }
+        let Some(pos) = graph.blocks[block]
+            .inputargs
+            .iter()
+            .position(|input| input == &var)
+        else {
+            return Err(missing.clone());
+        };
+        let preds = predecessor_exits(graph, block);
+        if preds.len() != 1 {
+            return Err(format!(
+                "{name}: toint map_err path is not a unique single-exit goto chain"
+            ));
+        }
+        let (pred, ei) = preds[0];
+        let arg = graph.blocks[pred]
+            .exits
+            .get(ei)
+            .and_then(|link| link.args.get(pos))
+            .ok_or_else(|| missing.clone())?;
+        match arg {
+            LinkArg::Const(constant) => {
+                return Ok(EnvAtHandler::PassThrough(LinkArg::Const(constant.clone())));
+            }
+            LinkArg::Value(pred_var) => {
+                var = pred_var.clone();
+                block = pred;
+            }
+        }
+    }
+    Err(missing)
+}
+
+fn plan_toint_map_err_path(
     graph: &FunctionGraph,
     origin: &CarrierOrigin,
     u: usize,
     env: &LinkArg,
     map_err_idx: usize,
+    recv: &Variable,
     fn_item: bool,
-) -> Result<EnvAtHandler, String> {
+) -> Result<ToIntMapErrPlan, String> {
     let name = graph.name.clone();
-    if fn_item {
-        return Ok(EnvAtHandler::FnItem);
-    }
-    match env {
-        LinkArg::Const(constant) => Ok(EnvAtHandler::PassThrough(LinkArg::Const(constant.clone()))),
-        LinkArg::Value(env_var) => {
-            if defined_before(graph, origin.a, env_var, origin.call_idx) {
-                return Ok(EnvAtHandler::PassThrough(LinkArg::Value(env_var.clone())));
+    let path = collect_toint_forward_path(graph, origin, u, map_err_idx)?;
+    let carrier = toint_carrier_vars(graph, origin, recv);
+    let is_carrier = |var: &Variable| carrier.iter().any(|seen| seen == var);
+    let mut fresh = Vec::new();
+    let mut extras: Vec<(Variable, LinkArg)> = Vec::new();
+    for (block, op) in &path {
+        if is_exception_raising_op(&op.kind) || !env_slice_op_is_pure_construction(&op.kind, &fresh)
+        {
+            return Err(format!(
+                "{name}: toint map_err path is not a pure construction"
+            ));
+        }
+        for var in op_operand_vars(&op.kind) {
+            if is_carrier(&var) {
+                return Err(format!(
+                    "{name}: toint map_err path reads the jit_bigint_toint result"
+                ));
             }
-            let Some(slice) =
-                env_construction_slice(&graph.blocks[u].operations, map_err_idx, env_var)
-            else {
-                let arg = resolve_env_external(graph, u, env_var, origin).ok_or_else(|| {
-                    format!("{name}: toint map_err closure env is not live at jit_bigint_toint")
-                })?;
-                return Ok(EnvAtHandler::PassThrough(arg));
-            };
-            let mut fresh = Vec::new();
-            let mut extras: Vec<(Variable, LinkArg)> = Vec::new();
-            for &idx in &slice {
-                let op = &graph.blocks[u].operations[idx];
-                if !env_slice_op_is_pure_construction(&op.kind, &fresh) {
-                    return Err(format!(
-                        "{name}: toint map_err closure env is not a pure construction"
-                    ));
-                }
-                for var in op_operand_vars(&op.kind) {
-                    if fresh.iter().any(|seen| seen == &var) {
-                        continue;
-                    }
-                    if extras.iter().any(|(seen, _)| seen == &var) {
-                        continue;
-                    }
-                    let arg = resolve_env_external(graph, u, &var, origin).ok_or_else(|| {
-                        format!(
-                            "{name}: toint map_err closure env operand is not live at jit_bigint_toint"
-                        )
-                    })?;
-                    extras.push((var, arg));
-                }
-                if let Some(result) = op.result.clone() {
-                    fresh.push(result);
-                }
+            if fresh.iter().any(|seen| seen == &var) {
+                continue;
             }
-            let ops = slice
-                .iter()
-                .map(|&idx| graph.blocks[u].operations[idx].clone())
-                .collect();
-            Ok(EnvAtHandler::Rebuild {
-                ops,
-                extras,
-                env_var: env_var.clone(),
-            })
+            if extras.iter().any(|(seen, _)| seen == &var) {
+                continue;
+            }
+            let arg = resolve_path_external(graph, origin, *block, &var).ok_or_else(|| {
+                format!("{name}: toint map_err path operand is not live at jit_bigint_toint")
+            })?;
+            extras.push((var, arg));
+        }
+        if let Some(result) = op.result.clone() {
+            fresh.push(result);
         }
     }
+    let ops: Vec<SpaceOperation> = path.into_iter().map(|(_, op)| op).collect();
+    let env = if fn_item {
+        EnvAtHandler::FnItem
+    } else {
+        match env {
+            LinkArg::Const(constant) => EnvAtHandler::PassThrough(LinkArg::Const(constant.clone())),
+            LinkArg::Value(env_var) => env_at_handler_from_var(graph, origin, u, env_var, &fresh)?,
+        }
+    };
+    Ok(ToIntMapErrPlan { ops, extras, env })
 }
 
-fn emit_env_rebuild(
+fn emit_path_replay(
     graph: &mut FunctionGraph,
     e_id: BlockId,
     e_inputs: &[Variable],
     ops: &[SpaceOperation],
     extras: &[(Variable, LinkArg)],
-    env_var: &Variable,
-) -> Variable {
+) -> Vec<(Variable, Variable)> {
     let mut remap: Vec<(Variable, Variable)> = extras
         .iter()
         .zip(e_inputs.iter())
-        .map(|((u_var, _), input)| (u_var.clone(), input.clone()))
+        .map(|((path_var, _), input)| (path_var.clone(), input.clone()))
         .collect();
     for op in ops {
         let kind = {
@@ -7762,14 +7883,87 @@ fn emit_env_rebuild(
             .operations
             .push(SpaceOperation { result, kind });
     }
-    linear_remap(&remap, env_var)
+    remap
+}
+
+fn is_type_of_call(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } if segments.as_slice() == ["type"]
+    )
+}
+
+/// True when `rewire_one_call_site`'s exception continuation is only
+/// pure construction (plus a trailing `type` / raise). Root pops and
+/// other cleanup (`shadowstack.py` `ShadowStackFrameworkGCTransformer.pop_roots`)
+/// refuse the replacement.
+fn exception_continuation_is_pure_construction(graph: &FunctionGraph, start: BlockId) -> bool {
+    let except = graph.exceptblock.0;
+    if start.0 == except {
+        return true;
+    }
+    let mut block = start.0;
+    let mut incoming_fresh: Vec<Variable> = Vec::new();
+    let mut seen = vec![false; graph.blocks.len()];
+    loop {
+        if block == except {
+            return true;
+        }
+        if block >= graph.blocks.len() || seen[block] {
+            return false;
+        }
+        seen[block] = true;
+        let body = &graph.blocks[block];
+        let raises = body.exits.iter().any(|link| link.target.0 == except);
+        let mut check_end = body.operations.len();
+        if raises {
+            while check_end > 0 && is_type_of_call(&body.operations[check_end - 1].kind) {
+                check_end -= 1;
+            }
+        }
+        let mut fresh = incoming_fresh;
+        for op in &body.operations[..check_end] {
+            if !env_slice_op_is_pure_construction(&op.kind, &fresh) {
+                return false;
+            }
+            if let Some(result) = op.result.clone() {
+                fresh.push(result);
+            }
+        }
+        if raises {
+            return true;
+        }
+        if body.exitswitch.is_some() || body.exits.len() != 1 {
+            return false;
+        }
+        let link = &body.exits[0];
+        let next = link.target.0;
+        if next >= graph.blocks.len() {
+            return false;
+        }
+        let next_inputs = &graph.blocks[next].inputargs;
+        let mut next_fresh = Vec::new();
+        for (i, arg) in link.args.iter().enumerate() {
+            if let LinkArg::Value(var) = arg
+                && fresh.iter().any(|seen| seen == var)
+                && let Some(input) = next_inputs.get(i)
+            {
+                next_fresh.push(input.clone());
+            }
+        }
+        incoming_fresh = next_fresh;
+        block = next;
+    }
 }
 
 fn emit_toint_overflow_mapper(
     graph: &mut FunctionGraph,
     origin: &CarrierOrigin,
     site: &crate::front::result_map_err::ResultMapErrSite,
-    env_plan: EnvAtHandler,
+    plan: ToIntMapErrPlan,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let a = origin.a;
@@ -7778,10 +7972,24 @@ fn emit_toint_overflow_mapper(
         .iter()
         .position(|link| link.exitcase.is_some())
         .ok_or_else(|| format!("{name}: fused toint `?` has no exception edge"))?;
-    let extra_args: Vec<LinkArg> = match &env_plan {
-        EnvAtHandler::FnItem => Vec::new(),
-        EnvAtHandler::PassThrough(arg) => vec![arg.clone()],
-        EnvAtHandler::Rebuild { extras, .. } => extras.iter().map(|(_, arg)| arg.clone()).collect(),
+    let exc_target = graph.blocks[a].exits[exc_idx].target;
+    if !exception_continuation_is_pure_construction(graph, exc_target) {
+        return Err(format!(
+            "{name}: toint map_err exception continuation is not a pure construction"
+        ));
+    }
+    let mut extra_args: Vec<LinkArg> = plan.extras.iter().map(|(_, arg)| arg.clone()).collect();
+    let env_slot = match &plan.env {
+        EnvAtHandler::FnItem | EnvAtHandler::Rebuild { .. } => None,
+        EnvAtHandler::PassThrough(arg) => Some(
+            extra_args
+                .iter()
+                .position(|seen| seen == arg)
+                .unwrap_or_else(|| {
+                    extra_args.push(arg.clone());
+                    extra_args.len() - 1
+                }),
+        ),
     };
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(extra_args.len());
     for (input, src) in e_inputs.iter().zip(extra_args.iter()) {
@@ -7789,21 +7997,20 @@ fn emit_toint_overflow_mapper(
             copy_concretetype(src, input);
         }
     }
-    let env_in = match env_plan {
+    let remap = emit_path_replay(graph, e_id, &e_inputs, &plan.ops, &plan.extras);
+    let env_in = match plan.env {
         EnvAtHandler::FnItem => None,
-        EnvAtHandler::PassThrough(_) => Some(
-            e_inputs
-                .first()
-                .cloned()
-                .ok_or_else(|| format!("{name}: toint map_err closure env is not threaded"))?,
-        ),
-        EnvAtHandler::Rebuild {
-            ops,
-            extras,
-            env_var,
-        } => Some(emit_env_rebuild(
-            graph, e_id, &e_inputs, &ops, &extras, &env_var,
-        )),
+        EnvAtHandler::PassThrough(_) => {
+            let slot = env_slot
+                .ok_or_else(|| format!("{name}: toint map_err closure env is not threaded"))?;
+            Some(
+                e_inputs
+                    .get(slot)
+                    .cloned()
+                    .ok_or_else(|| format!("{name}: toint map_err closure env is not threaded"))?,
+            )
+        }
+        EnvAtHandler::Rebuild { env_var } => Some(linear_remap(&remap, &env_var)),
     };
     let dummy = emit_rbigint_overflow_const(graph, e_id);
     let mapped = emit_callable(
@@ -7899,12 +8106,13 @@ fn fuse_one_toint_map_err(
             &format!("{name}: toint map_err block {u} is not a `?` diamond"),
         );
     }
-    let env_plan = match plan_toint_map_err_env(
+    let env_plan = match plan_toint_map_err_path(
         graph,
         &origin,
         u,
         &env,
         call_idx,
+        &recv_var,
         site.fn_item_segments.is_some(),
     ) {
         Ok(plan) => plan,
@@ -22142,6 +22350,129 @@ mod toint_overflow_tests {
             );
             assert_toint_map_err_fused(&graph);
         }
+    }
+
+    #[test]
+    fn toint_map_err_alias_field_write_fuses() {
+        let (mut graph, r, mapped) =
+            map_err_question_graph(CallTarget::method("map_err", Some("Result".into())));
+        let u = producer_block_index(&graph, &mapped).expect("map_err block");
+        let env = graph.blocks[u].operations[0]
+            .result
+            .clone()
+            .expect("closure env ctor");
+        let alias = graph.alloc_value_var();
+        copy_concretetype(&env, &alias);
+        graph.blocks[u].operations.insert(
+            1,
+            SpaceOperation {
+                result: Some(alias.clone()),
+                kind: OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: env,
+                    result_ty: ValueType::Ref(Some("fixture::closure".into())),
+                },
+            },
+        );
+        match &mut graph.blocks[u].operations[2].kind {
+            OpKind::FieldWrite { base, .. } => *base = alias,
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        let prefix_before = ops_before_toint(&graph);
+        let fused = fuse_toint_map_err_sites(
+            &mut graph,
+            &[(r, None, ValueType::Int)],
+            &[map_err_site(mapped)],
+        )
+        .expect("toint map_err fuses");
+        assert_eq!(fused.len(), 1);
+        assert_eq!(
+            ops_before_toint(&graph),
+            prefix_before,
+            "no op is inserted before jit_bigint_toint"
+        );
+        assert_toint_map_err_fused(&graph);
+        let producer = graph
+            .blocks
+            .iter()
+            .position(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_is_jit_bigint_toint(&op.kind))
+            })
+            .expect("jit_bigint_toint");
+        let mapper = &graph.blocks[overflow_exit(&graph, producer).target.0];
+        let same_as_idx = mapper
+            .operations
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as"))
+            .expect("OverflowError handler replays same_as");
+        let write_idx = mapper
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref() == Some("fixture::closure")
+                )
+            })
+            .expect("OverflowError handler replays FieldWrite");
+        let mapper_idx = mapper
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                        if name == "call_once"
+                )
+            })
+            .expect("OverflowError catch runs the mapper");
+        assert!(
+            same_as_idx < write_idx && write_idx < mapper_idx,
+            "same_as and FieldWrite on the rebuilt alias precede the mapper"
+        );
+        let alias_var = mapper.operations[same_as_idx]
+            .result
+            .as_ref()
+            .expect("same_as result");
+        match &mapper.operations[write_idx].kind {
+            OpKind::FieldWrite { base, .. } => assert_eq!(
+                base, alias_var,
+                "FieldWrite targets the rebuilt same_as alias"
+            ),
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toint_map_err_side_effect_in_path_declines() {
+        let (mut graph, r, mapped) =
+            map_err_question_graph(CallTarget::method("map_err", Some("Result".into())));
+        let u = producer_block_index(&graph, &mapped).expect("map_err block");
+        graph.blocks[u].operations.insert(
+            0,
+            SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(["side_effect"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Void,
+                },
+            },
+        );
+        let before = graph.clone();
+        let fused = fuse_toint_map_err_sites(
+            &mut graph,
+            &[(r, None, ValueType::Int)],
+            &[map_err_site(mapped)],
+        )
+        .expect("declined fusion is not a translation error");
+        assert_eq!(fused.len(), 0);
+        assert_eq!(graph, before, "side-effect in P leaves the graph unchanged");
     }
 
     #[test]
