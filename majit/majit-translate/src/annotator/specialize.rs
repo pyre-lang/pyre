@@ -9,6 +9,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
+use indexmap::map::Entry;
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::description::{DescKey, FunctionDesc, GraphBuilder, GraphCacheKey, SpecializeResult};
@@ -112,29 +113,27 @@ pub fn all_values(s: &SomeValue) -> Result<Vec<ConstValue>, AnnotatorError> {
 ///             yield (value,) + tuple_tail
 /// ```
 ///
-/// Upstream is a generator; the Rust port materialises the same
-/// sequence eagerly. The emission order is preserved exactly: the
-/// first list varies fastest within each tail, so `memo`'s
+/// Like upstream's generator, tuples are produced lazily. The first
+/// list varies fastest within each tail, so `memo`'s
 /// `possiblevalues.next()` picks the same `firstvalues` tuple as
 /// upstream.
-pub fn cartesian_product<T: Clone>(lstlst: &[Vec<T>]) -> Vec<Vec<T>> {
+pub fn cartesian_product<'a, T: Clone + 'a>(
+    lstlst: &'a [Vec<T>],
+) -> Box<dyn Iterator<Item = Vec<T>> + 'a> {
     // upstream: `if not lstlst: yield (); return`.
     if lstlst.is_empty() {
-        return vec![Vec::new()];
+        return Box::new(std::iter::once(Vec::new()));
     }
     // upstream: `for tuple_tail in cartesian_product(lstlst[1:]):`.
-    let tails = cartesian_product(&lstlst[1..]);
-    let mut out = Vec::with_capacity(tails.len() * lstlst[0].len());
-    for tail in &tails {
+    Box::new(cartesian_product(&lstlst[1..]).flat_map(move |tail| {
         // upstream: `for value in lstlst[0]: yield (value,) + tuple_tail`.
-        for value in &lstlst[0] {
+        lstlst[0].iter().map(move |value| {
             let mut tuple = Vec::with_capacity(tail.len() + 1);
             tuple.push(value.clone());
             tuple.extend(tail.iter().cloned());
-            out.push(tuple);
-        }
-    }
-    out
+            tuple
+        })
+    }))
 }
 
 /// RPython `flatten_star_args(funcdesc, args_s)` (specialize.py).
@@ -262,8 +261,7 @@ pub fn default_specialize(
             continue;
         };
         if let SomeValue::Instance(inst) = s_obj {
-            let has_flag = inst.flags.get("access_directly").copied().unwrap_or(false);
-            if has_flag {
+            if inst.flags.contains_key("access_directly") {
                 if jit_look_inside {
                     access_directly = true;
                     key = GraphCacheKey::Tuple(vec![GraphCacheKey::AccessDirect, key.clone()]);
@@ -1137,7 +1135,7 @@ fn is_false_true(values: &[ConstValue]) -> bool {
 impl SharedUnionFindInfo for MemoTable {
     /// RPython `MemoTable.absorb(self, other)` (specialize.py):
     /// `self.table.update(other.table); assert self.graph is None;
-    /// other.do_not_process = True`.
+    /// del other.graph; other.do_not_process = True`.
     fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
         {
             let other_ref = other.borrow();
@@ -1149,38 +1147,28 @@ impl SharedUnionFindInfo for MemoTable {
             // upstream: `assert self.graph is None, "too late for MemoTable merge!"`.
             assert!(me.graph.is_none(), "too late for MemoTable merge!");
         }
+        let mut other_mut = other.borrow_mut();
+        // upstream: `del other.graph   # just in case`.
+        other_mut.graph = None;
         // upstream: `other.do_not_process = True`.
-        other.borrow_mut().do_not_process = true;
+        other_mut.do_not_process = true;
     }
 }
 
 /// One `Bookkeeper.all_specializations[funcdesc]` entry: the
 /// `UnionFind(compute_one_result)` family of argument tuples
-/// (specialize.py) plus a per-family latch for the host-call error.
-///
-/// The UnionFind info factory has an infallible `Fn(&K) -> V` signature,
-/// so the `compute_one_result` host call (`func(*args)`) cannot return a
-/// `Result` from inside it. Rather than the previous pre-flight (which
-/// called `func(*args)` once to validate and once more in the factory),
-/// the factory latches the first host-call error into `host_err` and
-/// [`memo`] surfaces it after `find`/`union` — a single call per argument
-/// tuple. The latch lives with the family (not the `memo` call) so a
-/// later reflow that triggers a fresh `find` miss latches into the same
-/// cell the next `memo` call reads.
-pub struct MemoFamily {
-    pub uf: UnionFind<Vec<ConstValue>, Rc<RefCell<MemoTable>>>,
-    pub host_err: Rc<RefCell<Option<AnnotatorError>>>,
-}
+/// (specialize.py). A failing `compute_one_result` (`func(*args)`)
+/// propagates out of `try_find`/`try_union` and leaves the tuple
+/// untracked, so the next `memo` call runs it again.
+pub type MemoFamily = UnionFind<Vec<ConstValue>, Rc<RefCell<MemoTable>>, AnnotatorError>;
 
 /// Build the `UnionFind(compute_one_result)` family both [`memo`] and
 /// [`memotable_for_args`] store in `Bookkeeper.all_specializations`.
 ///
 /// `register_finish` matches `MemoTable.register_finish` after a
 /// successful `compute_one_result` (`memo`); rtyper-time table lookups
-/// skip it. A failed host call latches into `host_err` and yields a
-/// `do_not_process` placeholder, never registered. `fail_kind` is the
-/// clause in the latched error (`host call` vs `compute_one_result`)
-/// so each caller keeps its existing message.
+/// skip it. `fail_kind` is the clause in the factory error (`host call`
+/// vs `compute_one_result`) so each caller keeps its existing message.
 fn new_memo_family(
     name: String,
     defaults: Vec<Constant>,
@@ -1189,9 +1177,7 @@ fn new_memo_family(
     fail_kind: &'static str,
     compute_one_result: impl Fn(&[ConstValue]) -> Result<ConstValue, String> + 'static,
 ) -> MemoFamily {
-    let host_err: Rc<RefCell<Option<AnnotatorError>>> = Rc::new(RefCell::new(None));
-    let factory_err = host_err.clone();
-    let uf = UnionFind::new(
+    UnionFind::new_fallible(
         move |args: &Vec<ConstValue>| match compute_one_result(args) {
             Ok(value) => {
                 let memotable = Rc::new(RefCell::new(MemoTable::new(
@@ -1204,27 +1190,13 @@ fn new_memo_family(
                 if register_finish {
                     MemoTable::register_finish(&memotable);
                 }
-                memotable
+                Ok(memotable)
             }
-            Err(e) => {
-                if factory_err.borrow().is_none() {
-                    *factory_err.borrow_mut() = Some(AnnotatorError::new(format!(
-                        "memo call: {fail_kind} for {name} failed on {args:?}: {e}"
-                    )));
-                }
-                let memotable = Rc::new(RefCell::new(MemoTable::new(
-                    name.clone(),
-                    defaults.clone(),
-                    bookkeeper.clone(),
-                    args.clone(),
-                    ConstValue::None,
-                )));
-                memotable.borrow_mut().do_not_process = true;
-                memotable
-            }
+            Err(e) => Err(AnnotatorError::new(format!(
+                "memo call: {fail_kind} for {name} failed on {args:?}: {e}"
+            ))),
         },
-    );
-    MemoFamily { uf, host_err }
+    )
 }
 
 /// `specialize.py memo` KeyError branch:
@@ -1255,12 +1227,8 @@ pub fn memotable_for_args(
                 compute_one_result,
             )
         });
-        let rep = family.uf.find(args).1;
-        if let Some(e) = family.host_err.borrow_mut().take() {
-            return Err(e);
-        }
+        let rep = family.try_find(args)?.1;
         family
-            .uf
             .get(&rep)
             .expect("memotable_for_args: representative MemoTable present after find")
             .clone()
@@ -1279,13 +1247,8 @@ pub fn memotable_for_args(
 /// [`crate::flowspace::model::HostCall`] hook on the function's
 /// `GraphFunc`.
 ///
-/// upstream's `compute_one_result` runs `func(*args)` inside the
-/// `UnionFind` info factory, whose `Fn(&K) -> V` signature cannot carry a
-/// `Result`. The factory therefore latches the first host-call error into
-/// the family's [`MemoFamily::host_err`] cell (and yields a
-/// `do_not_process` placeholder table); `memo` surfaces that error after
-/// `find`/`union`. Each argument tuple is thus evaluated exactly once —
-/// no pre-flight double call.
+/// The factory returns the host-call error, which `try_find`/`try_union`
+/// propagate before the tuple is recorded.
 pub fn memo(
     funcdesc: &FunctionDesc,
     args_s: &[Option<SomeValue>],
@@ -1299,46 +1262,17 @@ pub fn memo(
             .ok_or_else(|| AnnotatorError::new(format!("memo: argument {i} is unannotated")))?;
         per_arg.push(all_values(s)?);
     }
-    let possiblevalues = cartesian_product(&per_arg);
+    let mut possiblevalues = cartesian_product(&per_arg);
 
     // upstream: `bookkeeper = funcdesc.bookkeeper`.
     let bookkeeper: Rc<Bookkeeper> = funcdesc.base.bookkeeper.clone();
 
-    // upstream: `func = funcdesc.pyobj; if func is None: raise ...`.
-    let func_ho = funcdesc.base.pyobj.as_ref().ok_or_else(|| {
-        AnnotatorError::new(format!(
-            "memo call: no Python function object to call ({})",
-            funcdesc.name
-        ))
-    })?;
-    let graph_func = func_ho.user_function().ok_or_else(|| {
-        AnnotatorError::new(format!(
-            "memo call: pyobj of {} is not a user function",
-            funcdesc.name
-        ))
-    })?;
     // upstream keys `all_specializations` by the funcdesc object;
     // `Desc.identity` is that object's key in every bookkeeper table.
     let key = funcdesc.base.identity;
-    let host_call = graph_func.host_call.clone().ok_or_else(|| {
-        AnnotatorError::new(format!(
-            "memo call: function {} has no host_call hook registered",
-            funcdesc.name
-        ))
-    })?;
-
     let name = funcdesc.name.clone();
     let defaults = funcdesc.defaults.clone();
     let bk_weak = Rc::downgrade(&bookkeeper);
-
-    // upstream: `firstvalues = possiblevalues.next()` (StopIteration if
-    // any argument's value set is empty).
-    let firstvalues = possiblevalues.first().cloned().ok_or_else(|| {
-        AnnotatorError::new(format!(
-            "memo call: {} has no possible argument combinations",
-            funcdesc.name
-        ))
-    })?;
 
     // Resolve the merged MemoTable. Scope the all_specializations borrow
     // so the per-table `register_finish` (which borrows the *separate*
@@ -1349,35 +1283,59 @@ pub fn memo(
         // upstream: `memotables = bookkeeper.all_specializations[funcdesc]`
         //           with the KeyError branch building a fresh
         //           `UnionFind(compute_one_result)`.
-        let family = specs.entry(key).or_insert_with(|| {
-            // upstream `compute_one_result`: `value = func(*args);
-            // memotable = MemoTable(funcdesc, args, value);
-            // memotable.register_finish(); return memotable`.
-            let host_call = host_call.clone();
-            new_memo_family(
-                name.clone(),
-                defaults.clone(),
-                bk_weak.clone(),
-                true,
-                "host call",
-                move |args| (host_call.0)(args),
-            )
-        });
+        let family = match specs.entry(key) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => {
+                // upstream: `func = funcdesc.pyobj; if func is None: raise ...`.
+                let func_ho = funcdesc.base.pyobj.as_ref().ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "memo call: no Python function object to call ({})",
+                        funcdesc.name
+                    ))
+                })?;
+                let graph_func = func_ho.user_function().ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "memo call: pyobj of {} is not a user function",
+                        funcdesc.name
+                    ))
+                })?;
+                let host_call = graph_func.host_call.clone().ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "memo call: function {} has no host_call hook registered",
+                        funcdesc.name
+                    ))
+                })?;
+                // upstream `compute_one_result`: `value = func(*args);
+                // memotable = MemoTable(funcdesc, args, value);
+                // memotable.register_finish(); return memotable`.
+                v.insert(new_memo_family(
+                    name.clone(),
+                    defaults.clone(),
+                    bk_weak.clone(),
+                    true,
+                    "host call",
+                    move |args| (host_call.0)(args),
+                ))
+            }
+        };
+
+        // upstream: `firstvalues = possiblevalues.next()` (StopIteration if
+        // any argument's value set is empty).
+        let firstvalues = possiblevalues.next().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "memo call: {} has no possible argument combinations",
+                funcdesc.name
+            ))
+        })?;
 
         // upstream: `_, _, memotable = memotables.find(firstvalues)`.
-        let mut rep = family.uf.find(firstvalues.clone()).1;
+        let mut rep = family.try_find(firstvalues.clone())?.1;
         // upstream: `for values in possiblevalues: _, _, memotable =
         //            memotables.union(firstvalues, values)`.
-        for values in possiblevalues.iter().skip(1) {
-            rep = family.uf.union(firstvalues.clone(), values.clone()).1;
-        }
-        // Surface a host-call error the factory latched (single call per
-        // argument tuple — no pre-flight).
-        if let Some(e) = family.host_err.borrow_mut().take() {
-            return Err(e);
+        for values in possiblevalues {
+            rep = family.try_union(firstvalues.clone(), values)?.1;
         }
         family
-            .uf
             .get(&rep)
             .expect("memo: representative MemoTable present after find/union")
             .clone()
@@ -1412,13 +1370,13 @@ mod tests {
     #[test]
     fn cartesian_product_empty_yields_one_empty_tuple() {
         // upstream: `if not lstlst: yield ()`.
-        let out = cartesian_product::<i32>(&[]);
+        let out = cartesian_product::<i32>(&[]).collect::<Vec<_>>();
         assert_eq!(out, vec![Vec::<i32>::new()]);
     }
 
     #[test]
     fn cartesian_product_single_list() {
-        let out = cartesian_product(&[vec![1, 2, 3]]);
+        let out = cartesian_product(&[vec![1, 2, 3]]).collect::<Vec<_>>();
         assert_eq!(out, vec![vec![1], vec![2], vec![3]]);
     }
 
@@ -1426,7 +1384,7 @@ mod tests {
     fn cartesian_product_orders_first_list_fastest() {
         // Mirrors the generator's emission order: tails come from the
         // tail product, the first list varies fastest within each.
-        let out = cartesian_product(&[vec![1, 2], vec![3, 4]]);
+        let out = cartesian_product(&[vec![1, 2], vec![3, 4]]).collect::<Vec<_>>();
         assert_eq!(out, vec![vec![1, 3], vec![2, 3], vec![1, 4], vec![2, 4]]);
     }
 

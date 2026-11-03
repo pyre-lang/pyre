@@ -75,9 +75,10 @@ impl<T: SharedUnionFindInfo> UnionFindInfo for Rc<RefCell<T>> {
 }
 
 /// RPython `class UnionFind(object)` (unionfind.py).
-pub struct UnionFind<K, V>
+pub struct UnionFind<K, V, E = std::convert::Infallible>
 where
     K: Eq + Hash + Clone,
+    E: 'static,
 {
     /// RPython `self.link_to_parent` (unionfind.py:8).
     /// `IndexMap`, not `HashMap`: `keys()` iterates this to drive commonbase
@@ -92,21 +93,21 @@ where
     /// Upstream dictionary deletion in `union` is O(1); ordering is derived
     /// from `link_to_parent`, so hash storage preserves both properties.
     root_info: Table<K, V>,
-    /// RPython `self.info_factory` (unionfind.py:10). See module doc
-    /// for why the Rust port makes this mandatory.
-    info_factory: Box<dyn Fn(&K) -> V>,
+    /// RPython `self.info_factory`. An `Err` from it leaves `obj`
+    /// untracked, as an exception raised by `self.info_factory(obj)` does
+    /// upstream; `E = Infallible` for factories that cannot fail.
+    info_factory: Box<dyn Fn(&K) -> Result<V, E>>,
 }
 
-impl<K, V> UnionFind<K, V>
+impl<K, V, E> UnionFind<K, V, E>
 where
     K: Eq + Hash + Clone,
     V: UnionFindInfo,
 {
-    /// RPython `UnionFind.__init__(self, info_factory=None)`
-    /// (unionfind.py).
-    pub fn new<F>(info_factory: F) -> Self
+    /// RPython `UnionFind.__init__` with a factory that may fail.
+    pub fn new_fallible<F>(info_factory: F) -> Self
     where
-        F: Fn(&K) -> V + 'static,
+        F: Fn(&K) -> Result<V, E> + 'static,
     {
         UnionFind {
             link_to_parent: IndexMap::default(),
@@ -136,65 +137,19 @@ where
             .filter_map(move |k| self.root_info.get(k))
     }
 
-    /// RPython `UnionFind.__getitem__(self, obj)` (unionfind.py).
-    ///
-    /// Returns `None` for the KeyError case. Path-compresses as a
-    /// side-effect; matches upstream (the body calls `self.find`).
-    pub fn get(&mut self, obj: &K) -> Option<&V> {
-        if !self.link_to_parent.contains_key(obj) {
-            return None;
-        }
-        let (_, rep) = self.find(obj.clone());
-        self.root_info.get(&rep)
-    }
-
-    /// Mutable counterpart of [`Self::get`]. No upstream equivalent —
-    /// Python returns `info` directly and lets callers mutate fields;
-    /// Rust splits read vs write. Callers must use this to reach
-    /// `info.<method>()` calls that upstream writes as
-    /// `uf[obj].method()`.
-    pub fn get_mut(&mut self, obj: &K) -> Option<&mut V> {
-        if !self.link_to_parent.contains_key(obj) {
-            return None;
-        }
-        let (_, rep) = self.find(obj.clone());
-        self.root_info.get_mut(&rep)
-    }
-
-    /// RPython `UnionFind.find_rep(self, obj)` (unionfind.py).
-    ///
-    /// Returns the root representative. Auto-inserts via
-    /// `info_factory` if `obj` isn't tracked yet (matches upstream —
-    /// `find_rep` falls through to `find` on the KeyError path).
-    pub fn find_rep(&mut self, obj: K) -> K {
-        let (_, rep) = self.find(obj);
-        rep
-    }
-
-    /// RPython `UnionFind.find(self, obj)` (unionfind.py).
-    ///
-    /// Returns `(new_root, representative)`. `new_root` is `true` when
-    /// `obj` was not previously tracked and a fresh partition was
-    /// created via `info_factory`. Performs path compression on the
-    /// walk from `obj` to its root.
-    pub fn find(&mut self, obj: K) -> (bool, K) {
-        let Some(parent) = self.link_to_parent.get(&obj).cloned() else {
-            // upstream: fresh singleton partition.
-            let info = (self.info_factory)(&obj);
-            self.root_info.insert(obj.clone(), info);
-            self.weight.insert(obj.clone(), 1);
-            self.link_to_parent.insert(obj.clone(), obj.clone());
-            return (true, obj);
-        };
+    /// Path-compress a tracked `obj` to its root. `obj` must already be
+    /// in `link_to_parent`.
+    fn find_tracked(&mut self, obj: K) -> K {
+        let parent = self.link_to_parent.get(&obj).cloned().unwrap();
 
         // A root, or a node linked straight to its root: the compression
         // below would write back every link it walks unchanged, so the
         // answer needs neither the walk nor the writes.
         if parent == obj {
-            return (false, obj);
+            return obj;
         }
         if self.link_to_parent[&parent] == parent {
-            return (false, parent);
+            return parent;
         }
 
         // upstream: `to_root = [obj]`; walk parents until fixed point.
@@ -210,22 +165,55 @@ where
             self.link_to_parent.insert(o, parent.clone());
         }
 
-        (false, parent)
+        parent
     }
 
-    /// RPython `UnionFind.union(self, obj1, obj2)` (unionfind.py).
+    /// RPython `UnionFind.__getitem__(self, obj)` (unionfind.py).
     ///
-    /// Returns `(not_noop, representative)`. `not_noop` is `true` iff
-    /// the call materially changed the partitioning — either a brand-
-    /// new singleton was created inside `find`, or two previously
-    /// distinct partitions got merged.
-    pub fn union(&mut self, obj1: K, obj2: K) -> (bool, K) {
-        let (new1, rep1) = self.find(obj1);
-        let (new2, rep2) = self.find(obj2);
+    /// Returns `None` for the KeyError case. Path-compresses as a
+    /// side-effect; matches upstream (the body calls `self.find`).
+    pub fn get(&mut self, obj: &K) -> Option<&V> {
+        if !self.link_to_parent.contains_key(obj) {
+            return None;
+        }
+        let rep = self.find_tracked(obj.clone());
+        self.root_info.get(&rep)
+    }
+
+    /// Mutable counterpart of [`Self::get`]. No upstream equivalent —
+    /// Python returns `info` directly and lets callers mutate fields;
+    /// Rust splits read vs write. Callers must use this to reach
+    /// `info.<method>()` calls that upstream writes as
+    /// `uf[obj].method()`.
+    pub fn get_mut(&mut self, obj: &K) -> Option<&mut V> {
+        if !self.link_to_parent.contains_key(obj) {
+            return None;
+        }
+        let rep = self.find_tracked(obj.clone());
+        self.root_info.get_mut(&rep)
+    }
+
+    /// RPython `UnionFind.find`.
+    pub fn try_find(&mut self, obj: K) -> Result<(bool, K), E> {
+        if !self.link_to_parent.contains_key(&obj) {
+            // upstream: fresh singleton partition.
+            let info = (self.info_factory)(&obj)?;
+            self.root_info.insert(obj.clone(), info);
+            self.weight.insert(obj.clone(), 1);
+            self.link_to_parent.insert(obj.clone(), obj.clone());
+            return Ok((true, obj));
+        }
+        Ok((false, self.find_tracked(obj)))
+    }
+
+    /// RPython `UnionFind.union`.
+    pub fn try_union(&mut self, obj1: K, obj2: K) -> Result<(bool, K), E> {
+        let (new1, rep1) = self.try_find(obj1)?;
+        let (new2, rep2) = self.try_find(obj2)?;
 
         if rep1 == rep2 {
             // upstream: `return new1 or new2, rep1, info1`.
-            return (new1 || new2, rep1);
+            return Ok((new1 || new2, rep1));
         }
 
         // upstream: `if info1 is not None: info1.absorb(info2)`. We
@@ -251,18 +239,91 @@ where
         self.weight.insert(new_rep1.clone(), w);
         self.root_info.insert(new_rep1.clone(), info1);
 
-        (true, new_rep1)
+        Ok((true, new_rep1))
+    }
+
+    /// RPython `UnionFind.find_rep`.
+    pub fn try_find_rep(&mut self, obj: K) -> Result<K, E> {
+        // upstream fast path: `parent = self.link_to_parent[obj]; self.root_info[parent]`.
+        if let Some(parent) = self.link_to_parent.get(&obj)
+            && self.root_info.contains_key(parent)
+        {
+            return Ok(parent.clone());
+        }
+        // upstream general case: `ignore, rep, info = self.find(obj)`.
+        Ok(self.try_find(obj)?.1)
+    }
+
+    /// RPython `UnionFind.union_list`.
+    pub fn try_union_list(&mut self, objlist: &[K]) -> Result<(), E> {
+        if objlist.is_empty() {
+            return Ok(());
+        }
+        let obj0 = objlist[0].clone();
+        self.try_find(obj0.clone())?;
+        for obj1 in objlist.iter().skip(1) {
+            self.try_union(obj0.clone(), obj1.clone())?;
+        }
+        Ok(())
+    }
+}
+
+impl<K, V> UnionFind<K, V, std::convert::Infallible>
+where
+    K: Eq + Hash + Clone,
+    V: UnionFindInfo,
+{
+    /// RPython `UnionFind.__init__(self, info_factory=None)`
+    /// (unionfind.py).
+    pub fn new<F>(info_factory: F) -> Self
+    where
+        F: Fn(&K) -> V + 'static,
+    {
+        Self::new_fallible(move |k| Ok(info_factory(k)))
+    }
+
+    /// RPython `UnionFind.find(self, obj)` (unionfind.py).
+    ///
+    /// Returns `(new_root, representative)`. `new_root` is `true` when
+    /// `obj` was not previously tracked and a fresh partition was
+    /// created via `info_factory`. Performs path compression on the
+    /// walk from `obj` to its root.
+    pub fn find(&mut self, obj: K) -> (bool, K) {
+        match self.try_find(obj) {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
+    }
+
+    /// RPython `UnionFind.union(self, obj1, obj2)` (unionfind.py).
+    ///
+    /// Returns `(not_noop, representative)`. `not_noop` is `true` iff
+    /// the call materially changed the partitioning — either a brand-
+    /// new singleton was created inside `find`, or two previously
+    /// distinct partitions got merged.
+    pub fn union(&mut self, obj1: K, obj2: K) -> (bool, K) {
+        match self.try_union(obj1, obj2) {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
+    }
+
+    /// RPython `UnionFind.find_rep(self, obj)` (unionfind.py).
+    ///
+    /// Returns the root representative. Takes upstream's fast path
+    /// (parent with root info) before falling through to `find`.
+    pub fn find_rep(&mut self, obj: K) -> K {
+        match self.try_find_rep(obj) {
+            Ok(r) => r,
+            Err(e) => match e {},
+        }
     }
 
     /// RPython `UnionFind.union_list(self, objlist)` (unionfind.py).
     pub fn union_list(&mut self, objlist: &[K]) {
-        if objlist.is_empty() {
-            return;
-        }
-        let obj0 = objlist[0].clone();
-        self.find(obj0.clone());
-        for obj1 in objlist.iter().skip(1) {
-            self.union(obj0.clone(), obj1.clone());
+        match self.try_union_list(objlist) {
+            Ok(()) => {}
+            Err(e) => match e {},
         }
     }
 }
@@ -458,5 +519,25 @@ mod tests {
         for i in 2..=5 {
             assert_eq!(uf.find_rep(i), rep);
         }
+    }
+
+    #[test]
+    fn try_find_error_leaves_obj_untracked() {
+        let mut uf: UnionFind<i32, (), String> = UnionFind::new_fallible(|k| {
+            if *k == 2 {
+                Err(format!("bad {k}"))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(uf.try_find(1), Ok((true, 1)));
+        assert_eq!(uf.try_union(1, 2), Err("bad 2".to_string()));
+        assert!(!uf.contains(&2));
+        assert!(uf.contains(&1));
+        assert_eq!(uf.keys().count(), 1);
+        assert_eq!(uf.try_find_rep(1), Ok(1));
+        assert_eq!(uf.try_union_list(&[1, 3, 2]), Err("bad 2".to_string()));
+        assert!(uf.contains(&3) && !uf.contains(&2));
+        assert_eq!(uf.try_find_rep(3), uf.try_find_rep(1));
     }
 }
