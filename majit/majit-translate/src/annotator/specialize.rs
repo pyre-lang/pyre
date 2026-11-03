@@ -14,7 +14,7 @@ use indexmap::map::Entry;
 
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::description::{DescKey, FunctionDesc, GraphBuilder, GraphCacheKey, SpecializeResult};
-use super::model::{AnnotatorError, SomeInstance, SomeObjectTrait, SomeValue, unionof};
+use super::model::{AnnotatorError, SomeInstance, SomeObjectTrait, SomeValue, not_const, unionof};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::HostCode;
 use crate::flowspace::model::{
@@ -418,6 +418,84 @@ pub fn specialize_argtype(
         key_parts.push(FunctionDesc::argtype_knowntype_key(s));
     }
     maybe_star_args(funcdesc, GraphCacheKey::Tuple(key_parts), args_s)
+}
+
+/// Bodyless foreign stub: no `HostCode`, no pending lift, and no
+/// `GraphCacheKey::None` template (`description.py` `cachedgraph`
+/// clones that template when `builder is None`). An empty cache is
+/// not the test — the second knowntype must still take this path
+/// after the first graph is cached.
+pub(crate) fn is_bodyless_argtype_stub(funcdesc: &FunctionDesc) -> bool {
+    if funcdesc.source_graph.borrow().is_some() {
+        return false;
+    }
+    let has_host_code = funcdesc
+        .base
+        .pyobj
+        .as_ref()
+        .and_then(|pyobj| pyobj.user_function())
+        .and_then(|func| func.code.as_ref())
+        .is_some();
+    if has_host_code {
+        return false;
+    }
+    !funcdesc.cache.borrow().contains_key(&GraphCacheKey::None)
+}
+
+/// Specialize-miss path for a bodyless `specialize:argtype` external.
+///
+/// `specialize_argtype` itself stays line-by-line with
+/// `specialize.py`. A stub has no body to re-annotate, so the miss
+/// constructs a graph whose result shell is `not_const(args_s[i])`
+/// (`EntryNonConstant.compute_result_annotation`, `rlib/nonconst.py`;
+/// `ExtRegistryEntry.compute_result_annotation`, `extregistry.py`).
+pub fn specialize_argtype_stub_result(
+    funcdesc: &FunctionDesc,
+    args_s: &[Option<SomeValue>],
+    argindices: &[usize],
+) -> Result<Rc<PyGraph>, AnnotatorError> {
+    let mut key_parts = Vec::with_capacity(argindices.len());
+    let mut result_shell: Option<SomeValue> = None;
+    for &idx in argindices {
+        let s_slot = args_s.get(idx).ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "specialize:argtype stub index {idx} out of range for {}",
+                funcdesc.name
+            ))
+        })?;
+        let s = s_slot.as_ref().ok_or_else(|| {
+            AnnotatorError::new(format!(
+                "specialize:argtype stub({idx}): argument is unannotated"
+            ))
+        })?;
+        key_parts.push(FunctionDesc::argtype_knowntype_key(s));
+        if result_shell.is_none() {
+            let mut shell = not_const(s);
+            if let SomeValue::Instance(inst) = &mut shell {
+                // Nullable `*mut T` (`raw_ptr_token_annotation`).
+                inst.can_be_none = true;
+            }
+            result_shell = Some(shell);
+        }
+    }
+    let result_shell = result_shell.ok_or_else(|| {
+        AnnotatorError::new(format!(
+            "specialize:argtype stub for {} requires at least one index",
+            funcdesc.name
+        ))
+    })?;
+    let name = funcdesc.name.clone();
+    let signature = funcdesc.signature.clone();
+    let builder: GraphBuilder<'_> = Box::new(move |_translator, _func| {
+        Ok(
+            crate::translator::rtyper::cutover::build_stub_pygraph_for_somevalue(
+                name,
+                signature,
+                result_shell,
+            ),
+        )
+    });
+    funcdesc.cachedgraph(GraphCacheKey::Tuple(key_parts), None, Some(builder))
 }
 
 /// RPython `specialize_arglistitemtype(funcdesc, args_s, i)`

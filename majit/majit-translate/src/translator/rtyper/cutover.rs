@@ -3093,6 +3093,21 @@ pub(crate) fn build_stub_pygraph_for_lltype(
     ))
 }
 
+/// Annotator-only stub PyGraph whose return Variable carries
+/// `return_someval`.
+///
+/// `ExtRegistryEntry.compute_result_annotation` (`extregistry.py`) is
+/// the annotation-stage result of a foreign external: a `SomeXXX`
+/// shell, not a flowed body. `EntryNonConstant.compute_result_annotation`
+/// (`rlib/nonconst.py`) returns `not_const(s_arg)` of a keyed argument.
+pub(crate) fn build_stub_pygraph_for_somevalue(
+    name: String,
+    signature: Signature,
+    return_someval: crate::annotator::model::SomeValue,
+) -> Rc<PyGraph> {
+    build_stub_pygraph_with_result_shell(name, signature, return_someval)
+}
+
 /// Build an annotator-only stub PyGraph whose return Variable carries
 /// `return_someval` directly.  Shared core of
 /// [`build_stub_pygraph_for_lltype`] (which projects an lltype through
@@ -3860,17 +3875,6 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self", "val", "order"],
         LowLevelType::Void,
     ),
-    // `AtomicPtr::swap` returns the previous `*mut T` as an untyped address.
-    (
-        &["sync", "atomic", "AtomicPtr", "swap"],
-        &["self", "val", "order"],
-        LowLevelType::Address,
-    ),
-    (
-        &["sync", "atomic", "AtomicPtr", "new"],
-        &["v"],
-        LowLevelType::Address,
-    ),
     (
         &["sync", "atomic", "AtomicI64", "new"],
         &["v"],
@@ -3966,6 +3970,20 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
         &["self", "ch"],
         LowLevelType::Void,
     ),
+];
+
+/// Generic pointer-atomic methods whose declared result is the keyed
+/// argument's instantiated `*mut T`. One FunctionDesc, many cached
+/// graphs (`specialize.py` `specialize_argtype`). No prefilled
+/// `GraphCacheKey::None` Address stub: a unique Address shell would
+/// first-bind every instantiation.
+const ATOMIC_PTR_ARGTYPE_EXTERNALS: &[(&[&str], &[&str], usize)] = &[
+    (
+        &["sync", "atomic", "AtomicPtr", "swap"],
+        &["self", "val", "order"],
+        1,
+    ),
+    (&["sync", "atomic", "AtomicPtr", "new"], &["v"], 0),
 ];
 
 /// Zero-arg Void externals with no effects and no graph.
@@ -4099,6 +4117,35 @@ fn register_opaque_external(
     registry.register_callee(key, signature, stub_pygraph);
 }
 
+/// Register a bodyless foreign external with `specialize:argtype(i)`.
+///
+/// `newfuncdesc_with_signature` reads `GraphFunc.annspecialcase`
+/// (`policy.py` `get_specializer`). The cache stays empty: prefilling
+/// `GraphCacheKey::None` would give every instantiation the same shell
+/// (`call_registry.rs` `register_callee` / `prefill_default_cache`).
+fn register_opaque_external_argtype(
+    registry: &CallRegistry,
+    segments: &[&str],
+    argnames: &[&str],
+    argtype_index: usize,
+) {
+    let signature = Signature::new(
+        argnames.iter().map(|n| (*n).to_string()).collect(),
+        None,
+        None,
+    );
+    let mut graph_func = GraphFunc::new(
+        segments.last().copied().unwrap_or_default().to_string(),
+        Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
+    );
+    graph_func.annspecialcase = Some(format!("specialize:argtype({argtype_index})"));
+    let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+    if alias_existing_lookup(registry, &key) {
+        return;
+    }
+    let _ = registry.get_or_register_with_func(key, signature, graph_func);
+}
+
 /// Declare the opaque MIR deref-write marker to the annotator.
 ///
 /// This is a two-parameter, `Void` external.  It is intentionally registered
@@ -4153,6 +4200,9 @@ fn register_saturating_arith_externals(registry: &CallRegistry) {
 pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
+    }
+    for (segments, argnames, argtype_index) in ATOMIC_PTR_ARGTYPE_EXTERNALS {
+        register_opaque_external_argtype(registry, segments, argnames, *argtype_index);
     }
     register_saturating_arith_externals(registry);
     // `<[T]>::to_vec` leftover the pair-slice rewrite did not retarget
@@ -13542,10 +13592,6 @@ mod tests {
                 ["sync", "atomic", "AtomicUsize", "new"].as_slice(),
                 ["v"].as_slice(),
             ),
-            (
-                ["sync", "atomic", "AtomicPtr", "swap"].as_slice(),
-                ["self", "val", "order"].as_slice(),
-            ),
         ] {
             let entry = registry
                 .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
@@ -13563,6 +13609,341 @@ mod tests {
                 "{segments:?}: annotator stub graph required"
             );
         }
+    }
+
+    fn pointer_atomic_argtype_registry() -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        CallRegistry,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        register_foreign_stdlib_externals(&registry);
+        (ann, registry)
+    }
+
+    fn pointer_atomic_argtype_row(
+        leaf: &str,
+    ) -> (&'static [&'static str], &'static [&'static str], usize) {
+        ATOMIC_PTR_ARGTYPE_EXTERNALS
+            .iter()
+            .copied()
+            .find(|(segments, _, _)| segments.last() == Some(&leaf))
+            .unwrap_or_else(|| panic!("missing pointer-atomic argtype row {leaf}"))
+    }
+
+    fn pointer_atomic_argtype_key(leaf: &str) -> FunctionPathKey {
+        let (segments, _, _) = pointer_atomic_argtype_row(leaf);
+        FunctionPathKey::from_segments(segments.iter().copied())
+    }
+
+    fn integer_cell() -> crate::annotator::model::SomeValue {
+        crate::annotator::model::SomeValue::Integer(crate::annotator::model::SomeInteger::default())
+    }
+
+    fn instance_cell(
+        classdef: &std::rc::Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) -> crate::annotator::model::SomeValue {
+        crate::annotator::model::SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ))
+    }
+
+    fn argtype_stub_link_result(
+        pygraph: &crate::flowspace::pygraph::PyGraph,
+    ) -> (String, crate::annotator::model::SomeValue) {
+        let graph = pygraph.graph.borrow();
+        let start = graph.startblock.borrow();
+        assert!(
+            start.operations.is_empty(),
+            "argtype stub has no residual body"
+        );
+        let link = start.exits[0].borrow();
+        let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+            panic!("stub return is a Variable");
+        };
+        let prefix = ret.name_prefix();
+        let value = ret
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| (**rc).clone())
+            .expect("stub result annotated");
+        (prefix, value)
+    }
+
+    #[test]
+    fn pointer_atomic_argtype_rows_register_empty_cache() {
+        use crate::annotator::policy::Specializer;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        for (segments, argnames, argtype_index) in ATOMIC_PTR_ARGTYPE_EXTERNALS {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .unwrap_or_else(|| panic!("{segments:?} must register"));
+            let e2 = registry
+                .lookup(&FunctionPathKey::from_segments(segments.iter().copied()))
+                .expect("lookup identity");
+            assert!(std::rc::Rc::ptr_eq(&entry.function_desc, &e2.function_desc));
+            let fd = entry.function_desc.borrow();
+            assert_eq!(
+                fd.signature.argnames,
+                argnames
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect::<Vec<_>>(),
+                "{segments:?}"
+            );
+            assert!(
+                matches!(
+                    fd.specializer.as_ref(),
+                    Some(Specializer::Argtype { parms }) if parms.as_slice() == [*argtype_index]
+                ),
+                "{segments:?} is specialize:argtype({argtype_index}), got {:?}",
+                fd.specializer
+            );
+            assert!(
+                fd.cache.borrow().is_empty(),
+                "{segments:?}: argtype stub must not prefill GraphCacheKey::None"
+            );
+            let annspecialcase = fd
+                .base
+                .pyobj
+                .as_ref()
+                .and_then(|pyobj| pyobj.user_function())
+                .and_then(|func| func.annspecialcase.clone());
+            let expected = format!("specialize:argtype({argtype_index})");
+            assert_eq!(annspecialcase.as_deref(), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn pointer_atomic_swap_result_is_not_const_instance_of_val_classdef() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeObjectTrait, SomeValue, unionof};
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        let class_a = ClassDef::new_standalone("pkg.A", None);
+        let mut val = instance_cell(&class_a);
+        val.set_const_box(Constant::new(ConstValue::Int(0)));
+        assert!(val.is_constant());
+        let entry = registry
+            .lookup(&pointer_atomic_argtype_key("swap"))
+            .unwrap();
+        let fd = entry.function_desc.borrow();
+        let graph = fd
+            .specialize(
+                &mut vec![
+                    Some(integer_cell()),
+                    Some(val.clone()),
+                    Some(integer_cell()),
+                ],
+                None,
+            )
+            .expect("specialize swap")
+            .expect_graph()
+            .unwrap();
+        let start = graph.graph.borrow().startblock.clone();
+        let start = start.borrow();
+        let Hlvalue::Variable(val_arg) = &start.inputargs[1] else {
+            panic!("val inputarg");
+        };
+        let link = start.exits[0].borrow();
+        let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+            panic!("return Variable");
+        };
+        assert_ne!(ret, val_arg, "result Variable is not the val inputarg");
+        assert_eq!(
+            ret.name_prefix(),
+            Variable::named("__unsafe_stub_result").name_prefix()
+        );
+        let result = ret
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| (**rc).clone())
+            .expect("annotated");
+        let SomeValue::Instance(inst) = &result else {
+            panic!("expected Instance, got {result:?}");
+        };
+        assert!(
+            std::rc::Rc::ptr_eq(inst.classdef.as_ref().unwrap(), &class_a),
+            "result classdef is the keyed argument's classdef"
+        );
+        assert!(inst.can_be_none);
+        assert!(!result.is_constant(), "not_const drops val's const");
+        assert!(!matches!(result, SomeValue::Address(_)));
+        let input = instance_cell(&class_a);
+        let united = unionof([&result, &input]).expect("Instance ∪ Instance");
+        assert!(
+            matches!(united, SomeValue::Instance(_)),
+            "union with the Input-seeded cell must stay Instance, got {united:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_atomic_swap_ccharp_val_yields_someptr() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        let val = lltype_to_annotation((*CCHARP).clone());
+        let entry = registry
+            .lookup(&pointer_atomic_argtype_key("swap"))
+            .unwrap();
+        let fd = entry.function_desc.borrow();
+        let graph = fd
+            .specialize(
+                &mut vec![Some(integer_cell()), Some(val), Some(integer_cell())],
+                None,
+            )
+            .expect("specialize swap CCHARP")
+            .expect_graph()
+            .unwrap();
+        let (_prefix, result) = argtype_stub_link_result(&graph);
+        assert!(
+            matches!(result, SomeValue::Ptr(_)),
+            "CCHARP val seeds SomePtr, got {result:?}"
+        );
+        assert!(!matches!(result, SomeValue::Instance(_)));
+    }
+
+    #[test]
+    fn pointer_atomic_swap_two_classdefs_two_graphs_one_desc() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::description::GraphCacheKey;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        let class_a = ClassDef::new_standalone("pkg.A", None);
+        let class_b = ClassDef::new_standalone("pkg.B", None);
+        let entry = registry
+            .lookup(&pointer_atomic_argtype_key("swap"))
+            .unwrap();
+        let fd = entry.function_desc.borrow();
+        let g_a = fd
+            .specialize(
+                &mut vec![
+                    Some(integer_cell()),
+                    Some(instance_cell(&class_a)),
+                    Some(integer_cell()),
+                ],
+                None,
+            )
+            .expect("class a")
+            .expect_graph()
+            .unwrap();
+        let g_a2 = fd
+            .specialize(
+                &mut vec![
+                    Some(integer_cell()),
+                    Some(instance_cell(&class_a)),
+                    Some(integer_cell()),
+                ],
+                None,
+            )
+            .expect("class a again")
+            .expect_graph()
+            .unwrap();
+        let g_b = fd
+            .specialize(
+                &mut vec![
+                    Some(integer_cell()),
+                    Some(instance_cell(&class_b)),
+                    Some(integer_cell()),
+                ],
+                None,
+            )
+            .expect("class b")
+            .expect_graph()
+            .unwrap();
+        assert!(std::rc::Rc::ptr_eq(&g_a, &g_a2));
+        assert!(!std::rc::Rc::ptr_eq(&g_a, &g_b));
+        assert!(
+            !fd.cache.borrow().contains_key(&GraphCacheKey::None),
+            "bodyless argtype stub must not grow a None template"
+        );
+        assert_eq!(fd.cache.borrow().len(), 2);
+    }
+
+    #[test]
+    fn monomorphic_atomic_usize_swap_stays_unique_unsigned() {
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::SomeValue;
+        use crate::annotator::policy::Specializer;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "sync",
+                "atomic",
+                "AtomicUsize",
+                "swap",
+            ]))
+            .expect("AtomicUsize::swap must register");
+        let fd = entry.function_desc.borrow();
+        assert!(
+            matches!(fd.specializer.as_ref(), Some(Specializer::Default)),
+            "monomorphic row must not grow an argtype specializer, got {:?}",
+            fd.specializer
+        );
+        let annspecialcase = fd
+            .base
+            .pyobj
+            .as_ref()
+            .and_then(|pyobj| pyobj.user_function())
+            .and_then(|func| func.annspecialcase.clone());
+        assert!(annspecialcase.is_none());
+        let pygraph = fd
+            .cache
+            .borrow()
+            .get(&GraphCacheKey::None)
+            .cloned()
+            .expect("unique Unsigned stub");
+        let (_prefix, result) = argtype_stub_link_result(&pygraph);
+        let SomeValue::Integer(int) = result else {
+            panic!("Unsigned stub result, got {result:?}");
+        };
+        assert!(int.unsigned);
+    }
+
+    #[test]
+    fn pointer_atomic_new_argtype_zero_result_is_v() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeValue;
+        use crate::annotator::policy::Specializer;
+
+        let (_ann, registry) = pointer_atomic_argtype_registry();
+        let entry = registry
+            .lookup(&pointer_atomic_argtype_key("new"))
+            .expect("new must register");
+        let fd = entry.function_desc.borrow();
+        let (_, _, argtype_index) = pointer_atomic_argtype_row("new");
+        assert!(
+            matches!(
+                fd.specializer.as_ref(),
+                Some(Specializer::Argtype { parms }) if parms.as_slice() == [argtype_index]
+            ),
+            "new is specialize:argtype({argtype_index}), got {:?}",
+            fd.specializer
+        );
+        assert!(fd.cache.borrow().is_empty());
+        let class_a = ClassDef::new_standalone("pkg.A", None);
+        let graph = fd
+            .specialize(&mut vec![Some(instance_cell(&class_a))], None)
+            .expect("specialize new")
+            .expect_graph()
+            .unwrap();
+        let (_prefix, result) = argtype_stub_link_result(&graph);
+        let SomeValue::Instance(inst) = &result else {
+            panic!("expected Instance, got {result:?}");
+        };
+        assert!(std::rc::Rc::ptr_eq(
+            inst.classdef.as_ref().unwrap(),
+            &class_a
+        ));
     }
 
     #[test]
