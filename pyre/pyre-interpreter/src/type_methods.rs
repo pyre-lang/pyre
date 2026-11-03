@@ -3460,44 +3460,65 @@ enum IntOrLong<'a> {
     Long(&'a BigInt),
 }
 
-/// `Formatter._int_to_base`: base 10 is `str(value)`; otherwise an unsigned
-/// digit loop. A negative value is negated as unsigned so `-sys.maxint-1`
-/// does not overflow.
-///
-/// Do not emit `0b`/`0o`/`0x`: the caller adds the base prefix itself
-/// (upstream `_int_to_base` emits it and `_format_int_or_long` strips it
-/// again with `skip_leading`).
+/// `newformat.py` `Formatter._int_to_base`: base 10 is `str(value)`; otherwise
+/// an unsigned digit loop. A negative value is negated as unsigned so
+/// `-sys.maxint-1` does not overflow. Emits the `0b`/`0o`/`0x` prefix and a
+/// leading `-` (e.g. `-0x2a`); `_format_int_or_long` strips them again with
+/// `skip_leading`.
 fn int_to_base(base: u32, value: i64) -> String {
     if base == 10 {
         return value.to_string();
     }
     let negative = value < 0;
-    let mut v = value as u64;
-    if negative {
-        v = v.wrapping_neg();
-    }
     let base = base as u64;
-    let mut digits = Vec::new();
+    let mut value = value as u64;
+    if negative {
+        // Change the sign on the unsigned number: otherwise we'd risk
+        // overflow if value == -sys.maxint-1.
+        value = value.wrapping_neg();
+    }
+    let mut buf = ['\0'; 8 * 8 + 6];
+    let mut i = buf.len() - 1;
     loop {
-        let div = v / base;
-        let digit = v - div * base;
-        let ch = if digit < 10 {
-            (b'0' + digit as u8) as char
+        let div = value / base;
+        let modulo = value - div * base;
+        let mut digit = modulo as i64;
+        digit += if digit < 10 {
+            i64::from(b'0')
         } else {
-            (b'a' + (digit as u8 - 10)) as char
+            i64::from(b'a') - 10
         };
-        digits.push(ch);
-        v = div;
-        if v == 0 {
+        buf[i] = char::from(digit as u8);
+        value = div;
+        i -= 1;
+        if value == 0 {
             break;
         }
     }
-    digits.reverse();
-    let mut result: String = digits.into_iter().collect();
-    if negative {
-        result.insert(0, '-');
+    if base == 2 {
+        buf[i] = 'b';
+        buf[i - 1] = '0';
+    } else if base == 8 {
+        buf[i] = 'o';
+        buf[i - 1] = '0';
+    } else if base == 16 {
+        buf[i] = 'x';
+        buf[i - 1] = '0';
+    } else {
+        buf[i] = '#';
+        buf[i - 1] = char::from(b'0' + (base % 10) as u8);
+        if base > 10 {
+            buf[i - 2] = char::from(b'0' + (base / 10) as u8);
+            i -= 1;
+        }
     }
-    result
+    i -= 1;
+    if negative {
+        i -= 1;
+        buf[i] = '-';
+    }
+    debug_assert!(i < buf.len());
+    buf[i..].iter().copied().collect()
 }
 
 /// `Formatter._format_int_or_long`: INT_KIND goes through `_int_to_base` on
@@ -3559,7 +3580,7 @@ fn format_int_or_long_kind(
             } else {
                 0
             };
-            let magnitude = big
+            let mut magnitude = big
                 .format(digits, "", "", maxdigits as i64)
                 .map_err(|error| match error {
                     majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
@@ -3568,18 +3589,27 @@ fn format_int_or_long_kind(
                     }
                     _ => unreachable!("validated radix formatting returned an unrelated error"),
                 })?;
+            if negative {
+                debug_assert!(magnitude.starts_with('-'));
+                magnitude.remove(0);
+            }
             (negative, magnitude)
         }
         IntOrLong::Int(v) => {
             // An i64 has at most 20 decimal digits, below the minimum
             // `int_max_str_digits` limit 640, so it can never trip.
-            (v < 0, int_to_base(radix, v))
+            let result = int_to_base(radix, v);
+            let mut skip_leading: usize = match p.ty {
+                'b' | 'o' | 'x' | 'X' => 2,
+                _ => 0,
+            };
+            let negative = result.starts_with('-');
+            if negative {
+                skip_leading += 1;
+            }
+            (negative, result[skip_leading..].to_string())
         }
     };
-    if negative {
-        debug_assert!(magnitude.starts_with('-'));
-        magnitude.remove(0);
-    }
     if upper {
         magnitude.make_ascii_uppercase();
     }
