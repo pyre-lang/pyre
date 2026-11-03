@@ -27,7 +27,7 @@ pub fn ptr2int<T>(ptr: *const T) -> AddressAsInt {
 
 /// Mutable-pointer spelling for Rust call sites that do not have an immutable
 /// raw pointer without an extra cast.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn ptr2int_mut<T>(ptr: *mut T) -> AddressAsInt {
     ptr2int(ptr.cast_const())
 }

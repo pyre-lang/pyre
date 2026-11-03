@@ -3049,7 +3049,7 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
 /// production-grade closure.  Tests that compare two SSARepr streams
 /// only compare opname + register kinds, so the `ConstRef(0)` value
 /// doesn't matter for those assertions.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) fn flatten_constant_operand_for_test(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),

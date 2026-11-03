@@ -625,7 +625,6 @@ pub fn enforce_signature_return(
 // Keep the unused `union` import doc-visible so future callsites that
 // land with the Sig.__call__ port can pick it up without re-adding
 // the use statement.
-#[allow(dead_code)]
 fn _union_hold(a: &SomeValue, b: &SomeValue) -> Result<SomeValue, super::model::UnionError> {
     union(a, b)
 }

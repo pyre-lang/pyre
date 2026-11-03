@@ -2,6 +2,8 @@ pub mod dispatch;
 mod frame;
 
 pub use dispatch::build_state_field_snapshot;
+#[cfg(test)]
+pub use dispatch::call_float_function;
 pub use dispatch::implement_guard_value_on_frames;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
@@ -12,8 +14,8 @@ pub use dispatch::{
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
 pub use dispatch::{
-    call_float_function, call_int_function, call_int_function_typed, call_ref_function,
-    call_ref_function_typed, call_void_function, call_void_function_typed,
+    call_int_function, call_int_function_typed, call_ref_function, call_ref_function_typed,
+    call_void_function, call_void_function_typed,
 };
 pub use dispatch::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 pub use frame::{MIFrame, MIFrameStack};
@@ -1690,27 +1692,6 @@ fn remap_prepared_arg(
     }
 }
 
-#[allow(dead_code)] // pyjitpl.py prepared-arg cache untag
-fn untag_prepared_cache(
-    opref: OpRef,
-    cache: &[Option<majit_ir::operand::Operand>],
-) -> majit_ir::operand::Operand {
-    if opref.is_none() || opref.is_constant() {
-        return majit_ir::operand::Operand::from_opref(opref);
-    }
-    let found = cache
-        .get(opref.raw() as usize)
-        .and_then(|slot| slot.clone())
-        .unwrap_or_else(|| {
-            panic!(
-                "prepare_bridge in-place cache miss for {opref:?} (cache_len={})",
-                cache.len()
-            )
-        });
-    assert_prepared_cache_bank("untag_prepared_cache", opref, found.to_opref().ty());
-    found
-}
-
 /// `_cache` is indexed by `OpRef::raw()`, which drops the variant tag, so
 /// an Int-bank position and a Ref-bank position carrying the same payload
 /// share one slot. That is sound only while `InputArg*(pos)` positions are
@@ -2169,15 +2150,6 @@ pub struct PartialTrace {
 /// `M` is the interpreter-specific metadata stored alongside each compiled loop
 /// (e.g., storage layout, register mapping). The interpreter provides `M` when
 /// closing a trace and receives it back when running compiled code.
-
-/// model.py cpu.cls_of_box(box) default implementation:
-///   obj = lltype.cast_opaque_ptr(OBJECTPTR, box.getref_base())
-///   return ConstInt(ptr2int(obj.typeptr))
-/// Reads the first word of the object (typeptr/vtable pointer).
-#[allow(dead_code)]
-fn default_cls_of_box(raw_ref: i64) -> i64 {
-    unsafe { *(raw_ref as *const usize) as i64 }
-}
 
 /// model.py:266-273 + RPython rclass.ll_issubclass default implementation.
 /// Uses the active backend's GC subclass range table, matching
@@ -21203,7 +21175,6 @@ pub struct SwitchToBlackhole {
 /// eventual hook payload stays stable. Values match the declaration
 /// order in jit.py so future Counter additions slot in
 /// without renumbering.
-#[allow(dead_code)]
 pub mod counters {
     /// jit.py `Counters.TRACING`.
     pub const TRACING: i32 = 0;
@@ -25248,13 +25219,6 @@ mod metainterp_static_data_tests {
             Some(JitArgKind::Float)
         );
         assert_eq!(JitArgKind::from_type(majit_ir::Type::Void), None);
-    }
-
-    #[allow(dead_code)]
-    extern "C" fn not_in_trace_clear_exc_helper() {
-        // Test helper that clears the EXC_TLS thread-local in tests.
-        // The do_not_in_trace_call test below sets last_exc_value
-        // explicitly, so this helper just runs the call.
     }
 
     extern "C" fn not_in_trace_record_arg_helper(arg: i64) {

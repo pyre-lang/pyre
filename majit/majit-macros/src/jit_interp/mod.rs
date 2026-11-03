@@ -416,8 +416,9 @@ pub enum StateFieldKind {
     /// (e.g. polymorphic `Storage`). Pair with `opaque(Type)` raw-pointer
     /// handles passed via additional `int` scalars when the JIT needs to
     /// touch the underlying memory through `jit_promote!` + raw-load IR.
-    #[allow(dead_code)]
-    Opaque(syn::Path),
+    /// The declared type path is parsed and dropped; the field keeps the type
+    /// written on the struct.
+    Opaque,
     /// Ref-typed scalar (e.g., `sel: ref(Stack)`) — a genuine `InputArgRef`
     /// threaded through the ref register bank (`registers_r`) rather than the
     /// int bank.  Storage on the state struct is a `usize` carrier (raw
@@ -426,7 +427,6 @@ pub enum StateFieldKind {
     /// optimizer heap-cache `getfield_gc` off it (a stable ref box), unlike
     /// the cosmetic `input_arg_ref` virt-array pointer which flows through the
     /// int bank.
-    #[allow(dead_code)]
     Ref(syn::Path),
     /// RPython `str` red (`rstr.STR`). One ref inputarg, same bank as
     /// `ref(T)`. `ll_strlen` / `ll_strgetitem` on it record `Strlen` /
@@ -1481,8 +1481,8 @@ fn parse_state_fields(input: ParseStream) -> syn::Result<StateFieldsConfig> {
             } else if head == "opaque" {
                 let inner;
                 syn::parenthesized!(inner in content);
-                let type_path: syn::Path = inner.parse()?;
-                StateFieldKind::Opaque(type_path)
+                let _type_path: syn::Path = inner.parse()?;
+                StateFieldKind::Opaque
             } else if head == "int" || head == "float" {
                 // RPython parity: optional `int(<TypePath>)` declares the
                 // Rust storage type when it differs from i64. `float(<Path>)`
@@ -1986,7 +1986,7 @@ fn value_kind_from_tag(tag: green_type_tag::GreenTypeTag) -> jitcode_lower::Valu
     use jitcode_lower::ValueKind;
     match tag {
         GreenTypeTag::Int => ValueKind::Int,
-        GreenTypeTag::Ref | GreenTypeTag::Str | GreenTypeTag::Unicode => ValueKind::Ref,
+        GreenTypeTag::Ref => ValueKind::Ref,
         GreenTypeTag::Float => ValueKind::Float,
     }
 }
@@ -3714,62 +3714,6 @@ fn rewrite_body(
                     (__green_bits, majit_ir::GreenType::Ref, majit_ir::GreenSlotRef)
                 }
             },
-            // ABI: the i64 is the address of a `'static` slot holding
-            // a `&'static str`.  `majit_ir::value::default_str_eq` /
-            // `default_str_hash` / `default_unicode_hash` dereference
-            // the i64 as `*const &'static str` and read the fat
-            // pointer (data + len) — RPython's `rstr.STR*` /
-            // `rstr.UNICODE*` carry their length internally; pyre
-            // mirrors that contract by storing the fat pointer at a
-            // stable address rather than the bare data pointer.
-            //
-            // TODO: allocation lifetime divergence
-            // from RPython, intentionally deferred):
-            //
-            //   * RPython: `rstr.STR*` is GC-allocated *once per
-            //     JitCell* and naturally stable for the JitCell's
-            //     lifetime.  `JitCell.greenargs[i]` holds the rstr
-            //     pointer; subsequent merge-point hits for the same
-            //     `(jitdriver, greenkey)` pass the existing pointer
-            //     into `equal_whatever` / `hash_whatever`.  No
-            //     re-allocation, GC frees the rstr when the cell
-            //     dies.
-            //
-            //   * pyre: `&str` has no stable backing-storage address
-            //     by default, so this macro emits a fresh slot via
-            //     `Box::leak` *every merge-point hit* — not once per
-            //     JitCell.  The GreenKey HashMap content-de-dupes via
-            //     `default_str_eq` / `default_str_hash`, so multiple
-            //     slots with the same content collapse to a single
-            //     cache entry, but the slot leaks themselves grow
-            //     unboundedly with merge-point hit count for
-            //     long-running programs.
-            //
-            // A structural fix (per-JitCell owned-string field
-            // instead of leaked slot, e.g. reshaping
-            // `GreenKey::values` from `Vec<i64>` to a typed enum
-            // carrying `Box<str>` for str/unicode greens, with the
-            // macro emitting a temporary the cache promotes on
-            // insertion) is a larger refactor and is
-            // intentionally deferred — a global intern side-table
-            // was rejected as non-orthodox (RPython does not
-            // maintain one).  Functional behavior matches RPython
-            // (content-keyed compare/hash); only the lifetime /
-            // allocation profile differs.
-            Some(GreenTypeTag::Str) => quote! {
-                (
-                    majit_ir::make_str_slot(#spec_expr),
-                    majit_ir::GreenType::Str,
-                    majit_ir::GreenSlotStr,
-                )
-            },
-            Some(GreenTypeTag::Unicode) => quote! {
-                (
-                    majit_ir::make_str_slot(#spec_expr),
-                    majit_ir::GreenType::Unicode,
-                    majit_ir::GreenSlotUnicode,
-                )
-            },
         }
     }
 
@@ -4948,12 +4892,7 @@ mod tests {
         let parsed = syn::parse2::<StateFieldsWrapper>(tokens).unwrap().0;
         assert_eq!(parsed.fields.len(), 3);
         assert_eq!(parsed.fields[0].name.to_string(), "storage");
-        match &parsed.fields[0].kind {
-            StateFieldKind::Opaque(p) => {
-                assert_eq!(p.segments.last().unwrap().ident.to_string(), "Storage");
-            }
-            _ => panic!("expected Opaque variant"),
-        }
+        assert!(matches!(parsed.fields[0].kind, StateFieldKind::Opaque));
         assert!(matches!(
             parsed.fields[1].kind,
             StateFieldKind::Scalar { .. }

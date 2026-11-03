@@ -40,7 +40,7 @@ pub struct QuasiImmut {
 
 /// Host `QuasiImmut` is a `Box::into_raw`'d host allocation, never a GC object.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_QuasiImmut: &str = "raw";
 
 /// The list `quasiimmut.py __init__` sets up, behind the lock that keeps
@@ -159,7 +159,7 @@ pub struct QuasiImmutLock(parking_lot::Mutex<()>);
 
 /// Host `QuasiImmutLock` is a `Box::into_raw`'d host allocation, never a GC object.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_QuasiImmutLock: &str = "raw";
 
 /// Borrowed view over the hidden `mutate_<name>` word pair

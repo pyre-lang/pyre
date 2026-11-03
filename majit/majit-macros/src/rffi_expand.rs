@@ -453,7 +453,7 @@ impl LlexternalInput {
             // the declaration's, the value is still that ECI.
             let info_name = format_ident!("_COMPILATION_INFO_{}", name);
             quote! {
-                #[allow(dead_code, non_upper_case_globals)]
+                #[allow(non_upper_case_globals)]
                 const #info_name: ::majit_rlib::rffi::ExternalCompilationInfo = #eci;
             }
         });
@@ -708,7 +708,7 @@ impl LlexternalInput {
             #[allow(unused_variables)]
             #vis unsafe #abi fn #name #wrapper_generics (#(#wrapper_params),*) -> #result {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #look_name: bool = false;
                 let _ = #save_err;
                 ::majit_rlib::rffi::sandbox_stub_panic(#fnname)
@@ -716,7 +716,7 @@ impl LlexternalInput {
             #[allow(unused_variables, non_snake_case)]
             #vis unsafe fn #call_name(#(#params),*) -> #result {
                 #[doc(hidden)]
-                #[allow(non_upper_case_globals, dead_code)]
+                #[allow(non_upper_case_globals)]
                 const #look_call: bool = false;
                 ::majit_rlib::rffi::sandbox_stub_publish(#fnname);
                 unsafe { ::core::mem::zeroed() }
@@ -771,20 +771,20 @@ impl LlexternalInput {
             quote! { #(#asserts)* }
         };
         quote! {
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #sandbox: bool = #sandbox_v;
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #nowrap: bool = #nowrap_v;
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #conv: &str = #conv_expr;
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #callback: bool = #callback_v;
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #around: bool = {
                 let _ = #conv;
                 #invoke
             };
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #elidable: bool = #elidable_v;
             #effects_marker
             const _: () = assert!(!(#elidable && #effects));
@@ -796,7 +796,7 @@ impl LlexternalInput {
     /// funcptr marker. The marker itself is emitted with the real wrapper.
     fn random_effects_presence_marker(&self, random_effects: bool, effects: &Ident) -> TokenStream {
         quote! {
-            #[allow(dead_code, non_upper_case_globals)]
+            #[allow(non_upper_case_globals)]
             const #effects: bool = #random_effects;
         }
     }
@@ -1113,7 +1113,7 @@ fn close_stack_marker(item: TokenStream) -> syn::Result<TokenStream> {
         #file
         #(#cfg_attrs)*
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         #vis const #marker: bool = true;
     })
 }
@@ -1200,7 +1200,7 @@ fn aroundstate_marker(attr: TokenStream, item: TokenStream) -> syn::Result<Token
         #file
         #(#cfg_attrs)*
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         #vis const #marker: (unsafe extern #abi fn(#(#tys),*) -> #ret, i64) =
             (#funcptr, #save_err);
     })

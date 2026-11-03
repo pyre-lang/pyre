@@ -54,7 +54,7 @@ impl Drop for CellFamily {
 
 /// Host `CellFamily` is a `Box::into_raw`'d host allocation, never a GC object.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_CellFamily: &str = "raw";
 
 impl CellFamily {

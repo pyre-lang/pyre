@@ -2340,7 +2340,7 @@ fn call_settled(
 
 /// The status word a returned scalar carries.  A COM method answers an
 /// `HRESULT` whatever its declared restype would otherwise make of the bytes.
-#[allow(dead_code)]
+#[cfg(windows)]
 fn scalar_int_result(result: &CallValue) -> i32 {
     let mut word = [0u8; 4];
     if let CallValue::Scalar(bytes) = result {

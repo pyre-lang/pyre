@@ -59,19 +59,6 @@ fn sub_jitcode_lower_error(lowerer: &mut Lowerer<'_>) -> SubJitcodeBodyError {
     SubJitcodeBodyError::Degrade(lowerer.take_body_failure_reason())
 }
 
-#[allow(dead_code)]
-pub fn try_generate_jitcode_body(body: &Expr) -> Option<TokenStream> {
-    try_generate_jitcode_body_inner(body, None).map(|p| p.body)
-}
-
-#[allow(dead_code)]
-pub fn try_generate_jitcode_body_with_config(
-    config: &LowererConfig,
-    body: &Expr,
-) -> Option<TokenStream> {
-    try_generate_jitcode_body_inner(body, Some(config)).map(|p| p.body)
-}
-
 /// Per-caller-local layout descriptor produced by
 /// [`try_generate_jitcode_body_parts_with_caller_bindings`].
 ///
@@ -86,7 +73,6 @@ pub fn try_generate_jitcode_body_with_config(
 #[allow(private_interfaces)]
 #[derive(Clone, Debug)]
 pub(crate) struct CallerLocalLayout {
-    #[allow(dead_code)]
     pub name: String,
     pub parent_reg: u16,
     pub callee_reg: u16,
@@ -741,43 +727,6 @@ pub(crate) fn inline_helper_param_counts(func: &ItemFn) -> syn::Result<(u16, u16
         }
     }
     Ok((count_i, count_r, count_f))
-}
-
-fn try_generate_jitcode_body_inner(
-    body: &Expr,
-    config: Option<&LowererConfig>,
-) -> Option<GeneratedJitCodeBody> {
-    let stmts = extract_stmts(body);
-    if stmts.is_empty() {
-        return None;
-    }
-
-    let mut lowerer = Lowerer::new(config);
-    for stmt in &stmts {
-        lowerer.lower_stmt(stmt)?;
-    }
-
-    // RPython `compute_liveness(ssarepr) → remove_repeated_live(ssarepr)
-    // → assemble()` (codewriter.py call order). `annotate_live_markers_
-    // with_liveness` materialises the per-marker fixed-point alive set
-    // onto each `LiveMarker.reads` so the repeated-live pass and the
-    // emit-time triple rewrite both consume the same ssarepr-mutated
-    // shape `liveness.py` produces.
-    annotate_live_markers_with_liveness(&mut lowerer.op_metadata);
-    remove_repeated_live(&mut lowerer.op_metadata, &mut lowerer.statements);
-    rewrite_live_marker_statements_with_triples(&lowerer.op_metadata, &mut lowerer.statements);
-    maybe_dump_liveness("jitcode_body", &lowerer.op_metadata);
-    let liveness_prebuild =
-        liveness_prebuild_tokens(&lowerer.op_metadata, &lowerer.inline_liveness_prebuild);
-    let statements = lowerer.statements;
-    Some(GeneratedJitCodeBody {
-        body: quote! {
-            #(#statements)*
-        },
-        liveness_prebuild,
-        green_schema: Vec::new(),
-        red_schema: Vec::new(),
-    })
 }
 
 /// A.3.6.1 (`jtransform.py` `promote_greens`): bind body-local `let` stmts that

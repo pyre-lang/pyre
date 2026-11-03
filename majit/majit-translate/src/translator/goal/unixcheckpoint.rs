@@ -85,35 +85,24 @@ pub fn restartable_point_nofork(auto: Option<&str>) -> Result<(), TaskError> {
 
 #[cfg(unix)]
 type Pid = libc::pid_t;
-#[cfg(not(unix))]
+#[cfg(all(not(unix), test))]
 type Pid = i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForkResult {
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "fork parent result is only constructed on Unix")
-    )]
+    #[cfg(any(unix, test))]
     Parent(Pid),
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "fork child result is only constructed on Unix")
-    )]
+    #[cfg(any(unix, test))]
     Child,
     NotSupported,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitStatus {
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "wait exit status is only constructed on Unix")
-    )]
+    #[cfg(any(unix, test))]
     Exited(i32),
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "wait signal status is only constructed on Unix")
-    )]
+    #[cfg(unix)]
     Signaled(i32),
     Other(i32),
 }
@@ -121,20 +110,16 @@ enum WaitStatus {
 trait CheckpointRuntime {
     fn restart_process(&self) -> Result<(), TaskError>;
     fn fork(&self) -> Result<ForkResult, TaskError>;
+    #[cfg(any(unix, test))]
     fn waitpid(&self, pid: Pid) -> Result<WaitStatus, WaitError>;
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitError {
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "EINTR wait retry is only constructed on Unix")
-    )]
+    #[cfg(any(unix, test))]
     Interrupted,
-    #[cfg_attr(
-        not(unix),
-        allow(dead_code, reason = "wait errno is only constructed on Unix")
-    )]
+    #[cfg(unix)]
     Other(i32),
 }
 
@@ -172,6 +157,7 @@ impl CheckpointRuntime for RealRuntime {
         }
     }
 
+    #[cfg(any(unix, test))]
     fn waitpid(&self, pid: Pid) -> Result<WaitStatus, WaitError> {
         #[cfg(unix)]
         {
@@ -208,6 +194,7 @@ impl CheckpointRuntime for NoForkRuntime<'_> {
         Ok(ForkResult::NotSupported)
     }
 
+    #[cfg(any(unix, test))]
     fn waitpid(&self, _pid: Pid) -> Result<WaitStatus, WaitError> {
         Ok(WaitStatus::Other(0))
     }
@@ -285,12 +272,14 @@ fn restartable_point_fork_with<R: BufRead, W: Write, P: CheckpointRuntime>(
         match runtime.fork()? {
             // Upstream `:39-41`: no `os.fork` attribute means return.
             ForkResult::NotSupported => return Ok(()),
+            #[cfg(any(unix, test))]
             ForkResult::Parent(pid) => {
                 // Upstream `:43-50`: parent waits, ignoring Ctrl-C.
                 let status = loop {
                     match runtime.waitpid(pid) {
                         Ok(status) => break status,
                         Err(WaitError::Interrupted) => continue,
+                        #[cfg(unix)]
                         Err(WaitError::Other(code)) => {
                             return Err(TaskError {
                                 message: format!(
@@ -307,6 +296,7 @@ fn restartable_point_fork_with<R: BufRead, W: Write, P: CheckpointRuntime>(
                     WaitStatus::Exited(code) => {
                         writeln_task(output, &format!("Child {pid} exited (exit code {code})"))?;
                     }
+                    #[cfg(unix)]
                     WaitStatus::Signaled(signal) => {
                         writeln_task(
                             output,
@@ -322,6 +312,7 @@ fn restartable_point_fork_with<R: BufRead, W: Write, P: CheckpointRuntime>(
                 }
                 continue;
             }
+            #[cfg(any(unix, test))]
             ForkResult::Child => {
                 // Upstream `:68-69`: in child, print line and return to caller.
                 writeln_task(output, &"_".repeat(78))?;
@@ -385,13 +376,7 @@ fn restart_process_real() -> Result<(), TaskError> {
     })
 }
 
-#[cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "OS-error formatting is only used by Unix syscalls"
-    )
-)]
+#[cfg(unix)]
 fn last_os_task_error(context: &str) -> TaskError {
     TaskError {
         message: format!("{context} failed: {}", io::Error::last_os_error()),

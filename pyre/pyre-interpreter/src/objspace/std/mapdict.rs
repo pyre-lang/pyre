@@ -4599,22 +4599,6 @@ pub unsafe fn plain_direct_write<O: MapdictObject>(
     }
 }
 
-/// mapdict.py `Terminator._read_terminator` and its
-/// `DevolvedDictTerminator` override (mapdict.py). Returns the value or
-/// `None` when the attribute is absent.
-///
-/// # Safety
-/// `term` must point to a live Terminator map node.
-#[allow(dead_code)]
-unsafe fn terminator_read<O: MapdictObject>(
-    term: MapRef,
-    obj: &O,
-    name: &Wtf8,
-    attrkind: u16,
-) -> Option<PyObjectRef> {
-    unsafe { terminator_read_checked(term, obj, name, attrkind) }.unwrap_or(None)
-}
-
 /// Fallible [`terminator_read`].  The devolved arm is the only one that can
 /// raise, and `space.finditem_str` propagates there upstream; the swallowing
 /// spelling above exists for the callers that have no error channel and is

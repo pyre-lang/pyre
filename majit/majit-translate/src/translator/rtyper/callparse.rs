@@ -878,7 +878,6 @@ fn call_shape_from_const(cv: &ConstValue) -> Result<CallShape, TyperError> {
 // Suppress unused warning for the lltype helper used by future
 // resulttype-typed inputconst paths (e.g. callparse callers that pass
 // `Void` directly rather than a Repr).
-#[allow(dead_code)]
 fn _force_use_inputconst_from_lltype() {
     let _ = inputconst_from_lltype;
 }

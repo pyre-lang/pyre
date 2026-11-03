@@ -389,38 +389,6 @@ pub fn trait_ref_kind(llbc: &majit_charon_reader::Llbc, tref: &serde_json::Value
     }
 }
 
-/// The first `trait_decl_ref.id` anywhere under `v`.
-///
-/// Both spellings of a virtual call carry the trait the same way — the
-/// `CallKind::Trait` payload and the fat pointer's `DynTrait` type — just at
-/// different depths, so one search answers for both.
-#[allow(dead_code)]
-fn first_trait_id(v: &serde_json::Value) -> Option<u64> {
-    if let Some(map) = v.as_object() {
-        if let Some(r) = map.get("trait_decl_ref")
-            && let Some(id) = r
-                .get("skip_binder")
-                .unwrap_or(r)
-                .get("id")
-                .and_then(|x| x.as_u64())
-        {
-            return Some(id);
-        }
-        for sub in map.values() {
-            if let Some(id) = first_trait_id(sub) {
-                return Some(id);
-            }
-        }
-    } else if let Some(arr) = v.as_array() {
-        for sub in arr {
-            if let Some(id) = first_trait_id(sub) {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 /// The dispatch entry points application-level Python is reached through.
 ///
 /// Matched on the trailing path segments so a crate rename cannot silently
@@ -443,7 +411,6 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     // methods, so the `impl` block sits in the path as an opaque segment and
     // the bare `pyframe::execute_frame` spelling can never match.
     "eval::eval_frame_plain",
-    "eval::eval_frame_plain_with_operr",
     "eval::eval_frame_plain_with_resume",
     "eval::eval_loop",
     "pyframe::<Impl>::execute_frame",

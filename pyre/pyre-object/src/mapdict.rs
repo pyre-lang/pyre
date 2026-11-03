@@ -328,7 +328,7 @@ pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAtt
 /// Map nodes are `lltype::malloc_raw` allocations that are never freed,
 /// never GC objects.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_MapNode: &str = "raw";
 
 /// mapdict.py `AbstractAttribute` plus its two concrete subclasses.
@@ -606,10 +606,10 @@ struct MapNodeTerminatorView {
 
 /// Both overlays view a raw [`MapNode`], so they share its flavor.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_MapNodeAbstractAttribute: &str = "raw";
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_MapNodeTerminatorView: &str = "raw";
 
 const _: () = {

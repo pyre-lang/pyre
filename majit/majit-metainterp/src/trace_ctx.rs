@@ -3218,7 +3218,7 @@ impl TraceCtx {
     ///
     /// Panics when a constant OpRef is not inline-resolvable — that is a
     /// genuine invariant break.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn opref_to_box(&self, opref: OpRef) -> OcBox {
         if opref.is_constant() {
             let value = opref.inline_const_to_value().unwrap_or_else(|| {
@@ -6188,7 +6188,6 @@ impl TraceCtx {
     /// `patch_new_loop_to_load_virtualizable_fields`. Covered by
     /// `emit_vable_field_reads_emits_compile_py_shape` so the helper
     /// stays honest until the call-site flip lands.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn emit_vable_field_reads(
         &mut self,
         vable: OpRef,
@@ -8486,9 +8485,6 @@ mod tests {
             }
         }
     }
-
-    #[allow(dead_code)]
-    extern "C" fn dummy_call_target() {}
 
     /// Test-side `self.metainterp.cpu` analog: implements the cache-hit
     /// load surface (`bh_getfield_gc_i/r/f`) plus the non-default

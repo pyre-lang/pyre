@@ -420,7 +420,6 @@ pub struct UnrollOptimizer {
     /// `next_global_opref` holds the smallest OpRef Phase 2 may emit; it
     /// is the `start_fresh` argument the next `TraceIterator::new` call
     /// (or bridge entry) should use. Initialized to 0.
-    #[allow(dead_code)]
     pub(crate) next_global_opref: u32,
     /// RPython metainterp_sd.callinfocollection parity.
     /// Maps oopspec indices to (calldescr, func_ptr) for generate_modified_call.
@@ -5049,7 +5048,7 @@ pub(crate) fn export_state(
 }
 
 /// unroll.py import_state — module-level entry point.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn import_state(
     targetargs: &[OpRef],
     exported_state: &ExportedState,
@@ -5059,7 +5058,7 @@ pub(crate) fn import_state(
     OptUnroll::new().import_state(targetargs, exported_state, optimizer, ctx)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn import_short_preamble_state(
     targetargs: &[OpRef],
     label_args: &[OpRef],

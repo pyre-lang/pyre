@@ -5180,7 +5180,6 @@ impl JitCodeBuilder {
     /// `JitCallTarget` at `descrs[fn_ptr_idx]`, materialises
     /// `concrete_ptr` in the int constants pool, and derives a typed
     /// `BhCallDescr` from arg kinds + `result_type` + `effect_info`.
-    #[allow(dead_code)]
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython metainterpreter routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and frame ownership"
@@ -5225,7 +5224,6 @@ impl JitCodeBuilder {
     /// `bhimpl_residual_call_{r,ir,irf}_i` (`blackhole.py bhimpl_residual_call_r_i`)
     /// dispatches via `cpu.bh_call_i` and writes the result into
     /// `bh.registers_i[dst]`.
-    #[allow(dead_code)]
     pub fn residual_call_int_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5241,7 +5239,6 @@ impl JitCodeBuilder {
         );
     }
 
-    #[allow(dead_code)]
     pub fn residual_call_int_canonical_via_target_with_effect_info(
         &mut self,
         fn_ptr_idx: u16,
@@ -5267,7 +5264,6 @@ impl JitCodeBuilder {
 
     /// ref-result sibling.  `bhimpl_residual_call_{r,ir,irf}_r`
     /// (`blackhole.py bhimpl_residual_call_r_r`) dispatches via `cpu.bh_call_r`.
-    #[allow(dead_code)]
     pub fn residual_call_ref_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5283,7 +5279,6 @@ impl JitCodeBuilder {
         );
     }
 
-    #[allow(dead_code)]
     pub fn residual_call_ref_canonical_via_target_with_effect_info(
         &mut self,
         fn_ptr_idx: u16,
@@ -5379,7 +5374,6 @@ impl JitCodeBuilder {
     /// `resoperation.py call_release_gil_for_descr` ("no such thing" `R_F` / `IR_F`)
     /// and goes through `Self::emit_canonical_call_typed_irf_f` so
     /// the F list count byte is always present.
-    #[allow(dead_code)]
     pub fn residual_call_float_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5395,7 +5389,6 @@ impl JitCodeBuilder {
         );
     }
 
-    #[allow(dead_code)]
     pub fn residual_call_float_canonical_via_target_with_effect_info(
         &mut self,
         fn_ptr_idx: u16,
@@ -5450,7 +5443,6 @@ impl JitCodeBuilder {
 
     /// Emit a canonical `residual_call_*_i` whose calldescr carries
     /// `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
-    #[allow(dead_code)]
     pub fn call_may_force_int_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5468,7 +5460,6 @@ impl JitCodeBuilder {
     /// Emit a canonical `residual_call_*_i` whose calldescr carries
     /// `EF_LOOPINVARIANT`.  RPython `codewriter/call.py:249-251
     /// getcalldescr` rejects loop-invariant calls with non-void args.
-    #[allow(dead_code)]
     pub fn call_loopinvariant_int_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5491,7 +5482,6 @@ impl JitCodeBuilder {
     }
 
     /// Ref-result sibling of [`Self::call_may_force_int_canonical_via_target`].
-    #[allow(dead_code)]
     pub fn call_may_force_ref_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5507,7 +5497,6 @@ impl JitCodeBuilder {
     }
 
     /// Ref-result sibling of [`Self::call_loopinvariant_int_canonical_via_target`].
-    #[allow(dead_code)]
     pub fn call_loopinvariant_ref_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5530,7 +5519,6 @@ impl JitCodeBuilder {
     }
 
     /// Float-result sibling of [`Self::call_may_force_int_canonical_via_target`].
-    #[allow(dead_code)]
     pub fn call_may_force_float_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5546,7 +5534,6 @@ impl JitCodeBuilder {
     }
 
     /// Float-result sibling of [`Self::call_loopinvariant_int_canonical_via_target`].
-    #[allow(dead_code)]
     pub fn call_loopinvariant_float_canonical_via_target(
         &mut self,
         fn_ptr_idx: u16,
@@ -5571,7 +5558,6 @@ impl JitCodeBuilder {
     /// low-level int-result direct entry — sibling of
     /// [`Self::residual_call_void_canonical_typed_args`].  Skips the
     /// `JitCallTarget` resolution and bakes `funcptr` as the `i` operand.
-    #[allow(dead_code)]
     pub fn residual_call_int_canonical_typed_args(
         &mut self,
         funcptr: i64,
@@ -5593,7 +5579,6 @@ impl JitCodeBuilder {
         );
     }
 
-    #[allow(dead_code)]
     pub fn residual_call_ref_canonical_typed_args(
         &mut self,
         funcptr: i64,
@@ -5615,7 +5600,6 @@ impl JitCodeBuilder {
         );
     }
 
-    #[allow(dead_code)]
     pub fn residual_call_float_canonical_typed_args(
         &mut self,
         funcptr: i64,

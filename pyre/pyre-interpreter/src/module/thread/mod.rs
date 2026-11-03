@@ -2112,11 +2112,6 @@ fn new_lock(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(W_Lock::allocate_stable(W_Lock::default()))
 }
 
-#[allow(dead_code)]
-fn new_handle(_: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Ok(W_ThreadHandle::allocate_stable(W_ThreadHandle::default()))
-}
-
 fn make_thread_handle(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let ident = unsafe { w_int_get_value(args[0]) };
     let obj = W_ThreadHandle::allocate_stable(W_ThreadHandle::default());

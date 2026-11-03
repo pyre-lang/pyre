@@ -2596,7 +2596,7 @@ pub trait ActionFlagOps {
     /// `dyn ActionFlagOps`.
     fn fire(&mut self, action: *mut dyn AsyncActionOps) {
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         const _jit_look_inside_fire: bool = false;
         if action.is_null() {
             return;
@@ -2672,7 +2672,7 @@ pub trait ActionFlagOps {
         frame: *mut PyFrame,
     ) -> Result<(), crate::PyError> {
         #[doc(hidden)]
-        #[allow(non_upper_case_globals, dead_code)]
+        #[allow(non_upper_case_globals)]
         const _jit_look_inside_action_dispatcher: bool = false;
         // Each `perform` may deliver a signal, which runs the handler at
         // app level; the next action in the loop is handed the same frame.

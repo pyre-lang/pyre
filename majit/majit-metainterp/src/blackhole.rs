@@ -1356,61 +1356,6 @@ impl BlackholeInterpreter {
         self.next_u8()
     }
 
-    fn peek_u16_at(&self, pos: usize) -> Option<u16> {
-        let code = &self.jitcode.code;
-        if pos + 1 >= code.len() {
-            return None;
-        }
-        Some((code[pos] as u16) | ((code[pos + 1] as u16) << 8))
-    }
-
-    fn runtime_bh_descr(&self, descr_idx: usize) -> Option<&BhDescr> {
-        if let Some(entry) = self.jitcode.exec.descrs.get(descr_idx) {
-            return entry.as_bh_descr();
-        }
-        self.descrs.get(descr_idx)
-    }
-
-    /// Read the static-field index from a canonical `VableField` descr
-    /// pool entry at `pos`. Panics if the bytes do not point at a
-    /// `BhDescr::VableField` — Stage 3c-3 collapses the dual-mode
-    /// auto-detect, so callers must already be on the canonical layout
-    /// (`assembler.py:165-167` + `:197-207`).
-    #[allow(dead_code)]
-    fn vable_field_index_at(&self, pos: usize) -> usize {
-        let idx = self
-            .peek_u16_at(pos)
-            .expect("vable_field_index_at: descr operand out of bounds");
-        match self.runtime_bh_descr(idx as usize) {
-            Some(BhDescr::VableField { index }) => *index,
-            other => {
-                panic!("vable_field_index_at: expected VableField at descr {idx}, got {other:?}")
-            }
-        }
-    }
-
-    /// Read the array-field index from a canonical
-    /// (`VableArray`, `Array`) descr pool pair at `field_pos` /
-    /// `array_pos`. Panics if either entry is missing or the wrong
-    /// variant — see [`Self::vable_field_index_at`].
-    #[allow(dead_code)]
-    fn vable_array_index_pair_at(&self, field_pos: usize, array_pos: usize) -> usize {
-        let field_idx = self
-            .peek_u16_at(field_pos)
-            .expect("vable_array_index_pair_at: field descr out of bounds");
-        let array_idx = self
-            .peek_u16_at(array_pos)
-            .expect("vable_array_index_pair_at: array descr out of bounds");
-        let field_descr = self.runtime_bh_descr(field_idx as usize);
-        let array_descr = self.runtime_bh_descr(array_idx as usize);
-        match (field_descr, array_descr) {
-            (Some(BhDescr::VableArray { index }), Some(BhDescr::Array { .. })) => *index,
-            other => panic!(
-                "vable_array_index_pair_at: expected (VableArray, Array) at descrs ({field_idx}, {array_idx}), got {other:?}"
-            ),
-        }
-    }
-
     /// blackhole.py _get_list_of_values parity.
     ///
     /// Decodes a bytecode-encoded register list: [length:u8][indices:u8...].
@@ -1816,14 +1761,6 @@ impl BlackholeInterpreter {
     }
 
     // -- Call argument reading --
-
-    fn read_call_arg(&self, kind: JitArgKind, reg: u16) -> i64 {
-        match kind {
-            JitArgKind::Int => self.registers_i[reg as usize],
-            JitArgKind::Ref => self.registers_r[reg as usize],
-            JitArgKind::Float => self.registers_f[reg as usize],
-        }
-    }
 
     /// Whether `run` must walk the caller chain to install register /
     /// virtualizable roots. False when every frame is already registered
@@ -2358,36 +2295,6 @@ impl BlackholeInterpreter {
                 Err(err)
             }
         }
-    }
-
-    /// Read call arguments from bytecode (kind:u8, reg:u8 per arg).
-    #[allow(dead_code)]
-    fn read_call_args(&mut self, num_args: usize) -> Vec<i64> {
-        let mut args = Vec::with_capacity(num_args);
-        let mut metas: Vec<(u8, u8)> = Vec::with_capacity(num_args);
-        for _ in 0..num_args {
-            let kind_byte = self.next_u8();
-            let kind = JitArgKind::decode(kind_byte);
-            let reg = self.next_reg();
-            metas.push((kind_byte, reg));
-            args.push(self.read_call_arg(kind, reg as u16));
-        }
-        if crate::majit_log_enabled() {
-            // Heuristic: for Ref args, peek intval at +0x10 (W_IntObject layout).
-            let mut intvals: Vec<Option<i64>> = Vec::with_capacity(args.len());
-            for ((kind_byte, _reg), val) in metas.iter().zip(args.iter()) {
-                if *kind_byte == 1 && *val != 0 {
-                    intvals.push(Some(unsafe { *((*val as usize + 0x10) as *const i64) }));
-                } else {
-                    intvals.push(None);
-                }
-            }
-            eprintln!(
-                "[bh] read_call_args pos={} num={} kinds_regs={:?} vals={:?} maybe_intvals={:?}",
-                self.last_opcode_position, num_args, metas, args, intvals
-            );
-        }
-        args
     }
 }
 

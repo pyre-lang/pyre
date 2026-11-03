@@ -6362,7 +6362,8 @@ impl Optimizer {
     /// `virtualizable_boxes` is `None` while the driver's `vinfo` is `Some`
     /// still slips past here and is caught only by the reader's
     /// `assert!(vable_size > 0)` in `resume.rs::consume_vable_info`.
-    #[allow(dead_code)] // optimizeopt/__init__.py build_opt_chain virtualizable
+    // optimizeopt/__init__.py build_opt_chain virtualizable
+    #[cfg(test)]
     pub(crate) fn default_pipeline_with_virtualizable(config: VirtualizableConfig) -> Self {
         Self::build_opt_chain(&default_enable_opt_names(), Some(config))
     }
@@ -6495,38 +6496,6 @@ mod tests {
         seed_guard_snapshots_with_oprc(ops, |_| Vec::new())
     }
 
-    /// A trivial pass that removes INT_ADD(x, 0) -> x
-    #[allow(dead_code)]
-    struct AddZeroElimination;
-
-    impl Optimization for AddZeroElimination {
-        fn propagate_forward(
-            &self,
-            op: &Op,
-            _op_rc: &majit_ir::OpRc,
-            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
-            ctx: &mut OptContext,
-        ) -> OptimizationResult {
-            if op.opcode == OpCode::IntAdd {
-                // Check if second arg is constant 0
-                if let Some(0) = ctx.get_constant_int_box(&op.arg(1).get_box_replacement(false)) {
-                    // Replace with first arg
-                    let old = op.pos().get();
-                    let new = op.arg(0).to_opref();
-                    let b_old = ctx.materialize_operand_at(old);
-                    let b_new = ctx.materialize_operand_at(new);
-                    ctx.make_equal_to(&b_old, &b_new);
-                    return OptimizationResult::Remove;
-                }
-            }
-            OptimizationResult::PassOn
-        }
-
-        fn name(&self) -> &'static str {
-            "add_zero_elim"
-        }
-    }
-
     struct AddVirtualInputsOnce {
         added: Cell<bool>,
     }
@@ -6598,33 +6567,6 @@ mod tests {
 
         fn name(&self) -> &'static str {
             "flush_counter"
-        }
-    }
-
-    #[allow(dead_code)]
-    struct RemoveAsTypedConstant {
-        target: OpRef,
-        value: majit_ir::Value,
-    }
-
-    impl Optimization for RemoveAsTypedConstant {
-        fn propagate_forward(
-            &self,
-            op: &Op,
-            _op_rc: &majit_ir::OpRc,
-            _opt: &mut Option<&mut crate::optimizeopt::optimizer::Optimizer>,
-            ctx: &mut OptContext,
-        ) -> OptimizationResult {
-            if op.pos().get() == self.target {
-                let b = ctx.materialize_operand_at(op.pos().get());
-                ctx.make_constant_box(&b, self.value);
-                return OptimizationResult::Remove;
-            }
-            OptimizationResult::PassOn
-        }
-
-        fn name(&self) -> &'static str {
-            "remove_as_typed_constant"
         }
     }
 

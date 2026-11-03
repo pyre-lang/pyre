@@ -217,7 +217,7 @@ pub(crate) fn probe_subscr_enabled() -> bool {
 }
 
 /// Auto-generated trace functions from majit-translate.
-#[allow(dead_code, unsafe_op_in_unsafe_fn, unused_imports, unused_variables)]
+#[allow(unsafe_op_in_unsafe_fn, unused_imports, unused_variables)]
 pub mod generated {
     use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
     include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));
@@ -225,7 +225,7 @@ pub mod generated {
 
 // Re-export top-level auto-generated functions for crate-level access.
 // Keep generated-code lint allowances scoped to this include wrapper.
-#[allow(dead_code, unsafe_op_in_unsafe_fn, unused_variables)]
+#[allow(unsafe_op_in_unsafe_fn, unused_variables)]
 mod generated_root {
     use pyre_interpreter::bytecode::{BinaryOperator, ComparisonOperator};
     include!(concat!(env!("OUT_DIR"), "/jit_trace_gen.rs"));

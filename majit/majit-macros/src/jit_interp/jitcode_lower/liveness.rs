@@ -6,7 +6,6 @@ use super::*;
 /// RPython `liveness.py`'s `set()` of `Register` objects — bank info
 /// rides on `Register.kind` and the encoder splits at emit time per
 /// `assembler.py get_liveness_info(args, kind)`.
-#[allow(dead_code)]
 type LiveMarkerLiveSets = Vec<BTreeSet<Register>>;
 /// Compute the live register set captured at every `LiveMarker` op in
 /// `op_metadata`, mirroring RPython
@@ -22,7 +21,6 @@ type LiveMarkerLiveSets = Vec<BTreeSet<Register>>;
 /// Returned `Vec<BTreeSet<Register>>` is indexed in `LiveMarker`
 /// encounter order, so callers can pair entries with their
 /// `live_placeholder()` emit sites.
-#[allow(dead_code)]
 pub(super) fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerLiveSets {
     let marker_indices: Vec<usize> = op_metadata
         .iter()
@@ -164,7 +162,6 @@ pub(super) fn compute_per_marker_liveness(op_metadata: &[OpMeta]) -> LiveMarkerL
 /// `BTreeSet<Register>` already iterates in `(kind, index)` order due
 /// to `Register`'s derived `Ord`, so the resulting `Vec<u8>` is sorted
 /// — matching `assembler.py:148 live = sorted(live)`.
-#[allow(dead_code)]
 pub(super) fn get_liveness_info(set: &BTreeSet<Register>, kind: BindingKind) -> Vec<u8> {
     set.iter()
         .filter(|r| r.kind == kind)
@@ -176,7 +173,6 @@ pub(super) fn get_liveness_info(set: &BTreeSet<Register>, kind: BindingKind) -> 
 /// from `set`. Used by `maybe_dump_liveness` and by the BC_LIVE
 /// per-marker patcher (`live_placeholder_with_triple` consumers added
 /// at emit time).
-#[allow(dead_code)]
 pub(super) fn liveness_triple(set: &BTreeSet<Register>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (
         get_liveness_info(set, BindingKind::Int),
@@ -190,7 +186,6 @@ pub(super) fn liveness_triple(set: &BTreeSet<Register>) -> (Vec<u8>, Vec<u8>, Ve
 /// Mirrors RPython `assembler.py get_liveness_info(args, kind)`
 /// applied to the marker's args directly, which by then are the full
 /// alive set per `liveness.py:52`.
-#[allow(dead_code)]
 pub(super) fn liveness_triple_from_reads(reads: &[Register]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut live_i = Vec::new();
     let mut live_r = Vec::new();
@@ -292,7 +287,6 @@ pub(super) fn liveness_prebuild_tokens(
 ///
 /// `op_metadata` and `statements` must stay index-aligned; both vectors
 /// are mutated in lockstep.
-#[allow(dead_code)]
 pub(super) fn remove_repeated_live(
     op_metadata: &mut Vec<OpMeta>,
     statements: &mut Vec<TokenStream>,

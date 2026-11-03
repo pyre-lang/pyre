@@ -24,16 +24,6 @@ const OP_END: u8 = 2;
 
 pub type Bytecode = [u8];
 
-#[allow(dead_code)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 #[majit_macros::jit_interp(
     state = DispatchTestState,
     env = Bytecode,
@@ -169,6 +159,9 @@ mod literal_for_unroll {
 
     const OP_UNROLL: u8 = 3;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct LiteralForState {
         acc: i64,
     }
@@ -234,6 +227,9 @@ mod float_state_field_shape {
 
     const OP_TOUCH_F: u8 = 9;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct FloatDispatchState {
         f: f64,
     }
@@ -288,6 +284,9 @@ mod or_pattern {
     use majit_metainterp::jitcode::insns::BC_STORE_STATE_FIELD;
     use majit_metainterp::{Assembler, BC_GOTO, JitDriver};
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct OrDispatchState {
         a: i64,
     }
@@ -523,11 +522,14 @@ mod pre_promote {
 
     use majit_metainterp::{Assembler, JitDriver};
 
+    type Bytecode = [u8];
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct PromoteState {
         stackpos: i64,
     }
-
-    type Bytecode = [u8];
 
     #[majit_macros::jit_interp(
         state = PromoteState,
@@ -708,11 +710,6 @@ mod oparg_minimal {
 
     use majit_metainterp::{Assembler, JitDriver};
 
-    struct OpargState {
-        last_instr: i64,
-        acc: i64,
-    }
-
     type Bytecode = [u8];
 
     const OP_NOP: u8 = 0;
@@ -748,6 +745,14 @@ mod oparg_minimal {
     /// rather than threading a Ref binding through the dispatch loop.
     #[majit_macros::dont_look_inside]
     fn bytecode_only_trace_helper() {}
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
+    struct OpargState {
+        last_instr: i64,
+        acc: i64,
+    }
 
     #[majit_macros::jit_interp(
         state = OpargState,
@@ -1296,17 +1301,20 @@ mod oparg_extended {
     };
     use majit_metainterp::{Assembler, JitDriver};
 
-    struct OpargExtState {
-        last_instr: i64,
-        acc: i64,
-    }
-
     type Bytecode = [u8];
 
     const OP_NOP: u8 = 0;
     const OP_ADD_I: u8 = 1;
     const EXTENDED_ARG: u8 = 254;
     const HAVE_ARGUMENT: u8 = 90;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
+    struct OpargExtState {
+        last_instr: i64,
+        acc: i64,
+    }
 
     #[majit_macros::jit_interp(
         state = OpargExtState,
@@ -1509,15 +1517,18 @@ mod oparg_with_pc_green {
 
     use majit_metainterp::{Assembler, JitDriver};
 
-    struct PcGreenState {
-        last_instr: i64,
-        acc: i64,
-    }
-
     type Bytecode = [u8];
 
     const OP_NOP: u8 = 0;
     const OP_ADD_I: u8 = 1;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
+    struct PcGreenState {
+        last_instr: i64,
+        acc: i64,
+    }
 
     #[majit_macros::jit_interp(
         state = PcGreenState,
@@ -1758,15 +1769,18 @@ mod oparg_with_pypy_parity_greens {
 
     use majit_metainterp::{Assembler, JitDriver};
 
-    struct ParityState {
-        last_instr: i64,
-        acc: i64,
-    }
-
     type Bytecode = [u8];
 
     const OP_NOP: u8 = 0;
     const OP_ADD_I: u8 = 1;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
+    struct ParityState {
+        last_instr: i64,
+        acc: i64,
+    }
 
     #[majit_macros::jit_interp(
         state = ParityState,
@@ -1904,16 +1918,19 @@ mod oparg_with_body_local_state_le_green {
 
     use majit_metainterp::{Assembler, JitDriver};
 
+    type Bytecode = [u8];
+
+    const OP_NOP: u8 = 0;
+    const OP_ADD_I: u8 = 1;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct LeGreenState {
         f1: i64,
         f2: i64,
         a: i64,
     }
-
-    type Bytecode = [u8];
-
-    const OP_NOP: u8 = 0;
-    const OP_ADD_I: u8 = 1;
 
     #[majit_macros::jit_interp(
         state = LeGreenState,
@@ -2107,10 +2124,8 @@ mod oparg_with_body_local_method_call_green {
             0
         }
 
-        #[expect(
-            dead_code,
-            reason = "shape-test fixture mirrors the interpreter program API"
-        )]
+        // Called only inside the lowered interpreter body, which never runs.
+        #[allow(dead_code)]
         fn len(&self) -> usize {
             self.bytes.len()
         }
@@ -2123,13 +2138,16 @@ mod oparg_with_body_local_method_call_green {
         }
     }
 
+    const OP_NOP: u8 = 0;
+    const OP_ADD_I: u8 = 1;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct MethodCallGreenState {
         f1: i64,
         a: i64,
     }
-
-    const OP_NOP: u8 = 0;
-    const OP_ADD_I: u8 = 1;
 
     #[majit_macros::jit_interp(
         state = MethodCallGreenState,
@@ -2380,16 +2398,19 @@ mod oparg_with_full_4_green_parity {
 
     use majit_metainterp::{Assembler, JitDriver};
 
+    type Bytecode = [u8];
+
+    const OP_NOP: u8 = 0;
+    const OP_ADD_I: u8 = 1;
+
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct FullParityState {
         f1: i64,
         f2: i64,
         sel: i64,
     }
-
-    type Bytecode = [u8];
-
-    const OP_NOP: u8 = 0;
-    const OP_ADD_I: u8 = 1;
 
     #[majit_macros::jit_interp(
         state = FullParityState,
@@ -2537,6 +2558,7 @@ mod residual_call_not_dropped {
     // treats it as a safe module-scope reference; before the fix its unrolled
     // loop body was dropped rather than aborting the arm.
     mod sidefx {
+        // Called only inside the lowered interpreter body, which never runs.
         #[allow(dead_code)]
         pub fn noop() {}
     }
@@ -2544,6 +2566,9 @@ mod residual_call_not_dropped {
     const OP_PURE: u8 = 4;
     const OP_LOOP_CALL: u8 = 5;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct CallState {
         acc: i64,
     }
@@ -2618,6 +2643,9 @@ mod float_compare_branch_gate {
     const OP_INT_BRANCH: u8 = 8;
     const OP_NEGATED_BRANCH: u8 = 9;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct FloatCmpState {
         fa: f64,
         fb: f64,
@@ -2730,6 +2758,9 @@ mod huge_range_for_loop_falls_back {
     const OP_PURE: u8 = 8;
     const OP_HUGE: u8 = 9;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct HugeState {
         acc: i64,
     }
@@ -2805,6 +2836,9 @@ mod degraded_arm_is_named_at_install {
     const OP_FBUMP: u8 = 6;
     const OP_FREM_ASSIGN: u8 = 7;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct DegradedArmState {
         regs: VirtArray<i64>,
         fregs: VirtArray<f64>,

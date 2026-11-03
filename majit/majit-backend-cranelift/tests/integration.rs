@@ -961,22 +961,6 @@ fn test_vec_chained_add_mul_simd() {
 
 // Stress tests: multi-pass optimizer pipeline integration
 
-/// Minimal field descriptor for optimizer-level tests.
-#[derive(Debug)]
-struct TestFieldDescr {
-    idx: u32,
-    immutable: bool,
-}
-
-impl Descr for TestFieldDescr {
-    fn index(&self) -> u32 {
-        self.idx
-    }
-    fn is_always_pure(&self) -> bool {
-        self.immutable
-    }
-}
-
 /// Minimal call descriptor for optimizer-level tests.
 #[derive(Debug)]
 struct TestCallDescr {
@@ -1008,45 +992,6 @@ impl majit_ir::CallDescr for TestCallDescr {
     fn get_extra_info(&self) -> &majit_ir::EffectInfo {
         &self.effect
     }
-}
-
-#[expect(
-    dead_code,
-    reason = "optimizer descriptor fixture helper retained for coverage parity"
-)]
-fn field_descr(idx: u32) -> DescrRef {
-    Arc::new(TestFieldDescr {
-        idx,
-        immutable: false,
-    })
-}
-
-#[expect(
-    dead_code,
-    reason = "optimizer descriptor fixture helper retained for coverage parity"
-)]
-fn immutable_field_descr(idx: u32) -> DescrRef {
-    Arc::new(TestFieldDescr {
-        idx,
-        immutable: true,
-    })
-}
-
-#[expect(
-    dead_code,
-    reason = "optimizer descriptor fixture helper retained for coverage parity"
-)]
-fn call_descr_can_raise(idx: u32) -> DescrRef {
-    Arc::new(TestCallDescr {
-        idx,
-        effect: majit_ir::EffectInfo {
-            extraeffect: majit_ir::ExtraEffect::CanRaise,
-            oopspecindex: majit_ir::OopSpecIndex::None,
-            ..Default::default()
-        },
-        arg_types: vec![Type::Int],
-        result_type: Type::Void,
-    })
 }
 
 /// Assign sequential positions to ops starting at `base`.

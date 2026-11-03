@@ -1721,7 +1721,6 @@ pub(crate) fn fbw_list_journal_push_pop_end(
 
 /// Record an Empty-list first append whose eager execution promoted the list
 /// to a typed strategy, for strategy restore when the walk does not commit.
-#[allow(dead_code)]
 pub(crate) fn fbw_append_promote_journal_push(list: pyre_object::PyObjectRef) {
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow_mut().push(list));
 }

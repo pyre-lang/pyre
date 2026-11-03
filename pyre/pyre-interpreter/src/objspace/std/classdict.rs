@@ -12,17 +12,14 @@ use rustpython_wtf8::Wtf8;
 
 /// `classdict.py ClassDictStrategy`.
 pub struct ClassDictStrategy {
-    #[allow(dead_code)]
-    space: crate::baseobjspace::SpaceHandle,
     /// The holder `W_DictObject.dstrategy` points at. A field of the
     /// fromcache / prebuilt-space instance, not a naked module-static read.
     pub strategy_ref: &'static DictStrategyRef,
 }
 
 impl ClassDictStrategy {
-    pub const fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
+    pub const fn new() -> Self {
         Self {
-            space,
             strategy_ref: &CLASS_DICT_STRATEGY_REF,
         }
     }

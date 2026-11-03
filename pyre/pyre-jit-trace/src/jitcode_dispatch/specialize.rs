@@ -211,74 +211,6 @@ pub(crate) fn try_walker_orthodox_truth<Sym: WalkSym>(
     )
 }
 
-/// The `W_LongObject.value` payload of a concrete long, read the way the folds
-/// that pass a payload to an `rbigint` helper need it.
-///
-/// # Safety
-/// `obj` must be a live concrete `W_LongObject` from the walker shadow.
-#[allow(dead_code)] // longobject.py W_LongObject.value
-unsafe fn long_payload_of(obj: pyre_object::PyObjectRef) -> i64 {
-    unsafe { *((obj as *const u8).add(pyre_object::longobject::LONG_VALUE_OFFSET) as *const i64) }
-}
-
-/// `longobject.py _make_descr_cmp`'s `isinstance(self, W_LongObject)` plus
-/// the `self.num` field read.  Exact `w_class` first implies the LONG
-/// vtable, so `walker_guard_class` then skips the redundant `GuardClass`.
-/// `W_IntObject.intval` sits at the same offset as `W_LongObject.value`.
-#[allow(dead_code)] // longobject.py _make_descr_cmp
-fn walker_guard_long_and_read_payload<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    boxed: OpRef,
-    expected_class: pyre_object::PyObjectRef,
-) -> Result<Option<OpRef>, DispatchError> {
-    let Some(obj) = walker_concrete_ref_object(ctx, boxed) else {
-        return Ok(None);
-    };
-    if !unsafe { pyre_object::is_long(obj) } {
-        return Ok(None);
-    }
-    let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    if pyre_object::tagged_int::CAN_BE_TAGGED
-        && !unsafe { pyre_object::tagged_int::is_tagged_int(obj) }
-    {
-        let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, boxed, false);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
-    }
-    walker_guard_exact_w_class(ctx, op_pc, boxed, expected_class)?;
-    walker_guard_class(ctx, op_pc, boxed, long_type_addr)?;
-    let payload = unsafe { long_payload_of(obj) };
-    let field =
-        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, boxed, crate::descr::long_value_descr());
-    ctx.trace_ctx.set_opref_concrete(
-        field,
-        majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
-    );
-    Ok(Some(field))
-}
-
-/// Record the `getfield_gc_r` that reads a long operand's `value` payload.
-/// A box the same trace built with [`crate::helpers::emit_box_long_inline`]
-/// answers this out of the heap cache, so the read costs nothing and the box
-/// keeps no reason to escape.
-#[allow(dead_code)] // longobject.py getfield of value
-fn walker_read_long_payload<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    boxed: OpRef,
-    concrete_payload: i64,
-) -> OpRef {
-    let payload = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[boxed],
-        crate::descr::long_value_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        payload,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_payload as usize)),
-    );
-    payload
-}
-
 /// rint.py `_ovf_zer` guards for a machine-int division: `int_eq(rhs,0)` →
 /// `guard_false` plus `(lhs==INT_MIN)&(rhs==-1)` → `guard_false`.  Both must
 /// precede the elidable `ll_int_py_div` / `ll_int_py_mod` call so a re-used
@@ -7383,15 +7315,6 @@ const FLOAT_NE_DESCENT: HelperDescent = HelperDescent {
     commit_label: "float_ne_commit",
     call_site_label: "float_ne_call_site",
     decline_tag: "FLOAT-NE-SUBWALK",
-};
-
-/// intobject.py `descr_abs` after `ovfcheck`.
-#[allow(dead_code)]
-const INT_ABS_DESCENT: HelperDescent = HelperDescent {
-    path: "pyre_interpreter::objspace::descroperation::_int_abs",
-    commit_label: "int_abs_commit",
-    call_site_label: "int_abs_call_site",
-    decline_tag: "INT-ABS-SUBWALK",
 };
 
 /// intobject.py `descr_invert`.

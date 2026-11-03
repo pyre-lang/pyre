@@ -52,22 +52,6 @@ const OP_END: u8 = 0;
 
 pub type Bytecode = [u8];
 
-// `BytecodeExt::get_op` is consumed by the macro-emitted `__trace_*` fn
-// (`codegen_trace.rs`'s `generate_trace_fn`, which reproduces the fixture
-// body's `program.get_op(pc)`), but the integration tests
-// below drive only `__dispatch_jitcode_*` / `__prebuild_*`, so the compiler
-// flags the trait as dead code in this binary's reachability graph.
-#[allow(dead_code)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 // Each arm drives a guard with a deliberately-different number of
 // `load_state_field` + `record_binop_i` ops upstream, so the backward
 // walker (`compute_per_marker_liveness`) sees distinct register

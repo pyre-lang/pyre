@@ -42,7 +42,6 @@ use pyre_object::{PY_NULL, PyObjectRef};
 /// `items` as traced locals, so `reds='auto'` names them without a
 /// shadow-stack pin and the drain fusion still sees
 /// `next(shadow_stack_get(root_base))` as the last op of its block.
-#[allow(dead_code)]
 pub struct UnpackSym {
     /// baseobjspace.py jit_merge_point(greenkey=greenkey) green.
     pub greenkey: PyObjectRef,

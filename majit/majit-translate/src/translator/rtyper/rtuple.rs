@@ -217,20 +217,6 @@ fn helper_identity_suffix(
         .join("_")
 }
 
-/// Encodes a tuple of item lltypes into a name suffix used for
-/// helper-graph names whose identity is fully determined by the
-/// lltype (e.g. tuple constructor / `getitem` / `len` helpers, where
-/// no per-Repr override exists). The cross-Repr sites that vary by
-/// helper identity (eq/hash) use [`helper_identity_suffix`] instead.
-#[allow(dead_code)]
-fn lltype_shape_suffix(lltypes: &[LowLevelType]) -> String {
-    lltypes
-        .iter()
-        .map(|t| t.short_name().to_string())
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
 /// RPython `_gen_hash_function_cache` (rtuple.py) +
 /// `gen_hash_function` (rtuple.py).
 ///

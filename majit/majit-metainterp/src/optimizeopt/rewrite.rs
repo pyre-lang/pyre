@@ -2664,53 +2664,6 @@ mod tests {
         }
     }
 
-    /// Run the rewrite pass on a sequence of ops and return the optimized ops.
-    #[allow(dead_code)]
-    fn run_rewrite(specs: &[OpSpec]) -> (Vec<Op>, OptContext) {
-        let ops = build_specs(specs);
-        let mut ctx = OptContext::new(ops.len());
-        let mut passes = test_pass_chain();
-
-        for op in ops.iter() {
-            // Resolve forwarded arguments
-            let mut resolved = (**op).clone();
-            resolve_op_args_in_ctx(&mut resolved, &mut ctx);
-
-            let __pf_rc = OpRc::new(resolved.clone());
-            ctx.bind_input_resops(std::slice::from_ref(&__pf_rc));
-            let mut result = OptimizationResult::PassOn;
-            for pass in passes.iter_mut() {
-                result = pass.propagate_forward(&resolved, &__pf_rc, &mut None, &mut ctx);
-                if !matches!(result, OptimizationResult::PassOn) {
-                    break;
-                }
-            }
-            match result {
-                OptimizationResult::Emit(emitted) => {
-                    ctx.emit(emitted);
-                }
-                OptimizationResult::Replace(replacement)
-                | OptimizationResult::Restart(replacement) => {
-                    ctx.emit(replacement);
-                }
-                OptimizationResult::Remove => {
-                    // removed, nothing emitted
-                }
-                OptimizationResult::PassOn => {
-                    ctx.emit(resolved);
-                }
-                OptimizationResult::InvalidLoop(_) => {
-                    std::panic::panic_any(crate::optimize::InvalidLoop(
-                        "guard proven to always fail",
-                    ));
-                }
-            }
-        }
-
-        let new_ops: Vec<Op> = ctx.new_operations.iter().map(|rc| (**rc).clone()).collect();
-        (new_ops, ctx)
-    }
-
     // ── Binary integer operation tests (consolidated) ──
     // RPython rewrite.py: identity, absorbing, constant-fold rules for all binops.
 

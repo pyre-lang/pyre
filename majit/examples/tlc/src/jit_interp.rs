@@ -53,20 +53,6 @@ pub static LAST_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
 pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
 pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 
-#[expect(
-    dead_code,
-    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
-)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 struct TlcState {
     stackpos: i64,
     stack: VirtArray<i64>,

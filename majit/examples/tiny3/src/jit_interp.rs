@@ -97,20 +97,6 @@ pub static LAST_HAS_JUMP: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 pub static LAST_ALWAYS_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[expect(
-    dead_code,
-    reason = "the jit_interp macro resolves bytecode reads through this trait surface"
-)]
-trait BytecodeExt {
-    fn get_op(&self, pc: usize) -> u8;
-}
-
-impl BytecodeExt for [u8] {
-    fn get_op(&self, pc: usize) -> u8 {
-        self[pc]
-    }
-}
-
 // ── JIT mainloop (integer-only path) ──
 
 #[majit_macros::jit_interp(

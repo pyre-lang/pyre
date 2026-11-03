@@ -4372,7 +4372,8 @@ pub fn specialize_legacy_graph(
 /// `legacy.variable(vid).annotation` directly via
 /// `legacy_annotator::setbinding(&var, ValueType::...)` before calling
 /// this so `seed_variable` has type info to attach.
-#[allow(dead_code)] // flowspace adapter Constant.concretetype / value_to_var
+// flowspace adapter Constant.concretetype / value_to_var
+#[cfg(test)]
 pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,

@@ -147,12 +147,6 @@ impl RegisterBank {
         self.0.as_ref().map_or(0, |slots| slots.len())
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn root(&self) -> RegisterBankRoot {
-        self.root_with(majit_metainterp::FrontendResrefOwner::NONE)
-    }
-
     pub(crate) fn root_with(
         &self,
         owner: majit_metainterp::FrontendResrefOwner,

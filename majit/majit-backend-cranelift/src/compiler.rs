@@ -643,12 +643,6 @@ impl majit_ir::CallDescr for CallAssemblerDescr {
 #[derive(Clone)]
 struct RegisteredLoopTarget {
     trace_id: u64,
-    /// RPython greenkey hash: function identifier for guard lookup.
-    #[expect(
-        dead_code,
-        reason = "registered loop targets retain green-key identity for bridge metadata"
-    )]
-    green_key: u64,
     /// Host-ABI wrapper (`execute_token` / `run_compiled_code`).
     code_ptr: *const u8,
     /// `CallConv::Tail` body. RPython `_ll_function_addr`
@@ -939,15 +933,6 @@ fn var(opref_vars: &IndexMap<u32, Variable>, idx: u32) -> Variable {
         .get(&idx)
         .copied()
         .unwrap_or_else(|| Variable::from_u32(idx))
-}
-
-/// Convert a slice of Values to a Vec of BlockArgs for Cranelift 0.130 branch instructions.
-#[expect(
-    dead_code,
-    reason = "kept as the Cranelift BlockArg adapter while typed branch lowering uses block_args_to"
-)]
-fn block_args(vals: &[CValue]) -> Vec<BlockArg> {
-    vals.iter().copied().map(BlockArg::from).collect()
 }
 
 /// Reinterpret `val` as `want` via `bitcast`, but only when the types
@@ -1938,48 +1923,6 @@ fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_nursery_object(addr))
 }
 
-struct GcRootSlotGuard {
-    slots: Vec<*mut GcRef>,
-    registered: bool,
-}
-
-impl GcRootSlotGuard {
-    #[expect(
-        dead_code,
-        reason = "constructor is paired with GcRootSlotGuard's retained RAII path"
-    )]
-    fn new(slots: Vec<*mut GcRef>) -> Self {
-        if slots.is_empty() {
-            return Self {
-                slots,
-                registered: false,
-            };
-        }
-        let registered = with_cranelift_gc(|gc| {
-            for &slot in &slots {
-                unsafe {
-                    gc.add_root(slot);
-                }
-            }
-        })
-        .is_some();
-        Self { slots, registered }
-    }
-}
-
-impl Drop for GcRootSlotGuard {
-    fn drop(&mut self) {
-        if !self.registered {
-            return;
-        }
-        with_cranelift_gc(|gc| {
-            for &slot in &self.slots {
-                gc.remove_root(slot);
-            }
-        });
-    }
-}
-
 fn write_barrier_if_managed(obj: GcRef) {
     if obj.is_null() {
         return;
@@ -2487,7 +2430,6 @@ fn register_call_assembler_target(
     // `_ll_initial_locs` or `frame_info`.
     let target = RegisteredLoopTarget {
         trace_id: compiled.trace_id,
-        green_key: token.green_key(),
         code_ptr: entry_code,
         body_ptr: entry_body,
         fail_descrs: compiled.fail_descrs.clone(),
@@ -3062,18 +3004,6 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
         .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
     Ok(jf.grab_exc_value())
-}
-
-/// `cpu.get_savedata_ref(deadframe)` for the raw JITFRAME handed to the
-/// CALL_ASSEMBLER guard helper.  `ResumeGuardForcedDescr.handle_fail`
-/// reveals it during the immediately following blackhole resume.
-#[inline]
-#[allow(dead_code)] // cpu.get_savedata_ref
-fn get_savedata_from_jf_ptr(jf_ptr: usize) -> usize {
-    if jf_ptr == 0 {
-        return 0;
-    }
-    unsafe { *((jf_ptr + JF_SAVEDATA_OFS as usize) as *const usize) }
 }
 
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
@@ -6460,7 +6390,8 @@ fn resolve_opref_or_imm(
 /// the physical spill offset. Attached bridges instead load from rd_locs
 /// (`bridge_source_slots`); those addresses must never index fail_arg_refs,
 /// especially after GUARD_NOT_FORCED_2 moves spills past the result slot.
-#[allow(dead_code)] // compile.py ResumeGuardDescr.get_inputargs_and_holes
+// compile.py ResumeGuardDescr.get_inputargs_and_holes
+#[cfg(test)]
 fn bridge_entry_indices(fail_arg_refs: &[OpRef]) -> Vec<usize> {
     fail_arg_refs
         .iter()
@@ -10607,12 +10538,6 @@ struct JitExecResult {
 }
 
 impl JitExecResult {
-    #[expect(
-        dead_code,
-        reason = "documents the JitFrame header layout for direct frame access"
-    )]
-    const HEADER_WORDS: usize = (JF_FRAME_ITEM0_OFS as usize) / 8;
-
     /// Read jf_frame[index] as i64.
     #[inline]
     fn get_jf_int(&self, index: usize) -> i64 {
@@ -11063,7 +10988,6 @@ struct GuardInfo {
     /// the recovery / bridge-entry gcmap must root. Written at collect
     /// time; the 2-arg patched HIT path loads from `rd_locs` instead of
     /// reading this (the old Tail-extra HIT arm did).
-    #[allow(dead_code)]
     fail_arg_types: Vec<Type>,
     /// Absolute address of this exit's out-of-line stub (`generate_quick_failure`).
     /// A bridgeable guard owns a 20-byte trampoline whose `adr_jump_offset`
@@ -11584,19 +11508,6 @@ impl CraneliftBackend {
     /// the same runtime classifier contract.
     pub(crate) fn cpu_handle(&self) -> CpuDescrHandle {
         Arc::clone(&self.descr_attachments)
-    }
-
-    /// llsupport/gc.py GcLLDescr_framework
-    ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-    /// Delegates to the installed `GcAllocator`. RPython resolves the
-    /// typeid through `cpu.gc_ll_descr`; in majit the gc_ll_descr role
-    /// is filled by the active GC runtime registered via set_gc_allocator.
-    #[expect(
-        dead_code,
-        reason = "GC type-id lookup hook is retained for gcremovetypeptr parity"
-    )]
-    fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
-        with_cranelift_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)).flatten()
     }
 
     pub fn with_gc_allocator(gc: Box<dyn GcAllocator>) -> Self {
@@ -23594,11 +23505,6 @@ mod tests {
         VALUES.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    fn may_force_ref_values() -> &'static Mutex<Vec<usize>> {
-        static VALUES: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
-        VALUES.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
     fn may_force_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -23716,33 +23622,6 @@ mod tests {
             values.push(get_int_from_deadframe(&deadframe, 2).unwrap() as u64);
         }
         12.5
-    }
-
-    #[expect(
-        dead_code,
-        reason = "ref-forcing residual-call test fixture retained for parity"
-    )]
-    extern "C" fn maybe_force_and_return_ref(
-        force_token: i64,
-        flag: i64,
-        _runtime_id: i64,
-        return_ref: i64,
-    ) -> i64 {
-        if flag != 0 {
-            let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
-            let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
-            set_savedata_ref_on_deadframe(&mut deadframe, preview_live).unwrap();
-            with_cranelift_gc_required(|gc| gc.collect_nursery());
-            let preview_result = get_ref_from_deadframe(&deadframe, 1).unwrap();
-            let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
-            let preview_return = get_ref_from_deadframe(&deadframe, 3).unwrap();
-            let mut values = may_force_ref_values().lock();
-            values.push(preview_result.0);
-            values.push(preview_live.0);
-            values.push(preview_return.0);
-            return get_ref_from_deadframe(&deadframe, 3).unwrap().0 as i64;
-        }
-        return_ref
     }
 
     /// Register JITFRAME on `gc` and tell the descr its id, which is what a

@@ -148,6 +148,7 @@ fn target_os_is_unix(os: &str) -> bool {
     !matches!(os, "windows" | "unknown" | "none" | "uefi")
 }
 
+#[cfg(test)]
 fn types_contains(c_name: &str) -> bool {
     TYPES.iter().any(|name| *name == c_name)
 }
@@ -265,7 +266,7 @@ struct RffiModule {
     /// `globals()['r_long']` from the first `setup()` (`rffi.py`), taken
     /// before `numbertype_to_rclass[Signed] = int`. A later `setup()` may
     /// republish `r_long` as builtin `int` when `LONG` is `Signed`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     first_r_long: KnownType,
 }
 
@@ -567,6 +568,7 @@ fn register_number_real(number_name: &str, r_name: &'static str) -> (KnownType, 
 /// write just installed, so this cannot re-enter through `RffiGlobal`.
 fn rffi_module_init() -> RffiModule {
     let mut number_types = setup_unforced();
+    #[cfg(test)]
     let first_r_long = published_table_cint("LONG").rclass;
     PLATFORM
         .lock()
@@ -581,6 +583,7 @@ fn rffi_module_init() -> RffiModule {
         int_real,
         r_uint_real: r_uint_real_cls,
         uint_real,
+        #[cfg(test)]
         first_r_long,
     }
 }

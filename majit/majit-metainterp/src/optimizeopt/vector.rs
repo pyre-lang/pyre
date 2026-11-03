@@ -1780,15 +1780,6 @@ impl VectorizingOptimizerState {
         Ok(())
     }
 
-    /// vector.py: schedule — run the scheduler on the given state.
-    #[allow(dead_code)]
-    fn schedule_state(_state: &mut VecScheduleState, _graph: &DependencyGraph) {
-        // vector.py:516: state.prepare() — handled by caller
-        // vector.py:517-518: scheduler.walk_and_emit(state) — scheduling
-        //   is done inline in run_optimization via schedule_operations
-        // vector.py: state.post_schedule() — handled by caller
-    }
-
     /// vector.py: analyse_index_calculations — move guarding
     /// instructions (and all the instructions the guard needs) to the loop
     /// header so guards fail "early" and dependencies relax. Without this

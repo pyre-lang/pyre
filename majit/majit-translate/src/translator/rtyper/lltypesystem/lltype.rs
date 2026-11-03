@@ -3102,28 +3102,6 @@ impl _array {
     }
 }
 
-#[allow(dead_code)]
-fn ptr_from_parent_type(parent_type: &LowLevelType) -> Ptr {
-    match parent_type {
-        LowLevelType::Struct(t) => Ptr {
-            TO: PtrTarget::Struct((**t).clone()),
-        },
-        LowLevelType::Array(t) => Ptr {
-            TO: PtrTarget::Array((**t).clone()),
-        },
-        LowLevelType::FixedSizeArray(t) => Ptr {
-            TO: PtrTarget::FixedSizeArray((**t).clone()),
-        },
-        LowLevelType::Opaque(t) => Ptr {
-            TO: PtrTarget::Opaque((**t).clone()),
-        },
-        LowLevelType::ForwardReference(t) => Ptr {
-            TO: PtrTarget::ForwardReference((**t).clone()),
-        },
-        other => panic!("InteriorPtr parent must be a container type, got {other:?}"),
-    }
-}
-
 /// RPython `_func.__eq__` (`lltype.py`) overrides `_container`'s
 /// identity default with structural comparison on `self.__dict__ ==
 /// other.__dict__`. Two `_func`s from separate `functionptr()` /

@@ -533,7 +533,6 @@ pub enum SpaceCacheClass {
 /// space alive. InternalSpaceCache stores Isolated(Weak); `fromcache`
 /// upgrades only this wrapper so `ObjSpace → cache → ObjSpace` cannot cycle.
 pub struct RetainedSpaceCache<T> {
-    #[allow(dead_code)]
     keep_alive: SpaceHandle,
     inner: std::sync::Arc<T>,
 }
@@ -662,9 +661,7 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
             Self::ClassDictStrategy => {
                 SpaceCacheInstance::ClassDictStrategy(RetainedSpaceCache::stored(
                     space.clone(),
-                    std::sync::Arc::new(crate::objspace::std::classdict::ClassDictStrategy::new(
-                        space.clone(),
-                    )),
+                    std::sync::Arc::new(crate::objspace::std::classdict::ClassDictStrategy::new()),
                 ))
             }
             Self::SysState => SpaceCacheInstance::SysState(RetainedSpaceCache::stored(
@@ -746,9 +743,7 @@ impl ObjSpace {
             base: majit_rlib::cache::Cache::EMPTY,
         },
         sys_state: crate::module::sys::state::SysState::new(),
-        class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(
-            SpaceHandle::ProcessWide,
-        ),
+        class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(),
         gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::ProcessWide),
         type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::ProcessWide),
         w_object: SpaceAttr::new(),
@@ -832,9 +827,7 @@ impl ObjSpace {
         let space = std::sync::Arc::new_cyclic(|space| Self {
             fromcache: InternalSpaceCache::new(SpaceHandle::Isolated(space.clone())),
             sys_state: crate::module::sys::state::SysState::new(),
-            class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(
-                SpaceHandle::Isolated(space.clone()),
-            ),
+            class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(),
             gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::Isolated(space.clone())),
             type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::Isolated(
                 space.clone(),

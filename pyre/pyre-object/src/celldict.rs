@@ -30,7 +30,6 @@
 //! `w_dict_get_strategy(obj)`.
 
 #![allow(unsafe_op_in_unsafe_fn)]
-#![allow(dead_code)]
 
 use crate::pyobject::*;
 
@@ -721,7 +720,6 @@ impl GlobalCache {
 
 /// `celldict.py` `self.caches.get(key)`. The registry mutex is the 3.14t
 /// wrapper; the lookup itself is the dict get upstream performs under the GIL.
-#[allow(dead_code)]
 #[majit_macros::dont_look_inside]
 fn caches_get(
     caches: &parking_lot::Mutex<Option<GlobalCacheRegistry>>,

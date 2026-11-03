@@ -198,11 +198,6 @@ pub(crate) fn pickling_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyErro
     pickle_exc("_pickle.PicklingError", msg.into())
 }
 
-#[allow(dead_code)]
-pub(crate) fn eof_error(msg: &str) -> PyError {
-    pickle_exc("EOFError", msg.into())
-}
-
 // ── import / dotted attribute resolution (save_global / find_class) ───
 
 /// PyPy `W_Unpickler.find_class`: call builtin `__import__(name)` first, then
@@ -508,52 +503,6 @@ pub(crate) fn getattribute_dotted_obj(
         pyre_object::gc_roots::shadow_stack_get(cur_slot),
         pyre_object::gc_roots::shadow_stack_get(parent_slot),
     ))
-}
-
-/// Resolve `module_name.name` to the live object, importing the module
-/// first. `builtins` names resolve through the execution context (whose
-/// `getattr` wrapper does not see builtins on the underlying storage); other
-/// names resolve through `getattr`, component-by-component for a dotted name,
-/// so a module-level dynamic attribute (`__getattr__`, PEP 562) resolves as it
-/// does for the live object. Returns `Ok(None)` when the name is simply absent
-/// (AttributeError) so the dump-time verification can report a precise
-/// "not found" error; the load-side `find_class` maps `None` to an error. No
-/// `_compat_pickle` remap — callers apply that first.
-///
-/// `allow_qualname` mirrors `getattribute(obj, name, allow_qualname)`: when set
-/// (proto >= 4 STACK_GLOBAL qualnames and the dump-side `whichmodule`
-/// verification) the name is walked as a qualname via `getattr` on each
-/// component, like `_getattribute`; when clear (the unpickler at protocol < 4)
-/// the name is a single `getattr`, so a dotted name resolves as one literal
-/// attribute and fails, as in CPython.
-#[allow(dead_code)]
-pub(crate) fn try_resolve_global(
-    module_name: &str,
-    name: &str,
-    allow_qualname: bool,
-) -> Result<Option<PyObjectRef>, PyError> {
-    if module_name == "builtins"
-        && !name.contains('.')
-        && let Some(obj) = lookup_builtin(name)
-    {
-        return Ok(Some(obj));
-    }
-    let module = import_module(module_name)?;
-    if allow_qualname {
-        // protocol >= 4: walk the qualname via `getattr` on each component (a
-        // non-dotted name is a single `getattr`), mirroring `_getattribute`.
-        return match getattribute_dotted(module, name) {
-            Ok((obj, _)) => Ok(Some(obj)),
-            Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => Ok(None),
-            Err(e) => Err(e),
-        };
-    }
-    // protocol < 4: a single `getattr`, never a qualname walk.
-    match pyre_interpreter::baseobjspace::getattr_str(module, name) {
-        Ok(obj) => Ok(Some(obj)),
-        Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 // ── encode_long / decode_long — two's-complement little-endian ───────

@@ -239,7 +239,7 @@ fn generate_state_fields_jit_state(
                 // opaque(T) fields are pass-through; the JIT does not
                 // enumerate them as inputargs, so any T is allowed. ref(T) is
                 // a ref-typed scalar (usize carrier), also any T.
-                StateFieldKind::Opaque(_) | StateFieldKind::Ref(_) | StateFieldKind::Str => {
+                StateFieldKind::Opaque | StateFieldKind::Ref(_) | StateFieldKind::Str => {
                     return None;
                 }
             };
@@ -350,7 +350,7 @@ fn generate_state_fields_jit_state(
         .fields
         .iter()
         .enumerate()
-        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Opaque(_)))
+        .filter(|(_, f)| matches!(f.kind, StateFieldKind::Opaque))
         .collect();
 
     let num_scalars = scalars.len();
@@ -378,14 +378,7 @@ fn generate_state_fields_jit_state(
         .count();
     let portal_ref_greens = portal_greens
         .iter()
-        .filter(|(_, _, tag)| {
-            matches!(
-                tag,
-                super::green_type_tag::GreenTypeTag::Ref
-                    | super::green_type_tag::GreenTypeTag::Str
-                    | super::green_type_tag::GreenTypeTag::Unicode
-            )
-        })
+        .filter(|(_, _, tag)| matches!(tag, super::green_type_tag::GreenTypeTag::Ref))
         .count();
     let portal_float_greens = portal_greens
         .iter()
@@ -1779,7 +1772,6 @@ fn generate_state_fields_jit_state(
             /// `JitCodeBuilder::live` (`assembler.py`) to
             /// register the canonical entry once per process and emit
             /// a `live/<offset>` prefix on each per-opcode jitcode.
-            #[allow(dead_code)]
             fn canonical_liveness_slots(
                 &self,
             ) -> (::std::vec::Vec<u8>, ::std::vec::Vec<u8>, ::std::vec::Vec<u8>) {
@@ -1825,7 +1817,6 @@ fn generate_state_fields_jit_state(
             /// reproduces RPython's order: all `-live-` entries are in
             /// `asm.all_liveness` before `finish_setup` snapshots
             /// `metainterp_sd.liveness_info`.
-            #[allow(dead_code)]
             fn install_canonical_liveness(
                 &self,
                 driver: &mut majit_metainterp::JitDriver<#state_type>,

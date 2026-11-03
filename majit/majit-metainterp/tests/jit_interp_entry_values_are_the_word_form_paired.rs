@@ -19,7 +19,8 @@ use majit_metainterp::{JitDriver, JitState};
 pub type Bytecode = [u8];
 
 struct Cell {
-    #[allow(dead_code)] // linked-cell shape for the virt-array entry test
+    // linked-cell shape for the virt-array entry test; named by `ref_fields`
+    #[allow(dead_code)]
     next: *mut Cell,
     value: i64,
 }

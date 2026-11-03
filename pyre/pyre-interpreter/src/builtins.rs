@@ -896,14 +896,6 @@ pub unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), crate::Py
     Ok(())
 }
 
-/// Raw logical bytes of a memoryview, or `None` when `obj` is not one.
-/// `bytes(memoryview)` / `bytearray(memoryview)` copy the view per the
-/// buffer protocol rather than iterating element values.
-#[allow(dead_code)]
-pub(crate) unsafe fn memoryview_as_bytes(obj: PyObjectRef) -> Option<Vec<u8>> {
-    unsafe { pyre_object::memoryview::is_w_memoryview(obj).then(|| memoryview_gather_bytes(obj)) }
-}
-
 /// Little-endian unpack of one `itemsize`-wide element at byte offset `base`
 /// — the fallback for formats the shared decoder rejects.  A narrower item is
 /// unsigned; a full-word one is the signed reading of those bytes, so a format
@@ -21644,7 +21636,11 @@ fn _hash_bytes_with_key(bytes: &[u8], secret: &[u8; 16]) -> i64 {
 
 /// The `bytes` hash over a caller's buffer, which is what `Py_HashBuffer`
 /// answers with.
-#[allow(dead_code)]
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
 pub(crate) fn hash_buffer(bytes: &[u8]) -> i64 {
     _hash_bytes(bytes)
 }
@@ -25525,6 +25521,7 @@ fn file_method_readlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `interp_posix.py write` / `interp_fileio.py write_w`:
 /// `space.getarg_w('s*', w_data).as_str()`; a bytes object is its own STR,
 /// any other buffer is gathered and then copied into one STR.
+#[cfg(unix)]
 pub(crate) unsafe fn file_write_as_str(
     obj: PyObjectRef,
 ) -> Result<majit_ir::GcRef, crate::PyError> {

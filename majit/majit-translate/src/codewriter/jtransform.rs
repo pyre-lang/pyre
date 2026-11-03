@@ -14363,7 +14363,7 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
     /// (jtransform.py).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // jtransform.py Transformer.rewrite_op_jit_record_known_result; Rust lowering does not emit this llop yet
     fn rewrite_op_jit_record_known_result(
         &mut self,
         _graph: &FunctionGraph,
@@ -14804,101 +14804,6 @@ impl<'a> Transformer<'a> {
                 unreachable!("indirect calls cannot classify as builtin/recursive")
             }
         }
-    }
-
-    /// RPython: elidable call — pure function, result depends only on args.
-    /// RPython jtransform.py:546-562.
-    ///
-    /// `target` is the funcptr identity per jtransform.py:457.
-    #[allow(dead_code)]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
-    )]
-    fn handle_elidable_call(
-        &mut self,
-        graph: &mut FunctionGraph,
-        op: &SpaceOperation,
-        target: &CallTarget,
-        descriptor: CallDescriptor,
-        args: &[crate::flowspace::model::Variable],
-        result_ty: &ValueType,
-        graph_name: &str,
-    ) -> RewriteResult {
-        self.notes.push(GraphTransformNote {
-            function: graph_name.to_string(),
-            detail: format!("call {target} → elidable"),
-        });
-        self.calls_classified += 1;
-        let (args_i, args_r, args_f, _) =
-            self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
-        let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_call_result(graph, op.result.clone(), result_ty);
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
-        RewriteResult::Replace(vec![
-            funcptr_op,
-            SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::CallElidable {
-                    funcptr: CallFuncPtr::Value(funcptr),
-                    descriptor,
-                    args_i,
-                    args_r,
-                    args_f,
-                    result_kind,
-                },
-            },
-        ])
-    }
-
-    /// RPython: may-force call — can trigger GC or force virtualizables.
-    /// RPython jtransform.py:609-625.
-    ///
-    /// `target` is the funcptr identity per jtransform.py:457.
-    #[allow(dead_code)]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
-    )]
-    fn handle_may_force_call(
-        &mut self,
-        graph: &mut FunctionGraph,
-        op: &SpaceOperation,
-        target: &CallTarget,
-        descriptor: CallDescriptor,
-        args: &[crate::flowspace::model::Variable],
-        result_ty: &ValueType,
-        graph_name: &str,
-    ) -> RewriteResult {
-        self.notes.push(GraphTransformNote {
-            function: graph_name.to_string(),
-            detail: format!("call {target} → may_force"),
-        });
-        self.calls_classified += 1;
-        let (args_i, args_r, args_f, _) =
-            self.rewrite_call_three_lists(args, graph_name, &format!("call argument ({target})"));
-        let result_kind = self.resolve_call_result(op.result.as_ref(), result_ty).kind;
-        self.stamp_call_result(graph, op.result.clone(), result_ty);
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
-        // RPython: call_may_force always followed by -live-
-        RewriteResult::Replace(vec![
-            funcptr_op,
-            SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::CallMayForce {
-                    funcptr: CallFuncPtr::Value(funcptr),
-                    descriptor,
-                    args_i,
-                    args_r,
-                    args_f,
-                    result_kind,
-                },
-            },
-            SpaceOperation {
-                result: None,
-                kind: OpKind::live(),
-            },
-        ])
     }
 
     /// Owner string `OpKind::New` can allocate for a niladic struct ctor.

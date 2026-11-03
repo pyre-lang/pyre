@@ -14,8 +14,6 @@
 //! `#[repr(C)]` because the same structs are read straight out of a loaded
 //! extension module's static data.
 
-#![allow(dead_code)]
-
 use core::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
 

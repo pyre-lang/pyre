@@ -534,7 +534,7 @@ pub static CODE_TYPE: PyType =
 /// const's bare leaf `CodeObject`, which is the field read's `owner_root`.
 /// `source_path` stays mutable (`fix_code_filenames`).
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _immutable_fields_CodeObject: &str =
     "varnames[*],cellvars[*],freevars[*],localspluskinds[*]";
 
@@ -542,7 +542,7 @@ pub const _immutable_fields_CodeObject: &str =
 /// GC object. `rclass.py getgcflavor` reads `_alloc_flavor_` off the
 /// classdesc so `getinstancerepr` builds a raw `InstanceRepr`.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _alloc_flavor_CodeObject: &str = "raw";
 
 /// `signature.py` `class Signature`: `_immutable_ = True` and
@@ -552,7 +552,7 @@ pub const _alloc_flavor_CodeObject: &str = "raw";
 /// so a promoted signature folds `num_argnames` / `find_w_argname` the same
 /// way `argnames[i]` does.
 #[doc(hidden)]
-#[allow(non_upper_case_globals, dead_code)]
+#[allow(non_upper_case_globals)]
 pub const _immutable_fields_Signature: &str =
     "argnames[*],varargname,kwargname,posonlyargcount,kwonlyargcount";
 

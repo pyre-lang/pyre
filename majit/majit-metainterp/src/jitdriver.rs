@@ -12137,14 +12137,6 @@ mod tests {
     }
 
     #[derive(Default)]
-    #[allow(dead_code)]
-    struct FrameMetadataState {
-        seen_trace_id: Option<u64>,
-        seen_header_pc: Option<u64>,
-        restored_values: Vec<Value>,
-    }
-
-    #[derive(Default)]
     struct NonTraceableState;
 
     impl JitState for TypedRestoreState {
@@ -12683,49 +12675,6 @@ mod tests {
         fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
             self.typed_restore_calls += 1;
             self.restored_values = values.to_vec();
-        }
-
-        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
-            Vec::new()
-        }
-
-        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
-            true
-        }
-    }
-
-    impl JitState for FrameMetadataState {
-        type Meta = ();
-        type Sym = ();
-        type Env = ();
-
-        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
-
-        fn extract_live(&mut self, _meta: &Self::Meta) -> Vec<i64> {
-            Vec::new()
-        }
-
-        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
-
-        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
-            true
-        }
-
-        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
-
-        fn restore_reconstructed_frame_values_with_metadata(
-            &mut self,
-            _meta: &Self::Meta,
-            _frame_index: usize,
-            _total_frames: usize,
-            frame: &ReconstructedFrame,
-            values: &[Value],
-            _exception: &ExceptionState,
-        ) -> bool {
-            self.seen_trace_id = frame.trace_id;
-            self.seen_header_pc = frame.header_pc;
-            self.restored_values = values.to_vec();
-            true
         }
 
         fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {

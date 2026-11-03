@@ -659,7 +659,6 @@ mod tests {
             Default::default(),
             None,
             Default::default(),
-            crate::guard::AttachedDescrPtrs::default(),
             Arc::new(crate::guard::CpuDescrCell::default()),
             0,
             0,
@@ -1216,7 +1215,6 @@ pub(crate) fn build_cond_call_slowpaths(
         classptr_to_typeid,
         None,
         classptr_to_subclass_range,
-        crate::guard::AttachedDescrPtrs::default(),
         // `CpuDescrCell::new` leaks the attachments box. One cell per process:
         // `ensure_cond_call_slowpath` builds this assembler once.
         Arc::new(crate::guard::CpuDescrCell::default()),
@@ -2116,17 +2114,6 @@ pub struct Assembler386<'a> {
     /// The same cell is consumed by `append_guard_token_with_faillocs`
     /// so jf_force_descr and jf_descr resolve to the same identity.
     pending_force_cell: Option<usize>,
-    /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
-    /// snapshot of the six descr pointers attached to the owning cpu
-    /// instance.  Retained for constructor signature stability across
-    /// runner / call_assembler callsites — emission helpers
-    /// (`done_with_this_frame_descr_ptr_for_type`,
-    /// `exit_frame_with_exception_descr_ref_ptr`,
-    /// `propagate_exception_descr_ptr`) read live from `cpu_handle`
-    /// instead so the raw ptr baked into `JF_DESCR_OFS` and the Arc
-    /// stamped into `meta_descr` come from the same snapshot.
-    #[allow(dead_code)]
-    attached_descrs: crate::guard::AttachedDescrPtrs,
     /// `Arc` clone of the owning cpu's attachment handle.  Its heap
     /// address is baked into the CALL_ASSEMBLER helper call site as a
     /// compile-time immediate (`Arc::as_ptr`) and the `Arc` is moved
@@ -2334,18 +2321,6 @@ static FLOAT_CONST_ABS: AlignedPdConst = AlignedPdConst([
 /// per method so the lint still reports anything else in this `impl` that
 /// stops being reached.
 impl<'a> Assembler386<'a> {
-    /// rpython/jit/metainterp/history.py is_constant `box.type` parity.
-    /// Single source of truth: `op.type_` for ops, `inputarg.tp` for
-    /// inputargs, the `Const` variant tag for constants.
-    ///
-    /// Unreached since the call emitters moved onto regalloc arglocs, which
-    /// carry the type in the `Loc` itself; kept per the note above.
-    #[allow(dead_code)]
-    #[inline]
-    fn opref_type(&self, opref: OpRef) -> Option<Type> {
-        self.opref_type_at(opref, None)
-    }
-
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
         let type_index = OpTypeIndex::from_parts(
@@ -2369,7 +2344,6 @@ impl<'a> Assembler386<'a> {
         classptr_to_typeid: IndexMap<i64, u32>,
         guard_gc_type_info: Option<GuardGcTypeInfo>,
         classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
-        attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         malloc_slowpath_headerless: usize,
@@ -2427,7 +2401,6 @@ impl<'a> Assembler386<'a> {
             },
             pending_force_descr: None,
             pending_force_cell: None,
-            attached_descrs,
             cpu_handle,
             frame_depth_to_patch: Vec::new(),
             pending_slowpaths: Vec::new(),
@@ -3105,7 +3078,7 @@ impl<'a> Assembler386<'a> {
     ///
     /// One in-memory subtract — no need to load the current top into a
     /// register, decrement, and store back.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // x86/assembler.py Assembler386._call_footer_shadowstack; raw footer helper is dispatched today
     fn gen_footer_shadowstack(&mut self) {
         emit_footer_shadowstack_raw(&mut self.mc);
         // `emit_footer_shadowstack_raw` writes `X86_64_SCRATCH_REG`.
@@ -6468,7 +6441,7 @@ impl<'a> Assembler386<'a> {
     // genop_* — integer arithmetic
 
     /// INT_ADD: result = arg0 + arg1
-    #[allow(dead_code)]
+    #[allow(dead_code)] // x86/assembler.py genop_*; pyre's x86 regalloc emits these ops directly instead of dispatching to genop_*
     fn genop_int_add(&mut self, op: &Op) {
         self.load_arg_to_rax(op.arg(0).to_opref());
         self.load_arg_to_rcx(op.arg(1).to_opref());

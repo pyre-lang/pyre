@@ -4952,7 +4952,6 @@ impl PyFrame {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
         // `pyframe.py peekvalue_maybe_none`: the same two checks as
         // [`Self::pop`].

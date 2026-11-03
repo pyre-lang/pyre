@@ -40,15 +40,18 @@ extern "C" fn jit_scramble(stack: usize) {
     }
 }
 
-struct ArrTestState {
-    a: i64,
-    sel: usize,
-}
-
 const OP_NOP: u8 = 0;
 const OP_SCRAMBLE: u8 = 1;
 
 pub type Bytecode = [u8];
+
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
+struct ArrTestState {
+    a: i64,
+    sel: usize,
+}
 
 #[majit_macros::jit_interp(
     state = ArrTestState,
@@ -166,6 +169,9 @@ mod without_the_bracket_suffix {
     use super::{ArrStack, Bytecode, JitDriver, OP_NOP, OP_SCRAMBLE, jit_scramble};
     use majit_metainterp::Assembler;
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct FieldOnlyState {
         a: i64,
         sel: usize,
@@ -258,6 +264,9 @@ mod unsigned_elements {
         }
     }
 
+    // Named as the `jit_interp` state type; the macro lowers the interpreter body
+    // into jitcode and never runs it, so nothing constructs the struct.
+    #[allow(dead_code)]
     struct ByteState {
         a: i64,
         sel: usize,

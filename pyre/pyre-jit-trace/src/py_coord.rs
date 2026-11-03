@@ -9,16 +9,6 @@
 //! the only Python-coordinate sources; runtime consumers never project a
 //! JitCode PC through a Python-keyed map.
 
-#[allow(dead_code)]
-pub(crate) fn floor_boundary_at_or_after(
-    metadata: &crate::PyJitCodeMetadata,
-    jit_pc: usize,
-) -> Option<(usize, u32)> {
-    let table = &metadata.py_floor_by_jit_pc;
-    let idx = table.partition_point(|&(off, _)| (off as usize) < jit_pc);
-    table.get(idx).map(|&(off, py)| (off as usize, py))
-}
-
 /// Resolve a JitCode offset to the Python instruction coordinate containing it.
 ///
 /// Exact block-head marker matches win first. Otherwise the per-emission-run

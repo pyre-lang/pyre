@@ -680,7 +680,6 @@ pub fn format_blocked_annotation_error(
 
 // Imports kept alive even when format_annotations returns empty
 // outside test builds.
-#[allow(dead_code)]
 fn _refs_hold(
     _block: Option<&RefCell<Block>>,
     _code: Option<&HostCode>,

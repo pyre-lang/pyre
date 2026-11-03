@@ -79,16 +79,6 @@ impl SSAReprEmitter {
         self.builder.set_calldescr(calldescr);
     }
 
-    #[allow(dead_code)]
-    fn add_const_i(&mut self, value: i64) -> u16 {
-        self.builder.add_const_i(value)
-    }
-
-    #[allow(dead_code)]
-    fn add_const_r(&mut self, value: i64) -> u16 {
-        self.builder.add_const_r(value)
-    }
-
     /// Register a helper fn pointer without a slot classification —
     /// used by `register_helper_fn_pointers::bind` for `MayForce` /
     /// `ReleaseGil` flavors whose runtime-resolved EI cannot be
@@ -186,17 +176,6 @@ impl SSAReprEmitter {
         let byte_positions =
             Self::insn_pos_to_byte_offset(&ssarepr, insn_positions.iter().copied());
         Some((jitcode, byte_positions))
-    }
-
-    /// Consume the emitter and yield its underlying [`JitCodeBuilder`].
-    /// Used by the canonical-assemble probe so it can drive
-    /// [`Assembler::assemble`] directly while retaining ownership of the
-    /// canonical [`SSARepr`] (whose `insns_pos` side-table the probe
-    /// inspects post-assemble).  Production callers continue to use
-    /// `finish_with_positions_from`.
-    #[allow(dead_code)]
-    pub fn into_builder(self) -> JitCodeBuilder {
-        self.builder
     }
 }
 

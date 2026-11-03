@@ -6405,6 +6405,7 @@ pub(crate) fn build_ll_copy_list_to_raw_array_helper_graph(
 /// `Signed` and `Unsigned` stay distinct (`rust_vec_item_key_segment`).
 /// Both still memcpy a word; the native leaf they residualize to is
 /// shared. Memoised by [`RPythonTyper::lowlevel_helper_function_with_builder`].
+#[cfg(test)]
 pub(crate) fn ll_copy_list_to_raw_array_helper(
     rtyper: &RPythonTyper,
     item: &LowLevelType,
@@ -6448,6 +6449,7 @@ pub(crate) fn ll_copy_list_to_raw_array_helper(
 /// [`emit_rustvec_len_store`]. `l.ll_length()` is `ll_fixed_length`.
 ///
 /// `item` is both the source array item and the result header item.
+#[cfg(test)]
 pub(crate) fn build_ll_vec_copy_from_fixed_list_helper_graph(
     name: &str,
     item: &LowLevelType,

@@ -240,7 +240,7 @@ fn set_jit_pending_exception(obj: pyre_object::PyObjectRef) {
 /// Test/runtime helper that clears only the current thread's pending
 /// JIT exception slot.
 #[inline]
-#[allow(dead_code)]
+#[cfg(test)]
 fn clear_jit_pending_exception() {
     TL_JIT_PENDING_EXCEPTION.with(|slot| slot.set(0));
 }

@@ -84,11 +84,6 @@ impl RegisterList {
     pub fn to_vec(&self) -> Vec<OpRef> {
         self.0.borrow().clone().unwrap_or_default()
     }
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn root(&self) -> RegisterListRoot {
-        self.root_with(majit_metainterp::FrontendResrefOwner::NONE)
-    }
 
     pub(crate) fn root_with(
         &self,

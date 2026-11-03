@@ -426,13 +426,6 @@ cover the condition they diagnose.
 - What it does: Prints the control-flow decisions a walk makes: the interpreter pc every `jit_merge_point` visit carries, and every `switch`, `goto_if_not` and `loop_header`, each tagged with the jitcode that owns it and its frame depth (`d=`). A walk that records without ever closing gives the same reading at the top (`seen_loop_header_for_jdindex` stays -1 at every merge point) whether the `loop_header` op was never reached or was reached and declined, and the two call for opposite fixes; the branch lines name which edge diverted the walk, at whatever depth it happened.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
-### `MAJIT_PROBE_LIVENESS`
-
-- Read sites: 1 — `pyre/pyre-jit/src/call_jit.rs`
-- Accessor: `majit_probe_liveness_enabled()`
-- What it does: Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
-- Retirement condition: **UNRECORDED** — owed by this gate's owner.
-
 ### `MAJIT_REGALLOC_DEBUG`
 
 - Read sites: 2 — `majit/majit-translate/src/tool/algo/regalloc.rs`

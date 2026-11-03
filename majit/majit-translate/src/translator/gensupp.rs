@@ -1,8 +1,10 @@
 //! Port of `rpython/translator/gensupp.py`.
 
 use parking_lot::Mutex;
+#[cfg(test)]
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -39,6 +41,7 @@ fn c_identifier_byte(b: u8) -> u8 {
 /// Apply the upstream `str.translate(C_IDENTIFIER)` to a UTF-8 input.
 /// Upstream Python operates on bytes directly; non-ASCII UTF-8 bytes
 /// therefore become `_` byte-by-byte.
+#[cfg(test)]
 fn translate_c_identifier(s: &str) -> String {
     s.bytes().map(c_identifier_byte).map(char::from).collect()
 }
@@ -194,7 +197,7 @@ impl NameManager {
     ///
     /// Grows `scopelist` so the new scope's per-basename dedup map
     /// is in place before the scope is used.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn local_scope_from(
         rc: &Rc<RefCell<Self>>,
         parent: Option<&LocalScope>,
@@ -226,8 +229,8 @@ impl NameManager {
     /// to 'simplify' things is not allowed"), the upstream-shape
     /// name is preserved as a wrapper even though `local_scope` is
     /// the canonical Rust spelling per CLAUDE.md §2.
-    #[allow(dead_code)]
     #[allow(non_snake_case)]
+    #[cfg(test)]
     pub(crate) fn localScope(rc: &Rc<RefCell<Self>>, parent: Option<&LocalScope>) -> LocalScope {
         Self::local_scope_from(rc, parent)
     }
@@ -250,8 +253,8 @@ impl NameManager {
 /// `Rc`, so distinct scopes share one `NameManager` allocation and
 /// `borrow_mut()` it on demand without colliding. Upstream
 /// `self.glob = glob` lowers to `self.glob = Rc::clone(glob_rc)`.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub(crate) struct LocalScope {
     /// `mapping`: external-name → mangled-name.
     pub(crate) mapping: HashMap<String, String>,
@@ -267,6 +270,7 @@ pub(crate) struct LocalScope {
     /// [`Self::glob`]. The field is dead upstream too (no reader
     /// outside `__init__`), but preserved for structural parity per
     /// AGENTS.md: "an RPython object attribute is preserved as a Rust struct field".
+    #[allow(dead_code)]
     pub(crate) parent: Option<Rc<LocalScope>>,
     /// RPython `_LocalScope.glob` (`gensupp.py`). Shared
     /// `Rc<RefCell<NameManager>>` so subsequent `uniquename` /
@@ -276,10 +280,11 @@ pub(crate) struct LocalScope {
     pub(crate) glob: Rc<RefCell<NameManager>>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl LocalScope {
     /// RPython `_LocalScope.uniquename(self, basename)`
     /// (`gensupp.py`).
+    #[cfg(test)]
     pub fn uniquename(&mut self, basename: &str) -> String {
         let basename = translate_c_identifier(basename);
         let p = *self.usednames.get(&basename).unwrap_or(&0);
@@ -318,6 +323,7 @@ impl LocalScope {
     /// (`gensupp.py`). Mangles a local name through
     /// [`Self::uniquename`], with the `v`/`w_`/`l_` prefix selection
     /// upstream uses to pacify a tcc parser bug.
+    #[cfg(test)]
     pub fn localname(&mut self, name: &str, wrapped: bool) -> String {
         if let Some(existing) = self.mapping.get(name) {
             return existing.clone();

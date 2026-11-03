@@ -91,7 +91,6 @@ fn type_bits(tp: Type) -> u32 {
 /// RPython FieldDescr: describes a field in a GC/raw struct.
 /// Runtime mint goes through `get_field_descr` (`SimpleFieldDescr`); this
 /// type remains for the `is_class_word` special case.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PyreFieldDescr {
     offset: usize,

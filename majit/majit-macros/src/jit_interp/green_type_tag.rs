@@ -38,12 +38,6 @@ pub(crate) enum GreenTypeTag {
     Int,
     Ref,
     Float,
-    // The parser refuses these until string storage is JitCell-owned, but the
-    // variants keep the implemented codegen ABI explicit and testable.
-    #[allow(dead_code)]
-    Str,
-    #[allow(dead_code)]
-    Unicode,
 }
 
 /// One green declaration with optional type tag.

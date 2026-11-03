@@ -53,18 +53,21 @@ struct PrefixedWithTail {
     extra: *mut Node,
 }
 
-struct PrefixState {
-    a: i64,
-    one: usize,
-    two: usize,
-}
-
 const OP_NOP: u8 = 0;
 const OP_READ_SIZE: u8 = 1;
 const OP_MOVE_HEAD: u8 = 2;
 const OP_HEAD_TO_EXTRA: u8 = 3;
 
 pub type Bytecode = [u8];
+
+// Named as the `jit_interp` state type; the macro lowers the interpreter body
+// into jitcode and never runs it, so nothing constructs the struct.
+#[allow(dead_code)]
+struct PrefixState {
+    a: i64,
+    one: usize,
+    two: usize,
+}
 
 #[majit_macros::jit_interp(
     state = PrefixState,

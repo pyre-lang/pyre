@@ -18,108 +18,6 @@ use majit_metainterp::{
 
 use pyre_interpreter::bytecode::{CodeObject, ComparisonOperator, Instruction};
 
-#[allow(dead_code)]
-extern "C" fn trace_function_get_defaults(func: PyObjectRef) -> PyObjectRef {
-    unsafe { function_get_defaults(func) }
-}
-
-#[allow(dead_code)]
-extern "C" fn trace_function_get_kwdefaults(func: PyObjectRef) -> PyObjectRef {
-    unsafe { pyre_interpreter::function_get_kwdefaults(func) }
-}
-
-#[allow(dead_code)]
-extern "C" fn trace_dict_lookup_jit(dict: PyObjectRef, key: PyObjectRef) -> PyObjectRef {
-    unsafe { pyre_object::w_dict_lookup(dict, key).unwrap_or(PY_NULL) }
-}
-
-/// floatobject.py `descr_pow` → `_pow(space, x, y)` parity.
-///
-/// `_pow` in floatobject.py takes two raw floats and returns a
-/// raw float (can raise OverflowError / ValueError / ZeroDivisionError).
-/// The JIT trace records this as `CALL_F(float_pow_jit, lhs, rhs)`
-/// (pyjitpl.py `do_residual_call` CALL_F branch, taken because
-/// `check_forces_virtual_or_virtualizable()` is False for ll_math_pow,
-/// and `exc=True` because EF_CAN_RAISE), followed by `GUARD_NO_EXCEPTION`
-/// via pyjitpl.py `handle_possible_exception`.
-///
-/// ll_math_pow (ll_math.py) is the can-raise helper (EF_CAN_RAISE),
-/// NOT elidable and NOT force-virtual. Using Rust's native `x.powf(y)`
-/// would drop the Python exception semantics (negative base fractional
-/// exponent → ValueError, 0.0 raised to negative → ZeroDivisionError,
-/// overflow → OverflowError). Using CALL_MAY_FORCE_F would be wrong
-/// because the optimizer postpones that family until GUARD_NOT_FORCED
-/// arrives (heap.py CALL_MAY_FORCE branch), which is the virtualizable
-/// protocol — ll_math_pow does not touch virtualizables.
-///
-/// Extracted to module level for stable function pointer identity.
-///
-/// Must match `float_pow_impl` semantics in `baseobjspace.rs`: any
-/// divergence would cause the JIT compiled code to produce a different
-/// result from the interpreter for the same input (correctness bug).
-/// ll_math.py `math_pow = llexternal('pow', [DOUBLE, DOUBLE], DOUBLE)`
-/// — the raw libm pow an inline-traced `_pow` fast path residualizes as
-/// `call_f(ConstClass(ccall_pow), x, y)` with an EF_CANNOT_RAISE descr
-/// (no `guard_no_exception` follows).
-#[allow(dead_code)] // ll_math.py math_pow
-pub(crate) extern "C" fn ccall_pow(x: f64, y: f64) -> f64 {
-    x.powf(y)
-}
-
-/// `sqrt_nonneg` (ll_math.rs) — `@jit.elidable`, `oopspec
-/// "math.sqrt_nonneg(x)"` (ll_math.py).  The trace records this as a
-/// pure `CALL_F(sqrt_nonneg_jit, x)` (EF_ELIDABLE_CANNOT_RAISE, no trailing
-/// guard) behind the domain-pinning guards emitted by
-/// `try_walker_specialize_math_sqrt`: `x >= 0` (excludes the ValueError
-/// direction) and `isfinite(x)` (excludes NaN/±inf).  Reached only with a
-/// finite, non-negative operand, so `x.sqrt()` cannot raise and matches
-/// `ll_math_sqrt`'s finite-nonneg branch bit-for-bit.
-#[allow(dead_code)] // ll_math.py ll_math_sqrt
-pub(crate) extern "C" fn sqrt_nonneg_jit(x: f64) -> f64 {
-    x.sqrt()
-}
-
-/// RPython `ll_math_{log,cos,sin}` fast-path calls after their exceptional
-/// branches have been pinned by the walker.  These are the raw libm calls the
-/// translated PyPy trace carries; boxing stays outside so optimizeopt can
-/// virtualize the resulting `W_FloatObject`.
-#[allow(dead_code)] // ll_math.py ll_math_log
-pub(crate) extern "C" fn math_log_positive_jit(x: f64) -> f64 {
-    x.ln()
-}
-
-#[allow(dead_code)] // ll_math.py ll_math_cos
-pub(crate) extern "C" fn math_cos_finite_jit(x: f64) -> f64 {
-    x.cos()
-}
-
-#[allow(dead_code)] // ll_math.py ll_math_sin
-pub(crate) extern "C" fn math_sin_finite_jit(x: f64) -> f64 {
-    x.sin()
-}
-
-#[allow(dead_code)] // ll_math.py math_pow float fast path
-pub(crate) extern "C" fn float_pow_jit(x: f64, y: f64) -> f64 {
-    match pyre_interpreter::float_pow_raw(x, y) {
-        Ok(z) => z,
-        Err(mut err) => {
-            // llmodel.py _store_exception parity: set JIT exception
-            // state so the following GuardNoException sees it and fails,
-            // propagating the raise into the meta-interpreter.
-            let exc_obj = err.to_exc_object();
-            #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
-            majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
-            #[cfg(all(feature = "dynasm", not(target_arch = "wasm32")))]
-            majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
-            #[cfg(target_arch = "wasm32")]
-            majit_backend_wasm::jit_exc_raise(exc_obj as i64);
-            let _ = exc_obj; // suppress unused warning when no backend
-            // Return value is discarded by GuardNoException path; use NaN
-            // as a safe sentinel in case the guard is elided.
-            f64::NAN
-        }
-    }
-}
 use pyre_interpreter::eval::{get_current_exception, set_current_exception};
 
 /// Runtime helper for traced `RAISE_VARARGS`.
@@ -130,7 +28,7 @@ use pyre_interpreter::eval::{get_current_exception, set_current_exception};
 /// helper the compiled bridge contains only the constructor call plus
 /// `GuardException`, so the guard sees no pending exception and incorrectly
 /// resumes down the normal path.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
     #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
     majit_backend_cranelift::jit_exc_raise(exc_obj);
@@ -147,7 +45,7 @@ pub(crate) extern "C" fn raise_exception_jit(exc_obj: i64) {
 /// normalize the exception operand, normalize/attach the optional
 /// cause, and publish the final exception via `jit_exc_raise` so the
 /// following `GUARD_EXCEPTION` sees it.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) extern "C" fn normalize_raise_varargs_jit(
     _frame_ptr: *const pyre_interpreter::pyframe::PyFrame,
     exc: pyre_object::PyObjectRef,
@@ -219,23 +117,6 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     final_exc
 }
 
-/// Runtime helper for traced `PUSH_EXC_INFO`: read the per-thread
-/// `CURRENT_EXCEPTION` slot so the compiled bridge preserves
-/// `pyopcode.py` / `eval.rs`'s `push_exc_info` semantics (save the
-/// previous sys_exc_info before `CURRENT_EXCEPTION` is overwritten).
-#[allow(dead_code)]
-pub(crate) extern "C" fn trace_get_current_exception_jit() -> PyObjectRef {
-    pyre_interpreter::eval::get_current_exception()
-}
-
-/// Runtime helper for traced `PUSH_EXC_INFO` / `POP_EXCEPT`: write the
-/// per-thread `CURRENT_EXCEPTION` slot so the compiled bridge preserves
-/// `pyopcode.py/:778` / `eval.rs`'s `push_exc_info` / `pop_except`
-/// semantics.
-#[allow(dead_code)]
-pub(crate) extern "C" fn trace_set_current_exception_jit(exc: PyObjectRef) {
-    pyre_interpreter::eval::set_current_exception(exc);
-}
 use pyre_interpreter::eval::{attach_raise_cause, normalize_raise_cause};
 use pyre_interpreter::truth_value as objspace_truth_value;
 use pyre_interpreter::{
@@ -260,11 +141,6 @@ use pyre_object::{
     w_list_uses_object_storage, w_tuple_len,
 };
 
-#[allow(dead_code)]
-fn trace_abort_error(reason: &'static str) -> PyError {
-    PyError::internal_trace_abort(reason)
-}
-
 /// Emit `GetfieldGcR(w_class) → PtrEq(expected) → GuardTrue` so the trace
 /// only stays specialised for instances whose Python-level `w_class`
 /// matches `expected_typeobj`. Mirrors the `type(w) is W_IntObject` /
@@ -281,7 +157,7 @@ fn trace_abort_error(reason: &'static str) -> PyError {
 /// collapse a boxed subclass to `Null`), never a subclass pointer. Reading
 /// `w_class` off such a value would force the box that OptVirtualize is
 /// meant to remove, so skip the guard there.
-#[allow(dead_code)]
+#[cfg(test)]
 fn trace_guard_exact_w_class(
     frame: &mut MIFrame,
     ctx: &mut TraceCtx,
@@ -300,128 +176,6 @@ fn trace_guard_exact_w_class(
     frame.generate_guard(ctx, OpCode::GuardValue, &[actual, expected]);
     // `pyjitpl.py` `MIFrame.implement_guard_value` parity.
     ctx.heap_cache_mut().replace_box(actual, expected);
-}
-
-#[allow(dead_code)]
-fn positional_defaults_to_load(
-    callable: PyObjectRef,
-    code: &CodeObject,
-    nargs: usize,
-) -> Option<Vec<PyObjectRef>> {
-    let nparams = code.arg_count as usize;
-    if nargs >= nparams {
-        return None;
-    }
-
-    let defaults = unsafe { function_get_defaults(callable) };
-    if defaults.is_null() {
-        return None;
-    }
-
-    let ndefaults = if unsafe { pyre_object::is_tuple(defaults) } {
-        unsafe { w_tuple_len(defaults) }
-    } else {
-        0
-    };
-    if ndefaults == 0 {
-        return None;
-    }
-
-    let first_default = nparams.saturating_sub(ndefaults);
-    if nargs < first_default {
-        return None;
-    }
-
-    let defaults_to_load = nparams - first_default;
-    let default_start = ndefaults - defaults_to_load;
-    let mut loaded = Vec::with_capacity(nparams - nargs);
-    for i in nargs..nparams {
-        let default_idx = default_start + (i - first_default);
-        loaded.push(unsafe { w_tuple_getitem(defaults, default_idx as i64) }.unwrap_or(PY_NULL));
-    }
-    Some(loaded)
-}
-
-#[allow(dead_code)]
-fn fill_positional_defaults_for_trace_call<'a>(
-    callable: PyObjectRef,
-    code: &CodeObject,
-    args: &'a [PyObjectRef],
-) -> Cow<'a, [PyObjectRef]> {
-    let Some(defaults) = positional_defaults_to_load(callable, code, args.len()) else {
-        return Cow::Borrowed(args);
-    };
-    let mut full = Vec::with_capacity(args.len() + defaults.len());
-    full.extend_from_slice(args);
-    full.extend(defaults);
-    Cow::Owned(full)
-}
-
-#[allow(dead_code)]
-fn const_step_one_slice_bounds(
-    concrete_obj: PyObjectRef,
-    concrete_key: PyObjectRef,
-    concrete_value: PyObjectRef,
-) -> Option<(i64, i64, i64, i64, bool)> {
-    unsafe {
-        if concrete_obj.is_null()
-            || concrete_key.is_null()
-            || concrete_value.is_null()
-            || !is_list(concrete_obj)
-            || !pyre_object::sliceobject::is_slice(concrete_key)
-            || !is_list(concrete_value)
-        {
-            return None;
-        }
-        let step = pyre_object::sliceobject::w_slice_get_step(concrete_key);
-        let step_is_none = pyre_object::is_none(step);
-        let step_is_one = if step_is_none {
-            true
-        } else if is_int(step) {
-            pyre_object::w_int_get_value(step) == 1
-        } else {
-            false
-        };
-        if !step_is_one {
-            return None;
-        }
-        let start = pyre_object::sliceobject::w_slice_get_start(concrete_key);
-        let stop = pyre_object::sliceobject::w_slice_get_stop(concrete_key);
-        if pyre_object::is_none(start)
-            || pyre_object::is_none(stop)
-            || !is_int(start)
-            || !is_int(stop)
-        {
-            return None;
-        }
-        let start = pyre_object::w_int_get_value(start);
-        let stop = pyre_object::w_int_get_value(stop);
-        if start < 0 || stop < start {
-            return None;
-        }
-        let len = w_list_len(concrete_obj) as i64;
-        // PyPy `W_ListObject.descr_setitem` routes slices through
-        // `_unpack_slice` before `setslice`, so storage-level code sees
-        // adjusted positive-step bounds, not the raw slice fields.  This
-        // helper only accepts non-negative constant bounds, so adjustment
-        // reduces to CPython/PyPy's upper clamp.
-        Some((start, stop, start.min(len), stop.min(len), step_is_none))
-    }
-}
-
-#[allow(dead_code)]
-fn concrete_list_strategy_id(concrete: PyObjectRef) -> Option<i64> {
-    unsafe {
-        if w_list_uses_object_storage(concrete) {
-            Some(0)
-        } else if w_list_uses_int_storage(concrete) {
-            Some(1)
-        } else if w_list_uses_float_storage(concrete) {
-            Some(2)
-        } else {
-            None
-        }
-    }
 }
 
 use crate::descr::{
@@ -625,6 +379,7 @@ pub(crate) fn restore_vable_resume_scalars(ctx: &mut TraceCtx, saved: SavedVable
 /// local colors and would overwrite the local mirror before loop-close and
 /// guard snapshots consume it. The encoder builds the color-indexed Ref bank
 /// separately from liveness and the virtualizable shadow.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
     sym.nlocals + stack_idx
 }
@@ -654,7 +409,7 @@ pub(crate) fn stack_slot_reg_idx(sym: &PyreSym, stack_idx: usize) -> usize {
 /// - Emitting the separate `_opimpl_setfield_vable_i(vsd, depth±1)`
 ///   IR op via `mirror_vable_static_to_boxes` when the operation
 ///   logically advances the frame's vsd field (push / pop).
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn write_stack_slot(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -753,7 +508,7 @@ pub(crate) fn write_stack_slot(
 /// fills reuse the same GCREF.  Without this guard,
 /// `trace_array_getitem_value(NONE, idx)` would record a malformed
 /// `GetarrayitemGcR` with a NONE base operand.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: usize) -> OpRef {
     let semantic_idx = sym.nlocals + stack_idx;
     // For portal frames, read the stack slot
@@ -802,7 +557,7 @@ pub(crate) fn read_stack_slot(sym: &mut PyreSym, ctx: &mut TraceCtx, stack_idx: 
 /// pair-read+pair-write.
 ///
 /// `reg_top` / `reg_other` are semantic frame-mirror indices.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn swap_stack_slots(
     sym: &mut PyreSym,
     ctx: &mut TraceCtx,
@@ -985,11 +740,6 @@ impl MIFrame {
         self.value_type(opref)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn ctx(&mut self) -> &mut TraceCtx {
-        unsafe { &mut *self.ctx }
-    }
-
     pub(crate) fn with_ctx<R>(&mut self, f: impl FnOnce(&mut Self, &mut TraceCtx) -> R) -> R {
         let ctx = self.ctx;
         unsafe { f(self, &mut *ctx) }
@@ -1111,16 +861,6 @@ impl MIFrame {
             Int,
             Ref,
             Float,
-        }
-        impl LiveBank {
-            #[allow(dead_code)]
-            fn ty(self) -> Type {
-                match self {
-                    LiveBank::Int => Type::Int,
-                    LiveBank::Ref => Type::Ref,
-                    LiveBank::Float => Type::Float,
-                }
-            }
         }
 
         let jitcode_ptr_pre = self.sym().jitcode;
@@ -1817,11 +1557,6 @@ impl MIFrame {
             }
         }
         Ok(s.registers_r.get(idx).expect("bound Ref register"))
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_next_instr(&mut self, _ctx: &mut TraceCtx, target: usize) {
-        self.sym_mut().pending_next_instr = Some(target);
     }
 
     /// Update virtualizable last_instr and valuestackdepth.
@@ -3052,19 +2787,6 @@ impl MIFrame {
         }
     }
 
-    /// virtualizable.py load_list_of_boxes _get_virtualizable_field_boxes parity:
-    /// [static_fields..., array_items..., virtualizable_ptr].
-    /// pyjitpl.py:2586: self.virtualizable_boxes → vable_array.
-    /// opencoder.py _encode parity: encode OpRef as SnapshotTagged.
-    /// Constant-pool OpRefs → Const(value, type) from pool.
-    /// NONE → Const(0, Ref). Regular → Box.
-    fn opref_to_snapshot_tagged(
-        opref: OpRef,
-        ctx: &majit_metainterp::TraceCtx,
-    ) -> majit_metainterp::recorder::SnapshotTagged {
-        Self::opref_to_snapshot_tagged_for_slot(opref, ctx, None)
-    }
-
     /// virtualizable.py `read_boxes(cpu, virtualizable, startindex)` parity:
     /// each slot is wrapped via `wrap(cpu, value, startindex + i)` where the
     /// lltype (ARRAYITEMTYPE or static field `FIELDTYPE`) is declared and
@@ -3390,18 +3112,6 @@ impl MIFrame {
         boxes
     }
 
-    /// RPython pyjitpl.py get_list_of_active_boxes parity:
-    #[allow(dead_code)]
-    fn fail_args_to_snapshot_boxes(
-        fail_args: &[OpRef],
-        ctx: &majit_metainterp::TraceCtx,
-    ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
-        fail_args
-            .iter()
-            .map(|&opref| Self::opref_to_snapshot_tagged(opref, ctx))
-            .collect()
-    }
-
     /// snapshot boxes from active_boxes = [locals, stack].
     /// RPython: each Box carries type ('r'/'i'/'f') — pyre passes types
     /// explicitly so _number_boxes can detect virtual vs int correctly.
@@ -3440,7 +3150,7 @@ impl MIFrame {
 
     /// pyjitpl.py implement_guard_value parity.
     /// executor.py constant_from_op(box): dispatches on box.type.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // pyjitpl.py MIFrame.implement_guard_value; current opcode paths emit the guard inline
     pub(crate) fn implement_guard_value(
         &mut self,
         ctx: &mut TraceCtx,
@@ -3539,21 +3249,6 @@ impl MIFrame {
         }
         self.guard_class(ctx, int_obj, &INT_TYPE as *const PyType);
         opimpl_getfield_gc_i(ctx, int_obj, int_intval_descr())
-    }
-}
-
-/// Returns (is_int, is_float) for the fused-dispatch fuseability gate.
-/// Mirrors the concrete-type classification codegen.rs uses to pick
-/// between the int and float fast paths in the retired compare helper,
-/// but reads the ConcreteValue variant directly so the check does not
-/// have to allocate an intermediate w_int/w_float box.
-#[allow(dead_code)]
-fn classify_concrete(cv: ConcreteValue) -> (bool, bool) {
-    match cv {
-        ConcreteValue::Int(_) => (true, false),
-        ConcreteValue::Float(_) => (false, true),
-        ConcreteValue::Ref(obj) if !obj.is_null() => unsafe { (is_int(obj), is_float(obj)) },
-        _ => (false, false),
     }
 }
 

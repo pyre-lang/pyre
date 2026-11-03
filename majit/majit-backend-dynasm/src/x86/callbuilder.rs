@@ -127,9 +127,7 @@ pub(crate) struct CallBuilder64<'m, 'a> {
     result_value_saved_early: bool,
     next_arg_gpr: usize,
     next_arg_xmm: usize,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     win64_arg_gpr: u8,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     win64_arg_xmm: u8,
     /// `push_gcmap` published the gcmap the regalloc left pending, so
     /// `pop_gcmap` clears it.
@@ -450,7 +448,7 @@ impl<'m, 'a> CallBuilder64<'m, 'a> {
 
     /// `CallBuilder64.save_result_value`: temporarily save the result
     /// value into [ESP].
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg(target_os = "windows")]
     fn save_result_value(&mut self, _save_edx: bool) {
         if self.ressize == 0 {
             return; // void return

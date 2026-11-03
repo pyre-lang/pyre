@@ -1510,13 +1510,6 @@ pub fn set_in_flight_exception(exc: PyObjectRef) {
     IN_FLIGHT_EXCEPTION.with(|c| c.set(exc));
 }
 
-#[allow(dead_code)]
-fn walk_in_flight_exception(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    IN_FLIGHT_EXCEPTION.with(|c| {
-        unsafe { walk_in_flight_exception_area(c as *const _, visitor) };
-    });
-}
-
 unsafe fn walk_in_flight_exception_area(
     c: *const Cell<PyObjectRef>,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -2339,8 +2332,8 @@ pub fn handle_exception_with_context(
     // operates in byte space, mirroring `pycode.py`.)
     //
     // `frame.last_instr == -1` is the pre-first-opcode sentinel
-    // (`pyframe.py` initialization).  An injected operr
-    // (`eval_frame_plain_with_operr`) drives `handle_exception` before any
+    // (`pyframe.py` initialization).  An injected operr (`execute_frame`
+    // with a generator `throw()` error) drives `handle_exception` before any
     // bytecode has executed, so the lookup must mirror PyPy
     // `pycode.py`: with `instr_offset == -1`, the first entry's
     // `start <= -1` is False and `start > -1` is True, returning the
@@ -2445,15 +2438,6 @@ pub(crate) fn eval_frame_plain(
     resume: Option<&mut crate::call::FrameResumeArgs>,
 ) -> PyResult {
     frame.execute_frame_plain(resume)
-}
-
-/// pyframe.py execute_frame body — enter/call_trace/eval_loop/
-/// return_trace/leave wrapping. When `operr` is Some, the generator's
-/// throw() path routes it through handle_operation_error and sets
-/// last_instr = next_instr - 1 before resuming (pyframe.py).
-#[allow(dead_code)]
-pub(crate) fn eval_frame_plain_with_operr(frame: &mut PyFrame, operr: Option<PyError>) -> PyResult {
-    frame.execute_frame(None, operr)
 }
 
 enum FrameResume {

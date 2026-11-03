@@ -659,27 +659,6 @@ impl RBigInt {
         }
     }
 
-    /// Fallible form of [`RBigInt::new`] for upstream paths whose translated
-    /// allocation has an explicit MemoryError edge.
-    #[allow(dead_code)] // rbigint.py `rbigint.__init__`
-    fn try_new(digits: &[Digit], sign: i64, size: i64) -> Result<Self, RBigIntError> {
-        debug_assert!(size >= 0);
-        let logical_len = if size == 0 {
-            i64::try_from(digits.len()).map_err(|_| RBigIntError::Memory)?
-        } else {
-            size
-        };
-        let allocation_size = digits.len().max(1);
-        let block = unsafe { Digits::try_new(allocation_size) }.ok_or(RBigIntError::Memory)?;
-        unsafe {
-            fill_digit_block(block, digits);
-        }
-        Ok(Self {
-            _digits: block,
-            _size: logical_len.checked_mul(sign).ok_or(RBigIntError::Memory)?,
-        })
-    }
-
     /// Fallible [`RBigInt::new_from_rooted`].
     fn try_new_from_rooted(
         src: &RBigIntGcRoot,
