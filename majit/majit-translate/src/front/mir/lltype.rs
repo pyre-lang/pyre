@@ -5238,22 +5238,29 @@ fn exception_class_by_value_adt<'a>(ty: &TyRef, llbc: &'a Llbc) -> Option<&'a Ty
     Some(td)
 }
 
+/// By-value `alloc::string::String`. A borrow or raw pointer is the
+/// address: [`exception_class_by_value_adt`] leaves `Ref` and `RawPtr`
+/// in place.
+pub(in crate::front::mir) fn tyref_is_by_value_alloc_string(ty: &TyRef, llbc: &Llbc) -> bool {
+    exception_class_by_value_adt(ty, llbc)
+        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
+}
+
 /// Whether a marked-enum variant field is one translated word.
 ///
-/// A by-value `String`, a `Vec` whose items are not one word, a by-value
-/// `VecDeque`, and a by-value raw-flavor or multi-word struct are not.
-/// A pointer or borrow of those types is the address. `Wtf8Buf`, a `Vec`
-/// of one-word items, scalars, and GC refs are.
+/// A by-value `String` is one rstr word (`Ptr(STR)`). A `Vec` whose
+/// items are not one word, a by-value `VecDeque`, and a by-value
+/// raw-flavor or multi-word struct are not. A pointer or borrow of
+/// those types is the address. `Wtf8Buf`, a `Vec` of one-word items,
+/// scalars, and GC refs are.
 pub(in crate::front::mir) fn exception_class_attr_is_one_word(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
-    if exception_class_by_value_adt(ty, llbc)
-        .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
-    {
-        return false;
+    if tyref_is_by_value_alloc_string(ty, llbc) {
+        return true;
     }
     if tyref_is_string_value(ty, llbc) {
         return true;

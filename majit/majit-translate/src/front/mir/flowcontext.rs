@@ -410,6 +410,14 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// length-prefixed GcArray. One field feeds both uses, so the mark
     /// sits on the result variable rather than on the shared read.
     pub(in crate::front::mir) fat_box_vars: Vec<Variable>,
+    /// Field reads of a by-value `String` attr on a marked exception
+    /// class. The word is rstr `Ptr(STR)`, not a rust-heap
+    /// `{cap, ptr, len}` header.
+    pub(in crate::front::mir) exception_rstr_attr_vars: Vec<Variable>,
+    /// Result ids of calls that passed one of those attrs into a
+    /// rust-heap `String` ABI. `finish` rejects the graph when that
+    /// call is still a `Call` after format collapse.
+    pub(in crate::front::mir) rust_heap_string_attr_call_results: Vec<u64>,
     /// Results of calls whose declared type is a fat `&dyn` or `Box<dyn>`.
     /// `FunctionGraph::set_return` carries one word, so
     /// [`crate::front::dyn_fat`] splices these callees and reads `method_*`
@@ -1570,6 +1578,8 @@ impl<'a> Lowering<'a> {
                 .collect(),
             list_view_fixed,
             fat_box_vars: Vec::new(),
+            exception_rstr_attr_vars: Vec::new(),
+            rust_heap_string_attr_call_results: Vec::new(),
             dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),

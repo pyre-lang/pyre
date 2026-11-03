@@ -16327,7 +16327,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
                 .expect("payload-less Ok lowers"),
             1
         );
@@ -16364,7 +16364,7 @@ mod static_result_shell_tests {
             .expect("shell");
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
-        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+        let err = lower_result_exc_returns_for_sum(&mut graph, 0, pyerror_spec(), None)
             .expect_err("payload Ok without __pos_0 must decline");
         assert!(
             err.contains("payload-bearing Result Ok ctor"),

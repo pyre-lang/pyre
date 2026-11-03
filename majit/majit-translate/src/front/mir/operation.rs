@@ -1011,11 +1011,18 @@ impl<'a> Lowering<'a> {
             }
             ProjectionElem::Tagged(v) => {
                 if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field")) {
+                    // A marked exception class stores a by-value `String`
+                    // as one rstr attr. The three-word rust-heap header
+                    // must not be copied leaf-by-leaf, and an offset-0
+                    // move must not overwrite the class word.
+                    let store_rstr_attr = self.exception_disc_info_for_ty(&field_base_ty).is_some()
+                        && tyref_is_by_value_alloc_string(dest_ty, self.llbc);
                     // A multi-word inline field is the aggregate, not a
                     // pointer. Storing the temporary's address into the
                     // first word overwrites the discriminant.
-                    if self.struct_field_offset_from_payload(&field_base_ty, field_payload)
-                        == Some(0)
+                    if !store_rstr_attr
+                        && self.struct_field_offset_from_payload(&field_base_ty, field_payload)
+                            == Some(0)
                         && let Some(plan) = self.move_plan(dest_ty)
                         && !plan.arms.is_empty()
                         && let LinkArg::Value(src) = &value
@@ -1028,13 +1035,15 @@ impl<'a> Lowering<'a> {
                     // recursion; `jtransform.py rewrite_op_getsubstruct`).
                     // The typeptr leaf stays for `rewrite_op_setfield` /
                     // `is_typeptr_getset` to drop on a vtable object.
-                    if let Some(nested) = tyref_by_value_struct_decl(
-                        dest_ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                        self.gc_struct_ids,
-                        &self.raw_alloc_flavor_structs,
-                    ) {
+                    if !store_rstr_attr
+                        && let Some(nested) = tyref_by_value_struct_decl(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    {
                         let src = value.as_variable().cloned().ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
@@ -1120,7 +1129,7 @@ impl<'a> Lowering<'a> {
                             );
                             let field_dest_ty =
                                 tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
-                            let ty =
+                            let overlaid =
                                 crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                     &owner_root,
                                     &field_name,
@@ -1140,6 +1149,11 @@ impl<'a> Lowering<'a> {
                                         )
                                     }),
                                 );
+                            let ty = if store_rstr_attr {
+                                ValueType::Str
+                            } else {
+                                overlaid
+                            };
                             if let Some(dest) = interior_dest
                                 && self.interior_field_alias.contains_key(&dest)
                             {
@@ -6394,6 +6408,13 @@ impl<'a> Lowering<'a> {
                         self.gc_struct_ids,
                         self.immutable_fields,
                     );
+                    // Captured before `resolve_place` moves `inner`. A
+                    // by-value `String` attr of a marked exception class
+                    // is rstr `Ptr(STR)` at the read, same as the row
+                    // registered for the class.
+                    let read_rstr_attr = self.exception_disc_info_for_ty(&inner.ty).is_some()
+                        && (tyref_is_by_value_alloc_string(&field_ty, self.llbc)
+                            || tyref_is_by_value_alloc_string(&place_ty, self.llbc));
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -6439,21 +6460,25 @@ impl<'a> Lowering<'a> {
                     // through that borrow as a scalar (`Rvalue::Ref`
                     // aliases the referent).  An ordinary struct's `&P`
                     // field is a pointer the program stores and compares.
-                    let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
-                        &owner_root,
-                        &field_name,
-                        adt_field_read_value_type(
-                            &place_ty,
-                            &field_ty,
-                            container_is_enum,
-                            owner_is_closure_env,
-                            owner_declared_gc,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        ),
-                    );
+                    let mut ty =
+                        crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                            &owner_root,
+                            &field_name,
+                            adt_field_read_value_type(
+                                &place_ty,
+                                &field_ty,
+                                container_is_enum,
+                                owner_is_closure_env,
+                                owner_declared_gc,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            ),
+                        );
+                    if read_rstr_attr {
+                        ty = ValueType::Str;
+                    }
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -6499,6 +6524,10 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
+                    if read_rstr_attr {
+                        stamp_as_rstr_str(&res);
+                        self.exception_rstr_attr_vars.push(res.clone());
+                    }
                     stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
                     stamp_raw_u8_ccharp(&res, &field_ty, self.llbc);
                     stamp_fn_ptr(&res, &place_ty, self.llbc, self.static_addrs.error_carrier);
@@ -7791,6 +7820,10 @@ impl<'a> Lowering<'a> {
                     raw_u8: declared_ty.is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc))
                         || field_ty == "*mut u8"
                         || field_ty == "*const u8",
+                    str_value: declared_ty.is_some_and(|ty| {
+                        tyref_is_by_value_alloc_string(ty, self.llbc)
+                            && self.exception_disc_info_for_ty(dest_ty).is_some()
+                    }),
                 }
             })
             .collect();

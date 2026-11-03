@@ -354,6 +354,11 @@ pub(in crate::front::mir) struct AggregateField {
     pub(in crate::front::mir) window: bool,
     /// Declared field type is `*mut u8` / `*const u8` (`rffi.py` `CCHARP`).
     pub(in crate::front::mir) raw_u8: bool,
+    /// Declared value type is `ValueType::Str` (`Ptr(STR)`). A by-value
+    /// `String` attr of a marked exception class. The operand stays the
+    /// rust-heap header; `jtransform` copies it when this write's type is
+    /// `Str` and the operand is `{cap, ptr, len}`.
+    pub(in crate::front::mir) str_value: bool,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -523,6 +528,9 @@ fn ctor_ccharp_field_store(
     field: &AggregateField,
     value: &Variable,
 ) -> Result<(Variable, ValueType), LowerError> {
+    if field.str_value {
+        return Ok((value.clone(), ValueType::Str));
+    }
     if ctor_field_is_raw_u8(ctor, field) {
         if value.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
             return Ok((value.clone(), ValueType::Unsigned));

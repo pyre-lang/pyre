@@ -352,6 +352,20 @@ impl<'a> Lowering<'a> {
             .iter()
             .map(|op| operand_tyref(op).map(clone_tyref))
             .collect();
+        // Callee formals, captured before `call.func` moves into the
+        // call-shape match. Trait / function-pointer calls have no
+        // `FunDecl` inputs; the place type is the fallback ABI.
+        let call_formals: Vec<TyRef> = match &call.func {
+            CallFunc::Regular(RegularCall {
+                kind: CallKind::Fun(FunId::Regular { id }),
+                ..
+            }) => self
+                .llbc
+                .fn_by_id(*id)
+                .map(|fd| fd.signature.inputs.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         // First argument's MIR-declared type, captured before the
         // operands are consumed — `reflexive_into_alias` compares it
         // against the destination type.
@@ -8731,6 +8745,13 @@ impl<'a> Lowering<'a> {
             } else {
                 None
             };
+        self.note_rust_heap_string_attr_call(
+            &op_kind,
+            &resolved_call_args,
+            &call_arg_tys,
+            &call_formals,
+            result_var.id(),
+        );
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -9665,4 +9686,69 @@ impl<'a> Lowering<'a> {
                 .and_then(|id| crate::front::clause_spec::render_trait_impl(self.llbc, id)),
         ))
     }
+
+    /// Record `result_id` when this call passes a by-value `String`
+    /// exception attr into a rust-heap `String` ABI. Identity views
+    /// (`as_str`, `deref`, `clone`) return before the call is pushed, so
+    /// they are not recorded. Format collapse deletes `new_display`
+    /// afterwards; a call that is still a `Call` fails in `finish`.
+    fn note_rust_heap_string_attr_call(
+        &mut self,
+        op_kind: &OpKind,
+        resolved_call_args: &[Variable],
+        call_arg_tys: &[Option<TyRef>],
+        call_formals: &[TyRef],
+        result_id: u64,
+    ) {
+        if self.exception_rstr_attr_vars.is_empty() {
+            return;
+        }
+        let OpKind::Call { args, .. } = op_kind else {
+            return;
+        };
+        for arg in args {
+            let Some(var) = arg.as_variable() else {
+                continue;
+            };
+            if !self
+                .exception_rstr_attr_vars
+                .iter()
+                .any(|marked| marked == var)
+            {
+                continue;
+            }
+            let Some(index) = resolved_call_args.iter().position(|orig| orig == var) else {
+                continue;
+            };
+            let formal = call_formals.get(index);
+            let place = call_arg_tys.get(index).and_then(|ty| ty.as_ref());
+            if passes_attr_as_rust_heap(formal, place, self.llbc) {
+                self.rust_heap_string_attr_call_results.push(result_id);
+                return;
+            }
+        }
+    }
+}
+
+/// Whether this argument position expects a rust-heap `String`
+/// (`{cap, ptr, len}`), not an rstr `&str` / `str` / `Wtf8` / `Wtf8Buf`.
+///
+/// A formal that is already an rstr view is not recorded, even when the
+/// place is still `&String`. A generic formal (`&T`) falls back to the
+/// place type, which is how `Argument::new_display` is recorded before
+/// format collapse deletes it.
+fn passes_attr_as_rust_heap(formal: Option<&TyRef>, place: Option<&TyRef>, llbc: &Llbc) -> bool {
+    if let Some(formal) = formal {
+        if tyref_strips_to_str(formal, llbc) || tyref_is_string_value(formal, llbc) {
+            return false;
+        }
+        if tyref_is_rust_heap_string(formal, llbc) {
+            return true;
+        }
+    }
+    place.is_some_and(|place| {
+        !tyref_strips_to_str(place, llbc)
+            && !tyref_is_string_value(place, llbc)
+            && tyref_is_rust_heap_string(place, llbc)
+    })
 }

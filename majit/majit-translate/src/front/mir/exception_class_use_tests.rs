@@ -3,7 +3,8 @@
 
 use std::panic::AssertUnwindSafe;
 
-use crate::model::{BlockId, CallTarget, ExitCase, FunctionGraph, OpKind, ValueType};
+use crate::flowspace::model::Variable;
+use crate::model::{BlockId, CallTarget, ExitCase, FunctionGraph, LinkArg, OpKind, ValueType};
 use majit_charon_reader::ullbc::TyRef;
 use serde_json::{Value, json};
 
@@ -589,7 +590,7 @@ fn ctors(graph: &FunctionGraph) -> Vec<Ctor> {
                         owner_path,
                         is_struct,
                         variant_tag,
-                        payload_void: _,
+                        ..
                     },
                 args,
                 result_ty,
@@ -841,6 +842,16 @@ fn bad_enum_llbc(
     extras: Vec<Value>,
     globals: Vec<Value>,
 ) -> majit_charon_reader::Llbc {
+    bad_enum_with_funs(enum_leaf, field_ty, extras, globals, Vec::new())
+}
+
+fn bad_enum_with_funs(
+    enum_leaf: &str,
+    field_ty: Value,
+    extras: Vec<Value>,
+    globals: Vec<Value>,
+    funs: Vec<Value>,
+) -> majit_charon_reader::Llbc {
     let mut types = vec![enum_decl(
         0,
         &["fixture", enum_leaf],
@@ -849,7 +860,7 @@ fn bad_enum_llbc(
     types.extend(extras);
     super::window_llbc_with_globals(
         types,
-        Vec::new(),
+        funs,
         std::iter::once(marker(
             0,
             &["fixture", &format!("_exception_class_{enum_leaf}")],
@@ -857,6 +868,215 @@ fn bad_enum_llbc(
         ))
         .chain(globals)
         .collect(),
+    )
+}
+
+fn opaque_string_decl(id: u64) -> Value {
+    json!({
+        "def_id": id,
+        "item_meta": super::window_meta(&["alloc", "string", "String"], false),
+        "kind": "Opaque"
+    })
+}
+
+fn str_ref_ty() -> Value {
+    json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]})
+}
+
+fn rust_string_copy_addr() -> i64 {
+    crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+        "jit_ll_str_from_rust_string",
+    ]))
+}
+
+fn names_rust_string_copy(graph: &FunctionGraph) -> bool {
+    let expected = rust_string_copy_addr();
+    super::window_graph_ops(graph)
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ConstFnAddr { value, .. } if *value == expected))
+}
+
+fn transform_graph(graph: &FunctionGraph) -> FunctionGraph {
+    crate::codewriter::jtransform::Transformer::new(
+        &crate::codewriter::jtransform::GraphTransformConfig::default(),
+    )
+    .transform(graph)
+    .graph
+}
+
+fn sole_input(graph: &FunctionGraph) -> Variable {
+    let found: Vec<Variable> = super::window_graph_ops(graph)
+        .into_iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input { .. } => op.result.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one argument; graph={}", graph.dump());
+    found[0].clone()
+}
+
+fn missing_field_writes(graph: &FunctionGraph) -> Vec<(ValueType, LinkArg)> {
+    super::window_graph_ops(graph)
+        .into_iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field, value, ty, ..
+            } if field.name == "missing" => Some((ty.clone(), value.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_coerce_then_setfield(graph: &FunctionGraph, source: &Variable) {
+    let expected = rust_string_copy_addr();
+    let mut found = false;
+    for block in &graph.blocks {
+        let ops = &block.operations;
+        for window in ops.windows(4) {
+            let addr = matches!(
+                &window[0].kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected
+            );
+            let OpKind::CallResidual { args_r, .. } = &window[1].kind else {
+                continue;
+            };
+            let live = matches!(window[2].kind, OpKind::Live { .. });
+            let write = match &window[3].kind {
+                OpKind::FieldWrite {
+                    field, value, ty, ..
+                } => {
+                    field.name == "missing"
+                        && *ty == ValueType::Str
+                        && matches!(value, LinkArg::Value(stored) if window[1].result.as_ref() == Some(stored))
+                }
+                _ => false,
+            };
+            if addr && args_r == &vec![source.clone()] && live && write {
+                found = true;
+            }
+        }
+    }
+    assert!(
+        found,
+        "rust-heap String is copied into the rstr attr before setfield; graph={}",
+        graph.dump()
+    );
+}
+
+fn assert_by_value_string_attr_is_rstr(llbc: &majit_charon_reader::Llbc, class: &str) {
+    let (_, fields, _, _, attrs) = program_metadata(llbc);
+    assert_rows(&fields, class, &[("missing", "str", false)]);
+    assert_eq!(
+        attrs.get(class),
+        Some(&vec![("missing".to_string(), ValueType::Str)])
+    );
+    let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+    assert_eq!(
+        bk.project_struct_field_type("str"),
+        crate::annotator::model::s_str0()
+    );
+    let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+    let rtyper = std::rc::Rc::new(crate::translator::rtyper::rtyper::RPythonTyper::new(&ann));
+    let repr = crate::translator::rtyper::rmodel::rtyper_makerepr(
+        &crate::annotator::model::s_str0(),
+        &rtyper,
+    )
+    .expect("SomeString rtyper_makerepr");
+    assert_eq!(repr.class_name(), "StringRepr");
+    assert_eq!(
+        repr.lowleveltype(),
+        &*crate::translator::rtyper::lltypesystem::rstr::STRPTR
+    );
+}
+
+fn assert_missing_field_not_str(
+    fields: &crate::front::semantic::StructFieldRegistry,
+    attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    keys: &[&str],
+) {
+    let mut saw_row = false;
+    for key in keys {
+        if let Some(rows) = row_names(fields, key) {
+            for (name, ty, _) in &rows {
+                if name == "missing" {
+                    saw_row = true;
+                    assert_ne!(ty.as_str(), "str", "{key} row {rows:?}");
+                }
+            }
+        }
+        if let Some(rows) = attrs.get(*key) {
+            for (name, ty) in rows {
+                if name == "missing" {
+                    assert_ne!(*ty, ValueType::Str, "{key} attr {rows:?}");
+                }
+            }
+        }
+    }
+    assert!(saw_row, "missing row absent under {keys:?}");
+}
+
+fn call_regular(fun_id: u64, arg: Value, dest: Value, target: u64, unwind: u64) -> Value {
+    json!({"Call": {"call": {
+        "func": {"Regular": {
+            "kind": {"Fun": fun_id},
+            "generics": super::window_empty_generics()
+        }},
+        "args": [{"Copy": arg}],
+        "dest": dest
+    }, "target": target, "on_unwind": unwind}})
+}
+
+fn enum_string_field_llbc(leaf: &str, marked: bool, funs: Vec<Value>) -> majit_charon_reader::Llbc {
+    let string_ty = adt(1);
+    let types = vec![
+        enum_decl(
+            0,
+            &["fixture", leaf],
+            vec![variant("S", vec![named_field("missing", &string_ty)], 0)],
+        ),
+        opaque_string_decl(1),
+    ];
+    let globals = if marked {
+        vec![marker(
+            0,
+            &["fixture", &format!("_exception_class_{leaf}")],
+            "",
+        )]
+    } else {
+        Vec::new()
+    };
+    super::window_llbc_with_globals(types, funs, globals)
+}
+
+fn build_struct_aggregate(
+    id: u64,
+    name: &str,
+    type_id: u64,
+    ret_ty: &Value,
+    arg_tys: &[Value],
+    operand_places: Vec<Value>,
+) -> Value {
+    let mut locals = vec![named_local(0, None, ret_ty)];
+    let mut inputs = Vec::new();
+    for (index, ty) in arg_tys.iter().enumerate() {
+        inputs.push(ty.clone());
+        locals.push(named_local((index + 1) as u64, None, ty));
+    }
+    let body = unstructured(
+        arg_tys.len() as u64,
+        locals,
+        vec![ret_block(vec![assign(
+            local_place(0, ret_ty),
+            json!({"Aggregate": [{"Adt": [type_id, null, null]}, operand_places]}),
+        )])],
+    );
+    fun(
+        id,
+        &["fixture", "synth", name],
+        inputs,
+        ret_ty.clone(),
+        body,
     )
 }
 
@@ -1153,7 +1373,7 @@ fn exception_class_non_one_word_field_panics() {
         vec![string_decl.clone()],
         vec![],
     );
-    expect_one_word_panic(&bad_str, "BadStrS", "String");
+    assert_by_value_string_attr_is_rstr(&bad_str, "BadStrS");
 
     let vec_adt = json!({
         "Adt": {
@@ -1210,10 +1430,314 @@ fn exception_class_non_one_word_field_panics() {
         })],
         vec![],
     );
-    let (_, fields, _, _, _) = program_metadata(&ok_ptr);
+    let (_, fields, _, _, attrs) = program_metadata(&ok_ptr);
     let rows = row_names(&fields, "OkPtrS").expect("OkPtrS");
     assert!(
         rows.iter().any(|(name, _, _)| name == "missing"),
         "{rows:?}"
+    );
+    assert_missing_field_not_str(&fields, &attrs, &["OkPtrS"]);
+}
+
+#[test]
+fn exception_class_string_attr_coerces_rust_heap_on_write() {
+    let string_ty = adt(1);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[string_ty.clone()],
+        vec![copy_of(local_place(1, &string_ty))],
+    );
+    let llbc = enum_string_field_llbc("BadStr", true, vec![build]);
+    let graph = lower(&llbc, "build_s");
+    let source = sole_input(&graph);
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 == ValueType::Str,
+        "front stores the attr as Ptr(STR); got {writes:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        matches!(&writes[0].1, LinkArg::Value(value) if value == &source),
+        "the operand is still the rust-heap local; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !names_rust_string_copy(&graph),
+        "the copy is a jtransform rewrite; graph={}",
+        graph.dump()
+    );
+    let inputs = inputs(&graph);
+    assert!(
+        inputs.iter().any(|(ty, root)| {
+            matches!(ty, ValueType::Ref(Some(name)) if name == "String" || name == "string::String")
+                || root
+                    .as_deref()
+                    .is_some_and(|name| name == "String" || name == "string::String")
+        }),
+        "the local stays a rust-heap header so the copy has a source; inputs={inputs:?}"
+    );
+    let transformed = transform_graph(&graph);
+    assert_coerce_then_setfield(&transformed, &source);
+}
+
+#[test]
+fn exception_class_string_attr_read_as_str_is_rstr() {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let string_ty = adt(1);
+    let out = str_ref_ty();
+    let disc_ty = isize_disc_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref.clone(), &enum_ty, 0, 0, &string_ty);
+    let disc = local_place(2, &disc_ty);
+    let ret = local_place(0, &out);
+    let as_str = super::window_opaque_fun(
+        0,
+        &["alloc", "string", "String", "as_str"],
+        vec![shared_ref(&string_ty)],
+        out.clone(),
+    );
+    let reader = json!({
+        "def_id": 1,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["BadStr", 0]},
+                {"Impl": {"Ty": {
+                    "skip_binder": {"Value": [0, enum_ty]},
+                    "kind": "InherentImplBlock"
+                }}},
+                {"Ident": ["read_missing", 0]}
+            ],
+            "span": span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "signature": {"is_unsafe": false, "inputs": [enum_ref.clone()], "output": out.clone()},
+        "body": unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+                named_local(2, None, &disc_ty),
+            ],
+            vec![
+                regular(
+                    vec![assign(disc.clone(), json!({"Discriminant": deref}))],
+                    switch_int(disc, &[(0, 1)], 2),
+                ),
+                regular(
+                    vec![],
+                    call_regular(0, field, ret, 3, 2),
+                ),
+                regular(vec![], json!({"Abort": "UndefinedBehavior"})),
+                ret_block(vec![]),
+            ],
+        )
+    });
+    let llbc = enum_string_field_llbc("BadStr", true, vec![as_str, reader]);
+    let graph = lower(&llbc, "read_missing");
+    let reads: Vec<&crate::model::SpaceOperation> = super::window_graph_ops(&graph)
+        .into_iter()
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty, .. }
+                    if field.name == "missing" && *ty == ValueType::Str
+            )
+        })
+        .collect();
+    assert_eq!(reads.len(), 1, "{}", graph.dump());
+    let produced = reads[0].result.as_ref().expect("field read result");
+    assert_eq!(
+        produced.concretetype().as_ref(),
+        Some(&*crate::translator::rtyper::lltypesystem::rstr::STRPTR),
+        "the getattr word is Ptr(STR); graph={}",
+        graph.dump()
+    );
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.exits)
+        .find_map(|link| {
+            (link.target == graph.returnblock).then(|| match link.args.first() {
+                Some(LinkArg::Value(value)) => Some(value.clone()),
+                _ => None,
+            })
+        })
+        .expect("return link")
+        .expect("return value");
+    let (block_id, index) = super::super::resolve_to_producer_op(&graph, &returned)
+        .unwrap_or_else(|| panic!("as_str must alias the attr; graph={}", graph.dump()));
+    let producer = &graph.block(block_id).operations[index];
+    assert!(
+        matches!(
+            &producer.kind,
+            OpKind::FieldRead { field, ty, .. }
+                if field.name == "missing" && *ty == ValueType::Str
+        ),
+        "as_str is the rstr word, not a rust-heap helper; op={:?} graph={}",
+        producer.kind,
+        graph.dump()
+    );
+    assert!(
+        producer.result.as_ref() == Some(produced),
+        "the returned word is the stamped getattr"
+    );
+    let calls_as_str = super::window_graph_ops(&graph)
+        .iter()
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("as_str"),
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "as_str",
+            _ => false,
+        });
+    assert!(
+        !calls_as_str,
+        "as_str aliases the rstr attr; graph={}",
+        graph.dump()
+    );
+    assert!(!names_rust_string_copy(&graph), "{}", graph.dump());
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_rust_string_copy(&transformed),
+        "jtransform must not copy a Ptr(STR) attr through the rust-heap helper; graph={}",
+        transformed.dump()
+    );
+}
+
+#[test]
+fn exception_class_string_attr_rust_heap_use_is_unsupported() {
+    let enum_ty = adt(0);
+    let enum_ref = shared_ref(&enum_ty);
+    let string_ty = adt(1);
+    let out = usize_ty();
+    let deref = super::window_place(
+        json!({"Projection": [local_place(1, &enum_ref), "Deref"]}),
+        &enum_ty,
+    );
+    let field = downcast_field(deref, &enum_ty, 0, 0, &string_ty);
+    let eat = super::window_opaque_fun(0, &["fixture", "eat"], vec![string_ty], out.clone());
+    let (unwind, ret) = super::window_unwind_and_return_blocks();
+    let user = fun(
+        1,
+        &["fixture", "use_missing"],
+        vec![enum_ref.clone()],
+        out.clone(),
+        unstructured(
+            1,
+            vec![
+                named_local(0, None, &out),
+                named_local(1, Some("self"), &enum_ref),
+            ],
+            vec![
+                regular(vec![], call_regular(0, field, local_place(0, &out), 2, 1)),
+                unwind,
+                ret,
+            ],
+        ),
+    );
+    let llbc = enum_string_field_llbc("BadStr", true, vec![eat, user]);
+    let err = match super::super::lower_function(&llbc, "use_missing") {
+        Err(err) => err,
+        Ok(graph) => panic!(
+            "a rust-heap String ABI on the attr must fail; graph={}",
+            graph.dump()
+        ),
+    };
+    let text = err.to_string();
+    assert!(
+        text.contains("String attr read as rust-heap String"),
+        "{text}"
+    );
+}
+
+#[test]
+fn exception_class_unmarked_string_field_stays_rust_heap() {
+    let string_ty = adt(1);
+    let enum_ty = adt(0);
+    let build = build_aggregate(
+        0,
+        "build_s",
+        0,
+        0,
+        &enum_ty,
+        &[string_ty.clone()],
+        vec![copy_of(local_place(1, &string_ty))],
+    );
+    let unmarked = enum_string_field_llbc("Plain", false, vec![build]);
+    let (_, fields, _, _, attrs) = program_metadata(&unmarked);
+    assert_missing_field_not_str(
+        &fields,
+        &attrs,
+        &["Plain::S", "fixture::Plain::S", "synth::Plain::S"],
+    );
+    let graph = lower(&unmarked, "build_s");
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 != ValueType::Str,
+        "an unmarked enum keeps the rust-heap store; got {writes:?} graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_rust_string_copy(&transformed),
+        "no coerce without the exception-class flag; graph={}",
+        transformed.dump()
+    );
+
+    let holder_ty = adt(0);
+    let holder = super::interior_struct(
+        0,
+        &["fixture", "Holder"],
+        &[("missing", string_ty.clone())],
+        24,
+        &[0],
+        false,
+    );
+    let build_holder = build_struct_aggregate(
+        0,
+        "build_holder",
+        0,
+        &holder_ty,
+        &[string_ty.clone()],
+        vec![copy_of(local_place(1, &string_ty))],
+    );
+    let plain = super::window_llbc_with_globals(
+        vec![holder, opaque_string_decl(1)],
+        vec![build_holder],
+        Vec::new(),
+    );
+    let (_, fields, _, _, attrs) = program_metadata(&plain);
+    assert_missing_field_not_str(&fields, &attrs, &["Holder", "fixture::Holder"]);
+    let graph = lower(&plain, "build_holder");
+    let writes = missing_field_writes(&graph);
+    assert_eq!(writes.len(), 1, "{}", graph.dump());
+    assert!(
+        writes[0].0 != ValueType::Str,
+        "a plain struct keeps the rust-heap store; got {writes:?} graph={}",
+        graph.dump()
+    );
+    let transformed = transform_graph(&graph);
+    assert!(
+        !names_rust_string_copy(&transformed),
+        "a plain String field is not an rstr attr; graph={}",
+        transformed.dump()
     );
 }

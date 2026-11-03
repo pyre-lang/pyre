@@ -3995,19 +3995,33 @@ fn register_exception_class_variant_fields(
                     "exception class {class_name}.{fname}: field type {spelling} is not a one-word attr"
                 );
             }
-            let row_ty = annotation_struct_field_type(
-                &field.ty,
-                llbc,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            );
-            let attr_ty = tyref_to_attr_value_type_with(
-                &field.ty,
-                llbc,
-                no_tombstoned_leaves(),
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            );
+            // A by-value `alloc::string::String` is the rstr attr.
+            // `"str"` is the spelling `project_struct_field_type` already
+            // maps to `s_str0()` (`SomeString`). The register bank is
+            // `ValueType::Str` (`Ptr(STR)`). A borrow or raw pointer is
+            // not this helper, so it keeps the address row.
+            let by_value_string = tyref_is_by_value_alloc_string(&field.ty, llbc);
+            let row_ty = if by_value_string {
+                "str".to_string()
+            } else {
+                annotation_struct_field_type(
+                    &field.ty,
+                    llbc,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            };
+            let attr_ty = if by_value_string {
+                ValueType::Str
+            } else {
+                tyref_to_attr_value_type_with(
+                    &field.ty,
+                    llbc,
+                    no_tombstoned_leaves(),
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            };
             attrs.push((fname.clone(), attr_ty));
             rows.push(field_row_from_decl(index, field, row_ty, llbc));
         }
@@ -7143,6 +7157,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         lo.graph.thread_undefined_field_bases();
         // `flowcontext.py` `fixeggblocks`, once the body is a finished graph.
         lo.graph.fixeggblocks();
+        reject_rust_heap_string_attr_call(lo)?;
         Ok(())
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals
@@ -7295,6 +7310,31 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         Err(e) => Err(e),
     }
+}
+
+/// A by-value `String` exception attr is `Ptr(STR)`. A call that still
+/// passes that word into a rust-heap `String` ABI after format collapse
+/// is a miscompile: the callee would read `{cap, ptr, len}` off an rstr.
+fn reject_rust_heap_string_attr_call(lo: &Lowering<'_>) -> Result<(), LowerError> {
+    if lo.rust_heap_string_attr_call_results.is_empty() {
+        return Ok(());
+    }
+    for block in &lo.graph.blocks {
+        for op in &block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            if !lo.rust_heap_string_attr_call_results.contains(&result.id()) {
+                continue;
+            }
+            if matches!(op.kind, OpKind::Call { .. } | OpKind::CallResidual { .. }) {
+                return Err(LowerError::Unsupported(
+                    "String attr read as rust-heap String".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
