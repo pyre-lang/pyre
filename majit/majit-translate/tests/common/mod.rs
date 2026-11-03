@@ -11,6 +11,7 @@ use majit_translate::front::mir::{LowerContext, LowerError, lower_fun_decl_with_
 use majit_translate::model::FunctionGraph;
 use rustpython_compiler::{Mode, compile as rp_compile};
 use rustpython_compiler_core::bytecode::CodeObject;
+use std::cell::Cell;
 use std::sync::OnceLock;
 
 pub const INTERPRETER_LLBC: &str = concat!(
@@ -29,6 +30,11 @@ pub const RLIB_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../target/llbc/majit-rlib.ullbc"
 );
+pub const JIT_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/llbc/pyre-jit.ullbc"
+);
+pub const CORPUS_LLBC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
 
 /// Compile `src` as an exec-mode module and return the first nested code
 /// object (the first function body). Panics if compilation fails or the
@@ -51,12 +57,16 @@ fn llbc_slot(path: &'static str) -> &'static OnceLock<Llbc> {
     static OBJECT: OnceLock<Llbc> = OnceLock::new();
     static MODULE: OnceLock<Llbc> = OnceLock::new();
     static RLIB: OnceLock<Llbc> = OnceLock::new();
+    static JIT: OnceLock<Llbc> = OnceLock::new();
+    static CORPUS: OnceLock<Llbc> = OnceLock::new();
     match path {
         INTERPRETER_LLBC => &INTERPRETER,
         OBJECT_LLBC => &OBJECT,
         MODULE_LLBC => &MODULE,
         RLIB_LLBC => &RLIB,
-        other => panic!("load_llbc only knows the four production artefacts, got {other}"),
+        JIT_LLBC => &JIT,
+        CORPUS_LLBC => &CORPUS,
+        other => panic!("load_llbc only knows the production artefacts, got {other}"),
     }
 }
 
@@ -65,13 +75,70 @@ fn context_slot(path: &'static str) -> &'static OnceLock<LowerContext<'static>> 
     static OBJECT: OnceLock<LowerContext<'static>> = OnceLock::new();
     static MODULE: OnceLock<LowerContext<'static>> = OnceLock::new();
     static RLIB: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static JIT: OnceLock<LowerContext<'static>> = OnceLock::new();
+    static CORPUS: OnceLock<LowerContext<'static>> = OnceLock::new();
     match path {
         INTERPRETER_LLBC => &INTERPRETER,
         OBJECT_LLBC => &OBJECT,
         MODULE_LLBC => &MODULE,
         RLIB_LLBC => &RLIB,
-        other => panic!("lower_context_for only knows the four production artefacts, got {other}"),
+        JIT_LLBC => &JIT,
+        CORPUS_LLBC => &CORPUS,
+        other => panic!("lower_context_for only knows the production artefacts, got {other}"),
     }
+}
+
+static LLBC_LINK_STATE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+thread_local! {
+    static LLBC_LINK_STATE_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Hold the process-wide link-state lock for the duration of `f`.
+///
+/// Nested calls on the same thread skip a second acquire so a census worker
+/// parent can wrap several artefacts, and so [`with_llbc_link_state`] can
+/// snapshot more than one parse under one lock.
+pub fn with_llbc_link_lock<R>(f: impl FnOnce() -> R) -> R {
+    LLBC_LINK_STATE_HELD.with(|held| {
+        if held.get() {
+            f()
+        } else {
+            let _mutex = LLBC_LINK_STATE_LOCK.lock();
+            held.set(true);
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    LLBC_LINK_STATE_HELD.with(|held| held.set(false));
+                }
+            }
+            let _reset = Reset;
+            f()
+        }
+    })
+}
+
+/// Snapshot `llbc`'s link side tables, run `f`, and restore them afterwards
+/// (including when `f` panics). Holds [`with_llbc_link_lock`] for the call.
+pub fn with_llbc_link_state<R>(llbc: &'static Llbc, f: impl FnOnce() -> R) -> R {
+    with_llbc_link_lock(|| {
+        let snapshot = llbc.snapshot_link_state();
+        struct Restore {
+            llbc: &'static Llbc,
+            snapshot: Option<majit_charon_reader::LinkStateSnapshot>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(snapshot) = self.snapshot.take() {
+                    self.llbc.restore_link_state(snapshot);
+                }
+            }
+        }
+        let _restore = Restore {
+            llbc,
+            snapshot: Some(snapshot),
+        };
+        f()
+    })
 }
 
 /// Parse `path` once per test binary and share the artefact.
@@ -91,7 +158,14 @@ pub fn load_llbc_if_present(path: &'static str) -> Option<&'static Llbc> {
 
 /// Derive [`LowerContext`] once per artefact in this test binary.
 pub fn lower_context_for(llbc: &'static Llbc) -> &'static LowerContext<'static> {
-    for path in [INTERPRETER_LLBC, OBJECT_LLBC, MODULE_LLBC, RLIB_LLBC] {
+    for path in [
+        INTERPRETER_LLBC,
+        OBJECT_LLBC,
+        MODULE_LLBC,
+        RLIB_LLBC,
+        JIT_LLBC,
+        CORPUS_LLBC,
+    ] {
         if let Some(loaded) = llbc_slot(path).get()
             && std::ptr::eq(llbc, loaded)
         {
@@ -122,10 +196,12 @@ pub fn lower_named_with_static_addrs(
     function_name: &str,
     static_addrs: HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
-    let fd = llbc
-        .local_fn(function_name)
-        .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
-    lower_fun_decl_with_static_addrs(lower_context_for(llbc), fd, static_addrs)
+    with_llbc_link_lock(|| {
+        let fd = llbc
+            .local_fn(function_name)
+            .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
+        lower_fun_decl_with_static_addrs(lower_context_for(llbc), fd, static_addrs)
+    })
 }
 
 pub fn interpreter_llbc() -> Option<&'static Llbc> {
@@ -138,6 +214,10 @@ pub fn object_llbc() -> Option<&'static Llbc> {
 
 pub fn module_llbc() -> Option<&'static Llbc> {
     load_llbc_if_present(MODULE_LLBC)
+}
+
+pub fn jit_llbc() -> Option<&'static Llbc> {
+    load_llbc_if_present(JIT_LLBC)
 }
 
 /// rbigint bodies live in `majit-rlib.ullbc`; their callers live in

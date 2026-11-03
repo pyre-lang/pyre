@@ -6,15 +6,12 @@
 //! `NamedConst`, folded by `const_eval_init_body`. A zero-arg
 //! `__trait_const` call is not a registered graph.
 
-use majit_charon_reader::Llbc;
+mod common;
+
+use common::{OBJECT_LLBC, load_llbc};
 use majit_translate::HostStaticAddrs;
 use majit_translate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names;
 use majit_translate::model::{CallTarget, OpKind};
-
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
 
 fn call_segments(target: &CallTarget) -> Option<&[String]> {
     match target {
@@ -25,9 +22,9 @@ fn call_segments(target: &CallTarget) -> Option<&[String]> {
 
 #[test]
 fn nursery_spec_folds_gc_type_size() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        std::slice::from_ref(&llbc),
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &[],
         &[
@@ -137,9 +134,9 @@ fn is_trait_const_sentinel(target: &CallTarget) -> bool {
 
 #[test]
 fn malloc_templates_with_a_clause_size_are_not_look_inside() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        std::slice::from_ref(&llbc),
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &[],
         &[

@@ -8,6 +8,9 @@
 //! scalar. An unspecialized `GcType::SIZE` is still a `Clause`, so it stays
 //! the `__trait_const` ref sentinel. That template is `dont_look_inside`.
 
+mod common;
+
+use common::{INTERPRETER_LLBC, OBJECT_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
@@ -17,13 +20,8 @@ use majit_translate::{
     model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType},
 };
 
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
-
-fn load_object() -> Llbc {
-    Llbc::load(OBJECT_LLBC).expect("pyre-object.ullbc is already extracted")
+fn load_object() -> &'static Llbc {
+    load_llbc(OBJECT_LLBC)
 }
 
 fn int_family(ty: &ValueType) -> bool {
@@ -256,7 +254,7 @@ fn scalar_pointer_params_match_int_callers() {
     assert!(passed_int, "caller passes hash_out as int");
 
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
-        std::slice::from_ref(&llbc),
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["dictmultiobject", "rordereddict"],
     )
@@ -372,11 +370,7 @@ fn ll_list_int_length_reads_int_array_len_field() {
 /// (`flowspace_adapter` `undefined operand`).
 #[test]
 fn orig_extend_from_tuple_has_no_undefined_link_args() {
-    const INTERPRETER_LLBC: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/llbc/pyre-interpreter.ullbc"
-    );
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("pyre-interpreter.ullbc is already extracted");
+    let llbc = load_llbc(INTERPRETER_LLBC);
     let graph =
         lower_function(&llbc, "_orig_extend_from_tuple").expect("lower _orig_extend_from_tuple");
     let mut holes = Vec::new();

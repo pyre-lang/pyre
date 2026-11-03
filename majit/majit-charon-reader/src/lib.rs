@@ -275,6 +275,20 @@ impl DedupBody {
     }
 }
 
+/// Link-side tables tests publish onto a shared parse.
+///
+/// Tests that publish link state onto a shared parse restore it afterwards.
+pub struct LinkStateSnapshot {
+    root_stack_effects: (Vec<String>, Vec<String>),
+    stack_sensitive_fns: Vec<String>,
+    stack_depth_neutral_fns: Vec<String>,
+    stack_leaves_above_fns: Vec<String>,
+    stack_observes_fns: Vec<String>,
+    stack_param_slots_fns: Vec<(String, Vec<u8>)>,
+    stack_returns_index_fns: Vec<String>,
+    stack_sensitive_ready: bool,
+}
+
 impl Llbc {
     /// Load and parse a `.llbc` / `.ullbc` JSON file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, SchemaError> {
@@ -610,6 +624,41 @@ impl Llbc {
             .read()
             .binary_search_by(|known| known.as_str().cmp(path))
             .is_ok()
+    }
+
+    /// Snapshot the link-side tables tests publish onto a shared parse.
+    ///
+    /// Tests that publish link state onto a shared parse restore it afterwards.
+    pub fn snapshot_link_state(&self) -> LinkStateSnapshot {
+        LinkStateSnapshot {
+            root_stack_effects: self.root_stack_effects.read().clone(),
+            stack_sensitive_fns: self.stack_sensitive_fns.read().clone(),
+            stack_depth_neutral_fns: self.stack_depth_neutral_fns.read().clone(),
+            stack_leaves_above_fns: self.stack_leaves_above_fns.read().clone(),
+            stack_observes_fns: self.stack_observes_fns.read().clone(),
+            stack_param_slots_fns: self.stack_param_slots_fns.read().clone(),
+            stack_returns_index_fns: self.stack_returns_index_fns.read().clone(),
+            stack_sensitive_ready: self
+                .stack_sensitive_ready
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    /// Replace the link-side tables with a [`Self::snapshot_link_state`] copy.
+    ///
+    /// Tests that publish link state onto a shared parse restore it afterwards.
+    pub fn restore_link_state(&self, snapshot: LinkStateSnapshot) {
+        *self.root_stack_effects.write() = snapshot.root_stack_effects;
+        *self.stack_sensitive_fns.write() = snapshot.stack_sensitive_fns;
+        *self.stack_depth_neutral_fns.write() = snapshot.stack_depth_neutral_fns;
+        *self.stack_leaves_above_fns.write() = snapshot.stack_leaves_above_fns;
+        *self.stack_observes_fns.write() = snapshot.stack_observes_fns;
+        *self.stack_param_slots_fns.write() = snapshot.stack_param_slots_fns;
+        *self.stack_returns_index_fns.write() = snapshot.stack_returns_index_fns;
+        self.stack_sensitive_ready.store(
+            snapshot.stack_sensitive_ready,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// The folded initializer stored on `def_id`, if this artefact has one.
@@ -1580,5 +1629,46 @@ mod tests {
             Some(&vec![serde_json::json!("Usize"), serde_json::json!("8")])
         );
         assert_eq!(provenance[2].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn restore_link_state_puts_every_snapshotted_table_back() {
+        let l = llbc("[]");
+        assert!(!l.is_stack_sensitive_fn("p"));
+        assert!(!l.is_stack_depth_neutral_fn("p"));
+        assert!(!l.is_stack_leaves_above_fn("p"));
+        assert!(!l.is_stack_observes_fn("p"));
+        assert!(!l.is_stack_returns_index_fn("p"));
+        assert!(l.stack_param_slots("p").is_none());
+        assert_eq!(l.root_stack_effect("c", "p"), None);
+        assert!(!l.stack_sensitive_fns_complete());
+
+        let snapshot = l.snapshot_link_state();
+        l.set_root_stack_effects(vec!["c".into()], vec!["p".into()]);
+        l.register_stack_sensitive_fns(["p".into()]);
+        l.register_stack_depth_neutral_fns(["p".into()]);
+        l.register_stack_leaves_above_fns(["p".into()]);
+        l.register_stack_observes_fns(["p".into()]);
+        l.register_stack_param_slots_fns([("p".into(), vec![0])]);
+        l.register_stack_returns_index_fns(["p".into()]);
+        l.mark_stack_sensitive_fns_complete();
+        assert!(l.is_stack_sensitive_fn("p"));
+        assert!(l.is_stack_depth_neutral_fn("p"));
+        assert!(l.is_stack_leaves_above_fn("p"));
+        assert!(l.is_stack_observes_fn("p"));
+        assert!(l.is_stack_returns_index_fn("p"));
+        assert_eq!(l.stack_param_slots("p").as_deref(), Some(&[0][..]));
+        assert_eq!(l.root_stack_effect("c", "p"), Some(true));
+        assert!(l.stack_sensitive_fns_complete());
+
+        l.restore_link_state(snapshot);
+        assert!(!l.is_stack_sensitive_fn("p"));
+        assert!(!l.is_stack_depth_neutral_fn("p"));
+        assert!(!l.is_stack_leaves_above_fn("p"));
+        assert!(!l.is_stack_observes_fn("p"));
+        assert!(!l.is_stack_returns_index_fn("p"));
+        assert!(l.stack_param_slots("p").is_none());
+        assert_eq!(l.root_stack_effect("c", "p"), None);
+        assert!(!l.stack_sensitive_fns_complete());
     }
 }

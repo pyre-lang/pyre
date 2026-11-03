@@ -18,13 +18,10 @@
 //! produce a false red.  A stale artefact can only under-report, which
 //! passes; a new hint can only over-report, which fails.
 
-use majit_charon_reader::Llbc;
-use majit_translate::front::llbc_hints::harvest_hints_from_llbcs;
+mod common;
 
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-interpreter.ullbc"
-);
+use common::{INTERPRETER_LLBC, load_llbc};
+use majit_translate::front::llbc_hints::harvest_hints_from_llbcs;
 
 /// The leaf name of every function reviewed as `unroll_safe`, with the
 /// upstream decorator it mirrors.
@@ -556,8 +553,8 @@ fn harvested_unroll_safe() -> Option<Vec<String>> {
         );
         return None;
     }
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
-    let hints = harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+    let llbc = load_llbc(INTERPRETER_LLBC);
+    let hints = harvest_hints_from_llbcs(std::slice::from_ref(llbc));
     let mut paths: Vec<String> = hints
         .iter()
         .filter(|(_, values)| values.iter().any(|h| h == "unroll_safe"))

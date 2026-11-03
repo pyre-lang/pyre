@@ -149,9 +149,9 @@ fn tuple_len_reads_the_fixed_list_not_the_items_block() {
 /// `items_block_items_base` accessor aliases to that array header.
 #[test]
 fn tuple_getitem_reads_the_fixed_list_not_the_items_block() {
-    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let llbc = load_llbc(OBJECT_LLBC);
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        std::slice::from_ref(llbc),
         HostStaticAddrs::default(),
         &["tupleobject"],
         &["w_tuple_getitem_known"],

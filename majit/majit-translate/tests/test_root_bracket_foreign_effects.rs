@@ -8,6 +8,9 @@
 //! `pyre-object`'s own answers; `core` and the other crates outside the
 //! translation input cannot name the API at all.
 
+mod common;
+
+use common::{INTERPRETER_LLBC, MODULE_LLBC, OBJECT_LLBC, load_llbc, with_llbc_link_state};
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
 use majit_translate::front::mir::{
@@ -16,19 +19,6 @@ use majit_translate::front::mir::{
     lower_function, mark_foreign_scope_owners, scope_owner_identity,
 };
 use majit_translate::model::OpKind;
-
-const OBJECT_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-object.ullbc"
-);
-const INTERPRETER_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-interpreter.ullbc"
-);
-const MODULE_LLBC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/llbc/pyre-module.ullbc"
-);
 
 /// Bodies that open a bracket, sampled: every `erased_root_bracket_guards`
 /// call starts a fresh root-stack analysis, so the whole population costs
@@ -104,8 +94,8 @@ fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
         eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
         return;
     }
-    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
-    let touching = harvest_root_stack_touching_paths(&object);
+    let object = load_llbc(OBJECT_LLBC);
+    let touching = harvest_root_stack_touching_paths(object);
     assert!(
         touching
             .iter()
@@ -119,17 +109,18 @@ fn published_dependency_effects_let_an_importing_crate_erase_its_brackets() {
         "an allocation leaves the root stack as it found it"
     );
     let crate_name = object.crate_name().to_string();
-    drop(object);
 
-    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
-    let (opening, before) = erased_bodies(&interpreter);
-    interpreter.set_root_stack_effects(vec![crate_name], touching);
-    let (_, after) = erased_bodies(&interpreter);
-    eprintln!("bodies opening a bracket: {opening}; erased before {before}, after {after}");
-    assert!(
-        after > before,
-        "publishing pyre-object's effects must let more interpreter brackets go"
-    );
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    with_llbc_link_state(interpreter, || {
+        let (opening, before) = erased_bodies(interpreter);
+        interpreter.set_root_stack_effects(vec![crate_name], touching);
+        let (_, after) = erased_bodies(interpreter);
+        eprintln!("bodies opening a bracket: {opening}; erased before {before}, after {after}");
+        assert!(
+            after > before,
+            "publishing pyre-object's effects must let more interpreter brackets go"
+        );
+    });
 }
 
 #[test]
@@ -140,8 +131,8 @@ fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() 
         eprintln!("skipping: run `python3 scripts/extract-llbc.py`");
         return;
     }
-    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
-    let owning = harvest_scope_owning_identities(&object);
+    let object = load_llbc(OBJECT_LLBC);
+    let owning = harvest_scope_owning_identities(object);
     assert!(
         owning.iter().any(|p| p.contains("RootedItems")),
         "RootedItems::new opens push_roots and returns that guard: {owning:?}"
@@ -150,8 +141,6 @@ fn a_bodyless_rooted_items_new_returns_the_scope_its_defining_crate_published() 
         owning.iter().any(|p| p.contains("DictOperationGuard")),
         "DictOperationGuard::new returns the bracket it opened: {owning:?}"
     );
-    drop(object);
-
     let mut interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
     let external_id = interpreter
         .iter_fun_decls()
@@ -195,8 +184,8 @@ fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
     // `PyError` is a one-field tuple over the raised value. The named
     // fields live on `PyErrorObject`, which `Deref` exposes. `parse_filter_spec`
     // reads `error.kind` as that struct's field.
-    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter");
-    let fields = harvest_published_structs(&interpreter);
+    let interpreter = load_llbc(INTERPRETER_LLBC);
+    let fields = harvest_published_structs(interpreter);
     let pyerror_object = fields
         .iter()
         .find(|body| body.path.ends_with("::PyErrorObject"))
@@ -213,8 +202,6 @@ fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
             .map(|field| field.name.as_deref())
             .collect::<Vec<_>>()
     );
-    drop(interpreter);
-
     let mut module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
     let opaque = module.iter_type_decls().any(|td| {
         td.item_meta.name_path().ends_with("::PyErrorObject")
@@ -253,9 +240,8 @@ fn an_opaque_pyerror_object_field_reads_the_defining_crates_field() {
 /// keeps the defining owner's fields when constructing an inline header.
 #[test]
 fn imported_class_header_construction_keeps_the_defining_fields() {
-    let object = Llbc::load(OBJECT_LLBC).expect("load pyre-object");
-    let fields = harvest_published_structs(&object);
-    drop(object);
+    let object = load_llbc(OBJECT_LLBC);
+    let fields = harvest_published_structs(object);
     let mut module = Llbc::load(MODULE_LLBC).expect("load pyre-module");
     apply_published_structs(&mut module, &fields);
     assert!(module.iter_type_decls().any(|td| {

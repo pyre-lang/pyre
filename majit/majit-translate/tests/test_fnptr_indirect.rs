@@ -7,11 +7,12 @@
 //! alongside it. One test in one process can toggle the cause and watch the
 //! instrument respond, which is the whole point of the file.
 
+mod common;
+
+use common::{CORPUS_LLBC, load_llbc};
 use majit_charon_reader::Llbc;
 use majit_translate::front::mir::lower_function;
 use majit_translate::model::{CallTarget, OpKind};
-
-const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc",);
 
 /// The two corpus fixtures that call through a `fn`-pointer field: the
 /// direct spelling and the one-hop `Option<fn-ptr>` deref.
@@ -88,7 +89,7 @@ fn shape_of(llbc: &Llbc, name: &str) -> Shape {
 /// the lowering.
 #[test]
 fn fnptr_indirect_switch_moves_the_lowering_in_both_directions() {
-    let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+    let llbc = load_llbc(CORPUS_LLBC);
 
     // SAFETY: `set_var` is unsafe in Rust 2024 because concurrent
     // environment mutation races.  This file's test binary holds exactly
