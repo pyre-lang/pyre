@@ -281,7 +281,7 @@ pub const W_BYTES_GC_TYPE_ID: u32 = 27;
 /// User-subclass bytes layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (163) ahead of the
 /// target-gated tail.
-pub const W_BYTES_USER_GC_TYPE_ID: u32 = 163;
+pub const W_BYTES_USER_GC_TYPE_ID: u32 = 164;
 pub const W_BYTES_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_BytesObjectUser>();
 
 /// Fixed payload size (`framework.py:811`).

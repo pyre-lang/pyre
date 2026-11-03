@@ -88,9 +88,9 @@ pub fn publish_gil_ready() {
     // place for a `static mut` field.
     unsafe {
         let state = &raw mut GIL_READY_STATE;
-        (*state).mutate_gil_ready().invalidate_then_store(|| {
+        crate::quasi_immut_store!((*state).mutate_gil_ready() =>
             (*state).gil_ready = 1;
-        });
+        );
     }
 }
 

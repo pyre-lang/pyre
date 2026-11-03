@@ -1559,7 +1559,7 @@ pub const PYFRAME_GC_TYPE_ID: u32 = 37;
 /// GC type id appended after the existing runtime registration census.
 /// `FrameDebugData` is stationary old-gen for a GC-owned frame.  Keep this
 /// at the tail of `pyre-jit::eval::build_gc` so older type ids never shift.
-pub const FRAME_DEBUG_DATA_GC_TYPE_ID: u32 = 98;
+pub const FRAME_DEBUG_DATA_GC_TYPE_ID: u32 = 99;
 
 /// GC header size in bytes — single source of truth is
 /// [`majit_gc::header::GcHeader::SIZE`]. Every `FixedObjectArray` and

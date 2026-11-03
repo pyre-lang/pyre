@@ -6962,6 +6962,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let field_descr = field_group.field_descrs[0].clone() as DescrRef;
@@ -7056,6 +7057,7 @@ mod tests {
                     virtualizable: false,
                     index_in_parent: 0,
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
                 majit_ir::descr::SimpleFieldDescrSpec {
                     is_class_word: Some(false),
@@ -7071,6 +7073,7 @@ mod tests {
                     virtualizable: false,
                     index_in_parent: 1,
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
             ],
         );

@@ -98,7 +98,7 @@ pub unsafe fn w_weakref_lifeline_set_has_callbacks(obj: PyObjectRef) {
 /// appends `MapdictStorageMixin` and carries `__dict__` / `__slots__` there.
 #[pyre_class(
     "weakref.ReferenceType",
-    type_id = 168,
+    type_id = 169,
     static_name = "WEAKREF_LAYOUT",
     user_subclass = "WEAKREF_LAYOUT_USER_TYPE"
 )]
@@ -138,7 +138,7 @@ pub static WEAKREF_LAYOUT_USER_TYPE: PyType = new_user_pytype(
 /// User-subclass weakref layout (`typedef.py` `_getusercls`). Appended
 /// after `W_LongObjectUser`, ahead of the target-gated tail (`build_gc`).
 /// Parents on `W_Weakref`.
-pub const W_WEAKREF_USER_GC_TYPE_ID: u32 = 200;
+pub const W_WEAKREF_USER_GC_TYPE_ID: u32 = 201;
 pub const W_WEAKREF_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_WeakrefUser>();
 
 impl crate::lltype::GcType for W_WeakrefUser {
@@ -647,8 +647,8 @@ mod tests {
     /// `W_WeakrefUser` carrying `WEAKREF_LAYOUT_USER_TYPE`.
     #[test]
     fn weakref_subclass_instance_carries_user_typeptr() {
-        assert_eq!(W_WEAKREF_LAYOUT_GC_TYPE_ID, 168);
-        assert_eq!(W_WEAKREF_USER_GC_TYPE_ID, 200);
+        assert_eq!(W_WEAKREF_LAYOUT_GC_TYPE_ID, 169);
+        assert_eq!(W_WEAKREF_USER_GC_TYPE_ID, 201);
         assert_eq!(
             W_WEAKREF_LAYOUT_OBJECT_SIZE,
             std::mem::offset_of!(W_Weakref, w_hash) + std::mem::size_of::<PyObjectRef>()

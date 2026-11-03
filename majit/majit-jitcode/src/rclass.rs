@@ -53,4 +53,15 @@ impl ImmutableRank {
     pub fn is_array(self) -> bool {
         matches!(self, Self::ImmutableArray | Self::QuasiImmutableArray)
     }
+
+    /// Suffix `rclass.py _parse_field_list` peels off an `_immutable_fields_`
+    /// entry: `""` / `"?"` / `"[*]"` / `"?[*]"`.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Immutable => "",
+            Self::QuasiImmutable => "?",
+            Self::ImmutableArray => "[*]",
+            Self::QuasiImmutableArray => "?[*]",
+        }
+    }
 }

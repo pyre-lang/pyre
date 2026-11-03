@@ -361,11 +361,13 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: None,
                     load_is_acquire: false,
+                    store_is_release: false,
                 }],
             })),
             name: "depth".into(),
             owner: "Frame".into(),
             load_is_acquire: false,
+            store_is_release: false,
         };
         let descrs = vec![
             field,

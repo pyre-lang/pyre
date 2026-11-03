@@ -12516,7 +12516,12 @@ pub(crate) unsafe fn w_type_getdictvalue(w_type: PyObjectRef, name: &Wtf8) -> Op
     }
     // `name` is an RPython `str` (`Ptr(STR)`): on the trace
     // `prebuilt_wtf8_storage` is the operand itself.  The interpreter reads
-    // the namespace directly, which is the elidable's own body.
+    // the namespace directly, which is the elidable's own body.  This is the
+    // split `lookup_in_type_where_wtf8` and `type_setdictvalue_wtf8` make, and
+    // for the same reason: `name` is a `&Wtf8` slice, not a STR, and
+    // `prebuilt_wtf8_storage` would intern every runtime name into
+    // `CONST_STR_CACHE` for good.  `W_TypeObject.getdictvalue` has one arm;
+    // it returns once `name` is spelled `Ptr(STR)` in the source.
     let w_value = if majit_metainterp::jit::we_are_jitted() {
         let name_str = pyre_object::unicodeobject::prebuilt_wtf8_storage(name);
         _pure_getdictvalue_no_unwrapping(w_type, name_str, version_tag)

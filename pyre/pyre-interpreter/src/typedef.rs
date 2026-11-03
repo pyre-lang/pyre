@@ -1884,6 +1884,11 @@ pub fn init_typeobjects() {
         // PyPy leaves them "X" and `MATCH_*` falls back to `ismapping_w` /
         // `issequence_w`; that fallback is dropped (see `match_sequence_value`),
         // so the marker is the whole test here.
+        // Evidence: `parity_tests/abc_weak_cache_membership.py`
+        // `collection_markers_follow_the_type_flags` passes on 3.15.2t and fails
+        // on pypy3.  The `flag_patma_collection?` hint governs stores after a
+        // trace has read the field; these run once while the type objects are
+        // built, before any trace exists.
         for (pytype, flag) in [
             (&pyre_object::pyobject::DICT_TYPE, b'M'),
             (&pyre_object::pyobject::FROZENDICT_TYPE, b'M'),
@@ -3218,7 +3223,10 @@ pub fn ensure_array_typeobjects() {
                 array_type,
                 Some(pyre_object::TypeDefBuffer::ReadWrite),
             );
-            // [3.15-spec] `arraymodule.c` Py_TPFLAGS_SEQUENCE; PyPy's array leaves "X" for the `issequence_w` fallback.
+            // [3.15-spec] `arraymodule.c` `array_spec` has `Py_TPFLAGS_SEQUENCE`;
+            // PyPy's array starts "X" and `MATCH_SEQUENCE` falls back to
+            // `issequence_w`.  Evidence and the quasi-immutable hint: see the
+            // built-in loop in `init_typeobjects`.
             pyre_object::typeobject::w_type_set_flag_patma_collection(array_type, b'S');
         }
         pyre_object::pyobject::set_instantiate(

@@ -61,24 +61,26 @@ pub(crate) fn expand(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let fty = &field.ty;
         let (ir_type_tok, flag_tok) = classify_field_type(fty);
         quote! {
-            let _ = gc_cache.get_field_descr(
-                __majit_key.clone(),
-                #fname_str,
-                None,
-                ::std::mem::offset_of!(Self, #fname),
-                ::std::mem::size_of::<#fty>(),
-                #ir_type_tok,
-                false,
-                false,
-                #flag_tok,
-                u32::MAX,
-                false,
-                // The declaration order of the struct's own named fields — a
-                // position this macro computes, never an unresolved claim.
-                Some(#idx),
-                false,
-            );
-        }
+                    let _ = gc_cache.get_field_descr(
+                        __majit_key.clone(),
+                        #fname_str,
+                        None,
+                        ::std::mem::offset_of!(Self, #fname),
+                        ::std::mem::size_of::<#fty>(),
+                        #ir_type_tok,
+                        false,
+                        false,
+                        #flag_tok,
+                        u32::MAX,
+                        false,
+                        // The declaration order of the struct's own named fields — a
+                        // position this macro computes, never an unresolved claim.
+                        Some(#idx),
+                        false,
+
+                        false,
+        );
+                }
     });
 
     quote! {

@@ -4208,13 +4208,15 @@ impl<'a> Assembler386<'a> {
             }
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                // `rewrite.rs transform_to_gc_load` lowers both opcodes to
-                // GC_STORE / GC_STORE_INDEXED through `emit_gc_store_or_indexed`
-                // before the regalloc ever sees them, and `consider_setfield`
-                // force-allocates a register for every non-constant base, so the
-                // only shape that could reach the else arm is a constant base on
-                // an op the rewriter did not consume.  Emitting it from
-                // `resolve_opref` would read whichever slot the lifetime's
+                // Unordered SETFIELD is lowered to GC_STORE by
+                // `transform_to_gc_load`. An ordered descr
+                // (`store_is_release`) keeps SETFIELD so this arm emits
+                // it (x86 TSO: a plain store is the Release).
+                // `consider_setfield` force-allocates a register for every
+                // non-constant base, so the only shape that could reach
+                // the else arm is a constant base on an op the rewriter
+                // did not consume.  Emitting it from `resolve_opref`
+                // would read whichever slot the lifetime's
                 // end-of-allocation `current_frame_loc` happens to name and
                 // clobber rax/rcx behind the regalloc's back; decline instead.
                 let [base_loc, val_loc] = arglocs else {
@@ -7127,8 +7129,8 @@ impl<'a> Assembler386<'a> {
     }
 
     /// assembler.py `load_from_mem`.
-    /// Aligned MOV is Acquire on x86 TSO; no extra fence for
-    /// `FieldDescr::load_is_acquire`.
+    /// Aligned MOV is Acquire and Release on x86 TSO; no extra fence for
+    /// `FieldDescr::load_is_acquire` or `FieldDescr::store_is_release`.
     fn load_from_mem(
         &mut self,
         resloc: crate::regloc::RegLoc,
@@ -7157,6 +7159,8 @@ impl<'a> Assembler386<'a> {
     }
 
     /// Sized store: `[base + ofs]` or `[base + ofs_reg]` — assembler.py save_into_mem.
+    /// Aligned MOV is also Release on x86 TSO; no extra fence for
+    /// `FieldDescr::store_is_release`.
     fn save_into_mem(&mut self, dest_addr: Operand, value_loc: &Loc, size: usize) {
         if let Loc::Reg(v) = value_loc
             && v.is_xmm

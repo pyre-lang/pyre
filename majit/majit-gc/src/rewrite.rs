@@ -2266,8 +2266,9 @@ impl GcRewriterImpl {
     /// non-null reference into a pointer-bearing field AND the base has
     /// not already been WB'd.  Does *not* emit the store itself — the
     /// caller is expected to follow up with `emit_maybe_forwarded` so
-    /// the lowered GC_STORE (forwarded by `transform_to_gc_load`) lands
-    /// after the WB.
+    /// the store lands after the WB: the lowered GC_STORE when
+    /// `transform_to_gc_load` forwarded it, or the original SETFIELD_GC
+    /// when an ordered descr (`store_is_release`) kept the op.
     fn handle_write_barrier_setfield(&self, op: &Op, st: &mut RewriteState) {
         let obj = st.get_box_replacement(op.arg(0));
         if st.wb_already_applied(&obj) {
@@ -2691,12 +2692,16 @@ impl GcRewriterImpl {
     /// `emit_gc_load_or_indexed` / `emit_gc_store_or_indexed`, which
     /// either forward the op (when `original` is `Some`) or emit directly.
     ///
-    /// Returns `true` only for the `GETFIELD_GC_*` fast-path at
-    /// rewrite.py:259-260, which flushes pending zeros, forwards, and
-    /// emits the forwarded op itself — the caller (`rewrite`) then
-    /// skips the rest of the main-loop body.  All other arms forward
-    /// the op and return `false`, delegating emission to the main loop
-    /// via `emit_maybe_forwarded` (or the write-barrier arms).
+    /// Returns `true` only for the unordered `GETFIELD_GC_*` fast-path
+    /// (`GcRewriterAssembler.transform_to_gc_load`), which flushes
+    /// pending zeros, forwards, and emits the forwarded op itself —
+    /// the caller (`rewrite`) then skips the rest of the main-loop
+    /// body.  An ordered GETFIELD_GC (`load_is_acquire`) flushes
+    /// pending zeros and returns `false` so the main loop emits the
+    /// original op with its FieldDescr.  All other arms forward the op
+    /// (or leave an ordered SETFIELD/GETFIELD unchanged) and return
+    /// `false`, delegating emission to the main loop via
+    /// `emit_maybe_forwarded` (or the write-barrier arms).
     fn transform_to_gc_load(&self, op: &OpRc, st: &mut RewriteState) -> bool {
         const NOT_SIGNED: bool = false;
         let opnum = op.opcode;
@@ -2828,11 +2833,29 @@ impl GcRewriterImpl {
                 // emit the forwarded op *here* so that the main loop
                 // short-circuits (return True).
                 st.emit_pending_zeros();
+                if fd.load_is_acquire() {
+                    // Free-threading adaptation. Upstream
+                    // `GcRewriterAssembler.transform_to_gc_load` lowers
+                    // every field access to GC_LOAD / GC_STORE (no
+                    // ordering exists without the GIL's absence). The
+                    // ordered descr bits (`load_is_acquire`,
+                    // `store_is_release`, minted from `quasi && atomic`)
+                    // must survive to the backend, which lowers ordered
+                    // SETFIELD / GETFIELD itself. Returning false leaves
+                    // the op unchanged for the main-loop catch-all.
+                    return false;
+                }
                 self.emit_gc_load_or_indexed(op, ptr, cint_zero, itemsize, 1, ofs, sign, st);
                 if let Forwarded::Op(lowered) = op.get_forwarded() {
                     st.emit_forwarded(op, lowered);
                 }
                 return true;
+            }
+            if fd.load_is_acquire() {
+                // Same free-threading early-out as GETFIELD_GC: keep the
+                // FieldDescr so the backend's GETFIELD_RAW arm honors
+                // `load_is_acquire`.
+                return false;
             }
             self.emit_gc_load_or_indexed(op, ptr, cint_zero, itemsize, 1, ofs, sign, st);
             return false;
@@ -2843,6 +2866,17 @@ impl GcRewriterImpl {
             let fd = descr
                 .as_field_descr()
                 .expect("SETFIELD descr must be FieldDescr");
+            if fd.store_is_release() {
+                // Free-threading adaptation. Upstream
+                // `GcRewriterAssembler.transform_to_gc_load` /
+                // `emit_gc_store_or_indexed` strip the FieldDescr into a
+                // descriptorless GC_STORE. Returning false leaves the
+                // SETFIELD with its descr so the backend emits the
+                // Release store (`stlr` / `atomic_store`). The main
+                // loop still runs `handle_write_barrier_setfield` for a
+                // ref SETFIELD_GC ahead of that store.
+                return false;
+            }
             let ofs = fd.offset() as i64;
             let itemsize = fd.field_size() as i64;
             let ptr = st.get_box_replacement(op.arg(0));
@@ -3582,9 +3616,11 @@ impl GcRewriterImpl {
                 // ── Stores that may need a write barrier ──
                 //
                 // rewrite.py:392-404 — the write-barrier section runs AFTER
-                // `transform_to_gc_load` has forwarded the store op to
-                // GC_STORE / GC_STORE_INDEXED.  `emit_maybe_forwarded`
-                // follows the forward and emits the lowered op.
+                // `transform_to_gc_load`. An unordered store is forwarded
+                // to GC_STORE / GC_STORE_INDEXED; an ordered SETFIELD_GC
+                // (`store_is_release`) is left as-is. `emit_maybe_forwarded`
+                // follows a forward when there is one, else emits the
+                // original op.
                 // rewrite.py:393 `if self.gc_ll_descr.write_barrier_descr is
                 // not None:` — a collector that needs no write barrier
                 // (`gc.py GcLLDescr_boehm.write_barrier_descr = None`)
@@ -3812,7 +3848,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::collector::const_ptr_table_test_guard;
-    use majit_ir::descr::{ArrayDescr, Descr, DescrRef, SizeDescr};
+    use majit_ir::descr::{ArrayDescr, Descr, DescrRef, SimpleFieldDescr, SizeDescr};
     use majit_ir::value::{InputArg, Type};
 
     #[test]
@@ -4236,6 +4272,19 @@ mod tests {
             field_size: 8,
             field_type: Type::Int,
         })
+    }
+
+    fn ordered_field_descr(
+        offset: usize,
+        field_type: Type,
+        load_is_acquire: bool,
+        store_is_release: bool,
+    ) -> DescrRef {
+        Arc::new(
+            SimpleFieldDescr::new(0, offset, 8, field_type, false)
+                .with_load_is_acquire(load_is_acquire)
+                .with_store_is_release(store_is_release),
+        )
     }
 
     fn array_len_field_descr() -> Arc<TestFieldDescr> {
@@ -4740,6 +4789,98 @@ mod tests {
         // Only the lowered GC_STORE — no WB for non-ref fields.
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::GcStore);
+    }
+
+    // Unordered SETFIELD_GC still becomes GC_STORE:
+    // `test_setfield_gc_ref_needs_wb`, `test_setfield_gc_int_no_wb`,
+    // `test_no_write_barrier_descr_emits_no_barrier_but_keeps_the_store`.
+
+    #[test]
+    fn test_setfield_gc_release_int_stays_setfield() {
+        let rw = make_rewriter();
+        let obj = OpRef::ref_op(0);
+        let val = OpRef::int_op(1);
+        let descr = ordered_field_descr(8, Type::Int, false, true);
+        let ops = vec![Op::with_descr(
+            OpCode::SetfieldGc,
+            &[ro(obj), ro(val)],
+            descr,
+        )];
+
+        let result = rw.rewrite_ops(&ops);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::SetfieldGc);
+        assert!(
+            result[0]
+                .getdescr()
+                .and_then(|d| d.as_field_descr().map(|fd| fd.store_is_release()))
+                == Some(true),
+            "release SETFIELD_GC must keep its FieldDescr"
+        );
+    }
+
+    #[test]
+    fn test_setfield_gc_release_ref_stays_setfield_after_wb() {
+        let rw = make_rewriter();
+        let obj = OpRef::ref_op(0);
+        let val = OpRef::ref_op(1);
+        let descr = ordered_field_descr(0, Type::Ref, false, true);
+        let ops = vec![Op::with_descr(
+            OpCode::SetfieldGc,
+            &[ro(obj), ro(val)],
+            descr,
+        )];
+
+        let result = rw.rewrite_ops(&ops);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].opcode, OpCode::CondCallGcWb);
+        assert_eq!(result[0].arg(0).to_opref(), obj);
+        assert_eq!(result[1].opcode, OpCode::SetfieldGc);
+        assert!(
+            result[1]
+                .getdescr()
+                .and_then(|d| d.as_field_descr().map(|fd| fd.store_is_release()))
+                == Some(true),
+            "release ref SETFIELD_GC must keep its FieldDescr after COND_CALL_GC_WB"
+        );
+    }
+
+    #[test]
+    fn test_getfield_gc_i_acquire_stays_getfield() {
+        let rw = make_rewriter();
+        let obj = OpRef::ref_op(0);
+        let descr = ordered_field_descr(8, Type::Int, true, false);
+        let ops = vec![Op::with_descr(OpCode::GetfieldGcI, &[ro(obj)], descr)];
+
+        let result = rw.rewrite_ops(&ops);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GetfieldGcI);
+        assert!(
+            result[0]
+                .getdescr()
+                .and_then(|d| d.as_field_descr().map(|fd| fd.load_is_acquire()))
+                == Some(true),
+            "acquire GETFIELD_GC_I must keep its FieldDescr"
+        );
+    }
+
+    #[test]
+    fn test_getfield_gc_i_unordered_becomes_gc_load() {
+        let rw = make_rewriter();
+        let obj = OpRef::ref_op(0);
+        let ops = vec![Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[ro(obj)],
+            int_field_descr(),
+        )];
+
+        let result = rw.rewrite_ops(&ops);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].opcode, OpCode::GcLoadI);
     }
 
     // ── Tests 4a-c: delayed_zero_setfields (rewrite.py, 761-766) ──

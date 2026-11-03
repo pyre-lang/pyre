@@ -1295,103 +1295,93 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(44, &crate::pytraceback::PYTRACEBACK_TYPE),
         // `_random.Random` and `_pickle`'s picklers and memo proxies live in
         // `pyre-module`; their aliases arrive through the module hook below.
-        subclass_range_alias(88, typed::<crate::module::__pypy__::W_PickleBuffer>()),
+        subclass_range_alias(89, typed::<crate::module::__pypy__::W_PickleBuffer>()),
         // `collections.deque` W_Deque — auto-id registered at the tail of the
         // GC type chain (`build_gc`), after the coroutine / dict-view-iterator
         // slots, so its vtable alias lands at the current max tid.
-        subclass_range_alias(110, typed::<crate::module::_collections::W_Deque>()),
+        subclass_range_alias(111, typed::<crate::module::_collections::W_Deque>()),
         // Formerly-immortal iterators converted to `allocate_stable` (managed),
         // registered at the tail of the JIT `register_pyre_class` chain after
         // the pyre-object iterators (W_Struct = 119 .. W_DequeRevIter = 122).
-        subclass_range_alias(119, typed::<crate::module::r#struct::W_Struct>()),
+        subclass_range_alias(120, typed::<crate::module::r#struct::W_Struct>()),
         subclass_range_alias(
-            120,
+            121,
             typed::<crate::module::r#struct::unpack_iter::W_UnpackIter>(),
         ),
-        subclass_range_alias(121, typed::<crate::module::_collections::W_DequeIter>()),
-        subclass_range_alias(122, typed::<crate::module::_collections::W_DequeRevIter>()),
+        subclass_range_alias(122, typed::<crate::module::_collections::W_DequeIter>()),
+        subclass_range_alias(123, typed::<crate::module::_collections::W_DequeRevIter>()),
         subclass_range_alias(
-            123,
+            124,
             typed::<crate::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
         ),
-        subclass_range_alias(128, typed::<crate::module::_io::W_BufferedReader>()),
-        subclass_range_alias(129, typed::<crate::module::_io::W_BufferedWriter>()),
-        subclass_range_alias(130, typed::<crate::module::_io::W_BufferedRWPair>()),
-        subclass_range_alias(131, typed::<crate::module::_io::W_BufferedRandom>()),
-        subclass_range_alias(132, typed::<crate::module::_io::W_TextIOWrapper>()),
-        subclass_range_alias(133, typed::<crate::module::thread::W_Local>()),
+        subclass_range_alias(129, typed::<crate::module::_io::W_BufferedReader>()),
+        subclass_range_alias(130, typed::<crate::module::_io::W_BufferedWriter>()),
+        subclass_range_alias(131, typed::<crate::module::_io::W_BufferedRWPair>()),
+        subclass_range_alias(132, typed::<crate::module::_io::W_BufferedRandom>()),
+        subclass_range_alias(133, typed::<crate::module::_io::W_TextIOWrapper>()),
+        subclass_range_alias(134, typed::<crate::module::thread::W_Local>()),
         // `all_w_class_only_descriptors` order, registered in `build_gc`
         // after `W_DequeBlock` and `W_BufferWrapper`.
-        subclass_range_alias(146, typed::<crate::module::thread::W_Lock>()),
-        subclass_range_alias(147, typed::<crate::module::thread::W_RLock>()),
-        subclass_range_alias(148, typed::<crate::module::thread::W_ThreadHandle>()),
+        subclass_range_alias(147, typed::<crate::module::thread::W_Lock>()),
+        subclass_range_alias(148, typed::<crate::module::thread::W_RLock>()),
+        subclass_range_alias(149, typed::<crate::module::thread::W_ThreadHandle>()),
         // `__pypy__.Bufferable` follows them in the order `build_gc`
         // registers them.
         subclass_range_alias(
-            149,
+            150,
             typed::<crate::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable>(),
         ),
         // `_io.BytesIO` registers after the `rbigint` result pair, which takes
         // 150 as a bare `with_gc_ptrs` id and carries no vtable of its own.
-        subclass_range_alias(151, typed::<crate::module::_io::W_BytesIO>()),
-        subclass_range_alias(152, typed::<crate::module::_io::W_StringIO>()),
+        subclass_range_alias(152, typed::<crate::module::_io::W_BytesIO>()),
+        subclass_range_alias(153, typed::<crate::module::_io::W_StringIO>()),
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they precede the target-gated native aliases.
-        subclass_range_alias(153, typed::<crate::pycode::W_LineIterObject>()),
-        subclass_range_alias(154, typed::<crate::pycode::W_PositionsIterObject>()),
-        subclass_range_alias(155, typed::<crate::pycode::W_BranchesIterObject>()),
+        subclass_range_alias(154, typed::<crate::pycode::W_LineIterObject>()),
+        subclass_range_alias(155, typed::<crate::pycode::W_PositionsIterObject>()),
+        subclass_range_alias(156, typed::<crate::pycode::W_BranchesIterObject>()),
         // `__pypy__.Bufferable` user layout (`typedef.py` `_getusercls`).
         subclass_range_alias(
-            195,
+            196,
             &crate::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
         ),
         // `collections.deque` and `_struct.Struct` user layouts
-        // (`typedef.py` `_getusercls`), appended after the closed 158-195 block.
-        subclass_range_alias(196, &crate::module::_collections::DEQUE_USER_TYPE),
-        subclass_range_alias(197, &crate::module::r#struct::STRUCT_USER_TYPE),
-        subclass_range_alias(204, &crate::module::thread::LOCAL_USER_TYPE),
-        subclass_range_alias(205, &crate::module::_io::BYTESIO_USER_TYPE),
-        subclass_range_alias(206, &crate::module::_io::STRINGIO_USER_TYPE),
-        subclass_range_alias(207, &crate::module::_io::BUFFEREDREADER_USER_TYPE),
-        subclass_range_alias(208, &crate::module::_io::BUFFEREDWRITER_USER_TYPE),
-        subclass_range_alias(209, &crate::module::_io::BUFFEREDRWPAIR_USER_TYPE),
-        subclass_range_alias(210, &crate::module::_io::BUFFEREDRANDOM_USER_TYPE),
-        subclass_range_alias(211, &crate::module::_io::TEXTIOWRAPPER_USER_TYPE),
-        subclass_range_alias(212, typed::<crate::module::_io::W_FileIO>()),
-        subclass_range_alias(213, &crate::module::_io::FILEIO_USER_TYPE),
+        // (`typedef.py` `_getusercls`), appended after the closed 159-196 block.
+        subclass_range_alias(197, &crate::module::_collections::DEQUE_USER_TYPE),
+        subclass_range_alias(198, &crate::module::r#struct::STRUCT_USER_TYPE),
+        subclass_range_alias(205, &crate::module::thread::LOCAL_USER_TYPE),
+        subclass_range_alias(206, &crate::module::_io::BYTESIO_USER_TYPE),
+        subclass_range_alias(207, &crate::module::_io::STRINGIO_USER_TYPE),
+        subclass_range_alias(208, &crate::module::_io::BUFFEREDREADER_USER_TYPE),
+        subclass_range_alias(209, &crate::module::_io::BUFFEREDWRITER_USER_TYPE),
+        subclass_range_alias(210, &crate::module::_io::BUFFEREDRWPAIR_USER_TYPE),
+        subclass_range_alias(211, &crate::module::_io::BUFFEREDRANDOM_USER_TYPE),
+        subclass_range_alias(212, &crate::module::_io::TEXTIOWRAPPER_USER_TYPE),
+        subclass_range_alias(213, typed::<crate::module::_io::W_FileIO>()),
+        subclass_range_alias(214, &crate::module::_io::FILEIO_USER_TYPE),
         // `_sre.SRE_Template` is the last unconditional interpreter class
-        // after the `_getusercls` layouts (158-217). Posix and the Windows
+        // after the `_getusercls` layouts (159-218). Posix and the Windows
         // console follow it. The object-carrier user alias lives in the
         // object crate.
-        subclass_range_alias(218, typed::<pyre_object::interp_sre::W_SRE_Template>()),
-        // Native-only posix aliases 219 and 220 preserve `build_gc`'s rclass
+        subclass_range_alias(219, typed::<pyre_object::interp_sre::W_SRE_Template>()),
+        // Native-only posix aliases 220 and 221 preserve `build_gc`'s rclass
         // registration order after `_sre.SRE_Template`.
         // `scandir` has no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(219, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(220, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(220, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(221, typed::<crate::module::posix::W_ScandirIterator>()),
         // PEP 528's raw console stream closes the interpreter's classes on
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(221, typed::<crate::module::_io::W_WinConsoleIO>()),
+        subclass_range_alias(222, typed::<crate::module::_io::W_WinConsoleIO>()),
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(222, &crate::module::_io::WINCONSOLEIO_USER_TYPE),
+        subclass_range_alias(223, &crate::module::_io::WINCONSOLEIO_USER_TYPE),
         // Registered after every platform-gated interpreter class.
-        // `build_gc`: SRE_Template is tid 218, then posix 219/220, then
-        // WinConsoleIO 221 and its user layout 222, then InstanceMethod.
-        subclass_range_alias(
-            if cfg!(target_arch = "wasm32") {
-                219
-            } else if WINDOWS_CONSOLE_IO {
-                223
-            } else {
-                221
-            },
-            typed::<pyre_object::instancemethod::InstanceMethod>(),
-        ),
+        // `build_gc`: SRE_Template is tid 219, then posix 220/221, then
+        // WinConsoleIO 222 and its user layout 223, then InstanceMethod.
         subclass_range_alias(
             if cfg!(target_arch = "wasm32") {
                 220
@@ -1400,7 +1390,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             } else {
                 222
             },
-            typed::<pyre_object::W_SentinelObject>(),
+            typed::<pyre_object::instancemethod::InstanceMethod>(),
         ),
         subclass_range_alias(
             if cfg!(target_arch = "wasm32") {
@@ -1409,6 +1399,16 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
                 225
             } else {
                 223
+            },
+            typed::<pyre_object::W_SentinelObject>(),
+        ),
+        subclass_range_alias(
+            if cfg!(target_arch = "wasm32") {
+                222
+            } else if WINDOWS_CONSOLE_IO {
+                226
+            } else {
+                224
             },
             typed::<pyre_object::W_LazyImportObject>(),
         ),
@@ -1435,11 +1435,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    222
+    223
 } else if WINDOWS_CONSOLE_IO {
-    226
+    227
 } else {
-    224
+    225
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this
@@ -1493,11 +1493,11 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     let mut active = core.to_vec();
     // Registered after the platform tail, before the module classes.
     let instancemethod_id = if cfg!(target_arch = "wasm32") {
-        219
+        220
     } else if WINDOWS_CONSOLE_IO {
-        223
+        224
     } else {
-        221
+        222
     };
     active.push((instancemethod_id, Some(0)));
     // PEP 661 `sentinel` / PEP 810 `lazy_import` — after `instancemethod`

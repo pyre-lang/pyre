@@ -44,7 +44,7 @@ const _: () = {
 
 /// User-subclass big-int layout. Appended after the closed ids, ahead of
 /// the target-gated tail (`build_gc`).
-pub const W_LONG_USER_GC_TYPE_ID: u32 = 199;
+pub const W_LONG_USER_GC_TYPE_ID: u32 = 200;
 pub const W_LONG_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_LongObjectUser>();
 
 impl crate::lltype::GcType for W_LongObjectUser {

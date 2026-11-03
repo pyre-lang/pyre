@@ -3581,7 +3581,7 @@ impl<'a> Lowering<'a> {
                     let is_acquire = ordering == Some("Acquire");
                     let ordering_label = ordering.unwrap_or("unknown").to_string();
                     if is_acquire
-                        && self.atomic_load_receiver_is_quasi_immutable_field(&args[0])
+                        && self.atomic_receiver_is_quasi_immutable_field(&args[0])
                         && self.atomic_referent_is_stable(&arg_locals)
                         && self.bind_dest_to_recorded_atomic_load(
                             mir_bb,
@@ -3622,66 +3622,71 @@ impl<'a> Lowering<'a> {
                 // target means teaching the BACKEND, or declining there.
                 // The load fold rests on the same precondition.
                 //
-                // ONLY a `Relaxed` store folds.  A stronger ordering is not
-                // decoration: `w_type_set_version_tag` publishes `version_tag`
-                // with `Release` against `w_type_get_version_tag`'s `Acquire`
-                // reader, and today that store reaches the CALL, which performs
-                // the release.  Replacing it with an unordered `FieldWrite`
-                // would let a traced class mutation publish the new cache key
-                // before the dictionary changes behind it are visible.  So the
-                // ordering is read (`atomic_ordering_locals`) and anything but
-                // `Relaxed` keeps the residual call it has today.
-                if args.len() == 3
-                    && self.is_atomic_store(&reg)
-                    && arg_locals
+                // A Relaxed store folds for any field whose place is recorded.
+                // A Release store folds only for a quasi-immutable field: the
+                // descr carries `store_is_release`, so the setfield is the
+                // Release store (the store twin of the Acquire `?` load fold).
+                // A Release store of any other field, SeqCst, and AcqRel stay
+                // the residual call.  A recorded borrow that is not stable is
+                // Unsupported rather than a fold.  `w_type_set_version_tag`
+                // publishes `version_tag` with Release against
+                // `w_type_get_version_tag`'s Acquire reader; folding that `?`
+                // store to FieldWrite lets `hook_setfield` mint the force, and
+                // the descr bit keeps the executable store Release.
+                if args.len() == 3 && self.is_atomic_store(&reg) {
+                    let ordering = arg_locals
                         .get(2)
                         .copied()
                         .flatten()
                         .and_then(|l| self.atomic_ordering_locals.get(&l))
-                        .is_some_and(|ordering| ordering == "Relaxed")
-                {
-                    // A receiver this body did not bind as a borrow of a
-                    // field — or one borrowing a whole local rather than a
-                    // field of one — leaves no place to write to.  Fall
-                    // through to the ordinary call path, which is what an
-                    // unrecognised `store` already lowers to, rather than
-                    // inventing a target or failing a graph that compiles
-                    // today.  A recorded borrow whose place goes through a
-                    // rebound local is unsupported: writing the place now
-                    // would name another object.  The place is copied, not
-                    // taken: one borrow stored through twice folds both times.
-                    if self.atomic_receiver_has_recorded_borrow(&arg_locals)
-                        && !self.atomic_referent_is_stable(&arg_locals)
-                    {
-                        return Err(LowerError::Unsupported(
-                            "atomic store ordering Relaxed requires address-preserving ordered lowering"
-                                .to_string(),
-                        ));
-                    }
-                    let referent = arg_locals
-                        .first()
-                        .copied()
-                        .flatten()
-                        .and_then(|l| self.atomic_ref_place.get(&l))
-                        .map(clone_place);
-                    if let Some(referent) = referent {
-                        let field_ty = clone_tyref(&referent.ty);
-                        if let PlaceKind::Projection(inner, elem) = referent.kind {
-                            let value = args[1].clone();
-                            self.emit_projection_write(
-                                mir_bb,
-                                *inner,
-                                elem,
-                                value.into(),
-                                &field_ty,
-                            )?;
-                            // The store's result is an actual unit constant.
-                            self.local_var[dest_local] =
-                                Some(LocalValue::One(self.emit_unit(bb_id)));
-                            let target_bb = self.block_id[target];
-                            let link_args = self.edge_args(mir_bb, target)?;
-                            self.graph.set_goto(bb_id, target_bb, link_args);
-                            return Ok(());
+                        .map(String::as_str);
+                    let fold = ordering == Some("Relaxed")
+                        || (ordering == Some("Release")
+                            && self.atomic_receiver_is_quasi_immutable_field(&args[0]));
+                    if fold {
+                        // A receiver this body did not bind as a borrow of a
+                        // field — or one borrowing a whole local rather than a
+                        // field of one — leaves no place to write to.  Fall
+                        // through to the ordinary call path, which is what an
+                        // unrecognised `store` already lowers to, rather than
+                        // inventing a target or failing a graph that compiles
+                        // today.  A recorded borrow whose place goes through a
+                        // rebound local is unsupported: writing the place now
+                        // would name another object.  The place is copied, not
+                        // taken: one borrow stored through twice folds both times.
+                        if self.atomic_receiver_has_recorded_borrow(&arg_locals)
+                            && !self.atomic_referent_is_stable(&arg_locals)
+                        {
+                            return Err(LowerError::Unsupported(format!(
+                                "atomic store ordering {} requires address-preserving ordered lowering",
+                                ordering.unwrap_or("unknown")
+                            )));
+                        }
+                        let referent = arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .and_then(|l| self.atomic_ref_place.get(&l))
+                            .map(clone_place);
+                        if let Some(referent) = referent {
+                            let field_ty = clone_tyref(&referent.ty);
+                            if let PlaceKind::Projection(inner, elem) = referent.kind {
+                                let value = args[1].clone();
+                                self.emit_projection_write(
+                                    mir_bb,
+                                    *inner,
+                                    elem,
+                                    value.into(),
+                                    &field_ty,
+                                )?;
+                                // The store's result is an actual unit constant.
+                                self.local_var[dest_local] =
+                                    Some(LocalValue::One(self.emit_unit(bb_id)));
+                                let target_bb = self.block_id[target];
+                                let link_args = self.edge_args(mir_bb, target)?;
+                                self.graph.set_goto(bb_id, target_bb, link_args);
+                                return Ok(());
+                            }
                         }
                     }
                 }

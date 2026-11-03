@@ -2027,20 +2027,23 @@ impl<'a> Lowering<'a> {
     /// The receiver variable is a `FieldRead`, or a `FrameState.copy` of
     /// one, of a field the owner declares quasi-immutable.
     ///
-    /// [`Self::is_atomic_load`] already established the receiver is an
-    /// `Atomic*`. Typed wrappers (`version_tag: AtomicU64`) and the
-    /// `AtomicPtr::from_ptr` overlay (`w_globals`) both produce a
-    /// `FieldRead` of the published slot. `w_code_get_w_globals` computes
-    /// `&raw (*code).w_globals` in one block and calls `AtomicPtr::load`
-    /// in the successor. `FrameState.copy` gives that successor a fresh
-    /// Variable, so the load's receiver is not the `FieldRead` result.
+    /// Shared by the Acquire load fold and the Release store fold.
+    /// [`Self::is_atomic_load`] / [`Self::is_atomic_store`] already
+    /// established the receiver is an `Atomic*`. Typed wrappers
+    /// (`version_tag: AtomicU64`) and the `AtomicPtr::from_ptr` overlay
+    /// (`w_globals`) both produce a `FieldRead` of the published slot.
+    /// `w_code_get_w_globals` computes `&raw (*code).w_globals` in one
+    /// block and calls `AtomicPtr::load` in the successor.
+    /// `FrameState.copy` gives that successor a fresh Variable, so the
+    /// load's receiver is not the `FieldRead` result.
     /// [`Self::input_copied_from`] is that copy.
     ///
     /// The marker is the table harvested once for this artefact
     /// (`self.immutable_fields`). A missing owner, a missing marker, a
-    /// merge phi, or a rank that is not quasi fails closed and the load
-    /// keeps the unsupported-ordering error.
-    pub(in crate::front::mir) fn atomic_load_receiver_is_quasi_immutable_field(
+    /// merge phi, or a rank that is not quasi fails closed: the load
+    /// keeps the unsupported-ordering error, and the store keeps the
+    /// residual call.
+    pub(in crate::front::mir) fn atomic_receiver_is_quasi_immutable_field(
         &self,
         recv: &Variable,
     ) -> bool {
@@ -2181,9 +2184,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// `<core::sync::atomic::Atomic*>::store(&self, value, ordering)` — the
-    /// write twin of [`Lowering::is_atomic_load`].  A relaxed store to a
-    /// layout-transparent atomic is the same machine store a plain field
-    /// write emits, so `lower_call` lowers it to the same `FieldWrite`.
+    /// write twin of [`Lowering::is_atomic_load`].  A Relaxed store to a
+    /// layout-transparent atomic, and a Release store of a quasi-immutable
+    /// field, lower to the same `FieldWrite` a plain field write emits.
     pub(in crate::front::mir) fn is_atomic_store(&self, reg: &RegularCall) -> bool {
         self.is_atomic_method(reg, "store")
     }

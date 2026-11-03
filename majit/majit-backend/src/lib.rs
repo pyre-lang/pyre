@@ -3399,7 +3399,15 @@ pub trait Backend: Send {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
         // SAFETY: `struct_ptr` is a GC-managed struct pointer; `offset`/`size`
         // come from the field descriptor.
-        unsafe { crate::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, newvalue) }
+        unsafe {
+            crate::llmodel::write_int_at_mem(
+                struct_ptr as usize,
+                offset,
+                size,
+                newvalue,
+                fielddescr.store_is_release(),
+            )
+        }
     }
     /// model.py:223 / llmodel.py bh_setfield_gc_r → pointer-width store at
     /// the field offset plus the write barrier.
@@ -3416,8 +3424,16 @@ pub trait Backend: Send {
         // This is the barrier `write_ref_at_mem` documents its callers as owing;
         // `transform_generic_set` (framework.py) puts it before the bare store.
         majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
-        // SAFETY: see `bh_setfield_gc_i`.
-        unsafe { crate::llmodel::write_ref_at_mem(struct_ptr as usize, offset, newvalue.0) };
+        // SAFETY: see `bh_setfield_gc_i`. Barrier first, then the
+        // (possibly Release) store publishes the pointer.
+        unsafe {
+            crate::llmodel::write_ref_at_mem(
+                struct_ptr as usize,
+                offset,
+                newvalue.0,
+                fielddescr.store_is_release(),
+            )
+        };
     }
     /// model.py / llmodel.py bh_setfield_gc_f. Size 8 is `FLOATSTORAGE`;
     /// size 4 demotes to f32.
@@ -3969,7 +3985,9 @@ pub trait Backend: Send {
     ) {
         let (base, size, _) = descr.unpack_arraydescr_size();
         assert_eq!(base, 0, "bh_raw_store_i requires a lengthless raw array");
-        unsafe { crate::llmodel::write_int_at_mem(addr as usize, offset as usize, size, newvalue) }
+        unsafe {
+            crate::llmodel::write_int_at_mem(addr as usize, offset as usize, size, newvalue, false)
+        }
     }
     // ── model.py: interior field access ──
     /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
@@ -4043,6 +4061,7 @@ pub trait Backend: Send {
                 offset as usize,
                 field_size,
                 newvalue,
+                field.store_is_release(),
             )
         }
     }
@@ -4059,10 +4078,15 @@ pub trait Backend: Send {
         };
         let (base, itemsize, _) = array.unpack_arraydescr_size();
         let offset = base as i64 + index * itemsize as i64 + field.as_offset() as i64;
-        unsafe {
-            crate::llmodel::write_ref_at_mem(array_ptr as usize, offset as usize, newvalue.0)
-        };
         majit_gc::gc_write_barrier(GcRef(array_ptr as usize));
+        unsafe {
+            crate::llmodel::write_ref_at_mem(
+                array_ptr as usize,
+                offset as usize,
+                newvalue.0,
+                field.store_is_release(),
+            )
+        };
     }
     /// model.py: bh_setinteriorfield_gc_f(array, index, newvalue, descr)
     fn bh_setinteriorfield_gc_f(
@@ -4123,7 +4147,13 @@ pub trait Backend: Send {
         assert!(bytes > 0);
         let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
         unsafe {
-            crate::llmodel::write_int_at_mem(addr as usize, offset as usize, bytes as usize, value)
+            crate::llmodel::write_int_at_mem(
+                addr as usize,
+                offset as usize,
+                bytes as usize,
+                value,
+                false,
+            )
         }
     }
     /// blackhole.py bhimpl_gc_store_indexed_f

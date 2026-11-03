@@ -250,26 +250,17 @@ impl CachedField {
     /// (computed once at insert via `field_slot_index`). Callers no
     /// longer need to gate manually.
     fn invalidate(&mut self, descr: &DescrRef, field_idx: u32, ctx: &mut OptContext) {
-        // `CachedField.invalidate`: `if descr.is_always_pure(): return`.
-        // Upstream's word covers a quasi-immutable field too — `is_pure` is
-        // `_immutable_field(name) != False` and `IR_QUASIIMMUTABLE` is an
-        // instance, not `False` — so a `?` field's cache survives a call and
-        // the loop keeps one read, with `guard_not_invalidated` carrying the
-        // per-window check. pyre's `is_always_pure` answers false for a `?`
-        // field to withhold the const-fold that same word licenses, so the
-        // surviving-a-call half is spelled here instead. Without it every
-        // residual call forces a re-read; over the scored bench dir that is 2
-        // of the 5 `ExecutionContext.w_tracefunc` getfield+guard pairs left in
-        // a peeled body. The other three read a different struct box each
-        // time, so no cache can reach them: upstream gets one box per loop from
-        // `ThreadLocalReference(ExecutionContext, loop_invariant=True)`.
+        // `heap.py CachedField.invalidate`: `if descr.is_always_pure(): return`.
+        // A declared `?` rank is always pure (`descr.py` `!= False`), so a
+        // `?` field's cache survives a call and the loop keeps one read, with
+        // `guard_not_invalidated` carrying the per-window check.
         //
         // Instance `w_class` is an ordinary mutable field, the analog of
         // mapdict `inst_map` (`BaseUserClassMapdict.setclass`). Type objects
         // keep their own quasi-immutable fields. A residual
         // `CallMayForce` therefore drops the instance class the way
         // `heap.py clean_caches` drops `inst_map`.
-        if descr.is_always_pure() || descr.is_quasi_immutable() {
+        if descr.is_always_pure() {
             return;
         }
         let descr_idx = field_idx;
@@ -4946,8 +4937,8 @@ mod tests {
     }
 
     /// `CachedField.invalidate` keeps a `?` field across `clean_caches`
-    /// (pyre spelling of upstream `is_always_pure` covering
-    /// `IR_QUASIIMMUTABLE`). Instance `w_class` is ordinary mutable
+    /// (`heap.py`: `if descr.is_always_pure(): return`; a declared `?`
+    /// rank is always pure). Instance `w_class` is ordinary mutable
     /// (`mapdict.py BaseUserClassMapdict.setclass` / `inst_map`), so a
     /// MOST_GENERAL residual setattr drops it. `ExecutionContext.w_tracefunc`
     /// stays.
@@ -4977,7 +4968,7 @@ mod tests {
                 16,
                 8,
                 Type::Ref,
-                false,
+                true,
                 ArrayFlag::Pointer,
                 "ExecutionContext.w_tracefunc".to_string(),
                 "w_tracefunc",
@@ -8568,7 +8559,7 @@ mod tests {
                 16,
                 8,
                 Type::Ref,
-                false,
+                true,
                 ArrayFlag::Pointer,
                 "ExecutionContext.w_tracefunc".to_string(),
                 "w_tracefunc",

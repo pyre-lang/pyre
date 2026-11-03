@@ -10642,6 +10642,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let descr = group.field_descrs[0].clone();
@@ -10730,6 +10731,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let field_descr = group.field_descrs[0].clone();
@@ -10899,6 +10901,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let field_descr = group.field_descrs[0].clone();

@@ -1669,8 +1669,14 @@ crate::py_module! {
     interpleveldefs: {
         "deque"                   => {
             let w_deque_type = type_object();
-            // [3.15-spec] `_collectionsmodule.c` deque has Py_TPFLAGS_SEQUENCE;
-            // PyPy's deque leaves "X" for the `issequence_w` fallback.
+            // [3.15-spec] `_collectionsmodule.c` `deque_spec` has
+            // `Py_TPFLAGS_SEQUENCE`; PyPy's deque starts "X" and `MATCH_SEQUENCE`
+            // falls back to `issequence_w`.  Evidence:
+            // `parity_tests/abc_weak_cache_membership.py`
+            // `collection_markers_follow_the_type_flags` passes on 3.15.2t and
+            // fails on pypy3.  The `flag_patma_collection?` hint is untouched:
+            // this store runs once when the module builds the type, before any
+            // trace can read the field.
             unsafe {
                 pyre_object::typeobject::w_type_set_flag_patma_collection(w_deque_type, b'S');
             }

@@ -1985,6 +1985,72 @@ fn after_residual_guard_uses_trailing_live_before_fallthrough_twin() {
     );
 }
 
+/// A full `walker_capture_snapshot_for_last_guard` image of `GUARD_NOT_FORCED`
+/// is not reachable with the existing harness: the tests that call capture
+/// (`parentless_populated_callee_does_not_publish_a_lone_resume_frame`) or
+/// record `GuardNotForced`
+/// (`loop_callee_portal_guard_not_forced_snapshot_abort_leaves_callee_ec`)
+/// abort at `GuardResumeCoordinateUnavailable` and never own a virtualizable
+/// overlay. The skip predicate and residual `result_argcode` decode are the
+/// capture's decision; the parity fixture is the regression test.
+#[test]
+fn async_force_result_slot_skips_only_guard_not_forced_ref_residual() {
+    use crate::jitcode_runtime::decode_op_at;
+    use majit_ir::OpCode;
+
+    let byte = |key: &str| {
+        *insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} must be in the insns table"))
+    };
+    let call_r = vec![byte("residual_call_r_r/iRd>r"), 0, 0, 1, 0, 0];
+    let call_v = vec![byte("residual_call_r_v/iRd"), 0, 0, 1, 0];
+    let ref_argcode = decode_op_at(&call_r, 0).map(|op| op.result_argcode());
+    let void_argcode = decode_op_at(&call_v, 0).map(|op| op.result_argcode());
+    assert_eq!(ref_argcode, Some('r'));
+    assert_eq!(void_argcode, Some('v'));
+
+    let slot = |guard, after, argcode, nlocals, depth| {
+        super::resume_snapshot::async_force_result_slot(guard, after, argcode, nlocals, depth)
+    };
+    // `hot(n)` CALL recurse: nlocals=3, post-call depth=4 → array index 6.
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), true, ref_argcode, 3, 4),
+        Some(6),
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNoException), true, ref_argcode, 3, 4),
+        None,
+        "GUARD_NO_EXCEPTION runs after the call returned"
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardException), true, ref_argcode, 3, 4),
+        None,
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardAlwaysFails), true, ref_argcode, 3, 4),
+        None,
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), true, void_argcode, 3, 4),
+        None,
+        "a void residual has no result home to exclude"
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), false, ref_argcode, 3, 4),
+        None,
+    );
+    assert_eq!(
+        slot(Some(OpCode::GuardNotForced), true, ref_argcode, 31, 4),
+        Some(34),
+    );
+    assert_ne!(
+        slot(Some(OpCode::GuardNotForced), true, ref_argcode, 31, 4),
+        Some(31),
+        "the FOR_ITER iterator at nlocals+0 is below the result TOS"
+    );
+}
+
 #[test]
 fn plain_guard_resume_keeps_jump_live_instead_of_opcode_start() {
     let live = crate::state::op_live();
@@ -2049,6 +2115,31 @@ fn exact_py_pc_preserves_a_later_disjoint_emission_region() {
     assert_eq!(
         crate::pyjitcode::exact_py_pc_for_jitcode_pc(&pyjit.metadata.py_exact_by_jit_pc, 35),
         Some(11),
+    );
+}
+
+#[test]
+fn containing_py_pc_prefers_exact_owner_of_a_late_block() {
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (10, 10), (20, 20)];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, 0), (10, 10), (20, 20), (30, 10)];
+    pyjit.metadata.forward_py_pc_pred_by_jit_pc = vec![(0, 0), (10, 10), (20, 20)];
+
+    assert_eq!(
+        crate::py_coord::containing_py_pc_for_jitcode_pc(&pyjit.metadata, 35),
+        10,
+        "a late block emitted after py 20's run still belongs to py 10",
+    );
+    assert_eq!(
+        crate::pyjitcode::floor_segment_for_jitcode_pc(&pyjit.metadata.py_floor_by_jit_pc, 35)
+            .map(|(_, py)| py),
+        Some(20),
+        "the floor table collapses that late block onto py 20",
+    );
+    assert_eq!(
+        pyjit.forward_py_pc_for_jitcode_pc(35),
+        Some(10),
+        "the forward twin consults the exact run before the floor pred",
     );
 }
 
@@ -7004,6 +7095,40 @@ fn jit_force_quasi_immutable_int_kind_declines_unobserved_mutate_value() {
     );
 }
 
+#[test]
+fn jit_force_quasi_immutable_id_declines_unobserved_mutate_value() {
+    // `/id` reads the owner from the int bank and records GETFIELD_RAW_R.
+    // An unobserved mutate value still declines rather than assuming null.
+    let byte = *insns_opname_to_byte()
+        .get("jit_force_quasi_immutable/id")
+        .expect("`jit_force_quasi_immutable/id` must be in insns table");
+    let code = [byte, 0x00, 0x00, 0x00];
+    let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
+        1,
+        16,
+        8,
+        majit_ir::Type::Ref,
+        false,
+    ));
+    let descr_pool = vec![descr];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_i = [OpRef::input_arg_int(0)];
+    let err = run_hint_step_with_descrs(&code, &mut tc, &mut [], &mut [], &mut regs_i, &descr_pool)
+        .expect_err("unobserved mutate value must not assume null");
+    let last = tc
+        .ops()
+        .last()
+        .expect("GETFIELD_RAW_R is recorded before the decline");
+    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldRawR);
+    assert_eq!(
+        err,
+        DispatchError::ForceQuasiImmutableValueNotConcrete {
+            pc: 0,
+            value: last.pos().get(),
+        }
+    );
+}
+
 /// Production-like `sub_jitcode_lookup` that resolves `idx` against
 /// `crate::jitcode_runtime::all_jitcodes()`. Used by the end-to-end
 /// helper acceptance tests (`walk_return_value_helper_*`,
@@ -7045,21 +7170,22 @@ fn module_dict_strategy_mutated_assembles_jit_force_quasi_immutable_llop() {
     // InstanceRepr.hook_setfield`: the `version?` store is preceded by
     // `jit_force_quasi_immutable(vinst, Const('mutate_version'))`.
     // `jtransform.py rewrite_op_jit_force_quasi_immutable` turns that
-    // call into `-live-` + `jit_force_quasi_immutable`. Identity is the
-    // `#[jit_llop]` marker on the callee, so this graph must assemble
-    // that llop rather than look inside the native invalidation body.
+    // call into `-live-` + `jit_force_quasi_immutable`. The force is the
+    // hook on the outer `FieldWrite { ModuleDictStrategy.version }`, then
+    // (after any `inline_call` of `fresh`) `setfield_gc_r` of that field.
     let path = "celldict::ModuleDictStrategy::mutated";
     let jc = crate::jitcode_runtime::pathed_jitcode(path)
         .expect("ModuleDictStrategy.mutated must be a discovered jitcode");
     let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
     let keys: Vec<&str> = ops.iter().map(|op| op.key).collect();
-    let force = ops
+    let force_i = ops
         .windows(2)
-        .find(|pair| pair[0].key == "live/" && pair[1].key == "jit_force_quasi_immutable/rd")
-        .map(|pair| &pair[1])
+        .position(|pair| pair[0].key == "live/" && pair[1].key == "jit_force_quasi_immutable/rd")
+        .map(|i| i + 1)
         .unwrap_or_else(|| {
             panic!("{path} must assemble live/ then jit_force_quasi_immutable/rd; ops={keys:?}")
         });
+    let force = &ops[force_i];
     assert_eq!(
         force.argcodes, "rd",
         "{path} jit_force_quasi_immutable must be keyed /rd; ops={keys:?}"
@@ -7082,6 +7208,57 @@ fn module_dict_strategy_mutated_assembles_jit_force_quasi_immutable_llop() {
         }
         other => {
             panic!("{path} force descr {descr_idx} must be Field mutate_version; got {other:?}")
+        }
+    }
+    let mut i = force_i + 1;
+    while i < ops.len() {
+        let k = ops[i].key;
+        if k == "live/"
+            || k.starts_with("inline_call")
+            || k.starts_with("new/")
+            || k.starts_with("new_with_vtable")
+        {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let store = ops
+        .get(i)
+        .unwrap_or_else(|| panic!("{path} force must be followed by setfield_gc_r; ops={keys:?}"));
+    assert!(
+        store.key.starts_with("setfield_gc_r"),
+        "{path} force must be followed (after inline_call of fresh) by setfield_gc_r; \
+         next={} ops={keys:?}",
+        store.key
+    );
+    let store_descr_idx = if store.argcodes == "rrd" {
+        let lo = jc.code[store.pc + 3] as u16;
+        let hi = jc.code[store.pc + 4] as u16;
+        (lo | (hi << 8)) as usize
+    } else {
+        panic!(
+            "{path} setfield_gc_r argcodes must be rrd, got {}; ops={keys:?}",
+            store.argcodes
+        )
+    };
+    match crate::jitcode_runtime::get_descr_by_index(store_descr_idx) {
+        Some(majit_jitcode::jitcode::BhDescr::Field { name, owner, .. }) => {
+            assert_eq!(
+                name, "version",
+                "{path} setfield descr {store_descr_idx} must be version; owner={owner}"
+            );
+            assert!(
+                owner == "celldict::ModuleDictStrategy" || owner.ends_with("::ModuleDictStrategy"),
+                "{path} setfield descr {store_descr_idx} must be owned by ModuleDictStrategy; \
+                 owner={owner}"
+            );
+        }
+        other => {
+            panic!(
+                "{path} setfield descr {store_descr_idx} must be Field ModuleDictStrategy.version; \
+                 got {other:?}"
+            )
         }
     }
 }

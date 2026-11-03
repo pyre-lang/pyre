@@ -11334,18 +11334,18 @@ impl CraneliftBackend {
     /// llmodel.py write_int_at_mem(gcref, ofs, size, newvalue).
     /// TODO: see `read_int_at_mem` above for the
     /// null-guard rationale (cranelift call-site auditing required).
-    fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
+    fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64, release: bool) {
         if addr == 0 {
             return;
         }
-        let ptr = (addr as usize).wrapping_add(offset as usize);
         unsafe {
-            match size {
-                1 => (ptr as *mut u8).write_unaligned(newvalue as u8),
-                2 => (ptr as *mut u16).write_unaligned(newvalue as u16),
-                4 => (ptr as *mut u32).write_unaligned(newvalue as u32),
-                _ => (ptr as *mut i64).write_unaligned(newvalue),
-            }
+            majit_backend::llmodel::write_int_at_mem(
+                addr as usize,
+                offset as usize,
+                size,
+                newvalue,
+                release,
+            )
         }
     }
 
@@ -17943,15 +17943,42 @@ impl CraneliftBackend {
 
                     let base = resolve_opref(&mut builder, &opref_var_map, op.arg(0).to_opref());
                     let val = resolve_opref(&mut builder, &opref_var_map, op.arg(1).to_opref());
-                    emit_store_to_addr(
-                        &mut builder,
-                        base,
-                        fd.offset() as i32,
-                        val,
-                        fd.field_type(),
-                        fd.field_size(),
-                        op.opcode,
-                    )?;
+                    let release =
+                        fd.store_is_release() && matches!(fd.field_type(), Type::Int | Type::Ref);
+                    if release {
+                        // Sequentially consistent store. It is the Release
+                        // twin of the Acquire getfield `atomic_load`.
+                        let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
+                        if fd.field_type() == Type::Ref {
+                            builder.ins().atomic_store(MemFlagsData::new(), val, addr);
+                        } else {
+                            let mem_ty = checked_cl_type_for_size(
+                                fd.field_size(),
+                                op.opcode,
+                                "release integer setfield supports 1-, 2-, 4-, and 8-byte fields",
+                            )?;
+                            let store_val = if mem_ty == cl_types::I64 {
+                                val
+                            } else {
+                                builder.ins().ireduce(mem_ty, val)
+                            };
+                            builder.ins().atomic_store(
+                                MemFlagsData::new().with_aligned(),
+                                store_val,
+                                addr,
+                            );
+                        }
+                    } else {
+                        emit_store_to_addr(
+                            &mut builder,
+                            base,
+                            fd.offset() as i32,
+                            val,
+                            fd.field_type(),
+                            fd.field_size(),
+                            op.opcode,
+                        )?;
+                    }
                 }
 
                 // ── Array access (getarrayitem) ──
@@ -22828,7 +22855,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // ofs == 0 always for raw lengthless arrays (llmodel.py assert)
         let size = descr.as_itemsize();
         // llmodel.py: self.write_int_at_mem(addr, offset, size, newvalue)
-        self.write_int_at_mem(addr, offset, size, newvalue);
+        self.write_int_at_mem(addr, offset, size, newvalue, false);
     }
 
     /// llmodel.py bh_raw_load_f(addr, offset, descr).
@@ -22913,7 +22940,13 @@ impl majit_backend::Backend for CraneliftBackend {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
-        self.write_int_at_mem(struct_ptr, offset as i64, size, value);
+        self.write_int_at_mem(
+            struct_ptr,
+            offset as i64,
+            size,
+            value,
+            fielddescr.store_is_release(),
+        );
     }
 
     fn bh_setfield_gc_r(
@@ -22928,8 +22961,16 @@ impl majit_backend::Backend for CraneliftBackend {
         // the bare store), identical to the array ref setters. Without it a
         // young value stored into an old managed struct is not remembered and
         // the next minor collection can free it while still referenced.
+        // Barrier first, then the (possibly Release) store publishes.
         write_barrier_if_managed(majit_ir::GcRef(struct_ptr as usize));
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(
+                struct_ptr as usize,
+                offset,
+                value.0,
+                fielddescr.store_is_release(),
+            )
+        };
     }
 
     /// llmodel.py bh_getarrayitem_gc_i: ofs=base_size, size+sign
@@ -22996,7 +23037,7 @@ impl majit_backend::Backend for CraneliftBackend {
     ) {
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
-        self.write_int_at_mem(array_ptr, offset, itemsize, newvalue);
+        self.write_int_at_mem(array_ptr, offset, itemsize, newvalue, false);
     }
 
     /// llmodel.py bh_setarrayitem_gc_r.
@@ -23049,7 +23090,7 @@ impl majit_backend::Backend for CraneliftBackend {
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
         let (foff, fsize, _) = field.unpack_fielddescr_size();
         let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
-        self.write_int_at_mem(array_ptr, offset, fsize, newvalue);
+        self.write_int_at_mem(array_ptr, offset, fsize, newvalue, field.store_is_release());
     }
 
     /// llmodel.py bh_setinteriorfield_gc_r.  Pointer-typed
@@ -23067,10 +23108,15 @@ impl majit_backend::Backend for CraneliftBackend {
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
         let (foff, _, _) = field.unpack_fielddescr_size();
         let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
-        unsafe {
-            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
-        }
         write_barrier_if_managed(majit_ir::GcRef(array_ptr as usize));
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(
+                array_ptr as usize,
+                offset as usize,
+                newvalue.0,
+                field.store_is_release(),
+            )
+        };
     }
 
     /// llmodel.py bh_setinteriorfield_gc_f.  Float-typed interior

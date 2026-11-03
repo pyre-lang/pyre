@@ -45,9 +45,9 @@ pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 /// type at collection time.
 pub const W_INT_GC_TYPE_ID: u32 = 1;
 /// User-subclass int layout (`typedef.py` `_getusercls`). Unconditional,
-/// so its tid sits with the other closed ids (158) ahead of the
+/// so its tid sits with the other closed ids (159) ahead of the
 /// target-gated tail.
-pub const W_INT_USER_GC_TYPE_ID: u32 = 158;
+pub const W_INT_USER_GC_TYPE_ID: u32 = 159;
 pub const W_INT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObjectUser>();
 
 // ── Prebuilt-int cache ───────────────────────────────────────────────
@@ -734,7 +734,7 @@ mod tests {
         // `W_IntObject` and the id that `pyre-jit/src/eval.rs`
         // asserts at JitDriver init. See `descr.rs` re-export.
         assert_eq!(W_INT_GC_TYPE_ID, 1);
-        assert_eq!(W_INT_USER_GC_TYPE_ID, 158);
+        assert_eq!(W_INT_USER_GC_TYPE_ID, 159);
     }
 
     /// `intobject.py _bit_count` parity — verifies the popcount

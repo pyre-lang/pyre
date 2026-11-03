@@ -2133,6 +2133,11 @@ pub struct BhFieldSpec {
     /// the quasi-pointer overlay in `BhDescr::load_is_acquire`.
     #[serde(default)]
     pub load_is_acquire: bool,
+    /// Stored Release stamp for a `?` `Atomic*` field's setfield.
+    /// Pair of `load_is_acquire`; stamped at mint from the same
+    /// `quasi && atomic` fact. There is no pointer overlay.
+    #[serde(default)]
+    pub store_is_release: bool,
 }
 
 impl BhFieldSpec {
@@ -2165,6 +2170,7 @@ impl BhFieldSpec {
             && self.index_in_parent == other.index_in_parent
             && self.effective_class_word() == other.effective_class_word()
             && self.load_is_acquire == other.load_is_acquire
+            && self.store_is_release == other.store_is_release
     }
 
     /// The class-word answer this spec rebuilds to: the producer declaration
@@ -2231,6 +2237,7 @@ impl BhFieldSpec {
             // wire would make the rebuilt descr a declaration nothing declared.
             is_class_word: fd.declared_w_class(),
             load_is_acquire: fd.stored_load_is_acquire(),
+            store_is_release: fd.stored_store_is_release(),
         }
     }
 }
@@ -2379,6 +2386,7 @@ impl BhSizeSpec {
                 Some(true) => 2,
             });
             out.push(u8::from(field.load_is_acquire));
+            out.push(u8::from(field.store_is_release));
         }
         push_str(out, &self.owner);
         let body_len = u32::try_from(out.len() - body_at).expect("layout record exceeds u32");
@@ -2416,6 +2424,7 @@ impl BhSizeSpec {
                 tag => panic!("layout class-word tag {tag}"),
             };
             let load_is_acquire = cursor.u8() != 0;
+            let store_is_release = cursor.u8() != 0;
             all_fielddescrs.push(BhFieldSpec {
                 index,
                 field_key,
@@ -2430,6 +2439,7 @@ impl BhSizeSpec {
                 index_in_parent,
                 is_class_word,
                 load_is_acquire,
+                store_is_release,
             });
         }
         let owner = cursor.string();
@@ -2508,6 +2518,7 @@ impl BhSizeSpec {
                 tag => panic!("layout class-word tag {tag}"),
             };
             let load_is_acquire = cursor.u8() != 0;
+            let store_is_release = cursor.u8() != 0;
             fields.push(StaticParentField {
                 index,
                 name,
@@ -2522,6 +2533,7 @@ impl BhSizeSpec {
                 index_in_parent,
                 is_class_word,
                 load_is_acquire,
+                store_is_release,
             });
         }
         let _owner = cursor.str_ref();
@@ -2568,6 +2580,7 @@ pub struct StaticParentField {
     pub index_in_parent: usize,
     pub is_class_word: Option<bool>,
     pub load_is_acquire: bool,
+    pub store_is_release: bool,
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -2705,6 +2718,7 @@ mod layout_pack_tests {
                     index_in_parent: 0,
                     is_class_word: Some(false),
                     load_is_acquire: false,
+                    store_is_release: false,
                 }],
             };
             let mut bytes = Vec::new();
@@ -2858,6 +2872,11 @@ pub enum BhDescr {
         /// in [`BhDescr::load_is_acquire`].
         #[serde(default)]
         load_is_acquire: bool,
+        /// Stored Release stamp. Pair of `load_is_acquire`; stamped at
+        /// mint from the same `quasi && atomic` fact. There is no
+        /// pointer overlay.
+        #[serde(default)]
+        store_is_release: bool,
     },
     /// Array descriptor: for getarrayitem/setarrayitem/arraylen.
     /// RPython: `ArrayDescr` with `itemsize`, `basesize` attributes.
@@ -3155,6 +3174,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
                 owner,
                 parent,
                 load_is_acquire,
+                store_is_release,
             } => {
                 out.string_count += 2;
                 out.string_bytes += name.len() + owner.len();
@@ -3188,7 +3208,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
                     .entry(format!(
                         "{owner}.{name} off={offset} sz={field_size} ty={field_type:?} \
                          flag={field_flag:?} signed={is_field_signed} imm={is_immutable} \
-                         qi={is_quasi_immutable} acq={load_is_acquire} idx={} parent[{parent_spelling}]",
+                         qi={is_quasi_immutable} acq={load_is_acquire} rel={store_is_release} idx={} parent[{parent_spelling}]",
                         index_in_parent.unwrap_or(0)
                     ))
                     .and_modify(|n| *n += 1)
@@ -3199,7 +3219,7 @@ pub fn descr_pool_content(descrs: &[BhDescr]) -> DescrPoolContent {
                     .push(format!(
                         "off={offset} sz={field_size} ty={field_type:?} flag={field_flag:?} \
                          signed={is_field_signed} imm={is_immutable} qi={is_quasi_immutable} \
-                         acq={load_is_acquire} idx={idx_spelling} parent[{parent_spelling}]"
+                         acq={load_is_acquire} rel={store_is_release} idx={idx_spelling} parent[{parent_spelling}]"
                     ));
                 "field"
             }
@@ -3354,6 +3374,17 @@ impl BhDescr {
             BhDescr::Array {
                 load_is_acquire, ..
             } => *load_is_acquire,
+            _ => false,
+        }
+    }
+
+    /// Release store of a field. Returns the stored bit only; there is
+    /// no pointer overlay (`Function.w_qualname` stays unordered).
+    pub fn store_is_release(&self) -> bool {
+        match self {
+            BhDescr::Field {
+                store_is_release, ..
+            } => *store_is_release,
             _ => false,
         }
     }
@@ -3706,6 +3737,7 @@ impl BhDescr {
             name: spec.field_key,
             owner: String::new(),
             load_is_acquire: spec.load_is_acquire,
+            store_is_release: spec.store_is_release,
         }
     }
 
@@ -3859,6 +3891,7 @@ pub fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> BhField
         // instead of receiving a declaration that outranks a real one.
         is_class_word: fd.declared_w_class(),
         load_is_acquire: fd.stored_load_is_acquire(),
+        store_is_release: fd.stored_store_is_release(),
     }
 }
 
@@ -4006,6 +4039,7 @@ mod tests {
             // both resolve to `false` and the layout comparison is unaffected.
             is_class_word: None,
             load_is_acquire: false,
+            store_is_release: false,
         }
     }
 
@@ -4125,8 +4159,10 @@ mod tests {
             name: "PyCode.w_globals".into(),
             owner: "PyCode".into(),
             load_is_acquire: false,
+            store_is_release: false,
         };
         assert!(descr.load_is_acquire());
+        assert!(!descr.store_is_release());
         let mutate = BhDescr::Field {
             offset: 0,
             field_size: 8,
@@ -4140,8 +4176,10 @@ mod tests {
             name: "mutate_w_globals".into(),
             owner: "PyCode".into(),
             load_is_acquire: false,
+            store_is_release: false,
         };
         assert!(!mutate.load_is_acquire());
+        assert!(!mutate.store_is_release());
     }
 
     #[test]
@@ -4159,8 +4197,10 @@ mod tests {
             name: "W_TypeObject.version_tag".into(),
             owner: "W_TypeObject".into(),
             load_is_acquire: true,
+            store_is_release: true,
         };
         assert!(descr.load_is_acquire());
+        assert!(descr.store_is_release());
         let mutate = BhDescr::Field {
             offset: 0,
             field_size: 8,
@@ -4174,8 +4214,10 @@ mod tests {
             name: "mutate_w_globals".into(),
             owner: "PyCode".into(),
             load_is_acquire: false,
+            store_is_release: false,
         };
         assert!(!mutate.load_is_acquire());
+        assert!(!mutate.store_is_release());
     }
 
     #[test]

@@ -5052,15 +5052,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // A runtime-mutable global counter, not a build-time constant: bind the
     // read seam by address so the JIT calls it instead of folding whatever
-    // serial the build process saw.
-    pa0!(
-        &mut entries,
-        "pyre_object::celldict::next_version_tag_serial",
-        "pyre_object::next_version_tag_serial",
-        pyre_object::celldict::next_version_tag_serial,
-    );
-    // Same shape for the `W_SetObject.set_id` counter the `w_set_new` body
-    // calls.
+    // serial the build process saw. Same shape for the `W_SetObject.set_id`
+    // counter the `w_set_new` body calls.
     pa0!(
         &mut entries,
         "pyre_object::setobject::fresh_set_id",
@@ -6316,6 +6309,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "celldict::INT_MUTABLE_CELL_TYPE",
             celldict::INT_MUTABLE_CELL_TYPE
         ),
+        pytype_addr!("celldict::VERSION_TAG_TYPE", celldict::VERSION_TAG_TYPE),
         pytype_addr!(
             "dictmultiobject::MODULE_DICT_TYPE",
             dictmultiobject::MODULE_DICT_TYPE

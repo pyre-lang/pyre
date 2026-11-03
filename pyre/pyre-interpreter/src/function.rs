@@ -266,8 +266,8 @@ pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1
 /// Which `_immutable_fields_` `?` entry a quasi-immutable operation names.
 ///
 /// `quasiimmut.py` keys everything off the mutate-field *name*. The tag
-/// names which embedded `mutate_<name>` a setter forces
-/// (`Function::jit_force_quasi_immutable`).
+/// names which embedded `mutate_<name>` a setter stores under
+/// (`quasi_immut_store!`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum QuasiImmutSlot {
     Code,
@@ -386,18 +386,6 @@ impl Function {
             QuasiImmutSlot::WTextSignature => self.mutate_w_text_signature(),
             QuasiImmutSlot::WKwDefs => self.mutate_w_kw_defs(),
         }
-    }
-
-    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
-    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
-    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
-    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
-    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
-    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
-    #[inline(never)]
-    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
-        self.mutate_field(QuasiImmutSlot::from_mutate_field_name(mutatefieldname))
-            .invalidate_if_installed();
     }
 }
 
@@ -1771,8 +1759,9 @@ pub unsafe fn fset_func_qualname(
             ));
         }
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_w_qualname");
-        (*(obj as *mut Function)).w_qualname = value;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_w_qualname() =>
+            (*(obj as *mut Function)).w_qualname = value;
+        );
         Ok(())
     }
 }
@@ -1877,8 +1866,9 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
         let w_qualname = pyre_object::w_str_new_managed(&name);
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_w_qualname");
-        (*(obj as *mut Function)).w_qualname = w_qualname;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_w_qualname() =>
+            (*(obj as *mut Function)).w_qualname = w_qualname;
+        );
         w_qualname
     }
 }
@@ -1896,8 +1886,9 @@ pub unsafe fn function_get_qualname_obj(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_qualname(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_w_qualname");
-        (*(obj as *mut Function)).w_qualname = value;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_w_qualname() =>
+            (*(obj as *mut Function)).w_qualname = value;
+        );
     }
 }
 
@@ -1988,8 +1979,9 @@ pub unsafe fn function_get_closure(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_closure(obj: PyObjectRef, closure: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_closure");
-        (*(obj as *mut Function)).closure = closure;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_closure() =>
+            (*(obj as *mut Function)).closure = closure;
+        );
     }
 }
 
@@ -2010,8 +2002,9 @@ pub unsafe fn function_get_defaults(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_defaults(obj: PyObjectRef, defaults: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_defs_w");
-        (*(obj as *mut Function)).defs_w = defaults;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_defs_w() =>
+            (*(obj as *mut Function)).defs_w = defaults;
+        );
     }
 }
 
@@ -2032,8 +2025,9 @@ pub unsafe fn function_get_kwdefaults(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_kwdefaults(obj: PyObjectRef, kwdefaults: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_w_kw_defs");
-        (*(obj as *mut Function)).w_kw_defs = kwdefaults;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_w_kw_defs() =>
+            (*(obj as *mut Function)).w_kw_defs = kwdefaults;
+        );
     }
 }
 
@@ -2691,8 +2685,9 @@ pub unsafe fn function_get_func_code(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn function_set_func_code(obj: PyObjectRef, code: *const ()) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_code");
-        (*(obj as *mut Function)).code = code;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_code() =>
+            (*(obj as *mut Function)).code = code;
+        );
     }
 }
 
@@ -2753,7 +2748,7 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
         }
         // Root `obj` and `name` across any collecting call
         // (`alloc_utf8_payload` / `FrameworkGCTransformer.gct_fv_gc_malloc`,
-        // `QuasiImmutField.invalidate`). `jit_force_quasi_immutable` runs
+        // `QuasiImmutField.invalidate`). `quasi_immut_store!` runs
         // before the barrier. `transform_generic_set` puts the barrier at the
         // pointer store, with no collecting call between barrier and stores.
         let _roots = pyre_object::gc_roots::push_roots();
@@ -2773,17 +2768,18 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
             slot
         };
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_name");
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
-        let payload = if payload_slot == usize::MAX {
-            w_str_storage(name)
-        } else {
-            pyre_object::gc_roots::shadow_stack_get(payload_slot) as *mut UnicodeValueStorage
-        };
-        function_write_barrier(obj);
-        (*(obj as *mut Function)).w_name = name;
-        (*(obj as *mut Function)).name = payload;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_name() =>
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+            let name = pyre_object::gc_roots::shadow_stack_get(name_slot);
+            let payload = if payload_slot == usize::MAX {
+                w_str_storage(name)
+            } else {
+                pyre_object::gc_roots::shadow_stack_get(payload_slot) as *mut UnicodeValueStorage
+            };
+            function_write_barrier(obj);
+            (*(obj as *mut Function)).w_name = name;
+            (*(obj as *mut Function)).name = payload;
+        );
     }
 }
 
@@ -2831,8 +2827,9 @@ pub unsafe fn fget_func_objclass(obj: PyObjectRef) -> Result<PyObjectRef, crate:
 pub unsafe fn function_set_objclass(obj: PyObjectRef, w_type: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_w_objclass");
-        (*(obj as *mut Function)).w_objclass = w_type;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_w_objclass() =>
+            (*(obj as *mut Function)).w_objclass = w_type;
+        );
     }
 }
 
@@ -2880,8 +2877,9 @@ pub unsafe fn fget_func_text_signature(obj: PyObjectRef) -> Result<PyObjectRef, 
 pub unsafe fn fset_func_text_signature(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
         function_write_barrier(obj);
-        (*(obj as *const Function)).jit_force_quasi_immutable("mutate_w_text_signature");
-        (*(obj as *mut Function)).w_text_signature = value;
+        pyre_object::quasi_immut_store!((*(obj as *const Function)).mutate_w_text_signature() =>
+            (*(obj as *mut Function)).w_text_signature = value;
+        );
     }
 }
 

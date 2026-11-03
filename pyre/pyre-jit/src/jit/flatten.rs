@@ -3464,6 +3464,7 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
             name: display_name.to_string(),
             owner: owner.to_string(),
             load_is_acquire: field.stored_load_is_acquire(),
+            store_is_release: field.stored_store_is_release(),
         }));
     }
     // Graph-side `raw_load_i` of the eval-breaker word (and any other

@@ -51,20 +51,16 @@ fn declared_ranks_land_on_the_field_specs() {
 
 #[test]
 fn a_quasi_immutable_entry_is_recorded_as_quasi() {
-    // `rclass.py _parse_field_list`'s `?` suffix.  The two flags are disjoint:
-    // `ImmutableRanking.pure` is false for the quasi ranks, because a
-    // quasi-immutable read is pinned by `record_quasiimmut_field` plus a guard
-    // rather than by the descr's pure flag.  Setting both would make the read
-    // unconditionally foldable and drop the guard that protects it.
+    // Declared rank, descr.py `!= False`: both flags are true for a `?` field.
     let mut builder = JitCodeBuilder::new();
     builder.register_struct_layout(24, TID_RANKS + 16, false, false, NODE, "version?");
 
     let version = field(&builder, TID_RANKS + 16, "version");
     assert!(version.is_quasi_immutable);
     assert!(
-        !version.is_immutable,
-        "the pure flag is false for a quasi rank — the same pair the LLBC front \
-         end writes from `ImmutableRank::is_immutable` / `is_quasi_immutable`",
+        version.is_immutable,
+        "a declared rank stamps is_immutable — descr.py get_field_descr \
+         is_pure = STRUCT._immutable_field(fieldname) != False",
     );
 }
 
@@ -181,9 +177,7 @@ mod minted_descr {
 
     #[test]
     fn a_quasi_declared_field_mints_a_quasi_descr() {
-        // `is_always_pure` is `is_immutable && !is_quasi_immutable`, so this
-        // pair is what keeps a quasi-immutable read behind its guard instead
-        // of folding it outright.
-        assert_eq!(immutability_of("marked", "marked?"), (false, true));
+        // Declared rank, descr.py `!= False`: both flags true.
+        assert_eq!(immutability_of("marked", "marked?"), (true, true));
     }
 }

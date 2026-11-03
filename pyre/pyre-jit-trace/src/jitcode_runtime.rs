@@ -4279,6 +4279,7 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: Some(false),
                     load_is_acquire: false,
+                    store_is_release: false,
                 }],
             );
             assert!(crate::descr::kind0_size_already_published(published));
@@ -4356,6 +4357,7 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: Some(false),
                     load_is_acquire: false,
+                    store_is_release: false,
                 }],
             };
             let mut bytes = Vec::new();

@@ -39,7 +39,7 @@ pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 /// User-subclass float layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (161) ahead of the
 /// target-gated tail.
-pub const W_FLOAT_USER_GC_TYPE_ID: u32 = 161;
+pub const W_FLOAT_USER_GC_TYPE_ID: u32 = 162;
 pub const W_FLOAT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_FloatObjectUser>();
 
 /// Fixed payload size for `W_FloatObject`, mirroring `info.fixedsize`

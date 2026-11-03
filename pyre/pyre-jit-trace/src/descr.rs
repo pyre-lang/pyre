@@ -229,6 +229,7 @@ pub(crate) fn gc_cached_field_descr(
         false,
         None,
         false,
+        false,
     ) as DescrRef
 }
 
@@ -605,7 +606,7 @@ pub fn make_quasi_immutable_field_descr(
         field_size,
         field_type,
         signed,
-        false,
+        true,
         true,
         u32::MAX,
     )
@@ -1147,6 +1148,7 @@ fn build_object_descr_group_inlining_parent(
                         index_in_parent,
                         is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                         load_is_acquire: false,
+                        store_is_release: false,
                     }
                 },
             )
@@ -1233,6 +1235,7 @@ fn build_object_descr_group_inlining_parent(
                 is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                 index_in_parent,
                 load_is_acquire: false,
+                store_is_release: false,
             },
         )
         .collect();
@@ -1337,6 +1340,7 @@ fn build_bare_gcstruct_descr_group(
                 is_class_word: Some(false),
                 index_in_parent,
                 load_is_acquire: false,
+                store_is_release: false,
             },
         )
         .collect();
@@ -2305,14 +2309,12 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 ///
 /// The `?` makes each field quasi-immutable and `[*]` makes the selected
 /// elements immutable after the field has been promoted.  All nine are marked
-/// here through the `quasi` row: `descr.py:229 is_pure =
+/// here through the `quasi` row: `descr.py get_field_descr` `is_pure =
 /// STRUCT._immutable_field(fieldname) != False` answers true for a
-/// quasi-immutable field — `IR_QUASIIMMUTABLE` is an object, so `!= False`
-/// holds — which is what the `is_immutable` column carries.  The rank is what
-/// keeps the read from folding on that column alone:
-/// `SimpleFieldDescr::is_always_pure` is `is_immutable && !is_quasi_immutable`,
-/// so the fold stays behind `record_quasiimmut_field` + `GUARD_NOT_INVALIDATED`
-/// exactly as `jtransform.py:895-903` sequences it.
+/// quasi-immutable field — `IR_QUASIIMMUTABLE` is falsy but not `False` —
+/// which is what the `is_immutable` column carries. The row is always pure;
+/// soundness comes from the paired `record_quasiimmut_field` (`jtransform.py
+/// rewrite_op_getfield`) so a folded read keeps its `GUARD_NOT_INVALIDATED`.
 ///
 /// The write half these descriptors depend on is
 /// `Function::jit_force_quasi_immutable("mutate_<name>")`, called immediately
@@ -2599,6 +2601,7 @@ fn mint_w_dict_int_alias(field_key: &str, display: &str, offset: usize) -> Descr
         u32::MAX,
         false,
         None,
+        false,
         false,
     ) as DescrRef
 }
@@ -4756,6 +4759,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 index_in_parent,
                 is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
                 load_is_acquire,
+                store_is_release: load_is_acquire,
             }
         };
         let specs = vec![
@@ -4765,7 +4769,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 w_name_offset,
                 WORD,
                 Type::Ref,
-                false,
+                true,
                 true,
                 ArrayFlag::Pointer,
                 0,
@@ -4777,7 +4781,7 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
                 version_tag_offset,
                 8,
                 Type::Int,
-                false,
+                true,
                 true,
                 ArrayFlag::Unsigned,
                 1,
@@ -5131,9 +5135,8 @@ fn mutate_descr_for_quasi_field_of_parent(field: &DescrRef, parent: &DescrRef) -
 /// `LOAD_GLOBAL` / `STORE_GLOBAL` cell folds bake the stored cell under a
 /// `QUASIIMMUT_FIELD` on this field. `_setitem_str_cell_known` (`celldict.py`)
 /// calls `mutated()` before every write that replaces the stored pointer.
-/// `is_immutable` / `is_quasi_immutable` match
-/// [`make_quasi_immutable_field_descr`]. Its HeapCache `index` is the
-/// interned `(STRUCT, fieldname)` identity.
+/// Both flags are true: a declared rank is always pure (`descr.py` `!= False`).
+/// Its HeapCache `index` is the interned `(STRUCT, fieldname)` identity.
 ///
 /// `caches` is `celldict.py ModuleDictStrategy.caches`. `heaptracker.py
 /// all_fielddescrs` walks every field of the STRUCT; the JIT never loads
@@ -5178,6 +5181,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
                 index_in_parent,
                 is_class_word: Some(false),
                 load_is_acquire: false,
+                store_is_release: false,
             }
         };
         let mut specs = vec![field(
@@ -5185,10 +5189,10 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             "version",
             version_offset,
             8,
-            Type::Int,
-            false,
+            Type::Ref,
             true,
-            ArrayFlag::Unsigned,
+            true,
+            ArrayFlag::Pointer,
             0,
         )];
         let mut index_in_parent = 1;
@@ -5244,8 +5248,8 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
         let cache_key = majit_ir::descr::path_hash("celldict::ModuleDictStrategy");
         let type_id = pyre_object::celldict::module_dict_strategy_gc_type_id();
         // `gc_alloc_storage_box` (`gc_storage.rs`) lays `[GcHeader | T]` and
-        // `register_leaf_storage_box` tags it with `MODULE_DICT_STRATEGY_GC_TYPE_ID`
-        // (`celldict.rs`). `is_gc_managed` matches that box. `headerless` is
+        // `register_storage_box_with_gc_ptrs` tags it with `MODULE_DICT_STRATEGY_GC_TYPE_ID`
+        // (`celldict.rs`), tracing `version`. `is_gc_managed` matches that box. `headerless` is
         // false once the tid is published (`build_gc`); a still-zero tid cannot
         // name the header, so `GUARD_GC_TYPE` must not fire against type_id 0.
         let headerless = type_id == 0;
@@ -5334,13 +5338,15 @@ fn make_mapdict_quasi_descr_group(
             offset,
             field_size,
             field_type,
-            is_immutable: false,
+            // declared `?` rank: descr.py get_field_descr `!= False`
+            is_immutable: is_quasi_immutable,
             is_quasi_immutable,
             flag,
             virtualizable: false,
             index_in_parent,
             is_class_word: Some(false),
             load_is_acquire: false,
+            store_is_release: false,
         }
     };
     let specs = vec![
@@ -5508,13 +5514,15 @@ static HOLDER_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             offset,
             field_size,
             field_type,
-            is_immutable: false,
+            // declared `?` rank: descr.py get_field_descr `!= False`
+            is_immutable: is_quasi_immutable,
             is_quasi_immutable,
             flag,
             virtualizable: false,
             index_in_parent,
             is_class_word: Some(false),
             load_is_acquire: false,
+            store_is_release: false,
         }
     };
     let specs = vec![
@@ -5700,6 +5708,7 @@ static W_PROPERTY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Laz
             index_in_parent,
             is_class_word: Some(false),
             load_is_acquire: false,
+            store_is_release: false,
         }
     };
     let specs = vec![
@@ -5709,7 +5718,7 @@ static W_PROPERTY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Laz
             fget_offset,
             WORD,
             Type::Ref,
-            false,
+            true,
             true,
             ArrayFlag::Pointer,
             0,
@@ -5720,7 +5729,7 @@ static W_PROPERTY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Laz
             fset_offset,
             WORD,
             Type::Ref,
-            false,
+            true,
             true,
             ArrayFlag::Pointer,
             1,
@@ -5731,7 +5740,7 @@ static W_PROPERTY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Laz
             fdel_offset,
             WORD,
             Type::Ref,
-            false,
+            true,
             true,
             ArrayFlag::Pointer,
             2,
@@ -8119,7 +8128,7 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             word_ref(
                 "w_globals",
                 std::mem::offset_of!(PyCode, w_globals),
-                false,
+                true,
                 true,
             ),
             word_ref(
@@ -9450,12 +9459,11 @@ pub fn ec_topframeref_descr() -> DescrRef {
 /// Field descr for `ExecutionContext::w_tracefunc`, the slot
 /// `executioncontext.py gettrace` reads (`jit.promote(self.w_tracefunc)`).
 ///
-/// Marked `w_tracefunc?` so the portal pin is a `QUASIIMMUT_FIELD` marker
+/// Marked `w_tracefunc?` so the pin is a `QUASIIMMUT_FIELD` marker
 /// plus `GUARD_NOT_INVALIDATED`; `settrace` invalidates the watchers.
-/// Recorded at the portal merge point by `record_portal_tracefunc_guard`
+/// Recorded at an inlined call by `walker_call_trace_hook_reads`
 /// (`jitcode_dispatch/mod.rs`).  Same group as the two accessors above, so
-/// the read shares their struct identity and the heapcache collapses a run
-/// of merge points to one.
+/// the read shares their struct identity.
 pub fn ec_w_tracefunc_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_W_TRACEFUNC_OFFSET)
 }
@@ -9553,6 +9561,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         // Stamped below, once the specs are in offset order.
         index_in_parent: 0,
         load_is_acquire: false,
+        store_is_release: false,
     };
     // The activation counters.  `field_size` is derived from the field's own
     // type rather than spelled, so the 32-bit target reads the same four bytes
@@ -9571,6 +9580,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_class_word: Some(false),
         index_in_parent: 0,
         load_is_acquire: false,
+        store_is_release: false,
     };
     let mutate_field = |field_key: &str, offset: usize| SimpleFieldDescrSpec {
         index: u32::MAX,
@@ -9586,6 +9596,7 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         is_class_word: Some(false),
         index_in_parent: 0,
         load_is_acquire: false,
+        store_is_release: false,
     };
     let mut w_tracefunc = field(
         u32::MAX,
@@ -9687,11 +9698,13 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
 /// hidden `mutate_gil_ready` / `mutate_gil_ready_lock` words
 /// (`rclass.py InstanceRepr._setup_repr` / `quasiimmut.py
 /// get_mutate_field_name`). Both `is_immutable` and `is_quasi_immutable`
-/// are set so `SimpleFieldDescr::is_always_pure` stays false: an
-/// always-pure read of a constant receiver folds the zero with no
-/// `QuasiimmutField` and no invalidation. `is_gc_managed` is false so the
-/// read does not emit `GUARD_GC_TYPE` against the bytes before the static.
-/// HeapCache `index` is the interned `(STRUCT, fieldname)` identity.
+/// are set: the row is always pure (`descr.py` `!= False`). Soundness
+/// comes from the paired `record_quasiimmut_field` (`jtransform.py
+/// rewrite_op_getfield`); jitcode `gil_ready_word` records the marker
+/// before the getfield. There is no walker GETFIELD of this descr.
+/// `is_gc_managed` is false so the read does not emit `GUARD_GC_TYPE`
+/// against the bytes before the static. HeapCache `index` is the interned
+/// `(STRUCT, fieldname)` identity.
 static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     use pyre_object::gil_ready::GilReadyState;
@@ -9719,6 +9732,7 @@ static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Lazy
             index_in_parent,
             is_class_word: Some(false),
             load_is_acquire: false,
+            store_is_release: false,
         }
     };
     let specs = [
@@ -10191,6 +10205,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: Some(true),
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         assert!(
@@ -10579,7 +10594,7 @@ mod tests {
                 Type::Ref,
                 false,
                 6,
-                false,
+                true,
             ),
             (
                 pycode_hidden_applevel_descr(),
@@ -11258,6 +11273,7 @@ mod tests {
                 false,
                 Some(i),
                 false,
+                false,
             );
             assert!(
                 std::ptr::eq(
@@ -11659,6 +11675,25 @@ mod tests {
                 .as_field_descr()
                 .expect("mutate_version_tag is a field")
                 .load_is_acquire()
+        );
+    }
+
+    #[test]
+    fn w_type_version_tag_canonical_descr_stores_with_release() {
+        let version = field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "version_tag");
+        let mutate =
+            field_descr_from_group_named(&*W_TYPE_OBJECT_DESCR_GROUP, "mutate_version_tag");
+        assert!(
+            version
+                .as_field_descr()
+                .expect("version_tag is a field")
+                .store_is_release()
+        );
+        assert!(
+            !mutate
+                .as_field_descr()
+                .expect("mutate_version_tag is a field")
+                .store_is_release()
         );
     }
 
@@ -12213,6 +12248,7 @@ mod tests {
                 index_in_parent,
                 is_class_word: Some(is_class_word),
                 load_is_acquire: false,
+                store_is_release: false,
             }
         };
         let group = majit_ir::descr::make_simple_descr_group(
@@ -12298,6 +12334,7 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: None,
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
                 BhFieldSpec {
                     index: 1,
@@ -12313,6 +12350,7 @@ mod tests {
                     index_in_parent: 1,
                     is_class_word: None,
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
             ],
         };
@@ -12330,6 +12368,7 @@ mod tests {
             name: "value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
 
@@ -12389,6 +12428,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
             is_gc_managed: true,
         });
@@ -12446,6 +12486,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
             is_gc_managed: true,
         });
@@ -12487,6 +12528,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         })
     }
@@ -12513,6 +12555,7 @@ mod tests {
             name: name.into(),
             owner: "CodeObject".into(),
             load_is_acquire: false,
+            store_is_release: false,
         })
     }
 
@@ -12594,6 +12637,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         });
         let count = bh_field(
@@ -12632,6 +12676,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         });
         let imp = bh_field(
@@ -12684,6 +12729,7 @@ mod tests {
                 name: name.into(),
                 owner: "CodeObject".into(),
                 load_is_acquire: false,
+                store_is_release: false,
             })
             .1
         }
@@ -12750,6 +12796,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         });
         let imp = majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
@@ -12765,6 +12812,7 @@ mod tests {
             name: "imp".into(),
             owner: "DictStrategyRef".into(),
             load_is_acquire: false,
+            store_is_release: false,
         })
         .1;
         let vtable = majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
@@ -12780,6 +12828,7 @@ mod tests {
             name: "imp.vtable".into(),
             owner: "DictStrategyRef".into(),
             load_is_acquire: false,
+            store_is_release: false,
         })
         .1;
         assert_ne!(imp.index(), 0);
@@ -12994,6 +13043,7 @@ mod tests {
                     index_in_parent,
                     is_class_word: None,
                     load_is_acquire: false,
+                    store_is_release: false,
                 }
             };
         let key = spec(0, "key", 0, Type::Ref, majit_ir::descr::ArrayFlag::Pointer);
@@ -13039,6 +13089,7 @@ mod tests {
                 name: "f_valid".into(),
                 owner: String::new(),
                 load_is_acquire: false,
+                store_is_release: false,
             }),
         });
 
@@ -13103,6 +13154,7 @@ mod tests {
             index_in_parent: 0,
             is_class_word: None,
             load_is_acquire: false,
+            store_is_release: false,
         };
         let parent = BhSizeSpec {
             size: std::mem::size_of::<usize>(),
@@ -13126,6 +13178,7 @@ mod tests {
             name: "capacity".into(),
             owner: "ItemsBlock".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         let canonical = items_block_capacity_descr();
 
@@ -13181,6 +13234,7 @@ mod tests {
                 name: name.into(),
                 owner: "W_ListObject".into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
             assert_ne!(field.offset(), 0, "{name} bridged to the list header");
@@ -13222,6 +13276,7 @@ mod tests {
                 name: name.into(),
                 owner: "W_ListObject".into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
             assert!(
@@ -13265,6 +13320,7 @@ mod tests {
                 name: name.into(),
                 owner: "W_ListObject".into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
             assert!(
@@ -13449,6 +13505,7 @@ mod tests {
                 name: name.into(),
                 owner: owner.into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&descr, &expected),
@@ -13477,6 +13534,7 @@ mod tests {
             name: "w_class".into(),
             owner: owner.into(),
             load_is_acquire: false,
+            store_is_release: false,
         }
     }
 
@@ -13544,6 +13602,7 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: None,
                     load_is_acquire: false,
+                    store_is_release: false,
                 }],
             };
             let descr = make_descr_from_bh(&bh);
@@ -13575,6 +13634,7 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: None,
                     load_is_acquire: false,
+                    store_is_release: false,
                 }],
             };
             publish_kind0_parent_layout(spec.clone());
@@ -13643,6 +13703,7 @@ mod tests {
             is_class_word: Some(false),
             index_in_parent: 0,
             load_is_acquire: false,
+            store_is_release: false,
         };
         let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
@@ -13678,6 +13739,7 @@ mod tests {
                     index_in_parent: 0,
                     is_class_word: Some(false),
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
                 BhFieldSpec {
                     index: 1,
@@ -13693,6 +13755,7 @@ mod tests {
                     index_in_parent: 1,
                     is_class_word: Some(false),
                     load_is_acquire: false,
+                    store_is_release: false,
                 },
             ],
         };
@@ -13767,10 +13830,10 @@ mod tests {
     }
 
     #[test]
-    fn gil_ready_descr_is_quasi_immutable_not_always_pure() {
+    fn gil_ready_descr_is_quasi_immutable_and_always_pure() {
         let descr = gil_ready_descr();
         assert!(descr.is_quasi_immutable());
-        assert!(!descr.is_always_pure());
+        assert!(descr.is_always_pure());
         assert!(
             std::sync::Arc::ptr_eq(
                 &descr,
@@ -13830,6 +13893,7 @@ mod tests {
                 name: "gil_ready".into(),
                 owner: owner.into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&descr, &canonical),
@@ -13850,6 +13914,7 @@ mod tests {
             name: "gil_ready".into(),
             owner: "GilReadyState".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         assert!(
             !std::sync::Arc::ptr_eq(&narrow, &canonical),
@@ -13949,13 +14014,13 @@ mod tests {
             version.index()
         );
         assert!(version.is_quasi_immutable());
-        assert!(!version.is_always_pure());
+        assert!(version.is_always_pure());
         assert_eq!(
             version_field.offset(),
             core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
         );
         assert_eq!(version_field.field_size(), 8);
-        assert_eq!(version_field.field_type(), Type::Int);
+        assert_eq!(version_field.field_type(), Type::Ref);
     }
 
     #[test]
@@ -13983,6 +14048,7 @@ mod tests {
                 name: "mutate_version".into(),
                 owner: owner.into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&descr, &canonical),
@@ -14003,6 +14069,7 @@ mod tests {
             name: "mutate_version".into(),
             owner: "ModuleDictStrategy".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         assert!(
             !std::sync::Arc::ptr_eq(&narrow, &canonical),
@@ -14025,8 +14092,8 @@ mod tests {
             let descr = make_descr_from_bh(&BhDescr::Field {
                 offset,
                 field_size: 8,
-                field_type: Type::Int,
-                field_flag: ArrayFlag::Unsigned,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
                 is_field_signed: false,
                 is_immutable: false,
                 is_quasi_immutable: false,
@@ -14035,6 +14102,7 @@ mod tests {
                 name: "version".into(),
                 owner: owner.into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&descr, &canonical),
@@ -14055,6 +14123,7 @@ mod tests {
             name: "version".into(),
             owner: "ModuleDictStrategy".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         assert!(
             !std::sync::Arc::ptr_eq(&narrow, &canonical),
@@ -14091,6 +14160,7 @@ mod tests {
                     name: name.into(),
                     owner: owner.into(),
                     load_is_acquire: false,
+                    store_is_release: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, &canonical_code),
@@ -14111,6 +14181,7 @@ mod tests {
                     name: name.into(),
                     owner: owner.into(),
                     load_is_acquire: false,
+                    store_is_release: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, &canonical_mutate),
@@ -14132,6 +14203,7 @@ mod tests {
             name: "mutate_code".into(),
             owner: "Function".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         assert!(
             std::sync::Arc::ptr_eq(&nested, &canonical_mutate),
@@ -14176,6 +14248,7 @@ mod tests {
                 name: "version_tag".into(),
                 owner: owner.into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&version, &canonical_version),
@@ -14194,6 +14267,7 @@ mod tests {
                 name: "w_name".into(),
                 owner: owner.into(),
                 load_is_acquire: false,
+                store_is_release: false,
             });
             assert!(
                 std::sync::Arc::ptr_eq(&name, &canonical_name),
@@ -14221,6 +14295,7 @@ mod tests {
                     name: name.into(),
                     owner: owner.into(),
                     load_is_acquire: false,
+                    store_is_release: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, canonical),
@@ -14242,6 +14317,7 @@ mod tests {
             name: "mutate_version_tag".into(),
             owner: "W_TypeObject".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         assert!(
             std::sync::Arc::ptr_eq(&nested, &canonical_mutate_version),
@@ -14398,6 +14474,7 @@ mod tests {
                     name: (*name).into(),
                     owner: (*owner).into(),
                     load_is_acquire: false,
+                    store_is_release: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, canonical),
@@ -14419,6 +14496,7 @@ mod tests {
             name: "mutate_allow_unboxing".into(),
             owner: "mapdict::Terminator".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         assert!(
             std::sync::Arc::ptr_eq(&nested, &terminator_mutate_allow_unboxing_descr()),
@@ -14648,6 +14726,7 @@ mod tests {
                     name: (*name).into(),
                     owner: (*owner).into(),
                     load_is_acquire: false,
+                    store_is_release: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, canonical),
@@ -14798,6 +14877,7 @@ mod tests {
                     name: name.into(),
                     owner: owner.into(),
                     load_is_acquire: false,
+                    store_is_release: false,
                 });
                 assert!(
                     std::sync::Arc::ptr_eq(&descr, &canonical),
@@ -14827,6 +14907,7 @@ mod tests {
                 index_in_parent: 0,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             },
             BhFieldSpec {
                 index: 1,
@@ -14842,6 +14923,7 @@ mod tests {
                 index_in_parent: 1,
                 is_class_word: None,
                 load_is_acquire: false,
+                store_is_release: false,
             },
         ];
         let owner = BhSizeSpec {
@@ -15011,6 +15093,7 @@ fn simple_field_spec_from_bh(
         is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
         load_is_acquire: spec.load_is_acquire,
+        store_is_release: spec.store_is_release,
     };
     stamp_vtable_method_field_spec(&mut out);
     out
@@ -15785,6 +15868,7 @@ fn field_spec_from_owned_bh(
         is_class_word: spec.is_class_word,
         index_in_parent: spec.index_in_parent,
         load_is_acquire: spec.load_is_acquire,
+        store_is_release: spec.store_is_release,
     };
     stamp_vtable_method_field_spec(&mut out);
     out
@@ -15982,6 +16066,7 @@ pub(crate) fn intern_packed_fields_into_gccache(spec: &majit_jitcode::jitcode::B
             Some(field.index_in_parent),
             field.is_class_word,
             field.load_is_acquire,
+            field.store_is_release,
         );
     }
 }
@@ -16038,6 +16123,7 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
             index_in_parent: field.index_in_parent,
             is_class_word: field.is_class_word,
             load_is_acquire: field.load_is_acquire,
+            store_is_release: field.store_is_release,
         })
         .collect();
     let _group = majit_ir::descr::publish_borrowed_struct_layout(
@@ -16112,6 +16198,7 @@ fn field_descr_from_bh_field(
                     // than leaving the name fallback to seed it.
                     field.is_class_word,
                     field.load_is_acquire,
+                    field.store_is_release,
                 );
                 return fd as DescrRef;
             }
@@ -16152,6 +16239,7 @@ fn field_descr_from_bh_field(
             claimed_index,
             field.is_class_word,
             field.load_is_acquire,
+            field.store_is_release,
         ) as DescrRef
 }
 
@@ -16602,6 +16690,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             name,
             owner,
             load_is_acquire,
+            store_is_release,
             ..
         } => {
             let field_key = bh_field_cache_key(owner, name);
@@ -16752,13 +16841,13 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // canonical object so `state.rs quasi_immut_descr` recognises it
             // by index. The codewriter names the owner by leaf or by module
             // path, as `is_pycode_w_globals_descr` does for PyCode's
-            // generated `w_globals`. Size 8, Int.
+            // generated `w_globals`. Size 8, Ref.
             if (owner.as_str() == "ModuleDictStrategy"
                 || owner.as_str().ends_with("::ModuleDictStrategy"))
                 && name.as_str() == "version"
             {
                 let canonical = module_dict_version_descr();
-                if *field_size == 8 && *field_type == Type::Int {
+                if *field_size == 8 && *field_type == Type::Ref {
                     return canonical;
                 }
             }
@@ -17134,6 +17223,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 // here declares and the name is what the rebuild reads.
                 is_class_word: None,
                 load_is_acquire: *load_is_acquire,
+                store_is_release: *store_is_release,
             };
             if name
                 .rsplit('.')
@@ -17793,7 +17883,7 @@ fn mint_field(
         && is_module_dict_strategy_struct(*struct_id)
     {
         let canonical = &MODULE_DICT_STRATEGY_DESCR_GROUP.field_descrs[0];
-        if *field_size == 8 && *field_type == Type::Int {
+        if *field_size == 8 && *field_type == Type::Ref {
             return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
         }
     }
@@ -17906,6 +17996,7 @@ fn mint_field(
         // The analyzer's `field_pos`, always computed — see the note above on
         // its two-word header offset against the runtime publish's numbering.
         Some(*index_in_parent),
+        false,
         false,
     ))
 }

@@ -168,6 +168,7 @@ fn field_spec_from_bh(
         virtualizable: false,
         index_in_parent: f.index_in_parent,
         load_is_acquire: f.load_is_acquire,
+        store_is_release: f.store_is_release,
     }
 }
 
@@ -292,6 +293,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
             is_immutable,
             is_quasi_immutable,
             load_is_acquire,
+            store_is_release,
             ..
         } => {
             // descr.py get_field_descr keys cache[STRUCT][fieldname] by the
@@ -410,6 +412,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                     virtualizable: false,
                                     index_in_parent: slot,
                                     load_is_acquire: *load_is_acquire,
+                                    store_is_release: *store_is_release,
                                 });
                                 specs.len() - 1
                             });
@@ -501,6 +504,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             false,
                             *index_in_parent,
                             *load_is_acquire,
+                            *store_is_release,
                         );
                         return (*offset, fd as majit_ir::DescrRef);
                     }
@@ -561,6 +565,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             // has no way to say "no slot was claimed".
                             index_in_parent: index_in_parent.unwrap_or(0),
                             load_is_acquire: *load_is_acquire,
+                            store_is_release: *store_is_release,
                         };
                         let owner_spelling = if !p.owner.is_empty() {
                             p.owner.as_str()
@@ -618,6 +623,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                         false,
                         *index_in_parent,
                         *load_is_acquire,
+                        *store_is_release,
                     );
                     return (*offset, fd as majit_ir::DescrRef);
                 }
@@ -675,6 +681,7 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     false,
                     *index_in_parent,
                     *load_is_acquire,
+                    *store_is_release,
                 );
                 (*offset, fd as majit_ir::DescrRef)
             }
@@ -777,6 +784,7 @@ pub fn residual_write_effect_info(
                         virtualizable: false,
                         index_in_parent: idx,
                         load_is_acquire: false,
+                        store_is_release: false,
                     }
                 },
             )
@@ -6518,6 +6526,7 @@ mod tests {
             index_in_parent: 0,
             is_class_word: None,
             load_is_acquire: true,
+            store_is_release: true,
         };
         let size = crate::blackhole::BhDescr::Size {
             size: 16,
@@ -6560,6 +6569,7 @@ mod tests {
             index_in_parent: 0,
             is_class_word: None,
             load_is_acquire: false,
+            store_is_release: false,
         };
         crate::blackhole::BhDescr::Field {
             offset: 0,
@@ -6582,6 +6592,7 @@ mod tests {
             name: field.to_string(),
             owner: String::new(),
             load_is_acquire: false,
+            store_is_release: false,
         }
     }
 
@@ -6700,6 +6711,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: i,
                 load_is_acquire: false,
+                store_is_release: false,
             });
         }
         specs.push(SimpleFieldDescrSpec {
@@ -6716,6 +6728,7 @@ mod tests {
             virtualizable: false,
             index_in_parent: FLAGS_INDEX,
             load_is_acquire: false,
+            store_is_release: false,
         });
         let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
@@ -6764,6 +6777,7 @@ mod tests {
             name: "PyFrame.flags".to_string(),
             owner: "PyFrame".to_string(),
             load_is_acquire: false,
+            store_is_release: false,
         };
 
         let reconstituted = field_descr_ref_from_bh(&bh).1;

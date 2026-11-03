@@ -2,11 +2,12 @@
 //!
 //! These helpers read the codewriter-built twin tables materialized at
 //! lowering time where the codewriter natively knows the Python PC:
-//! `block_head_py_by_jit_pc` for exact block-head markers and
-//! `py_floor_by_jit_pc` for containing floor segments. Together with the
-//! forward-carried `SnapshotFrame.py_pc` resume channel, these tables are the
-//! only Python-coordinate sources; runtime consumers never project a JitCode
-//! PC through a Python-keyed map.
+//! `block_head_py_by_jit_pc` for exact block-head markers,
+//! `py_exact_by_jit_pc` for the opcode that emitted each contiguous run, and
+//! `py_floor_by_jit_pc` for first-offset-per-PC floor segments. Together with
+//! the forward-carried `SnapshotFrame.py_pc` resume channel, these tables are
+//! the only Python-coordinate sources; runtime consumers never project a
+//! JitCode PC through a Python-keyed map.
 
 #[allow(dead_code)]
 pub(crate) fn floor_boundary_at_or_after(
@@ -20,26 +21,37 @@ pub(crate) fn floor_boundary_at_or_after(
 
 /// Resolve a JitCode offset to the Python instruction coordinate containing it.
 ///
-/// Exact block-head marker matches win first. Otherwise the floor segment is
-/// the Python instruction whose lowering region contains the JitCode PC, the
-/// coordinate the per-bytecode `last_instr` store in
-/// `pyopcode.py dispatch_bytecode` would have left in the frame.
+/// Exact block-head marker matches win first. Otherwise the per-emission-run
+/// owner (`py_exact_by_jit_pc`) names the opcode that actually emitted those
+/// bytes, including a block drained after the body. The first-offset-per-PC
+/// floor is the last resort: it collapses such a late block onto whichever
+/// PC last opened a segment. The coordinate is the one the per-bytecode
+/// `last_instr` store in `pyopcode.py dispatch_bytecode` would have left in
+/// the frame.
 pub(crate) fn containing_py_pc_for_jitcode_pc(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,
 ) -> u32 {
+    if let Ok(i) = metadata
+        .block_head_py_by_jit_pc
+        .binary_search_by_key(&jit_pc, |&(off, _)| off)
+    {
+        return metadata.block_head_py_by_jit_pc[i].1;
+    }
+    if !metadata.py_exact_by_jit_pc.is_empty() {
+        if let Some(py) =
+            crate::pyjitcode::exact_py_pc_for_jitcode_pc(&metadata.py_exact_by_jit_pc, jit_pc)
+        {
+            return py;
+        }
+    }
     if !metadata.py_floor_by_jit_pc.is_empty() {
-        let pivot = metadata
-            .block_head_py_by_jit_pc
-            .binary_search_by_key(&jit_pc, |&(off, _)| off)
-            .ok()
-            .map(|i| metadata.block_head_py_by_jit_pc[i].1)
-            .or_else(|| {
-                crate::pyjitcode::floor_segment_for_jitcode_pc(&metadata.py_floor_by_jit_pc, jit_pc)
-                    .map(|(_, py)| py)
-            })
-            .expect("drained JitCode PC floor pivot must begin at byte offset zero");
-        return pivot;
+        return crate::pyjitcode::floor_segment_for_jitcode_pc(
+            &metadata.py_floor_by_jit_pc,
+            jit_pc,
+        )
+        .map(|(_, py)| py)
+        .expect("drained JitCode PC floor pivot must begin at byte offset zero");
     }
     0
 }

@@ -2740,6 +2740,7 @@ mod tests {
             false,
             Some(0),
             false,
+            false,
         );
         let descr_b = gc.get_field_descr(
             majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("HeapB")),
@@ -2754,6 +2755,7 @@ mod tests {
             u32::MAX,
             false,
             Some(0),
+            false,
             false,
         );
         assert_ne!(descr_a.index(), descr_b.index());

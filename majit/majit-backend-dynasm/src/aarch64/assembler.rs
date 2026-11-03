@@ -3147,12 +3147,13 @@ impl<'a> AssemblerARM64<'a> {
             }
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                // `rewrite.rs transform_to_gc_load` lowers both opcodes to
-                // GC_STORE / GC_STORE_INDEXED through `emit_gc_store_or_indexed`
-                // before the regalloc ever sees them, and `prepare_op_setfield`
-                // force-allocates a register for every non-constant base, so the
-                // only shape that could reach the else arm is a constant base on
-                // an op the rewriter did not consume.  Emitting it from
+                // Unordered SETFIELD is lowered to GC_STORE by
+                // `transform_to_gc_load`. An ordered descr
+                // (`store_is_release`) keeps SETFIELD so this arm emits
+                // `stlr`. `prepare_op_setfield` force-allocates a register
+                // for every non-constant base, so the only shape that
+                // could reach the else arm is a constant base on an op
+                // the rewriter did not consume.  Emitting it from
                 // `resolve_opref` would read whichever slot the lifetime's
                 // end-of-allocation `current_frame_loc` happens to name and
                 // clobber x0/x1 behind the regalloc's back; decline instead.
@@ -3171,7 +3172,37 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
                 let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
-                self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
+                let release = !matches!(val_loc, Loc::Reg(v) if v.is_xmm)
+                    && op
+                        .with_field_descr(|fd| fd.store_is_release())
+                        .unwrap_or(false);
+                if release {
+                    // `stlr` addresses a base register, not base+offset.
+                    // x16 is ip0 for the address; keep the value out of x16.
+                    let scratch = RegLoc::new(17, false);
+                    let src = match val_loc {
+                        Loc::Reg(v) if !v.is_xmm && v.value != 16 => v,
+                        _ => {
+                            self.regalloc_mov(val_loc, &Loc::Reg(scratch));
+                            &scratch
+                        }
+                    };
+                    dynasm!(self.mc ; .arch aarch64 ; mov x16, X(base.value));
+                    if ofs != 0 {
+                        if (0..4096).contains(&ofs) {
+                            dynasm!(self.mc ; .arch aarch64 ; add x16, x16, ofs as u32);
+                        } else if src.value != 17 {
+                            self.emit_mov_imm64(17, ofs as i64);
+                            dynasm!(self.mc ; .arch aarch64 ; add x16, x16, x17);
+                        } else {
+                            self.emit_mov_imm64(16, ofs as i64);
+                            dynasm!(self.mc ; .arch aarch64 ; add x16, X(base.value), x16);
+                        }
+                    }
+                    self.emit_stlr_from_x16(src, field_size);
+                } else {
+                    self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
+                }
             }
             // ── aarch64/opassembler.py _emit_op_gc_load ──
             // arglocs = [base_loc, ofs_loc, res_loc, imm(nsize)]

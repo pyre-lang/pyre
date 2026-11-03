@@ -106,6 +106,7 @@ fn mint_field(
         false,
         Some(*index_in_parent),
         false,
+        false,
     ))
 }
 

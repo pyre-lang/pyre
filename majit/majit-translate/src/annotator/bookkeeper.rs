@@ -494,6 +494,10 @@ pub struct Bookkeeper {
     /// `rclass.py getgcflavor` reads `_alloc_flavor_` off the classdesc;
     /// intern stamps that param onto matching hosts.
     raw_alloc_flavor_structs: RefCell<HashSet<String>>,
+    /// Harvested `_immutable_fields_` ranks, keyed by intern spelling.
+    /// `classdesc.py ClassDesc.__init__` reads `cls.__dict__['_immutable_fields_']`;
+    /// intern stamps that list onto matching hosts.
+    immutable_fields_structs: RefCell<HashMap<String, Vec<(String, crate::model::ImmutableRank)>>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -1294,6 +1298,55 @@ fn fixed_object_array_items_field(canonical: &str) -> Option<&'static str> {
     (leaf == "FixedObjectArray").then_some("_items")
 }
 
+/// Resolve harvested `_immutable_fields_` for an intern key.
+///
+/// Exact key wins when other spellings resolve to different lists. Remaining
+/// lookup is `alloc_flavor_raw_identity_matches` (canonical name, crate-stripped
+/// key) plus the generic peel `key.split('<').next()` used by
+/// `alloc_flavor_raw_contains`. No enum `X::Variant` → `X` fallback:
+/// `_immutable_fields_` is per class and `ClassDesc.add_mixins` / base
+/// inheritance already unions a base's set.
+fn lookup_immutable_fields_entries<'a>(
+    map: &'a HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    key: &str,
+) -> Option<&'a [(String, crate::model::ImmutableRank)]> {
+    if let Some(entries) = map.get(key) {
+        return (!entries.is_empty()).then_some(entries.as_slice());
+    }
+    if let Some(entries) = lookup_immutable_fields_identity(map, key) {
+        return Some(entries);
+    }
+    let peeled = key.split('<').next().unwrap_or(key);
+    if peeled != key {
+        if let Some(entries) = map.get(peeled) {
+            return (!entries.is_empty()).then_some(entries.as_slice());
+        }
+        return lookup_immutable_fields_identity(map, peeled);
+    }
+    None
+}
+
+fn lookup_immutable_fields_identity<'a>(
+    map: &'a HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    path: &str,
+) -> Option<&'a [(String, crate::model::ImmutableRank)]> {
+    let identity = majit_ir::descr::canonical_struct_name(path);
+    if identity != path
+        && let Some(entries) = map.get(&identity)
+        && !entries.is_empty()
+    {
+        return Some(entries.as_slice());
+    }
+    let stripped = crate::front::mir::strip_crate_prefix(path);
+    if stripped != path
+        && let Some(entries) = map.get(&stripped)
+        && !entries.is_empty()
+    {
+        return Some(entries.as_slice());
+    }
+    None
+}
+
 impl Bookkeeper {
     /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py).
     /// Once the annotator driver lands, this constructor takes an
@@ -1340,6 +1393,7 @@ impl Bookkeeper {
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
             raw_alloc_flavor_structs: RefCell::new(HashSet::new()),
+            immutable_fields_structs: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1389,6 +1443,39 @@ impl Bookkeeper {
         ) {
             host.class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
         }
+    }
+
+    /// Thread harvested `_immutable_fields_` declarations and stamp already
+    /// interned hosts (`classdesc.py ClassDesc.__init__` reads `cls.__dict__['_immutable_fields_']`).
+    pub fn set_immutable_fields_structs(
+        &self,
+        by_struct: HashMap<String, Vec<(String, crate::model::ImmutableRank)>>,
+    ) {
+        *self.immutable_fields_structs.borrow_mut() = by_struct;
+        let hosts: Vec<(String, HostObject)> = self
+            .struct_root_classes
+            .borrow()
+            .iter()
+            .map(|(k, h)| (k.clone(), h.clone()))
+            .collect();
+        for (key, host) in hosts {
+            self.stamp_immutable_fields(&host, &key);
+        }
+    }
+
+    fn stamp_immutable_fields(&self, host: &HostObject, key: &str) {
+        let map = self.immutable_fields_structs.borrow();
+        let Some(entries) = lookup_immutable_fields_entries(&map, key) else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+        let items: Vec<ConstValue> = entries
+            .iter()
+            .map(|(field, rank)| ConstValue::byte_str(format!("{field}{}", rank.suffix())))
+            .collect();
+        host.class_set("_immutable_fields_", ConstValue::List(Arc::new(items)));
     }
 
     /// Name the interpreter's error carrier object (see the
@@ -4020,6 +4107,7 @@ impl Bookkeeper {
             let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
             crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.stamp_raw_alloc_flavor(&host, &key);
+            self.stamp_immutable_fields(&host, &key);
             self.struct_root_classes
                 .borrow_mut()
                 .insert(key, host.clone());
@@ -4062,6 +4150,7 @@ impl Bookkeeper {
         let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
         crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
         self.stamp_raw_alloc_flavor(&host, &key);
+        self.stamp_immutable_fields(&host, &key);
         self.struct_root_classes
             .borrow_mut()
             .insert(key, host.clone());
@@ -4645,7 +4734,7 @@ impl Bookkeeper {
         // `rewrite_op_getsubstruct` → int_add(ptr, ofs).
         // SomeInstance here made dual-gate report legacy=Signed, real=GcRef
         // on a nested FieldRead (MappedObj payload, sockaddr_in.sin_addr,
-        // RootScope, VersionTag).
+        // RootScope, StrKey).
         if let Some(s_ptr) = self.raw_struct_ptr_annotation(named_root.as_ref()) {
             return s_ptr;
         }
@@ -6734,6 +6823,53 @@ mod tests {
     }
 
     #[test]
+    fn set_immutable_fields_structs_stamps_interned_and_later_hosts() {
+        use crate::annotator::classdesc::ClassDesc;
+        use crate::model::ImmutableRank;
+
+        let bk = bk();
+        let interned = bk.intern_class_by_qualname("Q2ImmutHost");
+        let mut by_struct = HashMap::new();
+        let ranks = vec![
+            ("code".to_string(), ImmutableRank::Immutable),
+            ("name".to_string(), ImmutableRank::QuasiImmutable),
+            ("closure".to_string(), ImmutableRank::ImmutableArray),
+            ("defs_w".to_string(), ImmutableRank::QuasiImmutableArray),
+        ];
+        by_struct.insert("Q2ImmutHost".to_string(), ranks.clone());
+        by_struct.insert("Q2ImmutHostLater".to_string(), ranks);
+        bk.set_immutable_fields_structs(by_struct);
+
+        fn stamped_texts(host: &HostObject) -> Vec<String> {
+            match host.class_get("_immutable_fields_") {
+                Some(ConstValue::List(items)) => items
+                    .iter()
+                    .map(|v| v.as_text().expect("byte str").to_string())
+                    .collect(),
+                other => panic!("expected ConstValue::List of byte strings, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            stamped_texts(&interned),
+            vec!["code", "name?", "closure[*]", "defs_w?[*]"]
+        );
+
+        let later = bk.intern_class_by_qualname("Q2ImmutHostLater");
+        assert_eq!(
+            stamped_texts(&later),
+            vec!["code", "name?", "closure[*]", "defs_w?[*]"]
+        );
+
+        let desc = ClassDesc::new(&bk, interned, None, None, None).expect("ClassDesc");
+        assert!(
+            desc.borrow().immutable_fields.contains("name?"),
+            "ClassDesc.immutable_fields={:?}",
+            desc.borrow().immutable_fields
+        );
+    }
+
+    #[test]
     fn atomic_ptr_projects_as_pointer_not_payload() {
         let bk = bk();
         assert!(
@@ -8036,23 +8172,23 @@ mod tests {
 
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
-        let rows = vec![("__pos_0".to_string(), "u64".to_string())];
-        reg.fields.insert(
-            "pyre_object::celldict::VersionTag".to_string(),
-            rows.clone(),
-        );
-        reg.fields.insert("VersionTag".to_string(), rows);
+        // `celldict::StrKey(pub *mut Utf8Str)` remains a by-value positional
+        // leaf after `VersionTag` became a header-bearing `W_Root`.
+        let rows = vec![("__pos_0".to_string(), "*mut Utf8Str".to_string())];
+        reg.fields
+            .insert("pyre_object::celldict::StrKey".to_string(), rows.clone());
+        reg.fields.insert("StrKey".to_string(), rows);
         bk.set_struct_fields(Rc::new(reg));
 
-        let from_field = bk.intern_class_by_qualname("celldict::VersionTag");
-        let from_ctor = bk.intern_class_by_qualname("pyre_object.celldict.VersionTag");
+        let from_field = bk.intern_class_by_qualname("celldict::StrKey");
+        let from_ctor = bk.intern_class_by_qualname("pyre_object.celldict.StrKey");
         assert_eq!(from_field, from_ctor);
         let field_class = bk
             .getuniqueclassdef(&from_field)
-            .expect("field-side VersionTag classdef");
+            .expect("field-side StrKey classdef");
         let ctor_class = bk
             .getuniqueclassdef(&from_ctor)
-            .expect("constructor-side VersionTag classdef");
+            .expect("constructor-side StrKey classdef");
         assert!(Rc::ptr_eq(&field_class, &ctor_class));
     }
 

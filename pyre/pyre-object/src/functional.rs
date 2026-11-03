@@ -575,7 +575,7 @@ pub unsafe fn w_range_iter_has_next(obj: PyObjectRef) -> bool {
 /// the bound and the per-iteration cursor work is one load, one add and one
 /// store — `step` is the constant 1 and `remaining` is derived as
 /// `stop - current`.
-#[pyre_class("range_iterator", type_id = 156, static_name = "RANGE_ITER_STEP_ONE")]
+#[pyre_class("range_iterator", type_id = 157, static_name = "RANGE_ITER_STEP_ONE")]
 pub struct W_IntRangeStepOneIterator {
     pub current: i64,
     pub stop: i64,
@@ -604,7 +604,7 @@ pub unsafe fn w_range_iter_step_one_next(obj: PyObjectRef) -> PyObjectRef {
 /// class.
 ///
 /// Layout: `[ob_type | current: i64 | stop: i64]`
-#[pyre_class("range_iterator", type_id = 157, static_name = "RANGE_ITER_ONE_ARG")]
+#[pyre_class("range_iterator", type_id = 158, static_name = "RANGE_ITER_ONE_ARG")]
 pub struct W_IntRangeOneArgIterator {
     pub current: i64,
     pub stop: i64,
@@ -960,10 +960,10 @@ mod range_iter_tests {
 /// `compute_range_length`) and read back by `descr_len` / `descr_bool`.
 // Explicit `type_id` (not auto): `RANGE_DESCR_GROUP` in pyre-jit-trace bakes
 // `W_RANGE_GC_TYPE_ID` at compile time to virtualize range GET_ITER/FOR_ITER,
-// so the tid must be a const. 112 is the tail registration slot (right after
-// W_Enumerate = 111); register_pyre_class drift-checks it against the runtime
+// so the tid must be a const. 113 is the tail registration slot (right after
+// W_Enumerate = 112); register_pyre_class drift-checks it against the runtime
 // assignment order.
-#[pyre_class("range", type_id = 112, static_name = "RANGE")]
+#[pyre_class("range", type_id = 113, static_name = "RANGE")]
 pub struct W_Range {
     pub start: PyObjectRef,
     pub stop: PyObjectRef,

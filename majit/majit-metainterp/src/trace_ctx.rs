@@ -71,6 +71,7 @@ fn descr_to_bh_field_descr(descr: &DescrRef) -> Option<majit_jitcode::jitcode::B
         name: f.field_name().to_string(),
         owner: String::new(),
         load_is_acquire: f.stored_load_is_acquire(),
+        store_is_release: f.stored_store_is_release(),
     })
 }
 

@@ -1030,11 +1030,10 @@ pub unsafe fn w_type_set_compares_by_identity_status(w_type: PyObjectRef, status
         return;
     }
     let t = w_type as *const W_TypeObject;
-    (*t).mutate_compares_by_identity_status()
-        .invalidate_then_store(|| {
-            (*t).compares_by_identity_status
-                .store(status, std::sync::atomic::Ordering::Release);
-        });
+    crate::quasi_immut_store!((*t).mutate_compares_by_identity_status() =>
+        (*t).compares_by_identity_status
+            .store(status, std::sync::atomic::Ordering::Release);
+    );
 }
 
 /// typeobject.py — `flag_map_or_seq` accessor on a `W_TypeObject`.
@@ -1091,11 +1090,10 @@ pub unsafe fn w_type_set_flag_patma_collection(w_type: PyObjectRef, flag: u8) {
         return;
     }
     let t = w_type as *const W_TypeObject;
-    (*t).mutate_flag_patma_collection()
-        .invalidate_then_store(|| {
-            (*t).flag_patma_collection
-                .store(flag, std::sync::atomic::Ordering::Release);
-        });
+    crate::quasi_immut_store!((*t).mutate_flag_patma_collection() =>
+        (*t).flag_patma_collection
+            .store(flag, std::sync::atomic::Ordering::Release);
+    );
 }
 
 /// `Py_TPFLAGS_DISALLOW_INSTANTIATION` reader — `True` when `w_type`'s
@@ -1241,10 +1239,10 @@ pub unsafe fn w_type_set_abstract(w_type: PyObjectRef, abstract_: bool) {
         return;
     }
     let t = w_type as *const W_TypeObject;
-    (*t).mutate_flag_abstract().invalidate_then_store(|| {
+    crate::quasi_immut_store!((*t).mutate_flag_abstract() =>
         (*t).flag_abstract
             .store(abstract_, std::sync::atomic::Ordering::Release);
-    });
+    );
 }
 
 // ── Layout accessors ─────────────────────────────────────────────────
@@ -1695,10 +1693,10 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
     // The sweep and the store share the watcher lock: an `is_installed`
     // test outside it lets a recorder publish a watcher for the old
     // pointer after the test and before the store.  pyre is 3.14t, so
-    // `invalidate_then_store` owns every store; the GIL made that pair
+    // `quasi_immut_store!` owns every store; the GIL made that pair
     // indivisible in `quasiimmut.py make_invalidation_function.invalidation`.
     let t = obj as *mut W_TypeObject;
-    (*t).mutate_w_name().invalidate_then_store(|| {
+    crate::quasi_immut_store!((*t).mutate_w_name() =>
         // SURROGATE-NAME: `name` is `*mut String` (`NameStorage = String`).
         // `w_type_get_name` returns `&str` and is read from the interpreter, the
         // JIT GC trace, cpyext, and extension modules, so this slot is not switched
@@ -1707,10 +1705,10 @@ pub unsafe fn w_type_set_name(obj: PyObjectRef, w_name: PyObjectRef) {
         // keeps the assigned object.
         if let Some(name) = crate::w_str_get_value_opt(w_name) {
             *(*t).name = name.to_string();
-        }
+        };
         (*t).w_name = w_name;
-    });
-    type_write_barrier(obj);
+        type_write_barrier(obj);
+    );
 }
 
 /// `typeobject.py` / `getqualname`: the class qualified name lives
@@ -1995,9 +1993,9 @@ pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
     // `framework.py transform_generic_set` emits the write barrier before
     // the `setfield`.
     type_write_barrier(obj);
-    (*t).mutate_mro_w().invalidate_then_store(|| {
+    crate::quasi_immut_store!((*t).mutate_mro_w() =>
         (*t).mro_w = mro_w;
-    });
+    );
     if !purely_of_types {
         w_type_set_version_tag(obj, 0);
     }
@@ -2016,9 +2014,9 @@ pub unsafe fn w_type_store_mro_block(
 ) {
     let t = obj as *mut W_TypeObject;
     type_write_barrier(obj);
-    (*t).mutate_mro_w().invalidate_then_store(|| {
+    crate::quasi_immut_store!((*t).mutate_mro_w() =>
         (*t).mro_w = mro_w;
-    });
+    );
 }
 
 /// Restore the pre-`compute_mro` incomplete state (`mro_w is None`).
@@ -2031,9 +2029,9 @@ pub unsafe fn w_type_store_mro_block(
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_clear_mro(obj: PyObjectRef) {
     let t = obj as *mut W_TypeObject;
-    (*t).mutate_mro_w().invalidate_then_store(|| {
+    crate::quasi_immut_store!((*t).mutate_mro_w() =>
         (*t).mro_w = std::ptr::null_mut();
-    });
+    );
     w_type_set_version_tag(obj, 0);
     crate::gc_hook::try_gc_write_barrier(obj as crate::gc_hook::GCREF);
 }
@@ -2118,11 +2116,10 @@ pub unsafe fn w_type_set_cpython_type_flags(
     // `PyType_Freeze` share this writer; the sweep and the store share the
     // watcher lock so a recorder cannot publish a watcher for the old
     // value in between.
-    (*t).mutate_flag_cpython_immutabletype()
-        .invalidate_then_store(|| {
-            (*t).flag_cpython_immutabletype
-                .store(immutabletype, std::sync::atomic::Ordering::Release);
-        });
+    crate::quasi_immut_store!((*t).mutate_flag_cpython_immutabletype() =>
+        (*t).flag_cpython_immutabletype
+            .store(immutabletype, std::sync::atomic::Ordering::Release);
+    );
 }
 
 /// CPython 3.14 public HEAPTYPE ownership, distinct from PyPy's
@@ -2152,11 +2149,10 @@ pub unsafe fn w_type_is_cpython_static_builtin(obj: PyObjectRef) -> bool {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_cpython_immutabletype(obj: PyObjectRef, value: bool) {
     let t = obj as *const W_TypeObject;
-    (*t).mutate_flag_cpython_immutabletype()
-        .invalidate_then_store(|| {
-            (*t).flag_cpython_immutabletype
-                .store(value, std::sync::atomic::Ordering::Release);
-        });
+    crate::quasi_immut_store!((*t).mutate_flag_cpython_immutabletype() =>
+        (*t).flag_cpython_immutabletype
+            .store(value, std::sync::atomic::Ordering::Release);
+    );
 }
 
 /// Read CPython's public IMMUTABLETYPE axis.

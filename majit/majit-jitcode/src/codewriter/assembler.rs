@@ -1088,6 +1088,7 @@ pub enum AssemblerDescrKey {
         name: String,
         owner: String,
         load_is_acquire: bool,
+        store_is_release: bool,
     },
     Array {
         base_size: usize,
@@ -1193,6 +1194,7 @@ impl AssemblerDescrKey {
                 name,
                 owner,
                 load_is_acquire,
+                store_is_release,
             } => Self::Field {
                 offset: *offset,
                 field_size: *field_size,
@@ -1206,6 +1208,7 @@ impl AssemblerDescrKey {
                 name: name.clone(),
                 owner: owner.clone(),
                 load_is_acquire: *load_is_acquire,
+                store_is_release: *store_is_release,
             },
             crate::jitcode::BhDescr::Array {
                 base_size,

@@ -979,35 +979,36 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (52, Some(0)),
     (53, Some(0)),
     (54, Some(0)),
-    (56, Some(31)),
+    // `celldict.py VersionTag` — header-only internal W_Root, tid 56.
+    (56, Some(0)),
     (57, Some(31)),
     (58, Some(31)),
-    (59, Some(56)),
-    (60, Some(59)),
-    (61, Some(59)),
-    (62, Some(56)),
-    (63, Some(56)),
-    (64, Some(63)),
+    (59, Some(31)),
+    (60, Some(57)),
+    (61, Some(60)),
+    (62, Some(60)),
+    (63, Some(57)),
+    (64, Some(57)),
     (65, Some(64)),
-    (66, Some(64)),
-    (67, Some(64)),
-    (68, Some(56)),
-    (69, Some(56)),
-    (70, Some(69)),
-    (71, Some(69)),
-    (72, Some(56)),
-    (73, Some(56)),
-    (74, Some(73)),
-    (75, Some(73)),
-    (76, Some(56)),
-    (77, Some(56)),
-    (78, Some(56)),
-    (79, Some(56)),
-    (80, Some(56)),
-    (81, Some(80)),
-    (82, Some(56)),
-    (83, Some(56)),
-    (84, Some(0)),
+    (66, Some(65)),
+    (67, Some(65)),
+    (68, Some(65)),
+    (69, Some(57)),
+    (70, Some(57)),
+    (71, Some(70)),
+    (72, Some(70)),
+    (73, Some(57)),
+    (74, Some(57)),
+    (75, Some(74)),
+    (76, Some(74)),
+    (77, Some(57)),
+    (78, Some(57)),
+    (79, Some(57)),
+    (80, Some(57)),
+    (81, Some(57)),
+    (82, Some(81)),
+    (83, Some(57)),
+    (84, Some(57)),
     (85, Some(0)),
     (86, Some(0)),
     (87, Some(0)),
@@ -1020,7 +1021,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (94, Some(0)),
     (95, Some(0)),
     (96, Some(0)),
-    (99, Some(0)),
+    (97, Some(0)),
     (100, Some(0)),
     (101, Some(0)),
     (102, Some(0)),
@@ -1065,119 +1066,120 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (141, Some(0)),
     (142, Some(0)),
     (143, Some(0)),
-    (145, Some(0)),
+    (144, Some(0)),
+    (146, Some(0)),
     // `_thread` lock / RLock / handle, registered for the header `w_class`
     // edge (`all_w_class_only_descriptors`).
-    (146, Some(0)),
     (147, Some(0)),
     (148, Some(0)),
+    (149, Some(0)),
     // `__pypy__.Bufferable` is `allocate_stable` with no inline object
     // payload, so the header `w_class` is the only edge its marker forwards.
-    (149, Some(0)),
+    (150, Some(0)),
     // `_io.BytesIO` follows the `rbigint` result pair, which holds 150 as a
     // bare `with_gc_ptrs` id and is not an rclass.OBJECT type.
-    (151, Some(0)),
-    // `_io.StringIO` follows `_io.BytesIO`.
     (152, Some(0)),
-    // The three walks over a code object.
+    // `_io.StringIO` follows `_io.BytesIO`.
     (153, Some(0)),
+    // The three walks over a code object.
     (154, Some(0)),
     (155, Some(0)),
-    // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
+    // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (157, Some(0)),
-    // 158-167 and 169-195 are `typedef.py` `_getusercls` layouts
+    (158, Some(0)),
+    // 159-168 and 170-196 are `typedef.py` `_getusercls` layouts
     // (int/str/tuple/float/complex/bytes/bytearray/list/set/array,
     // plus enumerate/map/filter/zip/reversed/super/property, the itertools
     // user layouts, and `__pypy__.Bufferable`).
-    // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
-    // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
-    // 196-213 append deque, Struct, GenericAlias, big-int, weakref,
+    // 169 is `interp__weakref.py` `W_Weakref`, an object subclass.
+    // 170-196 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
+    // 197-214 append deque, Struct, GenericAlias, big-int, weakref,
     // staticmethod, classmethod, module, `_thread._local` and typed `_io`
     // user layouts without moving the closed block above.
-    (158, Some(1)),
-    (159, Some(34)),
-    (160, Some(8)),
-    (161, Some(2)),
-    (162, Some(54)),
-    (163, Some(27)),
-    (164, Some(28)),
-    (165, Some(7)),
-    (166, Some(30)),
-    (167, Some(94)),
-    (168, Some(0)), // W_Weakref
-    (169, Some(111)),
-    (170, Some(91)),
-    (171, Some(90)),
-    (172, Some(92)),
-    (173, Some(89)),
-    (174, Some(18)),
-    (175, Some(19)),
-    (176, Some(24)),
-    (177, Some(25)),
-    (178, Some(114)),
+    (159, Some(1)),
+    (160, Some(34)),
+    (161, Some(8)),
+    (162, Some(2)),
+    (163, Some(54)),
+    (164, Some(27)),
+    (165, Some(28)),
+    (166, Some(7)),
+    (167, Some(30)),
+    (168, Some(95)),
+    (169, Some(0)), // W_Weakref
+    (170, Some(112)),
+    (171, Some(92)),
+    (172, Some(91)),
+    (173, Some(93)),
+    (174, Some(90)),
+    (175, Some(18)),
+    (176, Some(19)),
+    (177, Some(24)),
+    (178, Some(25)),
     (179, Some(115)),
     (180, Some(116)),
-    (181, Some(134)),
+    (181, Some(117)),
     (182, Some(135)),
     (183, Some(136)),
     (184, Some(137)),
     (185, Some(138)),
     (186, Some(139)),
     (187, Some(140)),
-    (188, Some(103)),
+    (188, Some(141)),
     (189, Some(104)),
     (190, Some(105)),
     (191, Some(106)),
-    (192, Some(117)),
-    (193, Some(93)),
-    (194, Some(95)),
-    (195, Some(149)),
-    // Appended `_getusercls` layouts. Fixed ids 0-195 stay put.
-    (196, Some(110)), // collections.deque
-    (197, Some(119)), // _struct.Struct
-    (198, Some(87)),  // types.GenericAlias
-    (199, Some(35)),  // W_LongObject
-    (200, Some(168)), // W_WeakrefUser
-    (201, Some(20)),  // StaticMethodUser
-    (202, Some(21)),  // ClassMethodUser
-    (203, Some(36)),  // ModuleUser
-    (204, Some(133)), // W_LocalUser
-    (205, Some(151)), // W_BytesIOUser
-    (206, Some(152)), // W_StringIOUser
-    (207, Some(128)), // W_BufferedReaderUser
-    (208, Some(129)), // W_BufferedWriterUser
-    (209, Some(130)), // W_BufferedRWPairUser
-    (210, Some(131)), // W_BufferedRandomUser
-    (211, Some(132)), // W_TextIOWrapperUser
-    (212, Some(0)),   // W_FileIO
-    (213, Some(212)), // W_FileIOUser
+    (192, Some(107)),
+    (193, Some(118)),
+    (194, Some(94)),
+    (195, Some(96)),
+    (196, Some(150)),
+    // Appended `_getusercls` layouts. Fixed ids 0-196 stay put.
+    (197, Some(111)), // collections.deque
+    (198, Some(120)), // _struct.Struct
+    (199, Some(88)),  // types.GenericAlias
+    (200, Some(35)),  // W_LongObject
+    (201, Some(169)), // W_WeakrefUser
+    (202, Some(20)),  // StaticMethodUser
+    (203, Some(21)),  // ClassMethodUser
+    (204, Some(36)),  // ModuleUser
+    (205, Some(134)), // W_LocalUser
+    (206, Some(152)), // W_BytesIOUser
+    (207, Some(153)), // W_StringIOUser
+    (208, Some(129)), // W_BufferedReaderUser
+    (209, Some(130)), // W_BufferedWriterUser
+    (210, Some(131)), // W_BufferedRWPairUser
+    (211, Some(132)), // W_BufferedRandomUser
+    (212, Some(133)), // W_TextIOWrapperUser
+    (213, Some(0)),   // W_FileIO
+    (214, Some(213)), // W_FileIOUser
     // Extra-field exception payload (`W_ExceptionExtended`). No PyType alias:
     // exact realbases keep their class vtables, and `_getusercls` instances
     // use the user layouts below.
-    (214, Some(31)),
-    (215, Some(31)),  // W_BaseExceptionUser
-    (216, Some(214)), // W_ExceptionExtendedUser
+    (215, Some(31)),
+    (216, Some(31)),  // W_BaseExceptionUser
+    (217, Some(215)), // W_ExceptionExtendedUser
     // `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
     // `_getusercls(W_ObjectObject)`). Same payload as
     // `W_OBJECT_OBJECT_GC_TYPE_ID`.
-    (217, Some(53)),
+    (218, Some(53)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail, after the `_getusercls` layouts (158-217).
-    (218, Some(0)),
-    // Native-only type IDs 219 and 220 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (159-218).
+    (219, Some(0)),
+    // Native-only type IDs 220 and 221 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (219, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (220, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (221, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (221, Some(0)),
+    (222, Some(0)),
     #[cfg(windows)]
-    (222, Some(221)), // W_WinConsoleIOUser
+    (223, Some(222)), // W_WinConsoleIOUser
                       // The classes `pyre-module` registers follow, numbered by `build_gc` in
                       // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
@@ -1724,70 +1726,70 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(25, typed::<crate::interp_itertools::W_Repeat>()),
         // `enumerate` W_Enumerate — auto-id `allocate_stable` registered at the
         // tail of the JIT `register_pyre_class` chain (after W_Deque = 110).
-        subclass_range_alias(111, typed::<crate::functional::W_Enumerate>()),
+        subclass_range_alias(112, typed::<crate::functional::W_Enumerate>()),
         // Formerly-immortal iterators converted to `allocate_stable` (managed),
         // registered at the tail of the JIT `register_pyre_class` chain in this
         // exact order (after W_Enumerate = 111).
-        subclass_range_alias(112, typed::<crate::functional::W_Range>()),
-        subclass_range_alias(113, typed::<crate::functional::W_LongRangeIterator>()),
-        subclass_range_alias(114, typed::<crate::interp_itertools::W_TakeWhile>()),
-        subclass_range_alias(115, typed::<crate::interp_itertools::W_DropWhile>()),
-        subclass_range_alias(116, typed::<crate::interp_itertools::W_FilterFalse>()),
-        subclass_range_alias(117, typed::<crate::interp_itertools::W_Pairwise>()),
-        subclass_range_alias(118, typed::<crate::operation::_CallableIterator>()),
+        subclass_range_alias(113, typed::<crate::functional::W_Range>()),
+        subclass_range_alias(114, typed::<crate::functional::W_LongRangeIterator>()),
+        subclass_range_alias(115, typed::<crate::interp_itertools::W_TakeWhile>()),
+        subclass_range_alias(116, typed::<crate::interp_itertools::W_DropWhile>()),
+        subclass_range_alias(117, typed::<crate::interp_itertools::W_FilterFalse>()),
+        subclass_range_alias(118, typed::<crate::interp_itertools::W_Pairwise>()),
+        subclass_range_alias(119, typed::<crate::operation::_CallableIterator>()),
         // The two `step == 1` range-iterator shapes do not follow W_Range: they
         // register behind the unconditional code-object walks, the last block
         // before `build_gc`'s target-gated tail, so their ids are the same on
         // every target.
-        subclass_range_alias(156, typed::<crate::functional::W_IntRangeStepOneIterator>()),
-        subclass_range_alias(157, typed::<crate::functional::W_IntRangeOneArgIterator>()),
-        subclass_range_alias(158, &INT_USER_TYPE),
-        subclass_range_alias(159, &STR_USER_TYPE),
-        subclass_range_alias(160, &TUPLE_USER_TYPE),
-        subclass_range_alias(161, &FLOAT_USER_TYPE),
-        subclass_range_alias(162, &COMPLEX_USER_TYPE),
-        subclass_range_alias(163, &crate::bytesobject::BYTES_USER_TYPE),
-        subclass_range_alias(164, &crate::bytearrayobject::BYTEARRAY_USER_TYPE),
-        subclass_range_alias(165, &LIST_USER_TYPE),
-        subclass_range_alias(166, &crate::setobject::SET_USER_TYPE),
-        subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
-        subclass_range_alias(167, &crate::interp_array::ARRAY_USER_TYPE),
-        subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_TYPE),
-        subclass_range_alias(169, &crate::functional::ENUMERATE_USER_TYPE),
-        subclass_range_alias(170, &crate::functional::MAP_USER_TYPE),
-        subclass_range_alias(171, &crate::functional::FILTER_USER_TYPE),
-        subclass_range_alias(172, &crate::functional::ZIP_USER_TYPE),
-        subclass_range_alias(173, &crate::functional::REVERSED_USER_TYPE),
-        subclass_range_alias(174, &crate::descriptor::SUPER_USER_TYPE),
-        subclass_range_alias(175, &crate::descriptor::PROPERTY_USER_TYPE),
-        subclass_range_alias(176, &crate::interp_itertools::COUNT_USER_TYPE),
-        subclass_range_alias(177, &crate::interp_itertools::REPEAT_USER_TYPE),
-        subclass_range_alias(178, &crate::interp_itertools::TAKEWHILE_USER_TYPE),
-        subclass_range_alias(179, &crate::interp_itertools::DROPWHILE_USER_TYPE),
-        subclass_range_alias(180, &crate::interp_itertools::FILTERFALSE_USER_TYPE),
-        subclass_range_alias(181, &crate::interp_itertools::ISLICE_USER_TYPE),
-        subclass_range_alias(182, &crate::interp_itertools::BATCHED_USER_TYPE),
-        subclass_range_alias(183, &crate::interp_itertools::PRODUCT_USER_TYPE),
-        subclass_range_alias(184, &crate::interp_itertools::COMBINATIONS_USER_TYPE),
+        subclass_range_alias(157, typed::<crate::functional::W_IntRangeStepOneIterator>()),
+        subclass_range_alias(158, typed::<crate::functional::W_IntRangeOneArgIterator>()),
+        subclass_range_alias(159, &INT_USER_TYPE),
+        subclass_range_alias(160, &STR_USER_TYPE),
+        subclass_range_alias(161, &TUPLE_USER_TYPE),
+        subclass_range_alias(162, &FLOAT_USER_TYPE),
+        subclass_range_alias(163, &COMPLEX_USER_TYPE),
+        subclass_range_alias(164, &crate::bytesobject::BYTES_USER_TYPE),
+        subclass_range_alias(165, &crate::bytearrayobject::BYTEARRAY_USER_TYPE),
+        subclass_range_alias(166, &LIST_USER_TYPE),
+        subclass_range_alias(167, &crate::setobject::SET_USER_TYPE),
+        subclass_range_alias(167, &crate::setobject::FROZENSET_USER_TYPE),
+        subclass_range_alias(168, &crate::interp_array::ARRAY_USER_TYPE),
+        subclass_range_alias(169, &crate::weakref::WEAKREF_LAYOUT_TYPE),
+        subclass_range_alias(170, &crate::functional::ENUMERATE_USER_TYPE),
+        subclass_range_alias(171, &crate::functional::MAP_USER_TYPE),
+        subclass_range_alias(172, &crate::functional::FILTER_USER_TYPE),
+        subclass_range_alias(173, &crate::functional::ZIP_USER_TYPE),
+        subclass_range_alias(174, &crate::functional::REVERSED_USER_TYPE),
+        subclass_range_alias(175, &crate::descriptor::SUPER_USER_TYPE),
+        subclass_range_alias(176, &crate::descriptor::PROPERTY_USER_TYPE),
+        subclass_range_alias(177, &crate::interp_itertools::COUNT_USER_TYPE),
+        subclass_range_alias(178, &crate::interp_itertools::REPEAT_USER_TYPE),
+        subclass_range_alias(179, &crate::interp_itertools::TAKEWHILE_USER_TYPE),
+        subclass_range_alias(180, &crate::interp_itertools::DROPWHILE_USER_TYPE),
+        subclass_range_alias(181, &crate::interp_itertools::FILTERFALSE_USER_TYPE),
+        subclass_range_alias(182, &crate::interp_itertools::ISLICE_USER_TYPE),
+        subclass_range_alias(183, &crate::interp_itertools::BATCHED_USER_TYPE),
+        subclass_range_alias(184, &crate::interp_itertools::PRODUCT_USER_TYPE),
+        subclass_range_alias(185, &crate::interp_itertools::COMBINATIONS_USER_TYPE),
         subclass_range_alias(
-            185,
+            186,
             &crate::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE,
         ),
-        subclass_range_alias(186, &crate::interp_itertools::PERMUTATIONS_USER_TYPE),
-        subclass_range_alias(187, &crate::interp_itertools::GROUPBY_USER_TYPE),
-        subclass_range_alias(188, &crate::interp_itertools::COMPRESS_USER_TYPE),
-        subclass_range_alias(189, &crate::interp_itertools::STARMAP_USER_TYPE),
-        subclass_range_alias(190, &crate::interp_itertools::ACCUMULATE_USER_TYPE),
-        subclass_range_alias(191, &crate::interp_itertools::ZIP_LONGEST_USER_TYPE),
-        subclass_range_alias(192, &crate::interp_itertools::PAIRWISE_USER_TYPE),
-        subclass_range_alias(193, &crate::interp_itertools::CYCLE_USER_TYPE),
-        subclass_range_alias(194, &crate::interp_itertools::CHAIN_USER_TYPE),
-        subclass_range_alias(198, &crate::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE),
-        subclass_range_alias(199, &LONG_USER_TYPE),
-        subclass_range_alias(200, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
-        subclass_range_alias(201, &crate::function::STATICMETHOD_USER_TYPE),
-        subclass_range_alias(202, &crate::function::CLASSMETHOD_USER_TYPE),
-        subclass_range_alias(203, &MODULE_USER_TYPE),
+        subclass_range_alias(187, &crate::interp_itertools::PERMUTATIONS_USER_TYPE),
+        subclass_range_alias(188, &crate::interp_itertools::GROUPBY_USER_TYPE),
+        subclass_range_alias(189, &crate::interp_itertools::COMPRESS_USER_TYPE),
+        subclass_range_alias(190, &crate::interp_itertools::STARMAP_USER_TYPE),
+        subclass_range_alias(191, &crate::interp_itertools::ACCUMULATE_USER_TYPE),
+        subclass_range_alias(192, &crate::interp_itertools::ZIP_LONGEST_USER_TYPE),
+        subclass_range_alias(193, &crate::interp_itertools::PAIRWISE_USER_TYPE),
+        subclass_range_alias(194, &crate::interp_itertools::CYCLE_USER_TYPE),
+        subclass_range_alias(195, &crate::interp_itertools::CHAIN_USER_TYPE),
+        subclass_range_alias(199, &crate::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE),
+        subclass_range_alias(200, &LONG_USER_TYPE),
+        subclass_range_alias(201, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
+        subclass_range_alias(202, &crate::function::STATICMETHOD_USER_TYPE),
+        subclass_range_alias(203, &crate::function::CLASSMETHOD_USER_TYPE),
+        subclass_range_alias(204, &MODULE_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1807,8 +1809,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         // `_getusercls` instance layouts. `W_ExceptionExtended` (214) has no
         // vtable alias; these two are the mapdict typeptrs `is_exception`
         // must accept.
-        subclass_range_alias(215, &crate::interp_exceptions::BASE_EXCEPTION_USER_TYPE),
-        subclass_range_alias(216, &crate::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE),
+        subclass_range_alias(216, &crate::interp_exceptions::BASE_EXCEPTION_USER_TYPE),
+        subclass_range_alias(217, &crate::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE),
         subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
         subclass_range_alias(33, &TYPE_TYPE),
         subclass_range_alias(34, &STR_TYPE),
@@ -1827,100 +1829,101 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(50, &crate::celldict::INT_MUTABLE_CELL_TYPE),
         subclass_range_alias(52, &crate::weakref::GC_WEAKREF_BOX_TYPE),
         subclass_range_alias(53, &INSTANCE_TYPE),
-        subclass_range_alias(217, &INSTANCE_USER_TYPE),
+        subclass_range_alias(218, &INSTANCE_USER_TYPE),
         subclass_range_alias(54, &COMPLEX_TYPE),
-        subclass_range_alias(56, &crate::interp_exceptions::EXC_EXCEPTION_TYPE),
-        subclass_range_alias(57, &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE),
-        subclass_range_alias(58, &crate::interp_exceptions::EXC_GENERATOR_EXIT_TYPE),
-        subclass_range_alias(59, &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE),
-        subclass_range_alias(60, &crate::interp_exceptions::EXC_OVERFLOW_ERROR_TYPE),
-        subclass_range_alias(61, &crate::interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE),
-        subclass_range_alias(62, &crate::interp_exceptions::EXC_TYPE_ERROR_TYPE),
-        subclass_range_alias(63, &crate::interp_exceptions::EXC_VALUE_ERROR_TYPE),
-        subclass_range_alias(64, &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE),
-        subclass_range_alias(65, &crate::interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE),
-        subclass_range_alias(66, &crate::interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE),
+        subclass_range_alias(56, &crate::celldict::VERSION_TAG_TYPE),
+        subclass_range_alias(57, &crate::interp_exceptions::EXC_EXCEPTION_TYPE),
+        subclass_range_alias(58, &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE),
+        subclass_range_alias(59, &crate::interp_exceptions::EXC_GENERATOR_EXIT_TYPE),
+        subclass_range_alias(60, &crate::interp_exceptions::EXC_ARITHMETIC_ERROR_TYPE),
+        subclass_range_alias(61, &crate::interp_exceptions::EXC_OVERFLOW_ERROR_TYPE),
+        subclass_range_alias(62, &crate::interp_exceptions::EXC_ZERO_DIVISION_ERROR_TYPE),
+        subclass_range_alias(63, &crate::interp_exceptions::EXC_TYPE_ERROR_TYPE),
+        subclass_range_alias(64, &crate::interp_exceptions::EXC_VALUE_ERROR_TYPE),
+        subclass_range_alias(65, &crate::interp_exceptions::EXC_UNICODE_ERROR_TYPE),
+        subclass_range_alias(66, &crate::interp_exceptions::EXC_UNICODE_DECODE_ERROR_TYPE),
+        subclass_range_alias(67, &crate::interp_exceptions::EXC_UNICODE_ENCODE_ERROR_TYPE),
         subclass_range_alias(
-            67,
+            68,
             &crate::interp_exceptions::EXC_UNICODE_TRANSLATE_ERROR_TYPE,
         ),
-        subclass_range_alias(68, &crate::interp_exceptions::EXC_NAME_ERROR_TYPE),
-        subclass_range_alias(69, &crate::interp_exceptions::EXC_LOOKUP_ERROR_TYPE),
-        subclass_range_alias(70, &crate::interp_exceptions::EXC_INDEX_ERROR_TYPE),
-        subclass_range_alias(71, &crate::interp_exceptions::EXC_KEY_ERROR_TYPE),
-        subclass_range_alias(72, &crate::interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE),
-        subclass_range_alias(73, &crate::interp_exceptions::EXC_RUNTIME_ERROR_TYPE),
+        subclass_range_alias(69, &crate::interp_exceptions::EXC_NAME_ERROR_TYPE),
+        subclass_range_alias(70, &crate::interp_exceptions::EXC_LOOKUP_ERROR_TYPE),
+        subclass_range_alias(71, &crate::interp_exceptions::EXC_INDEX_ERROR_TYPE),
+        subclass_range_alias(72, &crate::interp_exceptions::EXC_KEY_ERROR_TYPE),
+        subclass_range_alias(73, &crate::interp_exceptions::EXC_ATTRIBUTE_ERROR_TYPE),
+        subclass_range_alias(74, &crate::interp_exceptions::EXC_RUNTIME_ERROR_TYPE),
         subclass_range_alias(
-            74,
+            75,
             &crate::interp_exceptions::EXC_NOT_IMPLEMENTED_ERROR_TYPE,
         ),
-        subclass_range_alias(75, &crate::interp_exceptions::EXC_RECURSION_ERROR_TYPE),
-        subclass_range_alias(76, &crate::interp_exceptions::EXC_STOP_ITERATION_TYPE),
-        subclass_range_alias(77, &crate::interp_exceptions::EXC_IMPORT_ERROR_TYPE),
-        subclass_range_alias(78, &crate::interp_exceptions::EXC_ASSERTION_ERROR_TYPE),
-        subclass_range_alias(79, &crate::interp_exceptions::EXC_REFERENCE_ERROR_TYPE),
-        subclass_range_alias(80, &crate::interp_exceptions::EXC_OS_ERROR_TYPE),
-        subclass_range_alias(81, &crate::interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE),
-        subclass_range_alias(82, &crate::interp_exceptions::EXC_MEMORY_ERROR_TYPE),
-        subclass_range_alias(83, &crate::interp_exceptions::EXC_SYSTEM_ERROR_TYPE),
-        subclass_range_alias(84, typed::<crate::interp_sre::W_SRE_Pattern>()),
-        subclass_range_alias(85, typed::<crate::interp_sre::W_SRE_Match>()),
-        subclass_range_alias(86, typed::<crate::interp_sre::W_SRE_Scanner>()),
-        subclass_range_alias(87, typed::<crate::_pypy_generic_alias::GenericAlias>()),
-        subclass_range_alias(89, typed::<crate::functional::W_ReversedIterator>()),
-        subclass_range_alias(90, typed::<crate::functional::W_Filter>()),
-        subclass_range_alias(91, typed::<crate::functional::W_Map>()),
-        subclass_range_alias(92, typed::<crate::functional::W_Zip>()),
-        subclass_range_alias(93, typed::<crate::interp_itertools::W_Cycle>()),
-        subclass_range_alias(94, typed::<crate::interp_array::W_Array>()),
-        subclass_range_alias(95, typed::<crate::interp_itertools::W_Chain>()),
-        subclass_range_alias(96, typed::<crate::memoryview::W_MemoryView>()),
-        subclass_range_alias(99, typed::<crate::setobject::W_SetIterObject>()),
-        subclass_range_alias(100, typed::<crate::iterobject::W_ListIterObject>()),
-        subclass_range_alias(101, typed::<crate::iterobject::W_ListReverseIterObject>()),
-        subclass_range_alias(102, typed::<crate::iterobject::W_TupleIterObject>()),
-        subclass_range_alias(103, typed::<crate::interp_itertools::W_Compress>()),
-        subclass_range_alias(104, typed::<crate::interp_itertools::W_StarMap>()),
-        subclass_range_alias(105, typed::<crate::interp_itertools::W_Accumulate>()),
-        subclass_range_alias(106, typed::<crate::interp_itertools::W_ZipLongest>()),
-        subclass_range_alias(107, &crate::generator::COROUTINE_TYPE),
-        subclass_range_alias(108, typed::<crate::generator::CoroutineWrapper>()),
-        subclass_range_alias(109, &crate::dictmultiobject::DICT_KEYITERATOR_TYPE),
-        subclass_range_alias(109, &crate::dictmultiobject::DICT_VALUEITERATOR_TYPE),
-        subclass_range_alias(109, &crate::dictmultiobject::DICT_ITEMITERATOR_TYPE),
-        subclass_range_alias(109, &crate::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE),
-        subclass_range_alias(109, &crate::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE),
-        subclass_range_alias(109, &crate::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE),
+        subclass_range_alias(76, &crate::interp_exceptions::EXC_RECURSION_ERROR_TYPE),
+        subclass_range_alias(77, &crate::interp_exceptions::EXC_STOP_ITERATION_TYPE),
+        subclass_range_alias(78, &crate::interp_exceptions::EXC_IMPORT_ERROR_TYPE),
+        subclass_range_alias(79, &crate::interp_exceptions::EXC_ASSERTION_ERROR_TYPE),
+        subclass_range_alias(80, &crate::interp_exceptions::EXC_REFERENCE_ERROR_TYPE),
+        subclass_range_alias(81, &crate::interp_exceptions::EXC_OS_ERROR_TYPE),
+        subclass_range_alias(82, &crate::interp_exceptions::EXC_FILE_NOT_FOUND_ERROR_TYPE),
+        subclass_range_alias(83, &crate::interp_exceptions::EXC_MEMORY_ERROR_TYPE),
+        subclass_range_alias(84, &crate::interp_exceptions::EXC_SYSTEM_ERROR_TYPE),
+        subclass_range_alias(85, typed::<crate::interp_sre::W_SRE_Pattern>()),
+        subclass_range_alias(86, typed::<crate::interp_sre::W_SRE_Match>()),
+        subclass_range_alias(87, typed::<crate::interp_sre::W_SRE_Scanner>()),
+        subclass_range_alias(88, typed::<crate::_pypy_generic_alias::GenericAlias>()),
+        subclass_range_alias(90, typed::<crate::functional::W_ReversedIterator>()),
+        subclass_range_alias(91, typed::<crate::functional::W_Filter>()),
+        subclass_range_alias(92, typed::<crate::functional::W_Map>()),
+        subclass_range_alias(93, typed::<crate::functional::W_Zip>()),
+        subclass_range_alias(94, typed::<crate::interp_itertools::W_Cycle>()),
+        subclass_range_alias(95, typed::<crate::interp_array::W_Array>()),
+        subclass_range_alias(96, typed::<crate::interp_itertools::W_Chain>()),
+        subclass_range_alias(97, typed::<crate::memoryview::W_MemoryView>()),
+        subclass_range_alias(100, typed::<crate::setobject::W_SetIterObject>()),
+        subclass_range_alias(101, typed::<crate::iterobject::W_ListIterObject>()),
+        subclass_range_alias(102, typed::<crate::iterobject::W_ListReverseIterObject>()),
+        subclass_range_alias(103, typed::<crate::iterobject::W_TupleIterObject>()),
+        subclass_range_alias(104, typed::<crate::interp_itertools::W_Compress>()),
+        subclass_range_alias(105, typed::<crate::interp_itertools::W_StarMap>()),
+        subclass_range_alias(106, typed::<crate::interp_itertools::W_Accumulate>()),
+        subclass_range_alias(107, typed::<crate::interp_itertools::W_ZipLongest>()),
+        subclass_range_alias(108, &crate::generator::COROUTINE_TYPE),
+        subclass_range_alias(109, typed::<crate::generator::CoroutineWrapper>()),
+        subclass_range_alias(110, &crate::dictmultiobject::DICT_KEYITERATOR_TYPE),
+        subclass_range_alias(110, &crate::dictmultiobject::DICT_VALUEITERATOR_TYPE),
+        subclass_range_alias(110, &crate::dictmultiobject::DICT_ITEMITERATOR_TYPE),
+        subclass_range_alias(110, &crate::dictmultiobject::DICT_REVERSEKEYITERATOR_TYPE),
+        subclass_range_alias(110, &crate::dictmultiobject::DICT_REVERSEVALUEITERATOR_TYPE),
+        subclass_range_alias(110, &crate::dictmultiobject::DICT_REVERSEITEMITERATOR_TYPE),
         // Async-generator support is appended after the interpreter-owned
         // FrameLocalsProxy (125) in build_gc: the shared generator payload
         // gets 126, followed by the three pyre_class helper awaitables.
-        subclass_range_alias(124, &crate::generator::ASYNC_GENERATOR_TYPE),
-        subclass_range_alias(125, typed::<crate::generator::AsyncGenValueWrapper>()),
-        subclass_range_alias(126, typed::<crate::generator::AsyncGenASend>()),
-        subclass_range_alias(127, typed::<crate::generator::AsyncGenAThrow>()),
+        subclass_range_alias(125, &crate::generator::ASYNC_GENERATOR_TYPE),
+        subclass_range_alias(126, typed::<crate::generator::AsyncGenValueWrapper>()),
+        subclass_range_alias(127, typed::<crate::generator::AsyncGenASend>()),
+        subclass_range_alias(128, typed::<crate::generator::AsyncGenAThrow>()),
         // W_ISlice is appended after the interpreter-owned W_Local (135) in
         // build_gc so every pre-existing Python-visible AUTO-ID stays stable.
-        subclass_range_alias(134, typed::<crate::interp_itertools::W_ISlice>()),
+        subclass_range_alias(135, typed::<crate::interp_itertools::W_ISlice>()),
         // W_Batched follows W_ISlice in the same append-only registration
         // chain.
-        subclass_range_alias(135, typed::<crate::interp_itertools::W_Batched>()),
-        subclass_range_alias(136, typed::<crate::interp_itertools::W_Product>()),
-        subclass_range_alias(137, typed::<crate::interp_itertools::W_Combinations>()),
+        subclass_range_alias(136, typed::<crate::interp_itertools::W_Batched>()),
+        subclass_range_alias(137, typed::<crate::interp_itertools::W_Product>()),
+        subclass_range_alias(138, typed::<crate::interp_itertools::W_Combinations>()),
         subclass_range_alias(
-            138,
+            139,
             typed::<crate::interp_itertools::W_CombinationsWithReplacement>(),
         ),
-        subclass_range_alias(139, typed::<crate::interp_itertools::W_Permutations>()),
-        subclass_range_alias(140, typed::<crate::interp_itertools::W_GroupBy>()),
-        subclass_range_alias(141, typed::<crate::interp_itertools::W_GroupByIterator>()),
+        subclass_range_alias(140, typed::<crate::interp_itertools::W_Permutations>()),
+        subclass_range_alias(141, typed::<crate::interp_itertools::W_GroupBy>()),
+        subclass_range_alias(142, typed::<crate::interp_itertools::W_GroupByIterator>()),
         subclass_range_alias(
-            142,
+            143,
             typed::<crate::interp_itertools::W_TeeChainedListNode>(),
         ),
-        subclass_range_alias(143, typed::<crate::interp_itertools::W_TeeIterable>()),
+        subclass_range_alias(144, typed::<crate::interp_itertools::W_TeeIterable>()),
         // `_buffer_wrapper` follows the deque's internal non-object Block
         // (146) at the append-only GC registration tail.
-        subclass_range_alias(145, typed::<crate::memoryview::W_BufferWrapper>()),
+        subclass_range_alias(146, typed::<crate::memoryview::W_BufferWrapper>()),
     ]
 }
 

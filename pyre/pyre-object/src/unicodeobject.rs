@@ -281,7 +281,7 @@ pub const UNICODE_INDEX_STORAGE_OFFSET: usize =
 /// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
 pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
 /// User-subclass str layout (`typedef.py` `_getusercls`). Unconditional id 159.
-pub const W_UNICODE_USER_GC_TYPE_ID: u32 = 159;
+pub const W_UNICODE_USER_GC_TYPE_ID: u32 = 160;
 
 /// Runtime-assigned GC type id for the retired Wtf8Buf value box. Published by
 /// `pyre-jit::eval` after the fixed-constant type registrations; never embedded

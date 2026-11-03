@@ -110,7 +110,7 @@ const _: () = {
 pub const W_TUPLE_GC_TYPE_ID: u32 = 8;
 pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 /// User-subclass tuple layout (`typedef.py` `_getusercls`). Unconditional id 160.
-pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 160;
+pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 161;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
 impl crate::lltype::GcType for W_TupleObject {

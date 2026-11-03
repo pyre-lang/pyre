@@ -2856,6 +2856,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let descr = group.field_descrs[0].clone() as majit_ir::DescrRef;
@@ -3204,6 +3205,7 @@ mod tests {
             false,
             Some(0),
             false,
+            false,
         );
         let descr_b = gc.get_field_descr(
             majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("PureB")),
@@ -3218,6 +3220,7 @@ mod tests {
             u32::MAX,
             false,
             Some(0),
+            false,
             false,
         );
         assert_ne!(descr_a.index(), descr_b.index());

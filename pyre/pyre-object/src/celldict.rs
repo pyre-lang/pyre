@@ -404,35 +404,37 @@ pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyO
 /// ```
 ///
 /// An opaque identity tag invalidated on every mutation that affects
-/// the JIT's view of the dict.  Pyre's stand-in is a monotonically
-/// increasing counter — pointer-identity matches PyPy's `is` test
-/// because each `Box<VersionTag>` allocates a fresh address but a
-/// counter is JIT-friendlier and trivially `Copy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VersionTag(pub u64);
+/// the JIT's view of the dict. Tags are compared by identity, as upstream.
+pub static VERSION_TAG_TYPE: PyType = new_pytype("__VersionTag");
 
-/// The serial [`VersionTag::fresh`] hands out — a process-global counter
-/// bumped once per tag.
-///
-/// The counter is a runtime-mutable global, so the read seam is residual
-/// (`@dont_look_inside`, `rlib/jit.py`, the `importing::sys_modules_dict`
-/// shape): whatever value the build process happens to observe is not a
-/// constant, and folding it would hand every dict the same tag.  Upstream
-/// allocates a fresh `VersionTag()` object here instead, which rtypes to a
-/// `malloc` the JIT models; a `static AtomicU64` has no llop counterpart, so
-/// the call itself is the last modellable point.  The `u64` serial is a single
-/// word and the newtype wrap stays traced.
-#[majit_macros::dont_look_inside]
-pub fn next_version_tag_serial() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+/// GC type id assigned to `VersionTag` — slot 56, immediately after
+/// `W_MAPDICT_STORAGE_GC_TYPE_ID=55`.
+pub const W_VERSION_TAG_GC_TYPE_ID: u32 = 56;
+
+/// `celldict.py VersionTag` — header-only `W_Root`.
+#[repr(C)]
+pub struct VersionTag {
+    pub ob_header: PyObject,
+}
+
+pub const W_VERSION_TAG_OBJECT_SIZE: usize = std::mem::size_of::<VersionTag>();
+
+impl crate::lltype::GcType for VersionTag {
+    fn type_id() -> u32 {
+        W_VERSION_TAG_GC_TYPE_ID
+    }
+    const SIZE: usize = W_VERSION_TAG_OBJECT_SIZE;
 }
 
 impl VersionTag {
     /// Allocate a fresh, never-before-seen version tag.
-    pub fn fresh() -> Self {
-        VersionTag(next_version_tag_serial())
+    pub fn fresh() -> *mut VersionTag {
+        crate::lltype::malloc_typed_managed(VersionTag {
+            ob_header: PyObject {
+                ob_type: &VERSION_TAG_TYPE as *const PyType,
+                w_class: get_instantiate(&VERSION_TAG_TYPE),
+            },
+        }) as *mut VersionTag
     }
 }
 
@@ -812,7 +814,7 @@ unsafe fn walk_one_global_cache(
 #[repr(C)]
 #[majit_macros::jit_immutable_fields("version?")]
 pub struct ModuleDictStrategy {
-    pub version: VersionTag,
+    pub version: *mut VersionTag,
     pub caches: parking_lot::Mutex<Option<GlobalCacheRegistry>>,
     /// Hidden `mutate_version` field `quasiimmut.py get_mutate_field_name`
     /// names and `rclass.py InstanceRepr._setup_repr` adds as
@@ -903,25 +905,6 @@ impl ModuleDictStrategy {
     /// after the abort forces nothing a second time.
     pub fn force_version_qmut(&self) {
         self.mutate_version().invalidate();
-    }
-
-    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
-    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
-    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
-    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
-    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
-    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
-    #[inline(never)]
-    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
-        match mutatefieldname {
-            "mutate_version" => {
-                if !self.mutate_version().is_installed() {
-                    return;
-                }
-                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_version) };
-            }
-            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
-        }
     }
 
     /// `celldict.py get_global_cache`:
@@ -1059,11 +1042,25 @@ impl ModuleDictStrategy {
     /// ```
     ///
     /// `rclass.py InstanceRepr.hook_setfield` emits `jit_force_quasi_immutable`
-    /// before the store to `version?`.
+    /// before the store to `version?`. Native invalidation is
+    /// `quasi_immut_store!`. `VersionTag()` is allocated before the write
+    /// barrier, so no collection runs between the barrier and the store (the
+    /// GC transformer puts the barrier at the setfield, after the malloc). The
+    /// barrier is gated so a trace does not residualize
+    /// `try_gc_write_barrier_prebuilt`; the backend's setfield emits its own.
+    /// `self` is the storage box payload (`gc_alloc_storage_box` /
+    /// `rordereddict` `set_items_write_barrier`).
     #[inline]
     pub fn mutated(&mut self) {
-        self.jit_force_quasi_immutable("mutate_version");
-        self.version = VersionTag::fresh();
+        let version = VersionTag::fresh();
+        crate::quasi_immut_store!(self.mutate_version() =>
+            if !::majit_rlib::jit::we_are_jitted() {
+                crate::gc_hook::try_gc_write_barrier_prebuilt(
+                    self as *mut Self as crate::gc_hook::GCREF,
+                );
+            };
+            self.version = version;
+        );
     }
 
     /// `celldict.py getdictvalue_no_unwrapping`:
@@ -1103,7 +1100,7 @@ impl ModuleDictStrategy {
     )]
     pub fn _getdictvalue_no_unwrapping_pure(
         &self,
-        _version: VersionTag,
+        _version: *mut VersionTag,
         w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
@@ -1634,14 +1631,15 @@ mod tests {
     fn fresh_versiontags_are_distinct() {
         let a = VersionTag::fresh();
         let b = VersionTag::fresh();
-        assert_ne!(a, b);
+        assert!(!std::ptr::eq(a, b));
     }
 
     #[test]
     fn mutated_flips_registered_version_watchers() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
-        let mut strategy = ModuleDictStrategy::new();
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strategy = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         let flag = Arc::new(AtomicBool::new(false));
         let token = crate::quasiimmut::test_loop_token(&flag);
         strategy.current_version_qmut().register_loop_token(&token);
@@ -1656,7 +1654,8 @@ mod tests {
     fn dead_version_watchers_drop_out() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
-        let mut strategy = ModuleDictStrategy::new();
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strategy = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         let flag = Arc::new(AtomicBool::new(false));
         let token = crate::quasiimmut::test_loop_token(&flag);
         strategy.current_version_qmut().register_loop_token(&token);
@@ -1711,7 +1710,7 @@ mod tests {
         let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
         let before = strat.version;
         strat.setitem_str(w_dict, "k", crate::w_str_new("v"));
-        assert_ne!(strat.version, before);
+        assert!(!std::ptr::eq(strat.version, before));
     }
 
     #[test]
@@ -1724,7 +1723,7 @@ mod tests {
         let removed = strat.delitem_str(w_dict, "k");
         assert_eq!(removed, Some(v));
         assert_eq!(strat.getitem_str(w_dict, "k"), None);
-        assert_ne!(strat.version, v_before);
+        assert!(!std::ptr::eq(strat.version, v_before));
     }
 
     #[test]

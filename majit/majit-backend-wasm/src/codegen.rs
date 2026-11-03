@@ -8135,8 +8135,9 @@ fn build_function(
                     let (size, signed) = field_size_sign_from_descr(op);
                     // Imported memory is not shared, so this stays a
                     // plain sized load when the descr's `load_is_acquire`
-                    // is set. The host sample of that field is
-                    // `bh_getfield_gc_i`.
+                    // is set, and a plain sized store when
+                    // `store_is_release` is set. The host sample of that
+                    // field is `bh_getfield_gc_i` / `bh_setfield_gc_i`.
                     emit_sized_int_load(&mut sink, field_offset, size, signed);
                     sink.local_set(value_types.local(vi));
                 }
@@ -8149,16 +8150,19 @@ fn build_function(
                     let field_offset = field_offset_from_descr(op);
                     // Pointer load. The imported memory is not shared, so
                     // this stays `i64.load32_u` when the descr's
-                    // `load_is_acquire` is set. The host sample of that
-                    // field is `bh_getfield_gc_r`.
+                    // `load_is_acquire` is set, and a plain store when
+                    // `store_is_release` is set. The host sample of that
+                    // field is `bh_getfield_gc_r` / `bh_setfield_gc_r`.
                     sink.i64_load32_u(memarg(field_offset, 2));
                     sink.local_set(value_types.local(vi));
                 }
             }
-            OpCode::SetfieldGc => {
-                panic!("wasm codegen: SetfieldGc must have been lowered by rewrite_ops_for_gc");
-            }
-            OpCode::SetfieldRaw => {
+            OpCode::SetfieldGc | OpCode::SetfieldRaw => {
+                // Imported memory is not shared, so this stays a plain
+                // sized store when the descr's `store_is_release` is set.
+                // Ordered SETFIELD_GC survives rewrite with its FieldDescr
+                // (`GcRewriterAssembler.transform_to_gc_load`); the rewriter
+                // still emits COND_CALL_GC_WB ahead of a ref store.
                 emit_resolve(&mut sink, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -8243,10 +8247,11 @@ fn build_function(
                 }
             }
 
-            // Same contract as `SetfieldGc` / `SetarrayitemGc`: a Ref
-            // interior store must have been rewritten to COND_CALL_GC_WB
-            // plus a raw store. Reaching here would write the pointer
-            // without the barrier.
+            // Same contract as unordered `SetarrayitemGc`: a Ref interior
+            // store must have been rewritten to COND_CALL_GC_WB plus a raw
+            // store. Reaching here would write the pointer without the
+            // barrier. Ordered SETFIELD_GC is emitted above after the
+            // rewriter's COND_CALL_GC_WB.
             OpCode::SetinteriorfieldGc => {
                 panic!(
                     "wasm codegen: SetinteriorfieldGc must have been lowered by rewrite_ops_for_gc"
@@ -8436,8 +8441,7 @@ fn build_function(
             // ── Conditional calls ──
             OpCode::CondCallGcWb => {
                 // rewrite.py `gen_write_barrier`: one-arg COND_CALL_GC_WB
-                // before the lowered GC_STORE. The SETFIELD_GC arm never
-                // sees that store, so the barrier has to run here.
+                // before the store (GC_STORE, or ordered SETFIELD_GC).
                 emit_write_barrier(
                     &mut sink,
                     value_types,

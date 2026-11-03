@@ -1229,9 +1229,9 @@ unsafe fn module_dict_object_custom_trace(
     let md = unsafe { &mut *(obj_addr as *mut pyre_object::dictmultiobject::W_ModuleDictObject) };
     f(&mut md.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // Grey each GC-managed storage box through its field slot so a major GC
-    // keeps it live; the box interiors are GC leaves, so the walk below is
-    // the only thing that forwards their element slots.  Non-moving, so the
-    // minor-GC forward is a no-op.  Guard on GC ownership: a `tid == 0`
+    // keeps it live. The strategy box's own type walks `version`; the walk
+    // below forwards storage value slots.  Non-moving, so the minor-GC
+    // forward is a no-op.  Guard on GC ownership: a `tid == 0`
     // `malloc_raw` fallback box (unit tests / pre-init) has no GC hook.
     if pyre_object::dictmultiobject::is_module_dict(obj) {
         // Same as `dict_object_custom_trace`: a young-nonmoving
@@ -1973,6 +1973,22 @@ fn register_traced_storage_box<T: 'static>(
 ) {
     let tid = gc.register_type(
         majit_gc::trace::TypeInfo::with_custom_trace(std::mem::size_of::<T>(), custom_trace)
+            .with_destructor_fn(destructor),
+    );
+    set_id(tid);
+}
+
+/// Register a storage-box type whose payload holds GC pointers at the given
+/// offsets. Offsets are payload-relative: `gc_alloc_storage_box` lays
+/// `[GcHeader | T]` and `TypeInfo` size is `size_of::<T>()`.
+fn register_storage_box_with_gc_ptrs<T: 'static>(
+    gc: &mut dyn majit_gc::GcAllocator,
+    offsets: Vec<usize>,
+    destructor: majit_gc::trace::DestructorFn,
+    set_id: impl FnOnce(u32),
+) {
+    let tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_gc_ptrs(std::mem::size_of::<T>(), offsets)
             .with_destructor_fn(destructor),
     );
     set_id(tid);
@@ -3439,6 +3455,31 @@ fn build_gc() -> Box<MiniMarkGC> {
         w_mapdict_storage_tid,
         pyre_object::object_array::W_MAPDICT_STORAGE_GC_TYPE_ID,
     );
+    // `celldict.py VersionTag(object): pass` — header-only `W_Root`, compared
+    // by identity. Registered immediately after `W_MAPDICT_STORAGE_GC_TYPE_ID
+    // = 55` so it takes tid 56 before the runtime-numbered `#[pyre_class]` /
+    // per-ExcKind registrations below. Internal: `without_app_level_typedef`,
+    // matching `IntMutableCell`.
+    let w_version_tag_tid = gc.register_type(
+        TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::celldict::VersionTag>(),
+            object_tid,
+        )
+        .without_app_level_typedef(),
+    );
+    debug_assert_eq!(
+        w_version_tag_tid,
+        pyre_object::celldict::W_VERSION_TAG_GC_TYPE_ID,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::celldict::VERSION_TAG_TYPE as *const _ as usize,
+        w_version_tag_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::celldict::VERSION_TAG_TYPE as *const _ as usize,
+        w_version_tag_tid,
+    );
     // `#[pyre_class]`-emitted typed-payload registrations.  Each
     // entry is one line consuming the macro-generated
     // `PyreClassDescriptor` static; `register_pyre_class` asserts
@@ -4195,7 +4236,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
 
     // The two `step == 1` iterator shapes.  Their ids are explicit
-    // (`type_id = 156` / `157`) because their descr groups bake them at
+    // (`type_id = 157` / `158`) because their descr groups bake them at
     // compile time to guard and virtualize a FOR_ITER, and an explicit id only
     // holds where registration order does: they are unconditional, so they
     // close the ungated block here, ahead of the target-gated tail whose ids
@@ -4394,7 +4435,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // mapdict storage. The raw element buffer is released by the same
     // `W_ArrayBase.__del__` destructor as the base tid.
     let array_tid = <pyre_object::interp_array::W_Array as pyre_object::lltype::GcType>::type_id();
-    debug_assert_eq!(array_tid, 94);
+    debug_assert_eq!(array_tid, 95);
     let array_user_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
             pyre_object::interp_array::W_ARRAY_USER_OBJECT_SIZE,
@@ -4435,7 +4476,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `#[pyre_class(..., user_layout)]` (`typedef.py` `_getusercls`).
     // Each is an rclass child of its builtin layout. Fixed payload offsets
     // stay on the descriptor; the custom trace walks mapdict storage only.
-    debug_assert_eq!(gc.types.len(), 169);
+    debug_assert_eq!(gc.types.len(), 170);
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
@@ -4640,7 +4681,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_object::function::W_STATICMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
     );
-    debug_assert_eq!(staticmethod_user_tid, 201);
+    debug_assert_eq!(staticmethod_user_tid, 202);
     gc.types
         .set_destructor(staticmethod_user_tid, staticmethod_destructor);
     let classmethod_user_tid = register_pyre_class(
@@ -4648,7 +4689,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         &pyre_object::function::W_CLASSMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
     );
-    debug_assert_eq!(classmethod_user_tid, 202);
+    debug_assert_eq!(classmethod_user_tid, 203);
     gc.types
         .set_destructor(classmethod_user_tid, classmethod_destructor);
     // `ModuleUser` (`typedef.py` `_getusercls`). Subclass instances are
@@ -4974,10 +5015,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id,
     );
     // Module-dict `dstorage`, holder and owner storage boxes. The traced
-    // `ModuleDictStorage` box walks value slots; strategy/owner boxes are
-    // leaves (no inner GC refs). The post-switch `dstorage` reuses the
-    // ObjectDictStorage box tid registered above. Keep these ids at the
-    // absolute tail.
+    // `ModuleDictStorage` box walks value slots; the strategy box traces
+    // `version` (a GC `VersionTag` pointer); the owner box is a leaf.
+    // The post-switch `dstorage` reuses the ObjectDictStorage box tid
+    // registered above. Keep these ids at the absolute tail.
     register_traced_storage_box::<pyre_object::celldict::ModuleDictStorage>(
         &mut gc,
         module_dict_storage_custom_trace,
@@ -5009,8 +5050,12 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut gc,
         pyre_object::rordereddict::set_str_key_pyobject_entries_gc_type_id,
     );
-    register_leaf_storage_box::<pyre_object::celldict::ModuleDictStrategy>(
+    register_storage_box_with_gc_ptrs::<pyre_object::celldict::ModuleDictStrategy>(
         &mut gc,
+        vec![std::mem::offset_of!(
+            pyre_object::celldict::ModuleDictStrategy,
+            version
+        )],
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
     );
@@ -16481,6 +16526,7 @@ fn bh_setfield_gc_int_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::
             descr_info.offset,
             descr_info.field_size,
             value,
+            false,
         )
     };
 }
@@ -16623,6 +16669,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 struct_ptr as usize,
                 descr_info.offset,
                 value as usize,
+                false,
             )
         };
         // llmodel.py `bh_setfield_gc_r` → :495 `write_ref_at_mem`: the

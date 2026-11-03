@@ -3984,10 +3984,10 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 /// names which STEP of it.  1 = before `decode_and_restore_guard_failure`, so
 /// nothing the attempt owns has run; 2 = after it, so the resume data has been
 /// decoded, its pending fields replayed and the virtualizable synchronised;
-/// 3 = after the frame's `last_instr` is repointed, so only the walk is
-/// missing.  Stage 1 is the control -- it has to reproduce `MAJIT_NO_BRIDGE=1`
-/// exactly, and a stage that does not is measuring the build rather than the
-/// step.
+/// 3 = after that decode (and the ForeignInnermost census), so only the walk
+/// is missing.  Stage 1 is the control -- it has to reproduce
+/// `MAJIT_NO_BRIDGE=1` exactly, and a stage that does not is measuring the
+/// build rather than the step.
 fn bridge_bail_stage() -> u32 {
     static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *STAGE.get_or_init(|| {
@@ -4192,15 +4192,15 @@ pub fn trace_and_compile_from_bridge(
     let is_multiframe_resume = num_resume_frames > 1;
     // `resume_pc` addresses the INNERMOST resumed section, so for a
     // multi-frame guard it is a pc in an inlined callee's own code object.
-    // It only addresses THIS frame while that section belongs to this
-    // frame's code — the same condition the paired valuestackdepth
-    // correction already applies before handing the coordinate back.
-    // The routing below is meant to keep such a resume off the live frame,
-    // but every arm after this point can still return `ResumeBlackhole`, and
-    // the blackhole itself refuses a jitcode carrying an abort opcode or a pc
-    // whose liveness it cannot decode. On that path the interpreter resumes
-    // this frame, so a foreign pc left in `last_instr` would step a code
-    // object the frame does not run. Keep the vable-derived position instead.
+    // The frame image comes from resume data as it stands
+    // (`write_from_resume_data_partial`); the blackhole resumes at the
+    // guard's jitcode pc (`resume.py blackhole_from_resumedata`). Every
+    // hand-off back to the interpreter carries its own next pc — the
+    // `ContinueRunningNormally` green (`apply_blackhole_crn_handoff`) or
+    // the coordinate `abort_permanent` stamped
+    // (`BlackholeResult::BailToInterpreter`). A foreign innermost pc does
+    // not address this frame — keep the vable-derived position
+    // (`Resume::ForeignInnermostLastInstr`).
     let frame_code = bridge_frame_root.frame().pycode as usize;
     let foreign_innermost = is_multiframe_resume
         && resume_coords.last().map(|&(code, _, _, _)| code) != Some(frame_code);
@@ -4209,10 +4209,6 @@ pub fn trace_and_compile_from_bridge(
             frame_code,
             "Resume::ForeignInnermostLastInstr",
         );
-    } else {
-        bridge_frame_root
-            .frame()
-            .set_last_instr_from_next_instr(resume_pc);
     }
     // A helper innermost has no Python code object (`py_pc == usize::MAX`).
     // The carrier drain walks that jitcode from the guard

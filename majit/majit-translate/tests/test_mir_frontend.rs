@@ -3782,20 +3782,16 @@ fn frame_box_owner_root_word_roundtrips() {
 
 /// `function_get_qualname_obj` force receiver is the CAST of the
 /// reloaded `PyObjectRef` onto `Function` (`rclass.py`
-/// `getinstancerepr(classdef)`). The Call dest carries that root.
+/// `getinstancerepr(classdef)`). `Transformer::hook_setfield` mints
+/// the force ahead of the `FieldWrite` to the quasi-immutable
+/// `w_qualname` field, so that store's base is the force's receiver.
+/// The CAST dest carries that root.
 #[test]
 fn function_get_qualname_obj_force_receiver_is_function_cast() {
     use majit_translate::model::{CallTarget, LinkArg, OpKind, ValueType};
 
     let llbc = load_llbc(INTERPRETER_LLBC);
     let graph = lower_named(llbc, "function_get_qualname_obj").expect("lower");
-
-    fn value_id(arg: &LinkArg) -> Option<u64> {
-        match arg {
-            LinkArg::Value(var) => Some(var.id()),
-            LinkArg::Const(_) => None,
-        }
-    }
 
     fn defining_op(
         graph: &majit_translate::model::FunctionGraph,
@@ -3849,34 +3845,58 @@ fn function_get_qualname_obj_force_receiver_is_function_cast() {
                         ));
                     }
                 }
+                OpKind::FieldWrite {
+                    base,
+                    field,
+                    value,
+                    ty,
+                } => {
+                    let value = match value {
+                        LinkArg::Value(var) => format!("v{}", var.id()),
+                        LinkArg::Const(c) => format!("const({c:?})"),
+                    };
+                    dump.push(format!(
+                        "FieldWrite {}.{} owner={:?} base=v{} value={value} ty={ty:?}",
+                        field.owner_root.as_deref().unwrap_or("<?>"),
+                        field.name,
+                        field.owner_root,
+                        base.id()
+                    ));
+                }
+                OpKind::InteriorFieldWrite { field, base, .. } => dump.push(format!(
+                    "InteriorFieldWrite {}.{} owner={:?} base=v{}",
+                    field.owner_root.as_deref().unwrap_or("<?>"),
+                    field.name,
+                    field.owner_root,
+                    base.id()
+                )),
                 _ => {}
             }
         }
     }
 
-    let force = graph.blocks.iter().find_map(|block| {
+    let store = graph.blocks.iter().find_map(|block| {
         block.operations.iter().find(|op| {
             matches!(
                 &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "jit_force_quasi_immutable"
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "w_qualname"
+                        && field.owner_root.as_deref() == Some("function::Function")
             )
         })
     });
-    let force = force.unwrap_or_else(|| panic!("no jit_force_quasi_immutable: {dump:?}"));
-    let OpKind::Call { args, .. } = &force.kind else {
-        panic!("force is not a Call: {dump:?}");
+    let store = store.unwrap_or_else(|| panic!("no w_qualname FieldWrite: {dump:?}"));
+    let OpKind::FieldWrite { base, .. } = &store.kind else {
+        panic!("store is not a FieldWrite: {dump:?}");
     };
-    let recv = value_id(&args[0]).unwrap_or_else(|| panic!("force arg0 is not a value: {dump:?}"));
+    let recv = base.id();
     let producer = defining_op(&graph, recv)
-        .unwrap_or_else(|| panic!("force arg0 v{recv} has no defining op: {dump:?}"));
+        .unwrap_or_else(|| panic!("store base v{recv} has no defining op: {dump:?}"));
     let root = majit_translate::model::cast_instance_root(&producer.kind);
     assert_eq!(
         root,
         Some("function::Function"),
-        "force receiver must be CAST onto Function; producer={:?} dump={dump:?}",
+        "store base must be CAST onto Function; producer={:?} dump={dump:?}",
         producer.kind
     );
     match &producer.kind {

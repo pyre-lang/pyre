@@ -3447,6 +3447,11 @@ impl<'a> Transformer<'a> {
                 Some((&self.renamings_constants, false)),
             );
             self.hook_access_field(original_op, &op, graph_name, graph);
+            // `rclass.py InstanceRepr.setfield`: hook_access_field,
+            // hook_setfield, then genop('setfield'). The force ops are
+            // remapped with the same alias/constant pass Replace results
+            // get, and appended before the store's own rewritten ops.
+            let hook_setfield_ops = self.hook_setfield(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
@@ -3455,6 +3460,9 @@ impl<'a> Transformer<'a> {
             #[cfg(test)]
             self.rewrite_input_ops.push(op.clone());
             let rewritten = self.rewrite_operation(&op, graph_name, graph);
+            new_ops.extend(hook_setfield_ops.iter().map(|op1| {
+                remap_op_renamings(op1, &self.aliases, Some((&self.renamings_constants, true)))
+            }));
             match rewritten {
                 RewriteResult::Replace(ops) => {
                     last_op_rewritten_away = ops.is_empty();
@@ -3823,6 +3831,75 @@ impl<'a> Transformer<'a> {
             },
         };
         let _ = self.rewrite_operation(&force, graph_name, graph);
+    }
+
+    /// `rclass.py InstanceRepr.hook_setfield`:
+    ///
+    /// ```text
+    /// def hook_setfield(self, vinst, fieldname, llops):
+    ///     if self.is_quasi_immutable(fieldname):
+    ///         c_fieldname = inputconst(Void, 'mutate_' + fieldname)
+    ///         llops.genop('jit_force_quasi_immutable', [vinst, c_fieldname])
+    /// ```
+    ///
+    /// `InstanceRepr::hook_setfield` genops this on the rtyped graph, which the dual gate does not publish; the
+    /// surface `FieldWrite` gets it here, the way `hook_access_field` mints `jit_force_virtualizable`.
+    fn hook_setfield(
+        &mut self,
+        original_op: &SpaceOperation,
+        renamed_op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut crate::model::FunctionGraph,
+    ) -> Vec<SpaceOperation> {
+        let _ = graph;
+        let field = match &original_op.kind {
+            OpKind::FieldWrite { field, .. } => field,
+            _ => return Vec::new(),
+        };
+        let rank = self
+            .callcontrol
+            .as_deref()
+            .and_then(|cc| cc.field_immutability(field.owner_root.as_deref(), &field.name));
+        if !rank.is_some_and(|rank| rank.is_quasi_immutable()) {
+            return Vec::new();
+        }
+        // A `?` field is never a typeptr / void store
+        // (`rewrite_op_setfield` drops those; this hook must not).
+        debug_assert!(
+            !crate::codewriter::heaptracker::is_typeptr_field(field),
+            "a ? field is never a typeptr"
+        );
+        let renamed_base = match &renamed_op.kind {
+            OpKind::FieldWrite { base, .. } => base,
+            _ => unreachable!("renaming preserves field-access kind"),
+        };
+        // `renamed_op` is constants-only remapped; Var→Var aliases are
+        // applied after rewrite. Resolve the same handle `hook_access_field`
+        // keys flags on.
+        let renamed_base = resolve_alias(renamed_base, &self.aliases);
+        let mutate_field =
+            FieldDescriptor::new(format!("mutate_{}", field.name), field.owner_root.clone());
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: format!(
+                "hook_setfield: jit_force_quasi_immutable before setfield of {owner}.{name}",
+                owner = field.owner_root.as_deref().unwrap_or("<?>"),
+                name = field.name,
+            ),
+        });
+        vec![
+            SpaceOperation {
+                result: None,
+                kind: OpKind::live(),
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::JitForceQuasiImmutable {
+                    base: crate::model::LinkArg::from(renamed_base),
+                    mutate_field,
+                },
+            },
+        ]
     }
 
     /// `jtransform.py _check_no_vable_array`.
@@ -27514,6 +27591,384 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let _ = transform_with_qi_llop(&graph, path);
+    }
+
+    /// `Transformer::hook_setfield` mints `-live-` + `jit_force_quasi_immutable`
+    /// before a store to a `?` field (`rclass.py InstanceRepr.hook_setfield`).
+    #[test]
+    fn hook_setfield_emits_force_before_store_to_quasi_field() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Function".to_string(),
+            vec![("code".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+
+        let mut graph = FunctionGraph::new("function_set_func_code");
+        let inst = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "func".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        inst.set_concretetype(Some(qi_ptr_struct("function::Function")));
+        let code = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "code".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: inst.clone(),
+                field: FieldDescriptor::new("code", Some("Function".to_string())),
+                value: LinkArg::from(code),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live { .. }))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { mutate_field, .. }
+                    if mutate_field.name == "mutate_code"
+                        && mutate_field.owner_root.as_deref() == Some("Function")
+            ),
+            "expected [Live, JitForceQuasiImmutable mutate_code/Function], got {ops:?}"
+        );
+        assert!(
+            matches!(
+                ops[live_idx + 2],
+                OpKind::FieldWrite { field, .. } if field.name == "code"
+            ),
+            "expected the setfield after the force, got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|k| matches!(k, OpKind::JitForceQuasiImmutable { .. }))
+                .count(),
+            1,
+            "exactly one force, got {ops:?}"
+        );
+        assert!(
+            result.notes.iter().any(|n| n.detail.contains(
+                "hook_setfield: jit_force_quasi_immutable before setfield of Function.code"
+            )),
+            "expected hook_setfield note, got {:?}",
+            result.notes
+        );
+    }
+
+    /// Integer atomic `?` field: the same `-live-` + force as the pointer
+    /// `Function.code` case, for `W_TypeObject.compares_by_identity_status`.
+    #[test]
+    fn hook_setfield_emits_force_before_store_to_integer_quasi_atomic_field() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "W_TypeObject".to_string(),
+            vec![(
+                "compares_by_identity_status".to_string(),
+                ImmutableRank::QuasiImmutable,
+            )],
+        );
+
+        let mut graph = FunctionGraph::new("w_type_set_compares_by_identity_status");
+        let inst = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "w_type".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        inst.set_concretetype(Some(qi_ptr_struct("typeobject::W_TypeObject")));
+        let status = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "status".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: inst.clone(),
+                field: FieldDescriptor::new(
+                    "compares_by_identity_status",
+                    Some("W_TypeObject".to_string()),
+                ),
+                value: LinkArg::from(status),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live { .. }))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { mutate_field, .. }
+                    if mutate_field.name == "mutate_compares_by_identity_status"
+                        && mutate_field.owner_root.as_deref() == Some("W_TypeObject")
+            ),
+            "expected [Live, JitForceQuasiImmutable mutate_compares_by_identity_status/W_TypeObject], got {ops:?}"
+        );
+        assert!(
+            matches!(
+                ops[live_idx + 2],
+                OpKind::FieldWrite { field, .. } if field.name == "compares_by_identity_status"
+            ),
+            "expected the setfield after the force, got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|k| matches!(k, OpKind::JitForceQuasiImmutable { .. }))
+                .count(),
+            1,
+            "exactly one force, got {ops:?}"
+        );
+        assert!(
+            result.notes.iter().any(|n| n.detail.contains(
+                "hook_setfield: jit_force_quasi_immutable before setfield of W_TypeObject.compares_by_identity_status"
+            )),
+            "expected hook_setfield note, got {:?}",
+            result.notes
+        );
+    }
+
+    /// `IR_IMMUTABLE` and an undeclared field do not mint the force.
+    #[test]
+    fn hook_setfield_ignores_immutable_and_plain_fields() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Function".to_string(),
+            vec![("name".to_string(), ImmutableRank::Immutable)],
+        );
+
+        let mut graph = FunctionGraph::new("function_set_name_obj");
+        let inst = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "func".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let name = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "name".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let w_name = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "w_name".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: inst.clone(),
+                field: FieldDescriptor::new("name", Some("Function".to_string())),
+                value: LinkArg::from(name),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: inst,
+                field: FieldDescriptor::new("w_name", Some("Function".to_string())),
+                value: LinkArg::from(w_name),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        assert!(
+            !ops.iter()
+                .any(|k| matches!(k, OpKind::JitForceQuasiImmutable { .. })),
+            "Immutable / undeclared stores must not emit the force, got {ops:?}"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|k| matches!(k, OpKind::FieldWrite { .. }))
+                .count(),
+            2,
+            "both stores must remain, got {ops:?}"
+        );
+    }
+
+    /// A raw/int-kind owner still gets the force; owner comes from the field
+    /// descriptor, not `ptr_struct_owner_root`. The assembler key `/id` is
+    /// covered by `assembles_jit_force_quasi_immutable_id` (commit 17cd75beafc).
+    #[test]
+    fn hook_setfield_raw_owner_int_base() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ImmutableRank};
+
+        let mut cc = CallControl::new();
+        cc.immutable_fields_by_struct.insert(
+            "Function".to_string(),
+            vec![("code".to_string(), ImmutableRank::QuasiImmutable)],
+        );
+
+        let mut graph = FunctionGraph::new("force_qmut_raw");
+        let inst = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "owner".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(
+            &inst,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let code = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "code".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldWrite {
+                base: inst.clone(),
+                field: FieldDescriptor::new("code", Some("Function".to_string())),
+                value: LinkArg::from(code),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let result = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live { .. }))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { base, mutate_field, .. }
+                    if matches!(base, LinkArg::Value(v) if v == &inst)
+                        && mutate_field.name == "mutate_code"
+                        && mutate_field.owner_root.as_deref() == Some("Function")
+            ),
+            "int-kind base must still emit JitForceQuasiImmutable mutate_code/Function, got {ops:?}"
+        );
+        assert!(
+            matches!(
+                ops[live_idx + 2],
+                OpKind::FieldWrite { field, .. } if field.name == "code"
+            ),
+            "expected the setfield after the force, got {ops:?}"
+        );
     }
 
     #[test]

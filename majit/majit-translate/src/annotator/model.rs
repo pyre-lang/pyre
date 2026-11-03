@@ -295,9 +295,9 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 
 /// True when two `ClassDef` name strings denote ONE struct reached by two
 /// frontend name spellings: a dot-joined crate-included constructor qualname
-/// (`pyre_object.celldict.VersionTag`, the flowspace_adapter
+/// (`pyre_object.celldict.StrKey`, the flowspace_adapter
 /// `SyntheticTransparentCtor` arm) vs the crate-stripped `::` field-read
-/// spelling (`celldict::VersionTag`).  Pyre has no single class object to key
+/// spelling (`celldict::StrKey`).  Pyre has no single class object to key
 /// identity on, so a non-header leaf struct minted from both spellings becomes
 /// two distinct base-less `ClassDef`s and `ClassDef::commonbase` finds no
 /// shared base — the union then fails "no common base class" even though it is

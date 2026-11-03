@@ -1848,9 +1848,10 @@ pub enum OpKind {
     /// with `descr1 = fielddescrof(STRUCT, 'mutate_' + name)`.
     /// `v_inst` is an `AbstractValue` — a `Variable` (register operand) or a
     /// `Constant` (prebuilt instance).  `LinkArg::Value`/`Const` mirrors that
-    /// union so a Constant ref stays inline as a pooled `r` operand
+    /// union so a Constant stays inline as a pooled operand
     /// (`assembler.py` `emit_const`) instead of being hoisted into a
-    /// register; the opcode key stays `jit_force_quasi_immutable/rd`.
+    /// register. The opcode key is `jit_force_quasi_immutable/rd` for a
+    /// GC owner and `/id` for a raw address (`getkind` Signed / non-GC ptr).
     JitForceQuasiImmutable {
         base: crate::model::LinkArg,
         mutate_field: FieldDescriptor,

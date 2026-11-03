@@ -430,24 +430,50 @@ pub unsafe fn get_float_value_direct(ptr: *const JitFrame, slot: usize) -> u64 {
 /// (symbolic.py:78 "does not contain Float ^^^ which must be
 /// special-cased") and go through [`write_float_at_mem`].
 ///
+/// `release` selects `AtomicU*::from_ptr(..).store(Release)` at the
+/// field width. Release stores require a naturally aligned address.
+///
 /// # Safety
-/// `base + ofs` must be a writable field of at least `size` bytes.
-pub unsafe fn write_int_at_mem(base: usize, ofs: usize, size: usize, newvalue: i64) {
+/// `base + ofs` must be a writable field of at least `size` bytes. When
+/// `release` is true, the address is naturally aligned and every read
+/// of that field is an atomic load of the same width.
+pub unsafe fn write_int_at_mem(base: usize, ofs: usize, size: usize, newvalue: i64, release: bool) {
     let addr = base.wrapping_add(ofs);
     // Truncation is width-identical for the signed and unsigned member of
     // each `unroll_basic_sizes` pair, so the store needs the size but not
     // the sign — which is why upstream discards it (`_` at llmodel.py:482)
     // while the matching read keeps it.
     unsafe {
-        match size {
-            1 => (addr as *mut u8).write_unaligned(newvalue as u8),
-            2 => (addr as *mut u16).write_unaligned(newvalue as u16),
-            4 => (addr as *mut u32).write_unaligned(newvalue as u32),
-            8 => (addr as *mut i64).write_unaligned(newvalue),
-            _ => panic!(
-                "write_int_at_mem: unsupported size {size} \
-                 (llmodel.py:488 NotImplementedError)"
-            ),
+        if release {
+            debug_assert!(
+                size > 0 && addr % size == 0,
+                "release integer store requires natural alignment: addr={addr:#x} size={size}"
+            );
+            use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+            match size {
+                1 => AtomicU8::from_ptr(addr as *mut u8).store(newvalue as u8, Ordering::Release),
+                2 => {
+                    AtomicU16::from_ptr(addr as *mut u16).store(newvalue as u16, Ordering::Release)
+                }
+                4 => {
+                    AtomicU32::from_ptr(addr as *mut u32).store(newvalue as u32, Ordering::Release)
+                }
+                8 => {
+                    AtomicU64::from_ptr(addr as *mut u64).store(newvalue as u64, Ordering::Release)
+                }
+                other => panic!("write_int_at_mem: unsupported release size {other}"),
+            }
+        } else {
+            match size {
+                1 => (addr as *mut u8).write_unaligned(newvalue as u8),
+                2 => (addr as *mut u16).write_unaligned(newvalue as u16),
+                4 => (addr as *mut u32).write_unaligned(newvalue as u32),
+                8 => (addr as *mut i64).write_unaligned(newvalue),
+                _ => panic!(
+                    "write_int_at_mem: unsupported size {size} \
+                     (llmodel.py:488 NotImplementedError)"
+                ),
+            }
         }
     }
 }
@@ -463,12 +489,26 @@ pub unsafe fn write_int_at_mem(base: usize, ofs: usize, size: usize, newvalue: i
 /// above" — implied by the `llop.raw_store` that the framework GC
 /// transformer rewrites. Nothing rewrites this store, so a caller whose
 /// container may be old-generation while `newvalue` is young owes the
-/// barrier itself.
+/// barrier itself. A Release pointer store still owes that barrier
+/// *before* the store: the card is marked, then the pointer is
+/// published.
+///
+/// `release` selects `AtomicPtr::from_ptr(..).store(Release)`.
 ///
 /// # Safety
-/// `base + ofs` must be a writable pointer-width field.
-pub unsafe fn write_ref_at_mem(base: usize, ofs: usize, newvalue: usize) {
-    unsafe { (base.wrapping_add(ofs) as *mut usize).write_unaligned(newvalue) }
+/// `base + ofs` must be a writable pointer-width field. When `release`
+/// is true, the address is naturally aligned and every write of that
+/// field is an atomic pointer store.
+pub unsafe fn write_ref_at_mem(base: usize, ofs: usize, newvalue: usize, release: bool) {
+    let addr = base.wrapping_add(ofs);
+    unsafe {
+        if release {
+            std::sync::atomic::AtomicPtr::<()>::from_ptr(addr as *mut *mut ())
+                .store(newvalue as *mut (), std::sync::atomic::Ordering::Release);
+        } else {
+            (addr as *mut usize).write_unaligned(newvalue);
+        }
+    }
 }
 
 /// Pointer-width load at an aligned address.
@@ -818,6 +858,46 @@ mod tests {
     use crate::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
     use crate::resume_guard_descr::make_resume_guard_descr_typed;
     use majit_ir::Type;
+
+    #[test]
+    fn release_write_int_round_trips_with_acquire_read() {
+        #[repr(C, align(8))]
+        struct Slot {
+            value: u64,
+        }
+        let mut slot = Slot { value: 0 };
+        let base = (&mut slot as *mut Slot) as usize;
+        unsafe {
+            super::write_int_at_mem(base, 0, 8, 0x1122_3344_5566_7788u64 as i64, true);
+            assert_eq!(
+                super::read_int_at_mem(base, 0, 8, false, true),
+                0x1122_3344_5566_7788u64 as i64
+            );
+            super::write_int_at_mem(base, 0, 8, 7, false);
+            assert_eq!(super::read_int_at_mem(base, 0, 8, false, false), 7);
+            super::write_int_at_mem(base, 0, 4, 0xAABB_CCDDu32 as i64, true);
+            assert_eq!(
+                super::read_int_at_mem(base, 0, 4, false, true) as u32,
+                0xAABB_CCDD
+            );
+        }
+    }
+
+    #[test]
+    fn release_write_ref_round_trips_with_acquire_read() {
+        #[repr(C, align(8))]
+        struct Slot {
+            value: usize,
+        }
+        let mut slot = Slot { value: 0 };
+        let base = (&mut slot as *mut Slot) as usize;
+        unsafe {
+            super::write_ref_at_mem(base, 0, 0xABCD, true);
+            assert_eq!(super::read_ref_at_mem(base, true), 0xABCD);
+            super::write_ref_at_mem(base, 0, 1, false);
+            assert_eq!(super::read_ref_at_mem(base, false), 1);
+        }
+    }
 
     #[test]
     fn sized_float_load_store_does_not_touch_neighbor() {

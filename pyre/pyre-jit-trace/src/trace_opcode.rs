@@ -2093,11 +2093,10 @@ impl MIFrame {
         }
     }
 
-    /// TODO: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
-    /// construction (`greenboxes + redboxes + virtualizable_boxes`,
-    /// `pop()` the trailing token) with the `vable_last_instr` pin
-    /// (`pyjitpl.py:2973`). RPython performs both inline within
-    /// `reached_loop_header`; pyre extracts them because pyre's "args"
+    /// TODO: bundles `pyjitpl.py` `live_arg_boxes` construction
+    /// (`greenboxes + redboxes + virtualizable_boxes`, `pop()` the
+    /// trailing token). RPython performs it inline within
+    /// `reached_loop_header`; pyre extracts it because pyre's "args"
     /// are `OpRef`s pulled from the unified `registers_r` register
     /// file, and the merge `target_pc` must be threaded through
     /// explicitly (RPython has it implicitly in `redboxes`).
@@ -2196,36 +2195,10 @@ impl MIFrame {
             }
         }
         self.flush_to_frame(ctx);
-        // pyjitpl.py reached_loop_header: a merge-point resume enters
-        // the target loop at `pc`, so last_instr must be `pc - 1` so the
-        // interpreter's `next_instr() = last_instr + 1` returns the merge
-        // point. flush_to_frame already stored `orgpc - 1`; override with
-        // the merge target.
-        //
-        // Propagation gap #1: propagate the override
-        // into the virtualizable_boxes shadow so the writeback below
-        // emits the merge-target PC, not the orgpc placed by
-        // flush_to_frame. virtualizable_boxes[0] = vable_last_instr per
-        // `virtualizable_gen.rs`'s `inputargs` ordering.
-        if let Some(pc) = target_pc {
-            let last_instr_value = pc as i64 - 1;
-            let opref = ctx.const_int(last_instr_value);
-            {
-                let s = self.sym_mut();
-                s.vable_last_instr = opref;
-            }
-            // `interp_jit.py` `jump_absolute` writes `self.last_instr =
-            // intmask(jumpto)` before `can_enter_jit`. On a virtualizable
-            // that is `_opimpl_setfield_vable` / `synchronize_virtualizable`,
-            // so `virtualizable_boxes[0]` already holds the header pc when
-            // `reached_loop_header` concatenates it. The walker records that
-            // store in `setfield_vable_via_metainterp`; this pin is the same
-            // write for the source-level close, including traces whose
-            // `owns_virtualizable_shadow` gate would otherwise leave the
-            // shadow on the pre-pin box. Snapshot capture still
-            // save/restores the boxes.
-            mirror_vable_static_to_boxes(ctx, "last_instr", opref, Value::Int(last_instr_value));
-        }
+        // `pyjitpl.py MetaInterp.reached_loop_header` concatenates
+        // `virtualizable_boxes` as they stand. `interp_jit.py`
+        // `PyFrame.jump_absolute` already stored `self.last_instr =
+        // intmask(jumpto)` (`_opimpl_setfield_vable`).
         // JUMP reads STANDARD `valuestackdepth` from
         // `virtualizable_boxes` (`virtualizable.py extra_box_names`),
         // not the live frame. `close_merge_point_vsd` already chose the
@@ -2862,20 +2835,18 @@ impl MIFrame {
                 | OpCode::GuardAlwaysFails
         );
         if after_residual_call {
-            // pyjitpl.py:2586-2602: residual-call guards snapshot the state
-            // AFTER the call, using the auto-advanced pc and post-call
-            // register file. The opcode-start snapshot is only for
-            // re-executing the current opcode from orgpc.
+            // Residual-call guards snapshot the state after the call in the
+            // jitcode (`MIFrame.pc` at the trailing `-live-`). The Python
+            // opcode is unchanged: the residual returns into the same opcode.
             self.clear_pre_opcode_state();
         }
-        // pyjitpl.py capture_resumedata(resumepc) parity:
+        // `capture_resumedata(resumepc)` (`pyjitpl.py`):
         // Normal guards: resumepc = orgpc (re-execute the opcode from start).
         // after_residual_call guards (GUARD_NOT_FORCED, GUARD_NO_EXCEPTION):
-        //   RPython generate_guard passes resumepc=-1, and capture_resumedata
-        //   skips the "frame.pc = resumepc" assignment — frame.pc stays at
-        //   the auto-advanced next instruction (pyre fallthrough_pc equivalent).
-        //   This ensures the liveness PC, header ni, and blackhole resume PC
-        //   all point to the instruction AFTER the call, not the call itself.
+        //   `generate_guard` passes resumepc=-1, and `capture_resumedata`
+        //   skips `frame.pc = resumepc` — `MIFrame.pc` stays at the trailing
+        //   `-live-` after the residual (`jtransform.py handle_residual_call`).
+        //   That is a jitcode offset, not a Python-opcode advance.
         let resume_pc = if after_residual_call {
             self.fallthrough_pc
         } else {

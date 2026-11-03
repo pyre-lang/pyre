@@ -2241,7 +2241,7 @@ fn cast_instance_intrinsic(
     }
     // A pointer to a declared-Raw ADT is an int-bank `SomePtr`. Retargeting
     // `*mut A as *mut B` must replace that pointee, not mint a GC instance.
-    // A by-value operand (`push_roots()` → `RootScope`, `VersionTag`) is
+    // A by-value operand (`push_roots()` → `RootScope`, `StrKey`) is
     // the same raw ADT: FieldRead already projects SomePtr
     // (`project_struct_field_type`), and `llannotation.py`
     // `pairtype(SomePtr, SomeObject).union` refuses Instance ∪ Ptr.

@@ -105,7 +105,7 @@ pub const W_OBJECT_OBJECT_GC_TYPE_ID: u32 = 53;
 /// (`typedef.py` `_getusercls(W_ObjectObject)`). Same size and
 /// `object_object_custom_trace` as [`W_OBJECT_OBJECT_GC_TYPE_ID`];
 /// that id is the parent.
-pub const W_OBJECT_OBJECT_USER_GC_TYPE_ID: u32 = 217;
+pub const W_OBJECT_OBJECT_USER_GC_TYPE_ID: u32 = 218;
 
 impl crate::lltype::GcType for W_ObjectObject {
     fn type_id() -> u32 {

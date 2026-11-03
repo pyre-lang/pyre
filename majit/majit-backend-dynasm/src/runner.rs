@@ -2140,17 +2140,18 @@ impl DynasmBackend {
     }
 
     /// llmodel.py write_int_at_mem(gcref, ofs, size, newvalue).
-    fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
-        let Some(ptr) = Self::raw_mem_ptr(addr, offset) else {
+    fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64, release: bool) {
+        let Some(_) = Self::raw_mem_ptr(addr, offset) else {
             return;
         };
         unsafe {
-            match size {
-                1 => (ptr as *mut u8).write_unaligned(newvalue as u8),
-                2 => (ptr as *mut u16).write_unaligned(newvalue as u16),
-                4 => (ptr as *mut u32).write_unaligned(newvalue as u32),
-                _ => (ptr as *mut i64).write_unaligned(newvalue),
-            }
+            majit_backend::llmodel::write_int_at_mem(
+                addr as usize,
+                offset as usize,
+                size,
+                newvalue,
+                release,
+            )
         }
     }
 
@@ -4383,7 +4384,7 @@ impl Backend for DynasmBackend {
         // ofs == 0 always for raw lengthless arrays (llmodel.py assert)
         let size = descr.as_itemsize();
         // llmodel.py: self.write_int_at_mem(addr, offset, size, newvalue)
-        self.write_int_at_mem(addr, offset, size, newvalue);
+        self.write_int_at_mem(addr, offset, size, newvalue, false);
     }
 
     /// llmodel.py bh_raw_load_f(addr, offset, descr).
@@ -4439,7 +4440,13 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_jitcode::jitcode::BhDescr,
     ) {
         let (offset, size, _sign) = fielddescr.unpack_fielddescr_size();
-        self.write_int_at_mem(struct_ptr, offset as i64, size, value);
+        self.write_int_at_mem(
+            struct_ptr,
+            offset as i64,
+            size,
+            value,
+            fielddescr.store_is_release(),
+        );
     }
 
     fn bh_setfield_gc_r(
@@ -4457,8 +4464,16 @@ impl Backend for DynasmBackend {
         // barrier (see bh_setarrayitem_gc_r). Without it, a young value
         // stored into an old managed struct is not remembered and the next
         // minor collection can free it while still referenced.
+        // Barrier first, then the (possibly Release) store publishes.
         dynasm_write_barrier_if_managed(struct_ptr as u64);
-        unsafe { *((struct_ptr as *mut u8).add(offset) as *mut usize) = value.0 };
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(
+                struct_ptr as usize,
+                offset,
+                value.0,
+                fielddescr.store_is_release(),
+            )
+        };
     }
 
     /// llmodel.py bh_getarrayitem_gc_i: ofs=base_size, size+sign
@@ -4531,7 +4546,7 @@ impl Backend for DynasmBackend {
     ) {
         let (base_size, itemsize, _sign) = arraydescr.unpack_arraydescr_size();
         let offset = (base_size as i64) + index * (itemsize as i64);
-        self.write_int_at_mem(array_ptr, offset, itemsize, newvalue);
+        self.write_int_at_mem(array_ptr, offset, itemsize, newvalue, false);
     }
 
     /// llmodel.py bh_setarrayitem_gc_r.
@@ -4586,7 +4601,7 @@ impl Backend for DynasmBackend {
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
         let (foff, fsize, _) = field.unpack_fielddescr_size();
         let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
-        self.write_int_at_mem(array_ptr, offset, fsize, newvalue);
+        self.write_int_at_mem(array_ptr, offset, fsize, newvalue, field.store_is_release());
     }
 
     /// llmodel.py bh_setinteriorfield_gc_r.  Pointer-typed
@@ -4604,13 +4619,16 @@ impl Backend for DynasmBackend {
         let (base_size, itemsize, _) = array.unpack_arraydescr_size();
         let (foff, _, _) = field.unpack_fielddescr_size();
         let offset = (base_size as i64) + (foff as i64) + index * (itemsize as i64);
-        unsafe {
-            *((array_ptr as *mut u8).offset(offset as isize) as *mut usize) = newvalue.0;
-        }
-        // Blackhole store — no inline TRACK_YOUNG_PTRS test precedes this
-        // call, so use the managed-guarded flag-checking barrier (see
-        // bh_setarrayitem_gc_r).
+        // Barrier first, then the (possibly Release) store publishes.
         dynasm_write_barrier_if_managed(array_ptr as u64);
+        unsafe {
+            majit_backend::llmodel::write_ref_at_mem(
+                array_ptr as usize,
+                offset as usize,
+                newvalue.0,
+                field.store_is_release(),
+            )
+        };
     }
 
     /// llmodel.py bh_setinteriorfield_gc_f.  Float-typed interior

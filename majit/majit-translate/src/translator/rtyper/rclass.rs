@@ -23,7 +23,10 @@
 //!   bookkeeper `memory_pressure_types`. `_check_for_immutable_hints`
 //!   copies `classdesc.immutable_fields` onto `immutable_field_set`;
 //!   `_setup_repr` appends `mutate_<name>` `OBJECTPTR` fields for
-//!   quasi-immutable attrs.
+//!   quasi-immutable attrs. A native `mutate_<q>` is that watcher slot
+//!   only when it is not readonly, `<q>` is a non-readonly
+//!   quasi-immutable attr, and its type is a pointer to the
+//!   `QuasiImmut` struct.
 //!
 //! Phase R3 landed (`ClassRepr.init_vtable` at [`ClassRepr::init_vtable`]
 //! line 838, `fill_vtable_root` at [`ClassRepr::fill_vtable_root`] line
@@ -2404,7 +2407,12 @@ impl Repr for RootClassRepr {
 /// rbase.object_type)`. `_setup_repr` copies
 /// `classdesc.immutable_fields` onto `immutable_field_set` and
 /// appends `mutate_<name>` `OBJECTPTR` fields for quasi-immutable
-/// attrs (rclass.py). `special_memory_pressure` remains R2-D.
+/// attrs (`InstanceRepr._setup_repr`). A native `mutate_<q>` occupies
+/// that slot only when it is not readonly, `<q>` is a non-readonly
+/// quasi-immutable attr, and its type is a pointer to the
+/// `QuasiImmut` struct; every other `mutate_*` attr is mangled
+/// `inst_<name>` and does not suppress the hidden OBJECTPTR append.
+/// `special_memory_pressure` remains R2-D.
 #[derive(Debug)]
 pub struct InstanceRepr {
     /// RPython `self.rtyper = rtyper` (rclass.py:469).
@@ -3598,6 +3606,43 @@ fn build_instance_types(
     }
 }
 
+/// True when a native attr is the hidden watcher slot
+/// `InstanceRepr._setup_repr` would append as `('mutate_' + name, OBJECTPTR)`.
+///
+/// `AtomicPtr<quasiimmut::QuasiImmut>` projects as `*mut QuasiImmut`
+/// (`project_struct_field_type` peels `AtomicPtr<T>` to `*mut T`, same
+/// as `atomic_ptr_projects_as_pointer_not_payload`). The watcher type
+/// is a pointer to the struct whose leaf name is `QuasiImmut` (or a
+/// `::` / `.` qualname of that leaf). A mere pointer (`OBJECTPTR`,
+/// `AtomicPtr<Other>`) is an ordinary instance attr.
+fn is_native_quasi_immut_watcher(s_value: &SomeValue, lowleveltype: &LowLevelType) -> bool {
+    let LowLevelType::Ptr(ptr) = lowleveltype else {
+        return false;
+    };
+    let pointee_name = |target: &PtrTarget| -> Option<String> {
+        match target {
+            PtrTarget::Struct(st) => Some(st._name.clone()),
+            PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+                Some(LowLevelType::Struct(st)) => Some(st._name.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let name = match s_value {
+        SomeValue::Ptr(p) => pointee_name(&p.ll_ptrtype.TO),
+        SomeValue::Instance(inst) => inst.classdef.as_ref().map(|cd| cd.borrow().name.clone()),
+        _ => None,
+    }
+    .or_else(|| pointee_name(&ptr.TO));
+    name.is_some_and(|n| {
+        n.rsplit([':', '.'])
+            .find(|s| !s.is_empty())
+            .unwrap_or(n.as_str())
+            == "QuasiImmut"
+    })
+}
+
 impl Repr for InstanceRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lowleveltype
@@ -4475,20 +4520,12 @@ impl Repr for InstanceRepr {
                 .map(|(k, v)| (k.clone(), (v.s_value.clone(), v.readonly)))
                 .collect::<BTreeMap<String, (SomeValue, bool)>>()
         };
-        for (attr_name, (s_value, readonly)) in &attrs_sorted {
-            if *readonly {
-                continue;
-            }
-            let r = rtyper.getrepr(s_value)?;
-            let mangled_name = format!("inst_{attr_name}");
-            fields.insert(attr_name.clone(), (mangled_name.clone(), r.clone()));
-            myllfields.push((mangled_name, r.lowleveltype().clone()));
-        }
-        sort_llfields(&mut myllfields);
 
         // rclass.py — `self.rbase = getinstancerepr(
         // self.rtyper, self.classdef.basedef, self.gcflavor);
         // self.rbase.setup()`.
+        // `is_quasi_immutable` walks `rbase`, so the parent chain is
+        // stored before the attr mangle loop uses that test.
         let basedef = classdef_rc.borrow().basedef.clone();
         let rbase = getinstancerepr(&rtyper, basedef.as_ref(), self.gcflavor)?;
         Repr::setup(rbase.as_ref())?;
@@ -4502,6 +4539,39 @@ impl Repr for InstanceRepr {
             .borrow()
             .immutable_fields
             .clone();
+
+        let arc_self = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+        // q names whose native `mutate_<q>` is the watcher slot: not
+        // readonly, `<q>` is a non-readonly quasi-immutable attr, and
+        // the declared type is a pointer to `QuasiImmut`
+        // (`InstanceRepr._setup_repr`). Local to this setup, not a field.
+        let mut native_mutate_watchers: HashSet<String> = HashSet::new();
+        for (attr_name, (s_value, readonly)) in &attrs_sorted {
+            if *readonly {
+                continue;
+            }
+            let r = rtyper.getrepr(s_value)?;
+            let native_q = attr_name.strip_prefix("mutate_").and_then(|q| {
+                let is_watcher = attrs_sorted
+                    .get(q)
+                    .is_some_and(|(_, q_readonly)| !*q_readonly)
+                    && arc_self.is_quasi_immutable(q)
+                    && is_native_quasi_immut_watcher(s_value, r.lowleveltype());
+                is_watcher.then_some(q.to_string())
+            });
+            let ll_name = if let Some(q) = native_q {
+                // Native `mutate_<q>` is the hidden watcher: keep the
+                // unmangled name and the native type
+                // (`AtomicPtr<QuasiImmut>` / `*mut QuasiImmut`).
+                native_mutate_watchers.insert(q);
+                attr_name.clone()
+            } else {
+                format!("inst_{attr_name}")
+            };
+            fields.insert(attr_name.clone(), (ll_name.clone(), r.clone()));
+            myllfields.push((ll_name, r.lowleveltype().clone()));
+        }
+        sort_llfields(&mut myllfields);
 
         // rclass.py:548-554 — `object_type = MkStruct(classdef.name,
         // ('super', rbase.object_type), hints=hints, adtmeths=adtmeths,
@@ -4519,10 +4589,18 @@ impl Repr for InstanceRepr {
         // rclass.py — `for name, attrdef in attrs:
         //     if not attrdef.readonly and self.is_quasi_immutable(name):
         //         llfields.append(('mutate_' + name, OBJECTPTR))`.
-        let arc_self = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+        // Skip the OBJECTPTR append only when a native `mutate_<q>` was
+        // recognized as the watcher (not readonly, `<q>` quasi-immutable,
+        // pointer to `QuasiImmut`). A readonly or wrongly typed
+        // `mutate_<q>` is mangled `inst_mutate_<q>` and does not suppress
+        // this hidden slot (`InstanceRepr._setup_repr`).
         for (attr_name, (_s_value, readonly)) in &attrs_sorted {
             if !*readonly && arc_self.is_quasi_immutable(attr_name) {
-                myllfields.push((format!("mutate_{attr_name}"), OBJECTPTR.clone()));
+                if native_mutate_watchers.contains(attr_name) {
+                    continue;
+                }
+                let mutate_name = format!("mutate_{attr_name}");
+                myllfields.push((mutate_name, OBJECTPTR.clone()));
             }
         }
         // `_parse_field_list` reads `self.fields`. Store them before
@@ -7246,6 +7324,22 @@ mod tests {
         classdef.borrow_mut().attrs.insert(name.to_string(), attr);
     }
 
+    /// `AtomicPtr<quasiimmut::QuasiImmut>` after
+    /// `project_struct_field_type` peels `AtomicPtr<T>` to `*mut T`.
+    fn quasi_immut_watcher_s_value() -> SomeValue {
+        use crate::annotator::model::SomePtr;
+        SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new("QuasiImmut", vec![])),
+        }))
+    }
+
+    fn watcher_lowleveltype(s_value: &SomeValue) -> LowLevelType {
+        let SomeValue::Ptr(p) = s_value else {
+            panic!("watcher s_value is SomePtr");
+        };
+        LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()))
+    }
+
     #[test]
     fn classrepr_setup_populates_clsfields_for_readonly_attrs() {
         use crate::annotator::model::SomeInteger;
@@ -7417,6 +7511,214 @@ mod tests {
             body._flds.get("mutate_w_qualname").cloned(),
             Some(OBJECTPTR.clone())
         );
+    }
+
+    #[test]
+    fn instance_repr_setup_lays_native_mutate_attr_out_as_the_mutate_field() {
+        use crate::annotator::model::SomeInteger;
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("Function", None);
+        attach_attr(
+            &classdef,
+            "w_qualname",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        let watcher = quasi_immut_watcher_s_value();
+        let watcher_ll = watcher_lowleveltype(&watcher);
+        attach_attr(&classdef, "mutate_w_qualname", watcher, false);
+        classdef
+            .borrow()
+            .classdesc
+            .borrow_mut()
+            .immutable_fields
+            .insert("w_qualname?".to_string());
+
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type is ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("object_type resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type resolves to Struct");
+        };
+        assert!(
+            body._flds.get("mutate_w_qualname").is_some(),
+            "native mutate_<name> occupies the canonical name; names={:?}",
+            body._names
+        );
+        assert!(
+            body._flds.get("inst_mutate_w_qualname").is_none(),
+            "native mutate_<name> is not mangled; names={:?}",
+            body._names
+        );
+        assert_eq!(
+            body._flds.get("mutate_w_qualname").cloned(),
+            Some(watcher_ll),
+            "native mutate slot keeps the attached attr's lowleveltype"
+        );
+        let mutate_slot_names: Vec<&String> = body
+            ._names
+            .iter()
+            .filter(|n| n.contains("mutate_w_qualname"))
+            .collect();
+        assert_eq!(
+            mutate_slot_names,
+            vec!["mutate_w_qualname"],
+            "exactly one mutate-slot field"
+        );
+        assert_eq!(
+            repr.fields()
+                .get("mutate_w_qualname")
+                .map(|(n, _)| n.as_str()),
+            Some("mutate_w_qualname"),
+        );
+    }
+
+    #[test]
+    fn instance_repr_setup_mangles_signed_mutate_attr_and_appends_hidden_objectptr() {
+        use crate::annotator::model::SomeInteger;
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("Host", None);
+        attach_attr(
+            &classdef,
+            "f",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        attach_attr(
+            &classdef,
+            "mutate_f",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        classdef
+            .borrow()
+            .classdesc
+            .borrow_mut()
+            .immutable_fields
+            .insert("f?".to_string());
+
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type is ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("object_type resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type resolves to Struct");
+        };
+        assert_eq!(
+            body._flds.get("inst_mutate_f").cloned(),
+            Some(LowLevelType::Signed),
+            "ordinary Signed mutate_f is mangled inst_mutate_f; names={:?}",
+            body._names
+        );
+        assert_eq!(
+            body._flds.get("mutate_f").cloned(),
+            Some(OBJECTPTR.clone()),
+            "hidden mutate_f OBJECTPTR is still appended; names={:?}",
+            body._names
+        );
+        assert_eq!(
+            repr.fields().get("mutate_f").map(|(n, _)| n.as_str()),
+            Some("inst_mutate_f"),
+        );
+    }
+
+    #[test]
+    fn instance_repr_setup_readonly_mutate_attr_does_not_suppress_hidden_objectptr() {
+        use crate::annotator::model::SomeInteger;
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("Host", None);
+        attach_attr(
+            &classdef,
+            "f",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        attach_attr(
+            &classdef,
+            "mutate_f",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            true,
+        );
+        classdef
+            .borrow()
+            .classdesc
+            .borrow_mut()
+            .immutable_fields
+            .insert("f?".to_string());
+
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(repr.as_ref()).expect("setup");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type is ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("object_type resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type resolves to Struct");
+        };
+        assert!(
+            body._flds.get("inst_mutate_f").is_none(),
+            "readonly mutate_f is skipped in the instance-attr loop; names={:?}",
+            body._names
+        );
+        assert_eq!(
+            body._flds.get("mutate_f").cloned(),
+            Some(OBJECTPTR.clone()),
+            "readonly mutate_f does not suppress hidden mutate_f OBJECTPTR; names={:?}",
+            body._names
+        );
+        assert!(
+            repr.fields().get("mutate_f").is_none(),
+            "readonly mutate_f is not an instance field"
+        );
+    }
+
+    #[test]
+    fn is_native_quasi_immut_watcher_requires_pointer_to_quasi_immut_struct() {
+        use crate::annotator::model::{SomeInstance, SomeInteger, SomePtr};
+
+        let s_int = SomeValue::Integer(SomeInteger::new(false, false));
+        assert!(!is_native_quasi_immut_watcher(
+            &s_int,
+            &LowLevelType::Signed
+        ));
+
+        let object_ptr = Ptr {
+            TO: PtrTarget::Struct(Struct::new("object", vec![])),
+        };
+        let s_object = SomeValue::Ptr(SomePtr::new(object_ptr.clone()));
+        let object_ll = LowLevelType::Ptr(Box::new(object_ptr));
+        assert!(!is_native_quasi_immut_watcher(&s_object, &object_ll));
+
+        let watcher = quasi_immut_watcher_s_value();
+        let watcher_ll = watcher_lowleveltype(&watcher);
+        assert!(is_native_quasi_immut_watcher(&watcher, &watcher_ll));
+
+        let qualified = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new("pyre_object::quasiimmut::QuasiImmut", vec![])),
+        }));
+        let qualified_ll = watcher_lowleveltype(&qualified);
+        assert!(is_native_quasi_immut_watcher(&qualified, &qualified_ll));
+
+        let lock = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new("QuasiImmutLock", vec![])),
+        }));
+        let lock_ll = watcher_lowleveltype(&lock);
+        assert!(!is_native_quasi_immut_watcher(&lock, &lock_ll));
+
+        let classdef = ClassDef::new_standalone("quasiimmut::QuasiImmut", None);
+        let s_inst =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), true, Default::default()));
+        let rtyper = fresh_rtyper();
+        let r = rtyper.getrepr(&s_inst).expect("InstanceRepr of QuasiImmut");
+        assert!(is_native_quasi_immut_watcher(&s_inst, r.lowleveltype()));
     }
 
     #[test]

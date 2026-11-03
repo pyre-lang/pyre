@@ -17068,17 +17068,32 @@ impl CodeWriter {
             pcdep_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             const_ref_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_trivia_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            // Op-start tier: predecessor scan, markers EXCLUDED. Dedup on the
+            // Op-start tier: predecessor scan, markers EXCLUDED from this
+            // map (they live in the exact-match marker tables). Dedup on the
             // jitcode offset (later py wins, matching `by_off`): a run of
             // trivia py_pcs collapses onto one jitcode offset, so direct-push
             // left duplicate offsets whose binary-search winner depended on
             // unstable-sort order. `BTreeMap` yields one offset-sorted entry
             // per offset; duplicates share `skip_python_trivia_forward`'s
             // target, so the surviving values are unchanged.
+            //
+            // Keys are `py_exact_by_jit_pc` emission runs, not
+            // `first_jit_pc_by_py_pc`. A block the flatten appends after the
+            // body keeps its own run start, so a predecessor lookup of a
+            // late-arm byte names that opcode rather than whichever PC last
+            // opened a first-offset floor segment. `depth_trivia` /
+            // `after_residual_*` share this map so a late-arm guard's vsd
+            // and fallthrough marker stay on the emitting opcode.
             let mut pred_by_off: BTreeMap<usize, usize> = BTreeMap::new();
-            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
-                if pos != usize::MAX {
-                    pred_by_off.insert(pos, py);
+            if py_exact_by_jit_pc.is_empty() {
+                for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
+                    if pos != usize::MAX {
+                        pred_by_off.insert(pos, py);
+                    }
+                }
+            } else {
+                for &(off, py) in &py_exact_by_jit_pc {
+                    pred_by_off.insert(off as usize, py as usize);
                 }
             }
             for (&pos, &py) in pred_by_off.iter() {
@@ -17153,22 +17168,20 @@ impl CodeWriter {
             result_color_after_residual_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             depth_after_residual_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             after_residual_fallthrough_py_pc_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            // Op-start tier: predecessor scan, markers EXCLUDED.
-            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
-                if pos != usize::MAX {
-                    let sk = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
-                    let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
-                    let value = first_jit_pc_by_py_pc
-                        .get(ft)
-                        .and_then(|_| resolve_marker(ft));
-                    after_residual_marker_pred_by_jit_pc.push((pos, value));
-                    let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
-                    result_color_after_residual_pred_by_jit_pc
-                        .push((pos, result_color_at_pc.get(ft_rc).copied()));
-                    depth_after_residual_pred_by_jit_pc
-                        .push((pos, static_depth.get(ft_rc).copied()));
-                    after_residual_fallthrough_py_pc_pred_by_jit_pc.push((pos, ft_rc as u32));
-                }
+            // Op-start tier: predecessor scan, markers EXCLUDED. Same
+            // exact-run keys as the trivia / forward pred twins above.
+            for (&pos, &py) in pred_by_off.iter() {
+                let sk = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
+                let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
+                let value = first_jit_pc_by_py_pc
+                    .get(ft)
+                    .and_then(|_| resolve_marker(ft));
+                after_residual_marker_pred_by_jit_pc.push((pos, value));
+                let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
+                result_color_after_residual_pred_by_jit_pc
+                    .push((pos, result_color_at_pc.get(ft_rc).copied()));
+                depth_after_residual_pred_by_jit_pc.push((pos, static_depth.get(ft_rc).copied()));
+                after_residual_fallthrough_py_pc_pred_by_jit_pc.push((pos, ft_rc as u32));
             }
             after_residual_marker_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
             result_color_after_residual_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
@@ -17189,11 +17202,9 @@ impl CodeWriter {
                     .push((off, after_residual_call_resume_for_py(py as usize)));
             }
             after_residual_call_resume_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
-            for (py, &pos) in first_jit_pc_by_py_pc.iter().enumerate() {
-                if pos != usize::MAX {
-                    after_residual_call_resume_pred_by_jit_pc
-                        .push((pos, after_residual_call_resume_for_py(py)));
-                }
+            for (&pos, &py) in pred_by_off.iter() {
+                after_residual_call_resume_pred_by_jit_pc
+                    .push((pos, after_residual_call_resume_for_py(py)));
             }
             after_residual_call_resume_pred_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
         }

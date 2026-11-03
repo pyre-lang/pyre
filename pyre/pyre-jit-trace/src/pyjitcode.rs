@@ -86,8 +86,11 @@ pub struct PyJitCodeMetadata {
     /// JitCode byte-offset → containing Python PC floor boundary table. Each
     /// entry starts a piecewise-constant opcode-emission segment; the first
     /// entry is always `(0, 0)` for a drained install. This is only the
-    /// predecessor op-start tier: exact block-head marker precedence remains in
-    /// `block_head_py_by_jit_pc`. Empty for skeleton / fixture metadata.
+    /// predecessor first-offset-per-PC tier: exact block-head marker
+    /// precedence remains in `block_head_py_by_jit_pc`, and
+    /// `containing_py_pc_for_jitcode_pc` consults [`Self::py_exact_by_jit_pc`]
+    /// before this table so a block drained after the body keeps its own
+    /// opcode. Empty for skeleton / fixture metadata.
     pub py_floor_by_jit_pc: Vec<(u32, u32)>,
     /// JitCode byte-offset → owning Python PC, one entry per contiguous
     /// emission run, sorted ascending by offset.
@@ -161,8 +164,10 @@ pub struct PyJitCodeMetadata {
     /// Trivia-aware STATIC-liveness depth twin, split into the
     /// SAME two tiers as `containing_py_pc_for_jitcode_pc` — an EXACT-match marker table
     /// (`depth_trivia_marker_by_jit_pc`, block-head precedence) and a PREDECESSOR
-    /// op-start table (`depth_trivia_pred_by_jit_pc`, markers EXCLUDED). Each
-    /// records `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(py)]`
+    /// op-start table (`depth_trivia_pred_by_jit_pc`, markers EXCLUDED). Pred keys
+    /// follow `py_exact_by_jit_pc` emission runs so a block drained after the
+    /// body keeps that opcode's depth. Each records
+    /// `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(py)]`
     /// for its resolving py — the value the ENCODE branch-resume depth readers
     /// compute AFTER their forward trivia-skip. A single merged predecessor table
     /// would mis-resolve an interior not-taken coordinate onto a marker byte that
@@ -918,12 +923,13 @@ impl PyJitCode {
     /// Trivia-aware STATIC-liveness depth keyed by a JitCode
     /// byte offset, resolved with the SAME two tiers as
     /// `containing_py_pc_for_jitcode_pc`: an EXACT marker match first (block-head
-    /// precedence), else a PREDECESSOR scan of the op-start table (markers
-    /// excluded). Equals
+    /// precedence), else a PREDECESSOR scan of the exact-run op-start table
+    /// (markers excluded). Equals
     /// `liveness_for(code).depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(jit_pc))]`
     /// by construction for ANY jitcode coordinate — including an interior
     /// not-taken offset the branch-resume readers query (which a single merged
-    /// predecessor table mis-resolves onto an interior marker) and a
+    /// predecessor table mis-resolves onto an interior marker), a late-serialized
+    /// arm whose floor owner is a later opcode, and a
     /// trailing-trivia overshoot past the last opcode (where the raw
     /// `depth_at_py_pc().get(py)` is `None`; the twin bakes the same `None`, not a
     /// spurious `0`). `None` when the twin is empty (skeleton /
@@ -1012,17 +1018,39 @@ impl PyJitCode {
     /// Forward Python PC paired with a carried resume JitCode PC. This is a
     /// codewriter-built twin of `trivia_normalized_py_pc_for_jitcode_pc`'s result, including its
     /// forward trivia normalization, not an encode-time inverse projection.
+    ///
+    /// Exact block-head marker matches win first. Otherwise the per-emission-run
+    /// owner is trivia-normalized the same way the pred-tier values were baked
+    /// (`skip_python_trivia_forward`). A trailing `-live-` the codewriter
+    /// re-keyed to a call's fallthrough is already that fallthrough run in
+    /// `py_exact_by_jit_pc`, so this agrees with the pred twin on in-order
+    /// code. The first-offset floor pred is the last resort when the exact
+    /// table is empty (skeleton / fixture).
     pub fn forward_py_pc_for_jitcode_pc(&self, jit_pc: usize) -> Option<u32> {
         let marker = &self.metadata.forward_py_pc_marker_by_jit_pc;
         let pred = &self.metadata.forward_py_pc_pred_by_jit_pc;
-        if marker.is_empty() && pred.is_empty() {
+        let exact = &self.metadata.py_exact_by_jit_pc;
+        if marker.is_empty() && pred.is_empty() && exact.is_empty() {
             return None;
         }
         if let Ok(i) = marker.binary_search_by_key(&jit_pc, |&(off, _)| off) {
             return Some(marker[i].1);
         }
+        if !exact.is_empty() {
+            if let Some(py) = exact_py_pc_for_jitcode_pc(exact, jit_pc) {
+                return Some(self.trivia_normalized_exact_py_pc(py));
+            }
+        }
         let search = pred.binary_search_by_key(&jit_pc, |&(off, _)| off);
         Self::predecessor_index(search).map(|i| pred[i].1)
+    }
+
+    fn trivia_normalized_exact_py_pc(&self, py: u32) -> u32 {
+        if self.code_ptr.is_null() {
+            return py;
+        }
+        let code = unsafe { &*self.code_ptr };
+        crate::jitcode_dispatch::skip_python_trivia_forward(code, py as usize) as u32
     }
 
     /// Return the codewriter-carried `(jitcode_pc, py_pc)` resume pair for a

@@ -459,9 +459,9 @@ static ROOTED_CTYPES: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(
 pub fn set_size(ct: &mut W_CType, size: i64) {
     let ct_ptr = ct as *mut W_CType;
     unsafe {
-        (*ct_ptr).mutate_size().invalidate_then_store(|| {
+        pyre_object::quasi_immut_store!((*ct_ptr).mutate_size() =>
             (*ct_ptr).size = size;
-        });
+        );
     }
 }
 

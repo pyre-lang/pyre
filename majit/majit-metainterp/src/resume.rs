@@ -6095,7 +6095,7 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         let ptr = llmodel_alloc(sd.type_id(), sd.size());
         if ptr != 0 && vtable != 0 {
             unsafe {
-                majit_backend::llmodel::write_ref_at_mem(ptr as usize, 0, vtable);
+                majit_backend::llmodel::write_ref_at_mem(ptr as usize, 0, vtable, false);
             }
         }
         ptr
@@ -6128,6 +6128,7 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                     ld.offset(),
                     ld.field_size(),
                     length as i64,
+                    ld.store_is_release(),
                 );
             }
         }
@@ -6147,6 +6148,7 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                 descr_info.offset,
                 descr_info.field_size,
                 value,
+                false,
             );
         }
     }
@@ -6163,6 +6165,7 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
                 struct_ptr as usize,
                 descr_info.offset,
                 value as usize,
+                false,
             );
         }
     }
@@ -6194,7 +6197,13 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
             .base_size()
             .wrapping_add(index.wrapping_mul(ad.item_size()));
         unsafe {
-            majit_backend::llmodel::write_int_at_mem(array as usize, ofs, ad.item_size(), value);
+            majit_backend::llmodel::write_int_at_mem(
+                array as usize,
+                ofs,
+                ad.item_size(),
+                value,
+                false,
+            );
         }
     }
 
@@ -6213,7 +6222,7 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
             .wrapping_add(index.wrapping_mul(ad.item_size()));
         majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
         unsafe {
-            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
+            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize, false);
         }
     }
 
@@ -6253,8 +6262,17 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
             return;
         };
         let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
+        let release = descr
+            .as_interior_field_descr()
+            .is_some_and(|ifd| ifd.field_descr().store_is_release());
         unsafe {
-            majit_backend::llmodel::write_int_at_mem(array as usize, ofs, fieldsize, value);
+            majit_backend::llmodel::write_int_at_mem(
+                array as usize,
+                ofs,
+                fieldsize,
+                value,
+                release,
+            );
         }
     }
 
@@ -6273,8 +6291,11 @@ impl BlackholeAllocator for LlmodelBlackholeAllocator {
         let ofs = ofs.wrapping_add(index.wrapping_mul(itemsize));
         // Barrier first: same as `bh_setarrayitem_gc_r` on this allocator.
         majit_gc::gc_write_barrier(majit_ir::GcRef(array as usize));
+        let release = descr
+            .as_interior_field_descr()
+            .is_some_and(|ifd| ifd.field_descr().store_is_release());
         unsafe {
-            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize);
+            majit_backend::llmodel::write_ref_at_mem(array as usize, ofs, value as usize, release);
         }
     }
 

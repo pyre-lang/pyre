@@ -166,6 +166,7 @@ enum Receiver {
 enum AtomicOp {
     Load(&'static str),
     RelaxedStore,
+    ReleaseStore,
 }
 
 fn quasi_atomic_u64_field_fixture(
@@ -195,7 +196,7 @@ fn quasi_atomic_u64_field_fixture(
     let adt_ord = json!({"Adt": {"id": 1, "generics": generics}});
     let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
     let reassigned_param = matches!(receiver, Receiver::ReassignedParam);
-    let is_store = matches!(op, AtomicOp::RelaxedStore);
+    let is_store = matches!(op, AtomicOp::RelaxedStore | AtomicOp::ReleaseStore);
     let arg_count = 1 + usize::from(reassigned_param) + usize::from(is_store);
     let value_local = arg_count;
     let ordering_local = arg_count + 1;
@@ -242,6 +243,7 @@ fn quasi_atomic_u64_field_fixture(
     let ordering_name = match op {
         AtomicOp::Load(name) => name,
         AtomicOp::RelaxedStore => "Relaxed",
+        AtomicOp::ReleaseStore => "Release",
     };
     let ordering_index = variants.iter().position(|v| *v == ordering_name).unwrap();
     let attr = json!({"attributes": [], "inline": null, "rename": null, "public": true});
@@ -795,4 +797,327 @@ fn acquire_quasi_atomic_load_reads_at_the_load_site() {
             );
         }
     }
+}
+
+fn graph_has_field_write(graph: &FunctionGraph, name: &str) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. } if field.name == name
+            )
+        })
+    })
+}
+
+fn graph_has_atomic_store_call(graph: &FunctionGraph) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call { target, .. } => match target {
+                CallTarget::FunctionPath { segments, .. } => {
+                    segments.last().map(String::as_str) == Some("store")
+                        && segments
+                            .iter()
+                            .any(|s| s.contains("Atomic") || s == "atomic")
+                }
+                CallTarget::Method { name, .. } => name == "store",
+                _ => false,
+            },
+            _ => false,
+        })
+    })
+}
+
+fn atomic_u64_field_store_fixture(
+    owner: &str,
+    field: &str,
+    entries: Option<&str>,
+    ordering: &str,
+) -> Llbc {
+    let span = json!({"data": {"file_id": 0,
+        "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        json!({
+            "name": path.iter().map(|s| json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let word = json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let unit = json!({"Adt": {"id": 99, "builtin": "Tuple", "generics": generics}});
+    let atomic = json!({"Adt": {"id": 0, "generics":
+        {"regions": [], "types": [word], "const_generics": [], "trait_refs": []}}});
+    let owner_adt = json!({"Adt": {"id": 2, "generics": generics, "builtin": null}});
+    let owner_ref = json!({"Ref": ["Erased", owner_adt, "Shared"]});
+    let recv_ty = json!({"Ref": ["Erased", atomic, "Shared"]});
+    let adt_ord = json!({"Adt": {"id": 1, "generics": generics}});
+    let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
+    let field_place = json!({
+        "kind": {"Projection": [
+            {"kind": {"Projection": [place(1, &owner_ref), "Deref"]}, "ty": owner_adt},
+            {"Field": [null, 0]}
+        ]},
+        "ty": atomic
+    });
+    let variants = ["Relaxed", "Acquire", "SeqCst", "Release", "AcqRel"];
+    let index = variants.iter().position(|v| *v == ordering).unwrap();
+    let attr = json!({"attributes": [], "inline": null, "rename": null, "public": true});
+    let global_decls = match entries {
+        Some(joined) => json!([{
+            "def_id": 0,
+            "item_meta": meta(&["fixture", &format!("_immutable_fields_{owner}")]),
+            "global_kind": "NamedConst",
+            "value": {"Value": [1, [{"Str": joined}, {"Ref": [
+                "Erased",
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Shared"
+            ]}]]}
+        }]),
+        None => json!([]),
+    };
+    let file = json!({"charon_version": "0.1.201", "has_errors": false,
+        "translated": {"crate_name": "fixture",
+            "type_decls": [
+                {"def_id": 0, "item_meta": meta(&["core", "sync", "atomic", "Atomic"]), "kind": "Opaque"},
+                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Ordering"]),
+                 "kind": {"Enum": variants.iter().enumerate().map(|(i, name)| json!({
+                    "name": name, "fields": [],
+                    "discriminant": {"Scalar": {"Unsigned": ["U8", i.to_string()]}}
+                 })).collect::<Vec<_>>()}},
+                {"def_id": 2, "item_meta": meta(&["fixture", owner]),
+                 "kind": {"Struct": [{
+                    "name": field, "ty": atomic, "attr_info": attr
+                 }]}}
+            ],
+            "fun_decls": [
+                {"def_id": 0, "item_meta": meta(&["fixture", "write_field"]),
+                 "signature": {"is_unsafe": false,
+                    "inputs": [owner_ref.clone(), word.clone()],
+                    "output": unit},
+                 "body": {"Unstructured": {"span": span,
+                    "locals": {"arg_count": 2, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": unit},
+                        {"index": 1, "name": "owner", "span": span, "ty": owner_ref},
+                        {"index": 2, "name": "value", "span": span, "ty": word},
+                        {"index": 3, "name": "ordering", "span": span, "ty": adt_ord},
+                        {"index": 4, "name": "recv", "span": span, "ty": recv_ty}
+                    ]},
+                    "body": [
+                        {"statements": [
+                            {"span": span, "kind": {"Assign": [place(3, &adt_ord),
+                                {"Aggregate": [{"Adt": [1, index, null, generics]}, []]}]}},
+                            {"span": span, "kind": {"Assign": [place(4, &recv_ty),
+                                {"Ref": {"place": field_place, "kind": "Shared", "ptr_metadata": null}}]}}
+                        ], "terminator": {"span": span, "kind": {"Call": {
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                "args": [
+                                    {"Copy": place(4, &recv_ty)},
+                                    {"Copy": place(2, &word)},
+                                    {"Copy": place(3, &adt_ord)}
+                                ],
+                                "dest": place(0, &unit)}, "target": 1, "on_unwind": 2
+                        }}}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                    ]
+                 }}},
+                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Atomic", "store"]),
+                 "signature": {"is_unsafe": false, "inputs": [recv_ty, word, adt_ord], "output": unit}, "body": "Opaque"}
+            ], "global_decls": global_decls, "trait_decls": [], "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("atomic field store fixture parses")
+}
+
+fn atomic_from_ptr_store_release_fixture() -> Llbc {
+    let span = json!({"data": {"file_id": 0,
+        "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+    let meta = |path: &[&str]| {
+        json!({
+            "name": path.iter().map(|s| json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span, "source_text": null, "is_local": true,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        })
+    };
+    let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+    let word = json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+    let unit = json!({"Adt": {"id": 99, "builtin": "Tuple", "generics": generics}});
+    let pointee = json!({"RawPtr": [word.clone(), "Mut"]});
+    let atomic = json!({"Adt": {"id": 0, "generics":
+        {"regions": [], "types": [word], "const_generics": [], "trait_refs": []}}});
+    let slot_ty = json!({"RawPtr": [word.clone(), "Mut"]});
+    let recv_ty = json!({"Ref": ["Erased", atomic, "Shared"]});
+    let adt_ord = json!({"Adt": {"id": 1, "generics": generics}});
+    let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
+    let variants = ["Relaxed", "Acquire", "SeqCst", "Release", "AcqRel"];
+    let _ = pointee;
+    let file = json!({"charon_version": "0.1.201", "has_errors": false,
+        "translated": {"crate_name": "fixture",
+            "type_decls": [
+                {"def_id": 0, "item_meta": meta(&["core", "sync", "atomic", "AtomicPtr"]), "kind": "Opaque"},
+                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Ordering"]),
+                 "kind": {"Enum": variants.iter().enumerate().map(|(i, name)| json!({
+                    "name": name, "fields": [],
+                    "discriminant": {"Scalar": {"Unsigned": ["U8", i.to_string()]}}
+                 })).collect::<Vec<_>>()}}
+            ],
+            "fun_decls": [
+                {"def_id": 0, "item_meta": meta(&["fixture", "write_slot"]),
+                 "signature": {"is_unsafe": false,
+                    "inputs": [slot_ty.clone(), word.clone()],
+                    "output": unit},
+                 "body": {"Unstructured": {"span": span,
+                    "locals": {"arg_count": 2, "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": unit},
+                        {"index": 1, "name": "slot", "span": span, "ty": slot_ty},
+                        {"index": 2, "name": "value", "span": span, "ty": word},
+                        {"index": 3, "name": "ordering", "span": span, "ty": adt_ord},
+                        {"index": 4, "name": "recv", "span": span, "ty": recv_ty}
+                    ]},
+                    "body": [
+                        {"statements": [
+                            {"span": span, "kind": {"Assign": [place(3, &adt_ord),
+                                {"Aggregate": [{"Adt": [1, 3, null, generics]}, []]}]}}
+                        ], "terminator": {"span": span, "kind": {"Call": {
+                            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                                "args": [{"Copy": place(1, &slot_ty)}],
+                                "dest": place(4, &recv_ty)}, "target": 1, "on_unwind": 3
+                        }}}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                            "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                                "args": [
+                                    {"Copy": place(4, &recv_ty)},
+                                    {"Copy": place(2, &word)},
+                                    {"Copy": place(3, &adt_ord)}
+                                ],
+                                "dest": place(0, &unit)}, "target": 2, "on_unwind": 3
+                        }}}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                    ]
+                 }}},
+                {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "AtomicPtr", "store"]),
+                 "signature": {"is_unsafe": false, "inputs": [recv_ty, word, adt_ord], "output": unit}, "body": "Opaque"},
+                {"def_id": 2, "item_meta": meta(&["core", "sync", "atomic", "<Impl>", "from_ptr"]),
+                 "signature": {"is_unsafe": false, "inputs": [slot_ty], "output": recv_ty}, "body": "Opaque"}
+            ], "global_decls": [], "trait_decls": [], "trait_impls": []
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("from_ptr store fixture parses")
+}
+
+#[test]
+fn release_store_of_quasi_field_through_reassigned_owner_is_unsupported() {
+    let result = lower_function(
+        &quasi_atomic_u64_field_fixture(
+            "Owner",
+            "version_tag",
+            Some("version_tag?"),
+            Receiver::ReassignedParam,
+            AtomicOp::ReleaseStore,
+        ),
+        "read_field",
+    );
+    assert!(
+        matches!(result, Err(LowerError::Unsupported(ref message))
+            if message.contains("atomic store ordering Release")
+                && message.contains("requires address-preserving ordered lowering")),
+        "Release store of a quasi field through a reassigned owner parameter must stay unsupported, got {result:?}"
+    );
+}
+
+#[test]
+fn release_store_of_quasi_atomic_field_lowers_to_field_write() {
+    let graph = lower_function(
+        &atomic_u64_field_store_fixture("Owner", "version_tag", Some("version_tag?"), "Release"),
+        "write_field",
+    )
+    .expect("Release store of quasi AtomicU64 field lowers");
+    assert!(
+        graph_has_field_write(&graph, "version_tag"),
+        "Release store of quasi version_tag must lower to FieldWrite, got {graph:?}"
+    );
+    assert!(
+        !graph_has_atomic_store_call(&graph),
+        "Release store of quasi version_tag must not keep Atomic::store, got {graph:?}"
+    );
+}
+
+#[test]
+fn release_store_of_non_quasi_atomic_field_stays_a_call() {
+    let graph = lower_function(
+        &atomic_u64_field_store_fixture("Plain", "hot_counter", None, "Release"),
+        "write_field",
+    )
+    .expect("Release store of a non-quasi field keeps lowering");
+    assert!(
+        !graph_has_field_write(&graph, "hot_counter"),
+        "Release store of non-quasi hot_counter must not become FieldWrite, got {graph:?}"
+    );
+    assert!(
+        graph_has_atomic_store_call(&graph),
+        "Release store of non-quasi hot_counter must stay Atomic::store, got {graph:?}"
+    );
+}
+
+#[test]
+fn relaxed_store_folds_regardless_of_rank() {
+    for (owner, field, entries) in [
+        ("Owner", "version_tag", Some("version_tag?")),
+        ("Plain", "hot_counter", None),
+    ] {
+        let graph = lower_function(
+            &atomic_u64_field_store_fixture(owner, field, entries, "Relaxed"),
+            "write_field",
+        )
+        .unwrap_or_else(|err| panic!("Relaxed store of {field} must fold: {err:?}"));
+        assert!(
+            graph_has_field_write(&graph, field),
+            "Relaxed store of {field} must lower to FieldWrite, got {graph:?}"
+        );
+        assert!(
+            !graph_has_atomic_store_call(&graph),
+            "Relaxed store of {field} must not keep Atomic::store, got {graph:?}"
+        );
+    }
+}
+
+#[test]
+fn atomic_from_ptr_store_release_stays_a_call() {
+    let graph = lower_function(&atomic_from_ptr_store_release_fixture(), "write_slot")
+        .expect("from_ptr store Release keeps lowering");
+    assert!(
+        !graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::FieldWrite { .. }))
+        }),
+        "AtomicPtr::from_ptr(slot).store(Release) must not invent a FieldWrite, got {graph:?}"
+    );
+    assert!(
+        graph_has_atomic_store_call(&graph),
+        "AtomicPtr::from_ptr(slot).store(Release) must stay a Call, got {graph:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires freshly extracted pyre-object LLBC; run extraction --check first"]
+fn atomic_store_real_release_writer_of_quasi_field_lowers() {
+    let llbc = Llbc::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/pyre-object.ullbc"
+    ))
+    .expect("load fresh pyre-object corpus");
+    let graph = lower_function(&llbc, "w_type_set_compares_by_identity_status")
+        .expect("Release store of quasi compares_by_identity_status lowers");
+    assert!(
+        graph_has_field_write(&graph, "compares_by_identity_status"),
+        "lowered w_type_set_compares_by_identity_status has no compares_by_identity_status FieldWrite"
+    );
+    assert!(
+        !graph_has_atomic_store_call(&graph),
+        "w_type_set_compares_by_identity_status must not keep Call AtomicU8::store"
+    );
 }

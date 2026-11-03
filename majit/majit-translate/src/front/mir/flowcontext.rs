@@ -336,12 +336,14 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// operand: it assigns `_i = Ordering::<V>` as a fieldless-enum
     /// `Aggregate` and passes `move _i`, so the variant is only knowable from
     /// that statement.  [`Lowering::is_atomic_store`]'s arm folds a `Relaxed`
-    /// store and nothing else — a `Release` store lowered as an unordered
-    /// `FieldWrite` would DROP a barrier the residual call it replaces still
-    /// performs (`w_type_set_version_tag` publishes `version_tag` with
-    /// `Release` against an `Acquire` reader).  Which makes reading the WRONG
-    /// variant a dropped barrier, so this map carries the single-assignment
-    /// restriction for the same reason [`Lowering::atomic_ref_place`] does.
+    /// store of any field, and a `Release` store of a quasi-immutable field
+    /// whose descr carries `store_is_release` so the setfield is the Release
+    /// store (the store twin of the Acquire `?` load fold).  A Release store
+    /// of any other field, SeqCst, and AcqRel stay the residual call.  A
+    /// recorded borrow that is not stable is Unsupported rather than a fold.
+    /// Which makes reading the WRONG variant a dropped barrier, so this map
+    /// carries the single-assignment restriction for the same reason
+    /// [`Lowering::atomic_ref_place`] does.
     pub(in crate::front::mir) atomic_ordering_locals: std::collections::HashMap<usize, String>,
     /// `FunctionDesc.cachedgraph` for this lowering. `None` outside the
     /// whole-program walk.

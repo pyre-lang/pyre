@@ -2513,7 +2513,7 @@ pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
 /// User-subclass set layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (166) ahead of the
 /// target-gated tail. `set` and `frozenset` share it.
-pub const W_SET_USER_GC_TYPE_ID: u32 = 166;
+pub const W_SET_USER_GC_TYPE_ID: u32 = 167;
 pub const W_SET_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObjectUser>();
 
 impl crate::lltype::GcType for W_SetObject {
@@ -2698,8 +2698,8 @@ fn set_items_write_barrier(items: *mut SetItemsStorage) {
 
 /// Process-wide source of [`W_SetObject::set_id`].
 ///
-/// [`next_version_tag_serial`] is the same shape: a `static` atomic has no
-/// llop, so the bump stays residual and the id is not a traced constant.
+/// A `static` atomic has no llop, so the bump stays residual and the id is
+/// not a traced constant.
 #[majit_macros::dont_look_inside]
 pub fn fresh_set_id() -> usize {
     static NEXT_SET_ID: AtomicUsize = AtomicUsize::new(1);
@@ -5171,7 +5171,7 @@ mod tests {
     /// `W_SetObjectUser` carrying `SET_USER_TYPE` or `FROZENSET_USER_TYPE`.
     #[test]
     fn set_subclass_instance_carries_user_typeptr() {
-        assert_eq!(W_SET_USER_GC_TYPE_ID, 166);
+        assert_eq!(W_SET_USER_GC_TYPE_ID, 167);
         assert_eq!(
             W_SET_OBJECT_SIZE,
             std::mem::offset_of!(W_SetObject, lifeline) + std::mem::size_of::<PyObjectRef>()

@@ -4116,6 +4116,166 @@ mod tests {
         assert!(bh.registers_i.is_empty() || bh.registers_i.iter().all(|&v| v == 0));
     }
 
+    /// Process-global `HOST_HOOKS` is one slot; save and restore it under a
+    /// lock so these tests cannot overwrite each other or a sibling.
+    static FORCE_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn with_force_hook<T>(
+        hook: crate::quasiimmut::ForceQuasiImmutable,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = FORCE_HOOK_TEST_LOCK.lock();
+        let saved = crate::host_hooks();
+        crate::publish_host_hooks(crate::HostHooks {
+            force_quasi_immutable: Some(hook),
+            ..crate::HostHooks::default()
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        crate::publish_host_hooks(saved);
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn mutate_field_descr(offset: usize) -> BhDescr {
+        BhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: true,
+            index_in_parent: Some(1),
+            parent: None,
+            name: "mutate_value".into(),
+            owner: "RawOwner".into(),
+            load_is_acquire: false,
+            store_is_release: false,
+        }
+    }
+
+    /// `/id` reads the owner from `registers_i` and forces through
+    /// `quasiimmut.py do_force_quasi_immutable` at `struct + offset`.
+    #[test]
+    fn handler_jit_force_quasi_immutable_id_forces_raw_owner() {
+        static FORCE_ADDR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        FORCE_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+        extern "C" fn force_hook(field_addr: i64) {
+            FORCE_ADDR.store(field_addr, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let descrs: &'static [BhDescr; 1] = Box::leak(Box::new([mutate_field_descr(8)]));
+        let mut bh = BlackholeInterpreter::default();
+        bh.descrs = descrs;
+        let struct_ptr = 0x1000i64;
+        bh.registers_i = vec![struct_ptr];
+        // Operand layout `id`: 1B int-reg + 2B descr-index 0.
+        let code = [0u8, 0, 0];
+        let next = with_force_hook(force_hook, || {
+            handler_jit_force_quasi_immutable_i(&mut bh, &code, 0).unwrap()
+        });
+        assert_eq!(next, 3);
+        assert_eq!(
+            FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            struct_ptr.wrapping_add(8),
+        );
+    }
+
+    fn field_bhdescr(
+        offset: usize,
+        field_type: majit_ir::value::Type,
+        field_flag: majit_ir::descr::ArrayFlag,
+        load_is_acquire: bool,
+        store_is_release: bool,
+    ) -> BhDescr {
+        BhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type,
+            field_flag,
+            is_field_signed: true,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "slot".into(),
+            owner: "Owner".into(),
+            load_is_acquire,
+            store_is_release,
+        }
+    }
+
+    #[test]
+    fn bh_int_field_honors_release_and_acquire() {
+        #[repr(C, align(8))]
+        struct Cell(i64);
+        let mut cell = Cell(0);
+        let ptr = &mut cell as *mut Cell as i64;
+        let release = field_bhdescr(
+            0,
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+            false,
+            true,
+        );
+        let acquire = field_bhdescr(
+            0,
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+            true,
+            false,
+        );
+        let unordered = field_bhdescr(
+            0,
+            majit_ir::value::Type::Int,
+            majit_ir::descr::ArrayFlag::Signed,
+            false,
+            false,
+        );
+        bh_store_int_field(ptr, 0x1122_3344_5566_7788u64 as i64, &release);
+        assert_eq!(
+            bh_load_int_field(ptr, &acquire),
+            0x1122_3344_5566_7788u64 as i64
+        );
+        bh_store_int_field(ptr, 7, &unordered);
+        assert_eq!(bh_load_int_field(ptr, &unordered), 7);
+    }
+
+    #[test]
+    fn bh_ref_field_honors_release_and_acquire() {
+        #[repr(C, align(8))]
+        struct Cell(usize);
+        let mut cell = Cell(0);
+        let ptr = &mut cell as *mut Cell as i64;
+        let release = field_bhdescr(
+            0,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            false,
+            true,
+        );
+        let acquire = field_bhdescr(
+            0,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            true,
+            false,
+        );
+        let unordered = field_bhdescr(
+            0,
+            majit_ir::value::Type::Ref,
+            majit_ir::descr::ArrayFlag::Pointer,
+            false,
+            false,
+        );
+        bh_store_ref_field(ptr, 0xABCD, &release);
+        assert_eq!(bh_load_ref_field(ptr, &acquire), 0xABCD);
+        bh_store_ref_field(ptr, 1, &unordered);
+        assert_eq!(bh_load_ref_field(ptr, &unordered), 1);
+    }
+
     // ── Executor opcode tests (bhimpl_* runtime coverage) ──
     //
     // Systematic correctness tests for each opcode category, driven directly
@@ -9544,61 +9704,77 @@ fn handler_unreachable(
 }
 
 //
-// RPython blackhole.py bhimpl_getfield_gc_i: bhimpl_getfield_gc_*/setfield_gc_*
-// These call `cpu.bh_getfield_gc_i(struct_ptr, descr)` etc.
-// The 'd' argcode is a 2-byte descriptor index into `bh.descrs`.
-// In pyre, descrs[index] resolves to a field offset (usize).
+// RPython blackhole.py bhimpl_getfield_gc_*/setfield_gc_* delegate to
+// `cpu.bh_getfield_gc_*` / `cpu.bh_setfield_gc_*`. These inline the same
+// bytes and must honor the same descr ordering bits (`load_is_acquire`,
+// `store_is_release`). The 'd' argcode is a 2-byte descriptor index into
+// `bh.descrs`.
 //
-// The default `Backend` impl is a raw load/store at that offset
-// (`llmodel.py read_int_at_mem`). Going through `bh.cpu()` is two
-// virtual calls per field on a path the regex leaf interprets for
-// the rest of `shift`. Same bytes, no vtable.
+// Going through `bh.cpu()` is two virtual calls per field on a path the
+// regex leaf interprets for the rest of `shift`. Same bytes, no vtable.
 
 #[inline(always)]
 fn bh_load_int_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
     let (offset, size, sign) = descr.unpack_fielddescr_size();
-    let addr = (struct_ptr as usize).wrapping_add(offset);
     // SAFETY: `struct_ptr` is the GC object the resume reader seeded;
     // `offset`/`size` come from the field descriptor.
+    // `llmodel::read_int_at_mem` is the unordered unaligned match when
+    // `load_is_acquire` is false, and `AtomicU*::load(Acquire)` when true.
     unsafe {
-        match (size, sign) {
-            (1, true) => (addr as *const i8).read_unaligned() as i64,
-            (1, false) => (addr as *const u8).read_unaligned() as i64,
-            (2, true) => (addr as *const i16).read_unaligned() as i64,
-            (2, false) => (addr as *const u16).read_unaligned() as i64,
-            (4, true) => (addr as *const i32).read_unaligned() as i64,
-            (4, false) => (addr as *const u32).read_unaligned() as i64,
-            (8, _) => (addr as *const i64).read_unaligned(),
-            other => panic!("bh_load_int_field: unsupported (size, signed) = {other:?}"),
-        }
+        majit_backend::llmodel::read_int_at_mem(
+            struct_ptr as usize,
+            offset,
+            size,
+            sign,
+            descr.load_is_acquire(),
+        )
     }
 }
 
 #[inline(always)]
 fn bh_store_int_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
     let (offset, size, _sign) = descr.unpack_fielddescr_size();
-    unsafe { majit_backend::llmodel::write_int_at_mem(struct_ptr as usize, offset, size, value) }
+    unsafe {
+        majit_backend::llmodel::write_int_at_mem(
+            struct_ptr as usize,
+            offset,
+            size,
+            value,
+            descr.store_is_release(),
+        )
+    }
 }
 
 #[inline(always)]
 fn bh_load_ref_field(struct_ptr: i64, descr: &BhDescr) -> i64 {
     let offset = descr.as_offset();
     let addr = (struct_ptr as usize).wrapping_add(offset);
-    unsafe { (addr as *const usize).read_unaligned() as i64 }
+    if descr.load_is_acquire() {
+        unsafe { majit_backend::llmodel::read_ref_at_mem(addr, true) as i64 }
+    } else {
+        unsafe { (addr as *const usize).read_unaligned() as i64 }
+    }
 }
 
 #[inline(always)]
 fn bh_store_ref_field(struct_ptr: i64, value: i64, descr: &BhDescr) {
     let offset = descr.as_offset();
     majit_gc::bh_probe_note_store(struct_ptr as usize, offset, 9);
-    unsafe {
-        majit_backend::llmodel::write_ref_at_mem(struct_ptr as usize, offset, value as usize);
-    }
+    // Barrier first, then the (possibly Release) store publishes the
+    // pointer — same order as `Backend::bh_setfield_gc_r`.
     // dynasm `bh_setfield_gc_r` / cranelift `write_barrier_if_managed`:
     // skip the header walk when the base is a reconstructed unmanaged
     // object. `gc_write_barrier` alone does not do that check.
     if majit_gc::gc_owns_object(struct_ptr as usize) {
         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
+    }
+    unsafe {
+        majit_backend::llmodel::write_ref_at_mem(
+            struct_ptr as usize,
+            offset,
+            value as usize,
+            descr.store_is_release(),
+        );
     }
 }
 
@@ -9795,6 +9971,7 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
             name: String::new(),
             owner: String::new(),
             load_is_acquire: false,
+            store_is_release: false,
         },
         pos,
     )
@@ -9839,6 +10016,7 @@ fn vable_array_field_descr(
         name: String::new(),
         owner: String::new(),
         load_is_acquire: false,
+        store_is_release: false,
     }
 }
 
@@ -12005,11 +12183,18 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             majit_jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD,
         ),
         // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
-        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`;
-        // `bhimpl_jit_force_quasi_immutable` is already wired below.
+        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`
+        // for a GC owner and `id` for a raw address (`getkind` of
+        // Signed / a non-GC ptr). `bhimpl_jit_force_quasi_immutable`
+        // is already wired below; the `/id` handler reads the owner
+        // from `registers_i`.
         (
             "jit_force_quasi_immutable/rd",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
+        ),
+        (
+            "jit_force_quasi_immutable/id",
+            majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -12501,6 +12686,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_jit_force_quasi_immutable,
     );
     builder.wire_handler(
+        "jit_force_quasi_immutable/id",
+        handler_jit_force_quasi_immutable_i,
+    );
+    builder.wire_handler(
         "record_known_result_i_ir_v/iiIRd",
         handler_record_known_result_i_ir_v,
     );
@@ -12854,13 +13043,35 @@ fn handler_record_quasiimmut_field(
 /// ```
 /// Skipping past the operands without running the force left every loop that
 /// folded a read of the field valid across the write that invalidates it.
+///
+/// `/rd` reads the owner from `registers_r`; `/id` from `registers_i`
+/// (a raw address). `quasiimmut.py do_force_quasi_immutable` then
+/// takes that address plus the mutate field descr — pyre's port adds
+/// the descr offset and calls the host hook, which is valid for a raw
+/// struct as well as a GC one.
 fn handler_jit_force_quasi_immutable(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (mutatefielddescr, p) = read_descr(bh, code, p + 1);
+    force_quasi_immutable_at(bh, code, p + 1, struct_ptr)
+}
+fn handler_jit_force_quasi_immutable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
+    force_quasi_immutable_at(bh, code, p + 1, struct_ptr)
+}
+fn force_quasi_immutable_at(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+    struct_ptr: i64,
+) -> Result<usize, DispatchError> {
+    let (mutatefielddescr, p) = read_descr(bh, code, p);
     crate::quasiimmut::do_force_quasi_immutable(struct_ptr, mutatefielddescr);
     Ok(p)
 }

@@ -71,7 +71,7 @@ pub static ARRAY_USER_TYPE: PyType = new_user_pytype_with_lifeline(
 /// User-subclass array layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (167) ahead of the
 /// target-gated tail.
-pub const W_ARRAY_USER_GC_TYPE_ID: u32 = 167;
+pub const W_ARRAY_USER_GC_TYPE_ID: u32 = 168;
 pub const W_ARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ArrayUser>();
 
 impl crate::lltype::GcType for W_ArrayUser {
@@ -478,7 +478,7 @@ mod tests {
     /// `W_ArrayUser` carrying `ARRAY_USER_TYPE`.
     #[test]
     fn array_subclass_instance_carries_user_typeptr() {
-        assert_eq!(W_ARRAY_USER_GC_TYPE_ID, 167);
+        assert_eq!(W_ARRAY_USER_GC_TYPE_ID, 168);
         assert_eq!(
             W_ARRAY_OBJECT_SIZE,
             std::mem::offset_of!(W_Array, w_weakreflifeline) + std::mem::size_of::<PyObjectRef>()

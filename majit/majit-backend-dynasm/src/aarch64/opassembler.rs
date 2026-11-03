@@ -192,6 +192,27 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
+    /// Release integer store to an address already in `x16`.
+    ///
+    /// Twin of [`Self::emit_ldar_from_x16`]: `stlr X` / `stlr W` /
+    /// `stlrh` / `stlrb`.
+    pub(crate) fn emit_stlr_from_x16(&mut self, src: &RegLoc, size: usize) {
+        match size {
+            1 => {
+                dynasm!(self.mc ; .arch aarch64 ; stlrb W(src.value), [x16]);
+            }
+            2 => {
+                dynasm!(self.mc ; .arch aarch64 ; stlrh W(src.value), [x16]);
+            }
+            4 => {
+                dynasm!(self.mc ; .arch aarch64 ; stlr W(src.value), [x16]);
+            }
+            _ => {
+                dynasm!(self.mc ; .arch aarch64 ; stlr X(src.value), [x16]);
+            }
+        }
+    }
+
     /// Form `x16 = base + ofs_loc` then [`Self::emit_ldar_from_x16`].
     pub(crate) fn emit_acquire_int_load(
         &mut self,

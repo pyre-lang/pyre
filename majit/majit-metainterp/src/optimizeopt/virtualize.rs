@@ -5625,6 +5625,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let sd = group.size_descr.clone() as DescrRef;
@@ -5725,6 +5726,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let sd = group.size_descr.clone() as DescrRef;
@@ -5870,6 +5872,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent,
                 load_is_acquire: false,
+                store_is_release: false,
             }
         }
         let group = majit_ir::descr::make_simple_descr_group(
@@ -7654,6 +7657,7 @@ mod tests {
                 virtualizable: false,
                 index_in_parent: 0,
                 load_is_acquire: false,
+                store_is_release: false,
             }],
         );
         let sd = group.size_descr.clone() as DescrRef;

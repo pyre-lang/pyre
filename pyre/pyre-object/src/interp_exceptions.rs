@@ -725,14 +725,14 @@ pub const W_BASE_EXCEPTION_GC_TYPE_ID: u32 = 31;
 /// the extended user layout can parent on it. Constant before GC init:
 /// `try_gc_alloc_collecting_rooted` with no hook is `NoRoute` and the
 /// allocator falls through to `malloc_typed`.
-pub const W_EXCEPTION_EXTENDED_GC_TYPE_ID: u32 = 214;
+pub const W_EXCEPTION_EXTENDED_GC_TYPE_ID: u32 = 215;
 
 /// `W_BaseExceptionUser` (`typedef.py` `_getusercls`). Parents on
 /// [`W_BASE_EXCEPTION_GC_TYPE_ID`].
-pub const W_BASE_EXCEPTION_USER_GC_TYPE_ID: u32 = 215;
+pub const W_BASE_EXCEPTION_USER_GC_TYPE_ID: u32 = 216;
 
 /// `W_ExceptionExtendedUser`. Parents on [`W_EXCEPTION_EXTENDED_GC_TYPE_ID`].
-pub const W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID: u32 = 216;
+pub const W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID: u32 = 217;
 
 /// Publish the GC tid for the extra-field exception layout. `build_gc`
 /// calls this with the constant tid as a registration-order check.
@@ -3267,9 +3267,9 @@ mod tests {
             <W_ExceptionExtended as crate::lltype::GcType>::SIZE,
             W_EXCEPTION_EXTENDED_SIZE
         );
-        assert_eq!(W_EXCEPTION_EXTENDED_GC_TYPE_ID, 214);
-        assert_eq!(W_BASE_EXCEPTION_USER_GC_TYPE_ID, 215);
-        assert_eq!(W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID, 216);
+        assert_eq!(W_EXCEPTION_EXTENDED_GC_TYPE_ID, 215);
+        assert_eq!(W_BASE_EXCEPTION_USER_GC_TYPE_ID, 216);
+        assert_eq!(W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID, 217);
         assert_eq!(
             <W_ExceptionExtended as crate::lltype::GcType>::type_id(),
             W_EXCEPTION_EXTENDED_GC_TYPE_ID

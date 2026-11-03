@@ -2480,9 +2480,9 @@ impl AssemblerEncode for Assembler {
             }
             // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
             // `jit_force_quasi_immutable(v_inst, descr1)` — a register or
-            // pooled `r` constant followed by one fielddescr. The blackhole
+            // pooled constant followed by one fielddescr. The blackhole
             // counterpart `bhimpl_jit_force_quasi_immutable` expects
-            // argcodes `rd`.
+            // argcodes `rd` (GC owner) or `id` (raw address).
             OpKind::JitForceQuasiImmutable { base, mutate_field } => {
                 match base {
                     crate::model::LinkArg::Value(var) => {
@@ -2493,13 +2493,13 @@ impl AssemblerEncode for Assembler {
                     crate::model::LinkArg::Const(c) => {
                         let kind = crate::flatten::constant_kind(c);
                         assert!(
-                            kind == 'r',
-                            "jit_force_quasi_immutable const base must be Ref, got {kind:?} — graph {:?}",
+                            kind == 'r' || kind == 'i',
+                            "jit_force_quasi_immutable const base must be Ref or Int, got {kind:?} — graph {:?}",
                             self.current_graph_name,
                         );
                         let byte = self.emit_const(&c.value, kind, state, callcontrol);
                         state.code.push(byte);
-                        argcodes.push('r');
+                        argcodes.push(kind);
                     }
                 }
                 // `jtransform.py rewrite_op_jit_force_quasi_immutable`
@@ -5383,6 +5383,8 @@ fn bh_field_spec_from_parts(
     is_quasi_immutable: bool,
     index_in_parent: usize,
     load_is_acquire: bool,
+
+    store_is_release: bool,
 ) -> crate::jitcode::BhFieldSpec {
     crate::jitcode::BhFieldSpec {
         index,
@@ -5402,6 +5404,7 @@ fn bh_field_spec_from_parts(
         // typed `Atomic*` field (`FieldRow.is_atomic`).
         is_class_word: None,
         load_is_acquire,
+        store_is_release,
     }
 }
 
@@ -5567,6 +5570,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
                 false,
                 0,
                 false,
+                false,
             ),
         );
     }
@@ -5721,6 +5725,7 @@ fn inherited_enum_tag_spec(
         tag.is_quasi_immutable,
         0,
         tag.load_is_acquire,
+        tag.store_is_release,
     ))
 }
 
@@ -5783,6 +5788,7 @@ fn bh_result_variant_field_specs(
             rank.is_some(),
             is_quasi,
             index,
+            is_quasi && row.is_atomic,
             is_quasi && row.is_atomic,
         ));
         offset += field_size;
@@ -5875,6 +5881,7 @@ fn bh_all_field_specs_for_struct_into(
                 fl.is_quasi_immutable(),
                 index_in_parent,
                 fl.is_quasi_immutable() && is_atomic,
+                fl.is_quasi_immutable() && is_atomic,
             ));
         }
         return;
@@ -5942,6 +5949,7 @@ fn bh_all_field_specs_for_struct_into(
                     is_immutable,
                     is_quasi,
                     index_in_parent,
+                    is_quasi && row.is_atomic,
                     is_quasi && row.is_atomic,
                 ));
             }
@@ -6108,6 +6116,7 @@ fn fielddescrof(
     let mut is_immutable = false;
     let mut is_quasi_immutable = false;
     let mut load_is_acquire = false;
+    let mut store_is_release = false;
     // `None` until a lookup arm actually resolves a slot. `Unresolved`
     // panics before a descr is minted, so a surviving `None` is only the
     // no-`CallControl` path.
@@ -6168,6 +6177,7 @@ fn fielddescrof(
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = Some(spec.index_in_parent);
                 load_is_acquire = spec.load_is_acquire;
+                store_is_release = spec.store_is_release;
             }
             FieldLayoutResolution::Layout(layout_field) => {
                 if layout_field.flag == majit_ir::descr::ArrayFlag::Struct
@@ -6190,6 +6200,7 @@ fn fielddescrof(
                     is_quasi_immutable = spec.is_quasi_immutable;
                     index_in_parent = Some(spec.index_in_parent);
                     load_is_acquire = spec.load_is_acquire;
+                    store_is_release = spec.store_is_release;
                     found_parent_field = true;
                 } else {
                     offset = layout_field.offset;
@@ -6226,11 +6237,13 @@ fn fielddescrof(
             }
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
-            is_immutable = rank.is_immutable();
+            // descr.py get_field_descr is_pure = STRUCT._immutable_field(fieldname) != False
+            is_immutable = true;
             is_quasi_immutable = rank.is_quasi_immutable();
         }
         if is_quasi_immutable && cc.field_row_is_atomic(owner, &field_key) {
             load_is_acquire = true;
+            store_is_release = true;
         }
         // Both fallbacks above take `offset` from a second source — the
         // `struct_layout_for` registry or the recorded scalar word — and neither
@@ -6395,8 +6408,9 @@ fn fielddescrof(
         is_field_signed = false;
         field_key = format!("{field_key}{suffix}");
         // `.buf` / `.len` / fat-pointer words are a new layout, not the
-        // parent field whose stored Acquire stamp was copied above.
+        // parent field whose stored Acquire/Release stamps were copied above.
         load_is_acquire = false;
+        store_is_release = false;
     }
     // A rustc vtable slot does not change. `descr.is_always_pure()` lets
     // the walker fold `getfield_raw_i` of `method_*` off a Const vtable
@@ -6410,6 +6424,7 @@ fn fielddescrof(
         field_flag = majit_ir::descr::ArrayFlag::Unsigned;
         is_field_signed = false;
         load_is_acquire = false;
+        store_is_release = false;
     }
     crate::jitcode::BhDescr::Field {
         offset,
@@ -6427,6 +6442,7 @@ fn fielddescrof(
         name: field_key,
         owner: canonical_owner.unwrap_or_default(),
         load_is_acquire,
+        store_is_release,
     }
 }
 
@@ -9421,6 +9437,7 @@ mod tests {
             name: "value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         let repeated = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
             offset: 0,
@@ -9435,6 +9452,7 @@ mod tests {
             name: "value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
         let other = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
             offset: 0,
@@ -9449,6 +9467,7 @@ mod tests {
             name: "mutate_value".into(),
             owner: "Cell".into(),
             load_is_acquire: false,
+            store_is_release: false,
         });
 
         assert_eq!(first, repeated);
@@ -11315,6 +11334,50 @@ mod tests {
             field_descr_names.contains(&"mutate_code"),
             "expected Field descr for `mutate_code`, got {:?}",
             field_descr_names
+        );
+    }
+
+    /// A `Signed` owner (raw address) keys `jit_force_quasi_immutable/id`.
+    /// `lookup_reg_with_kind_var` maps `ConcreteType::Signed` to `'i'`.
+    #[test]
+    fn assembles_jit_force_quasi_immutable_id() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("force_qmut_raw");
+        let base_var = push_input_var(&mut graph, "owner", ValueType::Int);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::JitForceQuasiImmutable {
+                base: LinkArg::Value(base_var.clone()),
+                mutate_field: FieldDescriptor::new("mutate_code", Some("Function".to_string())),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::Signed);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let key_count = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("jit_force_quasi_immutable/"))
+            .count();
+        assert_eq!(
+            key_count,
+            1,
+            "expected exactly one jit_force_quasi_immutable/* key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("jit_force_quasi_immutable/id"),
+            "expected key jit_force_quasi_immutable/id, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
         );
     }
 

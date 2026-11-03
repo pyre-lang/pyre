@@ -82,7 +82,7 @@ pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
 /// User-subclass bytearray layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (164) ahead of the
 /// target-gated tail.
-pub const W_BYTEARRAY_USER_GC_TYPE_ID: u32 = 164;
+pub const W_BYTEARRAY_USER_GC_TYPE_ID: u32 = 165;
 pub const W_BYTEARRAY_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_BytearrayObjectUser>();
 
 impl W_BytearrayObject {

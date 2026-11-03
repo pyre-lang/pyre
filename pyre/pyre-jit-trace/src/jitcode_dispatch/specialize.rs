@@ -3390,7 +3390,7 @@ fn walker_fold_type_name<Sym: WalkSym>(
     // `record_quasiimmut_field` installs the watcher before it captures
     // `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`). The
     // eligibility peek is only the non-null test; baking it would keep a
-    // pre-rename pointer after `invalidate_then_store` completed with no
+    // pre-rename pointer after `quasi_immut_store!` completed with no
     // watcher. Re-read after the record, the same order as the `getfield`
     // that follows `record_quasiimmut_field` on the rewritten load.
     // The guards can minor-collect; `concrete_obj` is a copy of the type box.

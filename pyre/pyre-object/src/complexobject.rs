@@ -43,7 +43,7 @@ pub const W_COMPLEX_GC_TYPE_ID: u32 = 54;
 /// User-subclass complex layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (162) ahead of the
 /// target-gated tail.
-pub const W_COMPLEX_USER_GC_TYPE_ID: u32 = 162;
+pub const W_COMPLEX_USER_GC_TYPE_ID: u32 = 163;
 pub const W_COMPLEX_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ComplexObjectUser>();
 
 /// Fixed payload size for `W_ComplexObject`.

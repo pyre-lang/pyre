@@ -362,7 +362,7 @@ pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
 /// User-subclass list layout (`typedef.py` `_getusercls`). Unconditional,
 /// so its tid sits with the other closed ids (165) ahead of the
 /// target-gated tail.
-pub const W_LIST_USER_GC_TYPE_ID: u32 = 165;
+pub const W_LIST_USER_GC_TYPE_ID: u32 = 166;
 pub const W_LIST_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObjectUser>();
 
 impl crate::lltype::GcType for W_ListObject {
