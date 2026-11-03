@@ -4158,6 +4158,240 @@ pub(super) fn pair_multiple_frozen_pbc_function_repr_convert_from_to(
     Ok(Some(Hlvalue::Constant(c)))
 }
 
+/// Python `access is other` for `FrozenAttrFamily` objects (and
+/// `None is None`). `FrozenAttrFamily` has no `__eq__`; identity is
+/// the `Rc` pointer.
+fn frozen_access_set_is(
+    left: Option<&Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
+    right: Option<&Rc<RefCell<crate::annotator::description::FrozenAttrFamily>>>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// RPython `pairtype(MultipleFrozenPBCRepr,
+/// MultipleUnrelatedFrozenPBCRepr).convert_from_to` (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((robj1, robj2), v, llops):
+///     return llops.genop('cast_ptr_to_adr', [v], resulttype=llmemory.Address)
+/// ```
+pub(super) fn pair_multiple_frozen_pbc_multiple_unrelated_convert_from_to(
+    v: &Hlvalue,
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+    // upstream: `return llops.genop('cast_ptr_to_adr', [v],
+    //                                resulttype=llmemory.Address)`.
+    let result = llops.genop(
+        "cast_ptr_to_adr",
+        vec![v.clone()],
+        GenopResult::LLType(LowLevelType::Address),
+    );
+    Ok(result.map(Hlvalue::Variable))
+}
+
+/// RPython `pairtype(MultipleFrozenPBCRepr,
+/// MultipleFrozenPBCRepr).convert_from_to` (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((r_pbc1, r_pbc2), v, llops):
+///     if r_pbc1.access_set == r_pbc2.access_set:
+///         return v
+///     return NotImplemented
+/// ```
+pub(super) fn pair_multiple_frozen_pbc_multiple_frozen_pbc_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_pbc1 = (r_from as &dyn std::any::Any)
+        .downcast_ref::<MultipleFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_multiple_frozen_pbc_multiple_frozen_pbc_convert_from_to: \
+                 r_from is not MultipleFrozenPBCRepr",
+            )
+        })?;
+    let r_pbc2 = (r_to as &dyn std::any::Any)
+        .downcast_ref::<MultipleFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_multiple_frozen_pbc_multiple_frozen_pbc_convert_from_to: \
+                 r_to is not MultipleFrozenPBCRepr",
+            )
+        })?;
+    // upstream: `if r_pbc1.access_set == r_pbc2.access_set: return v`.
+    // FrozenAttrFamily has no `__eq__`, so Python `==` is identity;
+    // `None == None` is true for the zero-field arm.
+    if frozen_access_set_is(r_pbc1.access_set.as_ref(), r_pbc2.access_set.as_ref()) {
+        return Ok(Some(v.clone()));
+    }
+    Ok(None)
+}
+
+/// RPython `pairtype(SingleFrozenPBCRepr,
+/// MultipleFrozenPBCRepr).convert_from_to` (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((r_pbc1, r_pbc2), v, llops):
+///     frozendesc1 = r_pbc1.frozendesc
+///     access = frozendesc1.queryattrfamily()
+///     if access is r_pbc2.access_set:
+///         value = r_pbc2.convert_desc(frozendesc1)
+///         lltype = r_pbc2.lowleveltype
+///         return Constant(value, lltype)
+///     return NotImplemented
+/// ```
+pub(super) fn pair_single_frozen_pbc_multiple_frozen_pbc_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_pbc1 = (r_from as &dyn std::any::Any)
+        .downcast_ref::<SingleFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_single_frozen_pbc_multiple_frozen_pbc_convert_from_to: \
+                 r_from is not SingleFrozenPBCRepr",
+            )
+        })?;
+    let r_pbc2 = (r_to as &dyn std::any::Any)
+        .downcast_ref::<MultipleFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_single_frozen_pbc_multiple_frozen_pbc_convert_from_to: \
+                 r_to is not MultipleFrozenPBCRepr",
+            )
+        })?;
+    // upstream: `access = frozendesc1.queryattrfamily()`.
+    let access = match &r_pbc1.frozendesc {
+        DescEntry::Frozen(fd) => fd.borrow().queryattrfamily(),
+        _ => None,
+    };
+    // upstream: `if access is r_pbc2.access_set:`.
+    if !frozen_access_set_is(access.as_ref(), r_pbc2.access_set.as_ref()) {
+        return Ok(None);
+    }
+    // upstream: `value = r_pbc2.convert_desc(frozendesc1);
+    //            return Constant(value, r_pbc2.lowleveltype)`.
+    let value = r_pbc2.convert_desc(&r_pbc1.frozendesc)?;
+    Ok(Some(Hlvalue::Constant(value)))
+}
+
+/// RPython `pairtype(MultipleFrozenPBCReprBase,
+/// SingleFrozenPBCRepr).convert_from_to` (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((r_pbc1, r_pbc2), v, llops):
+///     return inputconst(Void, r_pbc2.frozendesc)
+/// ```
+pub(super) fn pair_multiple_frozen_pbc_base_single_frozen_pbc_convert_from_to(
+    r_to: &dyn Repr,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_pbc2 = (r_to as &dyn std::any::Any)
+        .downcast_ref::<SingleFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_multiple_frozen_pbc_base_single_frozen_pbc_convert_from_to: \
+                 r_to is not SingleFrozenPBCRepr",
+            )
+        })?;
+    // upstream: `return inputconst(Void, r_pbc2.frozendesc)`. Void
+    // `_contains_value` accepts any constant; the FrozenDesc object
+    // is the desc's `pyobj` (or None when the desc has no host object).
+    let value = r_pbc2.frozendesc.pyobj_const().unwrap_or(ConstValue::None);
+    let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(&LowLevelType::Void, &value)?;
+    Ok(Some(Hlvalue::Constant(c)))
+}
+
+/// RPython `pairtype(FunctionRepr, MultipleFrozenPBCRepr)
+///                  .convert_from_to` (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((r_fn1, r_frozen2), v, llops):
+///     if r_fn1.s_pbc.is_constant():
+///         value = r_frozen2.convert_const(r_fn1.s_pbc.const)
+///         lltype = r_frozen2.lowleveltype
+///         return Constant(value, lltype)
+///     return NotImplemented
+/// ```
+pub(super) fn pair_function_repr_multiple_frozen_pbc_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_fn1 = (r_from as &dyn std::any::Any)
+        .downcast_ref::<FunctionRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_function_repr_multiple_frozen_pbc_convert_from_to: \
+                 r_from is not FunctionRepr",
+            )
+        })?;
+    // upstream: `if r_fn1.s_pbc.is_constant():` else NotImplemented.
+    if !r_fn1.base.s_pbc.is_constant() {
+        return Ok(None);
+    }
+    let value = r_fn1
+        .base
+        .s_pbc
+        .base
+        .const_box
+        .as_ref()
+        .map(|c| c.value.clone())
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_function_repr_multiple_frozen_pbc_convert_from_to: \
+                 FunctionRepr s_pbc.is_constant() but const_box is missing",
+            )
+        })?;
+    // upstream: `value = r_frozen2.convert_const(r_fn1.s_pbc.const);
+    //            return Constant(value, r_frozen2.lowleveltype)`.
+    let result = r_to.convert_const(&value)?;
+    Ok(Some(Hlvalue::Constant(result)))
+}
+
+/// RPython `pairtype(MethodOfFrozenPBCRepr,
+/// MethodOfFrozenPBCRepr).convert_from_to` (rpbc.py):
+///
+/// ```python
+/// def convert_from_to((r_from, r_to), v, llops):
+///     return pair(r_from.r_im_self, r_to.r_im_self).convert_from_to(v, llops)
+/// ```
+pub(super) fn pair_method_of_frozen_method_of_frozen_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let r_from = (r_from as &dyn std::any::Any)
+        .downcast_ref::<MethodOfFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_method_of_frozen_method_of_frozen_convert_from_to: \
+                 r_from is not MethodOfFrozenPBCRepr",
+            )
+        })?;
+    let r_to = (r_to as &dyn std::any::Any)
+        .downcast_ref::<MethodOfFrozenPBCRepr>()
+        .ok_or_else(|| {
+            TyperError::message(
+                "pair_method_of_frozen_method_of_frozen_convert_from_to: \
+                 r_to is not MethodOfFrozenPBCRepr",
+            )
+        })?;
+    // upstream: `return pair(r_from.r_im_self, r_to.r_im_self)
+    //                    .convert_from_to(v, llops)`.
+    crate::translator::rtyper::pairtype::pair_convert_from_to(
+        r_from.r_im_self.as_ref(),
+        r_to.r_im_self.as_ref(),
+        v,
+        llops,
+    )
+}
+
 pub(super) fn pair_small_function_set_functions_pbc_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
@@ -4584,6 +4818,15 @@ impl Repr for SingleFrozenPBCRepr {
             ConstValue::None,
             LowLevelType::Void,
         ))
+    }
+
+    /// RPython `SingleFrozenPBCRepr.get_ll_eq_function(self)` (rpbc.py):
+    /// `return None` — primitive `==` (Void has no payload).
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &RPythonTyper,
+    ) -> Result<Option<crate::translator::rtyper::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
     }
 
     /// RPython `SingleFrozenPBCRepr.rtype_getattr(_, hop)`
@@ -7867,6 +8110,7 @@ mod pbc_repr_tests {
     use crate::annotator::bookkeeper::Bookkeeper;
     use crate::annotator::description::{DescEntry, FunctionDesc};
     use crate::flowspace::argument::Signature;
+    use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
     use std::cell::RefCell as StdRefCell;
 
     fn make_rtyper() -> (Rc<RPythonAnnotator>, Rc<RPythonTyper>) {
@@ -9154,6 +9398,480 @@ mod pbc_repr_tests {
             unreachable!();
         };
         assert_eq!(p_f._hashable_identity(), p_f2._hashable_identity());
+    }
+
+    fn typed_var(lltype: LowLevelType) -> Hlvalue {
+        use crate::flowspace::model::Variable;
+        let v = Variable::new();
+        v.set_concretetype(Some(lltype));
+        Hlvalue::Variable(v)
+    }
+
+    fn merge_frozen_pair(bk: &Rc<Bookkeeper>, n1: &str, n2: &str) -> (DescEntry, DescEntry) {
+        let f = frozen_entry(bk, n1);
+        let g = frozen_entry(bk, n2);
+        let DescEntry::Frozen(f_rc) = &f else {
+            unreachable!("frozen_entry returns DescEntry::Frozen");
+        };
+        let DescEntry::Frozen(g_rc) = &g else {
+            unreachable!("frozen_entry returns DescEntry::Frozen");
+        };
+        f_rc.borrow()
+            .mergeattrfamilies(&[&g_rc.borrow()])
+            .expect("mergeattrfamilies");
+        (f, g)
+    }
+
+    fn seed_int_attr(entry: &DescEntry, name: &str) {
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        let DescEntry::Frozen(rc) = entry else {
+            unreachable!("seed_int_attr expects Frozen");
+        };
+        let fam = rc.borrow().getattrfamily().unwrap();
+        fam.borrow_mut()
+            .attrs
+            .insert(name.into(), SomeValue::Integer(SomeInteger::default()));
+    }
+
+    fn is_hop(
+        rtyper: &Rc<RPythonTyper>,
+        v1: Hlvalue,
+        v2: Hlvalue,
+        r1: std::sync::Arc<dyn Repr>,
+        r2: std::sync::Arc<dyn Repr>,
+    ) -> crate::translator::rtyper::rtyper::HighLevelOp {
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Bool));
+        let spaceop = SpaceOperation::new(
+            OpKind::Is.opname(),
+            vec![v1.clone(), v2.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v1);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r1));
+        hop.args_v.borrow_mut().push(v2);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r2));
+        hop
+    }
+
+    /// `pairtype(MultipleFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr)
+    /// .convert_from_to` emits `cast_ptr_to_adr`.
+    #[test]
+    fn pair_mf_mu_convert_from_to_emits_cast_ptr_to_adr() {
+        use crate::translator::rtyper::pairtype::pair_convert_from_to;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f, g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let r_mu: std::sync::Arc<dyn Repr> =
+            std::sync::Arc::new(MultipleUnrelatedFrozenPBCRepr::new(&rtyper));
+        let v = typed_var(r_mf.lowleveltype().clone());
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let converted = pair_convert_from_to(r_mf.as_ref(), r_mu.as_ref(), &v, &mut llops)
+            .expect("convert_from_to")
+            .expect("MF × MU must convert");
+        match converted {
+            Hlvalue::Variable(var) => {
+                assert_eq!(var.concretetype(), Some(LowLevelType::Address));
+            }
+            other => panic!("expected Address Variable, got {other:?}"),
+        }
+        assert!(
+            llops.ops.iter().any(|op| op.opname == "cast_ptr_to_adr"),
+            "expected cast_ptr_to_adr, got {:?}",
+            llops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>(),
+        );
+    }
+
+    /// `pairtype(MultipleFrozenPBCRepr, MultipleFrozenPBCRepr)
+    /// .convert_from_to`: same `access_set` is identity; a different
+    /// family is `NotImplemented`.
+    #[test]
+    fn pair_mf_mf_convert_from_to_identity_or_notimplemented() {
+        use crate::translator::rtyper::pairtype::pair_convert_from_to;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f, g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let v = typed_var(r_mf.lowleveltype().clone());
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let same = pair_convert_from_to(r_mf.as_ref(), r_mf.as_ref(), &v, &mut llops)
+            .expect("same access_set must not error")
+            .expect("same access_set is identity");
+        assert_eq!(same, v);
+
+        let (h, i) = merge_frozen_pair(&ann.bookkeeper, "frozen2", "frozen3");
+        let r_other = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![h, i], false)).unwrap();
+        Repr::setup(r_other.as_ref()).expect("setup");
+        let rejected = pair_convert_from_to(r_mf.as_ref(), r_other.as_ref(), &v, &mut llops)
+            .expect("different access_set must not error");
+        assert!(rejected.is_none(), "different access_set is NotImplemented");
+    }
+
+    /// `pairtype(SingleFrozenPBCRepr, MultipleFrozenPBCRepr)
+    /// .convert_from_to`: matching access materialises
+    /// `convert_desc`; a mismatch is `NotImplemented`.
+    #[test]
+    fn pair_single_mf_convert_from_to_matching_access_or_notimplemented() {
+        use crate::translator::rtyper::pairtype::pair_convert_from_to;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f.clone(), g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let r_single: std::sync::Arc<dyn Repr> =
+            std::sync::Arc::new(SingleFrozenPBCRepr::new(f.clone()));
+        let v = typed_var(LowLevelType::Void);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let converted = pair_convert_from_to(r_single.as_ref(), r_mf.as_ref(), &v, &mut llops)
+            .expect("matching access must not error")
+            .expect("matching access converts via convert_desc");
+        let Hlvalue::Constant(c) = converted else {
+            panic!("Single × MF matching access yields a Constant");
+        };
+        assert_eq!(c.concretetype.as_ref(), Some(r_mf.lowleveltype()));
+        assert!(matches!(c.value, ConstValue::LLPtr(_)));
+
+        let (h, i) = merge_frozen_pair(&ann.bookkeeper, "frozen2", "frozen3");
+        let r_other = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![h, i], false)).unwrap();
+        Repr::setup(r_other.as_ref()).expect("setup");
+        let rejected = pair_convert_from_to(r_single.as_ref(), r_other.as_ref(), &v, &mut llops)
+            .expect("mismatched access must not error");
+        assert!(
+            rejected.is_none(),
+            "mismatched queryattrfamily is NotImplemented"
+        );
+    }
+
+    /// `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)
+    /// .convert_from_to` is `inputconst(Void, r_pbc2.frozendesc)`,
+    /// reached from both Multiple subclasses via the Base MRO tag.
+    #[test]
+    fn pair_base_single_convert_from_to_void_constant() {
+        use crate::translator::rtyper::pairtype::pair_convert_from_to;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (ann, rtyper) = make_rtyper();
+        let f = frozen_entry(&ann.bookkeeper, "frozen0");
+        let r_single: std::sync::Arc<dyn Repr> =
+            std::sync::Arc::new(SingleFrozenPBCRepr::new(f.clone()));
+        let expected = f.pyobj_const().unwrap_or(ConstValue::None);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+
+        let r_mu: std::sync::Arc<dyn Repr> =
+            std::sync::Arc::new(MultipleUnrelatedFrozenPBCRepr::new(&rtyper));
+        let v_mu = typed_var(LowLevelType::Address);
+        let from_mu = pair_convert_from_to(r_mu.as_ref(), r_single.as_ref(), &v_mu, &mut llops)
+            .expect("MU × Single")
+            .expect("Base × Single converts");
+        let Hlvalue::Constant(c_mu) = from_mu else {
+            panic!("Base × Single yields a Void Constant");
+        };
+        assert_eq!(c_mu.concretetype, Some(LowLevelType::Void));
+        assert_eq!(c_mu.value, expected);
+
+        let (a, b) = merge_frozen_pair(&ann.bookkeeper, "frozen1", "frozen2");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![a, b], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let v_mf = typed_var(r_mf.lowleveltype().clone());
+        let from_mf = pair_convert_from_to(r_mf.as_ref(), r_single.as_ref(), &v_mf, &mut llops)
+            .expect("MF × Single")
+            .expect("Base × Single converts");
+        let Hlvalue::Constant(c_mf) = from_mf else {
+            panic!("Base × Single yields a Void Constant");
+        };
+        assert_eq!(c_mf.concretetype, Some(LowLevelType::Void));
+        assert_eq!(c_mf.value, expected);
+    }
+
+    /// `pairtype(FunctionRepr, MultipleFrozenPBCRepr).convert_from_to`:
+    /// a constant FunctionRepr converts via `convert_const`; a
+    /// non-constant FunctionRepr is `NotImplemented`.
+    #[test]
+    fn pair_function_repr_mf_convert_from_to_constant_or_notimplemented() {
+        use crate::translator::rtyper::pairtype::pair_convert_from_to;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (ann, rtyper) = make_rtyper();
+        let f = function_entry(&ann.bookkeeper, "f");
+        let g = function_entry(&ann.bookkeeper, "g");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f.clone(), g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let v = typed_var(LowLevelType::Void);
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+
+        let r_fn = FunctionRepr::new(&rtyper, SomePBC::new(vec![f.clone()], false)).unwrap();
+        assert!(
+            !r_fn.base().s_pbc.is_constant(),
+            "function_entry has no pyobj, so SomePBC is not constant"
+        );
+        let rejected = pair_convert_from_to(r_fn.as_ref(), r_mf.as_ref(), &v, &mut llops)
+            .expect("non-constant FunctionRepr must not error");
+        assert!(rejected.is_none());
+
+        let mut s_const = SomePBC::new(vec![f], false);
+        s_const.base.const_box = Some(Constant::new(ConstValue::None));
+        let r_fn_const = FunctionRepr::new(&rtyper, s_const).unwrap();
+        let converted = pair_convert_from_to(r_fn_const.as_ref(), r_mf.as_ref(), &v, &mut llops)
+            .expect("constant FunctionRepr must not error")
+            .expect("constant FunctionRepr converts via convert_const");
+        let Hlvalue::Constant(c) = converted else {
+            panic!("FunctionRepr × MF constant arm yields a Constant");
+        };
+        assert_eq!(c.concretetype.as_ref(), Some(r_mf.lowleveltype()));
+        let ConstValue::LLPtr(p) = &c.value else {
+            panic!("AccessNone convert_const(None) is the null instance");
+        };
+        assert!(
+            matches!(
+                p._obj0,
+                crate::translator::rtyper::lltypesystem::lltype::PtrObj::Null
+            ),
+            "convert_const(None) is nullptr(pbc_type)"
+        );
+    }
+
+    /// `pairtype(MethodOfFrozenPBCRepr, MethodOfFrozenPBCRepr)
+    /// .convert_from_to` delegates to `pair(r_im_self, r_im_self)`.
+    #[test]
+    fn pair_method_of_frozen_convert_from_to_delegates_to_im_self() {
+        use crate::translator::rtyper::pairtype::pair_convert_from_to;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let (ann, rtyper) = make_rtyper();
+        let Some(fd) = function_entry(&ann.bookkeeper, "f").as_function() else {
+            unreachable!()
+        };
+        let mof1 = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
+        let mof2 = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen1");
+        let r_from =
+            MethodOfFrozenPBCRepr::new(&rtyper, SomePBC::new(vec![mof1.clone()], false)).unwrap();
+        let r_to =
+            MethodOfFrozenPBCRepr::new(&rtyper, SomePBC::new(vec![mof1, mof2], false)).unwrap();
+        Repr::setup(r_to.r_im_self.as_ref()).expect("setup r_im_self");
+        assert_eq!(r_from.r_im_self.class_name(), "SingleFrozenPBCRepr");
+        assert_eq!(r_to.r_im_self.class_name(), "MultipleFrozenPBCRepr");
+        let v = typed_var(r_from.lowleveltype().clone());
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let converted = pair_convert_from_to(&r_from, &r_to, &v, &mut llops)
+            .expect("MethodOfFrozen convert_from_to")
+            .expect("delegates to Single × MF convert");
+        let Hlvalue::Constant(c) = converted else {
+            panic!("Single r_im_self × MF r_im_self yields a Constant");
+        };
+        assert_eq!(c.concretetype.as_ref(), Some(r_to.lowleveltype()));
+        assert!(matches!(c.value, ConstValue::LLPtr(_)));
+    }
+
+    /// `pairtype(Repr, Repr).rtype_is_` on two `MultipleFrozenPBCRepr`
+    /// values of the same Ptr type emits `ptr_eq`.
+    #[test]
+    fn pair_mf_mf_rtype_is_emits_ptr_eq() {
+        use crate::translator::rtyper::pairtype::pair_rtype_is_;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f, g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let v1 = typed_var(r_mf.lowleveltype().clone());
+        let v2 = typed_var(r_mf.lowleveltype().clone());
+        let hop = is_hop(&rtyper, v1, v2, r_mf.clone(), r_mf.clone());
+        let result = pair_rtype_is_(r_mf.as_ref(), r_mf.as_ref(), &hop)
+            .expect("rtype_is_")
+            .expect("ptr_eq result");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "ptr_eq"),
+            "expected ptr_eq, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>(),
+        );
+        match result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Bool)),
+            other => panic!("expected Bool Variable, got {other:?}"),
+        }
+    }
+
+    /// `pairtype(SingleFrozenPBCRepr, MultipleFrozenPBCRepr)` `is_`
+    /// Void-adopts the MF Ptr, converts the Single operand via the new
+    /// convert arm, then emits `ptr_eq`.
+    #[test]
+    fn pair_single_mf_rtype_is_converts_then_ptr_eq() {
+        use crate::translator::rtyper::pairtype::pair_rtype_is_;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f.clone(), g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let r_single: std::sync::Arc<dyn Repr> = std::sync::Arc::new(SingleFrozenPBCRepr::new(f));
+        let v1 = typed_var(LowLevelType::Void);
+        let v2 = typed_var(r_mf.lowleveltype().clone());
+        let hop = is_hop(&rtyper, v1, v2, r_single.clone(), r_mf.clone());
+        let result = pair_rtype_is_(r_single.as_ref(), r_mf.as_ref(), &hop)
+            .expect("rtype_is_")
+            .expect("ptr_eq result");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "ptr_eq"),
+            "expected ptr_eq, got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>(),
+        );
+        match result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Bool)),
+            other => panic!("expected Bool Variable, got {other:?}"),
+        }
+    }
+
+    /// Mixed MF × MU `is_`: `inputargs` on the MU pair converts the MF
+    /// operand via `cast_ptr_to_adr`, then `adr_eq`.
+    #[test]
+    fn pair_mf_mu_rtype_is_emits_cast_ptr_to_adr_then_adr_eq() {
+        use crate::translator::rtyper::pairtype::pair_rtype_is_;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f, g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+        let r_mu: std::sync::Arc<dyn Repr> =
+            std::sync::Arc::new(MultipleUnrelatedFrozenPBCRepr::new(&rtyper));
+        let v1 = typed_var(r_mf.lowleveltype().clone());
+        let v2 = typed_var(LowLevelType::Address);
+        let hop = is_hop(&rtyper, v1, v2, r_mf.clone(), r_mu.clone());
+        let result = pair_rtype_is_(r_mu.as_ref(), r_mu.as_ref(), &hop)
+            .expect("rtype_is_")
+            .expect("adr_eq result");
+        let ops = hop.llops.borrow();
+        let names: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            names.contains(&"cast_ptr_to_adr"),
+            "MF operand converts via cast_ptr_to_adr, got {names:?}"
+        );
+        assert!(
+            names.contains(&"adr_eq"),
+            "MU rtype_is_ emits adr_eq, got {names:?}"
+        );
+        match result {
+            Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Bool)),
+            other => panic!("expected Bool Variable, got {other:?}"),
+        }
+    }
+
+    /// `SingleFrozenPBCRepr.get_ll_eq_function` returns `None`.
+    #[test]
+    fn single_frozen_pbc_repr_get_ll_eq_function_is_none() {
+        let (ann, rtyper) = make_rtyper();
+        let f = frozen_entry(&ann.bookkeeper, "frozen0");
+        let r = SingleFrozenPBCRepr::new(f);
+        let eq = r.get_ll_eq_function(&rtyper).expect("get_ll_eq_function");
+        assert!(eq.is_none());
+    }
+
+    /// `MultipleFrozenPBCRepr.rtype_getattr` on a shared access-set
+    /// attr of a non-constant result emits `getfield` of `pbc_<attr>`.
+    #[test]
+    fn multiple_frozen_pbc_repr_rtype_getattr_emits_getfield_of_mangled_attr() {
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = make_rtyper();
+        let (f, g) = merge_frozen_pair(&ann.bookkeeper, "frozen0", "frozen1");
+        seed_int_attr(&f, "x");
+        let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f, g], false)).unwrap();
+        Repr::setup(r_mf.as_ref()).expect("setup");
+
+        let v_pbc = typed_var(r_mf.lowleveltype().clone());
+        let spaceop = SpaceOperation::new(
+            OpKind::GetAttr.opname(),
+            vec![
+                v_pbc.clone(),
+                Hlvalue::Constant(Constant::with_concretetype(
+                    ConstValue::byte_str("x"),
+                    LowLevelType::Void,
+                )),
+            ],
+            Hlvalue::Variable(Variable::new()),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_pbc);
+        hop.args_s.borrow_mut().push(SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_mf.clone()));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("x"),
+                LowLevelType::Void,
+            )));
+        let mut s_attr = SomeString::default();
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
+        hop.args_s.borrow_mut().push(SomeValue::String(s_attr));
+        hop.args_r.borrow_mut().push(None);
+        hop.s_result
+            .replace(Some(SomeValue::Integer(SomeInteger::default())));
+        hop.r_result
+            .replace(Some(signed_repr() as std::sync::Arc<dyn Repr>));
+
+        let out = r_mf
+            .rtype_getattr(&hop)
+            .expect("rtype_getattr")
+            .expect("non-empty result");
+        let Hlvalue::Variable(_) = out else {
+            panic!("non-const getattr returns a Variable");
+        };
+        let ops = hop.llops.borrow();
+        let getfield = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "getfield")
+            .expect("getfield of pbc_x");
+        let Hlvalue::Constant(field) = &getfield.args[1] else {
+            panic!("getfield arg[1] is the mangled field name");
+        };
+        assert_eq!(field.value, ConstValue::byte_str("pbc_x"));
+        assert_eq!(field.concretetype, Some(LowLevelType::Void));
+    }
+
+    /// `MultipleFrozenPBCRepr.convert_const(None)` is `null_instance`
+    /// (`nullptr(pbc_type)`).
+    #[test]
+    fn multiple_frozen_pbc_repr_convert_const_none_returns_null_instance() {
+        let (ann, rtyper) = make_rtyper();
+        let f = frozen_entry(&ann.bookkeeper, "frozen0");
+        let r = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![f], true)).unwrap();
+        assert_eq!(r.class_name(), "MultipleFrozenPBCRepr");
+        let c = r.convert_const(&ConstValue::None).unwrap();
+        assert_eq!(c.concretetype.as_ref(), Some(r.lowleveltype()));
+        let ConstValue::LLPtr(p) = &c.value else {
+            panic!("null_instance is an LLPtr, got {:?}", c.value);
+        };
+        assert!(
+            matches!(
+                p._obj0,
+                crate::translator::rtyper::lltypesystem::lltype::PtrObj::Null
+            ),
+            "convert_const(None) is nullptr(pbc_type)"
+        );
     }
 
     #[test]

@@ -3274,10 +3274,11 @@ pub fn rtyper_makerepr(
                 r_container.make_iterator_repr(&s_iter.variant, foldable)
             }
         }
-        // rpbc.py — SomePBC.rtyper_makerepr. Only the degenerate
-        // single-FunctionDesc / can_be_None=False branch is ported
-        // today; the remaining arms surface as
-        // `MissingRTypeOperation` from [`somepbc_rtyper_makerepr`].
+        // rpbc.py — SomePBC.rtyper_makerepr. Frozen-kind and uncallable
+        // Function-kind SomePBCs go through `getFrozenPBCRepr`
+        // (`SingleFrozenPBCRepr` / `MultipleFrozenPBCRepr` /
+        // `MultipleUnrelatedFrozenPBCRepr`); Class / Method /
+        // MethodOfFrozen take their own reprs.
         SomeValue::PBC(s_pbc) => {
             let self_rc = rtyper.self_rc()?;
             crate::translator::rtyper::rpbc::somepbc_rtyper_makerepr(s_pbc, &self_rc)

@@ -435,10 +435,10 @@ pub struct RPythonTyper {
     /// RPython `self.primitive_to_repr = {}` (`rtyper.py`).
     pub primitive_to_repr: RefCell<HashMap<LowLevelType, Arc<dyn Repr>>>,
     /// RPython `self.pbc_reprs = {}` (`rtyper.py`, populated by
-    /// `rpbc.getFrozenPBCRepr` at rpbc.py). Keyed by
+    /// `rpbc.getFrozenPBCRepr`). Keyed by
     /// [`PbcReprKey`] — singleton cache for
     /// [`crate::translator::rtyper::rpbc::MultipleUnrelatedFrozenPBCRepr`]
-    /// (and future `MultipleFrozenPBCRepr`).
+    /// and [`crate::translator::rtyper::rpbc::MultipleFrozenPBCRepr`].
     pub pbc_reprs: RefCell<HashMap<PbcReprKey, Arc<dyn Repr>>>,
     /// RPython `self.annmixlevel = None` (rtyper.py) lazily filled
     /// by [`RPythonTyper::getannmixlevel`] (rtyper.py). Reset to
