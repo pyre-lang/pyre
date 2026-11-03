@@ -726,11 +726,12 @@ pub struct ObjSpace {
     /// `setattr(self, 'w_' + typedef.name, w_type)` for each builtin type.
     w_object: SpaceAttr,
     w_type: SpaceAttr,
-    /// `space.w_BaseException` and `space.w_TypeError`:
+    /// `space.w_BaseException`, `space.w_TypeError`, `space.w_AttributeError`:
     /// `ObjSpace.export_builtin_exceptions` does
     /// `setattr(self, "w_" + excname, w_exc)`.
     w_base_exception: SpaceAttr,
     w_type_error: SpaceAttr,
+    w_attribute_error: SpaceAttr,
     /// Captured builtin `__lazy_import__`, the sibling of
     /// `space.w_default_importlib_import`.
     w_default_lazy_import: SpaceAttr,
@@ -750,6 +751,7 @@ impl ObjSpace {
         w_type: SpaceAttr::new(),
         w_base_exception: SpaceAttr::new(),
         w_type_error: SpaceAttr::new(),
+        w_attribute_error: SpaceAttr::new(),
         w_default_lazy_import: SpaceAttr::new(),
     };
 
@@ -802,6 +804,11 @@ impl ObjSpace {
         self.w_type_error.get()
     }
 
+    /// `space.w_AttributeError`; null before the exception is registered.
+    pub fn w_attribute_error(&self) -> PyObjectRef {
+        self.w_attribute_error.get()
+    }
+
     /// The `setattr(self, 'w_' + typedef.name, w_type)` of
     /// `StdObjSpace.initialize` for `object` and `type`.
     pub(crate) fn set_w_object(&self, w_object: PyObjectRef) {
@@ -818,6 +825,7 @@ impl ObjSpace {
         let attr = match excname {
             "BaseException" => &self.w_base_exception,
             "TypeError" => &self.w_type_error,
+            "AttributeError" => &self.w_attribute_error,
             _ => return,
         };
         attr.set(w_exc);
@@ -836,6 +844,7 @@ impl ObjSpace {
             w_type: SpaceAttr::new(),
             w_base_exception: SpaceAttr::new(),
             w_type_error: SpaceAttr::new(),
+            w_attribute_error: SpaceAttr::new(),
             w_default_lazy_import: SpaceAttr::new(),
         });
         OBJECT_SPACE_ROOTS
@@ -858,6 +867,7 @@ impl ObjSpace {
         self.w_type.walk(forward);
         self.w_base_exception.walk(forward);
         self.w_type_error.walk(forward);
+        self.w_attribute_error.walk(forward);
         self.sys_state.walk_roots(forward);
         self.w_default_lazy_import.walk(forward);
         self.fromcache.visit_values_mut(|cache| match cache {
@@ -1112,8 +1122,14 @@ fn cached_base_exception() -> Option<PyObjectRef> {
 }
 
 /// `space.w_TypeError`, set the same way as [`cached_base_exception`].
-fn cached_type_error() -> Option<PyObjectRef> {
+pub(crate) fn cached_type_error() -> Option<PyObjectRef> {
     let cls = object_space().w_type_error();
+    if cls.is_null() { None } else { Some(cls) }
+}
+
+/// `space.w_AttributeError`, set the same way as [`cached_base_exception`].
+pub(crate) fn cached_attribute_error() -> Option<PyObjectRef> {
+    let cls = object_space().w_attribute_error();
     if cls.is_null() { None } else { Some(cls) }
 }
 

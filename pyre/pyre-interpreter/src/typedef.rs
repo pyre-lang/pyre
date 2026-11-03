@@ -33028,6 +33028,26 @@ fn set_intersect_update(
     }
 }
 
+/// `W_BaseSetObject.descr_intersection`: `e.match(space, space.w_TypeError)`
+/// or `e.match(space, space.w_AttributeError)`.
+fn set_intersection_len_absorbed(err: &mut crate::PyError) -> bool {
+    if let Some(w_type_error) = crate::baseobjspace::cached_type_error() {
+        if err.match_(pyre_object::PY_NULL, w_type_error) {
+            return true;
+        }
+    } else if err.kind == crate::PyErrorKind::TypeError {
+        return true;
+    }
+    if let Some(w_attr_error) = crate::baseobjspace::cached_attribute_error() {
+        if err.match_(pyre_object::PY_NULL, w_attr_error) {
+            return true;
+        }
+    } else if err.kind == crate::PyErrorKind::AttributeError {
+        return true;
+    }
+    false
+}
+
 /// `setobject.py W_BaseSetObject.descr_intersection` — the shortest
 /// operand seeds the result and the rest are intersected into it. Length is
 /// measured on the operands as given, before any is turned into a set, so an
@@ -33057,13 +33077,12 @@ pub(crate) fn set_method_intersection(
     for i in 0..args.len() {
         let length = match crate::baseobjspace::len_w(operand_roots.get(operand_base + i)) {
             Ok(length) => length,
-            Err(e)
-                if e.kind == crate::PyErrorKind::TypeError
-                    || e.kind == crate::PyErrorKind::AttributeError =>
-            {
-                continue;
+            Err(mut e) => {
+                if set_intersection_len_absorbed(&mut e) {
+                    continue;
+                }
+                return Err(e);
             }
-            Err(e) => return Err(e),
         };
         if startlength == -1 || length < startlength {
             startindex = i;
