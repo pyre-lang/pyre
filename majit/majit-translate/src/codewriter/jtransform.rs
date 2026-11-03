@@ -1715,6 +1715,15 @@ fn lltype_is_gc(tp: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTy
     }
 }
 
+/// `history.getkind` of a `Ptr` whose `TO._gckind` is not `'gc'` is
+/// `'int'` (`rclass.py getgcflavor`). The rtyper writes that `Ptr` onto
+/// the result; restamping it to `OBJECT` would make `_is_gc` true.
+fn result_lltype_is_raw_ptr(var: &crate::flowspace::model::Variable) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    var.concretetype()
+        .is_some_and(|ct| matches!(ct, LowLevelType::Ptr(_)) && !lltype_is_gc(&ct))
+}
+
 /// A flow-graph `Constant` (`jtransform.py` `isinstance(v, Constant)`).
 ///
 /// The frontend materialises source constants as SSA Variables produced by
@@ -4237,6 +4246,33 @@ impl<'a> Transformer<'a> {
             }),
             _ => false,
         }
+    }
+
+    /// A GC-owner field whose MIR type is a GC pointer stays in the ref
+    /// bank. `rewrite_op_getfield` restamps a raw STRUCT load from an
+    /// Int base as Int (`getfield_raw_i`); a Signed base on a GC owner is
+    /// a mis-banked pointer `promote_gc_field_bases` rehomes, not a raw
+    /// struct. `history.getkind` of a GC `Ptr` is `"ref"`.
+    ///
+    /// A rtyper-written `Ptr` whose `TO._gckind` is raw is already int
+    /// (`rclass.py getgcflavor` / `history.getkind`). Isolated
+    /// `transform_graph` has `callcontrol is None` (`jtransform.py
+    /// Transformer.get_vinfo`), so [`Self::flavor_raw_ref_is_int_banked`]
+    /// cannot see the harvest; the lltype is the same fact.
+    fn gc_pointer_field_stays_ref(
+        &self,
+        field: &FieldDescriptor,
+        ty: &ValueType,
+        result: Option<&crate::flowspace::model::Variable>,
+    ) -> bool {
+        if result.is_some_and(result_lltype_is_raw_ptr) {
+            return false;
+        }
+        matches!(
+            ty,
+            ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+        ) && !self.flavor_raw_ref_is_int_banked(ty)
+            && crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
     }
 
     /// `jtransform.py Transformer.rewrite_op_malloc` reads `d['flavor']`
@@ -9394,6 +9430,12 @@ impl<'a> Transformer<'a> {
         // word into the int bank so assemble emits `getfield_raw_i`.
         // Immutable fields already returned `_pure` above
         // (`MapNodeTerminatorView.w_cls`).
+        //
+        // A GC owner with a Signed base is not that raw-struct arm:
+        // `promote_gc_field_bases` rehomes the base (`cast_int_to_ptr` /
+        // stamp). Stamping the loaded GC pointer Int puts it in the
+        // caller's `args_i` while the callee jitcode still banks it as
+        // Ref (`ObjectKey.obj` → `dict_entries_probe_hashed`).
         if let OpKind::FieldRead { base, pure, .. } = &op.kind
             && !*pure
             && self.get_value_kind_var(base) == 'i'
@@ -9402,21 +9444,33 @@ impl<'a> Transformer<'a> {
                 .as_ref()
                 .is_some_and(|r| self.get_value_kind_var(r) == 'r')
         {
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::FieldRead {
-                    base: base.clone(),
-                    field: field.clone(),
-                    ty: ValueType::Int,
-                    pure: false,
-                },
-            }]);
+            if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref()) {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+            } else {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::FieldRead {
+                        base: base.clone(),
+                        field: field.clone(),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                }]);
+            }
         }
         if &typed_ty != ty {
             let OpKind::FieldRead { base, pure, .. } = &op.kind else {
                 return RewriteResult::Keep;
             };
+            // rtyper may have typed a `*mut PyObject` field as Signed.
+            // `history.getkind` of that GC pointer is still `"ref"`.
+            if self.gc_pointer_field_stays_ref(field, ty, op.result.as_ref())
+                && matches!(typed_ty, ValueType::Int | ValueType::Unsigned)
+            {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), ty);
+                return RewriteResult::Keep;
+            }
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::FieldRead {
@@ -20115,6 +20169,203 @@ mod tests {
             !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
             "raw pointer field must not assemble getfield_raw_r, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `ObjectKey.obj` is a GC pointer. A Signed base is a mis-banked
+    /// GC address (`promote_gc_field_bases` rehomes it). The loaded
+    /// word stays Ref so a later `inline_call` puts it in `args_r`.
+    #[test]
+    fn gc_pointer_field_from_int_base_stays_in_the_ref_bank() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::FieldDescriptor;
+
+        let owner = "dictmultiobject::ObjectKey";
+        let mut graph = FunctionGraph::new("lookup_object_key_obj");
+        let key = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, key.clone());
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(obj.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let (ty, result) = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "obj" => {
+                    Some((ty.clone(), op.result.clone()))
+                }
+                _ => None,
+            })
+            .expect("obj FieldRead");
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "GC pointer field must keep Ref ty, got {ty:?}"
+        );
+        let result = result.expect("obj FieldRead has a result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::GcRef,
+            "GC pointer field must stay in the ref bank"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj),
+            ConcreteType::GcRef,
+            "the original result cell is the same pointer"
+        );
+    }
+
+    /// rtyper may have typed `*mut PyObject` as Signed. The MIR field
+    /// type is still a GC pointer; do not overlay Int onto it.
+    #[test]
+    fn gc_pointer_field_with_signed_cell_stays_in_the_ref_bank() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::FieldDescriptor;
+
+        let owner = "dictmultiobject::ObjectKey";
+        let mut graph = FunctionGraph::new("lookup_object_key_obj_signed");
+        let key = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, key.clone());
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&obj, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(obj.clone()));
+
+        let out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let (ty, result) = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name == "obj" => {
+                    Some((ty.clone(), op.result.clone()))
+                }
+                _ => None,
+            })
+            .expect("obj FieldRead");
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "GC pointer field must keep Ref ty, got {ty:?}"
+        );
+        let result = result.expect("obj FieldRead has a result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::GcRef,
+            "a Signed rtyper cell on a GC pointer field is restamped Ref"
+        );
+    }
+
+    /// Parent of `dict_entries_probe_hashed`: hash stays Int, obj is
+    /// Ref, so `make_three_lists` yields I[hash] R[entries, obj].
+    #[test]
+    fn gc_pointer_field_from_int_base_enters_the_call_ref_list() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::{CallTarget, FieldDescriptor, LinkArg};
+
+        let owner = "dictmultiobject::ObjectKey";
+        let mut graph = FunctionGraph::new("w_dict_lookup_probe_hashed");
+        let key = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let entries = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.push_inputarg_var(graph.startblock, key.clone());
+        graph.push_inputarg_var(graph.startblock, entries.clone());
+        let hash = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key.clone(),
+                    field: FieldDescriptor::new("hash", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&hash, ConcreteType::Signed);
+        let obj = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: key,
+                    field: FieldDescriptor::new("obj", Some(owner.into()))
+                        .with_owner_declared_gc(Some(true)),
+                    ty: ValueType::Ref(Some("pyobject::PyObject".into())),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let probed = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["dict_entries_probe_hashed"]),
+                    args: vec![
+                        LinkArg::Value(entries.clone()),
+                        LinkArg::Value(hash.clone()),
+                        LinkArg::Value(obj.clone()),
+                    ],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(probed));
+
+        let _out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&hash),
+            ConcreteType::Signed,
+            "ObjectKey.hash stays in the int bank"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&obj),
+            ConcreteType::GcRef,
+            "ObjectKey.obj stays in the ref bank so make_three_lists puts it in args_r"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&entries),
+            ConcreteType::GcRef
+        );
+        let kinds: String = [&entries, &hash, &obj]
+            .into_iter()
+            .map(|var| match FunctionGraph::concretetype_of(var) {
+                ConcreteType::Signed => 'i',
+                ConcreteType::GcRef => 'r',
+                ConcreteType::Float => 'f',
+                ConcreteType::Void => 'v',
+                ConcreteType::Unknown => '?',
+            })
+            .collect();
+        assert_eq!(
+            kinds, "rir",
+            "probe_hashed args are entries, hash, obj → I[hash] R[entries, obj]"
         );
     }
 
