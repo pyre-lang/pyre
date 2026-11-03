@@ -88,20 +88,12 @@ impl Descr for WasmFailDescr {
 }
 
 impl FailDescr for WasmFailDescr {
-    fn fail_index(&self) -> u32 {
-        self.fail_index
-    }
-
     fn fail_arg_types(&self) -> &[Type] {
         &self.fail_arg_types
     }
 
     fn is_finish(&self) -> bool {
         self.is_finish
-    }
-
-    fn trace_id(&self) -> u64 {
-        self.trace_id
     }
 }
 
@@ -353,7 +345,6 @@ mod tests {
         let descr: majit_ir::DescrRef = Arc::new(majit_backend::PropagateExceptionDescr::new());
         let fd = descr.as_fail_descr().expect("fail descr");
         assert!(!fd.is_finish());
-        assert_eq!(fd.fail_index(), u32::MAX);
         assert_eq!(
             majit_backend::propagate_exception_handle_fail(fd, 0x42),
             Some(0x42)

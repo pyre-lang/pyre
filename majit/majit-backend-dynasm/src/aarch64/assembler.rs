@@ -1053,9 +1053,9 @@ pub struct CompiledCode {
     pub entry_offset: AssemblyOffset,
     /// Fail descriptors for guards + FINISH ops.
     /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
-    /// contract (compile.py record_loop_or_bridge). Position
-    /// equals `descr.fail_index` by an invariant asserted at conversion
-    /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
+    /// contract (`compile.py` `record_loop_or_bridge`). A guard is
+    /// identified by the descr object (`compute_unique_id(faildescr)` /
+    /// `descr_identity`).
     pub fail_descrs: std::sync::Arc<FailDescrStore>,
     /// Input argument types.
     pub input_types: Vec<Type>,
@@ -2268,15 +2268,10 @@ impl<'a> AssemblerARM64<'a> {
         Self::fixup_target_tokens(tokens, frame_depth, rawstart);
         buffer.make_executable()?;
 
-        // Position is the canonical fail_index identity (matching
-        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
-        // carry per-emission `fail_index` on the descr itself).  Codegen
-        // increments the `fail_index` counter in lockstep with
-        // `fail_descrs.push`, so the contract is structural rather than
-        // descr-internal.  The earlier per-descr assertion was a pyre
-        // Deviation removed: singleton FINISH
-        // descrs (`compile.py:623-662`) answer the trait-default `0`
-        // for `fail_index_per_trace()` regardless of their Vec position.
+        // A guard is identified by its descr object
+        // (`compute_unique_id(faildescr)` / `descr_identity`). Codegen
+        // pushes each guard's descr into `fail_descrs` in emission
+        // order (`assembler.py` `_allgcrefs`).
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
@@ -2427,15 +2422,10 @@ impl<'a> AssemblerARM64<'a> {
             eprintln!();
         }
 
-        // Position is the canonical fail_index identity (matching
-        // `llsupport/assembler.py`'s `_allgcrefs` index — PyPy does not
-        // carry per-emission `fail_index` on the descr itself).  Codegen
-        // increments the `fail_index` counter in lockstep with
-        // `fail_descrs.push`, so the contract is structural rather than
-        // descr-internal.  The earlier per-descr assertion was a pyre
-        // Deviation removed: singleton FINISH
-        // descrs (`compile.py:623-662`) answer the trait-default `0`
-        // for `fail_index_per_trace()` regardless of their Vec position.
+        // A guard is identified by its descr object
+        // (`compute_unique_id(faildescr)` / `descr_identity`). Codegen
+        // pushes each guard's descr into `fail_descrs` in emission
+        // order (`assembler.py` `_allgcrefs`).
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
@@ -2576,7 +2566,6 @@ impl<'a> AssemblerARM64<'a> {
         op_index: usize,
         arglocs: &[Loc],
         result_loc: Option<&Loc>,
-        fail_index: u32,
         ops: &[OpRc],
     ) {
         // Only an ADJACENT comparison/guard pair may share NZCV; anything
@@ -3732,7 +3721,7 @@ impl<'a> AssemblerARM64<'a> {
                         | OpCode::CallReleaseGilF
                         | OpCode::CallReleaseGilN
                 ) {
-                    self._store_force_index_if_next_guard(ops, op_index, fail_index);
+                    self._store_force_index_if_next_guard(ops, op_index);
                 }
                 if is_math_sqrt {
                     // opassembler.py `math_sqrt`: FSQRT_dd(res, arg).
@@ -3759,7 +3748,7 @@ impl<'a> AssemblerARM64<'a> {
                 // assembler.py _store_force_index parity:
                 // store next GUARD_NOT_FORCED's descr ptr to jf_force_descr
                 // BEFORE the call, so forcing code knows which guard to resume.
-                self._store_force_index_if_next_guard(ops, op_index, fail_index);
+                self._store_force_index_if_next_guard(ops, op_index);
                 self.genop_call_assembler(op, arglocs, result_loc);
             }
             OpCode::CondCallN => self.genop_discard_cond_call(op, arglocs),
@@ -4972,25 +4961,12 @@ impl<'a> AssemblerARM64<'a> {
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
         // that was written to jf_force_descr.
-        // Stamp the per-trace fail_index and trace_id onto the metainterp
-        // ResumeGuardDescr (`op.descr`).  See x86 counterpart for rationale:
-        // routing the writes through the trait at codegen time lets readers
-        // consume the canonical metainterp identity before
-        // `stamp_guard_descr_trace_positions` (`compile.rs`) re-stamps.
-        if let Some(d) = op.getdescr()
-            && (d.is_resume_guard() || d.is_resume_guard_copied())
-            && let Some(fd) = d.as_fail_descr()
-        {
-            fd.set_fail_index_per_trace(fail_index);
-            fd.set_trace_id(self.trace_id);
-        }
         let descr: majit_ir::DescrRef = if let Some(pre) = self.pending_force_descr.take() {
             pre
         } else if let Some(d) = op.getdescr() {
             // Guard exit — `compile.py` ResumeGuardDescr family.
             // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
-            // directly; per-trace fail_index / trace_id were stamped
-            // above.  Refresh the descr's `fail_arg_types` slot when the
+            // directly.  Refresh the descr's `fail_arg_types` slot when the
             // inferred list disagrees: `store_final_boxes_in_guard` is
             // supposed to keep it in sync, but test scaffolds and earlier
             // optimizer paths can leave it empty.  The GC map below
@@ -5007,15 +4983,10 @@ impl<'a> AssemblerARM64<'a> {
         } else {
             // Test scaffold: tests synthesise guard ops without op.descr.
             // Mint a fresh metainterp ResumeGuardDescr to carry the
-            // codegen-time identity (fail_index / trace_id / fail_arg_types).
-            let fresh = majit_backend::make_resume_guard_descr_typed(
+            // codegen-time identity (`descr_identity` / fail_arg_types).
+            majit_backend::make_resume_guard_descr_typed(
                 self.infer_fail_arg_types(op, Some(op_index)).into_vec(),
-            );
-            if let Some(fd) = fresh.as_fail_descr() {
-                fd.set_fail_index_per_trace(fail_index);
-                fd.set_trace_id(self.trace_id);
-            }
-            fresh
+            )
         };
         let descr_fd = descr.as_fail_descr().expect("guard descr is FailDescr");
         if crate::majit_log_enabled() {
@@ -5882,7 +5853,7 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py _store_force_index: before a call that may force,
     /// store the next GUARD_NOT_FORCED's fail descr ptr to jf_force_descr,
     /// and zero jf_descr so GUARD_NOT_FORCED's CMP [jf_descr], 0 starts clean.
-    fn _store_force_index_if_next_guard(&mut self, ops: &[OpRc], op_idx: usize, fail_index: u32) {
+    fn _store_force_index_if_next_guard(&mut self, ops: &[OpRc], op_idx: usize) {
         // assembler.py _find_nearby_operation(+1)
         let next_idx = op_idx + 1;
         if next_idx >= ops.len() {
@@ -5896,16 +5867,9 @@ impl<'a> AssemblerARM64<'a> {
         // The full metadata (faillocs, rd_numb, etc.) will be filled in
         // when the guard is actually emitted in append_guard_token_with_faillocs.
         // Pre-allocated GuardNotForced descr — ResumeGuardDescr family.
-        // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
+        // Use the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
         // pass through `unsafe { Arc::as_ptr as *mut }`.
-        if let Some(d) = next_op.getdescr()
-            && (d.is_resume_guard() || d.is_resume_guard_copied())
-            && let Some(fd) = d.as_fail_descr()
-        {
-            fd.set_fail_index_per_trace(fail_index);
-            fd.set_trace_id(self.trace_id);
-        }
         let descr: majit_ir::DescrRef = if let Some(d) = next_op.getdescr() {
             // Same staleness guard as the main guard-emission path: keep
             // descriptor `fail_arg_types` in sync with the inferred list
@@ -5916,15 +5880,10 @@ impl<'a> AssemblerARM64<'a> {
             }
             d
         } else {
-            let fresh = majit_backend::make_resume_guard_descr_typed(
+            majit_backend::make_resume_guard_descr_typed(
                 self.infer_fail_arg_types(next_op, Some(next_idx))
                     .into_vec(),
-            );
-            if let Some(fd) = fresh.as_fail_descr() {
-                fd.set_fail_index_per_trace(fail_index);
-                fd.set_trace_id(self.trace_id);
-            }
-            fresh
+            )
         };
         // `force_token_to_dead_frame` (cranelift/compiler.rs)
         // recovers `jf_force_descr` via `recover_fail_descr_cell`, which
@@ -8541,16 +8500,7 @@ impl RegAllocAssembler for AssemblerARM64<'_> {
             );
         }
         self.pending_malloc_nursery_gcmap = gcmap;
-        let fail_index = self.fail_index;
-        self.asm_operations(
-            regalloc,
-            op,
-            op_index,
-            arglocs,
-            result_loc.as_ref(),
-            fail_index,
-            ops,
-        );
+        self.asm_operations(regalloc, op, op_index, arglocs, result_loc.as_ref(), ops);
         self.pending_malloc_nursery_gcmap = None;
     }
 
@@ -8579,8 +8529,7 @@ impl RegAllocAssembler for AssemblerARM64<'_> {
                 op.opcode
             );
         }
-        let fail_index = self.fail_index;
-        self.asm_operations(regalloc, op, op_index, arglocs, None, fail_index, ops);
+        self.asm_operations(regalloc, op, op_index, arglocs, None, ops);
         if op.opcode.is_guard() || op.opcode == OpCode::Finish {
             self.fail_index += 1;
         }

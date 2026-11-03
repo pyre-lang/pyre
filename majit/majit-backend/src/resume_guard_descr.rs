@@ -172,10 +172,6 @@ pub struct ResumeGuardDescr {
     pub rd_locs: UnsafeCell<majit_ir::RdLocs>,
     /// `compile.py` `AbstractResumeGuardDescr._attrs_ = ('status',)`.
     pub status: AtomicU64,
-    /// Pyre-only: identifier of the compiled trace that owns this guard.
-    pub trace_id: AtomicU64,
-    /// Pyre-only: per-trace `fail_index` assigned by `stamp_guard_descr_trace_positions`.
-    pub fail_index_per_trace: AtomicU32,
     /// Set when `compile_bridge` declined this guard for a deterministic
     /// structural reason (`Backend::bridge_decline_is_terminal`).
     pub bridge_declined_terminally: AtomicBool,
@@ -333,8 +329,6 @@ impl Descr for ResumeGuardDescr {
             rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
-            trace_id: AtomicU64::new(0),
-            fail_index_per_trace: AtomicU32::new(0),
             bridge_declined_terminally: AtomicBool::new(false),
             back_edge_poll: AtomicBool::new(false),
             external_jump_target: OnceLock::new(),
@@ -349,25 +343,6 @@ impl FailDescr for ResumeGuardDescr {
     }
     fn handle_fail_is_plain_resume_guard(&self) -> bool {
         true
-    }
-    fn fail_index(&self) -> u32 {
-        // `assembler.py:227 self.faildescr.index = i` — per-trace key
-        // (the global `alloc_fail_index()` value lives in `self.fail_index`
-        // and is exposed via `Descr::index()`).
-        self.fail_index_per_trace.load(Ordering::Relaxed)
-    }
-    fn trace_id(&self) -> u64 {
-        self.trace_id.load(Ordering::Relaxed)
-    }
-    fn set_trace_id(&self, trace_id: u64) {
-        self.trace_id.store(trace_id, Ordering::Relaxed);
-    }
-    fn fail_index_per_trace(&self) -> u32 {
-        self.fail_index_per_trace.load(Ordering::Relaxed)
-    }
-    fn set_fail_index_per_trace(&self, fail_index: u32) {
-        self.fail_index_per_trace
-            .store(fail_index, Ordering::Relaxed);
     }
     fn bridge_declined_terminally(&self) -> bool {
         self.bridge_declined_terminally.load(Ordering::Acquire)
@@ -555,8 +530,6 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_locs: UnsafeCell::new(majit_ir::RdLocs::new()),
         status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
-        trace_id: AtomicU64::new(0),
-        fail_index_per_trace: AtomicU32::new(0),
         bridge_declined_terminally: AtomicBool::new(false),
         back_edge_poll: AtomicBool::new(false),
         external_jump_target: OnceLock::new(),

@@ -925,9 +925,6 @@ mod tests {
     struct TestMarker(Type);
     impl majit_ir::Descr for TestMarker {}
     impl majit_ir::FailDescr for TestMarker {
-        fn fail_index(&self) -> u32 {
-            u32::MAX
-        }
         fn fail_arg_types(&self) -> &[Type] {
             match self.0 {
                 Type::Void => &[],

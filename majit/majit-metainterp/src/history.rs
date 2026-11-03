@@ -2318,9 +2318,6 @@ mod tests {
             }
         }
         impl FailDescr for TestFailDescr {
-            fn fail_index(&self) -> u32 {
-                self.0
-            }
             fn fail_arg_types(&self) -> &[Type] {
                 &[]
             }

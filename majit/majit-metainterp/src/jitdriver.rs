@@ -11779,8 +11779,8 @@ impl<S: JitState> JitDriver<S> {
                 // resumedescr, deadframe)` parity: thread the source
                 // descr Arc obtained from `cpu.get_latest_descr`
                 // through the bridge session so `compile_trace_inner`
-                // reads it directly (no `(trace_id, fail_index)`
-                // reverse lookup).
+                // reads it directly (`compute_unique_id(faildescr)` /
+                // `descr_identity`).
                 source_descr: descr_arc.clone(),
             });
         // RPython pyjitpl.py:2908 — bridge traces start with empty
@@ -15915,8 +15915,8 @@ mod tests {
         driver.meta.compile_loop(&[sum]);
         assert!(driver.has_compiled_loop(key.get_uhash()));
 
-        // Identify the fail_index assigned to the first guard in the optimized trace.
-        // `stamp_guard_descr_trace_positions` assigns fail_index sequentially starting from 0.
+        // First guard on the compiled token (`compiled_token_guard_descr`
+        // walks `asmmemmgr_gcreftracers` in emission order).
         let fail_index = 0u32;
         let descr_arc = compiled_guard_descr(&driver.meta, key.get_uhash(), fail_index);
 

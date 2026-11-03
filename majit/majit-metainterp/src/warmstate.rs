@@ -537,15 +537,14 @@ fn default_enable_opts() -> Vec<String> {
 /// binary reads 239874 guard failures against 25297 with bridges on, so the
 /// tally counts failures a bridge serves as well as deopts, and the 25297 is
 /// 8.4x the banned regime's 2999 at the SAME `loops_compiled=3`.  Every
-/// `(trace_id, fail_index)` coordinate is offered a bridge exactly once in the
-/// whole run — 103 offers, 60 bridges — and `must_compile` answers no to all
-/// 21802 later failures at those coordinates, one of which (`trace` 7,
-/// `fail` 2) accounts for 7777 by itself.  Whether those 43 offers that
+/// guard is identified by its descr object
+/// (`compute_unique_id(faildescr)` / `descr_identity`) and is offered a
+/// bridge exactly once in the whole run — 103 offers, 60 bridges — and
+/// `must_compile` answers no to all 21802 later failures at those descrs,
+/// one of which accounts for 7777 by itself.  Whether those 43 offers that
 /// produced no bridge should have been retried the way `must_compile` retries
 /// upstream (`jitcounter.tick` resets the counter when a bridge does not
-/// compile, `compile.py done_compiling`) is the open question; reading it
-/// needed `trace_id` next to `fail_index`, since an index is allocated per
-/// trace and a bridge re-uses the numbers of the loop it hangs off.
+/// compile, `compile.py done_compiling`) is the open question.
 ///
 /// Public because an embedder that demotes a key of its own on repeated
 /// aborts has to agree with this ceiling, and the consumers that do

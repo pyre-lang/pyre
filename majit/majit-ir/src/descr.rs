@@ -5184,9 +5184,6 @@ pub enum HandleFailClass {
 ///
 /// Mirrors rpython/jit/metainterp/history.py AbstractFailDescr.
 pub trait FailDescr: Descr {
-    /// Index in the fail descr table.
-    fn fail_index(&self) -> u32;
-
     /// The types of the fail arguments.
     fn fail_arg_types(&self) -> &[Type];
 
@@ -5456,58 +5453,6 @@ pub trait FailDescr: Descr {
     /// Should a loop version be compiled out of this guard?
     fn loop_version(&self) -> bool {
         false
-    }
-
-    /// Identifier of the compiled trace that owns this exit.
-    ///
-    /// Backends that lower loops and bridges as separate compiled traces use
-    /// this to let the frontend distinguish root-loop exits from bridge exits.
-    fn trace_id(&self) -> u64 {
-        0
-    }
-
-    /// Stamp the owning trace's identifier onto a resume-guard descr.
-    ///
-    /// Pyre-only: RPython resolves descr identity by Python `id(descr)`
-    /// (`history.py:125`), so the same `ResumeGuardDescr` object the
-    /// metainterp stamps is what `cpu.get_latest_descr()` later returns.
-    /// Pyre's runtime exit path uses a `(trace_id, fail_index)` lookup
-    /// key (`runner.rs::find_descr` / `compiler.rs::find_descr_by_ptr`)
-    /// that needs the owning trace_id captured on the descr; the
-    /// `record_loop_or_bridge` walker (`compile.py`) is the
-    /// natural stamp site since it already has `trace_id` in scope and
-    /// already dispatches on `is_resume_guard()`.
-    ///
-    /// Default panic — only `ResumeGuardDescr`-family descrs override.
-    fn set_trace_id(&self, _trace_id: u64) {
-        panic!(
-            "set_trace_id invoked on a FailDescr that does not carry a \
-             trace_id slot (compile.py:185 isinstance(descr, ResumeDescr) \
-             gates the stamp; only ResumeGuardDescr-family descrs accept it)"
-        );
-    }
-
-    /// Per-trace fail-index assigned by `compile.rs stamp_guard_descr_trace_positions`.
-    ///
-    /// Pyre-only: pyre's runtime exit path uses a `(trace_id, fail_index)`
-    /// key where `fail_index` is the per-trace numbering the optimizer
-    /// hands the backend (matching `assembler.py:227 self.faildescr.index
-    /// = i` semantics).  The descr's structural `fail_index` is allocated
-    /// from a global counter (`alloc_fail_index`), so a separate slot
-    /// captures the per-trace key for lookup parity.  Default 0 — non-
-    /// resume FailDescrs are not threaded through `stamp_guard_descr_trace_positions`.
-    fn fail_index_per_trace(&self) -> u32 {
-        0
-    }
-
-    /// `stamp_guard_descr_trace_positions` per-trace fail-index stamp setter.  Default
-    /// panic — only `ResumeGuardDescr`-family descrs override.
-    fn set_fail_index_per_trace(&self, _fail_index: u32) {
-        panic!(
-            "set_fail_index_per_trace invoked on a FailDescr that does not \
-             carry a per-trace fail_index slot (only ResumeGuardDescr-family \
-             descrs reach the stamp_guard_descr_trace_positions pipeline)"
-        );
     }
 
     /// This guard's bridge was rejected for a deterministic structural
@@ -9499,10 +9444,8 @@ pub fn make_malloc_big_fixedsize_calldescr() -> DescrRef {
 #[derive(Debug)]
 pub struct SimpleFailDescr {
     index: u32,
-    fail_index: u32,
     fail_arg_types: Vec<Type>,
     is_finish: bool,
-    trace_id: u64,
     /// schedule.py: vector accumulation info attached during vectorization.
     vector_info: std::cell::UnsafeCell<Option<Box<AccumInfo>>>,
 }
@@ -9511,10 +9454,8 @@ impl Clone for SimpleFailDescr {
     fn clone(&self) -> Self {
         SimpleFailDescr {
             index: self.index,
-            fail_index: self.fail_index,
             fail_arg_types: self.fail_arg_types.clone(),
             is_finish: self.is_finish,
-            trace_id: self.trace_id,
             vector_info: std::cell::UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
         }
     }
@@ -9526,31 +9467,22 @@ unsafe impl Send for SimpleFailDescr {}
 unsafe impl Sync for SimpleFailDescr {}
 
 impl SimpleFailDescr {
-    pub fn new(index: u32, fail_index: u32, fail_arg_types: Vec<Type>) -> Self {
+    pub fn new(index: u32, fail_arg_types: Vec<Type>) -> Self {
         SimpleFailDescr {
             index,
-            fail_index,
             fail_arg_types,
             is_finish: false,
-            trace_id: 0,
             vector_info: std::cell::UnsafeCell::new(None),
         }
     }
 
-    pub fn finish(index: u32, fail_index: u32, fail_arg_types: Vec<Type>) -> Self {
+    pub fn finish(index: u32, fail_arg_types: Vec<Type>) -> Self {
         SimpleFailDescr {
             index,
-            fail_index,
             fail_arg_types,
             is_finish: true,
-            trace_id: 0,
             vector_info: std::cell::UnsafeCell::new(None),
         }
-    }
-
-    pub fn with_trace_id(mut self, trace_id: u64) -> Self {
-        self.trace_id = trace_id;
-        self
     }
 }
 
@@ -9567,17 +9499,11 @@ impl Descr for SimpleFailDescr {
 }
 
 impl FailDescr for SimpleFailDescr {
-    fn fail_index(&self) -> u32 {
-        self.fail_index
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.fail_arg_types
     }
     fn is_finish(&self) -> bool {
         self.is_finish
-    }
-    fn trace_id(&self) -> u64 {
-        self.trace_id
     }
     fn attach_vector_info(&self, info: AccumInfo) {
         push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
@@ -11653,7 +11579,7 @@ mod tests {
 
     #[test]
     fn wrap_bakes_a_thin_ptr_that_recovers_the_same_descr() {
-        let descr: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
+        let descr: DescrRef = Arc::new(SimpleFailDescr::new(1, vec![Type::Int]));
         let cell = FailDescrCell::wrap(descr.clone());
         assert_eq!(std::mem::size_of::<DescrRef>(), 16);
         assert_eq!(
@@ -11671,8 +11597,8 @@ mod tests {
 
     #[test]
     fn fail_descr_store_keeps_thin_ptrs_stable() {
-        let a: DescrRef = Arc::new(SimpleFailDescr::new(1, 2, vec![Type::Int]));
-        let b: DescrRef = Arc::new(SimpleFailDescr::new(3, 4, vec![Type::Int]));
+        let a: DescrRef = Arc::new(SimpleFailDescr::new(1, vec![Type::Int]));
+        let b: DescrRef = Arc::new(SimpleFailDescr::new(3, vec![Type::Int]));
         let mut store = FailDescrStore::with_capacity(2);
         let pa = store.push(a.clone());
         let pb = store.push(b.clone());
@@ -11692,7 +11618,7 @@ mod tests {
 
     #[test]
     fn descr_instance_ptr_stamps_the_immortal_header() {
-        let descr: DescrRef = Arc::new(SimpleFailDescr::new(5, 6, vec![Type::Int]));
+        let descr: DescrRef = Arc::new(SimpleFailDescr::new(5, vec![Type::Int]));
         let ptr = descr_instance_ptr(&descr);
         assert_eq!(
             unsafe { *(ptr as *const u64).sub(1) },
@@ -12478,7 +12404,7 @@ mod tests {
 
     #[test]
     fn test_simple_fail_descr_vector_info_is_head_linked() {
-        let descr = SimpleFailDescr::new(1, 2, vec![Type::Int, Type::Int]);
+        let descr = SimpleFailDescr::new(1, vec![Type::Int, Type::Int]);
         descr.attach_vector_info(AccumInfo {
             prev: None,
             failargs_pos: 0,
@@ -12811,7 +12737,6 @@ mod tests {
     fn test_fail_descr_trait() {
         #[derive(Debug)]
         struct TestFailDescr {
-            index: u32,
             arg_types: Vec<Type>,
         }
         impl Descr for TestFailDescr {
@@ -12825,22 +12750,16 @@ mod tests {
             }
         }
         impl FailDescr for TestFailDescr {
-            fn fail_index(&self) -> u32 {
-                self.index
-            }
             fn fail_arg_types(&self) -> &[Type] {
                 &self.arg_types
             }
         }
 
         let fd = TestFailDescr {
-            index: 7,
             arg_types: vec![Type::Int, Type::Ref],
         };
-        assert_eq!(fd.fail_index(), 7);
         assert_eq!(fd.fail_arg_types(), &[Type::Int, Type::Ref]);
         assert!(!fd.is_finish());
-        assert_eq!(fd.trace_id(), 0);
     }
 
     #[test]
@@ -13269,12 +13188,12 @@ pub fn make_call_descr_full_with_classes(
 
 /// Create a fail descriptor.
 pub fn make_fail_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
-    std::sync::Arc::new(SimpleFailDescr::new(0, fail_index, fail_arg_types))
+    std::sync::Arc::new(SimpleFailDescr::new(fail_index, fail_arg_types))
 }
 
 /// Create a finish descriptor.
 pub fn make_finish_descr(fail_index: u32, fail_arg_types: Vec<Type>) -> DescrRef {
-    std::sync::Arc::new(SimpleFailDescr::finish(0, fail_index, fail_arg_types))
+    std::sync::Arc::new(SimpleFailDescr::finish(fail_index, fail_arg_types))
 }
 
 /// Create a loop TargetToken descriptor.

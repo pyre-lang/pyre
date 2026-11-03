@@ -170,9 +170,6 @@ impl Descr for DoneWithThisFrameDescrVoid {
 }
 
 impl FailDescr for DoneWithThisFrameDescrVoid {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
     }
@@ -229,9 +226,6 @@ impl Descr for DoneWithThisFrameDescrInt {
 }
 
 impl FailDescr for DoneWithThisFrameDescrInt {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
     }
@@ -287,9 +281,6 @@ impl Descr for DoneWithThisFrameDescrRef {
 }
 
 impl FailDescr for DoneWithThisFrameDescrRef {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
     }
@@ -345,9 +336,6 @@ impl Descr for DoneWithThisFrameDescrFloat {
 }
 
 impl FailDescr for DoneWithThisFrameDescrFloat {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
     }
@@ -435,9 +423,6 @@ impl Descr for DoneWithThisFrameDescrMulti {
 }
 
 impl FailDescr for DoneWithThisFrameDescrMulti {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
     }
@@ -493,9 +478,6 @@ impl Descr for ExitFrameWithExceptionDescrRef {
 }
 
 impl FailDescr for ExitFrameWithExceptionDescrRef {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         &self.0.fail_arg_types
     }
@@ -613,9 +595,6 @@ pub fn propagate_exception_handle_fail(descr: &dyn FailDescr, grabbed: i64) -> O
 }
 
 impl FailDescr for PropagateExceptionDescr {
-    fn fail_index(&self) -> u32 {
-        u32::MAX
-    }
     fn fail_arg_types(&self) -> &[Type] {
         // `compile.py` `ResOperation(rop.GUARD_NO_EXCEPTION, [], descr=faildescr)`
         // `operations[1].setfailargs([])` — no fail args.

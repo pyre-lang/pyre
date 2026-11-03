@@ -7677,7 +7677,6 @@ mod tests {
         assert!(target_from_token(&token).is_some());
         assert!(failguard::label_target(&label_kept).is_some());
         let fail = FreeFailDescr {
-            fail_index: 0,
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
         };
         let bridge_advance = OpRc::new(majit_ir::Op::new(
@@ -7866,7 +7865,6 @@ mod tests {
         assert_eq!(still.key, published.key);
 
         let fail = FreeFailDescr {
-            fail_index: 0,
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
         };
         let bridge_advance = OpRc::new(majit_ir::Op::new(
@@ -7975,16 +7973,12 @@ mod tests {
 
     #[derive(Debug)]
     struct FreeFailDescr {
-        fail_index: u32,
         arg_types: Vec<majit_ir::Type>,
     }
 
     impl majit_ir::Descr for FreeFailDescr {}
 
     impl majit_ir::descr::FailDescr for FreeFailDescr {
-        fn fail_index(&self) -> u32 {
-            self.fail_index
-        }
         fn fail_arg_types(&self) -> &[majit_ir::Type] {
             &self.arg_types
         }
