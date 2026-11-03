@@ -368,18 +368,13 @@ pub struct Bookkeeper {
     /// fallible; upstream lets the exception propagate, so the drain
     /// surfaces the first `Err` instead of swallowing or panicking on it.
     pub pending_specializations: RefCell<Vec<Box<dyn Fn() -> Result<(), AnnotatorError>>>>,
-    /// RPython `self.all_specializations = {}` (bookkeeper.py).
-    ///
-    /// `{FuncDesc: specialization-info}` keyed by the funcdesc object's
-    /// [`DescKey`] (`Desc.identity`) — the same identity every other
-    /// bookkeeper table uses. Insertion-ordered (`IndexMap`) as a Python
-    /// dict. Each value is the `UnionFind(compute_one_result)` upstream
-    /// uses (`memo`) — the families of argument tuples that can be called
-    /// together, merged on `union`, with each result living in its
-    /// [`super::specialize::MemoTable`]'s `table` — paired with a per-
-    /// family host-call error latch (see [`super::specialize::MemoFamily`]).
-    /// Consumed by [`super::specialize::memo`].
-    pub all_specializations: RefCell<IndexMap<DescKey, super::specialize::MemoFamily>>,
+    /// RPython `self.all_specializations = {}` (bookkeeper.py); `memo`
+    /// stores one `UnionFind(compute_one_result)` family
+    /// ([`super::specialize::MemoFamily`]) per funcdesc, shared by
+    /// reference (`Rc<RefCell<_>>`) so `find`/`union` run without holding
+    /// this registry. Consumed by [`super::specialize::memo`] and
+    /// [`super::specialize::memotable_for_args`].
+    pub all_specializations: RefCell<IndexMap<DescKey, Rc<RefCell<super::specialize::MemoFamily>>>>,
     /// RPython `hasattr(self, 'position_key')` (bookkeeper.py:99).
     ///
     /// Upstream distinguishes "no position entered" (attribute absent)

@@ -255,7 +255,7 @@ struct Representative {
 }
 
 impl UnionFindInfo for Representative {
-    fn absorb(&mut self, _other: Self) {}
+    fn absorb(&mut self, _other: &Self) {}
 }
 
 /// `simplify.py` `all_equal`.

@@ -913,7 +913,7 @@ pub struct Representative {
 }
 
 impl crate::tool::algo::unionfind::UnionFindInfo for Representative {
-    fn absorb(&mut self, _other: Self) {}
+    fn absorb(&mut self, _other: &Self) {}
 }
 
 /// RPython `all_equal(lst)` (simplify.py).

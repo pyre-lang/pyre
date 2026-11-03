@@ -8054,7 +8054,7 @@ pub fn remove_duplicate_inputargs(graph: &mut FunctionGraph) {
     }
 
     impl UnionFindInfo for Representative {
-        fn absorb(&mut self, _other: Self) {}
+        fn absorb(&mut self, _other: &Self) {}
     }
 
     let mut entries: HashMap<BlockId, Vec<(usize, usize)>> = HashMap::new();

@@ -47,29 +47,29 @@ use std::rc::Rc;
 /// is an `IndexMap`, which yields insertion order whatever the hasher is.
 type Table<K, V> = FxHashMap<K, V>;
 
-/// RPython `info1.absorb(info2)` (unionfind.py) — called by
-/// [`UnionFind::union`] when two partitions merge. `self` is the
-/// larger partition's info (pre-weight-swap), `other` the absorbed
-/// partition's info.
+/// RPython `info1.absorb(info2)`, called by [`UnionFind::union`]
+/// while both partitions' infos are still installed; `self` is
+/// `obj1`'s root info (before the weight swap), `other` the other
+/// root's info, which `union` drops afterwards.
 pub trait UnionFindInfo: Sized {
-    fn absorb(&mut self, other: Self);
+    fn absorb(&mut self, other: &Self);
 }
 
 /// No-op `absorb` — mirrors upstream `info_factory=None` skip path
 /// (unionfind.py `if info1 is not None`).
 impl UnionFindInfo for () {
-    fn absorb(&mut self, _other: Self) {}
+    fn absorb(&mut self, _other: &Self) {}
 }
 
 /// An info object shared by reference, as every upstream info object is.
 /// `absorb` receives both handles, so an implementation can also write to
 /// the absorbed side (`MemoTable.absorb` sets `other.do_not_process`).
 pub trait SharedUnionFindInfo: Sized {
-    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>);
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: &Rc<RefCell<Self>>);
 }
 
 impl<T: SharedUnionFindInfo> UnionFindInfo for Rc<RefCell<T>> {
-    fn absorb(&mut self, other: Self) {
+    fn absorb(&mut self, other: &Self) {
         T::absorb_shared(self, other);
     }
 }
@@ -139,19 +139,8 @@ where
 
     /// Path-compress a tracked `obj` to its root. `obj` must already be
     /// in `link_to_parent`.
+    /// RPython `UnionFind.find`'s tracked branch.
     fn find_tracked(&mut self, obj: K) -> K {
-        let parent = self.link_to_parent.get(&obj).cloned().unwrap();
-
-        // A root, or a node linked straight to its root: the compression
-        // below would write back every link it walks unchanged, so the
-        // answer needs neither the walk nor the writes.
-        if parent == obj {
-            return obj;
-        }
-        if self.link_to_parent[&parent] == parent {
-            return parent;
-        }
-
         // upstream: `to_root = [obj]`; walk parents until fixed point.
         let mut to_root = vec![obj.clone()];
         let mut parent = self.link_to_parent[&obj].clone();
@@ -216,30 +205,32 @@ where
             return Ok((new1 || new2, rep1));
         }
 
-        // upstream: `if info1 is not None: info1.absorb(info2)`. We
-        // take both infos out, absorb, and re-insert the merged one
-        // onto the chosen new root below. `()` infos no-op via the
-        // trait impl, matching the upstream None branch.
-        let mut info1 = self.root_info.remove(&rep1).expect("rep1 info");
-        let info2 = self.root_info.remove(&rep2).expect("rep2 info");
-        info1.absorb(info2);
+        // upstream: `if info1 is not None: info1.absorb(info2)`, with both
+        // infos still installed. `()` infos no-op via the trait impl.
+        {
+            let [info1, info2] = self.root_info.get_disjoint_mut([&rep1, &rep2]);
+            info1.expect("rep1 info").absorb(info2.expect("rep2 info"));
+        }
 
         // upstream: weighted union, smaller tree under larger.
-        let w1 = self.weight.remove(&rep1).expect("rep1 weight");
-        let w2 = self.weight.remove(&rep2).expect("rep2 weight");
+        let w1 = self.weight[&rep1];
+        let w2 = self.weight[&rep2];
         let w = w1 + w2;
-
-        let (new_rep1, new_rep2) = if w1 < w2 { (rep2, rep1) } else { (rep1, rep2) };
+        // `info1` moves to whichever root wins (`self.root_info[rep1] = info1`).
+        let info1 = self.root_info.remove(&rep1).expect("rep1 info");
+        // upstream: `if w1 < w2: rep1, rep2 = rep2, rep1`.
+        let (rep1, rep2) = if w1 < w2 { (rep2, rep1) } else { (rep1, rep2) };
 
         // upstream: `self.link_to_parent[rep2] = rep1`; `del
         // self.weight[rep2]`; `del self.root_info[rep2]`;
         // `self.weight[rep1] = w`; `self.root_info[rep1] = info1`.
-        self.link_to_parent
-            .insert(new_rep2.clone(), new_rep1.clone());
-        self.weight.insert(new_rep1.clone(), w);
-        self.root_info.insert(new_rep1.clone(), info1);
+        self.link_to_parent.insert(rep2.clone(), rep1.clone());
+        self.weight.remove(&rep2);
+        self.root_info.remove(&rep2);
+        self.weight.insert(rep1.clone(), w);
+        self.root_info.insert(rep1.clone(), info1);
 
-        Ok((true, new_rep1))
+        Ok((true, rep1))
     }
 
     /// RPython `UnionFind.find_rep`.
@@ -374,7 +365,7 @@ mod tests {
             state: Rc<State>,
         }
         impl UnionFindInfo for Info {
-            fn absorb(&mut self, other: Self) {
+            fn absorb(&mut self, other: &Self) {
                 // upstream: `state.remove(other)`.
                 self.state.remove(other.id);
             }
@@ -410,8 +401,8 @@ mod tests {
             values: Vec<i32>,
         }
         impl UnionFindInfo for Info {
-            fn absorb(&mut self, other: Self) {
-                self.values.extend(other.values);
+            fn absorb(&mut self, other: &Self) {
+                self.values.extend(other.values.iter().copied());
             }
         }
 

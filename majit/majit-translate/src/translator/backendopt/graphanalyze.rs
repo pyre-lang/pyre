@@ -50,12 +50,9 @@ impl<R: AnalyzerResult> Dependency<R> {
 }
 
 impl<R: AnalyzerResult> UnionFindInfo for Dependency<R> {
-    /// `Dependency.absorb(other)` (`graphanalyze.py`). The
-    /// pyre `UnionFindInfo` trait passes `other` by value so the
-    /// absorbed partition's info is consumed; pyre's
-    /// `merge_with_result` only needs `other.result`, so consume it.
-    fn absorb(&mut self, other: Self) {
-        self.merge_with_result(other.result);
+    /// `Dependency.absorb(other)` (`graphanalyze.py`).
+    fn absorb(&mut self, other: &Self) {
+        Dependency::absorb(self, other);
     }
 }
 

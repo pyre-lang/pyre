@@ -278,7 +278,7 @@ impl CallFamily {
 }
 
 impl SharedUnionFindInfo for CallFamily {
-    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: &Rc<RefCell<Self>>) {
         this.borrow_mut().absorb(&other.borrow());
     }
 }
@@ -344,7 +344,7 @@ impl FrozenAttrFamily {
 }
 
 impl SharedUnionFindInfo for FrozenAttrFamily {
-    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: &Rc<RefCell<Self>>) {
         this.borrow_mut().absorb(&other.borrow());
     }
 }
@@ -427,7 +427,7 @@ impl ClassAttrFamily {
 }
 
 impl SharedUnionFindInfo for ClassAttrFamily {
-    fn absorb_shared(this: &Rc<RefCell<Self>>, other: Rc<RefCell<Self>>) {
+    fn absorb_shared(this: &Rc<RefCell<Self>>, other: &Rc<RefCell<Self>>) {
         // `absorb = update` (description.py). `update` propagates a
         // `UnionError`; `UnionFindInfo` has no Result channel, so we
         // swallow here — the error surfaces at the next
