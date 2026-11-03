@@ -33,7 +33,7 @@ const OP_HALT: u8 = 3;
 
 /// Never the declared type of any access base in this machine. A key naming it
 /// cannot match, whatever it claims about the field.
-#[allow(dead_code)] // named only by the `int_fields` key below
+#[expect(dead_code)] // named only by the `int_fields` key below
 #[repr(C)]
 struct Unreached {
     count: u32,
@@ -41,7 +41,7 @@ struct Unreached {
 
 // Named as the `jit_interp` state type; the macro lowers the interpreter body
 // into jitcode and never runs it, so nothing constructs the struct.
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct CellState {
     cell: usize,
     total: i64,

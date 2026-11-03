@@ -236,7 +236,7 @@ impl ImportRLock {
     /// `importing.py lock_held_by_someone_else`.  No caller upstream
     /// either; its `true` branch is additionally unreachable while pyre runs a
     /// single Python thread.
-    #[allow(dead_code)] // importing.py ImportRLock.lock_held_by_someone_else; nothing in PyPy calls it either
+    #[expect(dead_code)] // importing.py ImportRLock.lock_held_by_someone_else; nothing in PyPy calls it either
     fn lock_held_by_someone_else(&self) -> bool {
         let me = thread_ident();
         let owner = self.lockowner.load(Ordering::Acquire);

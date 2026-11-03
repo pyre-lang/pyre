@@ -110,7 +110,7 @@ mod scalar_toplevel {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct FloatToplevelState {
         a: i64,
         f: f64,
@@ -317,7 +317,7 @@ mod scalar_float_slot_reserve {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct TwoFloatState {
         a: f64,
         b: f64,

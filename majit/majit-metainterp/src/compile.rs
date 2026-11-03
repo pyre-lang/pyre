@@ -358,20 +358,16 @@ impl<'a> BridgeCompileData<'a> {
 }
 
 /// `compile.py` `class UnrolledLoopData(CompileData)`.
-#[allow(dead_code)] // compile.py UnrolledLoopData; unrolled-loop compilation does not construct it yet
+#[expect(dead_code)] // compile.py UnrolledLoopData; unrolled-loop compilation does not construct it yet
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
-    #[allow(dead_code)]
     pub celltoken: &'a Arc<JitCellToken>,
-    #[allow(dead_code)]
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
-    #[allow(dead_code)]
     pub call_pure_results: &'a crate::optimizeopt::util::ArgsDict,
-    #[allow(dead_code)]
     pub enable_opts: &'a [String],
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 impl<'a> UnrolledLoopData<'a> {
     pub fn new(
         trace: &'a TreeLoop,

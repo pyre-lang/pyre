@@ -51,7 +51,7 @@ pub const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interprete
 /// core reads the product set's artefacts for its crates: none of them
 /// depends on `pyre-module`. Read by `build/prepass.rs`; the crate itself
 /// compiles this file only for its tests.
-#[cfg_attr(test, allow(dead_code))]
+#[cfg_attr(test, expect(dead_code))]
 pub const LLBC_SUBDIR: &str = "llbc";
 
 /// Build-dependencies the manifest declares but this translation never links:

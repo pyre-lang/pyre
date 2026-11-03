@@ -133,7 +133,7 @@ pub struct WasmFrameData {
     read_force: bool,
     /// Off-GC host-buffer owner. Keeps the entry JitFrame alive after
     /// `execute_token` returns. The wasm32 host-buffer path.
-    #[allow(dead_code)] // held for its Drop, never read
+    #[expect(dead_code)] // held for its Drop, never read
     host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
 }
 

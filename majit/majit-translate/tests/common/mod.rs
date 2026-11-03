@@ -1,7 +1,7 @@
 //! Shared helpers for the majit-translate integration tests.
 //!
 //! Each test crate includes this module and uses a subset of it.
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;

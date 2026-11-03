@@ -158,7 +158,7 @@ pub mod rjitlog;
 // calls the parser, prover or codegen. It is a file-for-file port of
 // `rpython/jit/metainterp/ruleopt/`, so the unreached surface is kept whole
 // rather than trimmed to whatever the last regeneration happened to touch.
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) mod ruleopt;
 pub mod support;
 mod trace_ctx;

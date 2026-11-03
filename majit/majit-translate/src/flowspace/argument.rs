@@ -86,7 +86,7 @@ impl Signature {
     }
 
     /// RPython `Signature.__getitem__` (argument.py).
-    #[allow(dead_code)] // argument.py Signature.__getitem__; Rust callers use tuple_view today
+    #[expect(dead_code)] // argument.py Signature.__getitem__; Rust callers use tuple_view today
     pub(crate) fn getitem(&self, i: usize) -> SignatureItem<'_> {
         match i {
             0 => SignatureItem::Argnames(&self.argnames),
@@ -101,7 +101,7 @@ impl Signature {
 ///
 /// Kept for RPython `Signature.__getitem__` parity even though current Rust
 /// callers prefer [`Signature::tuple_view`].
-#[allow(dead_code)]
+#[expect(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignatureItem<'a> {
     Argnames(&'a [String]),

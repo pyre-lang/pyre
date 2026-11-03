@@ -293,7 +293,7 @@ impl CachedField {
     }
 
     /// heap.py AbstractCachedEntry.getfield_from_cache
-    #[allow(dead_code)] // heap.py AbstractCachedEntry.getfield_from_cache; cache reads inline this body today
+    #[expect(dead_code)] // heap.py AbstractCachedEntry.getfield_from_cache; cache reads inline this body today
     fn getfield_from_cache(
         &self,
         struct_box: &Operand,
@@ -371,7 +371,7 @@ impl CachedField {
     }
 
     /// heap.py CachedField.put_field_back_to_info
-    #[allow(dead_code)] // heap.py CachedField.put_field_back_to_info; lazy-set paths inline this body today
+    #[expect(dead_code)] // heap.py CachedField.put_field_back_to_info; lazy-set paths inline this body today
     fn put_field_back_to_info(&mut self, op: &Op, ctx: &mut OptContext) {
         // info.py opinfo.setfield(descr, struct, op, optheap, cf=self)
         // PyPy: `setfield(..., cf=cf)` calls `cf.register_info(struct, self)`

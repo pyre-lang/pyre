@@ -835,7 +835,7 @@ enum RewriteResult {
     /// Fold the result to a Constant. `optimize_block` `isinstance(op1, Constant)`.
     /// Production rewrites Identity a `Const*` producer Variable; this
     /// arm is hit by the test fold `__test_fold_to_const_int`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code))]
     Constant(crate::flowspace::model::Constant),
     /// Keep the op unchanged
     Keep,
@@ -14363,7 +14363,7 @@ impl<'a> Transformer<'a> {
 
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
     /// (jtransform.py).
-    #[allow(dead_code)] // jtransform.py Transformer.rewrite_op_jit_record_known_result; Rust lowering does not emit this llop yet
+    #[expect(dead_code)] // jtransform.py Transformer.rewrite_op_jit_record_known_result; Rust lowering does not emit this llop yet
     fn rewrite_op_jit_record_known_result(
         &mut self,
         _graph: &FunctionGraph,

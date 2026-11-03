@@ -519,7 +519,7 @@ impl OptVirtualize {
     /// (optimize_new_array consults `OpCode::NewArrayClear`),
     /// so this wrapper has no behavioral effect. Kept as a structural
     /// mirror of the upstream dispatch table.
-    #[allow(dead_code)] // virtualize.py OptVirtualize.optimize_NEW_ARRAY_CLEAR; dispatch does not call the wrapper yet
+    #[expect(dead_code)] // virtualize.py OptVirtualize.optimize_NEW_ARRAY_CLEAR; dispatch does not call the wrapper yet
     fn optimize_new_array_clear(
         &self,
         op: &Op,

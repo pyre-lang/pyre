@@ -47,7 +47,7 @@ pub type Bytecode = [u8];
 
 // Named as the `jit_interp` state type; the macro lowers the interpreter body
 // into jitcode and never runs it, so nothing constructs the struct.
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct ArrTestState {
     a: i64,
     sel: usize,
@@ -171,7 +171,7 @@ mod without_the_bracket_suffix {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct FieldOnlyState {
         a: i64,
         sel: usize,
@@ -266,7 +266,7 @@ mod unsigned_elements {
 
     // Named as the `jit_interp` state type; the macro lowers the interpreter body
     // into jitcode and never runs it, so nothing constructs the struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct ByteState {
         a: i64,
         sel: usize,

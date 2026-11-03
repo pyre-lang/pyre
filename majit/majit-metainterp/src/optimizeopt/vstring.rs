@@ -1044,7 +1044,7 @@ impl OptString {
 
     /// vstring.py: postprocess — after STRLEN on a known-length string,
     /// record as pure (for CSE with OptPure).
-    #[allow(dead_code)] // vstring.py OptString.postprocess_STRLEN; postprocess dispatch is not wired yet
+    #[expect(dead_code)] // vstring.py OptString.postprocess_STRLEN; postprocess dispatch is not wired yet
     fn postprocess_strlen(&self, op: &Op, ctx: &mut OptContext) {
         // vstring.py: postprocess_STRLEN → make_nonnull_str
         let mode = if op.opcode == OpCode::Strlen {
