@@ -2142,7 +2142,7 @@ impl<'a> Lowering<'a> {
         let Some(Some(local)) = locals.first().copied() else {
             return locals;
         };
-        if let Some(r) = self.recorded_borrow_through_copies(local, &mut Vec::new()) {
+        if let Some(r) = self.recorded_borrow_through_copies(local) {
             locals[0] = Some(r);
         }
         locals
@@ -2248,38 +2248,141 @@ impl<'a> Lowering<'a> {
     /// borrow every source resolves to, when all of them resolve, are
     /// stable (`atomic_referent_is_stable`) and record the same place
     /// (`place_names_same`), so the place names one referent whichever
-    /// copy ran last.
-    fn recorded_borrow_through_copies(&self, local: usize, seen: &mut Vec<usize>) -> Option<usize> {
-        if self.atomic_ref_place.contains_key(&local) {
-            return Some(local);
+    /// copy ran last. Walks with an explicit stack; a local already
+    /// resolved in the walk is reused, and only a local on the active
+    /// path is a cycle.
+    fn recorded_borrow_through_copies(&self, start: usize) -> Option<usize> {
+        if self.atomic_ref_place.contains_key(&start) {
+            return Some(start);
         }
-        if seen.contains(&local) {
-            return None;
+        struct Frame {
+            local: usize,
+            sources: Vec<usize>,
+            next: usize,
+            resolved: Vec<usize>,
         }
-        seen.push(local);
-        let sources = self.copy_sources(local)?;
-        let mut resolved = Vec::new();
-        for src in sources {
-            resolved.push(self.recorded_borrow_through_copies(src, seen)?);
+        // Locals already resolved in this walk, so a local two sources
+        // reach is resolved once.
+        let mut resolved_locals: Vec<(usize, usize)> = Vec::new();
+        // The active path: a source already on it is a cycle.
+        let mut frames: Vec<Frame> = Vec::new();
+        frames.push(Frame {
+            local: start,
+            sources: self.copy_sources(start)?,
+            next: 0,
+            resolved: Vec::new(),
+        });
+        while !frames.is_empty() {
+            let i = frames.len() - 1;
+            if frames[i].next < frames[i].sources.len() {
+                let src = frames[i].sources[frames[i].next];
+                frames[i].next += 1;
+                if self.atomic_ref_place.contains_key(&src) {
+                    frames[i].resolved.push(src);
+                } else if let Some(&(_, r)) = resolved_locals.iter().find(|(l, _)| *l == src) {
+                    frames[i].resolved.push(r);
+                } else if frames.iter().any(|f| f.local == src) {
+                    return None;
+                } else {
+                    let sources = self.copy_sources(src)?;
+                    frames.push(Frame {
+                        local: src,
+                        sources,
+                        next: 0,
+                        resolved: Vec::new(),
+                    });
+                }
+                continue;
+            }
+            let Some(frame) = frames.pop() else {
+                break;
+            };
+            let r = self.same_place_borrow(&frame.resolved)?;
+            resolved_locals.push((frame.local, r));
+            match frames.last_mut() {
+                Some(parent) => parent.resolved.push(r),
+                None => return Some(r),
+            }
         }
+        None
+    }
+
+    /// The first of `resolved`, when they are all one borrow or all stable
+    /// borrows recording the same place (`place_names_same`).
+    fn same_place_borrow(&self, resolved: &[usize]) -> Option<usize> {
         let first = *resolved.first()?;
         if resolved.len() > 1 {
-            for &r in &resolved {
+            for &r in resolved {
                 if !self.atomic_referent_is_stable(&[Some(r)]) {
                     return None;
                 }
-                let Some(place_r) = self.atomic_ref_place.get(&r) else {
-                    return None;
-                };
-                let Some(place_first) = self.atomic_ref_place.get(&first) else {
-                    return None;
-                };
-                if !place_names_same(place_r, place_first) {
+                let place_r = self.atomic_ref_place.get(&r)?;
+                let place_first = self.atomic_ref_place.get(&first)?;
+                if !self.place_names_same(place_r, place_first) {
                     return None;
                 }
             }
         }
         Some(first)
+    }
+
+    /// `a` and `b` are the same place expression: locals with the same
+    /// `copy_root` or the same global, through the same projections (field,
+    /// deref, index by the same local, constant index). Types are not compared.
+    fn place_names_same(&self, a: &Place, b: &Place) -> bool {
+        match (&a.kind, &b.kind) {
+            (PlaceKind::Local(x), PlaceKind::Local(y)) => {
+                self.copy_root(*x as usize) == self.copy_root(*y as usize)
+            }
+            (PlaceKind::Projection(ia, ea), PlaceKind::Projection(ib, eb)) => {
+                let elems_eq = match (ea, eb) {
+                    (ProjectionElem::Atom(s), ProjectionElem::Atom(t)) => s == t,
+                    (ProjectionElem::Tagged(v), ProjectionElem::Tagged(w)) => v == w,
+                    _ => false,
+                };
+                elems_eq && self.place_names_same(ia, ib)
+            }
+            (
+                PlaceKind::Global {
+                    generics: g1,
+                    id: i1,
+                },
+                PlaceKind::Global {
+                    generics: g2,
+                    id: i2,
+                },
+            ) => i1 == i2 && g1 == g2,
+            _ => false,
+        }
+    }
+
+    /// The local `local`'s value was copied from: follows `l = copy src` /
+    /// `move src` while `l` has one definition, that definition is the
+    /// copy, and `src` has one definition too (`local_has_one_definition`).
+    /// Such an `l` holds the only value `src` ever holds, so two places
+    /// based on locals with one root name one object.
+    fn copy_root(&self, local: usize) -> usize {
+        let mut l = local;
+        let mut seen: Vec<usize> = Vec::new();
+        loop {
+            if seen.contains(&l) {
+                return l;
+            }
+            seen.push(l);
+            if !self.local_has_one_definition(l) {
+                return l;
+            }
+            let Some(v) = self.copy_sources(l) else {
+                return l;
+            };
+            if v.len() != 1 {
+                return l;
+            }
+            if !self.local_has_one_definition(v[0]) {
+                return l;
+            }
+            l = v[0];
+        }
     }
 
     /// Definitions of `local` that reach the point just before statement
@@ -8279,33 +8382,5 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
-    }
-}
-
-/// `a` and `b` are the same place expression: the same local or global,
-/// through the same projections (field, deref, index by the same local,
-/// constant index). Types are not compared.
-fn place_names_same(a: &Place, b: &Place) -> bool {
-    match (&a.kind, &b.kind) {
-        (PlaceKind::Local(x), PlaceKind::Local(y)) => x == y,
-        (PlaceKind::Projection(ia, ea), PlaceKind::Projection(ib, eb)) => {
-            let elems_eq = match (ea, eb) {
-                (ProjectionElem::Atom(s), ProjectionElem::Atom(t)) => s == t,
-                (ProjectionElem::Tagged(v), ProjectionElem::Tagged(w)) => v == w,
-                _ => false,
-            };
-            elems_eq && place_names_same(ia, ib)
-        }
-        (
-            PlaceKind::Global {
-                generics: g1,
-                id: i1,
-            },
-            PlaceKind::Global {
-                generics: g2,
-                id: i2,
-            },
-        ) => i1 == i2 && g1 == g2,
-        _ => false,
     }
 }
