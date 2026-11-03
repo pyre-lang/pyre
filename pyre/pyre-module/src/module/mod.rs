@@ -60,8 +60,6 @@ pub mod _posixshmem;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixsubprocess;
 #[allow(non_snake_case)]
-pub mod _pypy_generic_alias;
-#[allow(non_snake_case)]
 pub mod _queue;
 #[allow(non_snake_case)]
 pub mod _random;

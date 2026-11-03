@@ -68,7 +68,12 @@
 //! with the `__len__` call inlined at the `get_and_call_function` inside it,
 //! makes steps 2-4 that graph's own jitcode and deletes this module.  Format
 //! is the same gap for `descroperation.py format`: `bh_format_tail` stays
-//! until the walker can enter that generated graph.  The blocker is
+//! until the walker can enter that generated graph.  TypeCallNew is the
+//! same gap for `typeobject.py descr_call` after `__new__`: `bh_type_call_new_tail`
+//! stays until the walker can enter that generated graph.  BinopLast is the
+//! same gap for `descroperation.py binop_impl` after the last-arm
+//! `_invoke_binop`: `bh_binop_last_tail` stays until the walker can enter
+//! that generated graph.  The blocker is
 //! documented on `try_walker_orthodox_descent`: a mid-descent decline does
 //! not rewind an effect the sub-walk already executed.
 
@@ -93,16 +98,30 @@ pub(crate) enum OperatorTail {
     /// be a `str` (or subclass); anything else is a TypeError, and a str
     /// subclass keeps its identity.
     Format,
+    /// `typeobject.py descr_call` after `call_obj_args(w_newfunc, ...)`:
+    /// `__init__` on `type(w_newobject)` when `isinstance_w(w_newobject, self)`.
+    TypeCallNew,
+    /// `descroperation.py binop_impl` after the last-arm `_invoke_binop`:
+    /// NotImplemented becomes the unsupported-operand TypeError.
+    BinopLast,
 }
 
 impl OperatorTail {
-    const ALL: [OperatorTail; 3] = [OperatorTail::Len, OperatorTail::Truth, OperatorTail::Format];
+    const ALL: [OperatorTail; 5] = [
+        OperatorTail::Len,
+        OperatorTail::Truth,
+        OperatorTail::Format,
+        OperatorTail::TypeCallNew,
+        OperatorTail::BinopLast,
+    ];
 
     fn slot(self) -> usize {
         match self {
             OperatorTail::Len => 0,
             OperatorTail::Truth => 1,
             OperatorTail::Format => 2,
+            OperatorTail::TypeCallNew => 3,
+            OperatorTail::BinopLast => 4,
         }
     }
 
@@ -111,7 +130,19 @@ impl OperatorTail {
             OperatorTail::Len => "len_tail",
             OperatorTail::Truth => "truth_bool_tail",
             OperatorTail::Format => "format_tail",
+            OperatorTail::TypeCallNew => "type_call_new_tail",
+            OperatorTail::BinopLast => "binop_last_tail",
         }
+    }
+
+    /// Resume `-live-` names r1 next to the dunder result: Format's formatted
+    /// value, TypeCallNew's `(w_type, *args)` tuple, BinopLast's
+    /// `(lhs, rhs, w_op_tag)` operand tuple.
+    pub(crate) fn has_receiver(self) -> bool {
+        matches!(
+            self,
+            OperatorTail::Format | OperatorTail::TypeCallNew | OperatorTail::BinopLast
+        )
     }
 
     /// The host function the level's residual call runs, and the result bank
@@ -130,6 +161,14 @@ impl OperatorTail {
                 pyre_interpreter::residual_word_addr!(2, bh_format_tail) as i64,
                 'r',
             ),
+            OperatorTail::TypeCallNew => (
+                pyre_interpreter::residual_word_addr!(2, bh_type_call_new_tail) as i64,
+                'r',
+            ),
+            OperatorTail::BinopLast => (
+                pyre_interpreter::residual_word_addr!(2, bh_binop_last_tail) as i64,
+                'r',
+            ),
         }
     }
 }
@@ -139,9 +178,11 @@ impl OperatorTail {
 /// it so a post-return guard can carry the result already in this slot.
 const DUNDER_RESULT_REG: u16 = 0;
 
-/// The formatted value. Format's resume `-live-` names it next to the
-/// dunder result so `descroperation.py format` can build
-/// `%T.__format__() must return a str, not %T`.
+/// Extra ref next to the dunder result. Format: the formatted value, so
+/// `descroperation.py format` can build `%T.__format__() must return a str,
+/// not %T`. TypeCallNew: the `(w_type, *args)` tuple `descr_call` keeps
+/// across `__init__`. BinopLast: the `(lhs, rhs, w_op_tag)` tuple
+/// `descroperation.py binop_impl` keeps for the unsupported-operand TypeError.
 const RECEIVER_REG: u16 = 1;
 
 /// The operator's finished answer, in whichever bank [`OperatorTail::tail_call`]
@@ -154,9 +195,10 @@ const PLACEHOLDER_CALLEE: u16 = 0;
 
 /// Live ref colors at the resume `-live-`, in the order `boxes` stores them.
 fn resume_live_r(tail: OperatorTail) -> &'static [u8] {
-    match tail {
-        OperatorTail::Format => &[DUNDER_RESULT_REG as u8, RECEIVER_REG as u8],
-        _ => &[DUNDER_RESULT_REG as u8],
+    if tail.has_receiver() {
+        &[DUNDER_RESULT_REG as u8, RECEIVER_REG as u8]
+    } else {
+        &[DUNDER_RESULT_REG as u8]
     }
 }
 
@@ -211,6 +253,69 @@ pub extern "C" fn bh_format_tail(
         return w_res as i64;
     }
     let err = pyre_interpreter::type_methods::format_must_return_str(receiver, w_res);
+    use majit_ir::helper_fnaddr::ResidualError;
+    err.publish_residual();
+    0
+}
+
+/// `typeobject.py descr_call` after `__new__` has already returned.
+///
+/// `w_call` is the tuple `(w_type, *args)`. The tail never re-enters
+/// `__new__`: it only runs `type_call_init_after_new`. A guard inside the
+/// inlined `__new__`, and a post-return class pin that fails, resume here
+/// with the `__new__` result already in r0.
+pub extern "C" fn bh_type_call_new_tail(
+    w_newobject: pyre_object::PyObjectRef,
+    w_call: pyre_object::PyObjectRef,
+) -> i64 {
+    if w_call.is_null() || unsafe { !pyre_object::is_tuple(w_call) } {
+        return w_newobject as i64;
+    }
+    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(w_call) };
+    let Some((w_type, args)) = items.split_first() else {
+        return w_newobject as i64;
+    };
+    match pyre_interpreter::call::type_call_init_after_new(*w_type, w_newobject, args) {
+        Ok(value) => value as i64,
+        Err(err) => {
+            use majit_ir::helper_fnaddr::ResidualError;
+            err.publish_residual();
+            0
+        }
+    }
+}
+
+/// `descroperation.py binop_impl` after the last-arm `_invoke_binop`.
+///
+/// `w_operands` is the tuple `(lhs, rhs, w_op_tag)`. The tail never re-enters
+/// the dunder: NotImplemented becomes the unsupported-operand TypeError, and
+/// any other box is the operator's result.
+pub extern "C" fn bh_binop_last_tail(
+    w_res: pyre_object::PyObjectRef,
+    w_operands: pyre_object::PyObjectRef,
+) -> i64 {
+    if !std::ptr::eq(w_res, pyre_object::special::w_not_implemented()) {
+        return w_res as i64;
+    }
+    if w_operands.is_null() || unsafe { !pyre_object::is_tuple(w_operands) } {
+        return w_res as i64;
+    }
+    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(w_operands) };
+    if items.len() != 3 {
+        return w_res as i64;
+    }
+    let lhs = items[0];
+    let rhs = items[1];
+    let w_op_tag = items[2];
+    if unsafe { !pyre_object::is_int(w_op_tag) } {
+        return w_res as i64;
+    }
+    let tag = unsafe { pyre_object::w_int_get_value(w_op_tag) };
+    let Some(op) = pyre_interpreter::runtime_ops::binary_op_from_tag(tag) else {
+        return w_res as i64;
+    };
+    let err =
+        pyre_interpreter::objspace::descroperation::binop_last_arm_not_implemented(op, lhs, rhs);
     use majit_ir::helper_fnaddr::ResidualError;
     err.publish_residual();
     0
@@ -271,9 +376,10 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     // Format also names caller r1, the formatted receiver, as an argument
     // so the shared jitcode allocates that register; the instruction never
     // runs. The callee slot is positional 0 (`bhimpl_inline_call_*`).
-    let inline_args: &[(u16, u16)] = match tail {
-        OperatorTail::Format => &[(RECEIVER_REG, 0)],
-        _ => &[],
+    let inline_args: &[(u16, u16)] = if tail.has_receiver() {
+        &[(RECEIVER_REG, 0)]
+    } else {
+        &[]
     };
     builder.inline_call_r_r(PLACEHOLDER_CALLEE, inline_args, Some(DUNDER_RESULT_REG));
 
@@ -285,18 +391,21 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
     // A post-return guard (`GuardClass` / nonnegative `GuardTrue`) resumes
     // HERE with the dunder result already in r0, so that register is live
     // at the resume `-live-`. Format also keeps r1 live, the formatted
-    // value `descroperation.py format` names in the TypeError. An in-dunder
-    // abort still fills r0 through `_setup_return_value_r` (`blackhole.py`);
-    // the residual's own `-live-` stays empty: a failing `GUARD_NO_EXCEPTION`
-    // carries the exception.
+    // value `descroperation.py format` names in the TypeError. TypeCallNew
+    // keeps r1 live, the `(w_type, *args)` tuple `descr_call` names for
+    // `__init__`. BinopLast keeps r1 live, the `(lhs, rhs, w_op_tag)` tuple
+    // `descroperation.py binop_impl` names for the unsupported-operand
+    // TypeError. An in-dunder abort still fills r0 through
+    // `_setup_return_value_r` (`blackhole.py`); the residual's own `-live-`
+    // stays empty: a failing `GUARD_NO_EXCEPTION` carries the exception.
     let live_empty = crate::state::intern_liveness(&[], &[], &[])?;
     let live_at_resume = crate::state::intern_liveness(&[], resume_live_r(tail), &[])?;
     let live_patch = builder.live_placeholder();
     builder.patch_live_offset(live_patch, live_at_resume);
 
     let (funcptr, result_type) = tail.tail_call();
-    let (arg_classes, args) = match tail {
-        OperatorTail::Format => (
+    let (arg_classes, args) = if tail.has_receiver() {
+        (
             "rr",
             vec![
                 JitCallArg {
@@ -308,19 +417,23 @@ fn build(tail: OperatorTail) -> Option<(i32, usize)> {
                     reg: RECEIVER_REG,
                 },
             ],
-        ),
-        _ => (
+        )
+    } else {
+        (
             "r",
             vec![JitCallArg {
                 kind: majit_metainterp::jitcode::JitArgKind::Ref,
                 reg: DUNDER_RESULT_REG,
             }],
-        ),
+        )
     };
     let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
         // Len / Truth: one `Ref` argument, the box the dunder returned.
         // Format: that box and the formatted receiver (`descroperation.py
-        // format`). The result bank is the caller's own call-result register.
+        // format`). TypeCallNew: that box and the `(w_type, *args)` tuple
+        // (`typeobject.py descr_call`). BinopLast: that box and the
+        // `(lhs, rhs, w_op_tag)` tuple (`descroperation.py binop_impl`).
+        // The result bank is the caller's own call-result register.
         arg_classes: arg_classes.to_string(),
         result_type,
         ..Default::default()
@@ -436,8 +549,9 @@ mod tests {
 
     /// Every tail's resume `-live-` names r0 so a post-return guard can
     /// carry the dunder result. Format also names r1, the formatted
-    /// receiver. An in-dunder abort still fills r0 through
-    /// `_setup_return_value_r`.
+    /// receiver. TypeCallNew names r1, the `(w_type, *args)` tuple.
+    /// BinopLast names r1, the `(lhs, rhs, w_op_tag)` operand tuple. An
+    /// in-dunder abort still fills r0 through `_setup_return_value_r`.
     #[test]
     fn every_resume_pc_liveness_names_the_dunder_result() {
         for tail in OperatorTail::ALL {

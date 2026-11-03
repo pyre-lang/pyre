@@ -15,6 +15,7 @@ pub mod _immutables_map;
 pub mod _io;
 pub mod _locale;
 pub mod _opcode;
+pub mod _pypy_generic_alias;
 pub mod _sre;
 pub mod _stat;
 pub mod _structseq;

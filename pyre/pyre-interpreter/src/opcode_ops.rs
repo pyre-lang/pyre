@@ -130,7 +130,7 @@ pub fn binary_value(
 /// `Power`, `InplacePower` and `Subscr` are listed for the match to be
 /// exhaustive; each raises through a dispatch that spells its own message,
 /// and each keeps the spelling the table gives it.
-fn operator_symbol(op: BinaryOperator) -> &'static str {
+pub(crate) fn operator_symbol(op: BinaryOperator) -> &'static str {
     match op {
         BinaryOperator::Add => "+",
         BinaryOperator::Subtract => "-",

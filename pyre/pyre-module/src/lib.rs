@@ -105,10 +105,6 @@ pub fn install_optional_modules() {
         "_posixsubprocess",
         module::_posixsubprocess::init,
     );
-    pyre_interpreter::importing::register_builtin_module(
-        "_pypy_generic_alias",
-        module::_pypy_generic_alias::init,
-    );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
     pyre_interpreter::importing::register_builtin_module("gc", module::gc::moduledef::init);
     pyre_interpreter::importing::register_builtin_module_with_startup(

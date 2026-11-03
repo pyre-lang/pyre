@@ -6335,6 +6335,21 @@ fn operand_type_name(obj: PyObjectRef) -> String {
     }
 }
 
+/// `descroperation.py binop_impl` once its last `_invoke_binop` arm answered
+/// NotImplemented: the `errormsg` TypeError over the two operands.
+pub fn binop_last_arm_not_implemented(
+    op: crate::bytecode::BinaryOperator,
+    a: PyObjectRef,
+    b: PyObjectRef,
+) -> PyError {
+    let symbol = if matches!(op, crate::bytecode::BinaryOperator::Power) {
+        "** or pow()"
+    } else {
+        crate::opcode_ops::operator_symbol(op)
+    };
+    binop_type_error(symbol, a, b)
+}
+
 /// The `unsupported operand type(s) for <symbol>` TypeError raised once both
 /// the forward and the reflected special have declined.
 ///

@@ -3679,11 +3679,11 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
 ///
 /// `descroperation.py` checks the box AFTER the call, in the caller
 /// level (`format` `isinstance_w`, `len` `_check_len_result`, `is_true`
-/// bool-ness). The compiled pin must resume in `OperatorTail` with the
-/// result as the tail's pending return (`_setup_return_value_r`), not at
-/// the caller's CALL / FORMAT_WITH_SPEC `op.pc` — that coordinate re-runs
-/// the dunder. Every guard on the dunder result before the destination
-/// write goes through this helper.
+/// bool-ness, `binop_impl` last-arm NotImplemented). The compiled pin must
+/// resume in `OperatorTail` with the result as the tail's pending return
+/// (`_setup_return_value_r`), not at the caller's CALL / FORMAT_WITH_SPEC /
+/// BINARY_OP `op.pc` — that coordinate re-runs the dunder. Every guard on
+/// the dunder result before the destination write goes through this helper.
 pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3732,6 +3732,8 @@ pub(crate) fn walker_emit_operator_tail_result_guard<Sym: WalkSym>(
     let mut tail_frame = super::operator_continuation_parent_frame(tail, receiver)
         .ok_or(DispatchError::callee_inline_abort(op_pc, true))?;
     // r0 is the dunder result. Format keeps the receiver in boxes[1].
+    // TypeCallNew keeps the `(w_type, *args)` tuple; BinopLast keeps the
+    // `(lhs, rhs, w_op_tag)` operand tuple.
     tail_frame.boxes[0] = result;
     // `capture_resumedata` walks every `MetaInterp.framestack` entry.
     // `walker_capture_transparent_helper_snapshot` takes the same

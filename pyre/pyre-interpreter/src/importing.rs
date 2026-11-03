@@ -990,12 +990,14 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_sre);
     // `baseobjspace.py:finish` runs `atexit._run_exitfuncs` at shutdown;
     // `warnings` imports `_contextvars`, which imports `_immutables_map`;
+    // `_contextvars` also imports `_pypy_generic_alias`;
     // `os` imports `errno`. `_opcode` is one of `essential_modules`, and a
     // JIT build always has `pypyjit`. The `BUILD_TEMPLATE` and
     // `BUILD_INTERPOLATION` opcodes import `_template`.
     pyre_install_module!(atexit);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_immutables_map);
+    pyre_install_module!(_pypy_generic_alias);
     pyre_install_module!(errno);
     pyre_install_module!(_opcode);
     pyre_install_module!(pypyjit);
@@ -1065,7 +1067,7 @@ pub fn install_builtin_modules() {
 
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
     // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
-    // `_pypy_generic_alias`, `_pickle`, `_random`, `_tokenize`, `array`, `gc`,
+    // `_pickle`, `_random`, `_tokenize`, `array`, `gc`,
     // and the Windows host modules other than `winreg` live in `pyre-module`.
     // None of the host ones belong to the mediated ll_os/ll_time surface, so
     // the sandbox interpreter omits them entirely: `import _ctypes` then

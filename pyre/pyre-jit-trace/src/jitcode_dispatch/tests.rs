@@ -485,14 +485,13 @@ fn discarding_a_staged_abort_releases_the_coordinate_claim() {
 fn every_continuation_parent_carries_the_pending_result_placeholder() {
     for tail in [
         crate::operator_continuation::OperatorTail::Format,
+        crate::operator_continuation::OperatorTail::TypeCallNew,
+        crate::operator_continuation::OperatorTail::BinopLast,
         crate::operator_continuation::OperatorTail::Len,
         crate::operator_continuation::OperatorTail::Truth,
     ] {
         let parent = operator_continuation_parent_frame(tail, None).expect("tail installs");
-        let expected = match tail {
-            crate::operator_continuation::OperatorTail::Format => 2,
-            _ => 1,
-        };
+        let expected = if tail.has_receiver() { 2 } else { 1 };
         assert_eq!(
             parent.boxes.len(),
             expected,

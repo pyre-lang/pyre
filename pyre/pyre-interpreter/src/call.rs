@@ -5528,10 +5528,48 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
     };
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(instance);
+    let mut pinned_args = Vec::with_capacity(args_len);
+    extend_current_args(&mut pinned_args);
+    match type_call_init_after_new(
+        current_type(),
+        pyre_object::gc_roots::shadow_stack_get(instance_slot),
+        &pinned_args,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            set_call_error(error);
+            PY_NULL
+        }
+    }
+}
 
-    // Step 2: __init__ — only if __new__ returned an instance of w_type.
-    // PyPy checks the Python-level type(instance), so builtin-layout subtypes
-    // like set subclasses still run __init__.
+/// `typeobject.py descr_call` after `call_obj_args(w_newfunc, ...)`.
+///
+/// Step 2 of that method: `__init__` runs only when
+/// `space.isinstance_w(w_newobject, self)`, looked up on
+/// `space.type(w_newobject)`, and must return None. The instance is the
+/// call result either way.
+pub fn type_call_init_after_new(
+    w_type: PyObjectRef,
+    w_newobject: PyObjectRef,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    let args_len = args.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    for &arg in args {
+        let _ = pyre_object::gc_roots::pin_root(arg);
+    }
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_newobject);
+    let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
+        for i in 0..args_len {
+            dst.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+        }
+    };
+
     if let Some(w_insttype) = type_call_init_type(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         current_type(),
@@ -5543,16 +5581,14 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
         extend_current_args(&mut init_args);
         let res = call_function_impl(init_fn, &init_args);
         if res.is_null() {
-            // `__init__` raised — error already stashed; propagate it.
-            return PY_NULL;
+            return Err(
+                take_call_error().unwrap_or_else(|| crate::PyError::value_error("call failed"))
+            );
         }
-        if let Err(e) = check_init_returned_none(res) {
-            set_call_error(e);
-            return PY_NULL;
-        }
+        check_init_returned_none(res)?;
     }
 
-    pyre_object::gc_roots::shadow_stack_get(instance_slot)
+    Ok(pyre_object::gc_roots::shadow_stack_get(instance_slot))
 }
 
 /// `typeobject.py descr_call` — `__init__` must return None.  A non-null,
@@ -5585,7 +5621,8 @@ pub fn check_init_returned_none(result: PyObjectRef) -> Result<(), PyError> {
     )))
 }
 
-fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
+/// `space.type(instance)` when `space.isinstance_w(instance, w_type)`.
+pub fn type_call_init_type(instance: PyObjectRef, w_type: PyObjectRef) -> Option<PyObjectRef> {
     let w_insttype = crate::typedef::r#type(instance)?;
     if std::ptr::eq(w_insttype.as_ptr(), w_type) || issubtype_ptr(w_insttype.as_ptr(), w_type) {
         Some(w_insttype.as_ptr())

@@ -2969,6 +2969,23 @@ pub(super) fn walker_promote_instance_map<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     map: usize,
 ) -> Result<(), DispatchError> {
+    walker_promote_instance_map_with_guard(ctx, obj, concrete_obj, map, |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, args)
+    })
+}
+
+/// [`walker_promote_instance_map`] with caller-supplied GuardValue emission.
+fn walker_promote_instance_map_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    map: usize,
+    mut emit_guard: F,
+) -> Result<(), DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
     // GuardClass (and the version-tag pin) can minor-collect. `concrete_obj`
     // is a copy; the receiver box is `obj` (`RefFrontendOp` / `getref_base`).
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
@@ -2988,7 +3005,7 @@ pub(super) fn walker_promote_instance_map<Sym: WalkSym>(
     // GuardValue compares it as an Int word (`object_map_descr`).
     let slot_op = walker_record_getfield_gc_i_uncached(ctx, obj, descr.clone());
     let slot_const = ctx.trace_ctx.const_int(map as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[slot_op, slot_const])?;
+    emit_guard(ctx, OpCode::GuardValue, &[slot_op, slot_const])?;
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(slot_op, slot_const);
@@ -14339,8 +14356,24 @@ fn walker_guard_stamped_ref<Sym: WalkSym>(
     op: OpRef,
     concrete: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
+    walker_guard_stamped_ref_with_guard(ctx, op, concrete, |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, opcode, args)
+    })
+}
+
+/// [`walker_guard_stamped_ref`] with caller-supplied GuardValue emission.
+fn walker_guard_stamped_ref_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+    mut emit_guard: F,
+) -> Result<OpRef, DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
     let expected = ctx.trace_ctx.const_ref(concrete as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    emit_guard(ctx, OpCode::GuardValue, &[op, expected])?;
     if !op.is_constant() {
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
@@ -14570,9 +14603,25 @@ fn walker_guard_stamped_class<Sym: WalkSym>(
     obj: OpRef,
     type_addr: i64,
 ) -> Result<(), DispatchError> {
+    walker_guard_stamped_class_with_guard(ctx, obj, type_addr, |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, opcode, args)
+    })
+}
+
+/// [`walker_guard_stamped_class`] with caller-supplied GuardClass emission.
+fn walker_guard_stamped_class_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+    type_addr: i64,
+    mut emit_guard: F,
+) -> Result<(), DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.trace_ctx.const_int(type_addr);
-        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardClass, &[obj, type_const])?;
+        emit_guard(ctx, OpCode::GuardClass, &[obj, type_const])?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     Ok(())
@@ -14724,8 +14773,24 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
     op: OpRef,
     concrete: pyre_object::PyObjectRef,
 ) -> Result<OpRef, DispatchError> {
-    let expected = walker_guard_stamped_ref(ctx, pc, op, concrete)?;
-    walker_pin_type_version_tag(ctx, pc, expected)?;
+    walker_guard_stamped_type_version_with_guard(ctx, op, concrete, |ctx, opcode, args| {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, opcode, args)
+    })
+}
+
+/// [`walker_guard_stamped_type_version`] with caller-supplied GuardValue emission.
+fn walker_guard_stamped_type_version_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+    mut emit_guard: F,
+) -> Result<OpRef, DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
+    let expected = walker_guard_stamped_ref_with_guard(ctx, op, concrete, &mut emit_guard)?;
+    walker_pin_type_version_tag_with_guard(ctx, expected, &mut emit_guard)?;
     Ok(expected)
 }
 
@@ -14746,6 +14811,29 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     w_type: pyre_object::PyObjectRef,
 ) -> Result<Option<OpRef>, DispatchError> {
+    walker_pin_stamped_instance_class_with_guard(
+        ctx,
+        obj,
+        concrete_obj,
+        w_type,
+        |ctx, opcode, args| walker_emit_fold_guard_with_snapshot(ctx, pc, opcode, args),
+    )
+}
+
+/// [`walker_pin_stamped_instance_class`] with caller-supplied GuardClass /
+/// GuardValue emission, so a post-`__new__` pin can resume into
+/// `OperatorTail::TypeCallNew` rather than at the CALL pc.
+pub(super) fn walker_pin_stamped_instance_class_with_guard<Sym, F>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    mut emit_guard: F,
+) -> Result<Option<OpRef>, DispatchError>
+where
+    Sym: WalkSym,
+    F: FnMut(&mut WalkContext<'_, '_, Sym>, OpCode, &[OpRef]) -> Result<(), DispatchError>,
+{
     // Decline before emitting: a `W_ObjectObject` user instance with no
     // terminator cannot prove `getclass` (`mapdict.py BaseUserClassMapdict.getclass`).
     // Exception USER stamps the type terminator at alloc (`user_setup`);
@@ -14765,25 +14853,31 @@ fn walker_pin_stamped_instance_class<Sym: WalkSym>(
     // Every record below appends to `opencoder.py Trace._ops` and can
     // minor-collect. Box `w_type` before the first one; `w_type` is a copy.
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_guard_stamped_class(ctx, pc, obj, phys_type)?;
+    walker_guard_stamped_class_with_guard(ctx, obj, phys_type, &mut emit_guard)?;
     let concrete_obj = live_box_ref(ctx, obj, concrete_obj);
     if has_mapdict && !map.is_null() {
-        walker_promote_instance_map(ctx, pc, obj, concrete_obj, map as usize)?;
-        walker_pin_type_version_tag(ctx, pc, w_type_const)?;
+        walker_promote_instance_map_with_guard(
+            ctx,
+            obj,
+            concrete_obj,
+            map as usize,
+            &mut emit_guard,
+        )?;
+        walker_pin_type_version_tag_with_guard(ctx, w_type_const, &mut emit_guard)?;
         return Ok(Some(w_type_const));
     }
     if unsafe { pyre_object::is_instance(concrete_obj) } {
         // Exact `object()`: GuardClass already proved `INSTANCE_TYPE`.
         // PyPy `W_ObjectObject` has no mapdict.
-        walker_pin_type_version_tag(ctx, pc, w_type_const)?;
+        walker_pin_type_version_tag_with_guard(ctx, w_type_const, &mut emit_guard)?;
         return Ok(Some(w_type_const));
     }
     let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     // The getfield can minor-collect; read `w_type` through its box.
     let w_type = walker_const_ref_object(ctx, w_type_const);
-    Ok(Some(walker_guard_stamped_type_version(
-        ctx, pc, w_class, w_type,
-    )?))
+    let expected =
+        walker_guard_stamped_type_version_with_guard(ctx, w_class, w_type, &mut emit_guard)?;
+    Ok(Some(expected))
 }
 
 /// `allocate_instance` stamps the realbase vtable when `w_class` is that
