@@ -17645,15 +17645,29 @@ pub(crate) fn drain_collect_items(items: PyObjectRef) -> Vec<PyObjectRef> {
         .collect()
 }
 
+/// `ObjSpace.length_hint`: `e.match(space, space.w_TypeError)`.
+/// AttributeError stays the kind tag so a user subclass is not absorbed.
+fn length_hint_absorbed(err: &mut crate::PyError) -> bool {
+    if let Some(w_type_error) = cached_type_error() {
+        if err.match_(pyre_object::PY_NULL, w_type_error) {
+            return true;
+        }
+    } else if err.kind == crate::PyErrorKind::TypeError {
+        return true;
+    }
+    err.kind == crate::PyErrorKind::AttributeError
+}
+
 /// pypy/interpreter/baseobjspace.py `length_hint`.
 ///
 /// Returns the length of an object, consulting its `__length_hint__`
 /// method if necessary.  Errors mirror the upstream contract:
-/// `len_w`'s TypeError / AttributeError are absorbed; an
-/// `__length_hint__` that raises TypeError / AttributeError returns
-/// `default`; a NotImplemented return also yields `default`; a
-/// negative return raises ValueError "__length_hint__() should return
-/// >= 0"; any other exception propagates.
+/// `len_w`'s TypeError (subclasses included via `OperationError.match`)
+/// and an exact AttributeError kind are absorbed; an `__length_hint__`
+/// that raises those same errors returns `default`; a NotImplemented
+/// return also yields `default`; a negative return raises ValueError
+/// "__length_hint__() should return >= 0"; any other exception
+/// propagates.
 pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::PyError> {
     // baseobjspace.py `length_hint`: `w_obj` is a livevar across `len_w`,
     // `lookup('__length_hint__')`, and `get_and_call_function`. RPython
@@ -17667,10 +17681,11 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     match len_w(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
         Ok(n) => return Ok(n),
-        Err(e)
-            if e.kind == crate::PyErrorKind::TypeError
-                || e.kind == crate::PyErrorKind::AttributeError => {}
-        Err(e) => return Err(e),
+        Err(mut e) => {
+            if !length_hint_absorbed(&mut e) {
+                return Err(e);
+            }
+        }
     }
     // baseobjspace.py `w_descr = space.lookup(w_obj, '__length_hint__')`
     // — a type-MRO special-method lookup, NOT full attribute access: an
@@ -17733,10 +17748,8 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
     };
     let mut w_hint = match w_hint_result {
         Ok(v) => v,
-        Err(err) => {
-            if err.kind == crate::PyErrorKind::TypeError
-                || err.kind == crate::PyErrorKind::AttributeError
-            {
+        Err(mut err) => {
+            if length_hint_absorbed(&mut err) {
                 return Ok(default);
             }
             return Err(err);
