@@ -7659,6 +7659,66 @@ mod tests {
         );
     }
 
+    /// `StrKey(ptr)` / `BytesKey(ptr)` construction is the inner STR
+    /// (`AbstractTypedStrategy.setitem` unwrap). `project_struct_field_type`
+    /// already maps both to `s_str0()`; insert of that SomeString into the
+    /// matching `RDict` must not UnionError. A leftover `Instance(StrKey)`
+    /// still does — `DictDef::generalize_key` is unchanged.
+    #[test]
+    fn str_family_dict_key_newtype_inserts_as_somestring() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeValue, s_str0};
+
+        let bk = bk();
+        assert_eq!(
+            bk.project_struct_field_type("celldict::StrKey"),
+            s_str0(),
+            "StrKey is the inner STR"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("pyre_object::celldict::StrKey"),
+            s_str0()
+        );
+        assert_eq!(
+            bk.project_struct_field_type("dictmultiobject::BytesKey"),
+            s_str0(),
+            "BytesKey is the inner STR"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("pyre_object::dictmultiobject::BytesKey"),
+            s_str0()
+        );
+
+        fn assert_constructed_str_inserts(bk: &Rc<Bookkeeper>, root: &str, wrapper: &str) {
+            let projected = bk.stable_projected_root(root);
+            let SomeValue::Dict(dict) = projected else {
+                panic!("{root} is SomeDict, got {projected:?}");
+            };
+            dict.dictdef
+                .generalize_key(&s_str0())
+                .expect("constructed SomeString inserts into the matching RDict");
+            let leftover = SomeValue::Instance(SomeInstance::new(
+                Some(ClassDef::new_standalone(wrapper, None)),
+                false,
+                Default::default(),
+            ));
+            dict.dictdef.generalize_key(&leftover).expect_err(
+                "Instance(StrKey|BytesKey) still UnionError; generalize_key is unchanged",
+            );
+        }
+
+        assert_constructed_str_inserts(
+            &bk,
+            "RDict<celldict::StrKey,PyObjectRef>",
+            "celldict::StrKey",
+        );
+        assert_constructed_str_inserts(
+            &bk,
+            "RDict<dictmultiobject::BytesKey,PyObjectRef>",
+            "dictmultiobject::BytesKey",
+        );
+    }
+
     #[test]
     fn tagged_option_of_scalar_projects_instantiation_classdef() {
         // `Option<usize>` is a tagged enum instance, not `uint ∪ None`.

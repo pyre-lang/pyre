@@ -6180,6 +6180,12 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             // the wrapper class (`transparent_deref_target_class` above,
             // or `Ref(None)` plus the Input class_root). Peeling the
             // inner pointer would intern the handle as the payload.
+            // STR-family dict-key wrappers (`celldict::StrKey` /
+            // `dictmultiobject::BytesKey`) are the inner STR pointer
+            // (`AbstractTypedStrategy.setitem` unwrap).
+            // `project_struct_field_type` already maps them to `s_str0()`
+            // (`is_str_family_class_root`); peel so construction is that
+            // SomeString, not `objectmodel.instantiate` + setattr `__pos_0`.
             if registered_gc_ptr_class_root_with(
                 &field.ty,
                 llbc,
@@ -6189,7 +6195,12 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             )
             .is_some()
             {
-                return None;
+                // Same predicate `project_struct_field_type` uses. Do
+                // not run `class_identity_spelling`: that crate-peel
+                // turns `other::StrKey` into the family leaf `StrKey`.
+                if !is_str_family_class_root(&decl.item_meta.name_path()) {
+                    return None;
+                }
             }
             Some(tyref_to_value_type_with(
                 &field.ty,

@@ -9,7 +9,7 @@ use super::{
     tyref_to_attr_value_type_for_struct_field, tyref_to_value_type, tyref_tuple_suffix,
 };
 
-use crate::model::{FunctionGraph, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
 use majit_charon_reader::{
     Llbc,
@@ -27,7 +27,7 @@ use crate::front::mir::tests::{
     type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr, usize_ty,
     vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
     window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
-    window_shared_slice, window_slice, window_span,
+    window_shared_slice, window_slice, window_span, window_usize,
 };
 
 #[test]
@@ -71,6 +71,8 @@ fn crate_prefixed_utf8str_is_str_family() {
     assert!(is_str_family_class_root("celldict::StrKey"));
     assert!(is_str_family_class_root("dictmultiobject::BytesKey"));
     assert!(is_str_family_class_root("pyre_object::celldict::StrKey"));
+    assert!(!is_str_family_class_root("other::StrKey"));
+    assert!(!is_str_family_class_root("other::BytesKey"));
     assert!(!is_rstr_str_layout_declaration("celldict::StrKey"));
     assert!(!is_rstr_str_layout_declaration("dictmultiobject::BytesKey"));
 }
@@ -219,6 +221,206 @@ fn node_is_string_value_uses_declaration_identity() {
         tyref_to_value_type(&raw(6), &llbc),
         ValueType::Str
     ));
+}
+
+fn family_ptr_newtype_llbc(
+    inner_path: &[&str],
+    wrapper_path: &[&str],
+    wrap_name: &str,
+    unwrap_name: &str,
+) -> Llbc {
+    let inner_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let wrapper_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+    });
+    let inner_ptr = serde_json::json!({"RawPtr": [inner_adt.clone(), "Mut"]});
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(inner_path, true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let wrapper = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(wrapper_path, true),
+        "kind": {"Struct": [
+            {"name": null, "ty": inner_ptr.clone(), "attr_info": null}
+        ]},
+        "layout": transparent_layout()
+    });
+    let wrap = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", wrap_name], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [inner_ptr.clone()],
+            "output": wrapper_adt.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &wrapper_adt),
+                window_local(1, &inner_ptr)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &wrapper_adt),
+                        {"Aggregate": [
+                            {"Adt": [
+                                {"id": 1, "generics": window_empty_generics()},
+                                null,
+                                null
+                            ]},
+                            [{"Move": window_place(
+                                serde_json::json!({"Local": 1}),
+                                &inner_ptr
+                            )}]
+                        ]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 1}), &wrapper_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &inner_ptr,
+    );
+    let unwrap = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", unwrap_name], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [wrapper_adt.clone()],
+            "output": inner_ptr.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &inner_ptr),
+                window_local(1, &wrapper_adt)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &inner_ptr),
+                        {"Use": [{"Copy": field_place}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    window_llbc(vec![inner, wrapper], vec![wrap, unwrap])
+}
+
+fn wrapper_tyref() -> TyRef {
+    TyRef::Other(serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+    }))
+}
+
+fn graph_has_wrapper_ctor_or_pos0(graph: &FunctionGraph) -> bool {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { .. },
+                ..
+            } => true,
+            OpKind::FieldWrite { field, .. } if field.name == "__pos_0" => true,
+            OpKind::FieldRead { field, .. } if field.name == "__pos_0" => true,
+            _ => false,
+        })
+}
+
+/// `StrKey(ptr)` / `BytesKey(ptr)` construction is the inner STR pointer
+/// (`AbstractTypedStrategy.setitem` unwrap). `project_struct_field_type`
+/// already maps both to `s_str0()`; the Operand path must match so insert
+/// does not see `String ∪ Instance(StrKey|BytesKey)`.
+#[test]
+fn str_family_dict_key_newtype_constructs_as_str() {
+    let str_llbc = family_ptr_newtype_llbc(
+        &["pyre_object", "unicodeobject", "Utf8Str"],
+        &["pyre_object", "celldict", "StrKey"],
+        "wrap_str_key",
+        "unwrap_str_key",
+    );
+    let bytes_llbc = family_ptr_newtype_llbc(
+        &["pyre_object", "bytesobject", "BytesBlock"],
+        &["pyre_object", "dictmultiobject", "BytesKey"],
+        "wrap_bytes_key",
+        "unwrap_bytes_key",
+    );
+    let wrapper = wrapper_tyref();
+    assert!(
+        matches!(tyref_to_value_type(&wrapper, &str_llbc), ValueType::Str),
+        "StrKey(ptr) is the inner STR, not a nominal instance"
+    );
+    assert!(
+        matches!(tyref_to_value_type(&wrapper, &bytes_llbc), ValueType::Str),
+        "BytesKey(ptr) is the inner STR, not a nominal instance"
+    );
+
+    let wrap_str = super::lower_function(&str_llbc, "wrap_str_key").expect("lower StrKey wrap");
+    let unwrap_str =
+        super::lower_function(&str_llbc, "unwrap_str_key").expect("lower StrKey unwrap");
+    let wrap_bytes =
+        super::lower_function(&bytes_llbc, "wrap_bytes_key").expect("lower BytesKey wrap");
+    let unwrap_bytes =
+        super::lower_function(&bytes_llbc, "unwrap_bytes_key").expect("lower BytesKey unwrap");
+    assert!(
+        !graph_has_wrapper_ctor_or_pos0(&wrap_str),
+        "StrKey(ptr) must not instantiate + setattr(__pos_0); graph={}",
+        wrap_str.dump()
+    );
+    assert!(
+        !graph_has_wrapper_ctor_or_pos0(&unwrap_str),
+        "StrKey.0 must be identity; graph={}",
+        unwrap_str.dump()
+    );
+    assert!(
+        !graph_has_wrapper_ctor_or_pos0(&wrap_bytes),
+        "BytesKey(ptr) must not instantiate + setattr(__pos_0); graph={}",
+        wrap_bytes.dump()
+    );
+    assert!(
+        !graph_has_wrapper_ctor_or_pos0(&unwrap_bytes),
+        "BytesKey.0 must be identity; graph={}",
+        unwrap_bytes.dump()
+    );
+
+    let lookalike = family_ptr_newtype_llbc(
+        &["pyre_object", "unicodeobject", "Utf8Str"],
+        &["other", "StrKey"],
+        "wrap_lookalike",
+        "unwrap_lookalike",
+    );
+    assert!(
+        !matches!(tyref_to_value_type(&wrapper, &lookalike), ValueType::Str),
+        "other::StrKey is not the STR-family dict-key wrapper"
+    );
+    let wrap_lookalike =
+        super::lower_function(&lookalike, "wrap_lookalike").expect("lower lookalike wrap");
+    assert!(
+        graph_has_wrapper_ctor_or_pos0(&wrap_lookalike),
+        "a non-family pointer newtype keeps instantiate; graph={}",
+        wrap_lookalike.dump()
+    );
 }
 
 /// `shadow_stack_get(base) as *mut UnicodeValueStorage` in the real
