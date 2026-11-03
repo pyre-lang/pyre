@@ -1150,7 +1150,7 @@ pub(in crate::front::mir) fn collect_fn_stubs_from_llbc_if(
 ///   except a str-family result (`is_str_family_class_root`: rust-heap
 ///   `String`, `Wtf8Buf`, …) keeps `Ref(Some(root))` so the residual
 ///   annotates `SomeString` (`annotator/model.py` `SomeString`,
-///   `s_str0()`). Dropping that root minted the classdef-less Instance
+///   `no_nul=False`). Dropping that root minted the classdef-less Instance
 ///   `pairtype(SomeObject, SomeObject).union` cannot join with
 ///   `String::new()` (`binaryop.py`);
 /// - output is a payload-carrying enum (`GcAllocOutcome`) →
@@ -1391,8 +1391,8 @@ pub(in crate::front::mir) fn foreign_opaque_method_result_valuetype(
         //   `SomeInstance`, the shell `bigint_from` produces, except a
         //   str-family result (`is_str_family_class_root`: rust-heap
         //   `String`, …) keeps the class root so
-        //   `foreign_opaque_method_return_shell` seeds `s_str0()`
-        //   (`annotator/model.py` `SomeString`). Dropping it to
+        //   `foreign_opaque_method_return_shell` seeds `SomeString`
+        //   (`no_nul=False`). Dropping it to
         //   `Ref(None)` minted the classdef-less Instance
         //   `pairtype(SomeObject, SomeObject).union` cannot join with
         //   `String::new()` (`binaryop.py`);
@@ -4533,8 +4533,8 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // behind `*mut Wtf8Buf` (`W_UnicodeObject.value`).
     // A rust-heap `String` is not rstr `STR`; the `ValueType` stays
     // `Ref` so `ll_strconcat` does not consume a `{cap, ptr, len}`
-    // header. `valuetype_to_someshell` shells that Ref as `s_str0()`
-    // (`annotator/model.py` `SomeString`).
+    // header. `valuetype_to_someshell` shells that Ref as `SomeString`
+    // with `no_nul=False` (`annotator/model.py` `SomeString`).
     if tyref_is_rust_heap_string(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }
@@ -5186,15 +5186,11 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    depth: usize,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<InlineLeaf> {
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return Vec::new();
     };
-    if depth == 0 {
-        return Vec::new();
-    }
     let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
     let owner_node = tyref_node(instantiated, llbc).and_then(|n| strip_ty_wrappers(n, llbc));
     let transparent_payload_idx =
@@ -5233,13 +5229,15 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
             gc_struct_ids,
             raw_alloc_flavor_structs,
         ) {
+            // `heaptracker.all_fielddescrs`: by-value nesting is finite (a
+            // self-containing by-value struct is impossible), so there is no
+            // cutoff.
             let nested_leaves = collect_by_value_struct_leaves(
                 nested,
                 &field_ty,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
-                depth - 1,
                 raw_alloc_flavor_structs,
             );
             if transparent_payload_idx == Some(i) {
@@ -5312,7 +5310,6 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
             llbc,
             tombstoned,
             gc_struct_ids,
-            16,
             raw_alloc_flavor_structs,
         ),
     })
@@ -6916,6 +6913,24 @@ pub(in crate::front::mir) fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> boo
         == Some("u8")
 }
 
+/// `*mut` / `*const` whose pointee is `c_void` (`rffi.py` `VOIDP`).
+/// Charon spells `core::ffi::c_void`; a `std::ffi` / `libc` re-export
+/// is the same VOIDP word.
+pub(in crate::front::mir) fn tyref_is_raw_c_void_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_peel_one_raw_ptr_node(ty, llbc) else {
+        return false;
+    };
+    let Some(node) = type_node_peel_aliases(pointee, llbc) else {
+        return false;
+    };
+    adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            path == "c_void" || path.ends_with("::c_void")
+        })
+}
+
 /// The return is a `u8` list, or a `Result` whose `Ok` payload is one.
 /// `rffi.py` `charpsize2str` returns the str and raises `MemoryError`;
 /// `Result<Vec<u8>, MemoryError>` spells that raise as the `Err` arm, so
@@ -6945,6 +6960,47 @@ pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llb
     if tyref_is_raw_u8_ptr(ty, llbc) {
         stamp_as_ccharp(var);
     }
+}
+
+/// Stamp a function-pointer dest `Ptr(FuncType)` (`lltype.FuncType` /
+/// `getfunctionptr`). The walker rebuilds `SomePtr` from this
+/// `concretetype` (`var_concretetype_is_ccharp` parallel). Mint through
+/// `func_type_from_fn_spelling` with the exception-carrier test so
+/// `Result<(), E>` is `Void` and equals `fn_null_constant` of the same
+/// spelling (`ann_nullptr`).
+pub(in crate::front::mir) fn stamp_fn_ptr(
+    var: &Variable,
+    ty: &TyRef,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) {
+    let Some(spelling) = tyref_fn_ptr_spelling(ty, llbc) else {
+        return;
+    };
+    stamp_fn_ptr_spelling(var, &spelling, error_carrier);
+}
+
+/// [`stamp_fn_ptr`] from an already-rendered `fn(inputs) -> output`
+/// spelling (`tyref_fn_ptr_spelling`).
+pub(crate) fn stamp_fn_ptr_spelling(
+    var: &Variable,
+    spelling: &str,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) {
+    use crate::annotator::bookkeeper::{
+        exception_carrier_keys_from_spec, exception_carrier_type_spelling_keys,
+        func_type_from_fn_spelling,
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+    let (carrier, handle) = exception_carrier_keys_from_spec(error_carrier);
+    let is_carrier =
+        |e: &str| exception_carrier_type_spelling_keys(e, carrier.as_deref(), handle.as_deref());
+    let Some(ft) = func_type_from_fn_spelling(spelling, &is_carrier) else {
+        return;
+    };
+    var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Func(ft),
+    }))));
 }
 
 /// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
@@ -7287,6 +7343,11 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
         || owner_root_guard::tyref_is_guard(&payload, llbc)
     {
         return None;
+    }
+    // `Option<*mut c_void>` / `Option<*const c_void>` is the nullable
+    // `rffi.VOIDP` word. `history.py` `getkind` of a raw `Ptr` is `'int'`.
+    if tyref_is_raw_c_void_ptr(&payload, llbc) {
+        return Some(ValueType::Int);
     }
     if niche_option_storage_raw_struct_root(ty, llbc, tombstoned).is_some() {
         return Some(ValueType::Int);

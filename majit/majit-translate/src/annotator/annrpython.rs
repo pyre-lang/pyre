@@ -608,6 +608,86 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
     }
 }
 
+/// RPython `apply_renaming(self, s_out, renaming)` (annrpython.py).
+///
+/// Rewrites the `is_type_of` list of a `SomeTypeOf` and the
+/// `knowntypedata` table of a `SomeBool` under the provided
+/// variable-renaming. `renaming` maps each old variable to a
+/// (possibly empty) list of new variables — the annotation is
+/// either rebuilt against the renamed variables or stripped if
+/// no renaming entry exists. Does not use annotator `self`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+pub(crate) fn apply_renaming(
+    s_out: SomeValue,
+    renaming: &HashMap<Rc<Variable>, Vec<Rc<Variable>>>,
+) -> SomeValue {
+    use super::model::{
+        KnownTypeData, SomeBool, SomeTypeOf, SomeValue as SV, add_knowntypedata, r#typeof,
+    };
+    // Rebuild SomeTypeOf.is_type_of against the renamed variables.
+    // upstream: `for v in s_out.is_type_of: renamed += renaming[v]`.
+    let s_out = match s_out {
+        SV::TypeOf(t) => {
+            let mut renamed_is_type_of: Vec<Rc<Variable>> = Vec::new();
+            for v in &t.is_type_of {
+                if let Some(new_vs) = renaming.get(v) {
+                    renamed_is_type_of.extend(new_vs.iter().map(Rc::clone));
+                }
+            }
+            let newcell = r#typeof(&renamed_is_type_of);
+            match newcell {
+                SV::TypeOf(mut nc) => {
+                    if t.base.const_box.is_some() {
+                        nc.base.const_box = t.base.const_box.clone();
+                    }
+                    SV::TypeOf(nc)
+                }
+                // typeof returns SomeType when args_v is empty.
+                other => other,
+            }
+        }
+        other => other,
+    };
+    // Rewrite SomeBool.knowntypedata under the renaming.
+    if let SV::Bool(b) = &s_out
+        && let Some(ktd) = &b.knowntypedata
+    {
+        let mut renamed: KnownTypeData = HashMap::new();
+        for (value, constraints) in ktd {
+            let mut new_inner: HashMap<Rc<Variable>, SomeValue> = HashMap::new();
+            for (v, s) in constraints {
+                if let Some(new_vs) = renaming.get(v) {
+                    for new_v in new_vs {
+                        new_inner.insert(Rc::clone(new_v), s.clone());
+                    }
+                }
+            }
+            if !new_inner.is_empty() {
+                renamed.insert(*value, new_inner);
+            }
+        }
+        // upstream: `assert isinstance(s_out, SomeBool)` + rebuild.
+        let mut newcell = SomeBool::new();
+        // SomeObject.is_immutable_constant (model.py):
+        // `self.is_constant() and self.immutable`. SomeBool
+        // carries `immutable = True`, so the precondition here
+        // is just "const_box populated".
+        if b.base.const_box.is_some() {
+            newcell.base.const_box = b.base.const_box.clone();
+        }
+        newcell.set_knowntypedata(renamed);
+        // rebuild add_knowntypedata side-effect: not needed —
+        // set_knowntypedata already stores the rebuilt map.
+        let _ = add_knowntypedata; // keep the import alive.
+        let _ = SomeTypeOf::new(vec![]); // keep the import alive.
+        return SV::Bool(newcell);
+    }
+    s_out
+}
+
 impl RPythonAnnotator {
     /// RPython `RPythonAnnotator.__init__(self, translator=None,
     /// policy=None, bookkeeper=None, keepgoing=False)`
@@ -1400,68 +1480,7 @@ impl RPythonAnnotator {
         s_out: SomeValue,
         renaming: &HashMap<Rc<Variable>, Vec<Rc<Variable>>>,
     ) -> SomeValue {
-        use super::model::{
-            KnownTypeData, SomeBool, SomeTypeOf, SomeValue as SV, add_knowntypedata, r#typeof,
-        };
-        // Rebuild SomeTypeOf.is_type_of against the renamed variables.
-        // upstream: `for v in s_out.is_type_of: renamed += renaming[v]`.
-        let s_out = match s_out {
-            SV::TypeOf(t) => {
-                let mut renamed_is_type_of: Vec<Rc<Variable>> = Vec::new();
-                for v in &t.is_type_of {
-                    if let Some(new_vs) = renaming.get(v) {
-                        renamed_is_type_of.extend(new_vs.iter().map(Rc::clone));
-                    }
-                }
-                let newcell = r#typeof(&renamed_is_type_of);
-                match newcell {
-                    SV::TypeOf(mut nc) => {
-                        if t.base.const_box.is_some() {
-                            nc.base.const_box = t.base.const_box.clone();
-                        }
-                        SV::TypeOf(nc)
-                    }
-                    // typeof returns SomeType when args_v is empty.
-                    other => other,
-                }
-            }
-            other => other,
-        };
-        // Rewrite SomeBool.knowntypedata under the renaming.
-        if let SV::Bool(b) = &s_out
-            && let Some(ktd) = &b.knowntypedata
-        {
-            let mut renamed: KnownTypeData = HashMap::new();
-            for (value, constraints) in ktd {
-                let mut new_inner: HashMap<Rc<Variable>, SomeValue> = HashMap::new();
-                for (v, s) in constraints {
-                    if let Some(new_vs) = renaming.get(v) {
-                        for new_v in new_vs {
-                            new_inner.insert(Rc::clone(new_v), s.clone());
-                        }
-                    }
-                }
-                if !new_inner.is_empty() {
-                    renamed.insert(*value, new_inner);
-                }
-            }
-            // upstream: `assert isinstance(s_out, SomeBool)` + rebuild.
-            let mut newcell = SomeBool::new();
-            // SomeObject.is_immutable_constant (model.py):
-            // `self.is_constant() and self.immutable`. SomeBool
-            // carries `immutable = True`, so the precondition here
-            // is just "const_box populated".
-            if b.base.const_box.is_some() {
-                newcell.base.const_box = b.base.const_box.clone();
-            }
-            newcell.set_knowntypedata(renamed);
-            // rebuild add_knowntypedata side-effect: not needed —
-            // set_knowntypedata already stores the rebuilt map.
-            let _ = add_knowntypedata; // keep the import alive.
-            let _ = SomeTypeOf::new(vec![]); // keep the import alive.
-            return SV::Bool(newcell);
-        }
-        s_out
+        apply_renaming(s_out, renaming)
     }
 
     /// RPython `whereami(self, position_key)` (annrpython.py).

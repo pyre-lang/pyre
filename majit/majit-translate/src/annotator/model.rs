@@ -3109,6 +3109,13 @@ pub(crate) fn erased_integer_positional_field(s: &SomeValue, attr: &str) -> bool
     attr == "__pos_0" && matches!(s, SomeValue::Integer(_))
 }
 
+/// RPython `SomeString()` (`model.py` `SomeString.__init__` default
+/// `no_nul=False`). `no_nul` becomes True only through
+/// `rlib/rstring.py` `assert_str0`; `s_Str0` is the proven form.
+pub(crate) fn s_str() -> SomeValue {
+    SomeValue::String(SomeString::new(false, false))
+}
+
 /// RPython `s_Str0 = SomeString(no_nul=True)` (model.py).
 pub(crate) fn s_str0() -> SomeValue {
     SomeValue::String(SomeString::new(false, true))
@@ -3254,6 +3261,39 @@ impl AnnotatorError {
 }
 
 // union() dispatch (A4.6) — model.py + binaryop.py pair().union().
+
+/// `SomeConstantType` is a singleton non-nullable class PBC.
+///
+/// `SomeConstantType(SomePBC)`: `can_be_None = False`,
+/// `descriptions = set([bk.getdesc(x)])` (exactly one), `const = x`.
+/// Made only by `bookkeeper.py` `immutablevalue` for a type (`tp is type`).
+/// `binaryop.py` defines `union` for `pairtype(SomeType, SomeType)`,
+/// `pairtype(SomeType, SomeConstantType)`,
+/// `pairtype(SomeConstantType, SomeType)` only. A nullable or
+/// multi-description class PBC is a plain `SomePBC`; `SomeType` ∪ `SomePBC`
+/// falls to `pairtype(SomeObject, SomeObject).union` → `UnionError`. Two
+/// class PBCs union through `pairtype(SomePBC, SomePBC)` (a PBC, never
+/// `SomeType`).
+pub(crate) fn is_some_constant_type(s: &SomeValue) -> bool {
+    match s {
+        SomeValue::PBC(pbc) => {
+            pbc.get_kind() == Ok(DescKind::Class) && !pbc.can_be_none && pbc.descriptions.len() == 1
+        }
+        _ => false,
+    }
+}
+
+/// `binaryop.py pairtype(SomeType, SomeType).union` and the
+/// `(SomeType, SomeConstantType)` / `(SomeConstantType, SomeType)` twins.
+fn union_some_type_pair(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
+    let mut result = SomeType::new();
+    if s1.is_immutable_constant() && s2.is_immutable_constant() && s1.const_() == s2.const_() {
+        if let Some(c) = s1.const_() {
+            result.base.const_box = Some(Constant::new(c.clone()));
+        }
+    }
+    Ok(SomeValue::Type(result))
+}
 
 /// Short identity of a `union` operand for the unhandled-pair error text.
 ///
@@ -3792,6 +3832,49 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 },
             };
             Ok(SomeValue::WeakRef(SomeWeakRef::new(merged_classdef)))
+        }
+
+        // pairtype(SomeTypeOf, SomeTypeOf).union (binaryop.py):
+        //   vars = list(set(s_obj1.is_type_of) | set(s_obj2.is_type_of))
+        //   result = SomeTypeOf(vars)
+        // Variable identity is `Variable::eq` (`id`), the same equality
+        // `SomeTypeOf` already uses. First-occurrence order is a
+        // deterministic stand-in for Python's unordered `set`.
+        (SomeValue::TypeOf(a), SomeValue::TypeOf(b)) => {
+            let mut vars = a.is_type_of.clone();
+            for v in &b.is_type_of {
+                if !vars.iter().any(|e| e == v) {
+                    vars.push(Rc::clone(v));
+                }
+            }
+            let mut result = SomeTypeOf::new(vars);
+            if a.is_immutable_constant()
+                && b.is_immutable_constant()
+                && a.base.const_box.as_ref().map(|c| &c.value)
+                    == b.base.const_box.as_ref().map(|c| &c.value)
+            {
+                // binaryop.py writes `result.const = obj1.const`; `obj1`
+                // is unbound there (typo for `s_obj1.const`). Copy s_obj1.
+                result.base.const_box = a.base.const_box.clone();
+            }
+            Ok(SomeValue::TypeOf(result))
+        }
+
+        // pairtype(SomeType, SomeType) / (SomeType, SomeConstantType) /
+        // (SomeConstantType, SomeType).union (binaryop.py). SomeTypeOf
+        // is a SomeType subclass (`SomeValueTag::mro`), so TypeOf ∪ Type
+        // and TypeOf ∪ SomeConstantType land here the way pairtype MRO
+        // would. These arms were absent (the default `_` UnionError).
+        (SomeValue::Type(_), SomeValue::Type(_))
+        | (SomeValue::Type(_), SomeValue::TypeOf(_))
+        | (SomeValue::TypeOf(_), SomeValue::Type(_)) => union_some_type_pair(s1, s2),
+        (SomeValue::Type(_), SomeValue::PBC(_))
+        | (SomeValue::PBC(_), SomeValue::Type(_))
+        | (SomeValue::TypeOf(_), SomeValue::PBC(_))
+        | (SomeValue::PBC(_), SomeValue::TypeOf(_))
+            if is_some_constant_type(s1) || is_some_constant_type(s2) =>
+        {
+            union_some_type_pair(s1, s2)
         }
 
         // mixing Nones with other objects: upstream binaryop.py routes
@@ -5302,6 +5385,114 @@ mod tests {
         let t = SomeTypeOf::new(vec![v1, v2]);
         assert_eq!(t.is_type_of.len(), 2);
         assert_eq!(t.knowntype(), KnownType::Type);
+    }
+
+    #[test]
+    fn union_typeof_merges_is_type_of_by_variable_identity() {
+        // binaryop.py pairtype(SomeTypeOf, SomeTypeOf).union:
+        // list(set(is_type_of1) | set(is_type_of2)); Variable identity.
+        let v1 = Rc::new(Variable::named("v1"));
+        let v2 = Rc::new(Variable::named("v2"));
+        let a = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::clone(&v1)]));
+        let b = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::clone(&v2)]));
+        let SomeValue::TypeOf(joined) = union(&a, &b).expect("TypeOf ∪ TypeOf") else {
+            panic!("expected SomeTypeOf");
+        };
+        assert_eq!(joined.is_type_of.len(), 2);
+        assert!(joined.is_type_of.iter().any(|v| *v == v1));
+        assert!(joined.is_type_of.iter().any(|v| *v == v2));
+
+        let again = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::clone(&v1)]));
+        let SomeValue::TypeOf(same) = union(&a, &again).expect("same var once") else {
+            panic!("expected SomeTypeOf");
+        };
+        assert_eq!(same.is_type_of.len(), 1);
+        assert_eq!(same.is_type_of[0], v1);
+
+        let mut ca = SomeTypeOf::new(vec![Rc::clone(&v1)]);
+        let mut cb = SomeTypeOf::new(vec![Rc::clone(&v2)]);
+        let cval = Constant::new(ConstValue::Int(7));
+        ca.base.const_box = Some(cval.clone());
+        cb.base.const_box = Some(cval);
+        let SomeValue::TypeOf(with_const) =
+            union(&SomeValue::TypeOf(ca), &SomeValue::TypeOf(cb)).expect("const copy")
+        else {
+            panic!("expected SomeTypeOf");
+        };
+        assert_eq!(
+            with_const.base.const_box.as_ref().map(|c| &c.value),
+            Some(&ConstValue::Int(7))
+        );
+    }
+
+    #[test]
+    fn union_sometype_and_constant_type_is_sometype() {
+        // binaryop.py pairtype(SomeType, SomeType) /
+        // pairtype(SomeType, SomeConstantType). These arms were absent.
+        let a = SomeValue::Type(SomeType::new());
+        let b = SomeValue::Type(SomeType::new());
+        assert!(matches!(union(&a, &b).unwrap(), SomeValue::Type(_)));
+
+        let mut c1 = SomeType::new();
+        let mut c2 = SomeType::new();
+        c1.base.const_box = Some(Constant::new(ConstValue::Int(1)));
+        c2.base.const_box = Some(Constant::new(ConstValue::Int(1)));
+        let SomeValue::Type(equal_const) =
+            union(&SomeValue::Type(c1), &SomeValue::Type(c2)).unwrap()
+        else {
+            panic!("expected SomeType");
+        };
+        assert_eq!(
+            equal_const.base.const_box.as_ref().map(|c| &c.value),
+            Some(&ConstValue::Int(1))
+        );
+
+        let mut d1 = SomeType::new();
+        let mut d2 = SomeType::new();
+        d1.base.const_box = Some(Constant::new(ConstValue::Int(1)));
+        d2.base.const_box = Some(Constant::new(ConstValue::Int(2)));
+        let SomeValue::Type(unequal_const) =
+            union(&SomeValue::Type(d1), &SomeValue::Type(d2)).unwrap()
+        else {
+            panic!("expected SomeType");
+        };
+        assert!(unequal_const.base.const_box.is_none());
+
+        let v1 = Rc::new(Variable::named("v1"));
+        let typeof_v = SomeValue::TypeOf(SomeTypeOf::new(vec![v1]));
+        let s_type = SomeValue::Type(SomeType::new());
+        assert!(matches!(
+            union(&typeof_v, &s_type).unwrap(),
+            SomeValue::Type(_)
+        ));
+
+        let bk = Rc::new(super::super::bookkeeper::Bookkeeper::new());
+        let class_pbc = SomeValue::PBC(SomePBC::new(vec![fake_class_entry(&bk, "C")], false));
+        let s_type = SomeValue::Type(SomeType::new());
+        assert!(matches!(
+            union(&s_type, &class_pbc).unwrap(),
+            SomeValue::Type(_)
+        ));
+        assert!(matches!(
+            union(&class_pbc, &s_type).unwrap(),
+            SomeValue::Type(_)
+        ));
+
+        let nullable = SomeValue::PBC(SomePBC::new(vec![fake_class_entry(&bk, "N")], true));
+        assert!(union(&s_type, &nullable).is_err());
+        assert!(union(&nullable, &s_type).is_err());
+
+        let class_d = SomeValue::PBC(SomePBC::new(vec![fake_class_entry(&bk, "D")], false));
+        let multi = union(&class_pbc, &class_d).expect("two class PBCs union as SomePBC");
+        assert!(matches!(
+            &multi,
+            SomeValue::PBC(pbc) if pbc.descriptions.len() == 2 && !pbc.can_be_none
+        ));
+        assert!(union(&s_type, &multi).is_err());
+        assert!(union(&multi, &s_type).is_err());
+
+        let fn_pbc = SomeValue::PBC(SomePBC::new(vec![fake_function_entry(&bk, "f")], false));
+        assert!(union(&s_type, &fn_pbc).is_err());
     }
 
     #[test]

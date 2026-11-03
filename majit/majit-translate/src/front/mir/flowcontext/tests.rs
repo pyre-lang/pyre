@@ -24,12 +24,12 @@ use crate::front::mir::tests::{
     ident_path, interior_bb, interior_caller, interior_i64, interior_local, interior_meta,
     interior_opaque, interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths,
     llbc_with_types, lower_object_fn, ok_ctor_shape, option_adt_node, option_enum, option_int_arg,
-    option_ok_or_else_site, push_fn_const, replace_struct_ctors, rows, same_as_count,
-    some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
-    tyref_to_attr_value_type, window_call_leafs, window_empty_generics, window_graph_ops,
-    window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun, window_place,
-    window_shared_slice, window_slice, window_span, window_u8, window_unwind_and_return_blocks,
-    window_usize,
+    option_ok_or_else_site, push_fn_const, replace_struct_ctors, result_adt_node, result_enum,
+    rows, same_as_count, some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops,
+    struct_decl, struct_news, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
+    window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
+    window_place, window_shared_slice, window_slice, window_span, window_u8,
+    window_unwind_and_return_blocks, window_usize,
 };
 
 /// Per-graph simplification after lowering — the model-layer slice of
@@ -7905,6 +7905,228 @@ fn resolve_aggregate_adt_option_unit_some_payload_is_void() {
         }
         other => panic!("expected Ctor, got {other:?}"),
     }
+}
+
+/// `aggregate_shape` of `Ok(Zst)` / `Ok(())` stamps `payload_void` and
+/// marks `__pos_0` void (`lltype.py` `Struct._names_without_voids`);
+/// `Ok(5i64)` does not.
+#[test]
+fn aggregate_shape_result_ok_stamps_payload_void_for_unit_and_zst() {
+    let mut zst = struct_decl(
+        1,
+        ident_path(&["fixture", "Zst"]),
+        serde_json::json!([]),
+        false,
+    );
+    zst["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": 0,
+            "align": 1,
+            "variant_layouts": [{"field_offsets": []}],
+            "repr": {"transparent": false}
+        }
+    }]);
+    let llbc = llbc_with_types("fixture", vec![result_enum(0), zst], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let kind = serde_json::json!({"Adt": [0, 0]});
+    let dest = |ok: serde_json::Value| {
+        TyRef::Other(serde_json::json!({
+            "Value": [7, result_adt_node(0, ok, option_int_arg(true))]
+        }))
+    };
+    let zst_arg = serde_json::json!({"Adt": {
+        "id": 1,
+        "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+    }});
+    let check = |payload: serde_json::Value, expect_void: bool, label: &str| {
+        let dest_ty = dest(payload);
+        let shape = lowering.aggregate_shape(&kind, &dest_ty, 1).expect(label);
+        match shape {
+            super::AggregateShape::Ctor(ctor) => {
+                let CallTarget::SyntheticTransparentCtor {
+                    name, payload_void, ..
+                } = &ctor.target
+                else {
+                    panic!(
+                        "{label}: expected SyntheticTransparentCtor, got {:?}",
+                        ctor.target
+                    );
+                };
+                assert_eq!(name, "Ok", "{label}");
+                assert_eq!(*payload_void, expect_void, "{label}: payload_void");
+                assert_eq!(ctor.fields.len(), 1, "{label}");
+                assert_eq!(ctor.fields[0].name, "__pos_0", "{label}");
+                assert_eq!(ctor.fields[0].void, expect_void, "{label}: field.void");
+            }
+            other => panic!("{label}: expected Ctor, got {other:?}"),
+        }
+    };
+    check(zst_arg, true, "Ok(Zst)");
+    check(option_unit_arg(), true, "Ok(())");
+    check(option_int_arg(true), false, "Ok(5i64)");
+}
+
+fn option_enum_with_layout(def_id: u64, size: u64) -> serde_json::Value {
+    let mut decl = option_enum(def_id);
+    decl["layout"] = serde_json::json!([{
+        "key": "fixture-target",
+        "value": {
+            "size": size,
+            "align": 8,
+            "variant_layouts": [
+                {"field_offsets": []},
+                {"field_offsets": [0]}
+            ],
+            "repr": {"transparent": false}
+        }
+    }]);
+    decl
+}
+
+fn classify_option_ptr_none(option_decl: serde_json::Value) -> (bool, bool, super::AggregateShape) {
+    let object_decl = code_struct(1, &["pyre_object", "pyobject", "PyObject"]);
+    let llbc = llbc_with_types("fixture", vec![option_decl, object_decl], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let dest = TyRef::Other(option_adt_node(
+        0,
+        serde_json::json!({"RawPtr": [adt_node(1), "Mut"]}),
+    ));
+    let kind = serde_json::json!({"Adt": [0, 0]});
+    let void = super::tyref_is_void_zst(&dest, &llbc);
+    let niche = lowering.tyref_is_niche_option_ptr(&dest);
+    let shape = lowering
+        .aggregate_shape(&kind, &dest, 0)
+        .expect("Option None aggregate_shape");
+    (void, niche, shape)
+}
+
+/// `Option<*mut PyObject>::None` is a pointer-niche Option. `tyref_is_void_zst`
+/// must not win over `tyref_is_niche_option_ptr` even when Charon records a
+/// size-0 layout on the generic Option decl (the empty `None` variant).
+/// `bookkeeper.py` `immutablevalue(None)` is `s_None`; `rnone.py` `NoneRepr`
+/// (Void) is only for a variable that is only None.
+#[test]
+fn option_object_ptr_none_aggregate_is_niche_null_not_void() {
+    for (label, option_decl) in [
+        ("no_layout", option_enum(0)),
+        ("size_8", option_enum_with_layout(0, 8)),
+        ("size_0", option_enum_with_layout(0, 0)),
+    ] {
+        let (void, niche, shape) = classify_option_ptr_none(option_decl);
+        assert!(
+            niche,
+            "{label}: Option<*mut PyObject> is tyref_is_niche_option_ptr (void_zst={void})"
+        );
+        assert!(
+            matches!(shape, super::AggregateShape::NicheNull),
+            "{label}: Option<*mut PyObject>::None is NicheNull, got {shape:?} void_zst={void}"
+        );
+    }
+}
+
+/// Real `()` still folds to Void `ConstNone` (`emit_unit` / `NoneRepr`).
+#[test]
+fn unit_aggregate_is_still_void_const_none() {
+    let llbc = llbc_with_types("fixture", vec![], vec![]);
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let body: super::Unstructured = serde_json::from_value(serde_json::json!({
+        "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+    }))
+    .unwrap();
+    let dont_look_inside = std::collections::HashSet::new();
+    let accum = super::AccumulatorFacts::build(&llbc, &body);
+    let tombstoned = std::collections::HashSet::new();
+    let gc_struct_ids_llbc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let lowering = super::Lowering::new(
+        &llbc,
+        "fixture".into(),
+        &body,
+        crate::HostStaticAddrs::default(),
+        &[],
+        None,
+        &dont_look_inside,
+        &tombstoned,
+        &gc_struct_ids_llbc,
+        super::no_immutable_fields(),
+        &std::collections::HashSet::<String>::new(),
+        &accum,
+        &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
+        false,
+        false,
+    )
+    .unwrap();
+    let dest = TyRef::Other(option_unit_arg());
+    assert!(
+        super::tyref_is_void_zst(&dest, &llbc),
+        "() is tyref_is_void_zst"
+    );
+    let kind = serde_json::json!({"Adt": [{"builtin": "Tuple"}, null]});
+    let shape = lowering
+        .aggregate_shape(&kind, &dest, 0)
+        .expect("() aggregate_shape");
+    assert!(
+        matches!(shape, super::AggregateShape::Void),
+        "() stays AggregateShape::Void, got {shape:?}"
+    );
 }
 
 fn range_inclusive_struct(def_id: u64) -> serde_json::Value {

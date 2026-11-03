@@ -27,7 +27,7 @@ use super::annrpython::RPythonAnnotator;
 use super::model::{
     self, KnownType, SomeBool, SomeByteArray, SomeChar, SomeFloat, SomeInteger, SomeObjectTrait,
     SomeString, SomeTuple, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, SomeValueTag,
-    s_impossible_value, unionof,
+    UnionError, s_impossible_value, unionof,
 };
 use crate::tool::pairtype::DoubleDispatchRegistry;
 use crate::translator::rtyper::llannotation;
@@ -924,17 +924,79 @@ fn init_integer_pairtype(
     );
 }
 
-/// RPython `pairtype(SomeInteger, SomeInteger).union((int1, int2))`
-/// (binaryop.py). Returns the widening union of two integer
-/// annotations. `_clone(union, …)` arith entries reuse this body.
-///
-/// Upstream raises `UnionError` when the signedness cannot be proven;
-/// the Rust port surfaces that via `panic!` — matching the upstream
-/// `raise` at binaryop.py/196/200.
+/// `binaryop.py` `pairtype(SomeInteger, SomeInteger).union`, the body
+/// `_clone`d as `or_ = xor = add = mul`. Fresh `SomeInteger` — never
+/// copies `const_box` or `knowntypedata`. `SomeBool` is a `SomeInteger`
+/// subclass (`nonneg = True`, `unsigned = False`).
+pub(crate) fn integer_arith_union(s0: &SomeValue, s1: &SomeValue) -> Result<SomeValue, UnionError> {
+    let err = |msg: &str| UnionError {
+        lhs: Box::new(s0.clone()),
+        rhs: Box::new(s1.clone()),
+        msg: msg.into(),
+    };
+    let unpack = |s: &SomeValue| -> Option<(KnownType, bool, bool)> {
+        match s {
+            SomeValue::Integer(i) => Some((i.base.knowntype, i.nonneg, i.unsigned)),
+            SomeValue::Bool(_) => Some((KnownType::Bool, true, false)),
+            _ => None,
+        }
+    };
+    let (t1, nonneg1, unsigned1) = unpack(s0).ok_or_else(|| err("not an integer"))?;
+    let (t2, nonneg2, unsigned2) = unpack(s1).ok_or_else(|| err("not an integer"))?;
+    let knowntype = if unsigned1 == unsigned2 {
+        crate::rlib::rarithmetic::compute_restype(t1, t2)
+    } else {
+        let t1 = if matches!(t1, KnownType::Bool) {
+            KnownType::Int
+        } else {
+            t1
+        };
+        let t2 = if matches!(t2, KnownType::Bool) {
+            KnownType::Int
+        } else {
+            t2
+        };
+        if matches!(t2, KnownType::Int) {
+            if !nonneg2 {
+                return Err(err(
+                    "RPython cannot prove that these integers are of the same signedness",
+                ));
+            }
+            t1
+        } else if matches!(t1, KnownType::Int) {
+            if !nonneg1 {
+                return Err(err(
+                    "RPython cannot prove that these integers are of the same signedness",
+                ));
+            }
+            t2
+        } else {
+            return Err(err("RPython cannot unify these integer types"));
+        }
+    };
+    Ok(SomeValue::Integer(SomeInteger::new_with_knowntype(
+        nonneg1 && nonneg2,
+        knowntype,
+    )))
+}
+
+/// `SomeInteger.nonneg`; `SomeBool.nonneg` is True (`model.py` `SomeBool`).
+pub(crate) fn integer_family_nonneg(s: &SomeValue) -> bool {
+    match s {
+        SomeValue::Integer(i) => i.nonneg,
+        SomeValue::Bool(_) => true,
+        _ => false,
+    }
+}
+
+/// Registered handler for `binaryop.py` `_clone(union, …)` integer
+/// arith ops (`or_`, `xor`, `add`, `mul`, their `_ovf` forms,
+/// `div`/`floordiv`/`mod`, and `inplace_div`). Body is
+/// `integer_arith_union`; a `UnionError` panics as `"UnionError: {}"`.
 fn integer_union(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s1 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
-    match super::model::union(&s0, &s1) {
+    match integer_arith_union(&s0, &s1) {
         Ok(sv) => sv,
         Err(e) => panic!("UnionError: {}", e),
     }
@@ -954,10 +1016,7 @@ fn integer_sub(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
 fn integer_and(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s0 = ann.annotation(&hl.args[0]).unwrap_or(SomeValue::Impossible);
     let s1 = ann.annotation(&hl.args[1]).unwrap_or(SomeValue::Impossible);
-    let nonneg = match (&s0, &s1) {
-        (SomeValue::Integer(i0), SomeValue::Integer(i1)) => i0.nonneg || i1.nonneg,
-        _ => false,
-    };
+    let nonneg = integer_family_nonneg(&s0) || integer_family_nonneg(&s1);
     let kt = crate::rlib::rarithmetic::compute_restype(s0.knowntype(), s1.knowntype());
     SomeValue::Integer(SomeInteger::new_with_knowntype(nonneg, kt))
 }
@@ -1212,19 +1271,13 @@ fn init_bool_pairtype(
 
 /// RPython `pairtype(SomeBool, SomeBool).and_((boo1, boo2))`
 /// (binaryop.py).
-fn bool_and_(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
-    let s1 = annotator
-        .annotation(&hl.args[0])
-        .unwrap_or(SomeValue::Impossible);
-    let s2 = annotator
-        .annotation(&hl.args[1])
-        .unwrap_or(SomeValue::Impossible);
+pub(crate) fn bool_and_values(s1: &SomeValue, s2: &SomeValue) -> SomeValue {
     let mut s = SomeBool::new();
     if s1.is_constant() {
         if matches!(s1.const_(), Some(ConstValue::Bool(false))) {
             s.base.const_box = Some(Constant::new(ConstValue::Bool(false)));
         } else {
-            return s2;
+            return s2.clone();
         }
     }
     if s2.is_constant() && matches!(s2.const_(), Some(ConstValue::Bool(false))) {
@@ -1233,21 +1286,25 @@ fn bool_and_(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(s)
 }
 
-/// RPython `pairtype(SomeBool, SomeBool).or_((boo1, boo2))`
-/// (binaryop.py).
-fn bool_or_(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn bool_and_(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s1 = annotator
         .annotation(&hl.args[0])
         .unwrap_or(SomeValue::Impossible);
     let s2 = annotator
         .annotation(&hl.args[1])
         .unwrap_or(SomeValue::Impossible);
+    bool_and_values(&s1, &s2)
+}
+
+/// RPython `pairtype(SomeBool, SomeBool).or_((boo1, boo2))`
+/// (binaryop.py).
+pub(crate) fn bool_or_values(s1: &SomeValue, s2: &SomeValue) -> SomeValue {
     let mut s = SomeBool::new();
     if s1.is_constant() {
         if matches!(s1.const_(), Some(ConstValue::Bool(true))) {
             s.base.const_box = Some(Constant::new(ConstValue::Bool(true)));
         } else {
-            return s2;
+            return s2.clone();
         }
     }
     if s2.is_constant() && matches!(s2.const_(), Some(ConstValue::Bool(true))) {
@@ -1256,15 +1313,19 @@ fn bool_or_(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(s)
 }
 
-/// RPython `pairtype(SomeBool, SomeBool).xor((boo1, boo2))`
-/// (binaryop.py).
-fn bool_xor(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+fn bool_or_(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let s1 = annotator
         .annotation(&hl.args[0])
         .unwrap_or(SomeValue::Impossible);
     let s2 = annotator
         .annotation(&hl.args[1])
         .unwrap_or(SomeValue::Impossible);
+    bool_or_values(&s1, &s2)
+}
+
+/// RPython `pairtype(SomeBool, SomeBool).xor((boo1, boo2))`
+/// (binaryop.py).
+pub(crate) fn bool_xor_values(s1: &SomeValue, s2: &SomeValue) -> SomeValue {
     let mut s = SomeBool::new();
     if s1.is_constant()
         && s2.is_constant()
@@ -1273,6 +1334,16 @@ fn bool_xor(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         s.base.const_box = Some(Constant::new(ConstValue::Bool(b1 ^ b2)));
     }
     SomeValue::Bool(s)
+}
+
+fn bool_xor(annotator: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    let s1 = annotator
+        .annotation(&hl.args[0])
+        .unwrap_or(SomeValue::Impossible);
+    let s2 = annotator
+        .annotation(&hl.args[1])
+        .unwrap_or(SomeValue::Impossible);
+    bool_xor_values(&s1, &s2)
 }
 
 // binaryop.py __extend__ — pairtype(SomeFloat, SomeFloat)

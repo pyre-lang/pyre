@@ -1527,29 +1527,11 @@ impl Bookkeeper {
     /// to `ErrorCarrierSpec.carrier_path`; this is that compare on a
     /// Charon type string.
     fn exception_carrier_type_spelling(&self, spelling: &str) -> bool {
-        let t = peel_ref_and_ptr_prefixes(spelling);
-        if self.exception_carrier_handle_key(t) {
-            return true;
-        }
-        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(t));
-        if self.exception_carrier.borrow().as_deref() == Some(key.as_str()) {
-            return true;
-        }
-        let leaf = t.rsplit("::").next().unwrap_or(t);
-        if self
-            .exception_carrier_handle
-            .borrow()
-            .as_deref()
-            .and_then(|k| k.rsplit("::").next())
-            == Some(leaf)
-        {
-            return true;
-        }
-        self.exception_carrier
-            .borrow()
-            .as_deref()
-            .and_then(|k| k.rsplit("::").next())
-            == Some(leaf)
+        exception_carrier_type_spelling_keys(
+            spelling,
+            self.exception_carrier.borrow().as_deref(),
+            self.exception_carrier_handle.borrow().as_deref(),
+        )
     }
 
     /// The `__bases__` a first mint of class `key` receives when nothing
@@ -6075,6 +6057,55 @@ pub(crate) fn raw_fn_ptr_somevalue() -> SomeValue {
     }))
 }
 
+/// Keys [`Bookkeeper::set_exception_carrier`] /
+/// [`Bookkeeper::alias_exception_carrier_handle`] store for `spec`.
+/// `classdef_path` is the object class; the handle is aliased only when
+/// `carrier_class` names a distinct path.
+pub(crate) fn exception_carrier_keys_from_spec(
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> (Option<String>, Option<String>) {
+    let classdef = spec.classdef_path();
+    if classdef.is_empty() {
+        return (None, None);
+    }
+    let carrier = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(classdef));
+    let handle = if spec.carrier_class.is_empty() || spec.carrier_path.is_empty() {
+        None
+    } else {
+        let handle_key =
+            majit_ir::descr::canonical_struct_name(&normalize_class_qualname(spec.carrier_path));
+        if handle_key == carrier {
+            None
+        } else {
+            Some(handle_key)
+        }
+    };
+    (Some(carrier), handle)
+}
+
+/// Whether `spelling` names `carrier` or `handle` after
+/// [`Bookkeeper::set_exception_carrier`] /
+/// [`Bookkeeper::alias_exception_carrier_handle`].
+pub(crate) fn exception_carrier_type_spelling_keys(
+    spelling: &str,
+    carrier: Option<&str>,
+    handle: Option<&str>,
+) -> bool {
+    let t = peel_ref_and_ptr_prefixes(spelling);
+    let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(t));
+    if handle == Some(key.as_str()) {
+        return true;
+    }
+    if carrier == Some(key.as_str()) {
+        return true;
+    }
+    let leaf = t.rsplit("::").next().unwrap_or(t);
+    if handle.and_then(|k| k.rsplit("::").next()) == Some(leaf) {
+        return true;
+    }
+    carrier.and_then(|k| k.rsplit("::").next()) == Some(leaf)
+}
+
 /// `SomePtr(FuncType)` when `spelling` names a function pointer or a
 /// nullable `Option<fn>`. The `Int` bank (`history.getkind` of
 /// `Ptr(FuncType)`) still shells through `valuetype_to_someshell` as
@@ -6092,7 +6123,9 @@ pub(crate) fn fn_ptr_somevalue_for_spelling_in(
     bk: Option<&Bookkeeper>,
 ) -> Option<SomeValue> {
     use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
-    let ft = func_type_from_fn_spelling(spelling, bk)?;
+    let ft = func_type_from_fn_spelling(spelling, &|e| {
+        bk.is_some_and(|bk| bk.exception_carrier_type_spelling(e))
+    })?;
     Some(SomeValue::Ptr(super::model::SomePtr::new(Ptr {
         TO: PtrTarget::Func(ft),
     })))
@@ -6109,9 +6142,11 @@ fn empty_functype() -> crate::translator::rtyper::lltypesystem::lltype::FuncType
 /// `FuncType` of a Rust fn-pointer spelling. One Rust `fn` type is one
 /// `FuncType` (`lltype.py` `FuncType` / `getfunctionptr`), whether the
 /// producer is a parameter seed, a field read, or a reified fn item.
+/// `is_carrier` is the exception-carrier test (`exception_carrier_type_spelling`)
+/// so a `Result<T, E>` payload peels when `E` is that carrier.
 pub(crate) fn func_type_from_fn_spelling(
     spelling: &str,
-    bk: Option<&Bookkeeper>,
+    is_carrier: &dyn Fn(&str) -> bool,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::translator::rtyper::lltypesystem::lltype::FuncType;
     let t = spelling.trim();
@@ -6144,7 +6179,7 @@ pub(crate) fn func_type_from_fn_spelling(
         crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void
     } else {
         let ret = after.strip_prefix("->")?;
-        fn_ptr_result_lltype(ret.trim(), bk)
+        fn_ptr_result_lltype(ret.trim(), is_carrier)
     };
     Some(FuncType { args, result })
 }
@@ -6188,18 +6223,17 @@ fn peel_ref_and_ptr_prefixes(spelling: &str) -> &str {
     t
 }
 
-/// Ok payload of `Result<T, E>` when `E` is the bookkeeper's exception
-/// carrier (`tyref_is_result_of_carrier`). Other `Result` types stay
-/// the ADT; `FuncType.RESULT` is then `valuetype_to_lltype` of that
-/// payload, matching `getcallable` / `getfunctionptr`.
+/// Ok payload of `Result<T, E>` when `E` is the exception carrier
+/// (`tyref_is_result_of_carrier`). Other `Result` types stay the ADT;
+/// `FuncType.RESULT` is then `valuetype_to_lltype` of that payload,
+/// matching `getcallable` / `getfunctionptr`.
 fn result_ok_of_exception_carrier<'a>(
     spelling: &'a str,
-    bk: Option<&Bookkeeper>,
+    is_carrier: &dyn Fn(&str) -> bool,
 ) -> Option<&'a str> {
-    let bk = bk?;
     let args = spelling.trim().strip_prefix("Result<")?.strip_suffix('>')?;
     let parts = split_generic_args(args);
-    if parts.len() == 2 && bk.exception_carrier_type_spelling(parts[1].trim()) {
+    if parts.len() == 2 && is_carrier(parts[1].trim()) {
         Some(parts[0].trim())
     } else {
         None
@@ -6243,12 +6277,12 @@ fn fn_ptr_arg_lltype(
 /// (`tyref_is_result_of_carrier`).
 fn fn_ptr_result_lltype(
     spelling: &str,
-    bk: Option<&Bookkeeper>,
+    is_carrier: &dyn Fn(&str) -> bool,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::model::ValueType;
     use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
-    if let Some(ok) = result_ok_of_exception_carrier(spelling, bk) {
-        return fn_ptr_result_lltype(ok, bk);
+    if let Some(ok) = result_ok_of_exception_carrier(spelling, is_carrier) {
+        return fn_ptr_result_lltype(ok, is_carrier);
     }
     let t = spelling.trim();
     if t == "()" {

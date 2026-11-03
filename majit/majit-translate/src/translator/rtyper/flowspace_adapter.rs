@@ -7369,10 +7369,11 @@ mod tests {
 
     #[test]
     fn derive_subject_inputcells_seeds_str_family_ref_as_somestring() {
-        // `is_str_family_class_root` / `s_str0()`: a `&str` / `String`
-        // Input is `SomeString`, including when only the `Ref` payload
-        // names the family (`valuetype_to_someshell`). `String::new()`
-        // is the same shell (`string_constructor`).
+        // `is_str_family_class_root`: a `&str` / `String` Input is
+        // `SomeString`. When only the `Ref` payload names the family,
+        // `valuetype_to_someshell` uses `SomeString.__init__` default
+        // `no_nul=False`; `no_nul` needs `rlib/rstring.py` `assert_str0`.
+        // `String::new()` is the same shell (`string_constructor`).
         use crate::annotator::model::{SomeString, union};
         let s_new = SomeValue::String(SomeString::new(false, false));
         for (name, ty, class_root) in [
@@ -7404,14 +7405,25 @@ mod tests {
             let cells = derive_subject_inputcells(&graph, None)
                 .expect("str-family Input must project to a definite SomeValue cell");
             assert_eq!(cells.len(), 1);
-            assert!(
-                matches!(cells[0], SomeValue::String(_)),
-                "{name}: str-family Input must seed SomeString, got {:?}",
-                cells[0],
-            );
-            union(&cells[0], &s_new).unwrap_or_else(|e| {
+            let SomeValue::String(s) = &cells[0] else {
+                panic!(
+                    "{name}: str-family Input must seed SomeString, got {:?}",
+                    cells[0],
+                );
+            };
+            if name == "payload_only" {
+                assert!(
+                    !s.inner.no_nul,
+                    "{name}: str-family Input is SomeString(no_nul=False) (SomeString.__init__ default)"
+                );
+            }
+            let joined = union(&cells[0], &s_new).unwrap_or_else(|e| {
                 panic!("{name}: str-family Input must union with String::new(): {e}")
             });
+            assert!(
+                matches!(joined, SomeValue::String(_)),
+                "{name}: str-family Input ∪ String::new() must stay SomeString, got {joined:?}"
+            );
         }
     }
 

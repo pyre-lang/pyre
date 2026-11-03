@@ -598,6 +598,139 @@ fn fn_ptr_value_type_is_int_and_input_class_root_is_fn() {
 }
 
 #[test]
+fn stamp_fn_ptr_spelling_equals_fn_null_constant() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::builtin::fn_null_constant;
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::model::{ConstValue, Constant, Variable};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let spelling = "fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>";
+    let var = Variable::named("fnptr");
+    super::stamp_fn_ptr_spelling(&var, spelling, crate::ErrorCarrierSpec::default());
+    let bk = Rc::new(Bookkeeper::new());
+    let mut s_ty = crate::annotator::model::s_str0();
+    s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
+    let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new()).expect("typed null_fn");
+    let SomeValue::Ptr(p_null) = &s_null else {
+        panic!("fn_null_constant must be SomePtr, got {s_null:?}");
+    };
+    let ct = var.concretetype().expect("dest stamped");
+    let LowLevelType::Ptr(ptr_ty) = ct else {
+        panic!("stamp must be Ptr, got {ct:?}");
+    };
+    assert!(
+        matches!(ptr_ty.TO, PtrTarget::Func(_)),
+        "stamp is Ptr(FuncType)"
+    );
+    assert_eq!(
+        *ptr_ty, p_null.ll_ptrtype,
+        "stamp_fn_ptr equals fn_null_constant of the same spelling (`ann_nullptr`)"
+    );
+}
+
+#[test]
+fn stamp_fn_ptr_spelling_carrier_result_is_void() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::builtin::fn_null_constant;
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::model::{ConstValue, Constant, Variable};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let spelling = "fn(PyObjectRef, *const PyExecutionContext) -> Result<(), PyError>";
+    let spec = crate::ErrorCarrierSpec {
+        carrier_path: "error::PyError",
+        carrier_class: "error::PyErrorObject",
+        carrier_wrappers: &[],
+        to_exc_object: None,
+        from_exc_object: None,
+    };
+    let var = Variable::named("startup");
+    super::stamp_fn_ptr_spelling(&var, spelling, spec);
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_exception_carrier("error::PyErrorObject");
+    bk.alias_exception_carrier_handle("error::PyError");
+    let mut s_ty = crate::annotator::model::s_str0();
+    s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
+    let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new()).expect("typed null_fn");
+    let SomeValue::Ptr(p_null) = &s_null else {
+        panic!("fn_null_constant must be SomePtr, got {s_null:?}");
+    };
+    let ct = var.concretetype().expect("dest stamped");
+    let LowLevelType::Ptr(ptr_ty) = ct else {
+        panic!("stamp must be Ptr, got {ct:?}");
+    };
+    let PtrTarget::Func(ft) = &ptr_ty.TO else {
+        panic!("stamp is Ptr(FuncType)");
+    };
+    assert_eq!(
+        ft.result,
+        LowLevelType::Void,
+        "carrier Result<(), E> is Void (`fn_ptr_result_lltype`)"
+    );
+    assert_eq!(
+        *ptr_ty, p_null.ll_ptrtype,
+        "stamp_fn_ptr with the carrier equals fn_null_constant"
+    );
+}
+
+#[test]
+fn stamp_fn_ptr_spelling_equals_fn_null_constant_for_carrier_results() {
+    use crate::annotator::bookkeeper::Bookkeeper;
+    use crate::annotator::builtin::fn_null_constant;
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::model::{ConstValue, Constant, Variable};
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    let spec = crate::ErrorCarrierSpec {
+        carrier_path: "error::PyError",
+        carrier_class: "error::PyErrorObject",
+        carrier_wrappers: &[],
+        to_exc_object: None,
+        from_exc_object: None,
+    };
+    let bk = Rc::new(Bookkeeper::new());
+    bk.set_exception_carrier(spec.classdef_path());
+    if !spec.carrier_class.is_empty() {
+        bk.alias_exception_carrier_handle(spec.carrier_path);
+    }
+    for spelling in [
+        "fn() -> Result<(), PyError>",
+        "fn() -> Result<PyObjectRef, PyError>",
+    ] {
+        let var = Variable::named("fnptr");
+        super::stamp_fn_ptr_spelling(&var, spelling, spec);
+        let mut s_ty = crate::annotator::model::s_str0();
+        s_ty.set_const_box(Constant::new(ConstValue::byte_str(spelling)));
+        let s_null = fn_null_constant(&bk, &[Some(s_ty)], &HashMap::new())
+            .unwrap_or_else(|e| panic!("{spelling}: typed null_fn: {e}"));
+        let SomeValue::Ptr(p_null) = &s_null else {
+            panic!("{spelling}: fn_null_constant must be SomePtr, got {s_null:?}");
+        };
+        let ct = var
+            .concretetype()
+            .unwrap_or_else(|| panic!("{spelling}: dest stamped"));
+        let LowLevelType::Ptr(ptr_ty) = ct else {
+            panic!("{spelling}: stamp must be Ptr, got {ct:?}");
+        };
+        assert!(
+            matches!(ptr_ty.TO, PtrTarget::Func(_)),
+            "{spelling}: stamp is Ptr(FuncType)"
+        );
+        assert_eq!(
+            *ptr_ty, p_null.ll_ptrtype,
+            "{spelling}: stamp_fn_ptr equals fn_null_constant of the same spec"
+        );
+    }
+}
+
+#[test]
 fn function_pointer_uses_the_raw_pointer_int_bank() {
     let file = serde_json::json!({
         "charon_version": "0.1.201",
@@ -9480,4 +9613,40 @@ fn tyref_is_gcref_spelling_is_exactly_one_pointer_onto_gcrefopaque() {
         Some("ref"),
         "*mut *mut GCREFOpaque slot token"
     );
+}
+
+/// `heaptracker.all_fielddescrs` and `_reccopy` walk the whole finite by-value
+/// structure. A Rust struct cannot contain itself by value, so twenty nested
+/// levels still yield every leaf.
+#[test]
+fn collect_by_value_struct_leaves_walks_the_whole_finite_nesting() {
+    let field = |name: &str, ty: serde_json::Value| serde_json::json!({"name": name, "ty": ty, "attr_info": null});
+    let mut decls = vec![type_decl_struct(
+        0,
+        &["fixture", "N0"],
+        vec![field("x", i64_ty())],
+    )];
+    for k in 1..=20u64 {
+        let name = format!("N{k}");
+        decls.push(type_decl_struct(
+            k,
+            &["fixture", name.as_str()],
+            vec![field("inner", named_adt(k - 1, vec![]))],
+        ));
+    }
+    let llbc = window_llbc(decls, vec![]);
+    let outer = llbc.type_by_id(20).expect("N20 decl");
+    let outer_ty = TyRef::Other(named_adt(20, vec![]));
+    let leaves = super::collect_by_value_struct_leaves(
+        outer,
+        &outer_ty,
+        &llbc,
+        super::no_tombstoned_leaves(),
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(leaves.len(), 1, "one scalar leaf at the innermost struct");
+    let dotted = format!("{}{}", leaves[0].super_path, leaves[0].field.name);
+    let expected = format!("{}x", "inner.".repeat(20));
+    assert_eq!(dotted, expected);
 }

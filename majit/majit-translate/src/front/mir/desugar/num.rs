@@ -1941,43 +1941,17 @@ impl<'a> Lowering<'a> {
         let arg = arg.clone();
         let bb_id = self.emit_bb(mir_bb);
         if src_is_bool && dest_unsigned_word {
-            let res = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let (kind, res) = signedness_retype_op(&mut self.graph, arg, false);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(res.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect(),
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![arg]),
-                    result_ty: ValueType::Unsigned,
-                },
+                kind,
             });
             self.local_var[dest_local] = Some(LocalValue::One(res));
         } else if dest_signed_word {
-            let res = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let (kind, res) = signedness_retype_op(&mut self.graph, arg, true);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(res.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: ["rpython", "rlib", "rarithmetic", "intmask"]
-                            .into_iter()
-                            .map(str::to_string)
-                            .collect(),
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![arg]),
-                    result_ty: ValueType::Int,
-                },
+                kind,
             });
             self.local_var[dest_local] = Some(LocalValue::One(res));
         } else {

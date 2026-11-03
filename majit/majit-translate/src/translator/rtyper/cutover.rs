@@ -3308,8 +3308,9 @@ fn residual_stub_result_shell(
 /// The result a `_signature_` declares for a residual callee whose `ref`
 /// token alone would shell it as a classdef-less instance: `SomeString` for
 /// a low-level `STR` pointer (`FunctionGraph::return_is_str`) or a
-/// str-family `return_class_root` (`is_str_family_class_root` / `s_str0()`,
-/// `annotator/model.py` `SomeString`), `SomeList` for a pointer onto a
+/// str-family `return_class_root` (`is_str_family_class_root` /
+/// `SomeString` with `no_nul=False`, `annotator/model.py`
+/// `SomeString.__init__` default), `SomeList` for a pointer onto a
 /// Rust container (`FunctionGraph::return_container_root`, the `GcArray`
 /// a field of that type already projects), else `SomeInstance(classdef)`
 /// of a by-value ADT result or of a pointer to a registered GC struct
@@ -3378,10 +3379,11 @@ fn declared_return_annotation(
     // is false: not rstr `STR`). Residual token `"ref"` would otherwise
     // intern a ClassDef or fall through to the classdef-less
     // `valuetype_to_someshell(Ref(None))` shell. `rstr.py` has one
-    // string type: `is_str_family_class_root` / `s_str0()`, the same
-    // seed `__str_const` / `ConstValue::ByteStr` uses.
+    // string type: `is_str_family_class_root` / `SomeString` with
+    // `no_nul=False` (`SomeString.__init__` default). `no_nul` needs
+    // `rlib/rstring.py` `assert_str0`.
     if crate::front::mir::is_str_family_class_root(root) {
-        return Some(crate::annotator::model::s_str0());
+        return Some(crate::annotator::model::s_str());
     }
     // A by-value Raw ADT is Ptr of that struct (`history.getkind`),
     // the same shell FieldRead and a `raw:<owner>` token already use.
@@ -4249,12 +4251,13 @@ pub(crate) fn register_atomic_load_llexternals(
 /// Void result (`extfunc.py` `register_external` result `None` →
 /// `s_None`, via [`default_someshell_for_lltype`]), a `Ref(None)`
 /// classdef-less `SomeInstance` for a `BigInt`-returning method (matching
-/// `bigint_from`), `s_str0()` (`annotator/model.py` `SomeString`) for a
-/// str-family result (`is_str_family_class_root`: rust-heap `String`,
-/// …), a `SomeInstance(classdef)` of the interned enum-base for a
-/// payload-enum return (`GcAllocOutcome::from_hook`), or a scalar shell
-/// for an integer/float/bool return.  Same non-overwriting,
-/// annotator-only-carrier contract as [`register_foreign_stdlib_externals`].
+/// `bigint_from`), `SomeString` with `no_nul=False` (`annotator/model.py`
+/// `SomeString.__init__` default) for a str-family result
+/// (`is_str_family_class_root`: rust-heap `String`, …), a
+/// `SomeInstance(classdef)` of the interned enum-base for a payload-enum
+/// return (`GcAllocOutcome::from_hook`), or a scalar shell for an
+/// integer/float/bool return.  Same non-overwriting, annotator-only-carrier
+/// contract as [`register_foreign_stdlib_externals`].
 pub(crate) fn register_foreign_opaque_method_externals(
     registry: &CallRegistry,
     externals: &[(Vec<String>, Signature, crate::model::ValueType)],
@@ -4285,13 +4288,13 @@ pub(crate) fn register_foreign_opaque_method_externals(
 /// shell. `valuetype_to_someshell(Ref)` always drops the classdef
 /// (`annotation_state.rs`), which is the right shell for an opaque
 /// `BigInt` return.  A str-family result (`is_str_family_class_root`:
-/// rust-heap `String`, `Wtf8Buf`, …) is `s_str0()` (`annotator/model.py`
-/// `SomeString`), the same seed `__str_const` / `ConstValue::ByteStr`
-/// uses; intern'ing a ClassDef would mint `SomeInstance(String)` and
-/// `pairtype(SomeObject, SomeObject).union` cannot join that with
-/// `String::new()` (`binaryop.py`).  A payload-carrying enum
-/// (`GcAllocOutcome`) needs the interned enum-base ClassDef so a
-/// caller `match` can getattr `__discriminant` (`rclass.py`
+/// rust-heap `String`, `Wtf8Buf`, …) is `SomeString` with `no_nul=False`
+/// (`annotator/model.py` `SomeString.__init__` default); `no_nul` needs
+/// `rlib/rstring.py` `assert_str0`. Intern'ing a ClassDef would mint
+/// `SomeInstance(String)` and `pairtype(SomeObject, SomeObject).union`
+/// cannot join that with `String::new()` (`binaryop.py`).  A
+/// payload-carrying enum (`GcAllocOutcome`) needs the interned enum-base
+/// ClassDef so a caller `match` can getattr `__discriminant` (`rclass.py`
 /// `InstanceRepr.rtype_getattr`). [`declared_return_annotation`] is the
 /// wrong intern here: a raw-word payload enum is a `raw_word_owner`, so
 /// that helper prefers `raw_struct_ptr_annotation` (`SomePtr`) over
@@ -4308,7 +4311,7 @@ fn foreign_opaque_method_return_shell(
     }
     if let crate::model::ValueType::Ref(Some(root)) = result_ty {
         if crate::front::mir::is_str_family_class_root(root) {
-            return Some(crate::annotator::model::s_str0());
+            return Some(crate::annotator::model::s_str());
         }
         let bk = registry.bookkeeper();
         let host = bk.intern_class_by_qualname(root);
@@ -13056,7 +13059,8 @@ mod tests {
         // `return_class_root = string::String`. Interning a ClassDef
         // would mint `SomeInstance(String)`; `binaryop.py`
         // `pairtype(SomeObject, SomeObject).union` cannot join that
-        // with `String::new()`. `is_str_family_class_root` / `s_str0()`.
+        // with `String::new()`. `is_str_family_class_root` /
+        // `SomeString` with `no_nul=False` (`SomeString.__init__` default).
         use crate::annotator::model::{SomeString, SomeValue, union};
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
@@ -13066,12 +13070,20 @@ mod tests {
         graph.return_class_root = Some("string::String".into());
         let declared = declared_return_annotation(&registry, &graph)
             .expect("a str-family residual declares its annotation");
+        let SomeValue::String(s) = &declared else {
+            panic!("str-family residual is SomeString, got {declared:?}");
+        };
         assert!(
-            matches!(declared, SomeValue::String(_)),
-            "str-family residual is SomeString, got {declared:?}"
+            !s.inner.no_nul,
+            "str-family residual is SomeString(no_nul=False) (SomeString.__init__ default)"
         );
         let s_new = SomeValue::String(SomeString::new(false, false));
-        union(&declared, &s_new).expect("str-family residual must union with String::new()");
+        let joined =
+            union(&declared, &s_new).expect("str-family residual must union with String::new()");
+        assert!(
+            matches!(joined, SomeValue::String(_)),
+            "str-family residual ∪ String::new() must stay SomeString, got {joined:?}"
+        );
     }
 
     #[test]
@@ -13101,19 +13113,28 @@ mod tests {
         // (`foreign_opaque_method_result_valuetype`). Intern'ing a
         // ClassDef would mint `SomeInstance(String)`; `binaryop.py`
         // `pairtype(SomeObject, SomeObject).union` cannot join that
-        // with `String::new()`. `is_str_family_class_root` / `s_str0()`.
+        // with `String::new()`. `is_str_family_class_root` /
+        // `SomeString` with `no_nul=False` (`SomeString.__init__` default).
         use crate::annotator::model::{SomeString, SomeValue, union};
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = CallRegistry::new(ann.bookkeeper.clone());
         let result_ty = crate::model::ValueType::Ref(Some("string::String".into()));
         let shell = foreign_opaque_method_return_shell(&registry, &result_ty)
             .expect("a str-family residual has a shell");
+        let SomeValue::String(s) = &shell else {
+            panic!("str-family residual is SomeString, got {shell:?}");
+        };
         assert!(
-            matches!(shell, SomeValue::String(_)),
-            "str-family residual is SomeString, got {shell:?}"
+            !s.inner.no_nul,
+            "str-family residual is SomeString(no_nul=False) (SomeString.__init__ default)"
         );
         let s_new = SomeValue::String(SomeString::new(false, false));
-        union(&shell, &s_new).expect("str-family residual must union with String::new()");
+        let joined =
+            union(&shell, &s_new).expect("str-family residual must union with String::new()");
+        assert!(
+            matches!(joined, SomeValue::String(_)),
+            "str-family residual ∪ String::new() must stay SomeString, got {joined:?}"
+        );
     }
 
     #[test]

@@ -910,7 +910,8 @@ impl<'a> Lowering<'a> {
                                     specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: Vec::new(),
-                                result_ty: ValueType::Ref(None),
+                                // `AbstractStringBuilderRepr.rtyper_new`.
+                                result_ty: ValueType::StringBuilder,
                             },
                         });
                         self.local_var[acc] = Some(LocalValue::One(fresh));
@@ -1720,7 +1721,6 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
-            16,
             &self.raw_alloc_flavor_structs,
         );
         let bb_id = self.emit_bb(mir_bb);
@@ -4047,6 +4047,10 @@ impl<'a> Lowering<'a> {
             let ptr = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            // Window data word is `rffi.py` `CCHARP`. Dest starts
+            // Unknown so `ensure_window_ccharp` cannot stamp it; the
+            // walker reads this concretetype as `SomePtr(CCHARP)`.
+            stamp_as_ccharp(&ptr);
             let bb_id = self.emit_bb(mir_bb);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(ptr.clone()),
@@ -5913,8 +5917,13 @@ impl<'a> Lowering<'a> {
         // `ConstRefNull` (`const_ref_gcref_constant`). Dest `PyObjectRef`
         // is `lltype.cast_opaque_ptr` (`lltype.py` `ann_cast_opaque_ptr`).
         if is_gcref_null
-            && let Some((op, recast)) =
-                self.ptr_cast_marker(Some(&ValueType::Ref(None)), None, dest_ty, &res)
+            && let Some((op, recast)) = self.ptr_cast_marker(
+                Some(&ValueType::Ref(None)),
+                None,
+                dest_ty,
+                &res,
+                self.cast_src_is_pointer(None, Some(&ValueType::Ref(None)), &res),
+            )
         {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(recast.clone()),
@@ -7213,13 +7222,12 @@ impl<'a> Lowering<'a> {
     /// integer-kinded (`core::convert::num::<Impl>::from`) — `u32::from(u16)`
     /// and its family.
     ///
-    /// `jtransform.py rewrite_op_cast_bool_to_int` deletes every one of these outright:
-    /// `rewrite_op_cast_char_to_int`, `cast_int_to_uint`, `cast_uint_to_int`
-    /// and the rest are each `pass`, because a cast between two integer
-    /// primitives is a no-op once both live in the same `Int` register kind.
-    /// This is the same conclusion for the same reason, reached at the
-    /// callsite rather than at an op because `core` carries no graph body and
-    /// the call would otherwise stay residual.
+    /// Same-signedness widening is an identity bind (`rarithmetic.widen`).
+    /// A signedness change is `intmask` / `r_uint` (`rarithmetic.py`;
+    /// `rffi.cast` annotates from the target), the same marker
+    /// [`Lowering::materialize_int_cast`] emits for `Rvalue::Cast`.
+    /// `core` carries no graph body, so the callsite would otherwise stay
+    /// residual.
     ///
     /// Narrowing needs no separate rule: `From` between numerics is
     /// implemented only where the conversion is lossless, so a source that is
@@ -7258,6 +7266,62 @@ impl<'a> Lowering<'a> {
             )
         };
         register_int(src) && register_int(&fd.signature.output)
+    }
+
+    /// Lower `core::convert::num::<Impl>::from` between register integers.
+    /// Same-signedness widening aliases; a signedness change emits
+    /// `intmask` / `r_uint` through [`Lowering::materialize_int_cast`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    pub(in crate::front::mir) fn try_lower_widening_int_from(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        arg: Variable,
+        dest_local: usize,
+        src_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        arg_locals: &[Option<usize>],
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !self.is_widening_int_from(reg) {
+            return Ok(false);
+        }
+        let fd_src = match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => self
+                .llbc
+                .fn_by_id(*id)
+                .and_then(|fd| fd.signature.inputs.first()),
+            _ => None,
+        };
+        let src_ty = src_ty.or(fd_src);
+        if let Some(src_ty) = src_ty
+            && let (Some(src_w), Some(dst_w)) = (
+                self.literal_int_width(src_ty),
+                self.literal_int_width(dest_ty),
+            )
+            && let Some((op, res)) = self.materialize_int_cast(mir_bb, src_w, dst_w, arg.clone())
+        {
+            if let Some(kind) = op {
+                let bb_id = self.emit_bb(mir_bb);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind,
+                });
+                self.local_var[dest_local] = Some(LocalValue::One(res));
+            } else {
+                self.alias_dest_to_arg0_inherit(dest_local, arg, arg_locals);
+            }
+        } else {
+            self.alias_dest_to_arg0_inherit(dest_local, arg, arg_locals);
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
     }
 
     /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the

@@ -14950,6 +14950,7 @@ impl<'a> Transformer<'a> {
             owner_path: _,
             is_struct: _,
             variant_tag: _,
+            payload_void: _,
         } = target
         else {
             return false;

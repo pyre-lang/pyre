@@ -2111,6 +2111,28 @@ impl<'a> Lowering<'a> {
         option_ty: &TyRef,
     ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
+        // Overlay raw-struct payload (`*mut SomeRawStruct`): the Some
+        // arm is `cast_int_to_ptr(PTR, addr)` from
+        // `emit_dest_overlay_cast` → `dest_overlay_ptr_lltype`. None is
+        // the same PTR with `oddint == 0` (`cast_int_to_ptr` /
+        // `ann_cast_int_to_ptr` → `SomePtr(PTRTYPE)`).
+        if let Some(payload) = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+            && let Some(ptr) = self.dest_overlay_ptr_lltype(&payload)
+        {
+            return emit_typed_nullptr(&mut self.graph, bb_id, ptr);
+        }
+        // `Option<*mut c_void>` / `*mut c_void` is `rffi.VOIDP`
+        // (`rffi.py` `VOIDP`). None is `cast_int_to_ptr(VOIDP, 0)`
+        // (`lltype.py` `cast_int_to_ptr` when `oddint == 0` /
+        // `ann_cast_int_to_ptr` → `SomePtr(VOIDP)`). This arm runs
+        // before `option_niche_int_null` so the int-bank `null_raw` /
+        // `llmemory.NULL` arm does not take the VOIDP word.
+        if tyref_is_raw_c_void_ptr(option_ty, self.llbc)
+            || crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+                .is_some_and(|payload| tyref_is_raw_c_void_ptr(&payload, self.llbc))
+        {
+            return emit_voidp_nullptr(&mut self.graph, bb_id);
+        }
         // Int-banked niche (`Option<fn>` / raw Address): `rnone.py`
         // `rtype_is_None` compares against a null of the operand's own
         // lltype (`ptr_iszero` / `int_is_zero` / `adr_eq`). `null_mut()`

@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str0};
+use crate::annotator::model::{KnownType, SomeFloat, SomeInstance, SomeInteger, SomeValue, s_str};
 use crate::model::ValueType;
 use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
 
@@ -71,7 +71,7 @@ pub(crate) fn dump_classdef_less_ref_census() {}
 /// |--------------------|------------------------|--------------------------|
 /// | `Int`              | `Integer(SomeInteger)` | `model.py` -> `SomeValue::Integer` arm. |
 /// | `Float`            | `Float(SomeFloat)`     | `model.py` -> `SomeValue::Float` arm. |
-/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` or `SomeString` for a str-family payload | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py` `lltype_to_annotation`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  A `Ref` whose payload is `is_str_family_class_root` (`String`, `str`, `Wtf8Buf`, …) is `s_str0()` (`annotator/model.py` `SomeString`), the same seed `__str_const` / `ConstValue::ByteStr` uses; `rstr.py` has one string type.  Other Ref variants stay classdef-less → `GcRef` via `rclass.py`. |
+/// | `Ref(_)`           | `Instance(SomeInstance{classdef:None,..})` or `SomeString` for a str-family payload | `model.py`.  Typed pointers should lift to `SomePtr(ll_ptrtype)` (`llannotation.py` `lltype_to_annotation`), but the correct Ptr must come from the producer writing `Variable.annotation` directly — not from a process-global root-string lookup.  A `Ref` whose payload is `is_str_family_class_root` (`String`, `str`, `Wtf8Buf`, …) is `SomeString` with `no_nul=False` (`annotator/model.py` `SomeString.__init__` default); `no_nul` needs `rlib/rstring.py` `assert_str0`. `rstr.py` has one string type.  Other Ref variants stay classdef-less → `GcRef` via `rclass.py`. |
 /// | `Void`             | `Impossible`           | `model.py:627` -> `SomeValue::Impossible` arm. |
 /// | `State`            | `Instance(SomeInstance{classdef:None,..})` | **TODO: no upstream equivalent**.  Pyre-only `State` carries the JIT state pointer (a struct pointer to interpreter state).  RPython has no analogue; the `SomeInstance(classdef=None)` projection is a temporary fallback that lets the rtyper proceed without a real bookkeeper-attached pyre `ClassDef`.  Projects to `GcRef` via the same chain as `Ref`. |
 /// | `Unknown`          | `None`                 | **Fail-loud — annotation gap with no annotation-stage shell.**  RPython's annotator never produces an unknown lattice node — every Variable is annotated with a definite `SomeValue`, and unreachable code stays at `SomeImpossible`.  Pyre's `Unknown` is a coverage gap (annotator did not narrow / producer did not call `set_some`).  Returning `None` leaves `Variable.annotation` empty so `bindingrepr` panics with `KeyError: no binding for arg` (`annotator/annrpython.rs`'s `binding`) on the first attempt to lower the affected `Variable`, surfacing the producer-side gap rather than silently bridging it to `GcRef` via a fabricated `SomeInstance(None)` shell. `resolve_types` likewise panics on leftover Unknown (`rtyper.py setconcretetype`). |
@@ -132,12 +132,13 @@ pub fn valuetype_to_someshell(vt: &ValueType) -> Option<SomeValue> {
             // A rust-heap `String` / `&str` / `Wtf8Buf` is still
             // `ValueType::Ref` so `ll_strconcat` does not consume a
             // `{cap, ptr, len}` header (`tyref_to_value_type`). The
-            // annotation is `SomeString` (`annotator/model.py`
-            // `SomeString`, `s_str0()`): `rstr.py` has one string type,
-            // the same seed `__str_const` / `ConstValue::ByteStr` uses.
-            // `binaryop.py` `pairtype(SomeObject, SomeObject).union`
-            // raises, so a classdef-less `SomeInstance` here cannot
-            // join `String::new()`.
+            // annotation is `SomeString` with `no_nul=False`
+            // (`annotator/model.py` `SomeString.__init__` default):
+            // `rstr.py` has one string type. `no_nul` needs
+            // `rlib/rstring.py` `assert_str0`. `binaryop.py`
+            // `pairtype(SomeObject, SomeObject).union` raises, so a
+            // classdef-less `SomeInstance` here cannot join
+            // `String::new()`.
             if let Some(shell) = str_family_ref_shell(payload.as_deref()) {
                 return Some(shell);
             }
@@ -198,11 +199,13 @@ fn ref_fallback_instance() -> SomeValue {
     SomeValue::Instance(SomeInstance::new(None, false, BTreeMap::new()))
 }
 
-/// `s_str0()` when `payload` is `is_str_family_class_root`.
+/// `SomeString` with `no_nul=False` (`SomeString.__init__` default) when
+/// `payload` is `is_str_family_class_root`. `no_nul` needs
+/// `rlib/rstring.py` `assert_str0`.
 fn str_family_ref_shell(payload: Option<&str>) -> Option<SomeValue> {
     payload
         .filter(|root| crate::front::mir::is_str_family_class_root(root))
-        .map(|_| s_str0())
+        .map(|_| s_str())
 }
 
 /// Reduce a `SomeValue` lattice node to its `ValueType` discriminator.
@@ -213,11 +216,25 @@ fn str_family_ref_shell(payload: Option<&str>) -> Option<SomeValue> {
 /// annotation-stage `SomeValue` to pyre's flat `ValueType` enum used by
 /// downstream `codewriter` consumers that haven't been ported to
 /// `SomeValue` directly.
+///
+/// `Unsigned` shells to `SomeInteger { unsigned: true }`
+/// (`SomeInteger::new`); this inverse returns `Unsigned` when
+/// `integer.unsigned` (the 128-bit knowntypes stay `Int128` /
+/// `UInt128`). `Str` shells to `SomeString` (`SomeString::new` /
+/// `SomeString.__init__` default). A str-family `Ref(Some(..))`
+/// (`is_str_family_class_root`) shells to the same `SomeString`
+/// (`s_str`); both read back as `Str` because `rstr.py` has one
+/// string type and `Str` is the dedicated discriminator. The legacy
+/// walker re-reads the slot via `read_binding`, so a second
+/// `Unsigned` / `Str` incoming is then the same-shell union
+/// (`binaryop.py` `pairtype(SomeInteger, SomeInteger).union` of two
+/// unsigned integers; `pairtype(SomeString, SomeString).union`).
 pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
     match s {
         SomeValue::Integer(integer) => match integer.base.knowntype {
             KnownType::LongLongLong => ValueType::Int128,
             KnownType::ULongLongLong => ValueType::UInt128,
+            _ if integer.unsigned => ValueType::Unsigned,
             _ => ValueType::Int,
         },
         SomeValue::Bool(_) => ValueType::Bool,
@@ -247,11 +264,14 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // the rtyper picks `StringBuilderRepr` rather than the generic
         // `Ref` fallback (which would erase the builder method surface).
         SomeValue::StringBuilder(_) => ValueType::StringBuilder,
-        // `SomeImpossibleValue` represents unreachable code (`model.py:627`),
+        // Inverse of `valuetype_to_someshell(Str)` and of a str-family
+        // `Ref` (`s_str`). `rstr.py` has one string type.
+        SomeValue::String(_) => ValueType::Str,
+        // `SomeImpossibleValue` represents unreachable code (`model.py`),
         // which projects to `ValueType::Void` in pyre's flat enum just
         // like upstream `lltype.Void`.
         SomeValue::Impossible => ValueType::Void,
-        // Other variants (String / List / Tuple / Dict / Iterator /
+        // Other variants (List / Tuple / Dict / Iterator /
         // Exception / None_ / Property / InteriorPtr / LLADTMeth /
         // Builtin / BuiltinMethod / WeakRef / TypeOf / ByteArray /
         // Char / UnicodeCodePoint / UnicodeString / Type / Object) have
@@ -300,25 +320,33 @@ mod tests {
 
     #[test]
     fn str_family_ref_annotates_somestring_and_unions_with_string_new() {
-        // `is_str_family_class_root` / `s_str0()`: a rust-heap `String`,
-        // `&str`, or `Wtf8Buf` is `SomeString` (`annotator/model.py`
-        // `SomeString`), the same seed `__str_const` / `ConstValue::ByteStr`
-        // uses. `String::new()` is `SomeString` (`string_constructor`).
-        // `binaryop.py` `pairtype(SomeObject, SomeObject).union` raises
-        // on String ∪ Instance, so the classdef-less `Ref` fallback
-        // cannot join that constructor.
+        // `is_str_family_class_root`: a rust-heap `String`, `&str`, or
+        // `Wtf8Buf` is `SomeString` with `no_nul=False`
+        // (`annotator/model.py` `SomeString.__init__` default). `no_nul`
+        // needs `rlib/rstring.py` `assert_str0`. `String::new()` is
+        // `SomeString` (`string_constructor`). `binaryop.py`
+        // `pairtype(SomeObject, SomeObject).union` raises on String ∪
+        // Instance, so the classdef-less `Ref` fallback cannot join
+        // that constructor.
         use crate::annotator::model::{SomeString, union};
         let s_new = SomeValue::String(SomeString::new(false, false));
         for root in ["string::String", "String", "str", "Wtf8Buf"] {
             let shell = valuetype_to_someshell(&ValueType::Ref(Some(root.to_string())))
                 .unwrap_or_else(|| panic!("{root} Ref must project"));
+            let SomeValue::String(s) = &shell else {
+                panic!("str-family Ref({root}) must be SomeString, got {shell:?}");
+            };
             assert!(
-                matches!(shell, SomeValue::String(_)),
-                "str-family Ref({root}) must be SomeString, got {shell:?}"
+                !s.inner.no_nul,
+                "str-family Ref({root}) is SomeString(no_nul=False) (SomeString.__init__ default)"
             );
-            union(&shell, &s_new).unwrap_or_else(|e| {
+            let joined = union(&shell, &s_new).unwrap_or_else(|e| {
                 panic!("str-family Ref({root}) must union with String::new(): {e}")
             });
+            assert!(
+                matches!(joined, SomeValue::String(_)),
+                "str-family Ref({root}) ∪ String::new() must stay SomeString, got {joined:?}"
+            );
         }
         let unnamed = valuetype_to_someshell(&ValueType::Ref(None)).expect("opaque Ref projects");
         assert!(
@@ -354,6 +382,41 @@ mod tests {
     fn function_pointer_someptr_projects_as_int() {
         let s = crate::annotator::bookkeeper::raw_fn_ptr_somevalue();
         assert_eq!(somevalue_to_valuetype(&s), ValueType::Int);
+    }
+
+    #[test]
+    fn unsigned_roundtrips_through_shell() {
+        // `valuetype_to_someshell(Unsigned)` is `SomeInteger(unsigned=True)`
+        // (`SomeInteger::new`); `binaryop.py`
+        // `pairtype(SomeInteger, SomeInteger).union` of two unsigned
+        // integers succeeds, so the inverse must report `Unsigned`.
+        let shell = valuetype_to_someshell(&ValueType::Unsigned).expect("Unsigned projects");
+        let SomeValue::Integer(integer) = &shell else {
+            panic!("Unsigned must project to SomeInteger, got {shell:?}");
+        };
+        assert!(integer.unsigned);
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::Unsigned);
+    }
+
+    #[test]
+    fn str_roundtrips_through_shell() {
+        // `valuetype_to_someshell(Str)` is `SomeString` (`SomeString.__init__`
+        // default). A str-family `Ref(Some(..))` (`is_str_family_class_root`)
+        // shells to the same `SomeString` (`s_str`); both read back as
+        // `Str` because `rstr.py` has one string type.
+        let shell = valuetype_to_someshell(&ValueType::Str).expect("Str projects");
+        assert!(
+            matches!(shell, SomeValue::String(_)),
+            "Str must project to SomeString, got {shell:?}"
+        );
+        assert_eq!(somevalue_to_valuetype(&shell), ValueType::Str);
+        let family =
+            valuetype_to_someshell(&ValueType::Ref(Some("Wtf8Buf".to_string()))).expect("family");
+        assert!(
+            matches!(family, SomeValue::String(_)),
+            "str-family Ref must project to SomeString, got {family:?}"
+        );
+        assert_eq!(somevalue_to_valuetype(&family), ValueType::Str);
     }
 
     #[test]

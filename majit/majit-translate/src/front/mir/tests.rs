@@ -1250,6 +1250,323 @@ fn gcref_cast_to_utf8str_emits_cast_instance_str() {
     );
 }
 
+/// Immortal `alloc_varsize_with_gc_header_immortal` `*mut u8` recast onto
+/// rstr `STR` (`rstr.py` `mallocstr`). UnaryOp Cast and Rvalue RawPtr both
+/// emit `__cast_instance_intrinsic` with a Utf8Str-family root and
+/// `result_ty == ValueType::Str`.
+#[test]
+fn unsigned_cast_to_utf8str_emits_cast_instance_str() {
+    use crate::model::{OpKind, ValueType};
+
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty =
+        serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]});
+    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let n = usize_ty();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_immortal_str_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_immortal_str_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [utf8],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let is_utf8str_str_cast = |graph: &crate::model::FunctionGraph| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Str,
+                        ..
+                    }
+                ) && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
+                    super::lltype::is_str_family_class_root(root)
+                        && majit_ir::descr::class_root_leaf(root) == "Utf8Str"
+                })
+            })
+        })
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_immortal_str_cast")
+        .expect("lower UnaryOp Cast *mut u8 to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&unary_graph),
+        "UnaryOp Cast *mut u8 as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_immortal_str_cast")
+        .expect("lower Rvalue RawPtr Cast *mut u8 to *mut Utf8Str");
+    assert!(
+        is_utf8str_str_cast(&rvalue_graph),
+        "Rvalue::Cast RawPtr *mut u8 as *mut Utf8Str emits __cast_instance_intrinsic result_ty=Str; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+/// A genuine `usize` (`ValueType::Unsigned`) cast onto rstr `STR` is
+/// `rbuiltin.py` `gen_cast` Primitive→Ptr (`cast_int_to_ptr`), not the
+/// pointer-only dest-Str restore. UnaryOp Cast and Rvalue RawPtr both
+/// skip `__cast_instance_intrinsic`.
+#[test]
+fn usize_cast_to_utf8str_does_not_emit_cast_instance() {
+    let span = fixture_span();
+    let empty_g = empty_generics();
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_g.clone()}
+    });
+    let src_ty = usize_ty();
+    let dest_ty = serde_json::json!({"RawPtr": [utf8_adt, "Mut"]});
+    let n = usize_ty();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n, "attr_info": null}
+        ]}
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let fun = |def_id: u64, name: &str, rvalue: serde_json::Value| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", name])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "addr", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            rvalue
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        })
+    };
+    let unary = fun(
+        0,
+        "unary_usize_str_cast",
+        serde_json::json!({"UnaryOp": [
+            {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+            {"Move": place(1, &src_ty)}
+        ]}),
+    );
+    let rvalue = fun(
+        1,
+        "rvalue_usize_str_cast",
+        serde_json::json!({"Cast": [
+            "RawPtr",
+            {"Move": place(1, &src_ty)},
+            dest_ty.clone()
+        ]}),
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [utf8],
+            "fun_decls": [unary, rvalue],
+            "global_decls": [],
+            "trait_decls": [gctype_trait_decl()],
+            "trait_impls": [gctype_impl_row(0)]
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let has_cast_instance = |graph: &crate::model::FunctionGraph| {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| crate::model::cast_instance_root(&op.kind).is_some())
+    };
+    let unary_graph = super::lower_function(&llbc, "unary_usize_str_cast")
+        .expect("lower UnaryOp Cast usize to *mut Utf8Str");
+    assert!(
+        !has_cast_instance(&unary_graph),
+        "UnaryOp Cast usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        unary_graph.dump()
+    );
+    let rvalue_graph = super::lower_function(&llbc, "rvalue_usize_str_cast")
+        .expect("lower Rvalue RawPtr Cast usize to *mut Utf8Str");
+    assert!(
+        !has_cast_instance(&rvalue_graph),
+        "Rvalue::Cast RawPtr usize as *mut Utf8Str must not emit __cast_instance_intrinsic; graph={}",
+        rvalue_graph.dump()
+    );
+}
+
+/// `try_alloc_bytes_block` Managed payload and immortal STR recast are
+/// dest-Str (`rstr.py` `mallocstr` / `op_gc_restore_root`), not W_ROOT
+/// `PyObject`.
+#[test]
+fn try_alloc_bytes_block_str_malloc_not_object() {
+    use crate::model::{OpKind, ValueType};
+
+    let llbc =
+        Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("load pyre-object.ullbc");
+    let graph = super::lower_function(&llbc, "try_alloc_bytes_block")
+        .or_else(|_| {
+            super::lower_function(&llbc, "pyre_object::bytesobject::try_alloc_bytes_block")
+        })
+        .expect("lower try_alloc_bytes_block");
+    let mut managed_w_root = false;
+    let mut dest_str = false;
+    for block in &graph.blocks {
+        for window in block.operations.windows(2) {
+            if let OpKind::FieldRead { field, ty, .. } = &window[0].kind
+                && field.name == "__pos_0"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|owner| owner.contains("Managed"))
+            {
+                if crate::model::cast_instance_root(&window[1].kind)
+                    == Some(super::W_ROOT_CLASS_ROOT)
+                {
+                    managed_w_root = true;
+                }
+                if matches!(ty, ValueType::Str)
+                    || matches!(
+                        &window[1].kind,
+                        OpKind::Call {
+                            result_ty: ValueType::Str,
+                            ..
+                        }
+                    )
+                {
+                    dest_str = true;
+                }
+            }
+        }
+        for op in &block.operations {
+            if matches!(
+                &op.kind,
+                OpKind::Call {
+                    result_ty: ValueType::Str,
+                    ..
+                }
+            ) && crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| super::lltype::is_rstr_str_layout_declaration(root))
+            {
+                dest_str = true;
+            }
+        }
+    }
+    assert!(
+        !managed_w_root,
+        "Managed *mut BytesBlock must not W_ROOT; graph={}",
+        graph.dump()
+    );
+    assert!(
+        dest_str,
+        "try_alloc_bytes_block STR recast is dest-Str; graph={}",
+        graph.dump()
+    );
+    // Immortal `<*mut u8>::cast::<BytesBlock>()` is a dest-Str block of
+    // its own (`op_gc_restore_root`); Managed dest-Str shares the
+    // FieldRead block, `null_mut` dest-Str shares the nullptr Call.
+    let immortal_dest_str = graph.blocks.iter().any(|block| {
+        let has_field = block
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::FieldRead { .. }));
+        let has_null = block.operations.iter().any(|op| {
+            matches!(&op.kind, OpKind::Call { target, .. } if target.path_segments().is_some_and(|segs| segs.last() == Some(&"null_mut")))
+        });
+        let has_dest_str = block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    result_ty: ValueType::Str,
+                    ..
+                }
+            ) && crate::model::cast_instance_root(&op.kind)
+                .is_some_and(|root| super::lltype::is_rstr_str_layout_declaration(root))
+        });
+        has_dest_str && !has_field && !has_null
+    });
+    assert!(
+        immortal_dest_str,
+        "immortal *mut u8.cast::<BytesBlock>() is dest-Str; graph={}",
+        graph.dump()
+    );
+}
+
 /// Ref-source cast onto `LowlevelStringHeader` takes the dest-Str arm:
 /// that overlay is rstr `STR` (`is_rstr_str_layout_declaration`), so
 /// `op_gc_restore_root` restores Ptr(STR). The following `.length` read
@@ -13752,6 +14069,73 @@ fn map_or_i64_from_fn_item_is_identity_select() {
     );
 }
 
+/// `i64::from(u8)` (`core::convert::num::<Impl>::from`) is
+/// `rarithmetic.intmask` with `result_ty: Int`. Same marker
+/// `Rvalue::Cast` uses for unsigned→signed (`rarithmetic.py` `intmask`;
+/// `rffi.cast` annotates from the target).
+#[test]
+fn i64_from_u8_lowers_to_intmask() {
+    let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+    let i64_ty = interior_i64();
+    let from = interior_opaque(
+        1,
+        &["core", "convert", "num", "<Impl>", "from"],
+        vec![u8_ty.clone()],
+        i64_ty.clone(),
+    );
+    let caller = interior_caller(
+        "from_u8",
+        1,
+        vec![u8_ty.clone()],
+        i64_ty.clone(),
+        vec![
+            interior_local(0, None, &i64_ty),
+            interior_local(1, Some("x"), &u8_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &u8_ty))],
+                    interior_place(0, &i64_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![caller, from]);
+    let graph = lower_interior(&llbc, "from_u8");
+    let intmask = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice() == ["rpython", "rlib", "rarithmetic", "intmask"]
+            )
+        })
+        .unwrap_or_else(|| panic!("expected intmask; graph={}", graph.dump()));
+    match &intmask.kind {
+        OpKind::Call { result_ty, .. } => {
+            assert_eq!(
+                result_ty,
+                &ValueType::Int,
+                "intmask result_ty is Int; graph={}",
+                graph.dump()
+            );
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
 /// `opt.map_or(-1, plus_one)` with a local function item: the caller
 /// keeps a regular `map_or` call; the core body calls `plus_one`
 /// directly as `f(t)`.
@@ -15736,7 +16120,7 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
 /// arm, so the resulting graph directly exposes whether the classifier
 /// chose aggregate construction or the nullable-pointer identities.
 fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, false, false, false)
+    lower_option_fn_retyped("option_source", payload, false, false, false, None)
 }
 
 fn lower_option_source_with_payload_ext(
@@ -15749,11 +16133,12 @@ fn lower_option_source_with_payload_ext(
         false,
         inject_layoutless_nominal,
         false,
+        None,
     )
 }
 
 fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
-    lower_option_fn_retyped("option_source", payload, true, false, false)
+    lower_option_fn_retyped("option_source", payload, true, false, false, None)
 }
 
 fn lower_option_fn_retyped(
@@ -15762,6 +16147,7 @@ fn lower_option_fn_retyped(
     through_alias: bool,
     inject_layoutless_nominal: bool,
     inject_string: bool,
+    option_layout_size: Option<u64>,
 ) -> FunctionGraph {
     fn replace_dedup(
         value: &mut serde_json::Value,
@@ -15876,6 +16262,33 @@ fn lower_option_fn_retyped(
             })
         })
         .expect("Option type declaration in corpus");
+    if let Some(size) = option_layout_size {
+        let decls = translated
+            .get_mut("type_decls")
+            .and_then(serde_json::Value::as_array_mut)
+            .expect("corpus type_decls");
+        let decl = decls
+            .iter_mut()
+            .find(|decl| {
+                decl.get("def_id").and_then(serde_json::Value::as_u64) == Some(option_def_id)
+            })
+            .expect("Option decl");
+        // One layout entry so `select_target_layout` accepts it regardless
+        // of `TARGET`. Size 0 is the empty `None` variant Charon may
+        // record on the generic Option decl.
+        decl["layout"] = serde_json::json!([{
+            "key": "",
+            "value": {
+                "size": size,
+                "align": 8,
+                "variant_layouts": [
+                    {"field_offsets": []},
+                    {"field_offsets": [0]}
+                ],
+                "repr": {"transparent": false}
+            }
+        }]);
+    }
     if inject_layoutless_nominal {
         let decls = translated
             .get_mut("type_decls")
@@ -16282,6 +16695,118 @@ fn niche_option_nominal_pointers_none_is_null_some_is_identity() {
         assert_eq!(null_muts, 1, "case {name}: {none_msg}");
         assert_eq!(transparent_ctors, 0, "case {name}: {some_msg}");
     }
+}
+
+fn object_ref_payload() -> serde_json::Value {
+    // `type PyObjectRef = *mut PyObject`. Corpus Adt 4 is the sized
+    // nominal stand-in used by
+    // `niche_option_type_alias_of_raw_nominal_ptr_none_is_null`.
+    serde_json::json!({
+        "RawPtr": [
+            {
+                "Adt": {
+                    "id": 4,
+                    "generics": {
+                        "regions": [], "types": [],
+                        "const_generics": [], "trait_refs": []
+                    }
+                }
+            },
+            "Mut"
+        ]
+    })
+}
+
+fn const_none_link_args(graph: &FunctionGraph) -> Vec<(usize, crate::model::ConcreteType)> {
+    use crate::model::ConcreteType;
+    let mut const_nones = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for op in &block.operations {
+            if matches!(op.kind, OpKind::ConstNone) {
+                let ct = op
+                    .result
+                    .as_ref()
+                    .map(FunctionGraph::concretetype_of)
+                    .unwrap_or(ConcreteType::Unknown);
+                const_nones.push((bi, op.result.clone(), ct));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            for arg in &link.args {
+                let Some(v) = arg.as_variable() else {
+                    continue;
+                };
+                for (bi, var, ct) in &const_nones {
+                    if var.as_ref() == Some(v) {
+                        out.push((*bi, ct.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `Option<PyObjectRef>::None` through match (`option_source`) and `?`
+/// (`option_question_mark`). Size-0 Option layout is the empty `None`
+/// variant Charon may record on the generic Option decl; `aggregate_shape`
+/// classifies that dest as `NicheNull` before `tyref_is_void_zst`, so
+/// `option_source` constructs None with `push_niche_null_ptr`, never a Void
+/// `ConstNone` value. Option `?` is a regular call of the extracted
+/// `core::option::<Impl>::branch` body (`Try::branch`) plus a ControlFlow
+/// discriminant switch; the Break/None arm is
+/// `core::option::<Impl>::from_residual` (`FromResidual::from_residual`).
+/// The caller-side rewrite that inlined `push_niche_null_ptr` is gone.
+/// `bookkeeper.py` `immutablevalue(None)` is `s_None`; `rnone.py`
+/// `NoneRepr` Void is only for a variable that is only None.
+/// `pairtype(NoneRepr, Repr).convert_from_to` is `inputconst(r_to, None)`.
+/// `push_const_none` remains the `rtype_is_None` comparison RHS.
+#[test]
+fn option_object_ref_none_match_and_try_lowers_to_niche_null_not_void_constnone() {
+    let payload = object_ref_payload();
+    // Size-0 Option layout is the empty `None` variant Charon may
+    // record; `option_source` constructs `None` so that dest hits
+    // `aggregate_shape`.
+    for (fn_name, layout) in [("option_source", None), ("option_source", Some(0u64))] {
+        let graph = lower_option_fn_retyped(fn_name, payload.clone(), false, false, false, layout);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        let as_value = const_none_link_args(&graph);
+        assert!(
+            null_muts >= 1,
+            "{fn_name} layout={layout:?}: None is push_niche_null_ptr, got {null_muts} \
+             const_none_links={as_value:?} ctors={transparent_ctors}"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "{fn_name} layout={layout:?}: Some is the payload identity"
+        );
+        assert!(
+            as_value.is_empty(),
+            "{fn_name} layout={layout:?}: ConstNone must not be a link value \
+             (NoneRepr leak), got {as_value:?}"
+        );
+    }
+    let graph = lower_option_fn_retyped("option_question_mark", payload, false, false, false, None);
+    let (_null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+    let as_value = const_none_link_args(&graph);
+    let from_residuals = option_core_leaf_call_count(&graph, "from_residual");
+    assert!(
+        from_residuals >= 1,
+        "option_question_mark: None arm is from_residual, got {from_residuals} \
+         const_none_links={as_value:?} ctors={transparent_ctors}"
+    );
+    assert_eq!(
+        transparent_ctors, 0,
+        "option_question_mark: Some is the payload identity"
+    );
+    assert!(
+        as_value.is_empty(),
+        "option_question_mark: ConstNone must not be a link value \
+         (NoneRepr leak), got {as_value:?}"
+    );
 }
 
 /// `Rvalue::Discriminant` of `Option<&[u8]>` (and Charon's
@@ -17430,6 +17955,7 @@ fn niche_option_string_match_is_none_identity() {
         false,
         false,
         true,
+        None,
     );
     assert_eq!(
         option_core_leaf_call_count(&graph, "branch"),
@@ -21156,6 +21682,89 @@ fn owned_ctor_push_char_local_lowers() {
     assert!(
         has_path_leaf(&graph, crate::runtime_names::shims::UNICHAR_AS_UTF8),
         "a variable code point must go through unichr_as_utf8: {graph:#?}"
+    );
+}
+
+/// `String::new(); s.push_str(x); return s` — builder-mode ctor + append +
+/// terminal `move`. `AbstractStringBuilderRepr.rtyper_new` paints NEW
+/// `SomeStringBuilder`; `rtype_method_build` paints BUILD `SomeString`.
+#[test]
+fn owned_ctor_push_str_move_paints_stringbuilder_and_str() {
+    let string = string_adt();
+    let word = word_ty();
+    let unit = unit_ty();
+    let borrow = ref_string("Mut");
+    let graph = lower_owned_concat(
+        "ctor_push_str_move",
+        vec![string_decl()],
+        vec![
+            subject_decl(
+                "ctor_push_str_move",
+                1,
+                vec![word.clone()],
+                string.clone(),
+                vec![
+                    local_of(0, &string),
+                    local_of(1, &word),
+                    local_of(2, &string),
+                    local_of(3, &borrow),
+                    local_of(4, &unit),
+                ],
+                vec![
+                    bb(vec![], call_term(1, vec![], place_of(2, &string), 1, 4)),
+                    bb(
+                        vec![assign_stmt(
+                            place_of(3, &borrow),
+                            ref_rvalue(place_of(2, &string), "Mut"),
+                        )],
+                        call_term(
+                            2,
+                            vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                            place_of(4, &unit),
+                            2,
+                            4,
+                        ),
+                    ),
+                    bb(
+                        vec![assign_stmt(
+                            place_of(0, &string),
+                            use_move(place_of(2, &string)),
+                        )],
+                        json!("Return"),
+                    ),
+                    bb(vec![], json!("UnwindResume")),
+                ],
+            ),
+            string_new_decl(),
+            string_push_str_decl(),
+        ],
+    );
+    let marker_result_ty = |leaf: &str| -> Vec<&ValueType> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty,
+                    ..
+                } if segments.last().map(String::as_str) == Some(leaf) => Some(result_ty),
+                _ => None,
+            })
+            .collect()
+    };
+    let new_tys = marker_result_ty(crate::runtime_names::shims::STRINGBUILDER_NEW);
+    assert_eq!(
+        new_tys.as_slice(),
+        [&ValueType::StringBuilder],
+        "NEW is SomeStringBuilder (rtyper_new): {graph:#?}"
+    );
+    let build_tys = marker_result_ty(crate::runtime_names::shims::STRINGBUILDER_BUILD);
+    assert_eq!(
+        build_tys.as_slice(),
+        [&ValueType::Str],
+        "BUILD is SomeString (rtype_method_build): {graph:#?}"
     );
 }
 
@@ -28466,7 +29075,6 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         &llbc,
         tomb,
         &gc_struct_ids,
-        16,
         &raw_alloc,
     );
     assert_eq!(
@@ -28482,7 +29090,6 @@ fn transparent_generic_wrapper_by_value_struct_leaves_are_payload() {
         &llbc,
         tomb,
         &gc_struct_ids,
-        16,
         &raw_alloc,
     );
     assert_eq!(

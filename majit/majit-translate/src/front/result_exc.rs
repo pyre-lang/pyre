@@ -471,6 +471,44 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
     }
 }
 
+/// `Some(true)` when `spelling` is `Result<(), …>`; `Some(false)` when it is
+/// a payload-bearing `Result<T, …>`; `None` when it is not a Result.
+fn result_spelling_ok_is_unit(spelling: &str) -> Option<bool> {
+    let rest = spelling.split("Result<").nth(1)?;
+    Some(rest.starts_with("()"))
+}
+
+/// `Ok` ctor whose payload field was Void (`lltype.py`
+/// `Struct._names_without_voids`). `rnone.py` `NoneRepr` is only for a
+/// variable that is ONLY None (`bookkeeper.py` `immutablevalue(None)` =
+/// `s_None`).
+fn result_ok_payload_is_void(target: &CallTarget) -> bool {
+    let CallTarget::SyntheticTransparentCtor {
+        name, payload_void, ..
+    } = target
+    else {
+        return false;
+    };
+    name == "Ok" && *payload_void
+}
+
+fn call_result_ty_ok_is_unit(ty: &ValueType) -> Option<bool> {
+    match ty {
+        ValueType::Ref(Some(s)) => result_spelling_ok_is_unit(s),
+        _ => None,
+    }
+}
+
+fn call_target_is_ok_or_else(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method { name, .. } => name == "ok_or_else",
+        CallTarget::FunctionPath { segments, .. } => {
+            segments.last().map(String::as_str) == Some("ok_or_else")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod result_ctor_kind_tests {
     use super::*;
@@ -633,7 +671,7 @@ fn lower_result_exc_returns_inner(
     for bi in 0..nblocks {
         let block_id = crate::model::BlockId(bi);
         // Locate a Result ctor in this block.
-        let mut ctor: Option<(usize, Variable, bool)> = None;
+        let mut ctor: Option<(usize, Variable, bool, CallTarget)> = None;
         for (i, op) in graph.blocks[bi].operations.iter().enumerate() {
             if let OpKind::Call { target, args, .. } = &op.kind
                 && let Some(is_err) = result_ctor_kind(target)
@@ -657,10 +695,10 @@ fn lower_result_exc_returns_inner(
                         graph.name
                     ));
                 };
-                ctor = Some((i, v, is_err));
+                ctor = Some((i, v, is_err, target.clone()));
             }
         }
-        let Some((ctor_idx, ctor_var, is_err)) = ctor else {
+        let Some((ctor_idx, ctor_var, is_err, ctor_target)) = ctor else {
             continue;
         };
         // Payload FieldWrite (__pos_0).  Required except for the `Ok`
@@ -743,10 +781,17 @@ fn lower_result_exc_returns_inner(
                 );
                 continue;
             }
-            None if !is_err => (
+            None if !is_err && result_ok_payload_is_void(&ctor_target) => (
                 None,
                 graph.alloc_value_var_with_type(crate::model::ConcreteType::Void),
             ),
+            None if !is_err => {
+                return Err(format!(
+                    "{}: block {bi} payload-bearing Result Ok ctor `{ctor_target}` \
+                     has no __pos_0",
+                    graph.name
+                ));
+            }
             // A payload-less `Err` has no exception value to raise, so it is
             // never a return shell this rewrite lowers.
             None => {
@@ -918,8 +963,9 @@ fn lower_result_exc_returns_inner(
 
         // Drop the ctor + payload and optional static discriminant writes
         // (higher index first).  A dead `ConstInt` producer for the tag is
-        // removed by the ordinary dead-op sweep.  A payload-less `Ok` ctor
-        // becomes the unit constant it forwards instead.
+        // removed by the ordinary dead-op sweep.  `Ok(())` becomes the unit
+        // constant it forwards (`rnone.py` `NoneRepr`). A payload Ok without
+        // `__pos_0` is declined above, never rewritten to `ConstNone`.
         {
             let ops = &mut graph.blocks[bi].operations;
             let mut remove = Vec::new();
@@ -3740,11 +3786,11 @@ fn rewire_one_option_ok_or_else_try_site(
         ));
     }
     let (opt, env) = match &graph.blocks[a].operations[call_idx].kind {
-        OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } if name == "ok_or_else" && args.len() == 2 => (args[0].clone(), args[1].clone()),
+        OpKind::Call { target, args, .. }
+            if call_target_is_ok_or_else(target) && args.len() == 2 =>
+        {
+            (args[0].clone(), args[1].clone())
+        }
         other => {
             return Err(format!(
                 "{name}: recorded ok_or_else site has a different producer: {other:?}"
@@ -3791,17 +3837,20 @@ fn rewire_one_option_ok_or_else_try_site(
     // fresh payload variable and rewrites the normal link to carry it.
     // The truncation point and the carried-value filter have to follow that
     // name: keying them on the shell leaves the payload threaded out of
-    // block A after its only definition is deleted.
+    // block A after its only definition is deleted. Remint keeps the
+    // CallTarget, Method or Regular FunctionPath
+    // `core::option::<Impl>::ok_or_else`.
     let (call_idx, payload_var) = graph.blocks[a]
         .operations
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
-            OpKind::Call {
-                target: CallTarget::Method { name: method, .. },
-                args,
-                ..
-            } if method == "ok_or_else" && args.len() == 2 && args[0] == opt && args[1] == env => {
+            OpKind::Call { target, args, .. }
+                if call_target_is_ok_or_else(target)
+                    && args.len() == 2
+                    && args[0] == opt
+                    && args[1] == env =>
+            {
                 op.result.clone().map(|result| (i, result))
             }
             _ => None,
@@ -11655,7 +11704,7 @@ fn call_is_ok_or_else(graph: &FunctionGraph, block: usize, result: &Variable) ->
         op.result.as_ref() == Some(result)
             && matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "ok_or_else"
+                OpKind::Call { target, .. } if call_target_is_ok_or_else(target)
             )
     })
 }
@@ -11897,7 +11946,10 @@ fn classify_slot_value(
         .position(|op| op.result.as_ref() == Some(var))
     {
         let kind = &graph.blocks[source].operations[op_idx].kind;
-        if let OpKind::Call { target, .. } = kind {
+        if let OpKind::Call {
+            target, result_ty, ..
+        } = kind
+        {
             if result_ctor_kind(target).is_some() || is_control_flow_ctor(target) {
                 if leave_result_ctor_for_callee_rule(graph, source, var, target) {
                     return Ok(SlotAction::LeaveCtor);
@@ -11906,10 +11958,60 @@ fn classify_slot_value(
                     return Ok(SlotAction::Raise);
                 }
                 let field = shell_field_write(graph, source, var);
+                if field.is_none()
+                    && result_ctor_kind(target) == Some(false)
+                    && !result_ok_payload_is_void(target)
+                {
+                    return Err(format!(
+                        "{name}: merged continue block {source} payload-bearing \
+                         Result Ok ctor `{target}` has no __pos_0"
+                    ));
+                }
                 return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
             }
             let field = shell_field_write(graph, source, var);
-            return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
+            if field.is_some() {
+                return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
+            }
+            // `annrpython.py` `follow_link` binds each link arg to the
+            // target inputarg. `Project { field: None }` mints unit
+            // `ConstNone` (`rnone.py` `NoneRepr`); that is only `Ok(())`.
+            match call_result_ty_ok_is_unit(result_ty) {
+                Some(true) => {
+                    return Ok(SlotAction::Project(SlotProjection {
+                        pos: 0,
+                        field: None,
+                    }));
+                }
+                Some(false) => {
+                    return Err(format!(
+                        "{name}: merged continue block {source} payload-bearing \
+                         Result Call `{target}` has no capture and no __pos_0"
+                    ));
+                }
+                None => return Ok(SlotAction::Ready),
+            }
+        }
+        if let OpKind::IndirectCall { result_ty, .. } = kind {
+            let field = shell_field_write(graph, source, var);
+            if field.is_some() {
+                return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
+            }
+            match call_result_ty_ok_is_unit(result_ty) {
+                Some(true) => {
+                    return Ok(SlotAction::Project(SlotProjection {
+                        pos: 0,
+                        field: None,
+                    }));
+                }
+                Some(false) => {
+                    return Err(format!(
+                        "{name}: merged continue block {source} payload-bearing \
+                         Result IndirectCall has no capture and no __pos_0"
+                    ));
+                }
+                None => return Ok(SlotAction::Ready),
+            }
         }
         if is_branch_result(graph, var) {
             return Err(format!(
@@ -13965,7 +14067,8 @@ mod static_result_shell_tests {
                     target: CallTarget::synthetic_transparent_ctor_with_owner(
                         vec!["core".into(), "result".into(), "Result<(),E>".into()],
                         "Ok",
-                    ),
+                    )
+                    .with_payload_void(),
                     args: Vec::new(),
                     result_ty: ValueType::Ref(Some("core::result::Result<(),E>::Ok".into())),
                 },
@@ -13989,6 +14092,75 @@ mod static_result_shell_tests {
         assert_eq!(
             graph.blocks[entry.0].exits[0].args,
             vec![LinkArg::Value(unit.clone())]
+        );
+    }
+
+    /// `Ok(Zst)` of a `Result<Zst, E>` whose payload field is Void writes
+    /// no `__pos_0`: the return forwards the Void unit instead of the shell.
+    #[test]
+    fn payloadless_zst_ok_shell_returns_the_unit() {
+        let mut graph = FunctionGraph::new("zst_result_shell");
+        let entry = graph.startblock;
+        let shell = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<Zst,E>".into()],
+                        "Ok",
+                    )
+                    .with_payload_void(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<Zst,E>::Ok".into())),
+                },
+                true,
+            )
+            .expect("shell");
+        let returnblock = graph.returnblock;
+        graph.set_goto(entry, returnblock, vec![shell.clone()]);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("payload-less Ok lowers"),
+            1
+        );
+        let ops = &graph.blocks[entry.0].operations;
+        let [unit_op] = ops.as_slice() else {
+            panic!("expected the ctor to become one unit constant: {ops:?}");
+        };
+        let (Some(unit), OpKind::ConstNone) = (&unit_op.result, &unit_op.kind) else {
+            panic!("expected ConstNone, got {unit_op:?}");
+        };
+        assert_eq!(
+            graph.blocks[entry.0].exits[0].args,
+            vec![LinkArg::Value(unit.clone())]
+        );
+    }
+
+    #[test]
+    fn payload_ok_shell_without_pos0_is_declined() {
+        let mut graph = FunctionGraph::new("payload_result_shell");
+        let entry = graph.startblock;
+        let shell = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,E>".into()],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<i64,E>::Ok".into())),
+                },
+                true,
+            )
+            .expect("shell");
+        let returnblock = graph.returnblock;
+        graph.set_goto(entry, returnblock, vec![shell.clone()]);
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            .expect_err("payload Ok without __pos_0 must decline");
+        assert!(
+            err.contains("payload-bearing Result Ok ctor"),
+            "expected payload Ok decline, got {err}"
         );
     }
 
@@ -14500,14 +14672,52 @@ mod static_result_shell_tests {
     }
 
     /// `return Ok(())` of a `Result<(), E>` callee: the bare `Ok` shell
-    /// with its tag and no `__pos_0` write.
+    /// with its tag and no `__pos_0` write. The ctor carries `payload_void`
+    /// (`result_ok_payload_is_void`); a payload `Result<T, E>`
+    /// without `__pos_0` declines (`payload_ok_shell_without_pos0_is_declined`).
     fn unit_ok_shell() -> FunctionGraph {
-        let (mut graph, _, payload) = ok_shell_with_tag(0);
+        let mut graph = FunctionGraph::new("static_result_shell");
         let entry = graph.startblock;
-        graph.block_mut(entry).operations.retain(|op| {
-            op.result.as_ref() != Some(&payload)
-                && !matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__pos_0")
+        let shell = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<(),E>".into()],
+                        "Ok",
+                    )
+                    .with_payload_void(),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("core::result::Result<(),E>::Ok".into())),
+                },
+                true,
+            )
+            .expect("shell");
+        let disc = graph
+            .push_op_var(entry, OpKind::ConstInt(0), true)
+            .expect("tag");
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: shell.clone(),
+                field: crate::model::FieldDescriptor {
+                    name: "__discriminant".into(),
+                    owner_root: Some("core::result::Result<(),E>".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(disc),
+                ty: ValueType::Int,
+            },
         });
+        let returnblock = graph.returnblock;
+        graph.set_goto(entry, returnblock, vec![shell]);
         graph
     }
 
@@ -16438,6 +16648,26 @@ mod option_ok_or_else_try_tests {
     /// `ControlFlow` discriminant, the continue arm reads `__pos_0`, and
     /// the break arm is the `from_residual` reraise tail.
     fn ok_or_else_try_diamond() -> (FunctionGraph, OptionOkOrElseTrySite) {
+        ok_or_else_try_diamond_with_target(CallTarget::method(
+            "ok_or_else",
+            Some("core::option::Option<i64>".into()),
+        ))
+    }
+
+    /// Regular FunctionPath `core::option::<Impl>::ok_or_else`, the
+    /// `iter_unpack` spelling (`args.get(1).copied().ok_or_else(...)?`).
+    fn ok_or_else_try_diamond_function_path() -> (FunctionGraph, OptionOkOrElseTrySite) {
+        ok_or_else_try_diamond_with_target(CallTarget::function_path([
+            "core",
+            "option",
+            "<Impl>",
+            "ok_or_else",
+        ]))
+    }
+
+    fn ok_or_else_try_diamond_with_target(
+        target: CallTarget,
+    ) -> (FunctionGraph, OptionOkOrElseTrySite) {
         let mut graph = FunctionGraph::new("ok_or_else_try");
         let opt = graph.alloc_value_var();
         let env = graph.alloc_value_var();
@@ -16448,10 +16678,7 @@ mod option_ok_or_else_try_tests {
             .push_op_var(
                 a,
                 OpKind::Call {
-                    target: CallTarget::method(
-                        "ok_or_else",
-                        Some("core::option::Option<i64>".into()),
-                    ),
+                    target,
                     args: crate::model::call_args(vec![opt.clone(), env.clone()]),
                     result_ty: ValueType::Ref(None),
                 },
@@ -16608,12 +16835,99 @@ mod option_ok_or_else_try_tests {
         }
     }
 
+    fn reachable_blocks(graph: &FunctionGraph) -> Vec<bool> {
+        let mut reachable = vec![false; graph.blocks.len()];
+        let mut stack = vec![graph.startblock.0];
+        while let Some(block) = stack.pop() {
+            if block >= reachable.len() || reachable[block] {
+                continue;
+            }
+            reachable[block] = true;
+            for link in &graph.blocks[block].exits {
+                stack.push(link.target.0);
+            }
+        }
+        reachable
+    }
+
+    fn leftover_from_residual_or_break(graph: &FunctionGraph) -> Vec<String> {
+        let reachable = reachable_blocks(graph);
+        let mut hits = Vec::new();
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            if !reachable[bi] {
+                continue;
+            }
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "from_residual" => {
+                        hits.push(format!("bb{bi} Call Method from_residual"));
+                    }
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("from_residual") => {
+                        hits.push(format!("bb{bi} Call FunctionPath from_residual"));
+                    }
+                    OpKind::Call {
+                        target:
+                            CallTarget::SyntheticTransparentCtor {
+                                name, owner_path, ..
+                            },
+                        ..
+                    } if name == "Break"
+                        && owner_path.iter().any(|seg| seg.contains("ControlFlow")) =>
+                    {
+                        hits.push(format!("bb{bi} ControlFlow Break ctor"));
+                    }
+                    OpKind::FieldRead { field, .. } if field.name == "from_residual" => {
+                        hits.push(format!("bb{bi} getattr from_residual"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        hits
+    }
+
     #[test]
     fn ok_or_else_try_payload_is_defined_on_every_link() {
         let (mut graph, site) = ok_or_else_try_diamond();
         rewire_one_option_ok_or_else_try_site(&mut graph, &site, false)
             .expect("ok_or_else `?` diamond rewires");
         assert_link_args_defined(&graph);
+        let leftover = leftover_from_residual_or_break(&graph);
+        assert!(
+            leftover.is_empty(),
+            "Method ok_or_else `?` left from_residual / ControlFlow Break: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn function_path_ok_or_else_try_rewires_without_from_residual() {
+        let (mut graph, site) = ok_or_else_try_diamond_function_path();
+        rewire_one_option_ok_or_else_try_site(&mut graph, &site, false)
+            .expect("FunctionPath ok_or_else `?` diamond rewires");
+        assert_link_args_defined(&graph);
+        let leftover = leftover_from_residual_or_break(&graph);
+        assert!(
+            leftover.is_empty(),
+            "FunctionPath ok_or_else `?` left from_residual / ControlFlow Break: {leftover:?}"
+        );
+        let leftover_ok_or_else = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if call_target_is_ok_or_else(target)
+                )
+            })
+        });
+        assert!(
+            !leftover_ok_or_else,
+            "FunctionPath ok_or_else `?` left the residual call"
+        );
     }
 }
 

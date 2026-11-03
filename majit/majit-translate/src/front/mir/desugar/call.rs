@@ -1220,9 +1220,22 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if args.len() == 1
+                    && self.try_lower_widening_int_from(
+                        mir_bb,
+                        &reg,
+                        args[0].clone(),
+                        dest_local,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                        &arg_locals,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
+                if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
-                        || self.is_widening_int_from(&reg)
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
                         || self.is_raw_ptr_as_ref(&reg)
@@ -3101,10 +3114,13 @@ impl<'a> Lowering<'a> {
                 // the builder lives: a local or an instance attribute such as
                 // `rutf8.py` `Utf8StringBuilder._s`.
                 if let Some(method) = string_builder_method_leaf(self.llbc, &reg) {
+                    // `AbstractStringBuilderRepr.rtyper_new` yields the
+                    // builder (`SomeStringBuilder`); `rtype_method_build`
+                    // yields `SomeString` (`Ptr(STR)`).
                     let (marker, result_ty, concrete) = match method {
                         "new" => (
                             crate::runtime_names::shims::STRINGBUILDER_NEW,
-                            ValueType::Ref(None),
+                            ValueType::StringBuilder,
                             crate::model::ConcreteType::Unknown,
                         ),
                         "append" => (
@@ -3114,7 +3130,7 @@ impl<'a> Lowering<'a> {
                         ),
                         _ => (
                             crate::runtime_names::shims::STRINGBUILDER_BUILD,
-                            ValueType::Ref(None),
+                            ValueType::Str,
                             crate::model::ConcreteType::Unknown,
                         ),
                     };
@@ -3181,7 +3197,8 @@ impl<'a> Lowering<'a> {
                             } else {
                                 Vec::new()
                             },
-                            result_ty: ValueType::Ref(None),
+                            // `AbstractStringBuilderRepr.rtyper_new`.
+                            result_ty: ValueType::StringBuilder,
                         },
                     });
                     // `Wtf8Buf::from_string(initial)` and
@@ -3322,6 +3339,56 @@ impl<'a> Lowering<'a> {
                 // the method name never reaches the rtyper as a
                 // `ptr.getattr`.
                 if args.len() == 1 && self.is_ptr_identity_cast(&reg) {
+                    // Dest-Str restore (`op_gc_restore_root` /
+                    // `GCRefRepr.convert_from_to`) before aliasing
+                    // immortal `*mut u8` (`alloc_varsize_with_gc_header_immortal`)
+                    // onto rstr `STR` (`rstr.py` `mallocstr`). `<*mut u8>::cast::<BytesBlock>()`
+                    // is the method twin of `CastKind::RawPtr`; dest
+                    // layout is rstr even when dest_kind is `Str`.
+                    // `__cast_instance_intrinsic` of a string root
+                    // (`builtin.py`) requires a pointer operand. The
+                    // receiver of `<*mut T>::cast` is always RawPtr, so
+                    // dest-Str only when the word is a GC ref or a
+                    // stamped CCHARP (`ann_cast_int_to_ptr`). An i64
+                    // aliased onto that RawPtr (`alloc_utf8_payload`)
+                    // stays the identity alias.
+                    let src_kind = first_arg_ty.as_ref().map(|ty| {
+                        tyref_to_value_type_with(
+                            ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    });
+                    let src_root = first_arg_ty.as_ref().and_then(|ty| {
+                        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+                    });
+                    let src_is_pointer_operand = matches!(src_kind, Some(ValueType::Ref(_)))
+                        || args[0]
+                            .concretetype()
+                            .as_ref()
+                            .is_some_and(lltype_is_ccharp);
+                    if self.dest_ty_is_rstr_str(&call.dest.ty)
+                        && src_is_pointer_operand
+                        && let Some((kind, res)) = self.ptr_cast_marker(
+                            src_kind.as_ref(),
+                            src_root.as_deref(),
+                            &call.dest.ty,
+                            &args[0],
+                            src_is_pointer_operand,
+                        )
+                    {
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                     // When the cast target names a registered struct root
                     // (`ptr.cast::<W_SRE_Pattern>()` then a field read),
                     // narrow the result to `SomeInstance(root)` exactly
@@ -4065,6 +4132,11 @@ impl<'a> Lowering<'a> {
                                     None,
                                     &call.dest.ty,
                                     &orig,
+                                    self.cast_src_is_pointer(
+                                        None,
+                                        Some(&ValueType::Ref(None)),
+                                        &orig,
+                                    ),
                                 ) {
                                     Some((kind, res)) => {
                                         self.graph.block_mut(bb_id).operations.push(
@@ -4092,6 +4164,11 @@ impl<'a> Lowering<'a> {
                                     None,
                                     &call.dest.ty,
                                     &orig,
+                                    self.cast_src_is_pointer(
+                                        None,
+                                        Some(&ValueType::Ref(None)),
+                                        &orig,
+                                    ),
                                 ) {
                                     Some((kind, res)) => {
                                         self.graph.block_mut(bb_id).operations.push(
@@ -7465,6 +7542,12 @@ impl<'a> Lowering<'a> {
         // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
         if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
             stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+            stamp_fn_ptr(
+                &result_var,
+                &call.dest.ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            );
         }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
@@ -7527,13 +7610,8 @@ impl<'a> Lowering<'a> {
         // combinator, and lowering only the downstream `?` would leave that
         // unregistered residual (while lowering only the Option select would
         // materialise the Result shell RPython never has).
-        let captured_option_ok_or_else_try = if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && name == "ok_or_else"
-            && args.len() == 2
+        let captured_option_ok_or_else_try = if let OpKind::Call { target, args, .. } = &op_kind
+            && call_is_option_ok_or_else(target, args.len(), callee_name_path.as_deref())
             && let Some(site) = self.recognize_option_ok_or_else_try_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
@@ -7547,15 +7625,14 @@ impl<'a> Lowering<'a> {
         };
         // `Option::ok_or_else` is a combinator (`DiscCombinator::OptionOkOrElse`),
         // not a transformed `Result<T, PyError>` callee.  Capturing it as a
-        // scoped call remints the residual Method as a payload and leaves the
-        // foreign `ok_or_else` in the graph.
+        // scoped call remints the residual Method / FunctionPath as a payload
+        // and leaves the foreign `ok_or_else` in the graph. Regular Fun
+        // `core::option::<Impl>::ok_or_else` is the same combinator as the
+        // Method form.
         let option_ok_or_else_method = matches!(
             &op_kind,
-            OpKind::Call {
-                target: CallTarget::Method { name, .. },
-                args,
-                ..
-            } if name == "ok_or_else" && args.len() == 2
+            OpKind::Call { target, args, .. }
+                if call_is_option_ok_or_else(target, args.len(), callee_name_path.as_deref())
         ) && first_arg_ty.as_ref().is_some_and(|ty| {
             crate::front::result_exc::tyref_is_option(ty, self.llbc)
                 || self.peel_to_option_or_result(ty).is_some_and(|peeled| {
@@ -7579,8 +7656,28 @@ impl<'a> Lowering<'a> {
                 ..
             }
         );
+        // Dynamic residue (`fnptr_indirect` off) is `Call(__dyn_call)` with
+        // no `callee_name_path`. Unknown-family `IndirectCall` is the same
+        // Result-of-carrier dest as a named Fun: `remint_call_as_payload`
+        // (`annrpython.py` `follow_link` binds the value the source returns).
+        let dyn_call_residue = matches!(
+            &op_kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["__dyn_call"]
+        );
+        let unknown_family_indirect = matches!(
+            &op_kind,
+            OpKind::IndirectCall {
+                family_key: None,
+                ..
+            }
+        );
         if (matches!(&op_kind, OpKind::Call { .. }) && callee_name_path.is_some()
-            || indirect_family_call)
+            || indirect_family_call
+            || dyn_call_residue
+            || unknown_family_indirect)
             && !captured_option_ok_or_else_try
             && !option_ok_or_else_method
             && crate::front::result_exc::tyref_is_result_of_carrier(
@@ -8408,18 +8505,37 @@ impl<'a> Lowering<'a> {
         // `unwrap_or_else`/`or_else`/`is_some_and` are extracted core
         // bodies (`CHARON_CORE_INCLUDE`); this records the remaining
         // Option/Result methods whose semantics are the same shape.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && let Some(kind) = DiscCombinator::from_method(
+        let combinator = match &op_kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                args,
+                ..
+            } => DiscCombinator::from_method(
                 name,
                 args.len(),
                 callee_name_path.as_deref(),
                 first_arg_ty.as_ref(),
                 self.llbc,
             )
+            .map(|kind| (kind, args.as_slice())),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } => segments.last().and_then(|leaf| {
+                let path = segments.join("::");
+                DiscCombinator::from_method(
+                    leaf,
+                    args.len(),
+                    Some(path.as_str()),
+                    first_arg_ty.as_ref(),
+                    self.llbc,
+                )
+                .map(|kind| (kind, args.as_slice()))
+            }),
+            _ => None,
+        };
+        if let Some((kind, args)) = combinator
             && let Some(site) = self.recognize_disc_combinator_site(
                 kind,
                 args,
