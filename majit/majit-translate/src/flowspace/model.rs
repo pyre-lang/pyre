@@ -3144,6 +3144,11 @@ pub enum ConstValue {
     /// RPython `s_repr.const` when that constant is an `rmodel.Repr`
     /// (`rbuiltin.py` `rtype_hlinvoke`: `r_callable = s_repr.const`).
     Repr(ReprConst),
+    /// RPython `Constant(desc)` (`rpbc.py`
+    /// `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)`).
+    /// Identity is the desc (`tool/uid.py` `Hashable` falls back to
+    /// object identity for a Desc).
+    Desc(DescConst),
 }
 
 /// Address of a leaked `Box<Arc<dyn Repr>>`, not the live object.
@@ -3203,6 +3208,66 @@ impl Eq for ReprConst {}
 impl Hash for ReprConst {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.data_ptr.hash(state);
+    }
+}
+
+/// RPython `Constant(desc)` (`rpbc.py`
+/// `pairtype(MultipleFrozenPBCReprBase, SingleFrozenPBCRepr)`).
+/// Identity is the desc (`tool/uid.py` `Hashable` falls back to
+/// object identity for a Desc); the Box is leaked so the `DescKey`
+/// address can never be reused by another desc (same reason as
+/// [`ReprConst`]).
+#[derive(Clone)]
+pub struct DescConst {
+    /// `Box::into_raw(Box::new(desc: DescEntry))` as an integer. Always
+    /// nonzero: only [`DescConst::new`] constructs this type.
+    leaked: usize,
+    /// Captured `desc.desc_key()` so `PartialEq` / `Hash` / `Debug`
+    /// never dereference.
+    key: crate::annotator::description::DescKey,
+    thread: std::thread::ThreadId,
+}
+
+impl DescConst {
+    pub fn new(desc: crate::annotator::description::DescEntry) -> Self {
+        let key = desc.desc_key();
+        let leaked = Box::into_raw(Box::new(desc)) as usize;
+        DescConst {
+            leaked,
+            key,
+            thread: std::thread::current().id(),
+        }
+    }
+
+    pub fn as_desc(&self) -> crate::annotator::description::DescEntry {
+        assert!(
+            std::thread::current().id() == self.thread,
+            "DescConst::as_desc called off the creating thread"
+        );
+        // SAFETY: `leaked` is the `Box::into_raw` address from
+        // `DescConst::new` and is never freed. The thread check above
+        // confines the `!Send` DescEntry to the creating thread.
+        unsafe { (*(self.leaked as *const crate::annotator::description::DescEntry)).clone() }
+    }
+}
+
+impl std::fmt::Debug for DescConst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DescConst({:?})", self.key)
+    }
+}
+
+impl PartialEq for DescConst {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for DescConst {}
+
+impl Hash for DescConst {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state);
     }
 }
 
@@ -3293,6 +3358,7 @@ impl PartialEq for ConstValue {
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
             (ConstValue::Repr(a), ConstValue::Repr(b)) => a == b,
+            (ConstValue::Desc(a), ConstValue::Desc(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             (
@@ -3349,6 +3415,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
             ConstValue::Opaque(_) => f.write_str("<opaque>"),
             ConstValue::Repr(repr) => write!(f, "<repr {:#x}>", repr.data_ptr),
+            ConstValue::Desc(desc) => write!(f, "<desc {:?}>", desc.key),
             ConstValue::Dict(_)
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
@@ -3442,6 +3509,7 @@ impl Hash for ConstValue {
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::Opaque(opaque) => opaque.hash(state),
             ConstValue::Repr(repr) => repr.hash(state),
+            ConstValue::Desc(desc) => desc.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
             ConstValue::InheritanceId {
@@ -4068,6 +4136,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::InheritanceId { .. } => "InheritanceId",
         ConstValue::Opaque(_) => "Opaque",
         ConstValue::Repr(_) => "Repr",
+        ConstValue::Desc(_) => "Desc",
     }
 }
 
@@ -4304,7 +4373,7 @@ impl ConstValue {
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
             ConstValue::InheritanceId { .. } => Some(true),
-            ConstValue::Opaque(_) | ConstValue::Repr(_) => Some(true),
+            ConstValue::Opaque(_) | ConstValue::Repr(_) | ConstValue::Desc(_) => Some(true),
         }
     }
 
@@ -4402,7 +4471,8 @@ impl ConstValue {
             | ConstValue::InheritanceId { .. }
             | ConstValue::SpecTag(_)
             | ConstValue::Opaque(_)
-            | ConstValue::Repr(_) => None,
+            | ConstValue::Repr(_)
+            | ConstValue::Desc(_) => None,
         }
     }
 
@@ -6445,6 +6515,48 @@ mod tests {
         })
         .join();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn desc_const_identity_eq_hash_and_not_none() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::flowspace::argument::Signature;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let desc = |name: &str| {
+            DescEntry::function(Rc::new(RefCell::new(FunctionDesc::new(
+                Rc::clone(&bk),
+                None,
+                name,
+                Signature::new(vec![], None, None),
+                None,
+                None,
+            ))))
+        };
+        let desc_a = desc("a");
+        let desc_b = desc("b");
+
+        let same_left = DescConst::new(desc_a.clone());
+        let same_right = DescConst::new(desc_a.clone());
+        let different = DescConst::new(desc_b);
+
+        assert_eq!(same_left, same_right);
+        assert_ne!(same_left, different);
+
+        let mut ha = DefaultHasher::new();
+        let mut hb = DefaultHasher::new();
+        same_left.hash(&mut ha);
+        same_right.hash(&mut hb);
+        assert_eq!(ha.finish(), hb.finish());
+
+        let mut hd = DefaultHasher::new();
+        different.hash(&mut hd);
+        assert_ne!(ha.finish(), hd.finish());
+
+        let value = ConstValue::Desc(DescConst::new(desc_a));
+        assert_ne!(value, ConstValue::None);
     }
 
     /// `ConstValue::as_pystr` mirrors RPython `isinstance(value, str)`

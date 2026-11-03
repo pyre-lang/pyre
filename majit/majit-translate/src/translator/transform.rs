@@ -1019,7 +1019,8 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::SpecTag(_)
         | ConstValue::Placeholder
         | ConstValue::Opaque(_)
-        | ConstValue::Repr(_) => false,
+        | ConstValue::Repr(_)
+        | ConstValue::Desc(_) => false,
     }
 }
 

@@ -5571,9 +5571,10 @@ impl Bookkeeper {
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder
-            | ConstValue::Opaque(_) => {
-                // Code / Graphs / SpecTag / Atom / Placeholder cover
-                // internal flowspace / host-carrier values that
+            | ConstValue::Opaque(_)
+            | ConstValue::Desc(_) => {
+                // Code / Graphs / SpecTag / Atom / Placeholder / Opaque /
+                // Desc cover internal flowspace / host-carrier values that
                 // upstream never feeds into immutablevalue. Keep the
                 // fail-fast stub so any unexpected call-site surfaces
                 // a clear error rather than silent stub-SomePBC.

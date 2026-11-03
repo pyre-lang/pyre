@@ -1083,6 +1083,7 @@ pub fn builtin_bool(
             ConstValue::HostObject(_)
             | ConstValue::Opaque(_)
             | ConstValue::Repr(_)
+            | ConstValue::Desc(_)
             | ConstValue::Function(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)

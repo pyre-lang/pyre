@@ -1326,7 +1326,7 @@ pub(crate) mod tests {
 // (rpbc.py `__extend__(pairtype(...))`) live alongside their
 // owning concrete reprs below.
 
-use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
+use crate::flowspace::model::{ConstValue, Constant, DescConst, GraphKey, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{CanBeNull, Repr, ReprState};
@@ -4299,10 +4299,8 @@ pub(super) fn pair_multiple_frozen_pbc_base_single_frozen_pbc_convert_from_to(
                  r_to is not SingleFrozenPBCRepr",
             )
         })?;
-    // upstream: `return inputconst(Void, r_pbc2.frozendesc)`. Void
-    // `_contains_value` accepts any constant; the FrozenDesc object
-    // is the desc's `pyobj` (or None when the desc has no host object).
-    let value = r_pbc2.frozendesc.pyobj_const().unwrap_or(ConstValue::None);
+    // upstream: `return inputconst(Void, r_pbc2.frozendesc)`.
+    let value = ConstValue::Desc(DescConst::new(r_pbc2.frozendesc.clone()));
     let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(&LowLevelType::Void, &value)?;
     Ok(Some(Hlvalue::Constant(c)))
 }
@@ -9573,7 +9571,6 @@ mod pbc_repr_tests {
         let f = frozen_entry(&ann.bookkeeper, "frozen0");
         let r_single: std::sync::Arc<dyn Repr> =
             std::sync::Arc::new(SingleFrozenPBCRepr::new(f.clone()));
-        let expected = f.pyobj_const().unwrap_or(ConstValue::None);
         let mut llops = LowLevelOpList::new(rtyper.clone(), None);
 
         let r_mu: std::sync::Arc<dyn Repr> =
@@ -9586,7 +9583,13 @@ mod pbc_repr_tests {
             panic!("Base × Single yields a Void Constant");
         };
         assert_eq!(c_mu.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_mu.value, expected);
+        let ConstValue::Desc(d_mu) = &c_mu.value else {
+            panic!(
+                "Base × Single yields ConstValue::Desc, got {:?}",
+                c_mu.value
+            );
+        };
+        assert_eq!(d_mu.as_desc().desc_key(), f.desc_key());
 
         let (a, b) = merge_frozen_pair(&ann.bookkeeper, "frozen1", "frozen2");
         let r_mf = getFrozenPBCRepr(&rtyper, &SomePBC::new(vec![a, b], false)).unwrap();
@@ -9599,7 +9602,13 @@ mod pbc_repr_tests {
             panic!("Base × Single yields a Void Constant");
         };
         assert_eq!(c_mf.concretetype, Some(LowLevelType::Void));
-        assert_eq!(c_mf.value, expected);
+        let ConstValue::Desc(d_mf) = &c_mf.value else {
+            panic!(
+                "Base × Single yields ConstValue::Desc, got {:?}",
+                c_mf.value
+            );
+        };
+        assert_eq!(d_mf.as_desc().desc_key(), f.desc_key());
     }
 
     /// `pairtype(FunctionRepr, MultipleFrozenPBCRepr).convert_from_to`:

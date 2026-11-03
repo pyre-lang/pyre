@@ -549,7 +549,7 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         // whose `follow_link` / `mergeinputargs` union is not a single
         // FrozenDesc (`getFrozenPBCRepr`), or — when the dest is
         // unannotated — distinct Repr identities or a mixed non-Repr arg.
-        ConstValue::Repr(_) => ConcreteType::Void,
+        ConstValue::Repr(_) | ConstValue::Desc(_) => ConcreteType::Void,
     }
 }
 

@@ -475,7 +475,8 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_)
         | ConstValue::Opaque(_)
-        | ConstValue::Repr(_) => true,
+        | ConstValue::Repr(_)
+        | ConstValue::Desc(_) => true,
     }
 }
 
