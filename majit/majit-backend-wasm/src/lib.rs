@@ -1769,8 +1769,9 @@ fn wasm_get_referents(obj: GcRef, visitor: majit_gc::GetObjectsVisitorFn) {
     with_wasm_active_gc_mut(|gc| gc.get_referents(obj, &mut visit));
 }
 
-fn wasm_subgraph_has_pending_finalizer(roots: &[GcRef]) -> bool {
-    with_wasm_active_gc_mut(|gc| gc.subgraph_has_pending_finalizer(roots)).unwrap_or(false)
+fn wasm_subgraph_has_pending_finalizer(roots: &[GcRef], ignored_edges: &[(u32, usize)]) -> bool {
+    with_wasm_active_gc_mut(|gc| gc.subgraph_has_pending_finalizer(roots, ignored_edges))
+        .unwrap_or(false)
 }
 
 fn wasm_is_tracked(obj: GcRef) -> bool {

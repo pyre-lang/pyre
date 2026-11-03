@@ -1110,7 +1110,11 @@ pub trait GcAllocator: Send {
     /// whose app-level finalizer has not run yet.  A collector without graph
     /// metadata must answer conservatively: callers use `false` to skip a
     /// collection whose only purpose is prompt finalization.
-    fn subgraph_has_pending_finalizer(&mut self, _roots: &[GcRef]) -> bool {
+    fn subgraph_has_pending_finalizer(
+        &mut self,
+        _roots: &[GcRef],
+        _ignored_edges: &[(u32, usize)],
+    ) -> bool {
         true
     }
 
@@ -2038,8 +2042,12 @@ impl GcAllocator for GcHandle {
         // a live object as having no referents at all.
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.get_referents(obj, visitor))
     }
-    fn subgraph_has_pending_finalizer(&mut self, roots: &[GcRef]) -> bool {
-        gc_sync::gc_op(|gc| gc.subgraph_has_pending_finalizer(roots))
+    fn subgraph_has_pending_finalizer(
+        &mut self,
+        roots: &[GcRef],
+        ignored_edges: &[(u32, usize)],
+    ) -> bool {
+        gc_sync::gc_op(|gc| gc.subgraph_has_pending_finalizer(roots, ignored_edges))
     }
     fn is_tracked(&mut self, obj: GcRef) -> bool {
         // Same exposure as `get_referents`: a forwarded address is not a
@@ -3744,7 +3752,7 @@ pub fn get_referents(obj: GcRef, visitor: GetObjectsVisitorFn) {
 /// Backend-routed prefilter for a prompt-finalization boundary.  Unlike the
 /// process-wide finalizer census, this asks only about the graph whose owning
 /// edge is about to be released.
-pub type SubgraphHasPendingFinalizerFn = fn(&[GcRef]) -> bool;
+pub type SubgraphHasPendingFinalizerFn = fn(&[GcRef], &[(u32, usize)]) -> bool;
 
 global_hook!(static ACTIVE_SUBGRAPH_HAS_PENDING_FINALIZER: SubgraphHasPendingFinalizerFn);
 
@@ -3752,11 +3760,18 @@ pub fn set_active_subgraph_has_pending_finalizer(hook: Option<SubgraphHasPending
     ACTIVE_SUBGRAPH_HAS_PENDING_FINALIZER.set(hook);
 }
 
-pub fn subgraph_has_pending_finalizer(roots: &[GcRef]) -> bool {
+/// Backend-routed prefilter for a prompt-finalization boundary.  Unlike the
+/// process-wide finalizer census, this asks only about the graph whose owning
+/// edge is about to be released.
+///
+/// `ignored_edges` are `(type_id, field_offset)` edges the walk does not
+/// follow: a reference the owner keeps after the release (a frame's caller
+/// link), so whatever it reaches is not part of the released graph.
+pub fn subgraph_has_pending_finalizer(roots: &[GcRef], ignored_edges: &[(u32, usize)]) -> bool {
     match ACTIVE_SUBGRAPH_HAS_PENDING_FINALIZER.get() {
-        Some(f) => f(roots),
+        Some(f) => f(roots, ignored_edges),
         None if gc_sync::is_initialized() => {
-            gc_sync::gc_op(|gc| gc.subgraph_has_pending_finalizer(roots))
+            gc_sync::gc_op(|gc| gc.subgraph_has_pending_finalizer(roots, ignored_edges))
         }
         // No collector cannot own or finalize any value in the graph.
         None => false,

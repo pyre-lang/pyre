@@ -1,3 +1,6 @@
+# pyre-check: max-pypy-ratio=16
+# 11-03 local, macOS arm64 under load: dynasm 10.6x-11.7x, cranelift (jit-core) 13.5x-14.1x;
+# ceiling = max x 1.15, rounded.
 # Regression oracle: an exception raised inside a builtin (a residual call in
 # the trace) and caught in the same trace is one object with one history.
 # The handler's `e`, `sys.exc_info()[1]`, the value `__exit__` receives, the

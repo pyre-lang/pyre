@@ -1120,11 +1120,16 @@ fn dynasm_get_referents(obj: majit_ir::GcRef, visitor: majit_gc::GetObjectsVisit
     majit_gc::gc_sync::gc_op_with_root(obj, |g, obj| g.get_referents(obj, &mut visit));
 }
 
-fn dynasm_subgraph_has_pending_finalizer(roots: &[majit_ir::GcRef]) -> bool {
-    if let Some(found) = gc_box::with_mut(|g| g.subgraph_has_pending_finalizer(roots)) {
+fn dynasm_subgraph_has_pending_finalizer(
+    roots: &[majit_ir::GcRef],
+    ignored_edges: &[(u32, usize)],
+) -> bool {
+    if let Some(found) =
+        gc_box::with_mut(|g| g.subgraph_has_pending_finalizer(roots, ignored_edges))
+    {
         return found;
     }
-    majit_gc::gc_sync::gc_op(|g| g.subgraph_has_pending_finalizer(roots))
+    majit_gc::gc_sync::gc_op(|g| g.subgraph_has_pending_finalizer(roots, ignored_edges))
 }
 
 fn dynasm_is_tracked(obj: majit_ir::GcRef) -> bool {

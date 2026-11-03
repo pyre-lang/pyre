@@ -5697,10 +5697,6 @@ impl PyFrame {
         if !self.w_yielding_from.is_null() {
             released.push(majit_ir::GcRef(self.w_yielding_from as usize));
         }
-        // `f_backref` is the caller frame, still on the stack.  CPython's
-        // refcount drop is only the generator frame's own locals;
-        // walking the caller here treats live test-method objects as
-        // released and forces a heap collect on every `close()`.
         if let Some(debug) = self.getdebug_data() {
             released.extend(
                 [debug.w_locals, debug.w_extra_locals, debug.w_f_trace]
@@ -5709,7 +5705,45 @@ impl PyFrame {
                     .map(|value| majit_ir::GcRef(value as usize)),
             );
         }
-        majit_gc::subgraph_has_pending_finalizer(&released)
+        // The edges the census does not follow: references `_PyFrame_ClearExceptCode` does not
+        // drop, so nothing reached only through them belongs to the released graph.
+        // - a frame's `f_backref` (`previous`): a released exception's traceback reaches this
+        //   frame and others as graph nodes, and their caller link names a frame still executing.
+        //   Following it treats the live caller's locals (a suspended generator with a finalizer)
+        //   as released and collects on every `close()`.
+        // - a frame's code object and builtins (`f_executable`, borrowed `f_builtins`) and its
+        //   globals (borrowed `f_globals`).
+        // - the globals and builtins of a code object or function: the module namespace outlives
+        //   the frame. Walking it visits every code object and function of the module on each
+        //   `close()`.
+        // - `PyTraceback.w_code`, a pyre-only snapshot of `tb.frame.pycode` (`tb_traverse` visits
+        //   only `tb_next` and `tb_frame`).
+        const CLEARED_FRAME_KEPT_EDGES: &[(u32, usize)] = &[
+            (PYFRAME_GC_TYPE_ID, PYFRAME_F_BACKREF_OFFSET),
+            (PYFRAME_GC_TYPE_ID, PYFRAME_PYCODE_OFFSET),
+            (PYFRAME_GC_TYPE_ID, PYFRAME_W_BUILTIN_OFFSET),
+            (
+                FRAME_DEBUG_DATA_GC_TYPE_ID,
+                FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+            ),
+            (
+                crate::pytraceback::PYTRACEBACK_GC_TYPE_ID,
+                crate::pytraceback::PYTRACEBACK_W_CODE_OFFSET,
+            ),
+            (
+                crate::pycode::W_CODE_GC_TYPE_ID,
+                crate::pycode::CODE_W_GLOBALS_OFFSET,
+            ),
+            (
+                crate::function::FUNCTION_GC_TYPE_ID,
+                crate::function::FUNCTION_W_FUNC_GLOBALS_OBJ_OFFSET,
+            ),
+            (
+                crate::function::FUNCTION_GC_TYPE_ID,
+                crate::function::FUNCTION_W_BUILTINS_OFFSET,
+            ),
+        ];
+        majit_gc::subgraph_has_pending_finalizer(&released, CLEARED_FRAME_KEPT_EDGES)
     }
 
     /// Clear the frame-owned reference region after its owner has already

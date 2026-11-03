@@ -6958,8 +6958,10 @@ impl MiniMarkGC {
         let Some(type_id) = self.get_actual_typeid(obj) else {
             return false;
         };
-        let hidden_offset = self.app_level_inspector_hidden_edge_offset(type_id);
-        self.visit_referents_with_type_id_filtered(obj.0, type_id, hidden_offset, visitor);
+        let hidden = self
+            .app_level_inspector_hidden_edge_offset(type_id)
+            .map(|offset| (type_id, offset));
+        self.visit_referents_with_type_id_filtered(obj.0, type_id, hidden.as_slice(), visitor);
         true
     }
 
@@ -6974,22 +6976,30 @@ impl MiniMarkGC {
         type_id: u32,
         visitor: &mut dyn FnMut(GcRef),
     ) {
-        self.visit_referents_with_type_id_filtered(obj_addr, type_id, None, visitor);
+        self.visit_referents_with_type_id_filtered(obj_addr, type_id, &[], visitor);
     }
 
     fn visit_referents_with_type_id_filtered(
         &self,
         obj_addr: usize,
         type_id: u32,
-        ignored_offset: Option<usize>,
+        ignored_edges: &[(u32, usize)],
         visitor: &mut dyn FnMut(GcRef),
     ) {
         self.validate_type_id(type_id, obj_addr, "visit_referents");
         let type_info = self.types.get(type_id);
+        let ignored = |offset: usize| {
+            ignored_edges
+                .iter()
+                .any(|&(tid, off)| tid == type_id && off == offset)
+        };
         if let Some(trace_fn) = type_info.custom_trace {
             unsafe {
                 trace_fn(obj_addr, &mut |slot_ptr: *mut GcRef| {
-                    if ignored_offset.is_some_and(|offset| slot_ptr as usize == obj_addr + offset) {
+                    if ignored_edges
+                        .iter()
+                        .any(|&(tid, off)| tid == type_id && slot_ptr as usize == obj_addr + off)
+                    {
                         return;
                     }
                     let field_ref = *slot_ptr;
@@ -6999,11 +7009,11 @@ impl MiniMarkGC {
                 });
             }
         }
-        for &offset in &type_info.gc_ptr_offsets {
-            if ignored_offset == Some(offset) {
+        for &gc_offset in &type_info.gc_ptr_offsets {
+            if ignored(gc_offset) {
                 continue;
             }
-            let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
+            let field_ref = unsafe { *((obj_addr + gc_offset) as *const GcRef) };
             if !field_ref.is_null() {
                 visitor(field_ref);
             }
@@ -9487,7 +9497,16 @@ impl MiniMarkGC {
     /// before returning.  An enabled rawrefcount bridge keeps the sweep only
     /// when a reached object itself has a mirror — a process-wide rrc flag
     /// is not a per-graph witness.
-    pub fn do_subgraph_has_pending_finalizer(&self, roots: &[GcRef]) -> bool {
+    ///
+    /// `ignored_edges` are `(type_id, field_offset)` pairs the walk does not
+    /// follow: every pair is honoured, including several offsets of one type.
+    /// A pair names a reference the owner keeps after the release (a frame's
+    /// caller link), so whatever it reaches is not part of the released graph.
+    pub fn do_subgraph_has_pending_finalizer(
+        &self,
+        roots: &[GcRef],
+        ignored_edges: &[(u32, usize)],
+    ) -> bool {
         // A process-wide rawrefcount bridge is not a witness that *this*
         // released graph can run a death callback.  Walking the same edges
         // as marking, an enabled rrc only keeps the sweep when a reached
@@ -9513,7 +9532,13 @@ impl MiniMarkGC {
             } else if self.rawrefcount_enabled() && self.rawrefcount_from_obj(obj.0) != 0 {
                 found = true;
             }
-            self.visit_referents(obj.0, &mut |child| self.heap_dump_add(child, &mut pending));
+            let type_id = unsafe { (*hdr).type_id() };
+            self.visit_referents_with_type_id_filtered(
+                obj.0,
+                type_id,
+                ignored_edges,
+                &mut |child| self.heap_dump_add(child, &mut pending),
+            );
         }
         self.heap_dump_clear_gcflag(marked_roots);
         found
@@ -11248,8 +11273,12 @@ impl GcAllocator for MiniMarkGC {
         self.do_get_referents(obj, visitor)
     }
 
-    fn subgraph_has_pending_finalizer(&mut self, roots: &[GcRef]) -> bool {
-        self.do_subgraph_has_pending_finalizer(roots)
+    fn subgraph_has_pending_finalizer(
+        &mut self,
+        roots: &[GcRef],
+        ignored_edges: &[(u32, usize)],
+    ) -> bool {
+        self.do_subgraph_has_pending_finalizer(roots, ignored_edges)
     }
 
     fn is_tracked(&mut self, obj: GcRef) -> bool {
@@ -19422,17 +19451,73 @@ cache size\t: 8192 kB\n";
         unsafe { *(holder.0 as *mut GcRef) = finalizable };
         register_on_fq(&mut gc, finalizable, trigger);
 
-        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated]));
-        assert!(gc.do_subgraph_has_pending_finalizer(&[holder]));
+        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated], &[]));
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[]));
         gc.rawrefcount_init(rrc_test_trigger);
         assert!(
             gc.rawrefcount_enabled(),
             "rrc must not make an unrelated subgraph look finalizable"
         );
-        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated]));
-        assert!(gc.do_subgraph_has_pending_finalizer(&[holder]));
+        assert!(!gc.do_subgraph_has_pending_finalizer(&[unrelated], &[]));
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[]));
         // The inspector visited bit is scratch state, not a semantic mark.
         for obj in [unrelated, finalizable, holder] {
+            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
+        }
+    }
+
+    #[test]
+    fn finalizer_subgraph_prefilter_skips_ignored_edges() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let leaf_tid = gc.register_type(TypeInfo::simple(16));
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(2 * ptr_size, vec![0, 8]));
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + 2 * ptr_size);
+        let finalizable = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
+        unsafe {
+            *(holder.0 as *mut GcRef) = GcRef::NULL;
+            *((holder.0 + 8) as *mut GcRef) = finalizable;
+        }
+        register_on_fq(&mut gc, finalizable, trigger);
+
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[]));
+        assert!(!gc.do_subgraph_has_pending_finalizer(&[holder], &[(holder_tid, 8)]));
+        unsafe {
+            *(holder.0 as *mut GcRef) = finalizable;
+        }
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[(holder_tid, 8)]));
+        for obj in [holder, finalizable] {
+            assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
+        }
+    }
+
+    #[test]
+    fn finalizer_subgraph_prefilter_skips_every_ignored_edge_of_a_type() {
+        fn trigger() {}
+
+        let mut gc = test_gc(4096);
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let leaf_tid = gc.register_type(TypeInfo::simple(16));
+        let holder_tid = gc.register_type(TypeInfo::with_gc_ptrs(2 * ptr_size, vec![0, 8]));
+        let holder = gc.alloc_in_oldgen_clear(holder_tid, GcHeader::SIZE + 2 * ptr_size);
+        let finalizable_a = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
+        let finalizable_b = gc.alloc_in_oldgen_clear(leaf_tid, GcHeader::SIZE + 16);
+        unsafe {
+            *(holder.0 as *mut GcRef) = finalizable_a;
+            *((holder.0 + 8) as *mut GcRef) = finalizable_b;
+        }
+        register_on_fq(&mut gc, finalizable_a, trigger);
+        register_on_fq(&mut gc, finalizable_b, trigger);
+
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[]));
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[(holder_tid, 0)]));
+        assert!(gc.do_subgraph_has_pending_finalizer(&[holder], &[(holder_tid, 8)]));
+        assert!(
+            !gc.do_subgraph_has_pending_finalizer(&[holder], &[(holder_tid, 0), (holder_tid, 8)])
+        );
+        for obj in [holder, finalizable_a, finalizable_b] {
             assert!(unsafe { !(*header_of(obj.0)).has_flag(GcFlags::GCFLAG_EXTRA) });
         }
     }
